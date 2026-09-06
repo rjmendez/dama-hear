@@ -77,7 +77,7 @@ def build_sketch_golden() -> dict:
         x = pcm.astype(float)                      # quantise FIRST, then sketch
         q, ref = SK.sketch(x, fs)
         peak = int(min(np.abs(x).max(), 65535))
-        frame = SK.pack(123456, ref, peak, q)
+        frame = SK.pack(123456, ref, peak, q, fs=fs)
         cases.append({
             "name": name, "fs": fs, "n": int(len(pcm)),
             "pcm_b64": _b64(pcm.tobytes()),
@@ -85,12 +85,16 @@ def build_sketch_golden() -> dict:
             "q_b64": _b64(q.astype(np.int8).tobytes()),
             "frame_b64": _b64(frame),
             "frame_len": len(frame),
+            "fs_code": SK.fs_code(fs),
+            "band_edges_hz": [round(float(e), 4) for e in SK.band_edges_hz(fs)],
         })
     return {
-        "schema": "hear.sketch.golden.v2",
+        "schema": "hear.sketch.golden.v3",
         "mel_bands": SK.MEL_BANDS, "frames": SK.FRAMES,
         "f_lo": SK.F_LO, "f_hi": SK.F_HI, "hop_s": SK.HOP_S, "nfft": SK.NFFT,
         "wire_size": SK.wire_size(),
+        "fs_shift": SK.FS_SHIFT, "fs_mask": SK.FS_MASK,
+        "fs_codes": {str(int(k)): v for k, v in sorted(SK.FS_CODES.items())},
         "note": ("PCM is int16 and the vectors were computed FROM it -- reproduce by decoding "
                  "pcm_b64 to int16, widening to float, and sketching."),
         "cases": cases,

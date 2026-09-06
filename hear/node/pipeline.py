@@ -43,7 +43,7 @@ class Pipeline:
                 # sub-sample onset, not the floored slice bound: the timestamp is the product
                 frame = SK.pack(self.node_us_of(d["onset_index"]), ref,
                                 int(min(d["peak"], 65535)), q,
-                                flags=(1 if d["retrigger"] else 0))
+                                flags=(1 if d["retrigger"] else 0), fs=self.fs)
                 out.append({**d, "ref_db": ref, "frame": frame, "frame_len": len(frame)})
         return out
 
