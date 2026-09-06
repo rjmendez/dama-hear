@@ -245,3 +245,41 @@ class TestGeometryHelpers:
 
     def test_a_scatter_of_mics_is_not_collinear(self):
         assert not CN.array_axis([(0, 0, 0), (0.1, 0, 0), (0.05, 0.04, 0)])[2]
+
+
+class TestNullControl:
+    """⚠️A pass rate without a null is not a result. These pin the control down."""
+
+    def test_a_decoy_obeys_every_bound_and_is_still_not_a_plane_wave(self):
+        rng = np.random.default_rng(1)
+        c = CN.sound_speed(23.0)
+        taus = CN.decoy_taus(KINECT, c, rng)
+        # by construction it cannot be rejected by the physical bound -- that is the point
+        for (i, j), t in taus.items():
+            assert CN.physically_possible(t, CN.spacing(KINECT, i, j), c)
+        # and with probability 1 no arrival-time vector explains it
+        assert CN.closure_residual(taus, KINECT) > TOL_KINECT
+
+    def test_the_gate_rejects_almost_every_decoy(self):
+        c = CN.sound_speed(23.0)
+        r = CN.null_pass_rate(KINECT, tol_s=TOL_KINECT, c=c, trials=1000)
+        assert r["pass_rate"] < 0.02, "gate accepts decoys at %.3f" % r["pass_rate"]
+        # the tolerance has to be far below the typical decoy, or the test is vacuous
+        assert r["median_closure_us"] > 4 * r["tol_us"]
+
+    def test_the_measured_kinect_rate_beats_the_null_by_an_order_of_magnitude(self):
+        c = CN.sound_speed(23.0)
+        d = CN.discrimination(17 / 205, KINECT, tol_s=TOL_KINECT, c=c, trials=1000)
+        assert d["ratio"] > 5.0, "gate selects little: ratio %.1f" % d["ratio"]
+
+    def test_a_tolerance_wide_enough_to_admit_anything_shows_up_in_the_null(self):
+        """The null is what would have caught a tolerance set too loose to mean anything."""
+        c = CN.sound_speed(23.0)
+        r = CN.null_pass_rate(KINECT, tol_s=1.0, c=c, trials=200)
+        assert r["pass_rate"] == 1.0
+
+    def test_the_null_is_reproducible_from_its_seed(self):
+        c = CN.sound_speed(23.0)
+        a = CN.null_pass_rate(KINECT, tol_s=TOL_KINECT, c=c, trials=300, seed=7)
+        b = CN.null_pass_rate(KINECT, tol_s=TOL_KINECT, c=c, trials=300, seed=7)
+        assert a == b

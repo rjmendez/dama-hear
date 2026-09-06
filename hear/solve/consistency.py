@@ -25,6 +25,19 @@ per-pair bands already clamped to each pair's spatial Nyquist:
     the full verdict -- closure AND the bound       17 / 205   8.3%
     the full verdict with the band NOT clamped      0 / 205   0.0%
 
+⚠️AND THE CONTROL, which the gate did not have when those numbers were published. A pass rate on
+real data means nothing without the rate on delays that CANNOT be a plane wave. Measured here
+(`null_pass_rate`, 4000 decoys per geometry, seed 20260905, each pair drawn independently and
+uniformly over its own |tau| <= d/c so the bound and Nyquist checks are disarmed by construction
+and additivity is tested alone):
+
+    Kinect bar, tol 31.25 us (half a sample at 16 kHz)   0.50%   median decoy closure 171 us
+    ESP intra-board 4x38.1 mm, tol 10.42 us (48 kHz)     0.075%  median decoy closure 117 us
+
+So the Kinect gate passes 8.3% of real impulses against 0.5% of decoys -- a ratio of 16.6. The
+survivors are not survivors of chance. Note the median decoy is 5.5x the tolerance: this geometry
+has room to spare, and a tolerance twice as loose would still be a real test.
+
 The spread across the first three lines is why this module gates on `closure_residual` and not on
 a maximum over triangles: a loop residual is a sum of up to three pair errors, so the same data
 scores 2-3x worse as a loop than as a pair, and WHICH loops you pick changes the answer. A
@@ -485,3 +498,69 @@ def check_array(taus: Dict[Pair, float], mic_positions, *,
         plane_wave_residual_s=pw_res, plane_wave_tol_s=plane_wave_tol_s,
         axis_cos=axis_cos, axis_cos_spread=spread, cone_angle_deg=cone, note=note,
     )
+
+
+# ── the control the gate did not have ────────────────────────────────────────────────────────
+#
+# ⚠️A PASS RATE ON REAL DATA IS NOT A RESULT ON ITS OWN. The verdict passes 8.3% of 205 Kinect
+# impulses. That number means nothing until you know what it passes on delays that CANNOT be a
+# plane wave: if a random set inside the physical bound also passes at ~8%, the gate has selected
+# nothing and the survivors are survivors of chance. This is the control, and it is code rather
+# than a paragraph so it can be re-run when the tolerance or the geometry changes.
+#
+# The decoy is drawn per PAIR, independently and uniformly over its own bound |tau| <= d/c. That
+# is deliberately the HARDEST null available: it cannot be rejected by the plane-wave bound (it
+# obeys it by construction) or by the Nyquist check (a decoy carries no band), so the pass rate
+# it produces is additivity's discriminating power alone, with every other check disarmed. A
+# looser null -- delays drawn over some wider window -- would flatter the gate.
+
+def decoy_taus(mic_positions, c: float, rng=None) -> Dict[Pair, float]:
+    """One set of pairwise delays that obeys every bound and is not a plane wave.
+
+    Independent per pair, so with probability 1 no arrival-time vector explains them -- which is
+    exactly what additivity is supposed to detect.
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    P = _positions(mic_positions)
+    n = P.shape[0]
+    out: Dict[Pair, float] = {}
+    for i, j in itertools.combinations(range(n), 2):
+        lim = spacing(P, i, j) / float(c)
+        out[(i, j)] = float(rng.uniform(-lim, lim))
+    return out
+
+
+def null_pass_rate(mic_positions, *, tol_s: float, c: float, trials: int = 2000,
+                   seed: int = 20260905, **check_kw) -> Dict[str, float]:
+    """Fraction of decoy delay sets the gate accepts. The false-alarm rate of the gate itself.
+
+    Returns the rate, the trial count, and the median worst-pair closure residual over the
+    decoys -- the last one says HOW far from consistent a decoy typically is, which is what
+    tells you whether the tolerance is anywhere near the right size for this geometry.
+    """
+    rng = np.random.default_rng(seed)
+    P = _positions(mic_positions)
+    passed = 0
+    residuals: List[float] = []
+    for _ in range(int(trials)):
+        taus = decoy_taus(P, c, rng)
+        residuals.append(closure_residual(taus, P))
+        v = check_array(taus, P, c=c, tol_s=tol_s, **check_kw)
+        if v.valid:
+            passed += 1
+    return {"trials": float(trials), "pass_rate": passed / float(trials),
+            "median_closure_us": float(np.median(residuals) * 1e6),
+            "tol_us": float(tol_s * 1e6)}
+
+
+def discrimination(real_pass_rate: float, mic_positions, *, tol_s: float, c: float,
+                   trials: int = 2000, seed: int = 20260905, **check_kw) -> Dict[str, float]:
+    """Put a measured pass rate next to the null. Ratio near 1 means the gate selected nothing.
+
+    Stated as a ratio and not as a verdict: what counts as enough separation depends on how many
+    events you can afford to lose, and that is the operator's call, not this module's.
+    """
+    null = null_pass_rate(mic_positions, tol_s=tol_s, c=c, trials=trials, seed=seed, **check_kw)
+    r = null["pass_rate"]
+    return {**null, "real_pass_rate": float(real_pass_rate),
+            "ratio": float("inf") if r == 0.0 else float(real_pass_rate) / r}
