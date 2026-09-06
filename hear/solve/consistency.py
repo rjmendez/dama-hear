@@ -38,6 +38,20 @@ So the Kinect gate passes 8.3% of real impulses against 0.5% of decoys -- a rati
 survivors are not survivors of chance. Note the median decoy is 5.5x the tolerance: this geometry
 has room to spare, and a tolerance twice as loose would still be a real test.
 
+⚠️THAT IS THE EASY NULL, AND THE OPERATIONAL ONE IS 17x WORSE. A uniform draw has no acoustic
+structure. The null that matters is MISASSOCIATION: three real impulses that are real, and are not
+the same event. Measured on the 2026-09-05 phone set by building 504 mismatched triplets -- each
+node's window from a different burst, so every pass is false by construction -- **43/504 = 8.5%
+pass the full gate**, against 45% for real bursts. The gate still discriminates 5:1, but "the gate
+passed" is not "this is true", and 8.5% is the number to plan around, not 0.5%. (Those 504 come
+from 9 bursts and are not independent; read it as an order of magnitude.) `null_from_events`
+reproduces this control from delays alone -- see its docstring for what that costs.
+
+⚠️AND A COHERENT LIE PASSES EITHER NULL. 26 phone events once showed |tau| <= 0.2 ms on every pair
+with closure residual 0.00 ms and the gate said VALID -- whole-spectrum PHAT promoting out-of-band
+filter ringing, common-mode across nodes, to a tall peak at lag zero. All-zero delays are perfectly
+additive. No consistency check can see that; only the band restriction can.
+
 The spread across the first three lines is why this module gates on `closure_residual` and not on
 a maximum over triangles: a loop residual is a sum of up to three pair errors, so the same data
 scores 2-3x worse as a loop than as a pair, and WHICH loops you pick changes the answer. A
@@ -551,6 +565,49 @@ def null_pass_rate(mic_positions, *, tol_s: float, c: float, trials: int = 2000,
     return {"trials": float(trials), "pass_rate": passed / float(trials),
             "median_closure_us": float(np.median(residuals) * 1e6),
             "tol_us": float(tol_s * 1e6)}
+
+
+def null_from_events(events: Sequence[Dict[Pair, float]], mic_positions, *, tol_s: float,
+                     c: float, trials: int = 2000, seed: int = 20260905,
+                     **check_kw) -> Dict[str, float]:
+    """The MISASSOCIATION null, built from real measured delays instead of a uniform draw.
+
+    Each trial takes every pair's delay from a DIFFERENT event, so the marginal distribution of
+    each pair is the empirical one -- real acoustic structure, real peak-pick errors -- while the
+    joint is false by construction. This is the control that produced 8.5% on the 2026-09-05 phone
+    set, 17x the uniform decoy rate, and it is the one to size an operation against.
+
+    ⚠️WHAT THIS COSTS versus doing it on signals. The field control mismatched WINDOWS and
+    re-correlated, so pairs sharing a node stayed coupled -- tau(0,1) and tau(0,2) both moved when
+    node 0's window changed. Drawing per pair independently breaks that coupling, which makes an
+    inconsistent set slightly EASIER to build and so tends to UNDERSTATE the pass rate. Prefer the
+    signal-level control when you have the audio; use this when all you kept was the delays.
+
+    Needs at least as many events as pairs, or a trial cannot draw them all from different events.
+    """
+    P = _positions(mic_positions)
+    n = P.shape[0]
+    pairs = list(itertools.combinations(range(n), 2))
+    ev = [e for e in events if all(_has_pair(e, p) for p in pairs)]
+    if len(ev) < len(pairs):
+        raise ValueError("need >= %d events carrying every pair; got %d"
+                         % (len(pairs), len(ev)))
+    rng = np.random.default_rng(seed)
+    passed = 0
+    residuals: List[float] = []
+    for _ in range(int(trials)):
+        pick = rng.choice(len(ev), size=len(pairs), replace=False)
+        taus = {p: _tau(ev[k], p[0], p[1]) for p, k in zip(pairs, pick)}
+        residuals.append(closure_residual(taus, P))
+        if check_array(taus, P, c=c, tol_s=tol_s, **check_kw).valid:
+            passed += 1
+    return {"trials": float(trials), "pass_rate": passed / float(trials),
+            "median_closure_us": float(np.median(residuals) * 1e6),
+            "tol_us": float(tol_s * 1e6), "events": float(len(ev))}
+
+
+def _has_pair(taus: Dict[Pair, float], pair: Pair) -> bool:
+    return pair in taus or (pair[1], pair[0]) in taus
 
 
 def discrimination(real_pass_rate: float, mic_positions, *, tol_s: float, c: float,
