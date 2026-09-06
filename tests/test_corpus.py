@@ -177,3 +177,70 @@ class TestSummaryAndReader:
         assert len(skips) == 2
         assert any("ring_not_ready" in s for s in skips)
         assert any("bad json" in s for s in skips)
+
+
+class TestCrossRateAlignment:
+    """⚠️Band k is only the same frequency at two rates under the FIXED layout. These pin that."""
+
+    @staticmethod
+    def _rec(fs, seed=0, layout=SK.LAYOUT_FIXED, node="n"):
+        q, ref = SK.sketch(np.random.default_rng(seed).normal(0, 1000, 4096), fs, layout=layout)
+        return C.from_node(SK.pack(1, ref, 5, q, fs=fs, layout=layout), node)
+
+    def test_the_two_layouts_are_the_same_bytes_at_48k(self):
+        """The whole fleet's phones are above LAYOUT_EQUIVALENT_ABOVE_HZ, so turning the fixed
+        layout on changes not one byte they send. It changes everything a 16 kHz node sends."""
+        x = np.random.default_rng(4).normal(0, 1000, 4096)
+        a, ra = SK.sketch(x, 48000.0, layout=SK.LAYOUT_NYQUIST)
+        b, rb = SK.sketch(x, 48000.0, layout=SK.LAYOUT_FIXED)
+        assert np.array_equal(a, b) and ra == rb
+        c, _ = SK.sketch(x, 16000.0, layout=SK.LAYOUT_NYQUIST)
+        d, _ = SK.sketch(x, 16000.0, layout=SK.LAYOUT_FIXED)
+        assert not np.array_equal(c, d), "16 kHz must differ, or the fix does nothing"
+
+    def test_band_centres_agree_across_rates_under_the_fixed_layout(self):
+        e48 = SK.band_edges_hz(48000.0, layout=SK.LAYOUT_FIXED)
+        e16 = SK.band_edges_hz(16000.0, layout=SK.LAYOUT_FIXED)
+        assert np.allclose(e48, e16)
+        # and disagree under the shipped one, which is the defect
+        assert not np.allclose(SK.band_edges_hz(48000.0), SK.band_edges_hz(16000.0))
+
+    def test_a_slow_node_leaves_its_top_bands_empty(self):
+        q, _ = SK.sketch(np.random.default_rng(2).normal(0, 1000, 4096), 16000.0,
+                         layout=SK.LAYOUT_FIXED)
+        k = SK.valid_bands(16000.0)
+        assert k == 15
+        assert (q[k:] == q.min()).all(), "bands above Nyquist must sit at the floor"
+
+    def test_the_matrix_is_as_wide_as_the_narrowest_sensor(self):
+        recs = [self._rec(48000.0, 0), self._rec(48000.0, 1), self._rec(16000.0, 2)]
+        X, kept, info = C.aligned_matrix(recs)
+        assert X.shape == (3, 15 * SK.FRAMES)
+        assert info["bands"] == 15 and info["rates_hz"] == [16000.0, 48000.0]
+        assert info["dropped_bands"] == 5
+
+    def test_all_fast_sensors_keep_every_band(self):
+        X, _, info = C.aligned_matrix([self._rec(48000.0, i) for i in range(3)])
+        assert info["bands"] == SK.MEL_BANDS and X.shape[1] == SK.MEL_BANDS * SK.FRAMES
+
+    def test_it_refuses_a_rescaled_record_rather_than_aligning_fiction(self):
+        recs = [self._rec(48000.0, 0), self._rec(16000.0, 1, layout=SK.LAYOUT_NYQUIST)]
+        with pytest.raises(ValueError, match="nyquist"):
+            C.aligned_matrix(recs)
+
+    def test_an_unstated_rate_is_dropped_because_its_empty_bands_are_unknown(self):
+        q, ref = SK.sketch(np.zeros(4096), 16000.0, layout=SK.LAYOUT_FIXED)
+        nofs = C.from_node(SK.pack(1, ref, 0, q, layout=SK.LAYOUT_FIXED), "nofs")
+        X, kept, _ = C.aligned_matrix([self._rec(48000.0, 0), nofs])
+        assert len(kept) == 1
+
+    def test_strict_drops_the_partially_covered_top_band(self):
+        assert SK.valid_bands(16000.0, strict=True) < SK.valid_bands(16000.0, strict=False)
+        recs = [self._rec(48000.0, 0), self._rec(16000.0, 1)]
+        loose = C.aligned_matrix(recs)[2]["bands"]
+        tight = C.aligned_matrix(recs, strict=True)[2]["bands"]
+        assert tight < loose
+
+    def test_empty_input_is_empty_not_an_error(self):
+        X, kept, info = C.aligned_matrix([])
+        assert X.shape == (0, 0) and kept == [] and info["bands"] == 0

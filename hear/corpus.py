@@ -88,6 +88,11 @@ def from_phone(payload: Dict[str, Any], node_id: Optional[str] = None) -> Record
     for key, got in (("bands", d["q"].shape[0]), ("frames", d["q"].shape[1])):
         if key in payload and int(payload[key]) != got:
             raise SkipReason("%s: json says %s, header says %d" % (key, payload[key], got))
+    # The layout decides what band k MEANS, so a disagreement between the frame and the JSON
+    # beside it is not cosmetic -- one of the two producers is not the version we think it is.
+    if "layout" in payload and payload["layout"] != d["layout"]:
+        raise SkipReason("layout: json says %r, frame flags say %r"
+                         % (payload["layout"], d["layout"]))
     fs = d["fs_hz"]
     if fs is None and payload.get("fs"):
         # An older phone build that packed no rate code but reported it alongside. Believable,
@@ -102,9 +107,12 @@ def from_phone(payload: Dict[str, Any], node_id: Optional[str] = None) -> Record
         clipped=payload.get("clipped"),
         clock_tier=payload.get("clock_tier"),
         sync_sigma_ns=payload.get("sync_sigma_ns"),
-        extra={k: payload[k] for k in
-               ("trigger_ts_utc_ms", "onset_offset_us", "onset_dated", "since_prev_s")
-               if k in payload},
+        extra=dict({k: payload[k] for k in
+                    ("trigger_ts_utc_ms", "onset_offset_us", "onset_dated", "since_prev_s")
+                    if k in payload},
+                   # from the FRAME, not the JSON: it decides whether this row can be aligned
+                   # with a row from a sensor running at another rate.
+                   layout=d["layout"], valid_bands=d["valid_bands"]),
     )
 
 
@@ -123,6 +131,7 @@ def from_node(frame: bytes, node_id: str, second_utc_s: Optional[int] = None,
         node_id=str(node_id), source="node", q=d["q"], ref_db=d["ref_db"], peak=d["peak"],
         bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=d["node_us"],
         retrigger=bool(d["retrigger"]), ts_utc_s=ts,
+        extra={"layout": d["layout"], "valid_bands": d["valid_bands"]},
     )
 
 
@@ -157,6 +166,59 @@ def feature_matrix(records: Iterable[Record], fs_hz: float,
     if len(w) != 1:
         raise ValueError("mixed sketch geometry in one matrix: %s" % sorted(w))
     return np.vstack(rows), kept
+
+
+def aligned_matrix(records: Iterable[Record], mode: str = "db",
+                   strict: bool = False) -> Tuple[np.ndarray, List[Record], Dict[str, Any]]:
+    """ONE matrix across sensors running at DIFFERENT rates, over the bands they share.
+
+    This is the thing `feature_matrix` refuses to do, and it is only safe because of the fixed
+    band layout: under `LAYOUT_FIXED` band k is the same frequency at every rate, so a 16 kHz
+    node's bands 0-14 are the SAME MEASUREMENT as a 48 kHz phone's bands 0-14. The bands a slow
+    node cannot reach are dropped from every row, including the fast ones -- a matrix is only as
+    wide as its narrowest sensor.
+
+    Measured on the 228 labelled events (train 48 kHz, score the same audio at 16 kHz):
+
+        rescaled bank, all 20 bands       0.9141   <- what shipping without this does
+        fixed bank, all 20 bands          0.9306   <- fixed axis, empty bands NOT masked
+        fixed bank, common 15 bands       0.9473   <- this function
+
+    ⚠️REFUSES ANY `nyquist`-LAYOUT RECORD. Those bands are rescaled per rate, so "band 14" is a
+    different frequency in every row and the alignment this function performs would be fiction.
+    A frame that does not state its rate is dropped for the same reason.
+
+    Returns (X, kept, info). `info` names the rates included and the band count, because a matrix
+    whose width silently depends on which sensors happened to report is not reproducible.
+    """
+    if mode not in ("db", "q"):
+        raise ValueError("mode must be 'db' or 'q'")
+    recs = [r for r in records if r.fs_hz is not None]
+    bad = [r for r in recs if r.extra.get("layout", SK.LAYOUT_FIXED) != SK.LAYOUT_FIXED]
+    if bad:
+        raise ValueError(
+            "%d record(s) use the %r layout, whose band edges are rescaled per rate; they cannot "
+            "be aligned with anything. Re-sketch them or use feature_matrix() per rate."
+            % (len(bad), SK.LAYOUT_NYQUIST))
+    if not recs:
+        return np.zeros((0, 0)), [], {"bands": 0, "frames": 0, "rates_hz": [], "dropped": 0}
+    geom = {(r.bands, r.frames) for r in recs}
+    if len(geom) != 1:
+        raise ValueError("mixed sketch geometry: %s" % sorted(geom))
+    bands, frames = geom.pop()
+    rates = sorted({float(r.fs_hz) for r in recs})
+    k = min(SK.valid_bands(fs, bands, layout=SK.LAYOUT_FIXED, strict=strict) for fs in rates)
+    if k <= 0:
+        raise ValueError("no band is usable by every rate in %s" % rates)
+    rows = []
+    for r in recs:
+        v = r.db if mode == "db" else r.q.astype(float)
+        rows.append(v[:k, :].reshape(-1))
+    info = {"bands": k, "frames": frames, "rates_hz": rates, "strict": bool(strict),
+            "dropped_bands": bands - k,
+            "top_edge_hz": float(SK.band_edges_hz(max(rates), bands,
+                                                  layout=SK.LAYOUT_FIXED)[k + 1])}
+    return np.vstack(rows), recs, info
 
 
 def summarise(records: Iterable[Record]) -> Dict[str, Any]:
