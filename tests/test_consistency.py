@@ -283,3 +283,53 @@ class TestNullControl:
         a = CN.null_pass_rate(KINECT, tol_s=TOL_KINECT, c=c, trials=300, seed=7)
         b = CN.null_pass_rate(KINECT, tol_s=TOL_KINECT, c=c, trials=300, seed=7)
         assert a == b
+
+
+class TestMisassociationNull:
+    """The null that matters operationally: three impulses that are real and are not one event."""
+
+    @staticmethod
+    def _events(n=60, seed=0):
+        rng = np.random.default_rng(seed)
+        c = CN.sound_speed(23.0)
+        out = []
+        for _ in range(n):
+            th = rng.uniform(0.0, np.pi)
+            d = np.array([0.0, np.cos(th), np.sin(th)])
+            t = CN.plane_wave_taus(KINECT, d, c)
+            out.append({k: v + rng.normal(0.0, TOL_KINECT / 2) for k, v in t.items()})
+        return out
+
+    def test_real_events_pass_their_own_gate(self):
+        c = CN.sound_speed(23.0)
+        ev = self._events(40, seed=3)
+        passed = sum(CN.check_array(e, KINECT, c=c, tol_s=TOL_KINECT).valid for e in ev)
+        assert passed >= 35, "%d/40 real plane waves rejected" % (40 - passed)
+
+    def test_mismatching_the_pairs_across_events_is_caught(self):
+        c = CN.sound_speed(23.0)
+        r = CN.null_from_events(self._events(), KINECT, tol_s=TOL_KINECT, c=c, trials=500)
+        assert r["pass_rate"] < 0.05
+        assert r["events"] == 60.0
+
+    def test_it_is_a_harder_null_than_a_uniform_draw(self):
+        """Real delays carry real structure, so a mismatched set is closer to consistent than a
+        random one. Measured on the field's phone data the gap was 17x."""
+        c = CN.sound_speed(23.0)
+        mis = CN.null_from_events(self._events(), KINECT, tol_s=TOL_KINECT, c=c, trials=3000)
+        uni = CN.null_pass_rate(KINECT, tol_s=TOL_KINECT, c=c, trials=3000)
+        assert mis["pass_rate"] > uni["pass_rate"]
+
+    def test_it_refuses_when_there_are_too_few_events_to_mismatch(self):
+        """6 pairs on a 4-mic array cannot be drawn from fewer than 6 distinct events; silently
+        reusing one would put a real event's own pairs back together."""
+        c = CN.sound_speed(23.0)
+        with pytest.raises(ValueError):
+            CN.null_from_events(self._events(3), KINECT, tol_s=TOL_KINECT, c=c, trials=10)
+
+    def test_events_missing_a_pair_are_excluded_not_filled(self):
+        c = CN.sound_speed(23.0)
+        ev = self._events(20)
+        del ev[0][(0, 1)]
+        r = CN.null_from_events(ev, KINECT, tol_s=TOL_KINECT, c=c, trials=50)
+        assert r["events"] == 19.0
