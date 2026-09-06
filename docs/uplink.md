@@ -64,4 +64,7 @@ times from many nodes and spectra from only one.
 
 20 bands x 8 frames of 256-point real FFT is ~0.5 ms on a 64 MHz Cortex-M4F with CMSIS-DSP,
 computed once per detection rather than continuously. The nRF52840 in a fakeTec board can do
-this; it cannot do 192 kHz capture (I2S caps at 48 kHz, PDM at 16 kHz).
+this; it cannot do 192 kHz capture. Its I2S tops out near 50 kHz -- and cannot produce
+48000 Hz at all, since LRCK = MCK/RATIO over a fixed divider list. Use **50.000 kHz**
+(MCKFREQ 32MDIV10, RATIO 64X), which is exact. PDM is worse and capped at 16 kHz.
+See `docs/faketec-pin-budget.md`.

@@ -15,7 +15,9 @@ a line of fire and a miss distance. The shooter is somewhere back along that lin
 unknown**. Closing that needs one of:
 
 1. the muzzle blast and the crack–blast interval — which suppression denies you;
-2. N-wave duration → miss distance per node, needing >48 kHz sampling;
+2. N-wave duration → miss distance per node, needing far higher sampling AND a different
+   microphone -- the ICS-43434 low-passes above 24 kHz, so shape is out of reach on that
+   part at any rate. Changing the MCU alone does not buy this;
 3. bullet deceleration between nodes, fitted to the round's drag curve — no blast required,
    and the only one that works against a can.
 

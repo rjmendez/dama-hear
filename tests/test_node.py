@@ -14,7 +14,9 @@ from hear.node import telemetry as TL   # noqa: E402
 from hear.node.pipeline import Pipeline, summarise  # noqa: E402
 
 FS = 48000.0
-REAL = "/home/rjmendez/analysis_20260905/array/rear.wav"
+# Point this at your own single-channel WAV of known shots to run the recorded-audio test.
+# Unset, that test skips -- the field captures are not redistributable.
+REAL = os.environ.get("DAMA_HEAR_REAL_WAV", "")
 
 
 def _shot(n=48000, at=8000, amp=25000.0):
@@ -119,7 +121,8 @@ class TestPipeline:
         d = Pipeline(FS).run(x)
         assert any(SK.unpack(x_["frame"])["flags"] & 1 for x_ in d)
 
-    @pytest.mark.skipif(not os.path.exists(REAL), reason="recorded audio not present")
+    @pytest.mark.skipif(not REAL or not os.path.exists(REAL),
+                        reason="set DAMA_HEAR_REAL_WAV to a recorded capture to run this")
     def test_runs_on_real_recorded_audio(self):
         w = wave.open(REAL)
         a = np.frombuffer(w.readframes(min(w.getnframes(), int(FS * 20))), dtype="<i2").astype(float)

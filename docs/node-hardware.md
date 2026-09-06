@@ -38,7 +38,8 @@ Pressure doubles as an altitude cross-check for the 3D geometry.
   amplitude cue, and `ref_db` alone was worth AUC 0.90.
 - **50 Hz – 15 kHz**, low-passed above 24 kHz. No ultrasonic content, so N-wave *shape* is out of
   reach on this part at any sample rate.
-- **23–51.6 kHz I2S**, which is moot: the nRF52840 I2S caps at 48 kHz.
+- **23–51.6 kHz I2S**, which is nearly moot: the nRF52840 I2S cannot produce 48000 Hz at all
+  and its usable ceiling is 50.000 kHz. The two parts meet just above 50 kHz and no higher.
 
 ⚠️**Use an I2S mic, not PDM.** The nRF52840 PDM peripheral is hard-capped at 16 kHz with fixed
 ÷64/÷80 decimation. A PDM mic silently locks the node out of the band it needs.

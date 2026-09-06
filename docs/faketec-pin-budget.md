@@ -85,10 +85,10 @@ central side uses it, rather than either end assuming.
 
 No mic, no GPS, no BME280 — these still work:
 
-1. **Flash the `nrf52_promicro_diy_tcxo` variant** and confirm the radio enumerates. Wrong-variant
-   (`_xtal` vs `_tcxo`) is the standard fakeTec failure: it depends on whether the module is an
-   HT-RA62/E22 (TCXO) or an RA-01SH (crystal). Getting this right now costs nothing; getting it
-   wrong later looks like a bad antenna.
+1. **Flash the `nrf52_promicro_diy_tcxo` variant** and confirm the radio comes up. There is no
+   `_xtal` variant to get wrong any more -- it was removed, because `_tcxo` now defines
+   `TCXO_OPTIONAL` and tries DIO3 at 1.8 V and then XTAL at 0.0 V on every boot. Older guides
+   (including the fakeTec README) still link to `_xtal`; that link is dead.
 2. **Measure the airtime claim.** `docs/uplink.md` asserts 172 B is ~250 ms at SF7 and exceeds
    the 400 ms FCC dwell at SF9. Two boards and a 172 B payload on a private portnum settles it
    by measurement instead of a table.
@@ -99,3 +99,28 @@ No mic, no GPS, no BME280 — these still work:
    Pure host-side work, no hardware at all.
 
 Nothing here needs the sensors, and item 3 should happen before they are ordered.
+
+## Reading a radio that will not start
+
+The MCU can be perfectly healthy while the radio is absent. Meshtastic will still enumerate over
+USB and answer `--info`; what it cannot do is send. The tell is every outbound packet dying with
+`Routing.Error=4 NO_INTERFACE` and `air_util_tx` sitting at exactly `0.000000`.
+
+The boot log carries the real diagnosis, and the number matters:
+
+| `SX126x init result` | meaning |
+|---|---|
+| `-2` | `CHIP_NOT_FOUND` — nothing answering on SPI: wiring, or the module is unpowered |
+| `-707` | `SPI_CMD_FAILED` — the chip answered, then could not execute a command |
+
+`-707` is only reachable **after** RadioLib's `findChip()` has read the literal string `SX1262`
+back over SPI, so it *proves* SPI, RESET and the module's 3V3 rail are good. If you see it with
+both `Vref 1.800000V` and `Vref 0.0V`, the crystal-versus-TCXO question is already answered and
+the fault is the reference clock itself — a dead or absent TCXO, or one wanting a DIO3 voltage
+other than the 1.8 V the variant hardcodes. Do not go looking for cold joints on `CS/MOSI/MISO/SCK`;
+the chip just told you they work.
+
+⚠️Catching that line is awkward: the nRF52840 re-enumerates USB on reset, so a host attached
+after the fact misses the first seconds of boot. Watch the LED instead — Meshtastic blinks a
+`CriticalErrorCode`, and `3 NO_RADIO` / `10 SX1262_FAILURE` / `11 RADIO_SPI_BUG` separate the
+same cases.
