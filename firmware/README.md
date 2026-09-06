@@ -61,3 +61,36 @@ docs disagree (the wiki says GPIO3, the SD examples use 21), so it asks the hard
 picking one. Insert a card and it will report which CS the expansion actually uses.
 
 The camera is the 3 MP OV3660, not the OV2640 the older kits shipped.
+
+## Path test — live mic, bench PPS
+
+`firmware/path_test` runs the real chain on live audio from the Sense's onboard PDM mic, and
+exercises the timing path against a self-generated pulse. No GPS, no radio.
+
+**Wire a jumper from D0 (GPIO1) to D1 (GPIO2)** before running: D0 emits the bench pulse, D1
+captures it. The trick is taken from acoustic-triangulation's `twonode_selftest.cpp`, which is
+what makes a timing claim testable on a desk instead of in a field.
+
+Measured so far: 320000 samples in 20 s off the PDM mic (16000 Hz at block granularity), the gate
+firing on claps, and a real 172 B frame emitted per detection — the same `pack()` layout the
+Python produces.
+
+⚠️**A self-generated pulse cannot test clock discipline.** The pulse and `esp_timer` come off the
+same crystal, so the interval is that oscillator measured against itself. What it does test: that
+the capture path fires at all, its jitter, and the true I2S rate against the CPU clock — the
+48000-vs-47619 class of trap. Discipline needs the GPS.
+
+### On generating a 1 Hz pulse, which took five tries
+
+LEDC is the obvious peripheral and cannot do it. `freq = clk / (div * 2^res)`, the divider field
+is ~10 bits, and **the ESP32-S3 LEDC timer is 14 bits wide** — the 20-bit range belongs to the
+original ESP32. So low frequency needs high resolution and this part runs out of resolution first:
+the floor on the 80 MHz APB is 80e6/(1024·2^14) = **4.8 Hz**. Worse, a reachable 10 Hz/14-bit
+config returned attach-ok while driving nothing. A hardware timer ISR toggling the pad is less
+elegant and works; its jitter lands in the measured spread, so the spread is generator + capture
+rather than capture alone.
+
+Two smaller traps on the way: `digitalRead` on an LEDC-driven pad returns nothing useful because
+the input buffer is off, which made a working generator look dead — `GPIO_MODE_INPUT_OUTPUT` fixes
+it. And a generator self-check is worth the ten lines: without one, "no pulse" and "no jumper" are
+indistinguishable, and the first version blamed the wiring for a code fault.
