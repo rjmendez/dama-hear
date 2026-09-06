@@ -4,7 +4,8 @@ A microphone, a clock, and a radio. It detects, sketches and ships; it decides n
 
 ## Bill of materials
 
-You supply the MCU (fakeTec / nRF52840), LoRa, battery and solar.
+You supply the MCU, LoRa, battery and solar. The MCU is not settled; the sensor set below
+is independent of it.
 
 | item | each | ×3 |
 |---|---|---|
@@ -55,9 +56,8 @@ Both fit a 237 B Meshtastic payload with room to spare. Telemetry decodes to a d
 payload via `telemetry.to_dama()`, so a hear node is not a special case downstream — it is another
 fleet node with a thinner sensor set and `node_type: "hear"`.
 
-## Which pins are left
+## Pin cost
 
-On the fakeTec carrier the sensor set costs exactly the four GPIO the board has spare, and three
-of them are mid-board pads on the ProMicro module rather than fakeTec headers. The nRF52840 I2S
-also cannot produce 48 kHz. Both are settled in `docs/faketec-pin-budget.md`, which should be read
-before the mic is ordered.
+The sensor set needs eight GPIO: three for I2S, one for PPS, two for I2C (shared with anything
+else on the bus), one UART pair for GNSS NMEA. Carriers that break out fewer than that decide the
+build — `docs/faketec-pin-budget.md` is one that did, worked through pad by pad.

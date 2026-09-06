@@ -37,32 +37,15 @@ Early. The supersonic module carries real field data and measured results (see
 `docs/findings-2026-09-05.md`); the bioacoustic module is a placeholder. Nothing here is
 deployed.
 
-What exists is the platform in Python: detection gate, log-mel sketch, telemetry packing,
-shockwave solver, and a trained classifier. All of it runs off recorded audio with no hardware
-attached, because the node firmware has to be provable before a wire is cut. **The node firmware
-does not exist yet.**
+What exists is the platform in Python — gate, sketch, telemetry, solver, classifier — driven
+from recorded audio. **The node firmware does not exist yet**, and the hardware it will run on is
+not settled: `docs/node-hardware.md` is the sensor bill of materials, `docs/faketec-pin-budget.md`
+is a closed route kept for why it closed.
 
-    pip install numpy pytest && python -m pytest tests -q
+    python -m pytest tests -q
 
-## Running it
-
-Everything is driven from recorded audio. `hear/node/pipeline.py` takes samples in and produces
-the exact bytes a node would transmit:
-
-```python
-from hear.node.pipeline import Pipeline, summarise
-dets = Pipeline(fs).run(samples)      # samples: one channel, int16-scaled float
-summarise(dets)                       # counts it can defend, not counts it invents
-```
-
-The field captures behind `docs/findings-2026-09-05.md` are not redistributable. To run the
-recorded-audio test against your own, set `DAMA_HEAR_REAL_WAV` to a single-channel WAV.
-
-## Building a node
-
-`docs/node-hardware.md` is the bill of materials. `docs/faketec-pin-budget.md` works out what a
-fakeTec/ProMicro carrier actually leaves free — the sensor set needs exactly the four GPIO the
-board has spare — and why the nRF52840 cannot sample at 48 kHz. Read both before ordering parts.
+The field captures are not redistributable. Point `DAMA_HEAR_REAL_WAV` at your own single-channel
+WAV to run the recorded-audio test.
 
 ## Licence
 

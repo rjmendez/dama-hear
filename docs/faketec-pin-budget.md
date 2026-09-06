@@ -1,10 +1,11 @@
 # fakeTec pin budget
 
-The node has to fit a microphone, a PPS input and a BME280 onto a board that was designed to be
-a Meshtastic tracker and nothing else. It fits, with **zero pins spare**, and three of the four
-pins it needs are not on a fakeTec header at all.
+> **Closed route.** The nodes are not being built on fakeTec. Kept because the pin budget is why:
+> the sensor set needs exactly the four GPIO the board has spare, three of them mid-board pads on
+> the ProMicro module. That is a carrier limit, and it is what sent the build elsewhere.
 
-Read this before buying the mic. It decides the part and the build difficulty.
+The node has to fit a microphone, a PPS input and a BME280 onto a board designed to be a
+Meshtastic tracker and nothing else. It fits, with **zero pins spare**.
 
 ## What fakeTec actually routes
 
@@ -100,27 +101,12 @@ No mic, no GPS, no BME280 — these still work:
 
 Nothing here needs the sensors, and item 3 should happen before they are ordered.
 
-## Reading a radio that will not start
+## If the radio never starts
 
-The MCU can be perfectly healthy while the radio is absent. Meshtastic will still enumerate over
-USB and answer `--info`; what it cannot do is send. The tell is every outbound packet dying with
-`Routing.Error=4 NO_INTERFACE` and `air_util_tx` sitting at exactly `0.000000`.
-
-The boot log carries the real diagnosis, and the number matters:
-
-| `SX126x init result` | meaning |
-|---|---|
-| `-2` | `CHIP_NOT_FOUND` — nothing answering on SPI: wiring, or the module is unpowered |
-| `-707` | `SPI_CMD_FAILED` — the chip answered, then could not execute a command |
-
-`-707` is only reachable **after** RadioLib's `findChip()` has read the literal string `SX1262`
-back over SPI, so it *proves* SPI, RESET and the module's 3V3 rail are good. If you see it with
-both `Vref 1.800000V` and `Vref 0.0V`, the crystal-versus-TCXO question is already answered and
-the fault is the reference clock itself — a dead or absent TCXO, or one wanting a DIO3 voltage
-other than the 1.8 V the variant hardcodes. Do not go looking for cold joints on `CS/MOSI/MISO/SCK`;
-the chip just told you they work.
-
-⚠️Catching that line is awkward: the nRF52840 re-enumerates USB on reset, so a host attached
-after the fact misses the first seconds of boot. Watch the LED instead — Meshtastic blinks a
-`CriticalErrorCode`, and `3 NO_RADIO` / `10 SX1262_FAILURE` / `11 RADIO_SPI_BUG` separate the
-same cases.
+Meshtastic will still enumerate over USB and answer `--info` with no radio at all; the tell is
+every outbound packet dying `Routing.Error=4 NO_INTERFACE` with `air_util_tx` at `0.000000`.
+The boot log's `SX126x init result` is the diagnosis: **-2** is `CHIP_NOT_FOUND`, nothing
+answering on SPI. **-707** is `SPI_CMD_FAILED`, and is only reachable after RadioLib has read the
+string `SX1262` back over the bus — so it proves SPI, RESET and the module's rail are good, and
+the fault is the reference clock. Seeing -707 at both `Vref 1.8V` and `Vref 0.0V` rules out the
+TCXO-versus-crystal question too. This applies to any SX1262 build, not just this one.
