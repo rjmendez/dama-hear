@@ -231,6 +231,26 @@ def second_arrival(x, fs: float, t_crack_s: float, band=(100.0, 1000.0), frame_s
                 frame_s=frame_s)
 
 
+# Measured null of `rise_db` on shot-free audio; see rise_reference.__doc__ for provenance.
+# A threshold is read off this, never guessed.
+NULL_PERCENTILES = {50: 11.3, 90: 16.4, 95: 18.0, 99: 20.6, 99.9: 25.7}
+NULL_FALSE_ALARM = {12: 0.41, 16: 0.11, 18: 0.048, 20: 0.019, 22: 0.008}
+
+
+def suggested_threshold_db(max_false_alarm: float = 0.01) -> float:
+    """Smallest documented threshold whose measured false-alarm rate is <= `max_false_alarm`.
+
+    Refuses rather than extrapolating past the measured curve: a threshold nobody measured is
+    exactly the mistake the old p99~12 figure was.
+    """
+    ok = [t for t, fa in sorted(NULL_FALSE_ALARM.items()) if fa <= max_false_alarm]
+    if not ok:
+        raise ValueError("no measured threshold reaches FA <= %.3f; tightest measured is %.3f at %d dB"
+                         % (max_false_alarm, min(NULL_FALSE_ALARM.values()),
+                            max(NULL_FALSE_ALARM, key=lambda k: -NULL_FALSE_ALARM[k])))
+    return float(min(ok))
+
+
 def rise_reference(x, fs: float, anchors_s: Iterable[float], **kw) -> np.ndarray:
     """The `rise_db` of `second_arrival` evaluated at SHOT-FREE anchor times in the same recording.
 
@@ -239,11 +259,27 @@ def rise_reference(x, fs: float, anchors_s: Iterable[float], **kw) -> np.ndarray
     ~10 dB above its own trough.  This is the false-alarm curve, and the operating threshold is
     read off it rather than guessed.
 
-    MEASURED 2026-09-05 on the robot's own quiet audio (~3000 anchors per capture):
-        p50 ~ 5 dB, p90 ~ 8 dB, p99 ~ 12 dB, p99.9 ~ 17-31 dB.
-    The surveyed string's second arrival rose 20-26 dB -- far clear.  The full-auto burst's rose
-    only 6-15 dB per trace, i.e. NOT clear on any single trace; what carries that detection is
-    repeatability over 7 rounds x 6 mics and the cross-mic bound, not single-trace SNR.
+    ⚠️THE CURVE BELOW REPLACES A WRONG ONE. This docstring previously quoted p50~5 / p90~8 /
+    p99~12 dB, which was measured against the PRE-EVENT FLOOR while `rise_db` is referred to the
+    REVERBERATION TROUGH -- a different, always-smaller denominator. Anyone thresholding at the
+    old 12 dB was running at ~41% false alarms, not 1%.
+
+    MEASURED, and reproduced on two independent instruments:
+        robot ESP array, 48 kHz : p50 11.47, p90 16.65, p99 19.79 dB
+        phone clips,     48 kHz : p50 11.19, p90 16.21, p99 21.31 dB  (1660 anchors, 140 clips)
+    Agreement across different mics, hosts and sample paths says this is a property of the
+    STATISTIC, not of one dataset. `NULL_PERCENTILES` carries it in code, and a test asserts the
+    documented numbers are the ones this function actually produces -- the drift that made the old
+    curve wrong was invisible precisely because nothing checked it.
+
+    Operating points off the measured curve:
+        12 dB -> ~41% false alarm     18 dB -> ~4.8%
+        16 dB -> ~11%                 20 dB -> ~1.9%      22 dB -> ~0.8%
+
+    So the surveyed string's 20-26 dB is roughly p99, NOT "far clear", and the full-auto burst's
+    6-15 dB is below the median of noise. What carries both detections is LAG CONCENTRATION --
+    every real trace lands in a narrow interval where the null is spread over the whole search
+    window -- plus the cross-mic bound. Never single-trace rise_db.
     """
     out = []
     for a in anchors_s:
