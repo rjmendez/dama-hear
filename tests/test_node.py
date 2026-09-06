@@ -131,3 +131,50 @@ class TestPipeline:
         # events so it is denser, but the flag must be doing real work
         assert 0 < s["retriggers"] < s["detections"]
         assert s["bytes_if_all_sent"] == s["detections"] * SK.wire_size()
+
+
+class TestRearm:
+    """A fixed guard cannot tell a decay tail from a new round. Measured over 123.7 min of
+    capture: one shot became 4-5 'rounds' spaced at exactly the 25 ms guard."""
+
+    @staticmethod
+    def _shot_with_tail(tail_s, n=96000, at=8000, amp=25000.0):
+        x = np.random.RandomState(1).normal(0, 40, n)
+        x[at:at + 20] += amp * np.hanning(20)
+        L = int(tail_s * FS)
+        x[at + 20:at + 20 + L] += (amp * 0.35 * np.exp(-np.arange(L) / (0.03 * FS)) *
+                                   np.random.RandomState(2).normal(0, 1, L))
+        return x
+
+    @pytest.mark.parametrize("tail", [0.05, 0.15, 0.30])
+    def test_one_shot_with_a_long_tail_is_one_detection(self, tail):
+        d = DT.Gate(FS).process(self._shot_with_tail(tail), 0)
+        assert len(d) == 1, "%.0f ms tail produced %d detections" % (tail * 1000, len(d))
+
+    def test_two_separate_rounds_are_still_two(self):
+        a = self._shot_with_tail(0.10)
+        b = self._shot_with_tail(0.10, at=8000 + int(0.2 * FS))
+        both = a + b - np.random.RandomState(1).normal(0, 40, len(a))
+        d = DT.Gate(FS).process(both, 0)
+        assert len(d) == 2
+        assert abs((d[1]["t_s"] - d[0]["t_s"]) - 0.2) < 0.02
+
+    def test_full_auto_at_85ms_is_not_collapsed(self):
+        # ~700 rpm measured in the field. The re-arm must not swallow a real burst.
+        x = np.random.RandomState(3).normal(0, 40, 96000)
+        for k in range(5):
+            at = 8000 + int(k * 0.085 * FS)
+            x[at:at + 20] += 25000 * np.hanning(20)
+            L = int(0.03 * FS)
+            x[at + 20:at + 20 + L] += 8000 * np.exp(-np.arange(L) / (0.01 * FS))
+        d = DT.Gate(FS).process(x, 0)
+        assert len(d) == 5, "700 rpm burst gave %d of 5" % len(d)
+
+    def test_rearm_state_survives_a_block_boundary(self):
+        # the guard was enforced within a block but the decay crosses block edges
+        x = self._shot_with_tail(0.30)
+        g = DT.Gate(FS)
+        out = []
+        for s in range(0, len(x), 4096):
+            out += g.process(x[s:s + 4096], s)
+        assert len(out) == 1, "block-split decay produced %d detections" % len(out)

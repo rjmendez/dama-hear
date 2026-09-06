@@ -20,6 +20,7 @@ import numpy as np
 
 RETRIGGER_S = 0.060          # inside one muzzle blast's decay (median 12.7 ms, p90 119 ms)
 GUARD_S = 0.025
+REARM_FRAC = 0.35            # envelope must fall to this fraction of threshold before re-firing
 
 
 def envelope(x: np.ndarray, fs: float, ms: float = 1.0) -> np.ndarray:
@@ -41,15 +42,21 @@ class Gate:
     """
 
     def __init__(self, fs: float, ratio: float = 8.0, floor: float = 800.0,
-                 guard_s: float = GUARD_S, ambient_tau_s: float = 10.0):
+                 guard_s: float = GUARD_S, ambient_tau_s: float = 10.0,
+                 rearm_frac: float = REARM_FRAC):
         self.fs = float(fs)
         self.ratio = float(ratio)
         self.floor = float(floor)
         self.guard = max(1, int(guard_s * fs))
+        self.rearm_frac = float(rearm_frac)
         self.alpha = 1.0 / max(1.0, ambient_tau_s * fs / max(1, int(0.001 * fs)))
         self.ambient = 0.0
         self.n_seen = 0
         self.last_idx: Optional[int] = None
+        # Schmitt state. A fixed guard alone re-fires every guard interval for as long as the
+        # envelope stays high, so one shot with a 100 ms tail became 4-5 "rounds" spaced at
+        # exactly 25 ms. Measured over 123.7 min of capture before this was added.
+        self.armed = True
 
     def threshold(self) -> float:
         return max(self.ambient * self.ratio, self.floor)
@@ -60,8 +67,16 @@ class Gate:
         out: List[Dict] = []
         i = 0
         while i < len(e):
+            thr = self.threshold()
+            if not self.armed:
+                # re-arm only once the envelope has actually fallen back down; a guard that
+                # expires on time alone cannot tell a decay tail from a new round
+                if e[i] < thr * self.rearm_frac:
+                    self.armed = True
+                i += 1
+                continue
             # ambient tracks the quiet material only, so one loud event cannot raise the floor
-            if e[i] <= self.threshold():
+            if e[i] <= thr:
                 self.ambient = (1 - self.alpha) * self.ambient + self.alpha * e[i]
             else:
                 j = min(len(e), i + self.guard)
@@ -80,6 +95,7 @@ class Gate:
                     "retrigger": bool(since is not None and since < RETRIGGER_S),
                 })
                 self.last_idx = idx
+                self.armed = False
                 i = k + self.guard
                 continue
             i += 1
