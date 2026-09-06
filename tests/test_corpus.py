@@ -135,6 +135,33 @@ class TestSummaryAndReader:
         assert s["by_fs_hz"] == {"48000.0": 3, "16000.0": 2}
         assert s["by_source"] == {"node": 5}
 
+    def test_it_reads_the_corpus_workers_row_shape(self):
+        """dama-gotchi realtime/sketch_corpus_worker.py writes node_id at the TOP level, taken
+        from the topic -- the only place the broker guarantees it. A payload's own claim about
+        which node it is is checked last, because that is the one a misconfigured device gets
+        wrong."""
+        p, _, _ = _phone_payload()
+        row = {"node_id": "phone-a1", "topic": "dama/phone-a1/acoustic_sketch",
+               "recv_utc_ms": 1788700001000, "payload": p}
+        import tempfile, os
+        d = tempfile.mkdtemp()
+        f = os.path.join(d, "c.jsonl")
+        with open(f, "w") as fh:
+            fh.write(json.dumps(row) + "\n")
+        recs, skips = C.read_mqtt_jsonl(f)
+        assert not skips and recs[0].node_id == "phone-a1"
+
+    def test_the_topic_wins_over_a_payloads_own_claim(self):
+        p, _, _ = _phone_payload(node_id="not-me")
+        row = {"topic": "dama/phone-a1/acoustic_sketch", "payload": p}
+        import tempfile, os
+        d = tempfile.mkdtemp()
+        f = os.path.join(d, "c.jsonl")
+        with open(f, "w") as fh:
+            fh.write(json.dumps(row) + "\n")
+        recs, _ = C.read_mqtt_jsonl(f)
+        assert recs[0].node_id == "phone-a1"
+
     def test_reader_returns_its_skips_instead_of_swallowing_them(self, tmp_path):
         p, _, _ = _phone_payload()
         f = tmp_path / "cap.jsonl"

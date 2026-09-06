@@ -202,12 +202,18 @@ def read_mqtt_jsonl(path: str) -> Tuple[List[Record], List[str]]:
                 skips.append("line %d: bad json: %s" % (n, e))
                 continue
             payload = obj.get("payload", obj)
-            nid = None
-            topic = obj.get("topic")
-            if topic:
-                parts = str(topic).split("/")
-                if len(parts) >= 3:
-                    nid = parts[1]
+            # The node can be stated three ways and they are checked in order of how load-bearing
+            # they are: the corpus worker records it at the top level having taken it from the
+            # TOPIC (the only place the broker guarantees), a raw capture has the topic itself,
+            # and a bare payload may carry its own claim. A payload's self-report is last because
+            # it is the one a misconfigured device can get wrong.
+            nid = obj.get("node_id")
+            if not nid:
+                topic = obj.get("topic")
+                if topic:
+                    parts = str(topic).split("/")
+                    if len(parts) >= 3:
+                        nid = parts[1]
             try:
                 out.append(from_phone(payload, node_id=nid))
             except SkipReason as e:
