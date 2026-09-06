@@ -318,6 +318,14 @@ def interval_consistent(intervals_s: Dict[int, float], mic_positions, c: float =
     so their bound is 0.22 ms, below any onset noise this detector achieves, and every event
     "fails".  Measure sigma from same-board replicates -- their true intervals cannot differ by
     more than that same 0.22 ms, so their observed scatter IS the noise, with no ground truth.
+
+    ⚠️AND THE OPPOSITE TRAP, MEASURED. The bound scales with separation, so far apart it cannot
+    fail. On the three 2026-09-05 phones (10.132 / 13.012 / 20.005 m) it is 58.7 / 75.4 / 115.9 ms
+    against an onset scatter near 2 ms: every pair passed on every burst, including pairs whose
+    implied ranges differed by a factor of two (dt 41.2 ms vs 91.6 ms on one shot). A check that
+    cannot fail is not evidence the picks are right. For the bound to discriminate you need 2d/c
+    comparable to the scatter -- d <~ 0.35 m at 2 ms -- which is a CO-LOCATED pair, i.e. exactly
+    what a node array is and exactly what surveyed flags tens of metres apart are not.
     """
     if (tol_s is None) == (sigma_s is None):
         raise ValueError("pass exactly one of tol_s or sigma_s: a bound with no tolerance is "
