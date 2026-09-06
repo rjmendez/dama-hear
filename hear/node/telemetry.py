@@ -52,7 +52,7 @@ def spl_stats(x: np.ndarray, fs: float, full_scale_db: float = 120.0) -> Dict[st
 def pack(temp_c: Optional[float], pressure_hpa: Optional[float], humidity_pct: Optional[float],
          leq_dbfs: float, peak_dbfs: float, sats: int, batt_mv: int,
          pps_locked: bool, clipped_frac: float = 0.0) -> bytes:
-    """20 B. Missing sensor values are sent as a sentinel, never as zero.
+    """14 B. Missing sensor values are sent as a sentinel, never as zero.
 
     A zero temperature is -273 m/s of nothing and a plausible-looking 331.3 m/s of everything;
     a sentinel makes the central side say "no temperature" instead of quietly using the wrong c.
