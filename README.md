@@ -38,8 +38,9 @@ Early. The supersonic module carries real field data and measured results (see
 deployed.
 
 What exists is the platform in Python — gate, sketch, telemetry, solver, classifier — driven
-from recorded audio. **The node firmware does not exist yet**, and the hardware it will run on is
-not settled: `docs/node-hardware.md` is the sensor bill of materials, `docs/faketec-pin-budget.md`
+from recorded audio. The node firmware is a **proof of concept only** — `firmware/` runs the gate
+and sketch on a XIAO ESP32-S3 against vectors generated from `hear/`, with no microphone, GPS or
+radio attached. The hardware it will run on is not settled: `docs/node-hardware.md` is the sensor bill of materials, `docs/faketec-pin-budget.md`
 is a closed route kept for why it closed.
 
     python -m pytest tests -q
