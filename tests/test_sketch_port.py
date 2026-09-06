@@ -41,8 +41,8 @@ def _q(c):
 
 
 # ---- the Kotlin's exact arithmetic, transcribed ------------------------------------------
-def _kt_mel(fs, nfft=S.NFFT, bands=S.MEL_BANDS, f_lo=S.F_LO, f_hi=S.F_HI):
-    hi = min(f_hi, fs / 2.0 * 0.98)
+def _kt_mel(fs, nfft=S.NFFT, bands=S.MEL_BANDS, f_lo=S.F_LO, f_hi=S.F_HI, fixed=False):
+    hi = f_hi if fixed else min(f_hi, fs / 2.0 * 0.98)
     nb = nfft // 2 + 1
     h = lambda f: 2595.0 * math.log10(1.0 + f / 700.0)          # noqa: E731
     m = lambda v: 700.0 * (10.0 ** (v / 2595.0) - 1.0)          # noqa: E731
@@ -65,8 +65,8 @@ def _kt_mel(fs, nfft=S.NFFT, bands=S.MEL_BANDS, f_lo=S.F_LO, f_hi=S.F_HI):
     return out
 
 
-def _kt_sketch(x, fs):
-    fb = _kt_mel(fs)
+def _kt_sketch(x, fs, fixed=False):
+    fb = _kt_mel(fs, fixed=fixed)
     hop = max(1, int(S.HOP_S * fs))
     w = [0.5 - 0.5 * math.cos(2.0 * math.pi * i / (S.NFFT - 1)) for i in range(S.NFFT)]
     db = [0.0] * (S.MEL_BANDS * S.FRAMES)
@@ -98,18 +98,20 @@ class TestGoldenSelfConsistency:
         assert g["mel_bands"] == S.MEL_BANDS and g["frames"] == S.FRAMES
         assert g["wire_size"] == S.wire_size()
 
-    @pytest.mark.parametrize("i", range(6))
+    @pytest.mark.parametrize("i", range(9))
     def test_reference_reproduces_each_vector_from_its_own_pcm(self, i):
         c = _g()["cases"][i]
-        q, ref = S.sketch(_pcm(c), c["fs"])
+        q, ref = S.sketch(_pcm(c), c["fs"], layout=c.get("layout", S.LAYOUT_NYQUIST))
         assert np.array_equal(q, _q(c)), "%s: sketch not reproducible from stored PCM" % c["name"]
         assert abs(ref - c["ref_db"]) < 1e-12
 
     def test_stored_frame_matches_a_fresh_pack(self):
         for c in _g()["cases"]:
             x = _pcm(c)
-            q, ref = S.sketch(x, c["fs"])
-            frame = S.pack(123456, ref, int(min(np.abs(x).max(), 65535)), q, fs=c["fs"])
+            lay = c.get("layout", S.LAYOUT_NYQUIST)
+            q, ref = S.sketch(x, c["fs"], layout=lay)
+            frame = S.pack(123456, ref, int(min(np.abs(x).max(), 65535)), q,
+                           fs=c["fs"], layout=lay)
             assert frame == base64.b64decode(c["frame_b64"]), c["name"]
 
     def test_frame_states_its_own_sample_rate(self):
@@ -135,10 +137,11 @@ class TestGoldenSelfConsistency:
 class TestKotlinArithmetic:
     """The port uses a direct DFT and an explicit Hann; numpy must agree byte-for-byte."""
 
-    @pytest.mark.parametrize("i", range(6))
+    @pytest.mark.parametrize("i", range(9))
     def test_kotlin_logic_matches_numpy_exactly(self, i):
         c = _g()["cases"][i]
-        q, ref = _kt_sketch(list(_pcm(c)), c["fs"])
+        q, ref = _kt_sketch(list(_pcm(c)), c["fs"],
+                            fixed=c.get("layout") == S.LAYOUT_FIXED)
         assert np.array_equal(q, _q(c)), \
             "%s: %d of 160 bytes differ" % (c["name"], int((q != _q(c)).sum()))
         assert abs(ref - c["ref_db"]) < 1e-9

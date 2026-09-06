@@ -54,6 +54,61 @@ def score(feat: Dict[str, float], model: Dict[str, Any]) -> Optional[float]:
     return 1.0 / (1.0 + math.exp(-max(-60.0, min(60.0, z))))
 
 
+DEFAULT_SKETCH_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "model_sketch.json")
+#: For a fleet with anything slower than 32 kHz in it. 15 bands, AUC 0.9588 against 0.9634 --
+#: within noise, and it is the only one a 16 kHz node's frame can be scored with at all.
+FLEET_SKETCH_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "model_sketch_15.json")
+
+
+class SketchMismatch(Exception):
+    """The frame and the model do not describe the same measurement."""
+
+
+def score_sketch(frame, model: Dict[str, Any]) -> float:
+    """P(gunshot) from a wire frame. `frame` is `hear.sketch.unpack`'s dict, or the raw bytes.
+
+    ⚠️REFUSES RATHER THAN PADS. A 16 kHz node's top five bands are empty by construction, and
+    feeding those zeros to a 20-band model is not a degraded reading -- it is a spectrum claiming
+    the node measured silence above 9.4 kHz when it measured nothing at all. Scoring the same
+    audio that way costs 3.3 points of AUC (0.9141 against 0.9473). Use FLEET_SKETCH_MODEL.
+
+    ⚠️LAYOUT MUST MATCH. Under the legacy `nyquist` layout band k is a different frequency at
+    every rate, so a model's weight for band k means nothing on a frame from another rate.
+    """
+    if isinstance(frame, (bytes, bytearray)):
+        from hear import sketch as _sk
+        frame = _sk.unpack(bytes(frame))
+    q, ref = frame["q"], float(frame["ref_db"])
+    bands, frames = len(q), len(q[0])
+    want_b, want_f = int(model["bands"]), int(model["frames"])
+    if frames != want_f:
+        raise SketchMismatch("frame has %d time frames, model wants %d" % (frames, want_f))
+    if bands < want_b:
+        raise SketchMismatch("frame carries %d bands, model wants %d" % (bands, want_b))
+    if frame.get("layout") is not None and frame["layout"] != model.get("layout"):
+        raise SketchMismatch("frame layout %r, model trained on %r -- band k is not the same "
+                             "frequency in the two" % (frame["layout"], model.get("layout")))
+    valid = frame.get("valid_bands")
+    if valid is not None and valid < want_b:
+        raise SketchMismatch(
+            "only %d of this frame's bands carry a measurement (fs %s Hz) and the model wants "
+            "%d; the rest are empty by construction, not quiet. Score it with a model trained "
+            "on %d bands (FLEET_SKETCH_MODEL)." % (valid, frame.get("fs_hz"), want_b, valid))
+    w = model["w"]
+    if len(w) != want_b * want_f:
+        raise SketchMismatch("model has %d weights for a %dx%d sketch" % (len(w), want_b, want_f))
+    z = float(model["b"])
+    i = 0
+    for b in range(want_b):                       # band-major, matching model["order"]
+        row = q[b]
+        for t in range(want_f):
+            z += w[i] * (row[t] / 2.0 + ref)      # absolute dB; the reference is half the signal
+            i += 1
+    return 1.0 / (1.0 + math.exp(-max(-60.0, min(60.0, z))))
+
+
 def merge_rounds(events, window_s: float = 0.060):
     """Collapse per-board detections of ONE round into one round.
 

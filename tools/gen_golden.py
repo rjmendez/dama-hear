@@ -59,25 +59,35 @@ def _tone(fs: float, f: float, amp: float) -> np.ndarray:
 
 def sketch_cases():
     return [
-        ("impulse_48k", 48000.0, _q16(_impulse(48000.0, 12000.0, 20260905))),
-        ("tone_2k_48k", 48000.0, _q16(_tone(48000.0, 2000.0, 8000.0))),
-        ("noise_48k", 48000.0, _q16(np.random.default_rng(7).normal(0.0, 300.0, N))),
-        ("silence_48k", 48000.0, np.zeros(N, dtype=np.int16)),
+        ("impulse_48k", 48000.0, _q16(_impulse(48000.0, 12000.0, 20260905)), SK.LAYOUT_NYQUIST),
+        ("tone_2k_48k", 48000.0, _q16(_tone(48000.0, 2000.0, 8000.0)), SK.LAYOUT_NYQUIST),
+        ("noise_48k", 48000.0, _q16(np.random.default_rng(7).normal(0.0, 300.0, N)),
+         SK.LAYOUT_NYQUIST),
+        ("silence_48k", 48000.0, np.zeros(N, dtype=np.int16), SK.LAYOUT_NYQUIST),
         # Deliberately over-driven: the sketch of a clipped report is a sketch of the clipping,
         # and both sides have to agree on that spectrum too.
-        ("clipped_48k", 48000.0, _q16(_impulse(48000.0, 90000.0, 20260905))),
+        ("clipped_48k", 48000.0, _q16(_impulse(48000.0, 90000.0, 20260905)), SK.LAYOUT_NYQUIST),
         # 16 kHz exercises the mel bank's Nyquist clamp: F_HI is 20 kHz, above this Nyquist.
-        ("tone_2k_16k", 16000.0, _q16(_tone(16000.0, 2000.0, 8000.0))),
+        ("tone_2k_16k", 16000.0, _q16(_tone(16000.0, 2000.0, 8000.0)), SK.LAYOUT_NYQUIST),
+        # ⚠️THE FIXED LAYOUT. At 48 kHz it must be byte-identical to the rescaled one (the phone
+        # sends the same frame either way); at 16 kHz it must NOT be, or the fix does nothing and
+        # the top five bands would not be sitting at the floor where a masker expects them.
+        ("impulse_48k_fixed", 48000.0, _q16(_impulse(48000.0, 12000.0, 20260905)),
+         SK.LAYOUT_FIXED),
+        ("noise_16k_fixed", 16000.0, _q16(np.random.default_rng(11).normal(0.0, 300.0, N)),
+         SK.LAYOUT_FIXED),
+        ("impulse_16k_fixed", 16000.0, _q16(_impulse(16000.0, 12000.0, 20260905)),
+         SK.LAYOUT_FIXED),
     ]
 
 
 def build_sketch_golden() -> dict:
     cases = []
-    for name, fs, pcm in sketch_cases():
+    for name, fs, pcm, layout in sketch_cases():
         x = pcm.astype(float)                      # quantise FIRST, then sketch
-        q, ref = SK.sketch(x, fs)
+        q, ref = SK.sketch(x, fs, layout=layout)
         peak = int(min(np.abs(x).max(), 65535))
-        frame = SK.pack(123456, ref, peak, q, fs=fs)
+        frame = SK.pack(123456, ref, peak, q, fs=fs, layout=layout)
         cases.append({
             "name": name, "fs": fs, "n": int(len(pcm)),
             "pcm_b64": _b64(pcm.tobytes()),
@@ -86,14 +96,18 @@ def build_sketch_golden() -> dict:
             "frame_b64": _b64(frame),
             "frame_len": len(frame),
             "fs_code": SK.fs_code(fs),
-            "band_edges_hz": [round(float(e), 4) for e in SK.band_edges_hz(fs)],
+            "layout": layout,
+            "layout_bit": bool(layout == SK.LAYOUT_FIXED),
+            "valid_bands": SK.valid_bands(fs, layout=layout),
+            "band_edges_hz": [round(float(e), 4) for e in SK.band_edges_hz(fs, layout=layout)],
         })
     return {
-        "schema": "hear.sketch.golden.v3",
+        "schema": "hear.sketch.golden.v4",
         "mel_bands": SK.MEL_BANDS, "frames": SK.FRAMES,
         "f_lo": SK.F_LO, "f_hi": SK.F_HI, "hop_s": SK.HOP_S, "nfft": SK.NFFT,
         "wire_size": SK.wire_size(),
-        "fs_shift": SK.FS_SHIFT, "fs_mask": SK.FS_MASK,
+        "fs_shift": SK.FS_SHIFT, "fs_mask": SK.FS_MASK, "layout_bit": SK.LAYOUT_BIT,
+        "layout_equivalent_above_hz": SK.LAYOUT_EQUIVALENT_ABOVE_HZ,
         "fs_codes": {str(int(k)): v for k, v in sorted(SK.FS_CODES.items())},
         "note": ("PCM is int16 and the vectors were computed FROM it -- reproduce by decoding "
                  "pcm_b64 to int16, widening to float, and sketching."),

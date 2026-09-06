@@ -26,23 +26,44 @@ actually buys.
 
 ## It is not a downgrade — it is better
 
-Measured on the same 228 operator-labelled events, grouped 5-fold CV:
+Measured on the same 228 operator-labelled events. ⚠️**NESTED** grouped CV — the regularisation
+strength is chosen *inside* each outer fold, so the number is not selected on its own test
+statistic. The earlier figures on this page were single-level CV with `C` tuned against the
+score they reported, and they are superseded:
 
-| | AUC | accuracy |
+| | nested AUC | superseded figure |
 |---|---|---|
-| **172 B sketch** | **0.9631** | **0.8816** |
+| sketch + the six features together | **0.9668** | — |
+| **172 B sketch**, absolute dB | **0.9634** | 0.9631 |
+| hand-crafted 6 features | 0.9584 | 0.9589 |
+| band/frame summaries (36 dims) | 0.9554 | — |
+| sketch shape *without* `ref_db` | 0.9450 | 0.9519 |
 
-⚠️**These numbers predate the onset fix and have to be re-measured.** They were obtained on
-sketches whose first frame began at the envelope PEAK. `hear/node/pipeline.py` now starts the
-sketch at the constant-fraction ONSET, so frame 0 is the rise rather than the blast and the
-amplitude cue sits elsewhere in the window. The bytes are different, so the AUC is unknown until
-it is refitted on the same 228 hand-labelled events. Do not quote this table against current code.
-| hand-crafted 6 features | 0.9589 | 0.8684 |
-| `ref_db` alone (amplitude) | 0.9007 | — |
-| sketch shape *without* `ref_db` | 0.9519 | — |
+⚠️**EVERY NUMBER IN THIS TABLE IS PEAK-ALIGNED AND THE NODE NO LONGER IS.** They were fitted on
+sketches whose first frame begins at the envelope PEAK. `hear/node/detect.py` now reports a
+constant-fraction ONSET and `pipeline.py` starts the sketch there, so frame 0 is the rise rather
+than the blast. The bytes are different and the AUC is unknown until it is refitted on the same
+228 hand-labelled events. This applies to the nested figures above as much as to the ones they
+replaced — do not quote either against current node code.
 
-The sketch beats the features it replaces, and the shape carries strong signal independent of
-loudness — which is exactly what a six-scalar summary was throwing away.
+⚠️**The sketch does NOT measurably beat the features it replaces.** Paired bootstrap over the 69
+groups: sketch − hand features = **+0.0054, 95 % CI [−0.0098, +0.0232]**, P(sketch better) 0.75.
+That is a tie, and the previous wording ("the sketch beats the features it replaces") was reading
+noise. At n = 228 with 69 independent groups this corpus cannot separate them; more data would
+settle it, more features will not.
+
+The case for the sketch was never accuracy:
+
+1. it is what fits in a Meshtastic packet;
+2. it commits to no interpretation — the same bytes retrain for cicadas next year;
+3. a node cannot reliably compute `rise`/`decay`/`crest`. The envelope work behind those six
+   scalars is precisely what does not fit on the node.
+
+**What does not help, measured, so nobody retries it:** round-to-round interval capped at 250 ms
+so it cannot encode an operator's pause — 0.9634 → 0.9630, and *alone* it scores AUC **0.32**,
+anti-predictive, because short intervals mark retriggers and retriggers are labelled not-shot.
+Burst structure carries nothing on this corpus. Uncapped (the leaky `gap`) it is 0.9627, so the
+leak was not buying anything either.
 
 ⚠️`ref_db` must travel. Amplitude alone reaches 0.90; a sketch normalised per-event and sent
 without its reference would discard the single strongest cue this project has measured.
