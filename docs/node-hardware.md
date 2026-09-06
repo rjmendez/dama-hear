@@ -53,3 +53,10 @@ Pressure doubles as an altitude cross-check for the 3D geometry.
 Both fit a 237 B Meshtastic payload with room to spare. Telemetry decodes to a dama-shaped node
 payload via `telemetry.to_dama()`, so a hear node is not a special case downstream — it is another
 fleet node with a thinner sensor set and `node_type: "hear"`.
+
+## Which pins are left
+
+On the fakeTec carrier the sensor set costs exactly the four GPIO the board has spare, and three
+of them are mid-board pads on the ProMicro module rather than fakeTec headers. The nRF52840 I2S
+also cannot produce 48 kHz. Both are settled in `docs/faketec-pin-budget.md`, which should be read
+before the mic is ordered.
