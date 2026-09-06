@@ -16,6 +16,11 @@ So this answers two questions BEFORE anyone digs a post hole:
      `shockwave.shock_time` rather than restating the cone maths, so this cannot drift from
      the solver it is advising.
 
+⚠️DOP IGNORES WHETHER A NODE CAN HEAR THE EVENT. It improves with baseline extent, so this will
+happily rank a node 2 km away above one in the middle of the array -- geometrically true, useless
+if the shot never clears that node's threshold. Read the ranking as "best geometry among sites that
+all detect"; detectability is a separate question this tool does not answer.
+
 ⚠️DOP AND REDUNDANCY ARE DIFFERENT QUESTIONS AND BOTH MATTER. Three nodes give two equations for
 two unknowns: the fit is exact, the residual is ~0 by construction, and DOP is still finite and
 may look excellent. It says how precisely you locate IF nothing is wrong, and nothing about
@@ -253,7 +258,8 @@ def main(argv=None) -> int:
     print("median DOP %.2f   -> %.2f mm of position error per us of timing error"
           % (g["median"], mm_per_us))
     print("           timing is not your limit at this geometry; node survey error is")
-    print("usable     %.0f%% of the box at DOP <= %.0f" % (100 * g["usable_frac"], DOP_USABLE))
+    print("usable     %.0f%% of the box at DOP <= %.0f  (geometry only -- a node must still hear it)"
+          % (100 * g["usable_frac"], DOP_USABLE))
     w = worst_bearing(nodes, v_mps=a.speed, temp_c=a.temp)
     print("thinnest bearing %.0f deg: offset observable only for tracks in a %.1f m band"
           % (w["bearing_deg"], w["span_m"]))

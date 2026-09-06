@@ -37,6 +37,15 @@ class TestDop:
         outside = PL.dop(SQUARE, (50.0, 3000.0))["dop"]
         assert inside < outside
 
+    def test_a_distant_node_improves_dop_which_is_true_and_a_trap(self):
+        """Counterintuitive but correct: TDoA likes long baselines, so geometry alone prefers a
+        node far outside the array. It is a trap only because DOP says nothing about whether that
+        node hears the event. Pinned so nobody 'fixes' the maths to match the intuition."""
+        b = (-50.0, -50.0, 150.0, 150.0)
+        mid = PL.dop_grid(SQUARE + [(50.0, 50.0)], b, step=25.0)["median"]
+        far = PL.dop_grid(SQUARE + [(400.0, 400.0)], b, step=25.0)["median"]
+        assert far < mid
+
     def test_grid_reports_a_usable_fraction(self):
         g = PL.dop_grid(SQUARE, (-50.0, -50.0, 150.0, 150.0), step=25.0)
         assert 0.0 <= g["usable_frac"] <= 1.0
