@@ -109,8 +109,27 @@ class TestGoldenSelfConsistency:
         for c in _g()["cases"]:
             x = _pcm(c)
             q, ref = S.sketch(x, c["fs"])
-            frame = S.pack(123456, ref, int(min(np.abs(x).max(), 65535)), q)
+            frame = S.pack(123456, ref, int(min(np.abs(x).max(), 65535)), q, fs=c["fs"])
             assert frame == base64.b64decode(c["frame_b64"]), c["name"]
+
+    def test_frame_states_its_own_sample_rate(self):
+        """20 bands span 300 Hz-20 kHz at 48 kHz and 300 Hz-7.84 kHz at 16 kHz. Two frames that
+        do not say which are not comparable, and used to be indistinguishable."""
+        for c in _g()["cases"]:
+            d = S.unpack(base64.b64decode(c["frame_b64"]))
+            assert d["fs_code"] == c["fs_code"], c["name"]
+            assert d["fs_hz"] == c["fs"], c["name"]
+            assert np.allclose(d["band_edges_hz"], c["band_edges_hz"], atol=1e-3), c["name"]
+
+    def test_the_sample_rate_code_does_not_disturb_the_event_flags(self):
+        q, ref = S.sketch(np.zeros(4096), 48000.0)
+        for flags in (0, 1, 0xFF):
+            d = S.unpack(S.pack(1, ref, 0, q, flags=flags, fs=48000.0))
+            assert d["event_flags"] == flags
+            assert d["retrigger"] is bool(flags & 1)
+            assert d["fs_hz"] == 48000.0
+        # an unstated rate is not a guess
+        assert S.unpack(S.pack(1, ref, 0, q))["fs_hz"] is None
 
 
 class TestKotlinArithmetic:
