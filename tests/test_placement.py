@@ -103,6 +103,17 @@ class TestBestAddition:
         assert ranked[0]["dof"] == 1
 
 
+def test_map_reserves_at_sign_for_degenerate_cells_only():
+    """The legend says '@' means degenerate. A saturated but finite DOP must not render as '@',
+    or the map quietly lies about which cells are unsolvable. Found by Copilot on the port."""
+    assert "@" not in PL._RAMP
+    line = [(0.0, 0.0), (50.0, 0.0), (100.0, 0.0)]
+    g = PL.dop_grid(line, (-25.0, -25.0, 125.0, 25.0), step=25.0)
+    assert "@" in PL.render(g, line), "singular cells must still be marked"
+    sq = PL.dop_grid(SQUARE, (0.0, 0.0, 100.0, 100.0), step=25.0)
+    assert "@" not in PL.render(sq, SQUARE)
+
+
 def test_cli_runs(capsys):
     assert PL.main(["--nodes", "0,0;100,0;100,100;0,100", "--step", "40"]) == 0
     out = capsys.readouterr().out

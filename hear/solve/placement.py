@@ -186,7 +186,7 @@ def best_addition(nodes: Sequence, candidates: Sequence,
     return out
 
 
-_RAMP = " .:-=+*#%@"
+_RAMP = " .:-=+*#%"          # '@' is reserved for non-finite
 
 
 def render(g: Dict, nodes: Sequence, width: int = 60) -> str:
