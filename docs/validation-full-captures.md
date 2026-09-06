@@ -40,6 +40,6 @@ tail. The tests pin both ends.
 - **Nothing about node CPU cost.** The wall-clock figure here is Python on a Pi 5 and says
   nothing about an nRF52840. The algorithmic cost is ~3 ops/sample — about 0.23% duty at 64 MHz —
   but that is arithmetic, not a measurement on the part.
-- **No labels.** These 154 detections are unlabelled; the 0.9631 sketch AUC comes from a
+- **No labels.** These 168 detections are unlabelled; the 0.9631 sketch AUC comes from a
   different, hand-labelled set. Enrichment into known windows is corroboration, not ground truth.
 - **One board, one session, one site.** Rear board only, 2026-09-05, one range.

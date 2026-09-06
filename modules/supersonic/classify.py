@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Is this impulse a gunshot? Seven weights and a bias -- no sklearn, no GPU, no model file format.
+"""Is this impulse a gunshot? Six weights and a bias -- no sklearn, no GPU, no model file format.
 
 WHY THIS EXISTS. The detector upstream is a LEVEL GATE: amplitude over ambient. It cannot tell a
 rifle from a tailgate, it re-fires on a reverb tail, and it counts a reflection as a new event.
@@ -7,11 +7,11 @@ Measured on the 2026-09-05 live fire, it emitted 427 events for roughly 60 round
 
 TRAINED ON OPERATOR LABELS, not on a threshold and not on a public corpus: 228 events the operator
 listened to and called. Grouped 5-fold CV (events from one string never span folds, because the
-same round appears on three boards and inside one burst) gives AUC 0.960 against a 0.561
+same round appears on three boards and inside one burst) gives AUC 0.959 against a 0.561
 majority-class baseline. Ungrouped CV leaks and reports a number the field will not reproduce.
 
 ⚠️AMPLITUDE IS NOT THE WHOLE MODEL, though it is the largest single term. Ablated: peak alone
-0.873, the shape features WITHOUT peak 0.879, together 0.948-0.960. The shape features carry
+0.873, the shape features WITHOUT peak 0.879, together 0.959. The shape features carry
 independent information -- permutation importance says otherwise only because it hands shared
 signal to one correlated feature.
 
