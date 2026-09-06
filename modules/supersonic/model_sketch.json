@@ -169,6 +169,9 @@
  "b": -24.424144426367295,
  "auc_nested_grouped_cv": 0.9634375,
  "n_train": 228,
+ "auc_in_sample_MEANINGLESS": 0.9990625,
+ "tpr_at_0.5_in_sample": 0.99,
+ "fpr_at_0.5_in_sample": 0.0390625,
  "C": 0.3,
  "note": "absolute dB: q/2 + ref_db. ref_db MUST be added back -- a sketch scored without its reference is missing the single strongest term this project has measured.",
  "min_fs_hz": 32000.0

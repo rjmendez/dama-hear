@@ -147,12 +147,19 @@ def export(X, y, g, auc, layout, bands, frames):
     sc, lg = m.named_steps["standardscaler"], m.named_steps["logisticregression"]
     w = lg.coef_[0] / sc.scale_
     b = float(lg.intercept_[0] - np.dot(lg.coef_[0], sc.mean_ / sc.scale_))
+    # ⚠️Shipped ALONGSIDE the honest number, not instead of it. The in-sample AUC is 0.999 and it
+    # is meaningless -- the gap to the nested figure IS the overfit. It is in the file so that
+    # anyone who reads the file sees both and cannot quote the flattering one by accident.
+    ins = m.predict_proba(X)[:, 1]
     return {
         "kind": "sketch_db",
         "layout": layout, "bands": int(bands), "frames": int(frames),
         "order": "band_major",          # x[b*frames + t], matching SK.sketch's own reshape
         "w": w.tolist(), "b": b,
         "auc_nested_grouped_cv": float(auc), "n_train": int(len(y)),
+        "auc_in_sample_MEANINGLESS": float(roc_auc_score(y, ins)),
+        "tpr_at_0.5_in_sample": float((ins[y == 1] >= 0.5).mean()),
+        "fpr_at_0.5_in_sample": float((ins[y == 0] >= 0.5).mean()),
         "C": float(bestC),
         "note": ("absolute dB: q/2 + ref_db. ref_db MUST be added back -- a sketch scored without "
                  "its reference is missing the single strongest term this project has measured."),
