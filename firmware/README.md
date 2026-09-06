@@ -42,3 +42,22 @@ in 123.7 minutes, so 2.32 ms per detection is ~0.01% duty.
   for an impulse at 8000. The streaming gate is nearer the true onset than the reference is —
   which is the peak-versus-onset problem, visible as a number.
 - **Float32, not float64.** It happens to land byte-exact on this vector. That is one vector.
+
+## Sense bring-up
+
+`firmware/sense_bringup` proves the four subsystems a mains-powered recorder node needs, and says
+which actually work rather than assuming. Measured on a XIAO ESP32-S3 Sense:
+
+| | result |
+|---|---|
+| PSRAM | 8.0 MB — **only with `PSRAM=opi`**; the default board option disables it |
+| camera | **OV3660** (PID 0x3660), 1600×1200 JPEG ~42 kB, 10/10 frames at 13.9 fps |
+| PDM mic | 16 kHz, 99% non-zero, room noise at rms 2573 / peak 7923 |
+| WiFi | radio up, scan only — no credentials in the repo |
+| microSD | not mounted on CS 21 or 3 |
+
+The SD line is a missing card, not a defect: the test walks both CS candidates because Seeed's own
+docs disagree (the wiki says GPIO3, the SD examples use 21), so it asks the hardware instead of
+picking one. Insert a card and it will report which CS the expansion actually uses.
+
+The camera is the 3 MP OV3660, not the OV2640 the older kits shipped.
