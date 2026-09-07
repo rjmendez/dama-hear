@@ -1921,7 +1921,11 @@ void setup() {
     out += "a pad marked 'free' is safe to tap. anything else is driven by this build.\n";
     http.send(200, "text/plain", out);
   });
-  http.on("/tp", []() {
+  // Renamed from /tp. Two handlers were registered on /tp and WebServer answers with the
+  // FIRST match, so the UBX timepulse read-back below has never once been reachable --
+  // which is why /status could only ever say "(not read)". A duplicate route is a silent
+  // shadow, not an error.
+  http.on("/pinsweep", []() {
     // Answers "did you measure it right?" without relying on my two assumptions: that the wire
     // landed on D0, and that a ~45k internal pulldown cannot drag down a weakly-coupled tap.
     // Every free pin, all three pull modes. A 1 Hz / 100 ms pulse = ~2-3 edges and ~10% high.
