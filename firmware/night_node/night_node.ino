@@ -29,6 +29,8 @@
 #include "mel_scene.h"
 #include "esp_heap_caps.h"
 
+#include <esp_mac.h>
+
 #if __has_include("secrets.h")
 #include "secrets.h"
 #endif
@@ -38,6 +40,27 @@ static const char *WIFI_SSIDS[] = {""};
 static const char *WIFI_PASSES[] = {""};
 #endif
 
+// ---------------------------------------------------------------- identity
+// A record that does not name its node cannot be paired with anything, which makes it useless for
+// TDoA -- the entire point of more than one of these. Two nodes also cannot share one mDNS name or
+// one AP SSID.
+//
+// There is deliberately NO fixed default. A default would be identical on every node, which is the
+// bug this exists to prevent; an unconfigured node derives its id from its own MAC instead, so it
+// is at least unique even when nobody set one. NODE_ID and NODE_CLASS live in secrets.h because
+// that is the per-device file, not because they are secret.
+#ifndef NODE_CLASS
+#define NODE_CLASS "xiao-s3-pps"        // 1 PDM mic @16k, GPS PPS, BMP280, microSD. See docs/node-classes.md
+#endif
+static char node_id[24];
+static void node_identity() {
+#ifdef NODE_ID
+  snprintf(node_id, sizeof node_id, "%s", NODE_ID);
+#else
+  uint8_t m[6]; esp_efuse_mac_get_default(m);   // the factory MAC, available before WiFi starts
+  snprintf(node_id, sizeof node_id, "hear-%02x%02x%02x", m[3], m[4], m[5]);
+#endif
+}
 #define AP_SSID   "dama-hear-node"
 #define AP_PASS   "damahear"          // >=8 chars or the AP silently refuses to start
 
@@ -88,7 +111,7 @@ static volatile uint32_t g_samples = 0;      // updated by the audio loop, read 
 // which is the number that says whether the audio record has holes in it.
 // Touched only from loop() (the web handlers run there too), so no volatile and no races.
 static const char HEALTH_HDR[] =
-  "utc_us,time_valid,uptime_s,fix,sats,tacc_ns,pps,pps_bad,spread_us,esp_ppm,samples,fs_cum_hz,"
+  "node,utc_us,time_valid,uptime_s,fix,sats,tacc_ns,pps,pps_bad,spread_us,esp_ppm,samples,fs_cum_hz,"
   "fs_clean_hz,fs_win_s,drop_s,drop_samples,samp_last_s,det_n,det_written,det_lost,ambient,"
   "env_peak_win,heap,gate_armed,gate_thr,gate_e_max,gate_forced,sig_dc,sd_free_mb,write_fail,"
   "temp_c,press_hpa,c_mps,"
@@ -311,6 +334,51 @@ static void bmp_read() {
 // temperature must say so rather than quietly returning the 20 C answer.
 static float sound_speed_mps() {
   return (bmp_temp_c == bmp_temp_c) ? 331.3f + 0.606f * bmp_temp_c : NAN;
+}
+
+// ---------------------------------------------------------------- measuring the line, not guessing
+// Trying candidate baud rates answers "does THIS rate decode", which is silence when the answer is
+// none of them -- exactly what mach reports: a driven RX line, 512 bytes of undecodable data, and
+// 0 NMEA / 0 UBX at all eight rates. Measuring the line answers "what rate IS it", which is a
+// different and much more useful question, and it works whether the module is speaking NMEA, UBX
+// or something else entirely.
+//
+// The shortest run of one level on an asynchronous line is one bit time, because a UART frame
+// always contains at least one isolated bit somewhere in ordinary traffic. digitalRead() costs
+// under a microsecond here, so the floor of what this can resolve is a few hundred kbaud -- ample
+// for anything a GPS module ships with.
+static uint32_t gps_min_pulse_us(int pin, uint32_t window_ms) {
+  pinMode(pin, INPUT);
+  uint32_t minrun = 0xFFFFFFFFu;
+  uint64_t t0 = (uint64_t)esp_timer_get_time(), tlast = t0;
+  int last = digitalRead(pin);
+  while ((uint64_t)esp_timer_get_time() - t0 < (uint64_t)window_ms * 1000ULL) {
+    int v = digitalRead(pin);
+    if (v != last) {
+      uint64_t now = (uint64_t)esp_timer_get_time();
+      uint32_t run = (uint32_t)(now - tlast);
+      if (run && run < minrun) minrun = run;
+      tlast = now; last = v;
+    }
+  }
+  return minrun == 0xFFFFFFFFu ? 0 : minrun;
+}
+
+// Snap a measured bit time to the nearest standard rate, and report how far off it was. A big
+// residual means the line is not a UART at this rate -- inverted logic, a different protocol, or
+// contention from two drivers -- and saying so beats returning a confident wrong number.
+static const uint32_t GPS_BAUDS[] = {1200, 2400, 4800, 9600, 14400, 19200, 38400, 57600,
+                                     76800, 115200, 128000, 230400, 256000, 460800, 921600};
+static uint32_t gps_snap_baud(uint32_t bit_us, float *err_pct_out) {
+  if (!bit_us) { if (err_pct_out) *err_pct_out = 0; return 0; }
+  double measured = 1e6 / (double)bit_us;
+  uint32_t best = 0; double bestrel = 1e9;
+  for (unsigned i = 0; i < sizeof GPS_BAUDS / sizeof GPS_BAUDS[0]; i++) {
+    double rel = fabs(measured - (double)GPS_BAUDS[i]) / (double)GPS_BAUDS[i];
+    if (rel < bestrel) { bestrel = rel; best = GPS_BAUDS[i]; }
+  }
+  if (err_pct_out) *err_pct_out = (float)(bestrel * 100.0);
+  return best;
 }
 
 static void i2c_scan() {
@@ -913,7 +981,7 @@ static_assert(MELS_BANDS == MEL16_BANDS, "scene row size arithmetic above assume
 // the file self-describing: a scene.csv on a card no longer needs the firmware version to say
 // what its band 0 covered.
 static const char SCENE_HDR[] =
-  "utc_us,uptime_s,sample,bands,slices,span_ms,ref_db4,frames,fft_us,mel_hex,f_lo_hz,f_hi_hz";
+  "node,utc_us,uptime_s,sample,bands,slices,span_ms,ref_db4,frames,fft_us,mel_hex,f_lo_hz,f_hi_hz";
 static float    scene_acc[MELS_BANDS];               // power summed over the slice in progress
 static float    scene_db[MELS_BANDS * SCENE_SLICES]; // band-major, as sketch_frame's db[]
 static uint32_t scene_frame_i = 0, scene_slice_i = 0;
@@ -987,8 +1055,8 @@ static void scene_emit() {
     if (!scenef) return;
   }
   char line[MELS_BANDS * SCENE_SLICES * 2 + 192];
-  int m = snprintf(line, sizeof line, "%lld,%lu,%lu,%d,%d,%d,%d,%d,%lu,",
-                   (long long)utc, (unsigned long)((millis() - boot_ms) / 1000),
+  int m = snprintf(line, sizeof line, "%s,%lld,%lu,%lu,%d,%d,%d,%d,%d,%lu,",
+                   node_id, (long long)utc, (unsigned long)((millis() - boot_ms) / 1000),
                    (unsigned long)start, MELS_BANDS, SCENE_SLICES,
                    (int)((uint32_t)SCENE_FRAMES * MELS_NFFT * 1000u / FS_NOMINAL),
                    (int)lrintf(ref * 4.0f), SCENE_FRAMES, (unsigned long)scene_fft_us_last);
@@ -1174,7 +1242,9 @@ static bool     clip_have_last = false;
 static char clip_boot[9] = "00000000";
 
 static void clip_name(char *out, size_t n, uint32_t sample) {
-  snprintf(out, n, CLIP_DIR "/%s-%010lu.wav", clip_boot, (unsigned long)sample);
+  // node first: a clip is the one artefact that gets copied off the card and mailed around,
+  // so it has to carry its own provenance rather than depend on the directory it sits in.
+  snprintf(out, n, CLIP_DIR "/%s-%s-%010lu.wav", node_id, clip_boot, (unsigned long)sample);
 }
 
 static const char *clip_why(uint8_t st) {
@@ -1363,7 +1433,7 @@ static String status_json() {
   if (g_floor_saved == g_floor_saved) snprintf(floor_saved, sizeof floor_saved, "%.1f", g_floor_saved);
   else                                snprintf(floor_saved, sizeof floor_saved, "null");
   snprintf(b, sizeof b,
-    "{\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
+    "{\"node\":\"%s\",\"class\":\"%s\",\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
     "\"pps\":{\"edges\":%lu,\"glitches\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,\"spread_us\":%ld},"
@@ -1399,6 +1469,7 @@ static String status_json() {
     "\"budget_left_clips\":%lu,\"pre_s\":%.1f,\"post_s\":%.1f,\"dir\":\"%s\",\"boot\":\"%s\"},"
     "\"env\":{\"temp_c\":%s,\"press_hpa\":%s,\"c_mps\":%s,\"reads\":%lu,\"fail\":%lu},"
     "\"sd\":%s,\"sd_free_mb\":%lu,\"sd_total_mb\":%lu,\"i2c\":\"%s\"}",
+    node_id, NODE_CLASS,
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
     gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences,
@@ -1513,7 +1584,8 @@ void setup() {
   boot_ms = millis();
   logf("boot  attempt %lu on partition %s\n", (unsigned long)boot_try,
                 esp_ota_get_running_partition()->label);
-  logln("\n=== dama-hear night node ===");
+  node_identity();          // before anything logs or joins: the id names the log and the AP
+  logf("\n=== dama-hear night node %s (%s) ===\n", node_id, NODE_CLASS);
 
   // Try each configured network in turn. An outdoor node may only reach one of them, and which
   // one is not knowable from indoors.
@@ -1537,12 +1609,13 @@ void setup() {
          WiFi.localIP().toString().c_str());
   }
   else {
-    WiFi.mode(WIFI_AP); WiFi.softAP(AP_SSID, AP_PASS);
+    char ap[40]; snprintf(ap, sizeof ap, "%s-%s", AP_SSID, node_id);
+    WiFi.mode(WIFI_AP); WiFi.softAP(ap, AP_PASS);
     logf("wifi  AP   ssid \"%s\" pass \"%s\"  http://%s/\n",
-                  AP_SSID, AP_PASS, WiFi.softAPIP().toString().c_str());
+                  ap, AP_PASS, WiFi.softAPIP().toString().c_str());
     logln("      (no secrets.h, or the join failed -- see firmware/night_node/README)");
   }
-  if (MDNS.begin("damahear")) logln("mdns  http://damahear.local/");
+  if (MDNS.begin(node_id)) logf("mdns  http://%s.local/\n", node_id);
 
   // PULLDOWN, not bare INPUT. An unconnected CMOS input floats and self-oscillates -- measured
   // ~3.4 kHz of phantom edges, which the rate maths happily turned into a plausible +626 ppm.
@@ -1861,11 +1934,46 @@ void setup() {
     String o = "bytes=" + String((unsigned long)raw_tot) + " valid_nmea_lines=" + String((unsigned long)nmea_valid) +
                " ubx_ack=" + String((unsigned long)ubx_ack) + " ubx_nak=" + String((unsigned long)ubx_nak) + "\n\n";
     uint16_t st = raw_i;
+    // ?hex=1: '.' for every non-printable byte hides exactly the structure worth looking for --
+    // a UBX sync pair (b5 62), an NMEA '$' at the wrong framing, or a line stuck at one value.
+    bool as_hex = http.hasArg("hex");
     for (uint16_t k = 0; k < sizeof(rawbuf); k++) {
       char c = (char)rawbuf[(st + k) % sizeof(rawbuf)];
-      o += (c >= 32 && c < 127) ? c : (c == '\n' ? '\n' : '.');
+      if (as_hex) {
+        static const char hx[] = "0123456789abcdef";
+        o += hx[(uint8_t)c >> 4]; o += hx[(uint8_t)c & 0xF]; o += ' ';
+        if ((k & 31) == 31) o += '\n';
+      } else {
+        o += (c >= 32 && c < 127) ? c : (c == '\n' ? '\n' : '.');
+      }
     }
     http.send(200, "text/plain", o);
+  });
+  http.on("/gpsbaud", []() {
+    // Detaching the UART for the measurement and putting it straight back: the pin is shared, and
+    // a diagnostic that leaves the GPS silent afterwards would be worse than no diagnostic.
+    Serial1.end();
+    uint32_t bit_us = gps_min_pulse_us(GPS_RX, 400);
+    float err = 0; uint32_t snap = gps_snap_baud(bit_us, &err);
+    Serial1.begin(gps_baud, SERIAL_8N1, GPS_RX, GPS_TX);
+    char b[512];
+    snprintf(b, sizeof b,
+      "pin      D7/GPIO%d (GPS RX, module TX side)\n"
+      "min run  %lu us   <- shortest single level seen in 400 ms\n"
+      "implies  %.0f baud\n"
+      "nearest  %lu baud, %.1f%% away\n\n"
+      "%s\n"
+      "currently open at %lu baud.\n",
+      GPS_RX, (unsigned long)bit_us,
+      bit_us ? 1e6 / (double)bit_us : 0.0, (unsigned long)snap, err,
+      !bit_us ? "NOTHING TOGGLED. The line is idle: module not powered, not transmitting, or the\n"
+                "wire is on the module's RX rather than its TX."
+      : err < 5.0 ? "Clean match. If the firmware still decodes nothing at this rate the framing is\n"
+                    "wrong rather than the rate -- inverted logic, or not 8N1."
+      : "NO STANDARD RATE FITS. Either the line is not an 8N1 UART, or two drivers are fighting\n"
+        "on it -- which is what a swapped TX/RX pair looks like from here.",
+      (unsigned long)gps_baud);
+    http.send(200, "text/plain", b);
   });
   http.on("/i2c", []() { i2c_scan(); http.send(200, "text/plain", i2c_found); });   // rescan on demand
   // GET reads the floor, POST sets it. Two registrations, two methods -- and NOT two of the same
@@ -2018,7 +2126,7 @@ static File detf;
 // full". A row is not written until its clip has resolved, so the column never names a file that
 // does not exist -- see clip_pump() and the wait in det_flush.
 static const char DETS_HDR[] =
-  "utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,frame_hex,clip,clip_why";
+  "node,utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,frame_hex,clip,clip_why";
 
 static void det_flush() {
   if (!sd_ok || det_flushed == det_n) return;
@@ -2278,11 +2386,11 @@ void loop() {
         #define CSVF(dst, v) do { if ((v) == (v)) snprintf(dst, sizeof dst, "%.2f", (double)(v)); \
                                   else dst[0] = 0; } while (0)
         CSVF(ct, bmp_temp_c); CSVF(cp, bmp_press_hpa); CSVF(cc, sound_speed_mps());
-        f.printf("%lld,%d,%lu,%d,%d,%lu,%lu,%lu,%ld,%.4f,%lu,%.4f,"
+        f.printf("%s,%lld,%d,%lu,%d,%d,%lu,%lu,%lu,%ld,%.4f,%lu,%.4f,"
                  "%.4f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.1f,%.0f,%lu,%d,%.0f,%.1f,%lu,%.1f,%lu,%lu,"
                  "%s,%s,%s,"
                  "%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
-                 (long long)tnow, tok ? 1 : 0,
+                 node_id, (long long)tnow, tok ? 1 : 0,
                  (unsigned long)up, gps_fix, gps_sats, (unsigned long)gps_tacc_ns,
                  (unsigned long)pps_count, (unsigned long)pps_glitch,
                  (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0),

@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Emit firmware/night_node/secrets.h from ~/.wifi. secrets.h is gitignored.
 
+    python3 gen_secrets.py <node-id> [node-class]
+
+The node id is REQUIRED and there is no default, because a default would be identical on every
+node and two nodes that share an identity cannot be told apart in the record -- which makes every
+row of a multi-node capture unusable for TDoA. Use a short lowercase name: it becomes the mDNS
+hostname, the fallback AP SSID, the `node` column of every CSV, and the prefix of every clip file.
+
 ~/.wifi holds WIFI_<n>_SSID / WIFI_<n>_PSK pairs. Credentials are never printed -- this reports
 only how many networks it found and a masked name, so a terminal log or a screenshot cannot leak
 them.
@@ -8,6 +15,14 @@ them.
 import os
 import re
 import sys
+
+if len(sys.argv) < 2:
+    print(__doc__.strip()); sys.exit(2)
+node_id = sys.argv[1].strip()
+node_class = sys.argv[2].strip() if len(sys.argv) > 2 else "xiao-s3-pps"
+if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,22}", node_id):
+    print("node id must be lowercase letters, digits and dashes, <=23 chars: %r" % node_id)
+    sys.exit(2)
 
 src = os.path.expanduser("~/.wifi")
 out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "secrets.h")
@@ -33,9 +48,12 @@ with open(out, "w") as f:
     f.write("#pragma once\n#define WIFI_N %d\n" % len(pairs))
     f.write("static const char *WIFI_SSIDS[] = {%s};\n" % ", ".join('"%s"' % esc(s) for s, _ in pairs))
     f.write("static const char *WIFI_PASSES[] = {%s};\n" % ", ".join('"%s"' % esc(p) for _, p in pairs))
+    f.write('#define NODE_ID "%s"\n' % esc(node_id))
+    f.write('#define NODE_CLASS "%s"\n' % esc(node_class))
 os.chmod(out, 0o600)
 
 def mask(s):
     return s[0] + "*" * max(len(s) - 2, 1) + s[-1] if len(s) > 2 else "**"
 
-print("wrote %s (0600) with %d network(s): %s" % (out, len(pairs), ", ".join(mask(s) for s, _ in pairs)))
+print("wrote %s (0600) for node %r (class %r) with %d network(s): %s"
+      % (out, node_id, node_class, len(pairs), ", ".join(mask(s) for s, _ in pairs)))
