@@ -1984,22 +1984,32 @@ void setup() {
     // measuring it. A source that can drive the pin against a pulldown will show the same swing
     // in all three modes; one that cannot will show a swing with the pulldown off and none with
     // it on, and that difference is the whole question.
-    detachInterrupt(digitalPinToInterrupt(PPS_PIN));
-    analogSetPinAttenuation(PPS_PIN, ADC_11db);
-    String o = "pin D0/GPIO" + String(PPS_PIN) + ", 800 ms per mode\n\n";
+    // ?pin=N selects which pad to look at. Restricted to the four FREE ones: probing a driven
+    // output measures this node rather than the world, and repurposing one mid-run would
+    // interrupt the SD card or the microphone.
+    int pin = http.hasArg("pin") ? http.arg("pin").toInt() : PPS_PIN;
+    if (pin != 1 && pin != 2 && pin != 3 && pin != 4) {
+      http.send(400, "text/plain",
+                "pin must be a free pad: 1 (D0), 2 (D1), 3 (D2) or 4 (D3).\n"
+                "Everything else is driven by this build -- see /pins.\n");
+      return;
+    }
+    if (pin == PPS_PIN) detachInterrupt(digitalPinToInterrupt(PPS_PIN));
+    analogSetPinAttenuation(pin, ADC_11db);
+    String o = "GPIO" + String(pin) + ", 800 ms per mode\n\n";
     o += "mode      n      min V   max V   mean V  swing   digital-high\n";
     const int modes[3] = {INPUT_PULLDOWN, INPUT, INPUT_PULLUP};
     const char *mn[3] = {"pulldown", "float   ", "pullup  "};
     float best_swing = 0;
     for (int m = 0; m < 3; m++) {
-      pinMode(PPS_PIN, modes[m]);
+      pinMode(pin, modes[m]);
       delay(30);
       uint32_t n = 0, lo = 4095, hi = 0, dh = 0; uint64_t sum = 0;
       uint32_t t0 = millis();
       while (millis() - t0 < 800) {
-        uint32_t v = analogRead(PPS_PIN);
+        uint32_t v = analogRead(pin);
         if (v < lo) lo = v; if (v > hi) hi = v; sum += v; n++;
-        if (digitalRead(PPS_PIN)) dh++;
+        if (digitalRead(pin)) dh++;
       }
       double k = 3300.0 / 4095.0 / 1000.0;
       float sw = (float)((hi - lo) * k);
@@ -2011,15 +2021,16 @@ void setup() {
       o += b;
     }
     pinMode(PPS_PIN, INPUT_PULLDOWN);
-    attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
+    if (pin == PPS_PIN) attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
     o += "\n";
     o += best_swing < 0.25
        ? "NO SWING IN ANY MODE. Whatever is on this pin is static, and it is static with the\n"
          "pulldown removed as well -- so this firmware is not the thing flattening it.\n"
        : "A SWING APPEARS. Compare the modes above: if it is present with the pulldown off and\n"
          "absent with it on, the source cannot drive against 45k and the pulldown was the fault.\n";
-    o += "\nControl: nyquist runs this same build, same GPIO, same pinMode and same RISING\n"
-         "interrupt, and counts real edges. Ask it: curl http://nyquist.local/pps\n";
+    o += "\nThe firmware still listens for PPS on GPIO" + String(PPS_PIN) + ". Measuring another\n"
+         "pin does not move it: that is a rebuild, worth doing once a pin is shown to carry the\n"
+         "pulse. Control: nyquist runs this same build and counts real edges on GPIO1.\n";
     http.send(200, "text/plain", o);
   });
   http.on("/tplen", HTTP_POST, []() {
