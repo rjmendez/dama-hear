@@ -1077,7 +1077,12 @@ static void det_flush() {
       line[m++] = hx[d.frame[j] >> 4]; line[m++] = hx[d.frame[j] & 0xF];
     }
     line[m++] = '\n';
-    if (detf.write((const uint8_t *)line, m) != (size_t)m) { det_write_fail++; break; }
+    if (detf.write((const uint8_t *)line, m) != (size_t)m) {
+      // Close, so the next flush reopens. A short write that leaves the handle open turns a
+      // transient card error into a permanent, silent stop -- the failure would be counted but
+      // never recovered from, and the rest of the night would still be lost.
+      det_write_fail++; detf.close(); break;
+    }
     det_flushed = k + 1;      // only advance on a write that actually landed
   }
   detf.flush();          // commit: the plug timer can cut power between any two loop iterations
