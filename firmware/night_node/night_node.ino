@@ -54,11 +54,11 @@ static const char *WIFI_PASSES[] = {""};
 
 #define FS_NOMINAL 16000
 #define BLOCK      256                // finer block -> finer sample-count granularity per PPS
-#define MAXDET     64
+#define MAXDET     128               // ring, not a cap: the 65th detection used to vanish
 
 // ---------------------------------------------------------------- PPS capture
 static volatile uint32_t pps_count = 0;
-static volatile uint64_t pps_us_last = 0, pps_us_first = 0;
+static volatile uint64_t pps_us_last = 0, pps_us_first = 0, pps_us_prev = 0;
 static volatile uint32_t pps_samp_last = 0, pps_samp_first = 0;
 static volatile uint32_t pps_int_min = 0xFFFFFFFF, pps_int_max = 0;
 static volatile uint32_t pps_glitch = 0;
@@ -67,6 +67,25 @@ static volatile uint32_t pps_glitch = 0;
 // bench and produced a confident +626 ppm sample-rate figure out of nothing.
 #define PPS_MIN_GAP_US 500000
 static volatile uint32_t g_samples = 0;      // updated by the audio loop, read in the ISR
+
+// ---- acquisition audit: true sample rate, and what was lost -----------------
+// measured_fs() divides CUMULATIVE samples by cumulative seconds, so one stall poisons it for
+// the rest of the run: it read 13730 Hz while the node was really acquiring ~16100. A figure
+// like that cannot be used to convert a sample offset into a time. This estimator averages only
+// over unbroken runs of seconds and throws away any second that lost a block, so it converges on
+// the rate the hardware actually clocks -- and the seconds it discards become the drop counter,
+// which is the number that says whether the audio record has holes in it.
+// Touched only from loop() (the web handlers run there too), so no volatile and no races.
+static const char HEALTH_HDR[] =
+  "utc_us,time_valid,uptime_s,fix,sats,tacc_ns,pps,pps_bad,spread_us,esp_ppm,samples,fs_cum_hz,"
+  "fs_clean_hz,fs_win_s,drop_s,drop_samples,samp_last_s,det_n,det_written,det_lost,ambient,"
+  "env_peak_win,heap,gate_armed,gate_thr,gate_e_max,gate_forced,sig_dc";
+static double   fs_clean      = (double)FS_NOMINAL;
+static uint32_t fs_clean_secs = 0;    // length of the current unbroken window, in GPS seconds
+static uint32_t drop_seconds  = 0;    // seconds that came up short by a block or more
+static uint32_t drop_samples  = 0;    // estimated samples lost, cumulative
+static uint32_t samp_sec_last = 0;    // samples acquired during the most recent GPS second
+static float    env_peak_win  = 0.0f; // peak since the last health row, not since boot
 
 // ---- the anchor: local microseconds <-> UTC ---------------------------------
 // A PPS edge IS a top-of-second. Latch the local clock at the edge, then learn which second it was
@@ -96,6 +115,7 @@ static void IRAM_ATTR pps_isr() {
   } else {
     pps_us_first = now; pps_samp_first = sm;
   }
+  pps_us_prev = pps_us_last;
   pps_us_last = now; pps_samp_last = sm;
   pps_count++;
   pend_local_us = now; pend_edge_n = pps_count;   // pending: named by the NAV-PVT that follows.
@@ -415,20 +435,68 @@ static int sketch_frame(uint8_t *out, uint32_t back, uint32_t node_us, uint16_t 
 static float g_amb = 0, env_sum = 0, env_buf[16]; static int env_i = 0, armed = 1;
 static const float ENV_INV = 1.0f / 16.0f, ALPHA = 1.0f / 10000.0f;
 static const float RATIO = 8.0f, FLOOR = 800.0f, REARM = 0.35f;
+// A night that records nothing is ambiguous: was it quiet, or was the threshold set above
+// everything that happened? Track the highest envelope actually reached between health rows.
+// e_max well under thr all night says the gate was too high; e_max grazing thr says it was tuned
+// about right and the night was genuinely still. Without this the run cannot be told apart from
+// a dead microphone.
+static float env_e_max_win = 0.0f;
+// Ambient must keep being learned while DISARMED, or the gate deadlocks. Confining the update to
+// the armed branch means a noise floor that rises above thr can never be learned, so e can never
+// fall below thr*REARM, so the gate never re-arms. Measured outdoors on this node: 156 s solid
+// disarmed, envelope 1400-1600 against thr 800, ambient frozen at 73.2, two detections all night
+// -- both from before it locked. A rising floor must move the floor estimate even when it is loud,
+// just slowly enough that a millisecond-long shockwave does not desensitise the node to itself.
+static const float ALPHA_UP = 1.0f / 200000.0f;    // ~12.5 s at 16 kHz, vs 0.625 s for ALPHA
+// And a watchdog under that, because a gate that has gone deaf looks exactly like a quiet night.
+// 30 s is far longer than any real event and far shorter than a night.
+static const uint32_t REARM_MAX_SAMPLES = 30u * FS_NOMINAL;
+static uint32_t disarm_samples = 0, gate_forced = 0;
+// The PDM mic sits on a large positive DC pedestal. Measured on this node: mean(s) = 1285.8
+// against mean(|s|) = 1285.3 -- the same number, which can only happen if the waveform never
+// crosses zero. So the envelope detector was measuring the offset rather than any sound, and
+// pinned the threshold at 8 x 1285 = 10280: a real event had to swing 9000 counts (27% of full
+// scale) before it could register. Every sample is DC-blocked before anything looks at it.
+// One pole at ~1.6 Hz -- two decades below the acoustic band, so no transient is reshaped, and
+// it still settles within a fraction of a second at boot.
+static const float ALPHA_DC = 1.0f / 1600.0f;      // tau ~0.1 s at 16 kHz
+static float    sig_dc = 0.0f;                     // the pedestal being subtracted
+static bool     dc_ready = false;
+static float gate_thr() { float t = g_amb * RATIO; return t < FLOOR ? FLOOR : t; }
 static int gate(int16_t s) {
   float a = fabsf((float)s);
   env_sum += a - env_buf[env_i]; env_buf[env_i] = a;
   if (++env_i >= 16) env_i = 0;
   float e = env_sum * ENV_INV;
+  if (e > env_e_max_win) env_e_max_win = e;
   float thr = g_amb * RATIO; if (thr < FLOOR) thr = FLOOR;
-  if (!armed) { if (e < thr * REARM) armed = 1; return 0; }
-  if (e <= thr) { g_amb = (1.0f - ALPHA) * g_amb + ALPHA * e; return 0; }
+  // Track the floor unconditionally: fast while below threshold, slow while above it. The slow
+  // limb is what breaks the deadlock, and it is slow enough that a real transient is over long
+  // before it shifts the estimate.
+  g_amb += (e <= thr ? ALPHA : ALPHA_UP) * (e - g_amb);
+  if (!armed) {
+    if (e < thr * REARM) { armed = 1; disarm_samples = 0; }
+    else if (++disarm_samples > REARM_MAX_SAMPLES) { armed = 1; disarm_samples = 0; gate_forced++; }
+    return 0;
+  }
+  disarm_samples = 0;
+  if (e <= thr) return 0;
   armed = 0; return 1;
 }
 
-struct Det { uint32_t sample; uint32_t pps_n; uint32_t us_since_pps; int64_t utc_us;
-              int16_t trigger; uint32_t uptime_s; uint8_t frame[MEL16_FRAME_BYTES]; };
-static Det dets[MAXDET]; static volatile uint32_t det_n = 0;
+struct Det { uint32_t sample; uint32_t pps_n; int32_t us_since_pps; int64_t utc_us;
+              int16_t trigger; uint16_t flags; uint32_t uptime_s; double fs_at;
+              uint8_t frame[MEL16_FRAME_BYTES]; };
+// A RING. dets[] used to be a hard cap -- past the 64th, a detection incremented the counter and
+// stored nothing, so a windy night reported hundreds of events and kept the first 64. det_n is
+// the monotonic total; the slot is det_n % MAXDET.
+static Det dets[MAXDET];
+static uint32_t det_n = 0;        // total ever detected
+static uint32_t det_flushed = 0;  // total written to the card
+static uint32_t det_lost = 0;     // overwritten in the ring before they could be written
+// us_since_pps is SIGNED: a sample captured a few hundred us before an edge is back-dated across
+// it, and belongs to the previous second. Reporting that as a huge unsigned number would put the
+// event 999 ms from where it happened -- 343 m.
 
 // ---------------------------------------------------------------- state
 static I2SClass i2s;
@@ -554,16 +622,22 @@ static String status_json() {
   bool tv = local_to_utc(nowl, &utc_now);
   uint64_t since_edge = pps_count ? (nowl - edge_local_us) : 0;
   (void)tv;
-  char b[1024];
+  char b[1536];
   snprintf(b, sizeof b,
     "{\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
     "\"pps\":{\"edges\":%lu,\"glitches\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,\"spread_us\":%ld},"
     "\"i2s\":{\"nominal_hz\":%d,\"measured_hz\":%.4f,\"ppm\":%.1f,\"samples\":%lu},"
+    // measured_hz above is cumulative and stays poisoned by any stall. acq is the one to trust.
+    "\"acq\":{\"fs_clean_hz\":%.4f,\"win_s\":%lu,\"drop_s\":%lu,\"drop_samples\":%lu,\"last_s\":%lu},"
     "\"esp_clock\":{\"ppm_vs_gps\":%.3f,\"pps_intervals\":%lu},"
     "\"time\":{\"valid\":%s,\"utc_us\":%lld,\"since_edge_us\":%llu,\"navpvt_nano\":%ld,\"label_rejects\":%lu},"
-    "\"audio\":{\"enabled\":true,\"detections\":%lu,\"env_peak\":%.0f},\"sd\":%s,\"i2c\":\"%s\"}",
+    "\"audio\":{\"enabled\":true,\"detections\":%lu,\"written\":%lu,\"lost\":%lu,"
+    "\"ambient\":%.1f,\"env_peak\":%.0f},"
+    "\"gate\":{\"armed\":%d,\"thr\":%.0f,\"e_max_win\":%.1f,\"headroom\":%.2f,"
+    "\"forced_rearms\":%lu,\"dc\":%.1f},"
+    "\"sd\":%s,\"i2c\":\"%s\"}",
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
     gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences,
@@ -576,10 +650,16 @@ static String status_json() {
     (unsigned long)(pps_count > 1 ? pps_int_min : 0), (unsigned long)(pps_count > 1 ? pps_int_max : 0),
     (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0),
     FS_NOMINAL, fs, fs > 0 ? (fs / FS_NOMINAL - 1.0) * 1e6 : 0.0, (unsigned long)g_samples,
+    fs_clean, (unsigned long)fs_clean_secs, (unsigned long)drop_seconds,
+    (unsigned long)drop_samples, (unsigned long)samp_sec_last,
     esp_clock_ppm(NULL), (unsigned long)(pps_count > 1 ? pps_count - 1 : 0),
     time_valid ? "true" : "false", (long long)utc_now, (unsigned long long)since_edge,
     (long)last_nano, (unsigned long)time_glitch,
-    (unsigned long)det_n, env_peak_seen, sd_ok ? "true" : "false", i2c_found);
+    (unsigned long)det_n, (unsigned long)det_flushed, (unsigned long)det_lost,
+    g_amb, env_peak_seen,
+    armed, gate_thr(), env_e_max_win, env_e_max_win / gate_thr(),
+    (unsigned long)gate_forced, sig_dc,
+    sd_ok ? "true" : "false", i2c_found);
   return String(b);
 }
 
@@ -606,19 +686,25 @@ static void h_root() {
 }
 static void h_status() { http.send(200, "application/json", status_json()); }
 static void h_dets() {
+  uint32_t total = det_n;
+  uint32_t n = total < MAXDET ? total : MAXDET;
+  uint32_t first = total - n;                 // ring: the newest n, oldest first
   String o = "[";
-  uint32_t n = det_n < MAXDET ? det_n : MAXDET;
-  for (uint32_t i = 0; i < n; i++) {
-    char b[160];
-    snprintf(b, sizeof b, "%s{\"utc_us\":%lld,\"uptime_s\":%lu,\"sample\":%lu,\"pps_n\":%lu,"
-                          "\"us_since_pps\":%lu,\"trigger\":%d,\"frame_len\":%d,\"frame\":\"",
-             i ? "," : "", (long long)dets[i].utc_us, (unsigned long)dets[i].uptime_s, (unsigned long)dets[i].sample,
-             (unsigned long)dets[i].pps_n, (unsigned long)dets[i].us_since_pps, dets[i].trigger,
+  o.reserve(n * (MEL16_FRAME_BYTES * 2 + 200) + 64);
+  for (uint32_t k = first; k < total; k++) {
+    const Det &d = dets[k % MAXDET];
+    char b[240];
+    snprintf(b, sizeof b, "%s{\"i\":%lu,\"utc_us\":%lld,\"uptime_s\":%lu,\"sample\":%lu,\"pps_n\":%lu,"
+                          "\"us_since_pps\":%ld,\"trigger\":%d,\"flags\":%u,\"fs_hz\":%.3f,"
+                          "\"frame_len\":%d,\"frame\":\"",
+             k == first ? "" : ",", (unsigned long)k, (long long)d.utc_us,
+             (unsigned long)d.uptime_s, (unsigned long)d.sample,
+             (unsigned long)d.pps_n, (long)d.us_since_pps, d.trigger, (unsigned)d.flags, d.fs_at,
              MEL16_FRAME_BYTES);
     o += b;
     static const char hx[] = "0123456789abcdef";
-    for (int k = 0; k < MEL16_FRAME_BYTES; k++) {
-      o += hx[dets[i].frame[k] >> 4]; o += hx[dets[i].frame[k] & 0xF];
+    for (int j = 0; j < MEL16_FRAME_BYTES; j++) {
+      o += hx[d.frame[j] >> 4]; o += hx[d.frame[j] & 0xF];
     }
     o += "\"}";
   }
@@ -949,6 +1035,46 @@ void setup() {
   logln("http  up\n");
 }
 
+// ---------------------------------------------------------------- detections -> card
+// The ring is 128 deep and the card is the only thing that survives the timer cutting power, so
+// the ring is a staging area, not the record. The file is held OPEN and flushed in batches:
+// open/write/close per detection costs 20-50 ms inside loop(), which stalls the I2S reader and
+// drops the very audio we are here to capture. Whatever that flush still costs now shows up in
+// drop_seconds, so the cost is measured rather than assumed.
+static File detf;
+static bool det_hdr_done = false;
+
+static void det_flush() {
+  if (!sd_ok || det_flushed == det_n) return;
+  if (!detf) {
+    detf = SD.open("/dets.csv", FILE_APPEND);
+    if (!detf) return;
+    if (!det_hdr_done && detf.size() == 0)
+      detf.println("utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,frame_hex");
+    det_hdr_done = true;
+  }
+  // If more than MAXDET landed since the last flush, the oldest slots have already been
+  // overwritten. Count them as lost instead of writing whatever occupies the slot now.
+  uint32_t first = det_flushed;
+  if (det_n - det_flushed > MAXDET) { first = det_n - MAXDET; det_lost += first - det_flushed; }
+  uint32_t wrote = 0;
+  static const char hx[] = "0123456789abcdef";
+  for (uint32_t k = first; k < det_n && wrote < 16; k++, wrote++) {
+    const Det &d = dets[k % MAXDET];
+    char line[MEL16_FRAME_BYTES * 2 + 160];
+    int m = snprintf(line, sizeof line, "%lld,%lu,%lu,%lu,%ld,%d,%u,%.3f,",
+                     (long long)d.utc_us, (unsigned long)d.uptime_s, (unsigned long)d.sample,
+                     (unsigned long)d.pps_n, (long)d.us_since_pps, d.trigger,
+                     (unsigned)d.flags, d.fs_at);
+    for (int j = 0; j < MEL16_FRAME_BYTES && m < (int)sizeof line - 3; j++) {
+      line[m++] = hx[d.frame[j] >> 4]; line[m++] = hx[d.frame[j] & 0xF];
+    }
+    line[m++] = '\n'; detf.write((const uint8_t *)line, m);
+    det_flushed = k + 1;
+  }
+  detf.flush();          // commit: the plug timer can cut power between any two loop iterations
+}
+
 static int16_t blk[BLOCK];
 
 void loop() {
@@ -956,18 +1082,40 @@ void loop() {
 
   { size_t got = i2s.readBytes((char *)blk, sizeof blk);
     int n = got / 2;
+    // Seed the pedestal from the first block rather than ramping to it from zero, which would
+    // otherwise look like a huge transient and fire the gate on every boot.
+    if (!dc_ready && n > 0) {
+      float m = 0; for (int i = 0; i < n; i++) m += (float)blk[i];
+      sig_dc = m / (float)n; dc_ready = true;
+    }
     for (int i = 0; i < n; i++) {
-      aring[aring_w] = blk[i]; aring_w = (aring_w + 1) % ARING; aring_total++;
-      int fired = gate(blk[i]);                 // stateful: exactly one call per sample
+      sig_dc += ALPHA_DC * ((float)blk[i] - sig_dc);
+      int32_t v = (int32_t)lrintf((float)blk[i] - sig_dc);
+      int16_t sac = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+      aring[aring_w] = sac; aring_w = (aring_w + 1) % ARING; aring_total++;
+      int fired = gate(sac);                    // stateful: exactly one call per sample
       if (fired) {
-        uint32_t idx = det_n++;
-        if (idx < MAXDET) {
-          int64_t t = 0; bool tok = local_to_utc((uint64_t)esp_timer_get_time(), &t);
+        uint32_t idx = (det_n++) % MAXDET;
+        {
+          // The block arrives as a unit, so reading the clock here stamps every sample in it
+          // with the moment the block FINISHED. At BLOCK=256 that is up to 15.9 ms late -- 87x
+          // the 183 us budget, and it throws away the 21 ns the GPS is handing us. Back-date by
+          // the samples still to come, at the PPS-disciplined rate rather than the 16 kHz
+          // nominal (which is out by ~5600 ppm).
+          double   fsu     = fs_clean > 1000.0 ? fs_clean : (double)FS_NOMINAL;
+          uint32_t back_us = (uint32_t)((double)(n - 1 - i) * 1e6 / fsu + 0.5);
+          uint64_t cap_us  = (uint64_t)esp_timer_get_time() - back_us;
+          int64_t  off     = (int64_t)cap_us - (int64_t)pps_us_last;
+          uint32_t pn      = pps_count;
+          if (!pn) off = 0;    // pre-lock: there is no edge to be offset FROM. utc_us stays 0.
+          else if (off < 0 && pn > 1) { pn--; off = (int64_t)cap_us - (int64_t)pps_us_prev; }
+          int64_t t = 0; bool tok = local_to_utc(cap_us, &t);
           dets[idx].sample = g_samples + i;
-          dets[idx].pps_n = pps_count;
-          dets[idx].us_since_pps = (uint32_t)((uint64_t)esp_timer_get_time() - pps_us_last);
+          dets[idx].pps_n = pn;
+          dets[idx].us_since_pps = (int32_t)off;
           dets[idx].utc_us = tok ? t : 0;       // 0 = the anchor was not trusted at that instant
-          dets[idx].trigger = blk[i];
+          dets[idx].trigger = sac;
+          dets[idx].fs_at = fsu;
           dets[idx].uptime_s = (millis() - boot_ms) / 1000;
           // Sketch from a little BEFORE the trigger, so the rise the classifier needs is inside
           // the window rather than clipped off its front.
@@ -976,15 +1124,46 @@ void loop() {
           // silence is a legitimate-looking frame of all-equal bands. Flag it rather than ship a
           // number that means nothing. Bit 1 = insufficient context. (Bit 0 is retrigger.)
           uint16_t fl = (aring_total < back) ? 0x0002 : 0x0000;
+          dets[idx].flags = fl;
           sketch_frame(dets[idx].frame, back,
                        (uint32_t)(dets[idx].us_since_pps),
-                       (uint16_t)abs((int)blk[i]), fl);
+                       (uint16_t)abs((int)sac), fl);
         }
       }
-      float a = fabsf((float)blk[i]);
+      float a = fabsf((float)sac);
       if (a > env_peak_seen) env_peak_seen = a;
+      if (a > env_peak_win) env_peak_win = a;
     }
     g_samples += n; }
+
+  // ---- one GPS second of audio, audited ------------------------------------
+  // Each PPS edge is exactly one true second apart, so the samples between two edges ARE the
+  // acquisition rate -- no reliance on the ESP crystal, whose +9 ppm would otherwise creep in.
+  // A second that comes up short lost a block; it is counted and excluded, never averaged in.
+  { static uint32_t seen_edge = 0, prev_sm = 0, win_sm0 = 0, win_e0 = 0;
+    uint32_t e = pps_count;
+    if (e != seen_edge) {
+      uint32_t sm = pps_samp_last;
+      if (seen_edge) {
+        uint32_t d = sm - prev_sm;
+        samp_sec_last = d;
+        if (d < (uint32_t)(0.97 * fs_clean)) {
+          drop_seconds++;
+          drop_samples += (uint32_t)(fs_clean - (double)d);
+          fs_clean_secs = 0;                      // a broken second cannot be averaged over
+        } else {
+          if (!fs_clean_secs) { win_sm0 = prev_sm; win_e0 = e - 1; }
+          fs_clean_secs = e - win_e0;
+          if (fs_clean_secs >= 8) fs_clean = (double)(sm - win_sm0) / (double)fs_clean_secs;
+        }
+      }
+      prev_sm = sm; seen_edge = e;
+    }
+  }
+
+  { static uint32_t last_fl = 0;                  // batch, so the stall is once a second not once a hit
+    if (det_n != det_flushed && millis() - last_fl > 1000) { last_fl = millis(); det_flush(); }
+  }
 
   while (Serial1.available()) {
     char c = Serial1.read();
@@ -1024,17 +1203,46 @@ void loop() {
                   (unsigned long)pps_count, (unsigned long)pps_glitch,
                   (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0));
     if (sd_ok) {   // the radio is a convenience; the card is the record
-      File f = SD.open("/night.csv", FILE_APPEND);
+      // health.csv, not night.csv: the schema gained the acquisition audit and the detection
+      // counters, and silently changing the column count of an existing file makes every row in
+      // it ambiguous. night.csv keeps the earlier bench rows under its own header.
+      // If the schema has changed since the file was started, every row in it becomes ambiguous
+      // -- appending wider rows under a narrower header is worse than starting a new file. Roll
+      // the old one aside once per boot rather than quietly corrupting it.
+      static bool hdr_checked = false;
+      if (!hdr_checked) {
+        hdr_checked = true;
+        File r = SD.open("/health.csv", FILE_READ);
+        if (r) {
+          String first = r.readStringUntil('\n'); r.close();
+          first.trim();
+          if (first.length() && first != String(HEALTH_HDR)) {
+            SD.remove("/health-prev.csv");
+            SD.rename("/health.csv", "/health-prev.csv");
+          }
+        }
+      }
+      File f = SD.open("/health.csv", FILE_APPEND);
       if (f) {
-        if (f.size() == 0) f.println("utc_us,time_valid,uptime_s,fix,sats,tacc_ns,pps,pps_bad,spread_us,esp_ppm,samples,fs_hz");
+        if (f.size() == 0) f.println(HEALTH_HDR);
         int64_t tnow = 0; bool tok = local_to_utc((uint64_t)esp_timer_get_time(), &tnow);
-        f.printf("%lld,%d,%lu,%d,%d,%lu,%lu,%lu,%ld,%.4f,%lu,%.4f\n", (long long)tnow, tok ? 1 : 0,
+        f.printf("%lld,%d,%lu,%d,%d,%lu,%lu,%lu,%ld,%.4f,%lu,%.4f,"
+                 "%.4f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.1f,%.0f,%lu,%d,%.0f,%.1f,%lu,%.1f\n",
+                 (long long)tnow, tok ? 1 : 0,
                  (unsigned long)up, gps_fix, gps_sats, (unsigned long)gps_tacc_ns,
                  (unsigned long)pps_count, (unsigned long)pps_glitch,
                  (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0),
-                 esp_clock_ppm(NULL), (unsigned long)g_samples, fs);
+                 esp_clock_ppm(NULL), (unsigned long)g_samples, fs,
+                 fs_clean, (unsigned long)fs_clean_secs, (unsigned long)drop_seconds,
+                 (unsigned long)drop_samples, (unsigned long)samp_sec_last,
+                 (unsigned long)det_n, (unsigned long)det_flushed, (unsigned long)det_lost,
+                 g_amb, env_peak_win, (unsigned long)ESP.getFreeHeap(),
+                 armed, gate_thr(), env_e_max_win, (unsigned long)gate_forced, sig_dc);
         f.close();
       }
+      env_peak_win = 0.0f;      // per-row peak, so a single loud event does not flatten the night
+      env_e_max_win = 0.0f;
+      det_flush();              // never let the card lag the ring by more than a health interval
     }
   }
 }
