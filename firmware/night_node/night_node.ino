@@ -26,6 +26,7 @@
 #include <Update.h>
 #include "esp_ota_ops.h"
 #include "mel16.h"
+#include "esp_heap_caps.h"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -60,6 +61,15 @@ static const char *WIFI_PASSES[] = {""};
 static volatile uint32_t pps_count = 0;
 static volatile uint64_t pps_us_last = 0, pps_us_first = 0, pps_us_prev = 0;
 static volatile uint32_t pps_samp_last = 0, pps_samp_first = 0;
+// pps_samp_last is g_samples, which advances once per BLOCK -- so it names the last COMPLETED
+// block, not the edge, and is 0-255 samples (0-15.9 ms) early. That is fine for the acquisition
+// audit, which only ever differences it, and NOT fine for the raw ring, whose whole job is to map
+// a sample index to a UTC instant: 15.9 ms is 5.4 m of acoustic path. So the ring gets its own
+// interpolated index, and the audit keeps the block-quantised one it was validated against.
+static volatile uint32_t blk_end_samp = 0;     // g_samples at the last completed block
+static volatile uint64_t blk_end_us   = 0;     // esp_timer at that same instant
+static volatile uint32_t pps_samp_exact = 0;   // interpolated sample index AT the edge
+static volatile uint32_t pps_samp_prev_exact = 0;  // and the one before it, for the mark
 static volatile uint32_t pps_int_min = 0xFFFFFFFF, pps_int_max = 0;
 static volatile uint32_t pps_glitch = 0;
 // A 1 Hz pulse cannot have edges closer than this. Anything faster is noise on the wire, and it
@@ -116,6 +126,14 @@ static void IRAM_ATTR pps_isr() {
     pps_us_first = now; pps_samp_first = sm;
   }
   pps_us_prev = pps_us_last;
+  // Interpolate forward from the last completed block at the nominal rate: 16000/1e6 = 2/125,
+  // integer, no FPU in the ISR. CLAMPED to one block because the reader normally keeps up, so the
+  // true offset is inside [0, BLOCK); if a stall makes the elapsed time longer than that, the
+  // clamp leaves the mark no worse than the block-quantised value it replaces.
+  uint32_t since = (uint32_t)(((now - blk_end_us) * 2ULL) / 125ULL);
+  if (since > (uint32_t)BLOCK) since = (uint32_t)BLOCK;
+  pps_samp_prev_exact = pps_samp_exact;
+  pps_samp_exact = blk_end_samp + since;
   pps_us_last = now; pps_samp_last = sm;
   pps_count++;
   pend_local_us = now; pend_edge_n = pps_count;   // pending: named by the NAV-PVT that follows.
@@ -614,6 +632,268 @@ static double esp_clock_ppm(uint32_t *secs_out) {
   return (us / (double)n / 1e6 - 1.0) * 1e6;
 }
 
+// ---------------------------------------------------------------- raw ring (PSRAM)
+// The sketch is 44 ms of log-mel and only exists when the gate fires. That is enough to say what
+// a transient sounded like to a classifier built beforehand, and useless for anything else: the
+// night produced 45 in-run detections and no way to listen to any of them. (47 is the figure
+// the counter ends on; 45 excludes the two that fired in the first 12 s of that boot, before the
+// mic settled. Both are in the capture.) This ring keeps the
+// last few minutes of actual PCM so a detection can be heard, or re-analysed off-box with a
+// feature the node has never been taught.
+//
+// 240 s x 16000 Hz x 2 B = 7 680 000 B = 7.68 MB, against the 8.34 MB of PSRAM this board
+// reported free at runtime. It fits -- but ps_malloc needs one CONTIGUOUS block and total-free is
+// not largest-free, so ask for progressively less rather than fail outright, and treat failure as
+// a missing feature rather than an error: praw == NULL disables /audio and changes nothing else.
+static int16_t  *praw = NULL;
+static uint32_t  praw_cap = 0;              // samples the ring holds; 0 = not allocated
+static uint32_t  praw_want_s = 0;           // the span that actually got allocated, for the log
+
+// The ring is contiguous in WRITE order, not in time. A lost block leaves no hole in it, and the
+// night lost 18 seconds of 40791 (42749 samples), so reading it back at a flat rate would be
+// wrong by up to that much. Anchor it the way everything else here is anchored instead: one
+// (UTC, sample) pair per GPS second, which stays exact across a drop.
+#define PRAW_MARKS 300                      // >= the longest ring ever allocated, in seconds
+struct RawMark { int64_t utc_us; uint32_t sample; };
+static RawMark  praw_mark[PRAW_MARKS];
+static uint32_t praw_mark_n = 0;            // total ever recorded; slot is n % PRAW_MARKS
+
+static uint32_t praw_oldest() {             // oldest sample index the ring still holds
+  uint32_t now = g_samples;
+  return (praw_cap && now > praw_cap) ? now - praw_cap : 0;
+}
+static uint32_t praw_mark_first() { return praw_mark_n > PRAW_MARKS ? praw_mark_n - PRAW_MARKS : 0; }
+
+// What a mark is worth. Its sample index is interpolated from the last completed block to the
+// edge and clamped to one block, so in steady running it is good to about a sample; if the reader
+// stalls past a block the clamp caps the error at BLOCK = 256 samples = 15.9 ms, which is the
+// error the un-interpolated version carried ALL the time. Between marks we extrapolate from the
+// nearest one and claim nothing, because nothing has been measured there. None of this has been
+// checked against an external reference -- the node has no second clock to check it with -- so
+// treat these as bounds on the arithmetic, not as a measured accuracy.
+static bool sample_to_utc(uint32_t s, int64_t *utc) {
+  if (!praw_mark_n) return false;
+  uint32_t first = praw_mark_first();
+  const RawMark *best = &praw_mark[first % PRAW_MARKS];
+  for (uint32_t k = first; k < praw_mark_n; k++) {
+    const RawMark *m = &praw_mark[k % PRAW_MARKS];
+    if ((int32_t)(m->sample - s) > 0) break;
+    best = m;
+  }
+  double fsu = fs_clean > 1000.0 ? fs_clean : (double)FS_NOMINAL;
+  *utc = best->utc_us + (int64_t)llrint((double)(int32_t)(s - best->sample) * 1e6 / fsu);
+  return true;
+}
+static bool utc_to_sample(int64_t utc, uint32_t *s) {
+  if (!praw_mark_n) return false;
+  uint32_t first = praw_mark_first();
+  const RawMark *best = &praw_mark[first % PRAW_MARKS];
+  for (uint32_t k = first; k < praw_mark_n; k++) {
+    const RawMark *m = &praw_mark[k % PRAW_MARKS];
+    if (m->utc_us > utc) break;
+    best = m;
+  }
+  double fsu = fs_clean > 1000.0 ? fs_clean : (double)FS_NOMINAL;
+  int64_t v = (int64_t)best->sample + (int64_t)llrint((double)(utc - best->utc_us) * fsu / 1e6);
+  if (v < 0) return false;
+  *s = (uint32_t)v;
+  return true;
+}
+
+// ---------------------------------------------------------------- scene feature
+// The detection sketch is an IMPULSE descriptor: 8 frames at hop 64 = 704 samples = 44 ms, and it
+// is gated. Nothing in 11.33 h of running described the BACKGROUND, which is what separates a
+// chorus from a road. All 45 in-run sketches peaked in the bottom mel band, 312-500 Hz -- that
+// is measured, in modules/bioacoustic/README.md, not by this file. This is the
+// scene-scale counterpart -- the node's analogue of the 0.96 s patch hugbot's YAMNet consumes --
+// and it runs whether or not anything triggers.
+//
+// It re-uses the shipped filterbank and window UNCHANGED: MEL16_WIN and MEL16_FB_* are functions
+// of nfft and fs only, not of frame count, so a longer span needs no new tables. The measured
+// +10.6 ppm rate error (16000.169 Hz) is far inside one 62.5 Hz bin of a 256-point FFT, so tables
+// built for 16000.0 stay correct.
+//
+// BLOCK is 256 and MEL16_NFFT is 256, so one I2S block IS one FFT frame. That is deliberate: it
+// lets the descriptor be built 16 ms at a time at a steady 62.5 FFT/s instead of a 64-FFT burst
+// once a second, which would have to finish inside the I2S DMA's 6 x 240 frames = 90 ms of
+// headroom or drop audio. Cost is measured, not assumed -- see scene_fft_us_last and /status.
+#define SCENE_SLICES           4
+#define SCENE_FRAMES_PER_SLICE 16
+#define SCENE_FRAMES (SCENE_SLICES * SCENE_FRAMES_PER_SLICE)   // 64 x 256 = 16384 samples
+static_assert(BLOCK == MEL16_NFFT, "one I2S block must be exactly one scene FFT frame");
+// Card arithmetic, because this writes continuously to a 40 MB partition with 19 MB free:
+// 20 bands x 4 slices = 80 B of mel, hex-encoded to 160 chars, plus ~66 chars of columns and the
+// newline = ~227 B a row. 16384 samples is 1.024 s, so 12 h is 42188 rows = 9.6 MB. That fits
+// alongside health.csv (1360 rows x ~200 B = 0.3 MB per 12 h) and dets.csv, and still leaves the
+// card about half empty. A finer slice would not: 8 slices would be 16 MB and would not fit.
+static const char SCENE_HDR[] =
+  "utc_us,uptime_s,sample,bands,slices,span_ms,ref_db4,frames,fft_us,mel_hex";
+static float    scene_acc[MEL16_BANDS];               // power summed over the slice in progress
+static float    scene_db[MEL16_BANDS * SCENE_SLICES]; // band-major, as sketch_frame's db[]
+static uint32_t scene_frame_i = 0, scene_slice_i = 0;
+// Where the row in progress started. NOT derived from g_samples at emit time: a short I2S read is
+// skipped rather than padded, so the 64 frames of a row are not guaranteed to be 16384 contiguous
+// samples. Recording the index when the row opens keeps the row honest across that.
+static uint32_t scene_start = 0;
+static uint32_t scene_rows = 0;             // rows produced, card or no card
+static uint32_t scene_written = 0;          // rows that actually reached it. det_n/det_written
+                                            // exist for the same reason (commit 812ab4c): a row
+                                            // counted on intent makes a dead card read as healthy.
+static uint32_t scene_short_blocks = 0;     // I2S reads that came up short of a whole frame
+static uint32_t scene_write_fail = 0;
+static uint32_t scene_fft_us = 0;           // accumulating over the row in progress
+static uint32_t scene_fft_us_last = 0;      // us of FFT+filterbank per 1.024 s row, MEASURED
+static uint32_t scene_fft_us_max = 0;
+static File     scenef;
+
+// ---------------------------------------------------------------- append-CSV, header guaranteed
+// Every durable record this node keeps is an append-only CSV whose first line must be its header,
+// and there are three ways that has actually failed here:
+//
+//   1. The file does not exist yet. Obvious, and the only one the original code handled.
+//   2. It exists and is EMPTY. size()==0 catches this; SD.exists() alone does not, and a fix
+//      written with exists() alone reintroduces exactly the headerless file it set out to remove.
+//   3. It exists with a DIFFERENT header, or -- as happened over the 11.33 h run -- with no header
+//      at all. Appending to that makes every row in the file ambiguous, so the old file is rolled
+//      aside instead. This is also what repairs a headerless file: its first line does not match,
+//      so it is preserved under <name>-prev.csv and a correct one is started.
+//
+// Why size() is not used to decide (2) before opening: FS::size() returns VFSFileImpl::_stat
+// .st_size, filled by a stat() run BEFORE the open (core 3.0.5, vfs_api.cpp:274). On a file the
+// open CREATES that stat fails, _stat is left uninitialised, and size() returns heap garbage --
+// deterministic per build, which is how both CSVs ran a whole night with no header. So existence
+// is tested first, with exists(), and size() is consulted only on a file already known to be there.
+static File csv_open(const char *path, const char *prev, const char *hdr) {
+  bool fresh = !SD.exists(path);
+  if (!fresh) {
+    File r = SD.open(path, FILE_READ);
+    if (r) {
+      String first = r.readStringUntil('\n'); r.close(); first.trim();
+      if (first.length() == 0) {
+        fresh = true;                       // empty: just write the header, nothing to preserve
+      } else if (first != String(hdr)) {
+        SD.remove(prev);
+        // An unchecked rename appends new-schema rows under the old header -- the exact ambiguity
+        // the roll exists to prevent. Say so rather than corrupt quietly.
+        if (SD.rename(path, prev)) { fresh = true; logf("sd    rolled %s -> %s (header changed)\n", path, prev); }
+        else logf("sd    could NOT roll %s aside -- this boot's rows land under the old header\n", path);
+      }
+    }
+  }
+  File f = SD.open(path, FILE_APPEND);
+  if (f && (fresh || f.size() == 0)) f.println(hdr);
+  return f;
+}
+
+static void scene_emit() {
+  scene_fft_us_last = scene_fft_us;
+  if (scene_fft_us > scene_fft_us_max) scene_fft_us_max = scene_fft_us;
+  scene_fft_us = 0;
+  scene_rows++;
+  uint32_t start = scene_start;
+  int64_t utc = 0;
+  sample_to_utc(start, &utc);               // 0 = no PPS anchor yet, same convention as dets.csv
+  float ref = scene_db[0];
+  for (int i = 1; i < MEL16_BANDS * SCENE_SLICES; i++) if (scene_db[i] > ref) ref = scene_db[i];
+  if (!sd_ok) return;
+  if (!scenef) {
+    scenef = csv_open("/scene.csv", "/scene-prev.csv", SCENE_HDR);
+    if (!scenef) return;
+  }
+  char line[MEL16_BANDS * SCENE_SLICES * 2 + 160];
+  int m = snprintf(line, sizeof line, "%lld,%lu,%lu,%d,%d,%d,%d,%d,%lu,",
+                   (long long)utc, (unsigned long)((millis() - boot_ms) / 1000),
+                   (unsigned long)start, MEL16_BANDS, SCENE_SLICES,
+                   (int)((uint32_t)SCENE_FRAMES * MEL16_NFFT * 1000u / FS_NOMINAL),
+                   (int)lrintf(ref * 4.0f), SCENE_FRAMES, (unsigned long)scene_fft_us_last);
+  static const char hx[] = "0123456789abcdef";
+  for (int i = 0; i < MEL16_BANDS * SCENE_SLICES && m < (int)sizeof line - 3; i++) {
+    float v = roundf((scene_db[i] - ref) * 2.0f);      // 0.5 dB steps, as the detection sketch
+    uint8_t q = (uint8_t)(int8_t)(v < -128 ? -128 : (v > 127 ? 127 : v));
+    line[m++] = hx[q >> 4]; line[m++] = hx[q & 0xF];
+  }
+  line[m++] = '\n';
+  // Short write closes the handle so the next row reopens, exactly as det_flush does: leaving it
+  // open turns a transient card error into a permanent silent stop.
+  if (scenef.write((const uint8_t *)line, m) != (size_t)m) { scene_write_fail++; scenef.close(); }
+  else scene_written++;
+}
+
+// One 256-sample frame into the slice accumulator. Shares fft_re/fft_im with sketch_frame, which
+// is safe only because both are called from the loop task and never concurrently -- putting
+// either on a second FreeRTOS task would need its own buffers.
+static void scene_frame(const int16_t *s) {
+  if (!scene_frame_i && !scene_slice_i) scene_start = g_samples - MEL16_NFFT;
+  uint32_t t0 = (uint32_t)esp_timer_get_time();
+  for (int i = 0; i < MEL16_NFFT; i++) {
+    fft_re[i] = (float)s[i] * MEL16_WIN[i]; fft_im[i] = 0.0f;
+  }
+  fft256();
+  const float *w = MEL16_FB_W;
+  for (int b = 0; b < MEL16_BANDS; b++) {
+    int lo = MEL16_FB_LO[b], cnt = MEL16_FB_N[b];
+    float acc = 0.0f;
+    for (int i = 0; i < cnt; i++) {
+      int bin = lo + i; acc += w[i] * (fft_re[bin] * fft_re[bin] + fft_im[bin] * fft_im[bin]);
+    }
+    w += cnt;
+    scene_acc[b] += acc;
+  }
+  scene_fft_us += (uint32_t)esp_timer_get_time() - t0;
+  if (++scene_frame_i < SCENE_FRAMES_PER_SLICE) return;
+  scene_frame_i = 0;
+  // Mean power over the slice, then dB. Averaging power and not dB, so a single loud frame does
+  // not dominate the slice through the log.
+  for (int b = 0; b < MEL16_BANDS; b++) {
+    scene_db[b * SCENE_SLICES + scene_slice_i] =
+      10.0f * log10f(scene_acc[b] / (float)SCENE_FRAMES_PER_SLICE + 1e-12f);
+    scene_acc[b] = 0.0f;
+  }
+  if (++scene_slice_i < SCENE_SLICES) return;
+  scene_slice_i = 0;
+  scene_emit();
+}
+
+// ---------------------------------------------------------------- /audio limits and WAV
+// Serving the whole ring is 7.68 MB, and WiFi on this node measured 335 kB/s, so that is ~23 s
+// inside one handler. The I2S DMA holds 6 x 240 frames = 90 ms, so a handler that does not drain
+// it would throw away more audio than the entire night lost (18 s of 40791). Hence: bounded
+// requests, and the loop's own audio path pumped between chunks -- the same reason /tp pumps
+// Serial1 rather than delay()ing.
+#define AUDIO_MAX_S   30
+// 4096 B is 12 ms of link time at the measured 335 kB/s, against the 16 ms of audio that one
+// pumped block covers, so the DMA drains faster than it fills. The pump then paces the loop at one
+// block per iteration, which is 62.5 x 4096 = 256 kB/s -- arithmetic from the block rate, not a
+// throughput anyone has measured on this endpoint yet.
+#define AUDIO_CHUNK_B 4096
+// ESP_I2S.cpp ships dma_desc_num 6 x dma_frame_num 240 = 1440 samples = 90 ms, so six BLOCKs is
+// everything the peripheral can be holding. Asking for more would block on audio that does not
+// exist yet.
+#define AUDIO_PUMP_MAX 6
+// The writer does not stop while the response is sent, so refuse to serve the oldest part of the
+// ring. By that arithmetic a 30 s request takes about 4 s, in which the head advances 4 s of
+// samples; 16 s covers it even if the link turns out four times slower than the 335 kB/s measured.
+#define AUDIO_GUARD_S 16
+
+// Canonical 44-byte PCM WAV header. The rate field is an integer and cannot carry the measured
+// 16000.169 Hz, so the exact figure goes out in X-Audio-Fs-Hz instead; anything doing timing work
+// must use that and not what the WAV claims.
+static void wav_header(uint8_t *h, uint32_t data_bytes, uint32_t fs) {
+  uint32_t riff = 36 + data_bytes, brate = fs * 2;
+  memcpy(h, "RIFF", 4);
+  h[4] = riff; h[5] = riff >> 8; h[6] = riff >> 16; h[7] = riff >> 24;
+  memcpy(h + 8, "WAVEfmt ", 8);
+  h[16] = 16; h[17] = 0; h[18] = 0; h[19] = 0;      // fmt chunk length
+  h[20] = 1;  h[21] = 0;                            // PCM
+  h[22] = 1;  h[23] = 0;                            // mono
+  h[24] = fs; h[25] = fs >> 8; h[26] = fs >> 16; h[27] = fs >> 24;
+  h[28] = brate; h[29] = brate >> 8; h[30] = brate >> 16; h[31] = brate >> 24;
+  h[32] = 2;  h[33] = 0;                            // block align
+  h[34] = 16; h[35] = 0;                            // bits per sample
+  memcpy(h + 36, "data", 4);
+  h[40] = data_bytes; h[41] = data_bytes >> 8; h[42] = data_bytes >> 16; h[43] = data_bytes >> 24;
+}
+
 static double measured_fs() {
   if (pps_count < 3) return 0.0;
   double secs = (double)(pps_us_last - pps_us_first) / 1e6;
@@ -627,7 +907,11 @@ static String status_json() {
   bool tv = local_to_utc(nowl, &utc_now);
   uint64_t since_edge = pps_count ? (nowl - edge_local_us) : 0;
   (void)tv;
-  char b[1536];
+  uint32_t r_new = g_samples, r_old = praw_oldest();
+  uint32_t r_held = praw_cap ? r_new - r_old : 0;
+  int64_t  r_from = 0, r_to = 0;
+  if (praw_cap) { sample_to_utc(r_old, &r_from); sample_to_utc(r_new, &r_to); }
+  char b[2048];
   snprintf(b, sizeof b,
     "{\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
@@ -642,6 +926,13 @@ static String status_json() {
     "\"ambient\":%.1f,\"env_peak\":%.0f},"
     "\"gate\":{\"armed\":%d,\"thr\":%.0f,\"e_max_win\":%.1f,\"headroom\":%.2f,"
     "\"forced_rearms\":%lu,\"dc\":%.1f},\"write_fail\":%lu,"
+    // raw: what /audio can actually serve. span_s is what was allocated, held_s what has been
+    // written into it so far -- they differ only for the first few minutes after a boot.
+    "\"raw\":{\"span_s\":%.1f,\"cap_samples\":%lu,\"held_samples\":%lu,\"fill_pct\":%.1f,"
+    "\"from_utc_us\":%lld,\"to_utc_us\":%lld,\"marks\":%lu,\"bytes\":%lu},"
+    // scene: fft_us_per_row is MEASURED on this part, summed over the 64 frames of one row.
+    "\"scene\":{\"rows\":%lu,\"written\":%lu,\"row_span_ms\":%d,\"fft_us_per_row\":%lu,\"fft_us_max\":%lu,"
+    "\"short_blocks\":%lu,\"write_fail\":%lu},"
     "\"sd\":%s,\"sd_free_mb\":%lu,\"sd_total_mb\":%lu,\"i2c\":\"%s\"}",
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
@@ -664,6 +955,15 @@ static String status_json() {
     g_amb, env_peak_seen,
     armed, gate_thr(), env_e_max_win, env_e_max_win / gate_thr(),
     (unsigned long)gate_forced, sig_dc, (unsigned long)det_write_fail,
+    praw_cap ? (double)praw_cap / (fs_clean > 1000.0 ? fs_clean : (double)FS_NOMINAL) : 0.0,
+    (unsigned long)praw_cap, (unsigned long)r_held,
+    praw_cap ? 100.0 * (double)r_held / (double)praw_cap : 0.0,
+    (long long)r_from, (long long)r_to, (unsigned long)praw_mark_n,
+    (unsigned long)(praw_cap * 2UL),
+    (unsigned long)scene_rows, (unsigned long)scene_written,
+    (int)((uint32_t)SCENE_FRAMES * MEL16_NFFT * 1000u / FS_NOMINAL),
+    (unsigned long)scene_fft_us_last, (unsigned long)scene_fft_us_max,
+    (unsigned long)scene_short_blocks, (unsigned long)scene_write_fail,
     sd_ok ? "true" : "false",
     (unsigned long)(sd_ok ? (SD.totalBytes() - SD.usedBytes()) / 1048576UL : 0UL),
     (unsigned long)(sd_ok ? SD.totalBytes() / 1048576UL : 0UL), i2c_found);
@@ -687,6 +987,8 @@ static void h_root() {
              "`<tr><td>I2S measured<td><b>${f}</b>`+`<tr><td>UTC now<td><b>${s.time.valid?new Date(s.time.utc_us/1000).toISOString():'anchor not valid'}</b> &middot; ${(s.time.since_edge_us/1000).toFixed(0)} ms since edge, ${s.time.label_rejects} rejected`+`<tr><td>ESP clock vs GPS<td><b>${s.esp_clock.pps_intervals>2?s.esp_clock.ppm_vs_gps.toFixed(3)+' ppm':'need 3 PPS edges'}</b> over ${s.esp_clock.pps_intervals} s`+"
              "`<tr><td>samples<td>${s.i2s.samples}`+"
              "`<tr><td>detections<td><b>${s.audio.detections}</b> (env peak ${s.audio.env_peak})`+"
+             "`<tr><td>raw ring<td>${s.raw.span_s?s.raw.span_s.toFixed(0)+' s, '+s.raw.fill_pct.toFixed(0)+'% written, '+(s.raw.bytes/1048576).toFixed(2)+' MB PSRAM':'<b>not allocated</b>'}`+"
+             "`<tr><td>scene<td>${s.scene.rows} rows &middot; FFT <b>${s.scene.fft_us_per_row} us</b> per ${s.scene.row_span_ms} ms (peak ${s.scene.fft_us_max})`+"
              "`<tr><td>SD<td>${s.sd}`+`<tr><td>I2C<td>${s.i2c}`+`<tr><td>heap / psram<td>${s.heap} / ${s.psram}`;}"
              "u();setInterval(u,2000);</script>";
   http.send(200, "text/html", p);
@@ -840,6 +1142,28 @@ void setup() {
   if (!i2s.begin(I2S_MODE_PDM_RX, FS_NOMINAL, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO))
     logln("i2s   FAILED");
   else logf("i2s   PDM %d Hz on CLK=%d DIN=%d\n", FS_NOMINAL, PDM_CLK, PDM_DIN);
+
+  // Raw ring. Ask for 240 s (7.68 MB of the 8.34 MB free) and step down rather than fail: what
+  // matters is largest CONTIGUOUS free block, which total-free does not report. Log the span that
+  // was actually obtained -- a silent failure here would look identical to a quiet night, which is
+  // the failure class env_e_max_win already exists to rule out.
+  {
+    static const uint32_t want_s[] = {240, 180, 120, 60, 30};
+    for (unsigned k = 0; k < sizeof(want_s) / sizeof(want_s[0]) && !praw; k++) {
+      size_t want = (size_t)want_s[k] * FS_NOMINAL * sizeof(int16_t);
+      // Leave 256 kB of PSRAM behind: WiFi buffers and the web server allocate from it too, and a
+      // ring that takes the last byte would trade audio for a node that cannot be reached.
+      if (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) < want + 262144) continue;
+      praw = (int16_t *)ps_malloc(want);
+      if (praw) { praw_cap = want_s[k] * FS_NOMINAL; praw_want_s = want_s[k]; }
+    }
+    if (praw)
+      logf("praw  raw ring %lu s = %lu kB PSRAM, %lu kB PSRAM still free\n",
+           (unsigned long)praw_want_s, (unsigned long)(praw_cap * 2UL / 1024UL),
+           (unsigned long)(ESP.getFreePsram() / 1024UL));
+    else
+      logln("praw  NO PSRAM ring -- /audio is disabled; capture, gate and logging are unaffected");
+  }
 
   http.on("/", h_root); http.on("/status", h_status); http.on("/detections", h_dets);
   http.on("/update", HTTP_POST,
@@ -1037,6 +1361,103 @@ void setup() {
     http.send(200, "text/plain", o);
   });
   http.on("/i2c", []() { i2c_scan(); http.send(200, "text/plain", i2c_found); });   // rescan on demand
+  http.on("/audio", []() {
+    // Bare /audio answers "what is retrievable?" so a caller never has to guess a window; with
+    // ?from=<utc_us>&dur=<s> it returns that window as a playable WAV.
+    double   fsu = fs_clean > 1000.0 ? fs_clean : (double)FS_NOMINAL;
+    uint32_t newest = g_samples;
+    uint32_t lo = praw_oldest();
+    // A flat 16 s guard would swallow half of a 30 s fallback ring, so cap it at a third.
+    if (praw_cap && newest > praw_cap) {
+      uint32_t g = (uint32_t)AUDIO_GUARD_S * FS_NOMINAL;
+      if (g > praw_cap / 3) g = praw_cap / 3;
+      lo += g;
+    }
+    int64_t lo_utc = 0, hi_utc = 0;
+    bool span_ok = praw && sample_to_utc(lo, &lo_utc) && sample_to_utc(newest, &hi_utc);
+    if (!http.hasArg("from")) {
+      char b[512];
+      snprintf(b, sizeof b,
+        // addressable_samples, NOT held_samples: /status reports everything the ring holds, this
+        // reports what is safe to ASK for, which is smaller by the overwrite guard. Same quantity
+        // under one name in two places would be a label that drifts from what it describes.
+        "{\"ring\":%s,\"span_s\":%.1f,\"cap_samples\":%lu,\"addressable_samples\":%lu,"
+        "\"fs_hz\":%.4f,\"addressable\":%s,\"from_utc_us\":%lld,\"to_utc_us\":%lld,"
+        "\"max_dur_s\":%d,\"usage\":\"/audio?from=<utc_us>&dur=<seconds>\"}",
+        praw ? "true" : "false",
+        praw_cap ? (double)praw_cap / fsu : 0.0, (unsigned long)praw_cap,
+        (unsigned long)(praw_cap && newest > lo ? newest - lo : 0), fsu,
+        span_ok ? "true" : "false", (long long)lo_utc, (long long)hi_utc, AUDIO_MAX_S);
+      http.send(200, "application/json", b);
+      return;
+    }
+    if (!praw) { http.send(503, "text/plain", "no PSRAM ring: allocation failed at boot\n"); return; }
+    if (!span_ok) {
+      http.send(503, "text/plain", "no PPS/UTC anchor yet -- the ring cannot be addressed by time\n");
+      return;
+    }
+    int64_t from = strtoll(http.arg("from").c_str(), NULL, 10);
+    float dur = http.hasArg("dur") ? http.arg("dur").toFloat() : 5.0f;
+    if (!(dur > 0.0f)) dur = 5.0f;
+    if (dur > (float)AUDIO_MAX_S) dur = (float)AUDIO_MAX_S;
+    uint32_t s0;
+    if (!utc_to_sample(from, &s0)) { http.send(400, "text/plain", "cannot map that time\n"); return; }
+    // Clamp to what is actually held and SAY SO in a header. Silently returning a shorter file is
+    // how a caller ends up believing it has audio either side of an event that it does not have.
+    int64_t want0 = (int64_t)s0, want1 = want0 + (int64_t)llrint((double)dur * fsu);
+    int64_t got0 = want0 < (int64_t)lo ? (int64_t)lo : want0;
+    int64_t got1 = want1 > (int64_t)newest ? (int64_t)newest : want1;
+    const char *clip = (got0 > want0) ? (got1 < want1 ? "both" : "head")
+                                      : (got1 < want1 ? "tail" : "none");
+    if (got1 <= got0) {
+      http.sendHeader("X-Audio-Clipped", "all");
+      http.send(416, "text/plain", "that window is not in the ring\n");
+      return;
+    }
+    uint32_t nout = (uint32_t)(got1 - got0);
+    int64_t out_utc = 0; sample_to_utc((uint32_t)got0, &out_utc);
+    char v[48];
+    snprintf(v, sizeof v, "%lld", (long long)out_utc); http.sendHeader("X-Audio-From-Utc-Us", v);
+    snprintf(v, sizeof v, "%lu", (unsigned long)nout); http.sendHeader("X-Audio-Samples", v);
+    snprintf(v, sizeof v, "%.4f", fsu);                http.sendHeader("X-Audio-Fs-Hz", v);
+    http.sendHeader("X-Audio-Clipped", clip);
+    snprintf(v, sizeof v, "%lld", (long long)lo_utc);  http.sendHeader("X-Audio-Ring-From-Utc-Us", v);
+    snprintf(v, sizeof v, "%lld", (long long)hi_utc);  http.sendHeader("X-Audio-Ring-To-Utc-Us", v);
+    http.sendHeader("Content-Disposition", "inline; filename=\"audio.wav\"");
+    // Content-Length is the header plus exactly the samples being sent. streamFile() advertising
+    // f.size() regardless of a seek is what made /sd promise a whole file and deliver a fragment;
+    // the same mistake here would be a WAV whose header and body disagree.
+    http.setContentLength(44 + (size_t)nout * 2);
+    http.send(200, "audio/wav", "");
+    WiFiClient c = http.client();
+    uint8_t hdr[44];
+    wav_header(hdr, nout * 2, (uint32_t)lrint(fsu));
+    c.write(hdr, sizeof hdr);
+    static uint8_t obuf[AUDIO_CHUNK_B];
+    uint64_t t_prev = (uint64_t)esp_timer_get_time();
+    uint32_t s = (uint32_t)got0, left = nout;
+    while (left && c.connected()) {
+      uint32_t nsamp = left > AUDIO_CHUNK_B / 2 ? AUDIO_CHUNK_B / 2 : left;
+      uint32_t idx = s % praw_cap;
+      uint32_t run = praw_cap - idx; if (run > nsamp) run = nsamp;
+      memcpy(obuf, praw + idx, (size_t)run * 2);
+      if (run < nsamp) memcpy(obuf + run * 2, praw, (size_t)(nsamp - run) * 2);
+      if (c.write(obuf, (size_t)nsamp * 2) != (size_t)nsamp * 2) break;
+      s += nsamp; left -= nsamp;
+      // The mic does not stop for a download. Drain by ELAPSED TIME rather than one block per
+      // chunk: a block is 16 ms of audio, so a fixed one-per-chunk only keeps up above roughly
+      // 256 kB/s, and below that the DMA's 90 ms overruns after a few chunks and stays overrun
+      // for the rest of the download -- losing more audio than the whole night did. Capped at
+      // the DMA depth, because past that the samples are already gone and blocking here to ask
+      // for them would only widen the hole.
+      uint64_t t_now = (uint64_t)esp_timer_get_time();
+      uint32_t due = (uint32_t)((((t_now - t_prev) * 2ULL) / 125ULL) / (uint32_t)BLOCK);
+      if (due < 1) due = 1;
+      if (due > AUDIO_PUMP_MAX) due = AUDIO_PUMP_MAX;
+      for (uint32_t k = 0; k < due; k++) audio_pump();
+      t_prev = (uint64_t)esp_timer_get_time();
+    }
+  });
   fft_init();
   http.begin();
   logln("http  up\n");
@@ -1049,16 +1470,16 @@ void setup() {
 // drops the very audio we are here to capture. Whatever that flush still costs now shows up in
 // drop_seconds, so the cost is measured rather than assumed.
 static File detf;
-static bool det_hdr_done = false;
+static const char DETS_HDR[] =
+  "utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,frame_hex";
 
 static void det_flush() {
   if (!sd_ok || det_flushed == det_n) return;
   if (!detf) {
-    detf = SD.open("/dets.csv", FILE_APPEND);
+    // The old det_hdr_done latch is gone: it was set even when the header had NOT been written,
+    // so a card swapped mid-run could never get one.
+    detf = csv_open("/dets.csv", "/dets-prev.csv", DETS_HDR);
     if (!detf) return;
-    if (!det_hdr_done && detf.size() == 0)
-      detf.println("utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,frame_hex");
-    det_hdr_done = true;
   }
   // If more than MAXDET landed since the last flush, the oldest slots have already been
   // overwritten. Count them as lost instead of writing whatever occupies the slot now.
@@ -1089,10 +1510,15 @@ static void det_flush() {
 }
 
 static int16_t blk[BLOCK];
+// The DC-blocked copy of the same block, kept contiguous: the PSRAM ring then takes one memcpy
+// instead of a modulo and an uncached external-RAM store per sample, and the scene FFT has a
+// whole frame to read without walking aring's wrap.
+static int16_t dcblk[BLOCK];
 
-void loop() {
-  http.handleClient();
-
+// One I2S block: DC-block, ring, gate, sketch, raw ring, scene frame. Factored out of loop()
+// because /audio has to keep calling it while it streams -- the I2S DMA is 6 x 240 frames = 90 ms
+// and a handler that does not drain it loses audio.
+static void audio_pump() {
   { size_t got = i2s.readBytes((char *)blk, sizeof blk);
     int n = got / 2;
     // Seed the pedestal from the first block rather than ramping to it from zero, which would
@@ -1106,6 +1532,7 @@ void loop() {
       int32_t v = (int32_t)lrintf((float)blk[i] - sig_dc);
       int16_t sac = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
       aring[aring_w] = sac; aring_w = (aring_w + 1) % ARING; aring_total++;
+      dcblk[i] = sac;
       int fired = gate(sac);                    // stateful: exactly one call per sample
       if (fired) {
         uint32_t idx = (det_n++) % MAXDET;
@@ -1147,7 +1574,26 @@ void loop() {
       if (a > env_peak_seen) env_peak_seen = a;
       if (a > env_peak_win) env_peak_win = a;
     }
-    g_samples += n; }
+    // The DC-BLOCKED samples go into the raw ring, not the raw ones: the pedestal drifted
+    // 1093.9 -> 1439.6 over the night, so raw audio carries a moving offset a consumer would only
+    // have to remove again, and the ring would not match what the gate and the sketch saw.
+    // sig_dc is in health.csv if the pedestal is ever wanted back.
+    if (praw && n > 0) {
+      uint32_t w = g_samples % praw_cap;               // g_samples is this block's first sample
+      uint32_t run = praw_cap - w; if (run > (uint32_t)n) run = (uint32_t)n;
+      memcpy(praw + w, dcblk, (size_t)run * 2);
+      if ((uint32_t)n > run) memcpy(praw, dcblk + run, (size_t)((uint32_t)n - run) * 2);
+    }
+    g_samples += n;
+    blk_end_samp = g_samples; blk_end_us = (uint64_t)esp_timer_get_time();
+    // One block IS one scene frame (BLOCK == MEL16_NFFT), so the 1.024 s descriptor is built
+    // 16 ms at a time. A short read cannot be a frame; count it rather than pad it with silence.
+    if (n == BLOCK) scene_frame(dcblk); else scene_short_blocks++; }
+}
+
+void loop() {
+  http.handleClient();
+  audio_pump();
 
   // ---- one GPS second of audio, audited ------------------------------------
   // Each PPS edge is exactly one true second apart, so the samples between two edges ARE the
@@ -1160,6 +1606,27 @@ void loop() {
       if (seen_edge) {
         uint32_t d = sm - prev_sm;
         samp_sec_last = d;
+        // Anchor the raw ring: a (UTC, sample) pair for the PREVIOUS edge, which local_to_utc
+        // will only name once its NAV-PVT has landed -- and if it has not, the pair is skipped
+        // rather than guessed. (I had a figure here for how late that report arrives; it was not
+        // measured and is gone. The code never depended on it: local_to_utc either names the edge
+        // or refuses.) Only when exactly one edge has passed, because a blocking handler can
+        // straddle two, and then the timestamp and the sample count describe different seconds.
+        if (e - seen_edge == 1) {
+          // The ISR writes the timestamp and the sample index as a set. Read them, then re-read
+          // the edge counter: if an edge landed between the two reads, the pair is mismatched by
+          // a whole second -- 343 m -- so throw it away rather than record it.
+          uint64_t mus = pps_us_prev;
+          uint32_t msamp = pps_samp_prev_exact;
+          if (pps_count == e) {
+            int64_t mu;
+            if (local_to_utc(mus, &mu)) {
+              praw_mark[praw_mark_n % PRAW_MARKS].utc_us = mu;
+              praw_mark[praw_mark_n % PRAW_MARKS].sample = msamp;
+              praw_mark_n++;
+            }
+          }
+        }
         if (d < (uint32_t)(0.97 * fs_clean)) {
           drop_seconds++;
           drop_samples += (uint32_t)(fs_clean - (double)d);
@@ -1219,25 +1686,12 @@ void loop() {
       // health.csv, not night.csv: the schema gained the acquisition audit and the detection
       // counters, and silently changing the column count of an existing file makes every row in
       // it ambiguous. night.csv keeps the earlier bench rows under its own header.
-      // If the schema has changed since the file was started, every row in it becomes ambiguous
-      // -- appending wider rows under a narrower header is worse than starting a new file. Roll
-      // the old one aside once per boot rather than quietly corrupting it.
-      static bool hdr_checked = false;
-      if (!hdr_checked) {
-        hdr_checked = true;
-        File r = SD.open("/health.csv", FILE_READ);
-        if (r) {
-          String first = r.readStringUntil('\n'); r.close();
-          first.trim();
-          if (first.length() && first != String(HEALTH_HDR)) {
-            SD.remove("/health-prev.csv");
-            SD.rename("/health.csv", "/health-prev.csv");
-          }
-        }
-      }
-      File f = SD.open("/health.csv", FILE_APPEND);
+      // The roll's rename is what made the header bug bite: before it, /health.csv always existed
+      // at open time so stat() succeeded and size() was real; the rename made the very next open a
+      // CREATE, the one path that reaches the uninitialised _stat. csv_open handles all of it, and
+      // handles it identically for all three records.
+      File f = csv_open("/health.csv", "/health-prev.csv", HEALTH_HDR);
       if (f) {
-        if (f.size() == 0) f.println(HEALTH_HDR);
         int64_t tnow = 0; bool tok = local_to_utc((uint64_t)esp_timer_get_time(), &tnow);
         f.printf("%lld,%d,%lu,%d,%d,%lu,%lu,%lu,%ld,%.4f,%lu,%.4f,"
                  "%.4f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.1f,%.0f,%lu,%d,%.0f,%.1f,%lu,%.1f,%lu,%lu\n",
@@ -1255,6 +1709,10 @@ void loop() {
                  (unsigned long)det_write_fail);
         f.close();
       }
+      // scene.csv is held open and written every 1.024 s; committing it costs the same 20-50 ms
+      // as any other card flush, so it happens on the 30 s health interval rather than per row.
+      // The exposure is up to 30 rows (~7 kB) if the plug timer cuts power mid-interval.
+      if (scenef) scenef.flush();
       env_peak_win = 0.0f;      // per-row peak, so a single loud event does not flatten the night
       env_e_max_win = 0.0f;
       det_flush();              // never let the card lag the ring by more than a health interval

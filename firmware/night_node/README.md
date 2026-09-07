@@ -47,16 +47,144 @@ LED swings: through an LED and series resistor only one side is a usable edge.
 `/detections` lists what the gate fired on.
 
 The SD card is the actual record. WiFi is a convenience and an overnight run must not depend on
-it. Two files, both fetchable over the same link with `/sd?file=/dets.csv&tail=20000`:
+it. Three files, all fetchable over the same link with `/sd?file=/dets.csv&tail=20000`:
 
 | file | written | holds |
 |---|---|---|
 | `dets.csv` | as detections fire, batched once a second | one row per detection: `utc_us`, `sample`, `pps_n`, signed `us_since_pps`, `trigger`, `flags`, the rate it was timed at, and the log-mel sketch as hex |
 | `health.csv` | every 30 s | GPS and PPS quality, the acquisition audit, gate state, detection counters, card space |
+| `scene.csv` | every 1.024 s, ungated | the scene descriptor — 20 bands × 4 quarter-second slices of log-mel, hex, plus the microseconds its FFTs cost |
 
 `night.csv` is the older, narrower health schema and is no longer written. If the health schema
 changes again the node rolls the old file to `health-prev.csv` rather than appending wider rows
 under a narrower header, which would make every row in it ambiguous.
+
+### The header row was missing for 11.33 h, and it was not the CSV code
+
+An 11.33 h run produced `health.csv` and `dets.csv` with **no header row at all**, and
+`health-prev.csv` had none either. The writer looked correct: open `FILE_APPEND`, `if (f.size() ==
+0)` write the header.
+
+`File::size()` is the bug. In esp32 core 3.0.5 `VFSFileImpl::size()` returns `_stat.st_size` and
+only re-`stat`s when the file has been written (`vfs_api.cpp:406`). `_stat` is a plain member that
+the constructor never initialises — it is filled by one `stat()` run **before** the open
+(`vfs_api.cpp:274`), and on a file the open is about to *create* that `stat()` fails and leaves
+`_stat` untouched. So on a freshly created file `size()` returns whatever was on the heap:
+deterministic per build, because the same allocation sequence repeats every 30 s.
+
+Which is why it appeared exactly at the schema roll. Before it, `/health.csv` always existed at
+open time and `size()` was real. The roll's `rename` makes the very next open a *create* — the only
+path that reaches the uninitialised `_stat`. And it was self-perpetuating: the headerless file
+failed the schema check on the next boot, rolled itself aside, and destroyed the last file that
+still carried the old header.
+
+Both writers now ask `SD.exists()` before opening, which opens `"r"` and tests the handle and is
+therefore also correct for a file that exists and is empty. The `det_hdr_done` latch went with it —
+it was set even when the header had *not* been written, so a card swapped mid-run could never get
+one — and the `SD.rename` that rolls the old schema aside is now checked and logged.
+
+## The last four minutes of audio, in PSRAM
+
+The detection sketch is 44 ms of log-mel and only exists when the gate fires. That is enough for a
+classifier built beforehand and useless for anything else: the 11.33 h run produced 45 in-run
+detections and no way to listen to a single one. (The counter ends on 47; 45 leaves out the two
+that fired in the first 12 s of that boot, before the mic had settled. Both are in the capture.)
+
+`praw` is a rolling raw-PCM ring in PSRAM. 240 s × 16000 Hz × 2 B = **7.68 MB** against the 8.34 MB
+the board reports free. `ps_malloc` needs one *contiguous* block and total-free is not
+largest-free, so boot asks for 240 s and steps down through 180/120/60/30 rather than failing, and
+keeps 256 kB of PSRAM back for WiFi. **A failed allocation is not an error** — `/audio` goes away
+and capture, gating and logging are untouched. The boot log says which span was obtained, because a
+silent failure here would look exactly like a quiet night.
+
+It holds the **DC-blocked** samples, not the raw ones: the pedestal drifted 1093.9 → 1439.6 over
+the night, so raw audio carries a moving offset a consumer would only have to remove again, and the
+ring would not match what the gate and the sketch saw. `gate.dc` / `sig_dc` recovers the pedestal if
+it is ever wanted.
+
+The ring is contiguous in **write order, not in time**. A lost block leaves no hole in it, and the
+night lost 18 seconds of 40791 (42749 samples), so reading it back at a flat rate would be wrong by
+up to that much. So it is anchored the way everything else here is: one `(UTC, sample)` pair per GPS
+second, 300 of them, recorded for the *previous* edge, because `local_to_utc` will only name an
+edge whose NAV-PVT has arrived — and if it has not, the pair is skipped rather than guessed. There
+was a figure here for how late that report arrives. It was never measured, so it is gone; nothing
+depended on it, because the naming either succeeds or refuses.
+
+A mark's sample index is interpolated from the last completed I2S block to the edge and clamped to
+one block. Without that it is `g_samples`, which advances once per 256-sample block and so names
+the last completed block rather than the edge — 0 to 15.9 ms early, every time, which is up to
+5.4 m of acoustic path. The clamp means a reader stall can at worst put it back where it started.
+None of this has been checked against an external reference, because the node has no second clock
+to check it with: these are bounds on the arithmetic, not a measured accuracy.
+
+    GET /audio                              what is retrievable: span, fill, from/to utc_us
+    GET /audio?from=<utc_us>&dur=<seconds>  that window as a playable mono 16-bit WAV
+
+`dur` is capped at 30 s. Serving the whole ring would be 7.68 MB, which at the 335 kB/s measured on
+this node is ~23 s inside one handler, and the I2S DMA holds 6 × 240 frames = **90 ms** — a handler
+that does not drain it would throw away more audio than the whole night lost. So the loop's own
+audio path is pumped between 4 kB chunks, the same reason `/tp` pumps `Serial1` rather than
+`delay()`ing.
+
+The writer does not stop while the response is sent, so the oldest ~16 s of the ring is not served
+(capped at a third of the ring, so a 30 s fallback ring still gives 20 s). If the requested window
+is not entirely held, **what is there is served and the response says so** rather than silently
+returning a short file:
+
+| header | |
+|---|---|
+| `X-Audio-Clipped` | `none` / `head` / `tail` / `both`; `416` with `all` if none of it is held |
+| `X-Audio-From-Utc-Us`, `X-Audio-Samples` | what actually came back |
+| `X-Audio-Fs-Hz` | the PPS-disciplined rate, e.g. `16000.1690` |
+| `X-Audio-Ring-From-Utc-Us`, `X-Audio-Ring-To-Utc-Us` | what else could have been asked for |
+
+⚠️A WAV header's rate field is an **integer** and cannot carry 16000.169 Hz. It says 16000. Anything
+doing timing work must use `X-Audio-Fs-Hz`, not what the WAV claims. `Content-Length` is the 44-byte
+header plus exactly the samples being sent — the `/sd` tail bug (`streamFile()` advertising
+`f.size()` regardless of the seek) is not repeated here.
+
+## The scene feature: 1.024 s, ungated
+
+The sketch is an **impulse** descriptor: 8 frames at hop 64 = 704 samples = 44 ms, and it only
+exists when the gate fires. Nothing in 11.33 h described the **background**, which is what separates
+a chorus from a road. All 45 in-run sketches peaked in the bottom mel band, 312–500 Hz — measured
+in `modules/bioacoustic/README.md`, not here.
+
+`scene.csv` is the scene-scale counterpart, the node's analogue of the 0.96 s patch hugbot's YAMNet
+consumes. 20 bands × 4 quarter-second slices, 1.024 s of span, written whether or not anything
+triggers. It re-uses the shipped filterbank and window **unchanged**: `MEL16_WIN` and `MEL16_FB_*`
+are functions of nfft and fs only, not of frame count, so a longer span needs no new tables. The
+measured +10.6 ppm rate error is far inside one 62.5 Hz bin of a 256-point FFT, so tables built for
+16000.0 stay correct.
+
+`BLOCK` is 256 and `MEL16_NFFT` is 256, so **one I2S block is one FFT frame** — enforced by a
+`static_assert`. That is the whole design: the descriptor is built 16 ms at a time at a steady
+62.5 FFT/s, instead of a 64-FFT burst once a second that would have to fit inside the DMA's 90 ms
+of headroom or drop audio.
+
+Storage, because it writes continuously to a 40 MB partition with 19 MB free: 80 B of mel
+hex-encoded to 160 chars plus ~66 chars of columns is **~227 B a row**, and 12 h is 42188 rows =
+**9.6 MB**. That fits alongside `health.csv` (~0.3 MB per 12 h) and `dets.csv` and leaves the card
+about half empty. Eight slices instead of four would be 16 MB and would not.
+
+**The cost is measured, not estimated.** `scene.fft_us_per_row` in `/status` (and the `fft_us`
+column of every row) is the microseconds of FFT and filterbank summed over the 64 frames of one
+1.024 s row, taken with `esp_timer_get_time()` around the work itself; `scene.fft_us_max` is the
+worst row since boot.
+
+Measured on the node, 115 rows in: **16 842 µs per 1.024 s row — 1.64% of one core**, worst row
+17 670 µs. So the scene descriptor is essentially free, and the 44 ms impulse sketch beside it is
+smaller again. `rows` and `written` were both 115 with `write_fail` 0 and `short_blocks` 0.
+
+One thing the same session measured that is worth knowing before you lean on `/audio`: fetching a
+3 s clip and three CSVs took `drop_s` from 2 to 4. Plain `/status` polling costs nothing
+detectable, but a **download does** — it holds `loop()` long enough to lose a block or two even
+with the pump draining by elapsed time. Pull audio when you want audio, not on a timer.
+
+Two more counters worth a glance: `scene.short_blocks` is I2S reads that came up short of a whole
+frame and were skipped rather than padded with silence, and `scene.write_fail` is the same
+short-write accounting `dets.csv` gets. `scene.csv` is held open and flushed on the 30 s health
+interval rather than per row, so a power cut can lose up to 30 rows (~7 kB).
 
 `us_since_pps` is **signed**. A sample back-dated across an edge belongs to the second before it,
 and reporting that unsigned would put the event 999 ms — 343 m — from where it happened.
@@ -229,7 +357,9 @@ morning. It runs detached and does not depend on any terminal staying open.
 | `GET /log` | the boot log, from a 6 kB RAM ring |
 | `POST /reboot` | restart. POST only, so a link prefetcher cannot reboot a node by looking at it |
 | `POST /update` | firmware, `curl -F firmware=@<bin>` |
-| `GET /sd?tail=N` | `night.csv` off the card |
+| `GET /sd?file=/scene.csv&tail=N` | any file off the card |
+| `GET /audio` | what the PSRAM ring currently holds, as JSON |
+| `GET /audio?from=<utc_us>&dur=<s>` | that window of raw PCM as a WAV |
 
 Every diagnosis worth having so far — the 230400-baud UBX scan, the driven-vs-floating pin probes,
 the I²C scan — came out of the boot log, which used to exist only on USB. It survives the cable now.
