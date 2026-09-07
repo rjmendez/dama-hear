@@ -1,5 +1,6 @@
 """v2 frame: what it adds over v1, what it costs, and what it refuses to guess at."""
 import os
+import struct
 import sys
 
 import numpy as np
@@ -164,3 +165,120 @@ class TestMidnightRollover:
         t = DAY0 + 43200.0
         us = WR.us_of_day_from_utc(t)
         assert WR.unwrap_utc(us, t + 86400.0) - WR.unwrap_utc(us, t) == pytest.approx(86400.0)
+
+
+class TestTheHeaderIsPinnedToBytesNotToItself:
+    """A round trip through this module's own pack/unpack passes for ANY self-consistent layout.
+    firmware/hear_poc/hear_core.h is an independent C implementation of the v1 header and
+    hear_poc.ino compares 12 header bytes byte-exact against a golden frame; v2 gets the same
+    treatment here, or a v2 firmware author reading the docstring emits frames Python misreads."""
+
+    # 13 B for us_of_day=12345678901, ref_db=-13.75, peak=0x1234, node_id=0xBEEF, seq=200,
+    # profile 0, retrigger. ts LE uint40 | ref4 <h> | peak <H> | node_id <H> | flags <H>.
+    GOLDEN = bytes.fromhex("351cdcdf02" "c9ff" "3412" "efbe" "41c8")
+
+    def _frame(self):
+        return WR.pack_v2(us_of_day=12_345_678_901, node_id=0xBEEF, seq=200, ref_db=-13.75,
+                          peak=0x1234, q=_q(), retrigger=True)
+
+    def test_the_header_bytes_are_exactly_these(self):
+        h = self._frame()[:WR.HDR_V2]
+        assert h == self.GOLDEN, "v2 header moved: %s" % h.hex(" ")
+        # field by field, so a failure says WHICH field moved
+        assert h[0:5] == (12_345_678_901).to_bytes(5, "little")
+        assert h[5:7] == (-55).to_bytes(2, "little", signed=True)   # -13.75 dB at 0.25 dB
+        assert h[7:9] == b"\x34\x12"                                # peak, not node_id
+        assert h[9:11] == b"\xef\xbe"                               # node_id, not peak
+        assert h[11:13] == (0xC841).to_bytes(2, "little")           # seq 200|ver 2<<5|retrig
+
+    def test_peak_and_node_id_are_not_interchangeable(self):
+        """Both are <H> and adjacent. Swapping them in pack AND unpack round-trips perfectly."""
+        got = WR.unpack_v2(self._frame())
+        assert (got["peak"], got["node_id"]) == (0x1234, 0xBEEF)
+        assert struct.unpack_from("<H", self._frame(), 7)[0] == 0x1234
+
+    def test_the_profile_field_starts_at_bit_1(self):
+        """Only profile 0 exists, so a round trip cannot see the profile shift at all -- pid 0
+        encodes as zero bits wherever you put it. Forcing a bit is the only way to locate it."""
+        b = bytearray(self._frame())
+        b[11] |= 0x02                                   # bit 1 -> profile 1 if the field is there
+        with pytest.raises(ValueError, match="unknown profile id 1"):
+            WR.unpack_v2(bytes(b))
+
+    def test_the_profile_field_is_4_bits_and_stops_below_the_version_field(self):
+        """Profile ids 8-15 use bit 4. If profile and version overlap, an id in that half is read
+        as a version bump and the frame is rejected for the wrong reason -- or accepted."""
+        b = bytearray(self._frame())
+        b[11] |= 0x10                                   # bit 4 -> profile 8, version still 2
+        with pytest.raises(ValueError, match="unknown profile id 8"):
+            WR.unpack_v2(bytes(b))
+
+
+class TestTheReceiveSideChecksTheTimestampToo:
+    def test_a_forged_us_of_day_past_midnight_is_refused_on_unpack(self):
+        """37 bits hold 137438953471 us; a day is 86400000000. Everything between is a legal
+        uint37 and an illegal time, so the bits-37-39 check cannot see it. Without the range
+        check this decodes to a wrong absolute second and nothing downstream can tell."""
+        forged = 100_000_000_000
+        assert forged < 2 ** 37 and forged > WR.US_PER_DAY
+        b = bytearray(WR.pack_v2(1_000_000, 1, 0, 0.0, 0, _q()))
+        b[0:5] = forged.to_bytes(5, "little")
+        b = bytes(b)
+
+        assert WR.version_of(b) == 2                    # the bad frame reaches unpack_v2
+        with pytest.raises(ValueError, match="us_of_day 100000000000"):
+            WR.unpack_v2(b)
+        with pytest.raises(ValueError, match="us_of_day"):
+            WR.decode(b)
+
+    def test_the_wrong_time_it_would_otherwise_produce(self):
+        """The cost of not checking, in seconds: 100000000000 us unwrapped against DAY0 is
+        13600 s past the reference. That is the mislabel the module docstring refuses."""
+        assert WR.unwrap_utc(100_000_000_000, DAY0) - DAY0 == pytest.approx(13600.0, abs=1e-6)
+
+    @pytest.mark.parametrize("us", [WR.US_PER_DAY, WR.US_PER_DAY + 1, 2 ** 37 - 1])
+    def test_every_value_in_the_illegal_band_is_refused(self, us):
+        b = bytearray(WR.pack_v2(1_000_000, 1, 0, 0.0, 0, _q()))
+        b[0:5] = int(us).to_bytes(5, "little")
+        with pytest.raises(ValueError, match="us_of_day"):
+            WR.unpack_v2(bytes(b))
+
+    def test_the_last_legal_microsecond_of_the_day_still_decodes(self):
+        """The counter-case: an off-by-one in the guard would eat 23:59:59.999999."""
+        last = WR.US_PER_DAY - 1
+        assert WR.unpack_v2(WR.pack_v2(last, 1, 0, 0.0, 0, _q()))["us_of_day"] == last
+
+
+class TestPeakIsRefusedNotClamped:
+    """v1 clamps with min(int(peak), 0xFFFF) (sketch.py:92). A clamped peak is a silent lie about
+    the one field a clipping check reads, and it is the same failure class as the masked
+    timestamp -- so v2 refuses it, and every refusal is a ValueError."""
+
+    def test_a_peak_over_the_field_raises_instead_of_clamping(self):
+        with pytest.raises(ValueError, match="peak 70000"):
+            WR.pack_v2(0, 1, 0, 0.0, 70_000, _q())
+
+    def test_a_negative_peak_raises_a_valueerror_not_a_struct_error(self):
+        with pytest.raises(ValueError, match="peak -1"):
+            WR.pack_v2(0, 1, 0, 0.0, -1, _q())
+
+    def test_the_boundary_value_is_carried_exactly(self):
+        assert WR.unpack_v2(WR.pack_v2(0, 1, 0, 0.0, 0xFFFF, _q()))["peak"] == 0xFFFF
+
+    def test_an_absurd_ref_db_raises_a_valueerror_not_a_struct_error(self):
+        with pytest.raises(ValueError, match="ref_db"):
+            WR.pack_v2(0, 1, 0, 1e6, 0, _q())
+
+    def test_a_one_dimensional_sketch_raises_a_valueerror_not_an_indexerror(self):
+        with pytest.raises(ValueError, match="1-D"):
+            WR.pack_v2(0, 1, 0, 0.0, 0, np.zeros(160, dtype=np.int8))
+
+    def test_every_refusal_this_module_makes_is_catchable_as_one_type(self):
+        """The contract the module docstring claims: one except clause covers pack_v2."""
+        bad = [dict(us_of_day=WR.US_PER_DAY), dict(node_id=0x10000), dict(seq=256),
+               dict(peak=70_000), dict(peak=-1), dict(ref_db=1e6),
+               dict(q=np.zeros(160, dtype=np.int8)), dict(q=_q(24, 8)), dict(profile_id=7)]
+        base = dict(us_of_day=0, node_id=1, seq=0, ref_db=0.0, peak=0, q=_q())
+        for override in bad:
+            with pytest.raises(ValueError):
+                WR.pack_v2(**{**base, **override})

@@ -12,15 +12,30 @@ from hear.solve import point as PT  # noqa: E402
 from hear.solve import shockwave as SW  # noqa: E402
 
 T = 23.0
+# ⚠️Every fixture runs on a real epoch, not a tidy t0=1000. `arrivals` are absolute seconds and
+# the result key is t0_utc_s, so a small t0 tests a regime no caller is ever in -- and it is
+# precisely where the float64-cancellation bug pinned at the bottom of this file hides.
+T0_UTC = 1_757_000_000.0
 SQUARE = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
 LINE = [(0.0, 0.0), (50.0, 0.0), (100.0, 0.0), (150.0, 0.0)]
+
+
+def _rot(pts, deg):
+    th = math.radians(deg)
+    ca, sa = math.cos(th), math.sin(th)
+    return [(e * ca - n * sa, e * sa + n * ca) for e, n in pts]
+
+
+# The same fence line at a bearing. LINE is axis-aligned, which lets any north-spread proxy stand
+# in for PL.linearity and pass the whole file; this one is degenerate on neither axis.
+LINE_30 = _rot(LINE, 30.0)
 
 
 CRACK_ARRAY = [(-200.0, -200.0), (200.0, 200.0), (175.0, -150.0), (-150.0, 175.0)]
 CRACK_BEARING_DEG, CRACK_OFFSET_M, CRACK_V_MPS = 20.0, 8.0, 900.0
 
 
-def _arrivals(P, source, t0=1000.0, temp_c=T):
+def _arrivals(P, source, t0=T0_UTC, temp_c=T):
     c = SW.sound_speed(temp_c)
     s = np.asarray(source, float)[:2]
     return [t0 + float(np.linalg.norm(s - np.asarray(p, float)[:2])) / c for p in P]
@@ -31,7 +46,7 @@ def _crack_fitted_as_a_blast(P):
     nearest the array -- the closest thing to a 'right answer' a point model could have given."""
     c = SW.sound_speed(T)
     br = math.radians(CRACK_BEARING_DEG)
-    t = [1000.0 + SW.shock_time(p, br, CRACK_OFFSET_M, CRACK_V_MPS, c) for p in P]
+    t = [T0_UTC + SW.shock_time(p, br, CRACK_OFFSET_M, CRACK_V_MPS, c) for p in P]
     u, n = SW._axes(br)
     w = np.asarray(P, float).mean(axis=0) - n * CRACK_OFFSET_M
     closest = n * CRACK_OFFSET_M + u * float(np.dot(w, u))
@@ -47,7 +62,7 @@ class TestRecovery:
         assert got["position_observable"] is True
         assert got["east_m"] == pytest.approx(self.SRC[0], abs=1.0)
         assert got["north_m"] == pytest.approx(self.SRC[1], abs=1.0)
-        assert got["t0_utc_s"] == pytest.approx(1000.0, abs=0.005)
+        assert got["t0_utc_s"] == pytest.approx(T0_UTC, abs=0.005)
 
     def test_does_not_depend_on_which_node_is_called_first(self):
         """t0 is marginalised, not differenced against node 0. Regression against a reference
@@ -61,6 +76,30 @@ class TestRecovery:
         rev = PT.solve(list(reversed(SQUARE)), list(reversed(t)), "blast", temp_c=T)
         assert rev["east_m"] == pytest.approx(base["east_m"], rel=1e-6)
         assert rev["north_m"] == pytest.approx(base["north_m"], rel=1e-6)
+
+    # Deterministic +/-0.2 ms of clock disagreement -- an RNG here would make a geometry test
+    # flaky for no gain.
+    JITTER_S = (0.0002, -0.00015, 0.0001, -0.0002)
+
+    @pytest.mark.parametrize("src", [(260.0, 40.0), (263.7, 41.9)])
+    def test_node_order_still_does_not_matter_when_the_arrivals_disagree(self, src):
+        """The test above cannot fail for the regression it names. Noise-free arrivals are exactly
+        consistent, so `return (r - r[0])[1:]` -- a reference node creeping back into _residual --
+        shares the same exact zero minimum as the marginalised cost and passes it. Inconsistent
+        data is what separates the two. Run here: that mutant moves the fit 3.64 m (on-grid src)
+        and 3.92 m (off-grid) across these rotations; the shipped code moves 8.8e-7 m."""
+        c = SW.sound_speed(T)
+        t = [T0_UTC + math.hypot(src[0] - p[0], src[1] - p[1]) / c + j
+             for p, j in zip(SQUARE, self.JITTER_S)]
+        base = PT.solve(SQUARE, t, "blast", temp_c=T)
+        assert base["rms_residual_ms"] > 0.1, "arrivals must disagree, or this proves nothing"
+        for k in range(1, len(SQUARE)):
+            got = PT.solve(SQUARE[k:] + SQUARE[:k], t[k:] + t[:k], "blast", temp_c=T)
+            assert got["east_m"] == pytest.approx(base["east_m"], abs=1e-3)
+            assert got["north_m"] == pytest.approx(base["north_m"], abs=1e-3)
+        rev = PT.solve(list(reversed(SQUARE)), list(reversed(t)), "blast", temp_c=T)
+        assert rev["east_m"] == pytest.approx(base["east_m"], abs=1e-3)
+        assert rev["north_m"] == pytest.approx(base["north_m"], abs=1e-3)
 
     def test_a_three_vector_position_is_sliced_not_rejected(self):
         """Fact 1: the solver is 2D. Pinned rather than left implicit in shockwave.py:88's [:2]."""
@@ -111,10 +150,24 @@ class TestCollinear:
         assert "UNOBSERVABLE" in got["note"]
         assert got["linearity"] < PL.COLLINEAR_LINEARITY
 
+    def test_a_fence_line_at_a_bearing_is_refused_too(self):
+        """The verdict must come from PL.linearity's SVD, not from a proxy that only happens to
+        agree on an axis-aligned fixture. `obs = P[:, 1].std() > 1e-9` -- no relation to the
+        contract at all -- passes every other test in this file, and would then fit a fence line
+        at any bearing but due east confidently: the exact failure this class exists to prevent."""
+        assert np.asarray(LINE_30)[:, 1].std() > 1.0, "if it were axis-aligned this proves nothing"
+        got = PT.solve(LINE_30, _arrivals(LINE_30, self.SRC), "blast", temp_c=T)
+        assert got["position_observable"] is False
+        assert got["east_m"] is None and got["north_m"] is None
+        assert "UNOBSERVABLE" in got["note"]
+        assert got["linearity"] < PL.COLLINEAR_LINEARITY
+
     def test_the_mirror_really_is_indistinguishable(self):
         """Pins the reason for the refusal. If this ever fails, the verdict is over-cautious."""
-        a = _arrivals(LINE, self.SRC)
-        b = _arrivals(LINE, self.MIRROR)
+        # t0=0: this is a statement about ranges, and at a real epoch float64 spacing (2.4e-7 s)
+        # would swamp abs=1e-9 and make the tolerance a lie.
+        a = _arrivals(LINE, self.SRC, t0=0.0)
+        b = _arrivals(LINE, self.MIRROR, t0=0.0)
         assert a == pytest.approx(b, abs=1e-9)
 
     def test_an_off_line_node_makes_it_observable_again(self):
@@ -143,7 +196,7 @@ class TestSourceClassGate:
     def test_feeding_it_a_crack_as_a_blast_costs_this_much(self):
         """The gate cannot catch a caller who lies about the class, so pin the damage. Arrivals
         from a real M855 track, labelled 'blast': the fit is confident and far off the track.
-        Four nodes at least make the residual scream -- 299 ms, run here."""
+        Four nodes at least make the residual scream -- 188 ms, run here."""
         got, closest = _crack_fitted_as_a_blast(CRACK_ARRAY)
         assert got["position_observable"] is True, "it does not hesitate; that is the problem"
         fitted = np.array([got["east_m"], got["north_m"]])
@@ -152,7 +205,7 @@ class TestSourceClassGate:
 
     def test_at_three_nodes_the_same_lie_is_silent(self):
         """The worst case in the repo, and it is arithmetic, not bad luck: the same crack fed to
-        three nodes lands 302 m off the track (run here) at rms_residual_ms 0.00000. Two
+        three nodes lands 145 m off the track (run here) at rms_residual_ms 0.00001. Two
         equations, two unknowns -- the residual CANNOT report the model is wrong."""
         got, closest = _crack_fitted_as_a_blast(CRACK_ARRAY[:3])
         fitted = np.array([got["east_m"], got["north_m"]])
@@ -187,11 +240,11 @@ def test_solves_at_a_real_utc_epoch_not_just_a_small_t0():
     nodes = [(0., 0.), (200., 0.), (200., 200.), (0., 200.), (100., 100.)]
     src = (263.7, 41.9)                     # deliberately off the 10 m grid
     errs = {}
-    for t0 in (1000.0, 1_757_000_000.0):
+    for t0 in (1000.0, T0_UTC):
         arr = [t0 + math.hypot(src[0] - n[0], src[1] - n[1]) / c for n in nodes]
         r = PT.solve(nodes, arr, "blast", temp_c=20.0)
         errs[t0] = math.hypot(r["east_m"] - src[0], r["north_m"] - src[1])
         assert r["t0_utc_s"] == pytest.approx(t0, abs=1e-3), "t0 must survive recentring"
-    assert errs[1_757_000_000.0] < 0.1, "real-epoch error %.3f m" % errs[1_757_000_000.0]
-    assert errs[1_757_000_000.0] == pytest.approx(errs[1000.0], abs=0.05), \
+    assert errs[T0_UTC] < 0.1, "real-epoch error %.3f m" % errs[T0_UTC]
+    assert errs[T0_UTC] == pytest.approx(errs[1000.0], abs=0.05), \
         "accuracy must not depend on the epoch the operator happens to run at"

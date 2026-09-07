@@ -134,8 +134,16 @@ static void gate_init(hear_gate_t *g, float fs) {
   g->env_n = (int)(0.001f * fs); if (g->env_n < 1) g->env_n = 1;
   if (g->env_n > 64) g->env_n = 64;
   g->env_inv = 1.0f / (float)g->env_n;
-  // Matches hear/node/detect.py:52 exactly, including that the alpha is derived for a 1 ms hop
-  // and then applied per sample -- real tau is 10000 samples, not the documented 10 s.
+  // Numerically matches hear/node/detect.py -- alpha is 1e-4 at 48 kHz either way -- but the
+  // Python now derives it honestly as 1/(AMBIENT_TAU_S*fs) with AMBIENT_TAU_S documented as
+  // 0.2083 s. This expression should follow.
+  //
+  // ⚠️AND THIS GATE IS NOW A THIRD BEHAVIOUR. gate_push returns the THRESHOLD-CROSSING index --
+  // not the envelope peak the Python used to return, and not the constant-fraction onset it
+  // returns now. A threshold crossing is the amplitude-dependent timestamp that constant-fraction
+  // exists to remove, so this PoC no longer reproduces the reference it was written to check.
+  // Porting the back-walk needs a longer env history than the 64 samples here: 1.3 ms at 48 kHz
+  // against rise times measured out to 20 ms.
   g->alpha = 1.0f / (10.0f * fs / (float)g->env_n);
   g->armed = 1; g->last_idx = -1;
 }

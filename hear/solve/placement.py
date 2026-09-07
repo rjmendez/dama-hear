@@ -27,8 +27,8 @@ may look excellent. It says how precisely you locate IF nothing is wrong, and no
 whether you would notice if something were. `dof` is the second number. Four nodes is where a
 residual begins to carry information.
 
-⚠️THE SOLVERS ARE 2D. shockwave.py slices [:2] at lines 58, 68, 88 and 129; this module at 61, 62,
-108, 136 and 177. docs/node-hardware.md:32 and hear/node/telemetry.py:10 both promise "the 3D
+⚠️THE SOLVERS ARE 2D. shockwave.py slices [:2] at lines 66, 76, 96 and 137; this module at 85, 86,
+132, 160 and 201. docs/node-hardware.md:32 and hear/node/telemetry.py:10 both promise "the 3D
 geometry" and are wrong until someone decides otherwise. The 3D block below -- `coplanarity`,
 `dop3`, `height_sensitivity`, `vertical_observability`, `plan_3d` -- answers "could this site do
 3D at all?" before anyone buys two more nodes. It does not make the solvers 3D.
@@ -59,7 +59,9 @@ COLLINEAR_LINEARITY: float = 0.02
 # RMS distance to the best-fit plane. JUDGEMENT, tied to survey error -- the repo has no field
 # data on vertical geometry; the 2026-09-05 session recorded no node heights.
 COPLANAR_RMS_M: float = 0.5
-# Same floor offset_sensitivity() already uses at placement.py:123.
+# The floor a verdict of "observable" has to clear, horizontally and vertically. Both
+# offset_sensitivity() and height_sensitivity() read it from here: the two are meant to be the
+# same test in two directions, and a second copy of the number is how that quietly stops being true.
 RESOLVABLE_SWING_MS: float = 0.05
 
 
@@ -142,7 +144,7 @@ def offset_sensitivity(nodes: Sequence, bearing_deg: float, offset_m: float = 0.
         "straddles": SW.straddles(P, br, offset_m),
         "max_tdoa_swing_ms": swing_ms,
         "delta_m": delta_m,
-        "observable": swing_ms > 0.05,               # a swing the timebase can actually resolve
+        "observable": swing_ms > RESOLVABLE_SWING_MS,   # a swing the timebase can resolve
         "bearing_deg": bearing_deg,
     }
 

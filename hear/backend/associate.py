@@ -19,6 +19,15 @@ arrival that already joined.
 Nothing is dropped silently: n_input == sum(event n_nodes) + len(rejected) + len(duplicates), and
 every rejection names its reason and carries the numbers that produced it.
 
+⚠️AN ARRAY WIDER THAN THE CADENCE LOSES EVERY ROUND BUT THE FIRST. A rejected candidate is
+terminal: it is not returned to the pool, so it can never seed a group of its own. Once the window
+(d/c + margin) exceeds the round spacing, round 2 lands inside round 1's scan, every node of it is
+`duplicate_node_in_group`, and the round is gone. Run on a 128.1 m array (window 0.403 s) with
+three rounds 85 ms apart that all four nodes heard: 1 event, 8 rejections, rounds 2 and 3 vanish.
+Conservation still holds -- they are reported, not dropped -- but they are never solved. Re-seeding
+rejected candidates would satisfy conservation too and is the open alternative; it is not what this
+does. tests/test_associate.py TestWideArray pins the loss, so the choice cannot change by accident.
+
 What this refuses to do: it does not classify, does not solve, and does not say whether a residual
 is meaningful -- that depends on the model and the dimension and belongs to the solver. It also
 does not resolve the genuinely ambiguous case, a node that missed a round on an array whose d/c
@@ -84,12 +93,12 @@ def associate(detections: Sequence[Dict], survey, temp_c: float = 20.0,
     Refuses to drop anything: every input detection ends in exactly one of `events`, `rejected` or
     `duplicates`. Refuses to admit a second detection from a node already in a group, and refuses
     any candidate whose separation-in-time from a member exceeds their separation-in-space over c.
+    Refuses to treat a repeated (node_id, seq) as a duplicate once it is a window away: seq wraps.
     """
     c = SW.sound_speed(temp_c)
     diameter_m = float(survey.diameter_m())
-    if window_s is None:
-        window_s = diameter_m / c + float(margin_s)
-    window_s = float(window_s)
+    # One definition of the policy, so max_window_s() cannot drift away from what the scan uses.
+    window_s = float(max_window_s(survey, temp_c, margin_s) if window_s is None else window_s)
 
     rejected: List[Dict] = []
     duplicates: List[Dict] = []
@@ -107,12 +116,18 @@ def associate(detections: Sequence[Dict], survey, temp_c: float = 20.0,
     first_seen: Dict = {}
     for d in known:
         key = (int(d["node_id"]), int(d["seq"]))
-        if key in first_seen:
+        t = float(d["t_utc_s"])
+        prior = first_seen.get(key)
+        # ⚠️seq is an 8-bit field that wraps (hear/wire.py:113) and a rebooted node restarts its
+        # counter, so an unbounded (node_id, seq) dedupe silently eats genuine later events. A
+        # repeat is the same frame only if it could still have joined the same group -- one window.
+        # `known` is sorted by time, so `prior` is the most recent accepted copy.
+        if prior is not None and t - prior <= window_s:
             duplicates.append(_row(d, "duplicate_seq",
                                    "node %d seq %d already accepted at %.6f s; this copy %.6f s"
-                                   % (key[0], key[1], first_seen[key], float(d["t_utc_s"]))))
+                                   % (key[0], key[1], prior, t)))
         else:
-            first_seen[key] = float(d["t_utc_s"])
+            first_seen[key] = t
             pool.append(d)
 
     pos: Dict[int, np.ndarray] = {}

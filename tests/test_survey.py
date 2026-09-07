@@ -69,25 +69,34 @@ class TestRefusals:
         with pytest.raises(SV.SurveyError, match=r"duplicate node_id 2\b"):
             SV.from_dict(d)
 
-    def test_a_missing_coordinate_is_refused_not_zeroed(self):
+    @pytest.mark.parametrize("key", ["e_m", "n_m", "u_m"])
+    def test_a_missing_coordinate_is_refused_not_zeroed(self, key):
         """Same reason telemetry.pack sends a sentinel (hear/node/telemetry.py:55-58): a node
-        defaulted to up=0 looks exactly like a node that was surveyed at ground level."""
-        d = doc([(1, 0.0, 0.0, 4.0), (2, 100.0, 0.0, 0.0), (3, 0.0, 100.0, 0.0)])
-        del d["nodes"][0]["u_m"]
-        with pytest.raises(SV.SurveyError, match="node 1 has no u_m"):
+        defaulted to up=0 looks exactly like a node that was surveyed at ground level.
+
+        All THREE keys, not just u_m. A guard covering only the one the module's docstring names
+        loads a node whose e_m was dropped in transcription at east=0, in silence, which is the
+        same silent-wrong survey by a different letter."""
+        d = doc([(1, 20.0, 30.0, 4.0), (2, 100.0, 0.0, 0.0), (3, 0.0, 100.0, 0.0)])
+        del d["nodes"][0][key]
+        with pytest.raises(SV.SurveyError, match="node 1 has no %s" % key):
             SV.from_dict(d)
 
+    @pytest.mark.parametrize("key", ["e_m", "n_m", "u_m"])
     @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
-    def test_non_finite_coordinates_are_refused(self, bad):
+    def test_non_finite_coordinates_are_refused(self, bad, key):
         d = doc(SQUARE)
-        d["nodes"][1]["n_m"] = bad
-        with pytest.raises(SV.SurveyError, match="non-finite"):
+        d["nodes"][1][key] = bad
+        with pytest.raises(SV.SurveyError, match="non-finite %s" % key):
             SV.from_dict(d)
 
-    def test_a_non_numeric_coordinate_is_refused(self):
+    @pytest.mark.parametrize("key", ["e_m", "n_m", "u_m"])
+    def test_a_non_numeric_coordinate_is_refused(self, key):
+        # 12.5, not 100.0: a value that coerces to a still-legal layout, so a guard that misses
+        # this key gets caught here and not incidentally by the coincidence check downstream.
         d = doc(SQUARE)
-        d["nodes"][1]["e_m"] = "100.0"
-        with pytest.raises(SV.SurveyError, match="not a number"):
+        d["nodes"][1][key] = "12.5"
+        with pytest.raises(SV.SurveyError, match="has %s '12.5', which is not a number" % key):
             SV.from_dict(d)
 
     def test_two_entries_five_centimetres_apart_are_one_node(self):
@@ -133,10 +142,42 @@ class TestRefusals:
     def test_min_linearity_is_placements_number_not_a_second_copy(self):
         assert SV.MIN_LINEARITY is PL.COLLINEAR_LINEARITY
 
+    def test_the_refusal_reads_min_linearity_and_is_not_a_hardcoded_number(self, monkeypatch):
+        """The identity assert above pins the CONSTANT; it does not pin the COMPARISON. Measured,
+        LINE has linearity 0.0000 and the bent set 0.1494, so a guard hardcoded to any threshold
+        in (0.0, 0.1494] satisfies both halves of the cross-check and imports PL for decoration.
+        Move the constant and the refusal must move with it, in both directions."""
+        bent = list(LINE)
+        bent[2] = (3, 100.0, 20.0, 0.0)
+        assert SV.from_dict(doc(bent)).linearity() == pytest.approx(0.149422, abs=1e-5)
+
+        monkeypatch.setattr(SV, "MIN_LINEARITY", 0.5)
+        with pytest.raises(SV.SurveyError, match="collinear"):
+            SV.from_dict(doc(bent))
+
+        monkeypatch.setattr(SV, "MIN_LINEARITY", 0.0)
+        assert SV.from_dict(doc(LINE)).linearity() == pytest.approx(0.0, abs=1e-12)
+
 
 class TestGeometry:
     RELIEF = [(1, 0.0, 0.0, 0.0), (2, 100.0, 0.0, 0.0), (3, 100.0, 100.0, 0.0),
               (4, 0.0, 100.0, 30.0)]
+
+    # RELIEF's widest pair IS its bounding-box corner pair, so it cannot tell a real diameter from
+    # a box diagonal. DIAMOND puts the axis extremes on four different nodes: widest real pair
+    # 107.703 m, box diagonal 146.969 m.
+    DIAMOND = [(1, 0.0, 50.0, 0.0), (2, 50.0, 0.0, 0.0), (3, 100.0, 50.0, 0.0),
+               (4, 50.0, 100.0, 40.0)]
+
+    def test_diameter_is_a_pair_of_real_nodes_not_a_bounding_box(self):
+        """A box diagonal over-estimates, which widens associate's window on the safe side -- but
+        it is not the number this docstring promises and no fixture with the extremes on one pair
+        can tell the two apart."""
+        sv = SV.from_dict(doc(self.DIAMOND))
+        P = sv.positions(sv.ids)
+        assert sv.diameter_m() == pytest.approx(math.sqrt(100.0 ** 2 + 40.0 ** 2), abs=1e-9)
+        assert float(np.linalg.norm(P.max(0) - P.min(0))) - sv.diameter_m() > 39.0
+        assert sv.diameter_m() > 100.0      # still 3D: the widest HORIZONTAL pair is exactly 100 m
 
     def test_diameter_is_the_3d_distance_not_the_horizontal_one(self):
         """associate turns this into its window bound. Computed horizontally it would be 4 m of
@@ -155,6 +196,20 @@ class TestGeometry:
         assert hilly["ok"] is False
         assert hilly["vertical_spread_m"] == pytest.approx(30.0, abs=1e-9)
         assert "30.0" in hilly["note"]
+
+    def test_vertical_spread_is_relief_not_altitude(self):
+        """Every fixture above sits with min(u) == 0, where max(u) and max-min are the same number.
+        An array on a 100 m ridge has 100 m of altitude and 0 m of relief; reporting the altitude
+        tells the operator the 2D projection costs 100 m when it costs nothing."""
+        plateau = [(i, e, n, 100.0) for i, e, n, _ in SQUARE]
+        flat = SV.from_dict(doc(plateau)).validate_2d_assumption()
+        assert flat["vertical_spread_m"] == pytest.approx(0.0, abs=1e-9)
+        assert flat["ok"] is True and flat["note"] is None
+
+        ridge = [(i, e, n, u + 100.0) for i, e, n, u in self.RELIEF]
+        hilly = SV.from_dict(doc(ridge)).validate_2d_assumption()
+        assert hilly["vertical_spread_m"] == pytest.approx(30.0, abs=1e-9)
+        assert hilly["ok"] is False and "30.0" in hilly["note"]
 
     def test_linearity_matches_placement_on_the_same_nodes(self):
         sv = SV.from_dict(doc(SQUARE))

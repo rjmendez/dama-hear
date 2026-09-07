@@ -19,6 +19,16 @@ artefacts.
 **46% of detections land inside known firing windows covering 3.3% of the audio** — 14x
 enrichment over chance.
 
+⚠️**Which ambient constant produced these numbers.** The gate's floor ran at
+`AMBIENT_TAU_S = 0.2083 s`. The code used to *document* 10 s while realising 0.21 s, because its
+alpha was derived per 1 ms hop and applied per sample; the parameter now says 0.21 s and the
+arithmetic is bit-identical, so nothing in this table moved. If anyone ever changes that constant,
+this table has to be re-measured -- it is not a property of the algorithm, it is a property of that
+number.
+
+⚠️**The 0.9631 sketch AUC quoted below predates the onset fix** and needs refitting; see
+`docs/uplink.md`.
+
 ## The bug this run exposed
 
 A fixed guard interval **cannot distinguish a decay tail from a new round.** It only suppresses

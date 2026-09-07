@@ -15,8 +15,10 @@ import numpy as np
 from .. import sketch as SK
 from . import detect as DT
 
-PRE_S = 0.02          # a little context before the onset; the sketch starts AT it
 POST_S = 0.30
+# NO PRE-ROLL. There used to be 20 ms of it, fetched and then sliced straight back off, under a
+# comment claiming the sketch started at the onset while the gate was handing over the PEAK.
+# The gate reports a real onset now, so seg[0] IS the onset and the rise is inside the sketch.
 
 
 class Pipeline:
@@ -34,14 +36,13 @@ class Pipeline:
         for s in range(0, len(x), block):
             for d in self.gate.process(x[s:s + block], s):
                 i = d["index"]
-                lo = max(0, i - int(PRE_S * self.fs))
-                hi = min(len(x), i + int(POST_S * self.fs))
-                seg = x[lo:hi]
+                seg = x[i:min(len(x), i + int(POST_S * self.fs))]
                 if len(seg) < int(0.01 * self.fs):
                     continue
-                # sketch from the onset, not from the padded window start
-                q, ref = SK.sketch(seg[i - lo:], self.fs)
-                frame = SK.pack(self.node_us_of(i), ref, int(min(d["peak"], 65535)), q,
+                q, ref = SK.sketch(seg, self.fs)
+                # sub-sample onset, not the floored slice bound: the timestamp is the product
+                frame = SK.pack(self.node_us_of(d["onset_index"]), ref,
+                                int(min(d["peak"], 65535)), q,
                                 flags=(1 if d["retrigger"] else 0))
                 out.append({**d, "ref_db": ref, "frame": frame, "frame_len": len(frame)})
         return out

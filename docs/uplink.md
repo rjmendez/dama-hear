@@ -31,6 +31,12 @@ Measured on the same 228 operator-labelled events, grouped 5-fold CV:
 | | AUC | accuracy |
 |---|---|---|
 | **172 B sketch** | **0.9631** | **0.8816** |
+
+⚠️**These numbers predate the onset fix and have to be re-measured.** They were obtained on
+sketches whose first frame began at the envelope PEAK. `hear/node/pipeline.py` now starts the
+sketch at the constant-fraction ONSET, so frame 0 is the rise rather than the blast and the
+amplitude cue sits elsewhere in the window. The bytes are different, so the AUC is unknown until
+it is refitted on the same 228 hand-labelled events. Do not quote this table against current code.
 | hand-crafted 6 features | 0.9589 | 0.8684 |
 | `ref_db` alone (amplitude) | 0.9007 | — |
 | sketch shape *without* `ref_db` | 0.9519 | — |

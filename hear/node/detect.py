@@ -21,6 +21,14 @@ import numpy as np
 RETRIGGER_S = 0.060          # inside one muzzle blast's decay (median 12.7 ms, p90 119 ms)
 GUARD_S = 0.025
 REARM_FRAC = 0.35            # envelope must fall to this fraction of threshold before re-firing
+ONSET_FRAC = 0.20            # constant fraction of the envelope peak that defines the onset
+# Seconds, and deliberately not rounded: this exact value is what the 2026-09-05 run used, and
+# docs/validation-full-captures.md's numbers were measured with it.
+# ⚠️The 48000 below is the CAPTURE RIG's rate, not the node's. docs/faketec-pin-budget.md records
+# that the nRF52840 cannot produce 48000 Hz at all, and the PDM mic runs at 16 kHz. tau is a TIME,
+# so it carries across sample rates unchanged -- the equivalent SAMPLE count does not, and writing
+# this as "10 000 samples" in library code would assert a rate the hardware cannot reach.
+AMBIENT_TAU_S = 10000.0 / 48000.0   # 0.2083 s
 
 
 def envelope(x: np.ndarray, fs: float, ms: float = 1.0) -> np.ndarray:
@@ -34,6 +42,33 @@ def envelope(x: np.ndarray, fs: float, ms: float = 1.0) -> np.ndarray:
     return np.convolve(np.abs(x), np.ones(n) / n, mode="same")
 
 
+def onset_index(e: np.ndarray, peak: int, frac: float = ONSET_FRAC, back: int = 0) -> float:
+    """Sub-sample constant-fraction onset. Index into `e`, fractional, always <= `peak`.
+
+    Walks back from the envelope peak to the last sample below `frac * e[peak]` and linearly
+    interpolates the crossing. Constant fraction rather than a fixed threshold because the gate's
+    own threshold is an absolute level: a loud round crosses it far earlier in its rise than a
+    quiet one, so a threshold-crossing timestamp carries the range-dependent bias this function
+    exists to remove.
+
+    ⚠️`e` MUST BE AN ENVELOPE, never raw |x|. The identical walk on raw samples stops at the
+    first zero crossing -- see envelope() above. The sibling project shipped exactly that: its
+    back-walk moves 0 samples, so its "onset" is its peak, measured across a 100x amplitude sweep.
+
+    Refuses to search more than `back` samples before the peak (0 = back to e[0]). An onset that
+    predates the window is reported AT the window edge, not extrapolated: a detection whose rise
+    began in the previous block is late, and saying so beats inventing a number.
+    """
+    lo = max(0, peak - back) if back > 0 else 0
+    target = frac * float(e[peak])
+    below = np.nonzero(e[lo:peak] < target)[0]
+    if below.size == 0:
+        return float(lo)
+    j = lo + int(below[-1])          # last sample below the fraction; crossing is in [j, j+1]
+    rise = float(e[j + 1]) - float(e[j])
+    return float(j) if rise <= 0 else j + (target - float(e[j])) / rise
+
+
 class Gate:
     """Streaming level gate with an adaptive floor.
 
@@ -42,17 +77,34 @@ class Gate:
     """
 
     def __init__(self, fs: float, ratio: float = 8.0, floor: float = 800.0,
-                 guard_s: float = GUARD_S, ambient_tau_s: float = 10.0,
-                 rearm_frac: float = REARM_FRAC):
+                 guard_s: float = GUARD_S, ambient_tau_s: float = AMBIENT_TAU_S,
+                 rearm_frac: float = REARM_FRAC, onset_frac: float = ONSET_FRAC):
+        """⚠️`ambient_tau_s` DEFAULTS TO 0.21 s AND USED TO SAY 10 s. It never was 10 s: the old
+        alpha was derived per 1 ms hop and then applied once per SAMPLE, so the realised constant
+        was 10 000 samples -- 0.208 s at 48 kHz, 48x faster than the parameter claimed.
+
+        The measured behaviour is kept and the parameter renamed to what it does, not the other
+        way round, for two reasons. Every number in docs/validation-full-captures.md (338 raw
+        detections -> 168, 32 impossible clusters -> 1, zero false alarms in 68.5 min of quiet)
+        was produced by the 0.21 s floor; correcting the arithmetic upward would have invalidated
+        a published result without touching the document. And 0.21 s is the constant a gunshot
+        gate wants anyway: the floor only ever sees material already below threshold, so nothing
+        it tracks is an event, and a range's floor moves with wind and traffic inside a single
+        string faster than a 10 s average can follow.
+
+        The realised constant is pinned by step response in tests/test_node.py, not asserted here.
+        """
         self.fs = float(fs)
         self.ratio = float(ratio)
         self.floor = float(floor)
         self.guard = max(1, int(guard_s * fs))
         self.rearm_frac = float(rearm_frac)
-        self.alpha = 1.0 / max(1.0, ambient_tau_s * fs / max(1, int(0.001 * fs)))
+        self.onset_frac = float(onset_frac)
+        # per SAMPLE, because that is where it is applied
+        self.alpha = 1.0 / max(1.0, ambient_tau_s * fs)
         self.ambient = 0.0
         self.n_seen = 0
-        self.last_idx: Optional[int] = None
+        self.last_onset: Optional[float] = None
         # Schmitt state. A fixed guard alone re-fires every guard interval for as long as the
         # envelope stays high, so one shot with a 100 ms tail became 4-5 "rounds" spaced at
         # exactly 25 ms. Measured over 123.7 min of capture before this was added.
@@ -62,7 +114,14 @@ class Gate:
         return max(self.ambient * self.ratio, self.floor)
 
     def process(self, block: np.ndarray, block_start: int) -> List[Dict]:
-        """Detections in this block. `block_start` is the absolute sample index of block[0]."""
+        """Detections in this block. `block_start` is the absolute sample index of block[0].
+
+        `index`/`t_s` are the ONSET -- sub-sample, constant-fraction. `peak_index`/`env_peak`/
+        `peak` are the envelope peak and stay: they are classifier features, and the peak is the
+        more amplitude-robust of the two reference points. What the peak is NOT is an arrival
+        time. Timestamping it costs the rise time of the round, which grows with range, so the
+        bias is per-node and does not cancel in TDoA -- against a 183 us budget (node-hardware.md).
+        """
         e = envelope(block, self.fs)
         out: List[Dict] = []
         i = 0
@@ -81,11 +140,14 @@ class Gate:
             else:
                 j = min(len(e), i + self.guard)
                 k = i + int(np.argmax(e[i:j]))
-                idx = block_start + k
-                since = None if self.last_idx is None else (idx - self.last_idx) / self.fs
+                # bounded by the guard, which is also the window the peak was found in
+                on = block_start + onset_index(e, k, self.onset_frac, back=self.guard)
+                since = None if self.last_onset is None else (on - self.last_onset) / self.fs
                 out.append({
-                    "index": int(idx),
-                    "t_s": idx / self.fs,
+                    "index": int(on),           # floored onset -- the sketch's first sample
+                    "onset_index": float(on),   # sub-sample; what t_s is made of
+                    "t_s": on / self.fs,
+                    "peak_index": int(block_start + k),
                     "peak": float(np.abs(block[max(0, k - self.guard):k + self.guard]).max()),
                     "env_peak": float(e[k]),
                     "threshold": self.threshold(),
@@ -94,7 +156,7 @@ class Gate:
                     # analysis needs it. Flagged so the central side can decide.
                     "retrigger": bool(since is not None and since < RETRIGGER_S),
                 })
-                self.last_idx = idx
+                self.last_onset = on
                 self.armed = False
                 i = k + self.guard
                 continue

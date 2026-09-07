@@ -6,14 +6,14 @@ from. This module is the only door, and it either loads clean or raises: a surve
 wrong puts every later answer in the wrong place at a residual that looks perfect.
 
 Frame is local ENU metres -- east=+e, north=+n, up=+u, right-handed, one arbitrary common origin.
-Three components on disk even though the solvers are 2D today (hear/solve/shockwave.py:58,68,88,129
-and hear/solve/placement.py:61,62,108,136,177 all slice [:2]), so the file survives that being
+Three components on disk even though the solvers are 2D today (hear/solve/shockwave.py:66,76,96,137
+and hear/solve/placement.py:83,84,130,158,199,239 all slice [:2]), so the file survives that being
 resolved. `positions_2d()` is the ONLY place `up` is dropped.
 
 ⚠️REFUSALS ARE LOAD-TIME, NOT VERDICTS. Duplicate ids, a missing coordinate, coincident entries and
 collinear layouts all raise. A survey is read once, before any data exists; a degeneracy known then
 should stop the load rather than decorate every later answer, and dop() is genuinely singular on a
-line (hear/solve/placement.py:73-77) so there is nothing to decorate.
+line (hear/solve/placement.py:90-96) so there is nothing to decorate.
 
 ⚠️A MISSING COORDINATE IS NEVER 0.0. Same reasoning as telemetry.pack's sentinel
 (hear/node/telemetry.py:55-58): an absent `u_m` defaulted to zero is a plausible-looking node at
@@ -33,7 +33,7 @@ import numpy as np
 from ..solve import placement as PL
 
 # Two entries this close are one point entered twice. JUDGEMENT: it sits below the node survey
-# error that placement.py:260 names as the binding term once DOP is good.
+# error that placement.py:484 names as the binding term once DOP is good.
 COINCIDENT_M: float = 0.10
 
 # The collinearity threshold is placement's, imported so it cannot drift. survey, point and
@@ -102,8 +102,8 @@ class Survey:
     def positions_2d(self, node_ids: Sequence[int]) -> np.ndarray:
         """(N,2) east/north, rows IN THE ORDER GIVEN. This is what hear/solve/*.py consumes.
 
-        ⚠️DROPS `up`. Valid only while the solvers are 2D (hear/solve/shockwave.py:58,68,88,129 and
-        hear/solve/placement.py:61,62,108,136,177). This is the one site that projects; call
+        ⚠️DROPS `up`. Valid only while the solvers are 2D (hear/solve/shockwave.py:66,76,96,137 and
+        hear/solve/placement.py:83,84,130,158,199,239). This is the one site that projects; call
         validate_2d_assumption() to get the assumption back as data instead of as a comment.
         """
         return self.positions(node_ids)[:, :2]

@@ -25,6 +25,7 @@
 #include <Wire.h>
 #include <Update.h>
 #include "esp_ota_ops.h"
+#include "mel16.h"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -338,6 +339,78 @@ static void ubx_feed(uint8_t c) {
   }
 }
 
+// ---------------------------------------------------------------- sketch
+// Same log-mel sketch hear/sketch.py produces, at the PDM mic's rate. A detection that carries
+// only a timestamp says something happened; the sketch says what it sounded like, and the central
+// side can retrain on the same bytes forever. That is the whole argument for a sketch over a
+// verdict (docs/uplink.md).
+#define ARING 4096                       // ~256 ms at 16 kHz: pre-roll plus the sketch window
+static int16_t aring[ARING];
+static volatile uint32_t aring_w = 0;
+static volatile uint32_t aring_total = 0;   // so we never sketch a buffer that has not filled
+
+static float fft_re[MEL16_NFFT], fft_im[MEL16_NFFT];
+static float tw_re[MEL16_NFFT / 2], tw_im[MEL16_NFFT / 2];
+static void fft_init() {
+  for (int k = 0; k < MEL16_NFFT / 2; k++) {
+    float a = -2.0f * (float)M_PI * k / MEL16_NFFT; tw_re[k] = cosf(a); tw_im[k] = sinf(a);
+  }
+}
+static void fft256() {
+  const int N = MEL16_NFFT;
+  for (int i = 1, j = 0; i < N; i++) {
+    int bit = N >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit;
+    if (i < j) { float t = fft_re[i]; fft_re[i] = fft_re[j]; fft_re[j] = t;
+                 t = fft_im[i]; fft_im[i] = fft_im[j]; fft_im[j] = t; }
+  }
+  for (int len = 2; len <= N; len <<= 1) {
+    int step = N / len;
+    for (int i = 0; i < N; i += len)
+      for (int k = 0; k < len / 2; k++) {
+        int a = i + k, b = a + len / 2;
+        float cr = tw_re[k * step], ci = tw_im[k * step];
+        float xr = fft_re[b] * cr - fft_im[b] * ci, xi = fft_re[b] * ci + fft_im[b] * cr;
+        fft_re[b] = fft_re[a] - xr; fft_im[b] = fft_im[a] - xi;
+        fft_re[a] += xr;            fft_im[a] += xi;
+      }
+  }
+}
+
+// Build the 172 B frame from the ring, starting `back` samples before the write head.
+static int sketch_frame(uint8_t *out, uint32_t back, uint32_t node_us, uint16_t peak, uint16_t flags) {
+  static float db[MEL16_BANDS * MEL16_FRAMES];
+  uint32_t start = (aring_w + ARING - back) % ARING;
+  for (int t = 0; t < MEL16_FRAMES; t++) {
+    uint32_t s0 = start + (uint32_t)t * MEL16_HOP;
+    for (int i = 0; i < MEL16_NFFT; i++) {
+      fft_re[i] = (float)aring[(s0 + i) % ARING] * MEL16_WIN[i];
+      fft_im[i] = 0.0f;
+    }
+    fft256();
+    const float *w = MEL16_FB_W;
+    for (int b = 0; b < MEL16_BANDS; b++) {
+      int lo = MEL16_FB_LO[b], cnt = MEL16_FB_N[b];
+      float acc = 0.0f;
+      for (int i = 0; i < cnt; i++) {
+        int bin = lo + i; acc += w[i] * (fft_re[bin] * fft_re[bin] + fft_im[bin] * fft_im[bin]);
+      }
+      w += cnt;
+      db[b * MEL16_FRAMES + t] = 10.0f * log10f(acc + 1e-12f);
+    }
+  }
+  float ref = db[0];
+  for (int i = 1; i < MEL16_BANDS * MEL16_FRAMES; i++) if (db[i] > ref) ref = db[i];
+  int16_t r4 = (int16_t)lrintf(ref * 4.0f);
+  out[0] = node_us; out[1] = node_us >> 8; out[2] = node_us >> 16; out[3] = node_us >> 24;
+  out[4] = r4; out[5] = r4 >> 8; out[6] = peak; out[7] = peak >> 8;
+  out[8] = MEL16_BANDS; out[9] = MEL16_FRAMES; out[10] = flags; out[11] = flags >> 8;
+  for (int i = 0; i < MEL16_BANDS * MEL16_FRAMES; i++) {
+    float v = roundf((db[i] - ref) * 2.0f);
+    out[12 + i] = (uint8_t)(int8_t)(v < -128 ? -128 : (v > 127 ? 127 : v));
+  }
+  return MEL16_FRAME_BYTES;
+}
+
 // ---------------------------------------------------------------- gate (as hear/node/detect.py)
 static float g_amb = 0, env_sum = 0, env_buf[16]; static int env_i = 0, armed = 1;
 static const float ENV_INV = 1.0f / 16.0f, ALPHA = 1.0f / 10000.0f;
@@ -354,7 +427,7 @@ static int gate(int16_t s) {
 }
 
 struct Det { uint32_t sample; uint32_t pps_n; uint32_t us_since_pps; int64_t utc_us;
-              int16_t trigger; uint32_t uptime_s; };
+              int16_t trigger; uint32_t uptime_s; uint8_t frame[MEL16_FRAME_BYTES]; };
 static Det dets[MAXDET]; static volatile uint32_t det_n = 0;
 
 // ---------------------------------------------------------------- state
@@ -505,10 +578,17 @@ static void h_dets() {
   uint32_t n = det_n < MAXDET ? det_n : MAXDET;
   for (uint32_t i = 0; i < n; i++) {
     char b[160];
-    snprintf(b, sizeof b, "%s{\"utc_us\":%lld,\"uptime_s\":%lu,\"sample\":%lu,\"pps_n\":%lu,\"us_since_pps\":%lu,\"trigger\":%d}",
+    snprintf(b, sizeof b, "%s{\"utc_us\":%lld,\"uptime_s\":%lu,\"sample\":%lu,\"pps_n\":%lu,"
+                          "\"us_since_pps\":%lu,\"trigger\":%d,\"frame_len\":%d,\"frame\":\"",
              i ? "," : "", (long long)dets[i].utc_us, (unsigned long)dets[i].uptime_s, (unsigned long)dets[i].sample,
-             (unsigned long)dets[i].pps_n, (unsigned long)dets[i].us_since_pps, dets[i].trigger);
+             (unsigned long)dets[i].pps_n, (unsigned long)dets[i].us_since_pps, dets[i].trigger,
+             MEL16_FRAME_BYTES);
     o += b;
+    static const char hx[] = "0123456789abcdef";
+    for (int k = 0; k < MEL16_FRAME_BYTES; k++) {
+      o += hx[dets[i].frame[k] >> 4]; o += hx[dets[i].frame[k] & 0xF];
+    }
+    o += "\"}";
   }
   o += "]";
   http.send(200, "application/json", o);
@@ -660,6 +740,57 @@ void setup() {
       marked_healthy ? "yes" : "not yet", (int)st, ota_msg);
     http.send(200, "text/plain", b);
   });
+  http.on("/sd", []() {
+    // night.csv was described as the durable record. A record that can only be read by walking
+    // outside and pulling the card is not one -- this makes it retrievable over the same link.
+    String name = http.hasArg("file") ? http.arg("file") : String("/night.csv");
+    if (!name.startsWith("/")) name = "/" + name;
+    if (name.indexOf("..") >= 0) { http.send(400, "text/plain", "no\n"); return; }
+    if (!sd_ok) { http.send(503, "text/plain", "no card mounted\n"); return; }
+    File f = SD.open(name.c_str(), FILE_READ);
+    if (!f) { http.send(404, "text/plain", "not found: " + name + "\n"); return; }
+    long tail = http.hasArg("tail") ? http.arg("tail").toInt() : 0;   // last N bytes
+    size_t remain = f.size();
+    if (tail > 0 && remain > (size_t)tail) { f.seek(remain - tail); remain = tail; }
+    // streamFile() advertises f.size() regardless of the seek, so a tail request promised the
+    // whole file and delivered a fragment -- curl reports "end of response with N bytes missing".
+    // Send the length of what we are ACTUALLY sending.
+    http.sendHeader("Content-Disposition", "inline; filename=\"" + name.substring(1) + "\"");
+    http.setContentLength(remain);
+    http.send(200, "text/csv", "");
+    uint8_t buf[512];
+    while (remain) {
+      size_t n = f.read(buf, remain > sizeof buf ? sizeof buf : remain);
+      if (!n) break;
+      http.client().write(buf, n);
+      remain -= n;
+    }
+    f.close();
+  });
+  http.on("/ls", []() {
+    if (!sd_ok) { http.send(503, "text/plain", "no card mounted\n"); return; }
+    String o; File d = SD.open("/");
+    for (File e = d.openNextFile(); e; e = d.openNextFile()) {
+      o += String(e.isDirectory() ? "d " : "- ") + e.name() + "  " + String((long)e.size()) + " B\n";
+      e.close();
+    }
+    http.send(200, "text/plain", o.length() ? o : "(empty)\n");
+  });
+  http.on("/perf", []() {            // measured throughput, not a datasheet number
+    int mb = http.hasArg("mb") ? http.arg("mb").toInt() : 4;
+    if (mb < 1) mb = 1; if (mb > 32) mb = 32;
+    static uint8_t chunk[1460];        // one TCP segment
+    for (size_t i = 0; i < sizeof chunk; i++) chunk[i] = (uint8_t)i;
+    http.setContentLength((size_t)mb * 1024 * 1024);
+    http.send(200, "application/octet-stream", "");
+    WiFiClient c = http.client();
+    size_t sent = 0, total = (size_t)mb * 1024 * 1024;
+    while (sent < total && c.connected()) {
+      size_t n = total - sent; if (n > sizeof chunk) n = sizeof chunk;
+      if (c.write(chunk, n) != n) break;
+      sent += n;
+    }
+  });
   http.on("/pins", []() {          // the compiled-in map, so it can be checked rather than trusted
     char b[640];
     snprintf(b, sizeof b,
@@ -751,6 +882,7 @@ void setup() {
     http.send(200, "text/plain", o);
   });
   http.on("/i2c", []() { i2c_scan(); http.send(200, "text/plain", i2c_found); });   // rescan on demand
+  fft_init();
   http.begin();
   Serial.println("http  up\n");
 }
@@ -763,6 +895,7 @@ void loop() {
   { size_t got = i2s.readBytes((char *)blk, sizeof blk);
     int n = got / 2;
     for (int i = 0; i < n; i++) {
+      aring[aring_w] = blk[i]; aring_w = (aring_w + 1) % ARING; aring_total++;
       int fired = gate(blk[i]);                 // stateful: exactly one call per sample
       if (fired) {
         uint32_t idx = det_n++;
@@ -774,6 +907,16 @@ void loop() {
           dets[idx].utc_us = tok ? t : 0;       // 0 = the anchor was not trusted at that instant
           dets[idx].trigger = blk[i];
           dets[idx].uptime_s = (millis() - boot_ms) / 1000;
+          // Sketch from a little BEFORE the trigger, so the rise the classifier needs is inside
+          // the window rather than clipped off its front.
+          uint32_t back = MEL16_NFFT + (MEL16_FRAMES - 1) * MEL16_HOP + 32;
+          // ⚠️Before the ring has filled, the window behind the trigger is zeros, and a sketch of
+          // silence is a legitimate-looking frame of all-equal bands. Flag it rather than ship a
+          // number that means nothing. Bit 1 = insufficient context. (Bit 0 is retrigger.)
+          uint16_t fl = (aring_total < back) ? 0x0002 : 0x0000;
+          sketch_frame(dets[idx].frame, back,
+                       (uint32_t)(dets[idx].us_since_pps),
+                       (uint16_t)abs((int)blk[i]), fl);
         }
       }
       float a = fabsf((float)blk[i]);

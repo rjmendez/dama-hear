@@ -21,9 +21,12 @@ to happen, so this module ships no alias and no compatibility shim.
 ⚠️A v2 FRAME CANNOT CARRY AN UNLISTED GEOMETRY. profile_for() raises rather than inventing an id.
 That is the honest cost of spending 4 bits instead of 16 on the sketch shape.
 
-This module refuses; it never masks. Out-of-range inputs raise ValueError -- v1's
-`int(node_us) & 0xFFFFFFFF` (sketch.py:91) is precisely the bug class refused here. It imports
-hear/sketch.py and never edits it: v1 pack/unpack keep working untouched.
+This module refuses; it never masks. EVERY out-of-range input raises ValueError and nothing is
+wrapped, clamped or coerced on the way to the wire -- v1's `int(node_us) & 0xFFFFFFFF`
+(sketch.py:91) and its `min(int(peak), 0xFFFF)` (sketch.py:92) are precisely the bug class refused
+here. That the refusals are all one exception type is contract: a caller wraps pack_v2 in
+`except ValueError` and catches all of them. It imports hear/sketch.py and never edits it: v1
+pack/unpack keep working untouched.
 """
 from __future__ import annotations
 
@@ -95,8 +98,9 @@ def pack_v2(us_of_day: int, node_id: int, seq: int, ref_db: float, peak: int,
     `us_of_day` is integer MICROSECONDS OF DAY, UTC -- not v1's sub-second `node_us`.
     `profile_id` None derives the id from q.shape.
 
-    Refuses, never wraps: an out-of-range timestamp, node id or sequence raises rather than being
-    masked into the field (the sketch.py:91 failure).
+    Refuses, never wraps and never clamps: an out-of-range timestamp, node id, sequence, peak or
+    ref_db raises ValueError rather than being masked into the field (the sketch.py:91-92 failure).
+    A non-2-D `q` raises ValueError too, not the IndexError the shape lookup would give.
     """
     us = int(us_of_day)
     if not (0 <= us < US_PER_DAY):
@@ -107,8 +111,19 @@ def pack_v2(us_of_day: int, node_id: int, seq: int, ref_db: float, peak: int,
     s = int(seq)
     if not (0 <= s <= 0xFF):
         raise ValueError("seq %d outside 0..255" % s)
+    pk = int(peak)
+    if not (0 <= pk <= 0xFFFF):
+        raise ValueError("peak %d outside 0..65535" % pk)
+    # ref_db lands in an <h> at 0.25 dB, so the field tops out at -8192..8191.75 dB. Absurd input
+    # either way -- the point is that it fails as a ValueError, not as a struct.error the caller's
+    # `except ValueError` walks straight past.
+    r4 = int(round(float(ref_db) * 4))
+    if not (-0x8000 <= r4 <= 0x7FFF):
+        raise ValueError("ref_db %r outside -8192..8191.75 dB" % (ref_db,))
 
     q = np.asarray(q)
+    if q.ndim != 2:
+        raise ValueError("q is %d-D; a sketch is 2-D (bands, frames)" % q.ndim)
     pid = profile_for(q.shape[0], q.shape[1]) if profile_id is None else int(profile_id)
     bands, frames = profile_shape(pid)
     if q.shape != (bands, frames):
@@ -119,8 +134,7 @@ def pack_v2(us_of_day: int, node_id: int, seq: int, ref_db: float, peak: int,
              | ((pid & _F_PROFILE_MASK) << _F_PROFILE_SHIFT)
              | ((VERSION & _F_VERSION_MASK) << _F_VERSION_SHIFT)
              | ((s & _F_SEQ_MASK) << _F_SEQ_SHIFT))
-    hdr = (us.to_bytes(5, "little")
-           + struct.pack("<hHHH", int(round(ref_db * 4)), min(int(peak), 0xFFFF), nid, flags))
+    hdr = (us.to_bytes(5, "little") + struct.pack("<hHHH", r4, pk, nid, flags))
     return hdr + q.astype(np.int8).tobytes()
 
 

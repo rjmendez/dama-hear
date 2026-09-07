@@ -16,8 +16,8 @@ to it returns a confident position that is wrong by that angle. The caller must 
 class; `source_class` is a required argument for that reason and CONE_CLASSES is refused
 outright. What the array actually heard on 2026-09-05 was 92 cracks and 0 blast-only events
 (docs/findings-2026-09-05.md:36) -- the gate is not hypothetical. Cost of ignoring it, run in
-tests/test_point.py on a 400 m array: 145 m off at rms 299 ms with four nodes, and 302 m off at
-rms 0.00000 ms with three, where nothing in the result says so.
+tests/test_point.py on a 400 m array: 134 m off at rms 188 ms with four nodes, and 145 m off at
+rms 0.00001 ms with three, where nothing in the result says so.
 
 ⚠️COLLINEAR NODES CANNOT PLACE A SOURCE. Reflect the source across the line the nodes sit on and
 every range is unchanged, so both fit identically at zero residual. That is the same degeneracy

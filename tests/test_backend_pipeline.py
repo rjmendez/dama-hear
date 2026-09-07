@@ -22,6 +22,8 @@ from hear.solve import shockwave as SW    # noqa: E402
 V = 900.0                       # M855, the round the 2026-09-05 session actually fired
 T = 23.0                        # docs/findings-2026-09-05.md:42 -- c = 345.24 m/s
 T0 = 1_757_000_000.0            # 15:33 UTC, nowhere near a day boundary
+MIDNIGHT = 1_756_944_000.0      # 1_757_000_000 // 86400 * 86400 -- an exact UTC day boundary
+C_AT_T = 345.238                # shockwave.sound_speed(23.0), measured; c(20.0) is 343.420
 Q = np.zeros((20, 8), np.int8)  # the sketch body is irrelevant here; only its geometry is
 
 # ⚠️COMPACT ON PURPOSE. hear/solve/shockwave.py:61 gives the miss term a coefficient of
@@ -87,15 +89,30 @@ class TestEndToEnd:
         assert _bearing_error(sol["bearing_deg"], BEARING) < 1.0
         assert sol["offset_m"] == pytest.approx(OFFSET, abs=1.0)
 
-    def test_frame_order_cannot_move_the_answer(self):
-        """Row alignment. positions_2d rows are paired with arrivals by index, so a re-sort
-        anywhere in the chain mislabels every node -- and no residual would catch it."""
+    def test_ingest_order_never_reaches_the_solver(self):
+        """Arrival order, not ingest order, decides the rows: associate sorts the pool by
+        t_utc_s (hear/backend/associate.py:104) before it emits node_ids, so a mesh that delivers
+        frames in any order at all cannot reach positions_2d. This pins THAT, not row alignment --
+        row alignment is test_positions_rows_pair_with_arrivals_by_index."""
         s = _survey(RING)
         fr = _frames(range(1, 6), _shock_arrivals(RING, BEARING, OFFSET))
         base = BP.Backend(s, temp_c=T, v_mps=V).run(fr)["events"][0]["solution"]["bearing_deg"]
         for order in ([2, 0, 4, 1, 3], [4, 3, 2, 1, 0]):
             got = BP.Backend(s, temp_c=T, v_mps=V).run([fr[i] for i in order])
             assert got["events"][0]["solution"]["bearing_deg"] == pytest.approx(base, rel=1e-6)
+
+    def test_positions_rows_pair_with_arrivals_by_index(self):
+        """positions_2d is called WITH ev['node_ids'], so row i belongs to arrival i. Re-ordering
+        those ids -- sorting them, most plausibly -- mislabels every node at a residual that stays
+        small enough to look like a fit. Measured on this fixture: 75.5 deg, at rms 2.84 ms."""
+        s = _survey(RING)
+        ev = BP.Backend(s, temp_c=T, v_mps=V).run(
+            _frames(range(1, 6), _shock_arrivals(RING, BEARING, OFFSET)))["events"][0]
+        assert ev["node_ids"] != sorted(ev["node_ids"]), "fixture must exercise the mislabel"
+        mislabelled = SW.solve(s.positions_2d(sorted(ev["node_ids"])), ev["arrivals"],
+                               v_mps=V, temp_c=T)
+        assert _bearing_error(mislabelled["bearing_deg"], BEARING) > 5.0
+        assert _bearing_error(ev["solution"]["bearing_deg"], BEARING) < 1.0
 
     def test_a_blast_routes_to_the_point_solver_and_lands_on_the_source(self):
         """⚠️3.5 m, where the cone path gets 1.0 m. point.solve's finite-difference refine
@@ -110,6 +127,106 @@ class TestEndToEnd:
         assert ev["model"] == "point"
         assert ev["solution"]["east_m"] == pytest.approx(src[0], abs=3.5)
         assert ev["solution"]["north_m"] == pytest.approx(src[1], abs=3.5)
+
+
+class TestAbsoluteTime:
+    """TDoA cancels any constant offset, so every geometry test here would pass with the day
+    thrown away and the clock in the wrong units. Only these tests read the absolute number."""
+
+    def test_the_event_time_is_the_earliest_arrival_in_absolute_utc(self):
+        a = _shock_arrivals(RING, BEARING, OFFSET)
+        got = BP.Backend(_survey(RING), temp_c=T, v_mps=V).run(_frames(range(1, 6), a))
+        ev = got["events"][0]
+        # the wire carries us-of-day; only wire.unwrap_utc puts the day back on it
+        assert ev["t0_utc_s"] == pytest.approx(min(a), abs=1e-3)
+        assert ev["published"]["ts_utc_ms"] == int(min(a) * 1000)
+
+    def test_a_group_straddling_midnight_survives_the_day_boundary(self):
+        """Each frame unwraps against its OWN receive time (hear/wire.py:200-204). Three of these
+        five arrive before midnight and two after, so us-of-day alone puts them 86400 s apart --
+        far outside any window -- and the event never forms at all."""
+        a = _shock_arrivals(RING, BEARING, OFFSET, t0=MIDNIGHT - 0.02)
+        assert min(a) < MIDNIGHT < max(a), "fixture must actually straddle"
+        got = BP.Backend(_survey(RING), temp_c=T, v_mps=V).run(_frames(range(1, 6), a))
+        assert len(got["events"]) == 1
+        ev = got["events"][0]
+        assert ev["n_nodes"] == 5
+        assert ev["t0_utc_s"] == pytest.approx(min(a), abs=1e-3)
+        assert ev["published"]["ts_utc_ms"] == int(min(a) * 1000)
+        assert _bearing_error(ev["solution"]["bearing_deg"], BEARING) < 1.0
+
+
+class TestTemperatureReachesBothStages:
+    """c is not a constant of the module: it sets the association bound AND the solver's cone.
+    At 23 vs 20 deg C, c moves 1.8 m/s -- which the bearing tolerance above cannot see."""
+
+    def test_the_solver_and_the_grouper_both_get_the_configured_temperature(self):
+        got = BP.Backend(_survey(RING), temp_c=T, v_mps=V).run(
+            _frames(range(1, 6), _shock_arrivals(RING, BEARING, OFFSET)))
+        assert got["sound_speed_mps"] == pytest.approx(C_AT_T, abs=1e-3)
+        assert got["window_s"] == pytest.approx(
+            got["diameter_m"] / C_AT_T + got["margin_s"], rel=1e-9)
+        ev = got["events"][0]
+        assert ev["solution"]["sound_speed_mps"] == pytest.approx(C_AT_T, abs=1e-3)
+        assert ev["published"]["event"]["sound_speed_mps"] == pytest.approx(C_AT_T, abs=1e-3)
+
+    def test_the_wrong_temperature_hides_under_every_other_tolerance(self):
+        """Why the line above has to name c outright. Measured on RING, solving the same 23 deg C
+        arrivals at 20 deg C: bearing 20.0 -> 20.25 (this suite accepts 1.0) and rms 0.0005 ->
+        0.1418 ms (this suite accepts 0.5). Nothing else in the file can see a 1.8 m/s error."""
+        s = _survey(RING)
+        ev = BP.Backend(s, temp_c=T, v_mps=V).run(
+            _frames(range(1, 6), _shock_arrivals(RING, BEARING, OFFSET)))["events"][0]
+        cold = SW.solve(s.positions_2d(ev["node_ids"]), ev["arrivals"], v_mps=V, temp_c=20.0)
+        assert cold["sound_speed_mps"] == pytest.approx(343.420, abs=1e-3)
+        assert _bearing_error(cold["bearing_deg"], BEARING) < 1.0
+        assert cold["rms_residual_ms"] == pytest.approx(0.1418, abs=0.01)
+
+
+class TestInjectedArguments:
+    """Four constructor arguments that a mutation battery found could each be ignored outright."""
+
+    def test_classify_overrides_source_class_per_event(self):
+        """`classify` picks the MODEL, and a crack fitted as a point source is the 67.4 deg error
+        docs/findings-2026-09-05.md:42-43 measures. The array-wide default must lose to it."""
+        src = (40.0, -25.0)
+        got = BP.Backend(_survey(RING), temp_c=T, source_class="crack",
+                         classify=lambda ev: "blast").run(
+            _frames(range(1, 6), _point_arrivals(RING, src)))
+        ev = got["events"][0]
+        assert ev["source_class"] == "blast" and ev["model"] == "point"
+        assert ev["published"]["event"]["model"] == "point"
+        assert ev["solution"]["east_m"] == pytest.approx(src[0], abs=3.5)
+
+    def test_an_explicit_window_narrower_than_the_array_starves_the_event(self):
+        """The window bounds the SCAN only, and the computed value is already the loosest one the
+        pairwise gate can use -- diameter/c + margin is exactly the widest pairwise bound -- so a
+        too-wide window costs nothing here and a 1 ms one costs everything. RING spreads 65.7 ms.
+        """
+        s, a = _survey(RING), _shock_arrivals(RING, BEARING, OFFSET)
+        narrow = BP.Backend(s, temp_c=T, v_mps=V, window_s=0.001).run(_frames(range(1, 6), a))
+        assert narrow["window_s"] == 0.001
+        assert narrow["events"] == []
+        assert {r["reason"] for r in narrow["rejected"]} == {"too_few_nodes"}
+        wide = BP.Backend(s, temp_c=T, v_mps=V, window_s=5.0).run(_frames(range(1, 6), a))
+        assert wide["window_s"] == 5.0
+        assert wide["events"][0]["n_nodes"] == 5
+
+    def test_min_nodes_refuses_a_group_that_is_one_node_short(self):
+        s, a = _survey(RING), _shock_arrivals(RING, BEARING, OFFSET)
+        fr = _frames(range(1, 5), a[:4])                  # four of the five nodes report
+        strict = BP.Backend(s, temp_c=T, v_mps=V, min_nodes=5).run(fr)
+        assert strict["events"] == []
+        assert {r["reason"] for r in strict["rejected"]} == {"too_few_nodes"}
+        assert len(BP.Backend(s, temp_c=T, v_mps=V, min_nodes=4).run(fr)["events"]) == 1
+
+    def test_array_id_names_the_publisher(self):
+        """One fleet can run more than one array, and the payload's node_id is the only thing
+        that says which one spoke."""
+        got = BP.Backend(_survey(RING), temp_c=T, v_mps=V, array_id="hear_north").run(
+            _frames(range(1, 6), _shock_arrivals(RING, BEARING, OFFSET)))
+        assert got["events"][0]["published"]["node_id"] == "hear_north"
+        assert BP.to_dama_event(got["events"][0])["node_id"] == "hear"     # the default
 
 
 class TestTheWindowGuard:
@@ -145,6 +262,9 @@ class TestTheWindowGuard:
 
 
 class TestResidualHonesty:
+    """⚠️ASSERTED ON THE PAYLOAD, not on the solver's return value. The solver has its own tests;
+    what is unproven here is that the caveat survives to_dama_event and leaves the building."""
+
     def test_three_nodes_never_quote_their_residual_as_evidence(self):
         """2 equations, 2 unknowns: the residual is ~0 by construction and carries nothing.
         Measured on this fixture, the fit that produced it came back on a bearing 115 deg from
@@ -153,18 +273,41 @@ class TestResidualHonesty:
         s = _survey(tri)
         got = BP.Backend(s, temp_c=T, v_mps=V).run(
             _frames([1, 2, 3], _shock_arrivals(tri, 40.1, 3.1)))
-        sol = got["events"][0]["solution"]
+        ev = got["events"][0]
+        sol, body = ev["solution"], ev["published"]["event"]
         assert sol["n_equations"] == 2
+        assert body["n_equations"] == 2
         assert sol["residual_is_meaningful"] is False
+        assert body["residual_is_meaningful"] is False
         # 0.5 ms is the solver's own 0.25 deg / 0.25 m grid quantisation, not information
         assert sol["rms_residual_ms"] == pytest.approx(0.0, abs=0.5)
+        assert body["rms_residual_ms"] == sol["rms_residual_ms"]
 
     def test_five_nodes_do_get_a_meaningful_residual(self):
         got = BP.Backend(_survey(RING), temp_c=T, v_mps=V).run(
             _frames(range(1, 6), _shock_arrivals(RING, BEARING, OFFSET)))
-        sol = got["events"][0]["solution"]
-        assert sol["n_equations"] == 4
-        assert sol["residual_is_meaningful"] is True
+        ev = got["events"][0]
+        assert ev["solution"]["n_equations"] == 4
+        assert ev["solution"]["residual_is_meaningful"] is True
+        body = ev["published"]["event"]
+        assert body["n_equations"] == 4
+        assert body["residual_is_meaningful"] is True
+        assert body["rms_residual_ms"] == ev["solution"]["rms_residual_ms"]
+
+    def test_an_unobservable_offset_says_so_in_the_payload(self):
+        """All four nodes on one side of the track: every parallel track fits identically, so the
+        offset is not small, it is absent. A consumer that reads the payload alone must see that.
+        Measured on this fixture: offset_observable False at rms 0.0005 ms -- a residual that
+        would otherwise read as a perfect fix."""
+        nodes = TIGHT[:4]                         # a 10 m cluster, track 12 m off to one side
+        got = BP.Backend(_survey(nodes), temp_c=T, v_mps=V).run(
+            _frames([1, 2, 3, 4], _shock_arrivals(nodes, 0.0, 12.0)))
+        body = got["events"][0]["published"]["event"]
+        assert body["offset_observable"] is False
+        assert body["offset_m"] is None
+        assert "UNOBSERVABLE" in body["note"]
+        assert body["rms_residual_ms"] == pytest.approx(0.0, abs=0.5)
+        assert body["residual_is_meaningful"] is True    # 3 equations: honest, and still useless
 
 
 class TestBadFrames:

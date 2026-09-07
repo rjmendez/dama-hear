@@ -124,6 +124,15 @@ FLAT_SQUARE_3D = [(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 100.0, 0.0), (0.0,
 RAISED_SQUARE = [(0.0, 0.0, 30.0), (100.0, 0.0, 0.0), (100.0, 100.0, 0.0), (0.0, 100.0, 0.0)]
 # Square plus a mast in the middle: the only 5-node set here with real vertical extent.
 TOWER = FLAT_SQUARE_3D + [(50.0, 50.0, 30.0)]
+# Same square, mast collapsed to a kerb: horizontally identical, vertically ruined.
+STUB_MAST = FLAT_SQUARE_3D + [(50.0, 50.0, 0.5)]
+# Exactly coplanar and exactly VERTICAL -- coplanar without a mirror twin.
+VERTICAL_PLANE = [(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (0.0, 0.0, 30.0), (100.0, 0.0, 30.0)]
+# Exactly coplanar, sloped 10 m over 100 m. LAPACK hands back a DOWNWARD normal for this one.
+RAMP = [(0.0, 0.0, 0.0), (100.0, 0.0, 10.0), (100.0, 100.0, 10.0), (0.0, 100.0, 0.0)]
+# 9 nodes 0.4 m either side of their plane: rms 0.40 m, but raw s[2] is 1.19.
+JITTER_GRID = [(i * 50.0, j * 50.0, 0.4 if (i + j) % 2 == 0 else -0.4)
+               for i in range(3) for j in range(3)]
 
 
 class TestVerticalObservability:
@@ -151,9 +160,52 @@ class TestVerticalObservability:
         assert up["observable"] is True and up["note"] is None
         assert up["max_tdoa_swing_ms"] > 100.0 * flat["max_tdoa_swing_ms"] + 1.0
 
+        # Both fixtures above have measurement and inference agreeing, so they cannot tell the two
+        # apart. This one can: exactly coplanar, and observable anyway. Reading the verdict off
+        # COPLANAR_RMS_M calls it UNOBSERVABLE, which is the wrong answer about a real geometry.
+        off = PL.vertical_observability(FLAT_SQUARE_3D, (300.0, 300.0, 0.0))
+        assert off["coplanar"] is True and off["planarity_rms_m"] == 0.0
+        assert off["max_tdoa_swing_ms"] == pytest.approx(0.0618, abs=5e-4)
+        assert off["observable"] is True, "the perturbation decides; planarity is not evidence"
+        assert off["note"] is None
+        assert off["mirror_ambiguous"] is True, \
+            "still sees only the magnitude of elevation, never the sign -- a separate verdict"
+
+    def test_the_resolvable_floor_is_a_number_and_both_directions_use_it(self):
+        """0.05 ms is the verdict boundary of the entire block and the vertical and horizontal
+        halves are meant to be the same test in two directions. Each pair straddles it -- source
+        pushed to 300 m swings 0.0618 ms and to 350 m only 0.0424; 20 mm of node y-spread swings
+        0.0538 ms and 10 mm only 0.0269. A floor anywhere outside (0.0424, 0.0538) flips a verdict
+        here, and a second copy of the constant fails one pair while the other still passes."""
+        assert PL.RESOLVABLE_SWING_MS == 0.05
+        near = PL.height_sensitivity(FLAT_SQUARE_3D, (300.0, 300.0, 0.0))
+        far = PL.height_sensitivity(FLAT_SQUARE_3D, (350.0, 350.0, 0.0))
+        assert near["max_tdoa_swing_ms"] > PL.RESOLVABLE_SWING_MS > far["max_tdoa_swing_ms"]
+        assert near["observable"] is True and far["observable"] is False
+
+        for nodes, want in (([(0.0, 0.0), (60.0, 0.02), (120.0, 0.0)], True),
+                            ([(0.0, 0.0), (60.0, 0.01), (120.0, 0.0)], False)):
+            sp = PL.observable_span(nodes, 90.0)
+            mid = 0.5 * (sp["offset_lo"] + sp["offset_hi"])
+            r = PL.offset_sensitivity(nodes, 90.0, offset_m=mid)
+            assert r["straddles"] is True, "both straddle -- the floor is the only thing deciding"
+            assert r["observable"] is want
+            assert (r["max_tdoa_swing_ms"] > PL.RESOLVABLE_SWING_MS) is want
+
     def test_a_horizontal_coplanar_array_is_mirror_ambiguous(self):
         assert PL.vertical_observability(FLAT_SQUARE_3D)["mirror_ambiguous"] is True
         assert PL.vertical_observability(RAISED_SQUARE)["mirror_ambiguous"] is False
+
+    def test_a_coplanar_array_standing_on_edge_has_no_mirror_twin(self):
+        """The twin is the reflection IN THE PLANE, so the plane has to be horizontal for one to
+        exist. Four nodes in a vertical plane are exactly as coplanar and have no twin at all --
+        and the source's height is plainly observable to them. Pins the near_horizontal half of
+        the verdict, which coplanarity alone would get wrong."""
+        r = PL.vertical_observability(VERTICAL_PLANE)
+        assert r["coplanar"] is True, "coplanar alone cannot be the mirror verdict"
+        assert abs(r["plane_normal"][2]) < 1e-9 and r["near_horizontal"] is False
+        assert r["mirror_ambiguous"] is False
+        assert r["observable"] is True and r["max_tdoa_swing_ms"] > 9.0
 
     def test_c_comes_from_shockwave(self):
         r = PL.height_sensitivity(RAISED_SQUARE, (50.0, 50.0, 0.0), temp_c=23.0)
@@ -173,6 +225,30 @@ class TestCoplanarity:
         r = PL.coplanarity(FLAT_SQUARE_3D)
         assert r["near_horizontal"] is True
         assert r["plane_normal"][2] == pytest.approx(1.0, abs=1e-9)
+
+    def test_the_plane_normal_is_forced_upward_not_left_to_lapack(self):
+        """FLAT_SQUARE_3D passes the upward-normal test by SVD sign convention, not because the
+        code does anything. RAMP is the case that separates them: LAPACK returns V[2] pointing
+        DOWN, and one representative per plane means it still has to come out up."""
+        C = np.asarray(RAMP, float)
+        raw = np.linalg.svd(C - C.mean(axis=0), full_matrices=False)[2][2]
+        assert raw[2] < -0.9, "fixture is worthless the day LAPACK's sign convention changes"
+        r = PL.coplanarity(RAMP)
+        assert r["plane_normal"][2] == pytest.approx(0.99504, abs=1e-5)
+        assert r["near_horizontal"] is True and r["coplanar"] is True
+
+    def test_planarity_is_an_rms_distance_not_a_raw_singular_value(self):
+        """s[2] grows with node count; COPLANAR_RMS_M is a distance in metres, so they are only
+        comparable after /sqrt(N). Drop the normalisation and this 9-node grid -- 0.4 m either
+        side of its plane, which is survey noise -- gets reported non-planar at s[2] = 1.19."""
+        r = PL.coplanarity(JITTER_GRID)
+        C = np.asarray(JITTER_GRID, float)
+        C = C - C.mean(axis=0)
+        d = C @ np.asarray(r["plane_normal"], float)
+        assert r["planarity_rms_m"] == pytest.approx(math.sqrt(float(np.mean(d ** 2))), rel=1e-12)
+        assert r["planarity_rms_m"] == pytest.approx(0.3975, abs=1e-4)
+        assert float(np.linalg.svd(C, compute_uv=False)[2]) > PL.COPLANAR_RMS_M
+        assert r["coplanar"] is True
 
     def test_relief_breaks_coplanarity(self):
         r = PL.coplanarity(RAISED_SQUARE)
@@ -197,6 +273,24 @@ class TestDop3:
         r = PL.dop3(FLAT_SQUARE_3D, (50.0, 50.0, 0.0))
         assert r["singular"] is True and r["vdop"] == float("inf")
         assert math.isfinite(PL.dop(FLAT_SQUARE_3D, (50.0, 50.0))["dop"])
+
+    def test_vdop_is_the_vertical_half_and_a_stub_mast_is_what_ruins_it(self):
+        """vdop is the number this block exists to produce and nothing else says which half of the
+        covariance it comes from -- swapping it with hdop is invisible on a symmetric layout.
+        Values cross-checked against a covariance built from a finite-differenced Jacobian rather
+        than the analytic unit vectors: hdop 1.131552, vdop 2.084582, identical to 6 dp. Collapse
+        the 30 m mast to 0.5 m and vdop triples while hdop moves 4%: it is the vertical axis that
+        the mast was buying."""
+        src = (30.0, 20.0, 10.0)
+        t = PL.dop3(TOWER, src)
+        assert t["hdop"] == pytest.approx(1.13155, abs=1e-5)
+        assert t["vdop"] == pytest.approx(2.08458, abs=1e-5)
+        assert t["vdop"] > t["hdop"], "a 30 m mast on a 100 m square is still the weak axis"
+        assert t["pdop"] == pytest.approx(math.hypot(t["hdop"], t["vdop"]), rel=1e-12)
+        stub = PL.dop3(STUB_MAST, src)
+        assert stub["vdop"] == pytest.approx(7.19376, abs=1e-5)
+        assert stub["vdop"] > 3.0 * t["vdop"], "losing 29.5 m of mast is a vertical problem"
+        assert stub["hdop"] == pytest.approx(t["hdop"], rel=0.05), "...and not a horizontal one"
 
     def test_dof_counts_three_unknowns_not_two(self):
         n = len(TOWER)

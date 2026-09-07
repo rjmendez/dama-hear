@@ -181,3 +181,176 @@ class TestRearm:
         for s in range(0, len(x), 4096):
             out += g.process(x[s:s + 4096], s)
         assert len(out) == 1, "block-split decay produced %d detections" % len(out)
+
+
+def _burst(rise_s, amp, at=12000, n=48000, f=4000.0, plateau_s=0.005, decay_s=0.020):
+    """A shot with a KNOWN onset. Linear rise over `rise_s` from `at`, 5 ms plateau, decay.
+
+    The carrier is a 4 kHz tone, not noise: 48 kHz / 4 kHz is 12 samples, so |sin| has period 6
+    and the gate's 48-sample envelope window spans exactly 8 of them. Ripple cancels, and the
+    envelope of the plateau is flat to machine precision -- which is what lets these tests pin an
+    onset to a fraction of a sample instead of arguing about a noise realisation.
+    """
+    R, P = rise_s * FS, plateau_s * FS
+    t = np.arange(n) - at                       # `at` may be fractional: see the sub-sample test
+    s = np.clip(t / R, 0.0, 1.0)
+    s = np.where(t > R + P, np.exp(-(t - R - P) / (decay_s * FS)), s)
+    s[t < 0] = 0.0
+    return amp * s * np.sin(2 * np.pi * f * np.arange(n) / FS)
+
+
+class TestAmbientTau:
+    """The ambient time constant, measured rather than read off the parameter.
+
+    The old alpha was derived per 1 ms hop and applied per SAMPLE: the parameter said 10 s and the
+    gate ran at 0.208 s. Nothing caught it, because every other gate test runs on a signal loud
+    enough that the ambient is frozen by the arm/threshold logic for the whole event.
+    """
+
+    @staticmethod
+    def _realised_tau(tau, lo=20.0, hi=200.0):
+        """Step response. Seed the floor at `lo`, step the input to `hi`, bisect for the length
+        of step it takes the floor to cover 63.2% of it. Both levels sit under the 800 floor
+        threshold, so the gate never fires and the ambient updates on every sample."""
+        def ambient_after(n):
+            g = DT.Gate(FS, ambient_tau_s=tau)
+            g.ambient = lo                      # exact, and skips a settling run
+            g.process(np.full(n, hi), 0)
+            return g.ambient
+        target = lo + 0.6321205588 * (hi - lo)
+        a, b = 1, int(20 * tau * FS)
+        assert ambient_after(b) > target, "%.3f s tau did not converge in 20 tau" % tau
+        while b - a > 1:
+            m = (a + b) // 2
+            if ambient_after(m) < target:
+                a = m
+            else:
+                b = m
+        return b / FS
+
+    @pytest.mark.parametrize("tau", [0.05, DT.AMBIENT_TAU_S, 0.4])
+    def test_the_parameter_means_what_it_says(self, tau):
+        got = self._realised_tau(tau)
+        assert abs(got / tau - 1.0) < 0.05, \
+            "asked for %.4f s, measured %.4f s (%.0fx)" % (tau, got, got / tau)
+
+    def test_default_is_the_constant_the_published_run_was_measured_with(self):
+        # ⚠️docs/validation-full-captures.md (338 raw -> 168, 32 impossible clusters -> 1, zero
+        # false alarms in 68.5 min) was produced with alpha = 1e-4 per sample. Changing this
+        # number invalidates that table. If this fails, the document has to move too.
+        assert DT.Gate(FS).alpha == pytest.approx(1.0 / 10000.0, rel=1e-12)
+        assert self._realised_tau(DT.AMBIENT_TAU_S) < 0.25, "the floor is no longer sub-second"
+
+
+class TestOnset:
+    """The gate must timestamp the ONSET. It used to report the envelope peak, which arrives one
+    rise time late -- and rise time grows with range, so the error is a per-node bias that does
+    not cancel in TDoA. The budget this project argues about is 183 us (node-hardware.md)."""
+
+    @pytest.mark.parametrize("rise", [0.002, 0.005, 0.020])
+    @pytest.mark.parametrize("amp", [2000.0, 20000.0, 200000.0])
+    def test_onset_lands_on_the_rise_not_the_peak(self, rise, amp):
+        # true onset of a linear ramp at ONSET_FRAC of its own peak
+        true = 12000 + DT.ONSET_FRAC * rise * FS
+        d = DT.Gate(FS).process(_burst(rise, amp), 0)
+        assert len(d) == 1
+        err = d[0]["onset_index"] - true
+        assert abs(err) <= 2.0, "onset off by %+.2f samples (%.0f us)" % (err, err / FS * 1e6)
+        # and the back-walk really moved: the sibling project's moves 0, so its onset IS its peak
+        moved = d[0]["peak_index"] - d[0]["onset_index"]
+        assert moved > 0.7 * rise * FS, "back-walk moved only %.1f samples" % moved
+
+    @pytest.mark.parametrize("rise", [0.0005, 0.001, 0.002, 0.005, 0.020])
+    def test_onset_is_amplitude_invariant_over_100x(self, rise):
+        # Constant fraction exists for this: a fixed threshold is crossed earlier in the rise by
+        # a loud round than a quiet one, which is precisely a range-dependent timing bias.
+        # Measured spread here is 0.01 samples over 100x. Rises the 1 ms envelope cannot resolve
+        # read early against the ramp -- 7.1 samples at a 0.5 ms rise, 2.2 at 1 ms -- but that is
+        # a fixed offset of envelope(), identical at every amplitude, not a range-dependent bias.
+        got = [DT.Gate(FS).process(_burst(rise, a), 0)[0]["onset_index"]
+               for a in (2000.0, 20000.0, 200000.0)]
+        assert max(got) - min(got) <= 2.0, "100x amplitude moved the onset by %.2f samples" % \
+            (max(got) - min(got))
+
+    def test_the_back_walk_must_be_on_the_envelope(self):
+        # ⚠️THE TRAP, made falsifiable. Walking raw |x| from the peak stops at the first zero
+        # crossing of the carrier, so it reports the peak as the onset -- the sibling project
+        # ships that and its back-walk moves 0 samples over any amplitude.
+        x = _burst(0.020, 20000.0)
+        e = DT.envelope(x, FS)
+        k = int(np.argmax(e))
+        back = int(DT.GUARD_S * FS)
+        on_env = DT.onset_index(e, k, back=back)
+        on_raw = DT.onset_index(np.abs(x), k, back=back)
+        assert k - on_env > 0.7 * 0.020 * FS, \
+            "envelope walk moved only %.1f samples" % (k - on_env)
+        assert k - on_raw < 12, \
+            "raw |x| walk should stall inside one 4 kHz half-cycle, moved %.1f" % (k - on_raw)
+
+    def test_the_crossing_is_interpolated_not_truncated(self):
+        # straight envelope, 3 per sample from index 10, flat 100 after: the 20% crossing is
+        # analytic at 10 + 20/3. Returning the last-below index gives 16.0 and loses a third of
+        # a sample -- and 183 us is only 8.8 samples at 48 kHz.
+        e = np.concatenate([np.zeros(10), 3.0 * np.arange(35), np.full(20, 102.0)])
+        e = np.minimum(e, 100.0)
+        got = DT.onset_index(e, int(np.argmax(e)), frac=0.2)
+        assert got == pytest.approx(10.0 + 20.0 / 3.0, abs=1e-9)
+
+    @pytest.mark.parametrize("frac", [0.25, 0.5, 0.75])
+    def test_a_sub_sample_shift_reads_as_a_sub_sample_shift(self, frac):
+        # end to end, including the 1 ms envelope. Residual measured at 0.22 samples (4.5 us)
+        # over a 0.1-sample sweep -- a fortieth of the 183 us the whole design argues about.
+        def on(at):
+            return DT.Gate(FS).process(_burst(0.005, 20000.0, at=at), 0)[0]["onset_index"]
+        moved = on(12000.0 + frac) - on(12000.0)
+        assert abs(moved - frac) < 0.3, "%.2f sample shift read as %.2f" % (frac, moved)
+
+    def test_onset_never_reports_after_its_own_peak(self):
+        for rise in (0.0005, 0.005, 0.020):
+            d = DT.Gate(FS).process(_burst(rise, 20000.0), 0)[0]
+            assert d["onset_index"] <= d["peak_index"]
+            assert d["index"] == int(d["onset_index"])
+
+    @pytest.mark.parametrize("rise", [0.002, 0.020])
+    def test_onset_is_offset_independent(self, rise):
+        # given the whole event in one block, where it sits must not move the answer
+        errs = [DT.Gate(FS).process(_burst(rise, 20000.0, at=8192 + off, n=64000), 0)[0]
+                ["onset_index"] - (8192 + off + DT.ONSET_FRAC * rise * FS)
+                for off in range(0, 4096, 512)]
+        assert max(abs(e) for e in errs) <= 2.0, "worst %+.2f samples" % \
+            max(errs, key=abs)
+
+    def test_a_rise_that_predates_the_block_is_clamped_to_the_edge(self):
+        # The gate is block-local. Hand it a block that starts partway up the rise, so the 20%
+        # crossing is already behind it: the answer must be the edge, not an extrapolation.
+        start = 12500
+        d = DT.Gate(FS).process(_burst(0.020, 20000.0, at=12000)[start:], start)
+        assert d and d[0]["onset_index"] == float(start)
+
+
+class TestOnsetInThePipeline:
+    # ⚠️`at` IS CHOSEN SO THE WHOLE EVENT LANDS INSIDE ONE 4096-SAMPLE BLOCK. The gate's peak
+    # search is block-local (detect.py: `j = min(len(e), i + self.guard)`), so an event that
+    # straddles a block edge gets a truncated peak, a truncated 20% target and an onset up to
+    # 170 samples (3.5 ms) early -- measured over a 128-sample offset sweep, 7 of 32 offsets at a
+    # 20 ms rise. That is a defect in the streaming contract, not in the onset estimator, and the
+    # estimator is pinned offset-independently by test_onset_is_offset_independent below.
+    AT = 8400
+
+    def test_timestamp_and_sketch_both_start_at_the_onset(self):
+        rise = 0.020
+        p = Pipeline(FS, node_us_of=lambda idx: int(round(idx / FS * 1e6)))
+        d = p.run(_burst(rise, 20000.0, at=self.AT))[0]
+        got = SK.unpack(d["frame"])["node_us"]
+        assert got == int(round(d["onset_index"] / FS * 1e6))
+        # the peak is ~one rise time later; that is exactly the bias this removed
+        peak_us = int(round(d["peak_index"] / FS * 1e6))
+        assert peak_us - got > 0.7 * rise * 1e6
+
+    def test_the_sketch_contains_the_rise(self):
+        # sketched from the onset, the first frame must be quieter than the peak frame; sketched
+        # from the peak (the old behaviour) frame 0 IS the peak and the rise is gone
+        d = Pipeline(FS).run(_burst(0.020, 20000.0, at=self.AT))[0]
+        db = SK.unpack(d["frame"])["db"]
+        band = int(np.argmax(db.max(axis=1)))
+        assert db[band, 0] < db[band].max() - 6.0, "frame 0 is already the peak: no rise sketched"

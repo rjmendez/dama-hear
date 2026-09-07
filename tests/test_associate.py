@@ -46,6 +46,11 @@ def _conserved(got, n_input):
 
 TIGHT = Stub({1: (0, 0, 0), 2: (10, 0, 0), 3: (5, 8, 0)})          # diameter 10 m, window 59 ms
 SPREAD = Stub({1: (0, 0, 0), 2: (0, 40, 0), 3: (40, 0, 0), 4: (5, 0, 0)})   # diameter 56.6 m
+# Diameter 205 m -> window 627 ms, so the seed alone admits a half-second-late node. Nodes 2 and 4
+# are 5 m apart, which is the pair that must do the rejecting.
+PAIRED = Stub({1: (0, 0, 0), 2: (200, 0, 0), 3: (100, 150, 0), 4: (205, 0, 0)})
+# Diameter 128.1 m -> window 403 ms, wider than the 85 ms round cadence.
+WIDE = Stub({1: (0, 0, 0), 2: (100, 0, 0), 3: (50, 80, 0), 4: (0, 80, 0)})
 
 
 def _round(base_t, seq):
@@ -76,6 +81,24 @@ class TestCadences:
         _conserved(got, len(dets))
 
 
+class TestWideArray:
+    """The documented loss: rejection is terminal, so a wide-enough window eats whole rounds."""
+
+    def test_rounds_after_the_first_are_lost_on_an_array_wider_than_the_cadence(self):
+        """128.1 m diameter -> 403 ms window against an 85 ms cadence. All four nodes heard all
+        three rounds; rounds 2 and 3 come back as rejections, never as events. This is a pin on a
+        known cost, not an endorsement -- if re-seeding lands, this test is what has to change."""
+        dets = [_det(n, 100.0 + r * 0.085 + i * 0.005, r)
+                for r in range(3) for i, n in enumerate((1, 2, 3, 4))]
+        got = AS.associate(dets, WIDE)
+        assert got["diameter_m"] == pytest.approx(128.06, abs=0.01)
+        assert got["window_s"] == pytest.approx(0.4029, abs=1e-4)
+        assert got["window_s"] > 0.085, "fixture is void unless the window swallows the cadence"
+        assert [e["node_ids"] for e in got["events"]] == [[1, 2, 3, 4]]
+        assert [r["reason"] for r in got["rejected"]] == ["duplicate_node_in_group"] * 8
+        _conserved(got, len(dets))
+
+
 class TestPairwiseGate:
     """A node that missed round 1 and sent round 2 is the phantom, and geometry catches it."""
 
@@ -95,6 +118,22 @@ class TestPairwiseGate:
         assert "dt 85.0 ms" in bad[0]["detail"]
         assert "> 44.6 ms" in bad[0]["detail"]
         assert bad[0]["seed_node_id"] == 1
+        _conserved(got, len(dets))
+
+    def test_the_rejecting_member_need_not_be_the_seed(self):
+        """The gate is 'for EVERY member', and the phantom fixture cannot show that -- there the
+        rejector IS the seed. Here the seed is 205 m away and admits node 4 at 500 ms; only node 2,
+        5 m away, refuses it. A seed-only gate solves the phantom."""
+        dets = [_det(1, 100.000, 0), _det(2, 100.100, 0), _det(3, 100.200, 0),
+                _det(4, 100.500, 1)]          # node 4 skipped a round; 5 m from node 2
+        got = AS.associate(dets, PAIRED)
+        assert got["window_s"] > 0.5, "fixture is void unless the seed's own window admits node 4"
+        assert [e["node_ids"] for e in got["events"]] == [[1, 2, 3]]
+        assert [(r["node_id"], r["reason"]) for r in got["rejected"]] == [
+            (4, "pairwise_dt_exceeds_geometry")]
+        # The seed is node 1; the member that caught it is node 2.
+        assert got["rejected"][0]["seed_node_id"] == 1
+        assert "node 4 vs node 2: dt 400.0 ms > 44.6 ms" in got["rejected"][0]["detail"]
         _conserved(got, len(dets))
 
     def test_a_600_ms_margin_admits_the_phantom(self):
@@ -118,6 +157,12 @@ class TestWindow:
     def test_window_tightens_as_the_air_warms(self):
         small = Stub({1: (0, 0, 0), 2: (100, 0, 0), 3: (50, 1, 0)})
         assert AS.max_window_s(small, temp_c=35.0) < AS.max_window_s(small, temp_c=0.0)
+
+    @pytest.mark.parametrize("temp_c,margin_s", [(20.0, AS.MARGIN_S), (0.0, 0.010), (35.0, 0.100)])
+    def test_associate_reports_exactly_what_max_window_s_says(self, temp_c, margin_s):
+        """The documented policy must BE the algorithm's, not a second copy of it."""
+        got = AS.associate(_round(100.0, 0), TIGHT, temp_c=temp_c, margin_s=margin_s)
+        assert got["window_s"] == AS.max_window_s(TIGHT, temp_c, margin_s)
 
     def test_c_comes_from_shockwave(self):
         got = AS.associate(_round(100.0, 0), TIGHT, temp_c=23.0)
@@ -150,6 +195,29 @@ class TestBookkeeping:
         assert [d["iface"] for d in ev["detections"] if d["node_id"] == 1] == ["lora0"]
         assert len(got["duplicates"]) == 1
         assert got["duplicates"][0]["reason"] == "duplicate_seq"
+        assert got["rejected"] == []
+        _conserved(got, len(dets))
+
+    def test_a_reused_seq_a_window_later_is_a_new_event_not_a_duplicate(self):
+        """seq is 8-bit and wraps (hear/wire.py:113); a rebooted node restarts it without wrapping.
+        An unbounded (node_id, seq) dedupe collapses two real events into one and calls the second
+        a duplicate. Two disjoint 3-node events 200 s apart, every frame seq 7."""
+        dets = [d for base in (100.0, 300.0) for d in _round(base, 7)]
+        got = AS.associate(dets, TIGHT)
+        assert [e["node_ids"] for e in got["events"]] == [[1, 2, 3], [1, 2, 3]]
+        assert [e["t0_utc_s"] for e in got["events"]] == pytest.approx([100.0, 300.0], abs=1e-9)
+        assert got["duplicates"] == [] and got["rejected"] == []
+        _conserved(got, len(dets))
+
+    def test_a_second_copy_inside_the_window_is_still_a_duplicate(self):
+        """The bound must be the window, not equality of timestamps: the two-interface copy can
+        arrive with a different receive time and is still one frame."""
+        dets = _round(100.0, 0) + [_det(1, 100.020, 0, iface="mqtt")]   # window is 59 ms
+        got = AS.associate(dets, TIGHT)
+        assert [e["node_ids"] for e in got["events"]] == [[1, 2, 3]]
+        assert [d["iface"] for d in got["events"][0]["detections"] if d["node_id"] == 1] == \
+            ["lora0"]
+        assert [d["reason"] for d in got["duplicates"]] == ["duplicate_seq"]
         assert got["rejected"] == []
         _conserved(got, len(dets))
 
