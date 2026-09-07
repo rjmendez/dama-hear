@@ -196,8 +196,10 @@ and up. The number that bounds the small stuff is `fs_clean_hz` over a long wind
 16000.00 across 466 s, total loss is under 0.1% however it is distributed.
 
 Polling the node does **not** measurably cost audio, though `loop()` does read I2S, serve HTTP and
-parse GPS in one thread. Measured: 16 minutes at 15-30 s intervals with two concurrent pollers,
-`drop_s` flat at the two boot seconds and `fs_clean_hz` still 16000.00. An earlier build appeared
+parse GPS in one thread. Measured over 10.5 minutes at 15-30 s intervals with two concurrent
+pollers: three dropped seconds, two of them the I2S start, one at ~8 minutes. That rate is roughly
+70 over a night, each losing at least 32 ms -- call it 2 s of audio in 12 hours, 0.005%.
+`fs_clean_hz` reconverged to 16000.00 afterwards. An earlier build appeared
 to lose 14% under polling, but that reading came from `i2s.measured_hz`, which is cumulative and
 was still carrying the boot-second loss — the poller was not the cause.
 
