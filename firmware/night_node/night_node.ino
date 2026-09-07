@@ -23,6 +23,8 @@
 #include <SPI.h>
 #include "driver/gpio.h"
 #include <Wire.h>
+#include <Update.h>
+#include "esp_ota_ops.h"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -36,8 +38,11 @@ static const char *WIFI_PASSES[] = {""};
 #define AP_SSID   "dama-hear-node"
 #define AP_PASS   "damahear"          // >=8 chars or the AP silently refuses to start
 
-#define PPS_PIN   42                  // D11 -- was the PDM mic CLK, an OUTPUT. The mic is disabled
-                                      // below; two push-pull drivers on one pin is not a config
+#define PPS_PIN   1                   // D0. PPS must NOT sit on D11: that is the PDM mic's CLK,
+                                      // an output, and two push-pull drivers on one pin is not a
+                                      // configuration. D0 keeps mic and PPS coexisting.
+#define PDM_CLK   42                  // D11
+#define PDM_DIN   41                  // D12
 #define GPS_RX    44                  // D7  <- module TX
 #define GPS_TX    43                  // D6  -> module RX
 #define I2C_SDA 5                    // D4
@@ -348,7 +353,8 @@ static int gate(int16_t s) {
   armed = 0; return 1;
 }
 
-struct Det { uint32_t sample; uint32_t pps_n; uint32_t us_since_pps; int16_t trigger; uint32_t uptime_s; };
+struct Det { uint32_t sample; uint32_t pps_n; uint32_t us_since_pps; int64_t utc_us;
+              int16_t trigger; uint32_t uptime_s; };
 static Det dets[MAXDET]; static volatile uint32_t det_n = 0;
 
 // ---------------------------------------------------------------- state
@@ -357,6 +363,59 @@ static WebServer http(80);
 static bool sd_ok = false, sta_ok = false;
 static int sd_cs = 0;
 static uint32_t boot_ms = 0;
+
+// ---------------------------------------------------------------- OTA + failback
+// Failback does NOT rely on the bootloader's rollback feature: this core ships a prebuilt
+// bootloader and I could not confirm CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE is set, so depending on
+// it would be depending on something unverified. Instead the app counts its own boots in RTC
+// memory, which survives a reset. Three boots without reaching healthy and it flips the boot
+// partition back itself.
+//
+// ⚠️What this CANNOT save you from: a build that faults before setup() runs -- a bad global
+// constructor, say -- because nothing then increments the counter. That case still needs USB.
+// The counter is incremented as the first statement of setup() to shrink that window to almost
+// nothing.
+#define BOOT_MAGIC 0xB0074A11UL
+#define BOOT_MAX_TRIES 3
+#define HEALTHY_AFTER_MS 30000
+#define UNHEALTHY_REBOOT_MS 90000     // boots fine but never becomes reachable -> force a reboot
+#ifndef BUILD_TAG
+#define BUILD_TAG "A"
+#endif
+RTC_NOINIT_ATTR static uint32_t boot_magic;
+RTC_NOINIT_ATTR static uint32_t boot_try;
+static bool marked_healthy = false;
+static char ota_msg[96] = "idle";
+
+static void boot_guard() {
+  if (boot_magic != BOOT_MAGIC) { boot_magic = BOOT_MAGIC; boot_try = 0; }   // cold power-on
+  boot_try++;
+  if (boot_try > BOOT_MAX_TRIES) {
+    const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
+    boot_try = 0;
+    if (other && esp_ota_set_boot_partition(other) == ESP_OK) {
+      Serial.printf("\nBOOT GUARD: %d boots without reaching healthy -- reverting to %s\n",
+                    BOOT_MAX_TRIES, other->label);
+      Serial.flush(); delay(200); esp_restart();
+    }
+  }
+}
+
+static void mark_healthy_once() {
+  // An image that runs happily but never joins WiFi cannot be recovered over the air and will
+  // never reboot on its own, so the boot counter never advances. Force it: unreachable for long
+  // enough is a failed boot, and three of those revert the partition.
+  if (!marked_healthy && millis() - boot_ms > UNHEALTHY_REBOOT_MS) {
+    Serial.println("boot  never became reachable -- rebooting so the failback counter advances");
+    Serial.flush(); delay(200); esp_restart();
+  }
+  if (marked_healthy || millis() - boot_ms < HEALTHY_AFTER_MS) return;
+  if (!sta_ok) return;                       // healthy MUST include "reachable", or a node that
+  marked_healthy = true;                     // boots into a corner cannot be recovered over the air
+  boot_try = 0;
+  esp_ota_mark_app_valid_cancel_rollback();  // harmless if the bootloader ignores it
+  Serial.println("boot  marked healthy; failback counter cleared");
+}
 static float env_peak_seen = 0;
 
 // ppm error of the ESP32's own oscillator against GPS. esp_timer should advance exactly 1e6 us
@@ -399,7 +458,7 @@ static String status_json() {
     "\"i2s\":{\"nominal_hz\":%d,\"measured_hz\":%.4f,\"ppm\":%.1f,\"samples\":%lu},"
     "\"esp_clock\":{\"ppm_vs_gps\":%.3f,\"pps_intervals\":%lu},"
     "\"time\":{\"valid\":%s,\"utc_us\":%lld,\"since_edge_us\":%llu,\"navpvt_nano\":%ld,\"label_rejects\":%lu},"
-    "\"audio\":{\"enabled\":false,\"note\":\"PDM mic off: GPIO42 is PPS in\"},\"sd\":%s,\"i2c\":\"%s\"}",
+    "\"audio\":{\"enabled\":true,\"detections\":%lu,\"env_peak\":%.0f},\"sd\":%s,\"i2c\":\"%s\"}",
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
     gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences,
@@ -415,7 +474,7 @@ static String status_json() {
     esp_clock_ppm(NULL), (unsigned long)(pps_count > 1 ? pps_count - 1 : 0),
     time_valid ? "true" : "false", (long long)utc_now, (unsigned long long)since_edge,
     (long)last_nano, (unsigned long)time_glitch,
-    sd_ok ? "true" : "false", i2c_found);
+    (unsigned long)det_n, env_peak_seen, sd_ok ? "true" : "false", i2c_found);
   return String(b);
 }
 
@@ -435,7 +494,7 @@ static void h_root() {
              "`<tr><td>PPS edges<td><b>${s.pps.edges}</b> spread ${s.pps.spread_us} us, ${s.pps.glitches} rejected`+"
              "`<tr><td>I2S measured<td><b>${f}</b>`+`<tr><td>UTC now<td><b>${s.time.valid?new Date(s.time.utc_us/1000).toISOString():'anchor not valid'}</b> &middot; ${(s.time.since_edge_us/1000).toFixed(0)} ms since edge, ${s.time.label_rejects} rejected`+`<tr><td>ESP clock vs GPS<td><b>${s.esp_clock.pps_intervals>2?s.esp_clock.ppm_vs_gps.toFixed(3)+' ppm':'need 3 PPS edges'}</b> over ${s.esp_clock.pps_intervals} s`+"
              "`<tr><td>samples<td>${s.i2s.samples}`+"
-             "`<tr><td>audio<td>${s.audio.note}`+"
+             "`<tr><td>detections<td><b>${s.audio.detections}</b> (env peak ${s.audio.env_peak})`+"
              "`<tr><td>SD<td>${s.sd}`+`<tr><td>I2C<td>${s.i2c}`+`<tr><td>heap / psram<td>${s.heap} / ${s.psram}`;}"
              "u();setInterval(u,2000);</script>";
   http.send(200, "text/html", p);
@@ -446,8 +505,8 @@ static void h_dets() {
   uint32_t n = det_n < MAXDET ? det_n : MAXDET;
   for (uint32_t i = 0; i < n; i++) {
     char b[160];
-    snprintf(b, sizeof b, "%s{\"uptime_s\":%lu,\"sample\":%lu,\"pps_n\":%lu,\"us_since_pps\":%lu,\"trigger\":%d}",
-             i ? "," : "", (unsigned long)dets[i].uptime_s, (unsigned long)dets[i].sample,
+    snprintf(b, sizeof b, "%s{\"utc_us\":%lld,\"uptime_s\":%lu,\"sample\":%lu,\"pps_n\":%lu,\"us_since_pps\":%lu,\"trigger\":%d}",
+             i ? "," : "", (long long)dets[i].utc_us, (unsigned long)dets[i].uptime_s, (unsigned long)dets[i].sample,
              (unsigned long)dets[i].pps_n, (unsigned long)dets[i].us_since_pps, dets[i].trigger);
     o += b;
   }
@@ -456,9 +515,12 @@ static void h_dets() {
 }
 
 void setup() {
+  boot_guard();                    // first statement: a later fault still counts as a failed boot
   Serial.begin(115200);
   delay(1500);
   boot_ms = millis();
+  Serial.printf("boot  attempt %lu on partition %s\n", (unsigned long)boot_try,
+                esp_ota_get_running_partition()->label);
   Serial.println("\n=== dama-hear night node ===");
 
   // Try each configured network in turn. An outdoor node may only reach one of them, and which
@@ -562,12 +624,42 @@ void setup() {
   Serial.printf("sd    %s%s", sd_ok ? "mounted, CS=" : "no card", sd_ok ? "" : "\n");
   if (sd_ok) Serial.printf("%d\n", sd_cs);
 
-  // PDM mic DISABLED. Its CLK is GPIO42, which now carries PPS in from the module. Starting I2S
-  // would drive that pin against the GPS. The acoustic chain is already proven byte-exact against
-  // the Python (firmware/hear_poc); what this run needs is the edge.
-  Serial.println("i2s   PDM mic DISABLED -- GPIO42 reassigned to PPS input");
+  i2s.setPinsPdmRx(PDM_CLK, PDM_DIN);
+  if (!i2s.begin(I2S_MODE_PDM_RX, FS_NOMINAL, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO))
+    Serial.println("i2s   FAILED");
+  else Serial.printf("i2s   PDM %d Hz on CLK=%d DIN=%d\n", FS_NOMINAL, PDM_CLK, PDM_DIN);
 
   http.on("/", h_root); http.on("/status", h_status); http.on("/detections", h_dets);
+  http.on("/update", HTTP_POST,
+    []() {
+      bool bad = Update.hasError();
+      http.send(bad ? 500 : 200, "text/plain", bad ? "FAILED\n" : "OK, rebooting into the new image\n");
+      delay(400); ESP.restart();
+    },
+    []() {
+      HTTPUpload &u = http.upload();
+      if (u.status == UPLOAD_FILE_START) {
+        snprintf(ota_msg, sizeof ota_msg, "receiving %s", u.filename.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+      } else if (u.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
+      } else if (u.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) snprintf(ota_msg, sizeof ota_msg, "wrote %u B", (unsigned)u.totalSize);
+        else { Update.printError(Serial); snprintf(ota_msg, sizeof ota_msg, "write failed"); }
+      }
+    });
+  http.on("/ota", []() {
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    esp_ota_img_states_t st = ESP_OTA_IMG_UNDEFINED;
+    esp_ota_get_state_partition(run, &st);
+    char b[320];
+    snprintf(b, sizeof b,
+      "build     " BUILD_TAG "\nrunning   %s @ 0x%06lx\nboot_try  %lu (reverts after %d)\nhealthy   %s\n"
+      "img_state %d\nlast ota  %s\n\npush:  curl -F firmware=@<bin> http://<ip>/update\n",
+      run->label, (unsigned long)run->address, (unsigned long)boot_try, BOOT_MAX_TRIES,
+      marked_healthy ? "yes" : "not yet", (int)st, ota_msg);
+    http.send(200, "text/plain", b);
+  });
   http.on("/pins", []() {          // the compiled-in map, so it can be checked rather than trusted
     char b[640];
     snprintf(b, sizeof b,
@@ -668,6 +760,27 @@ static int16_t blk[BLOCK];
 void loop() {
   http.handleClient();
 
+  { size_t got = i2s.readBytes((char *)blk, sizeof blk);
+    int n = got / 2;
+    for (int i = 0; i < n; i++) {
+      int fired = gate(blk[i]);                 // stateful: exactly one call per sample
+      if (fired) {
+        uint32_t idx = det_n++;
+        if (idx < MAXDET) {
+          int64_t t = 0; bool tok = local_to_utc((uint64_t)esp_timer_get_time(), &t);
+          dets[idx].sample = g_samples + i;
+          dets[idx].pps_n = pps_count;
+          dets[idx].us_since_pps = (uint32_t)((uint64_t)esp_timer_get_time() - pps_us_last);
+          dets[idx].utc_us = tok ? t : 0;       // 0 = the anchor was not trusted at that instant
+          dets[idx].trigger = blk[i];
+          dets[idx].uptime_s = (millis() - boot_ms) / 1000;
+        }
+      }
+      float a = fabsf((float)blk[i]);
+      if (a > env_peak_seen) env_peak_seen = a;
+    }
+    g_samples += n; }
+
   while (Serial1.available()) {
     char c = Serial1.read();
     rawbuf[raw_i] = (uint8_t)c; raw_i = (raw_i + 1) % sizeof(rawbuf); raw_tot++;
@@ -693,6 +806,8 @@ void loop() {
     static uint32_t retry = 0;
     if (millis() - retry > 15000) { retry = millis(); WiFi.reconnect(); }
   }
+
+  mark_healthy_once();
 
   static uint32_t last = 0;
   if (millis() - last > 30000) {

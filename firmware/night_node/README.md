@@ -115,6 +115,32 @@ to timestamp for the ~200 ms each second before the report arrived -- the last g
 persists, and local and UTC are committed together as one matched pair. And it is the PENDING edge
 that must be named, not "the most recent edge", or a late report renames the wrong one.
 
+## OTA, and what happens when a bad image lands
+
+    arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi \
+      --output-dir .otabuild/out firmware/night_node
+    curl -F firmware=@.otabuild/out/night_node.ino.bin http://<ip>/update
+
+`/ota` shows the running partition, the boot counter, and whether this image has been accepted.
+
+**Verified, not asserted.** A good image pushed over WiFi took **5.9 s**, moved app0 -> app1, and came
+back healthy. The failback was then exercised by resetting the board four times with 16 s gaps, so
+no boot ever reached the 30 s healthy mark: after the third the node **flipped itself back to app0**
+and came up clean.
+
+⚠️**The failback does not use the bootloader's rollback feature.** This core ships a prebuilt
+bootloader and `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` could not be confirmed, so relying on it
+would be relying on something unverified. Instead the app counts its own boots in RTC memory, which
+survives a reset; three boots without reaching healthy and it sets the other partition itself.
+
+Healthy means **WiFi joined** as well as running, because an image that boots happily but cannot be
+reached is unrecoverable over the air. That case also cannot reboot itself, so an image that has not
+become reachable within 90 s restarts deliberately, which advances the counter.
+
+⚠️**What it cannot save you from:** a build that faults before `setup()` runs -- a bad global
+constructor, say -- since nothing then increments the counter. That still needs USB. The counter is
+the first statement of `setup()` to make that window as small as possible.
+
 ## What a good night looks like
 
 `fix` 3+ with 6+ sats, `pps` climbing by 1 per second with `glitches` at 0, spread of tens of µs,
