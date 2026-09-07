@@ -26,9 +26,10 @@
 #if __has_include("secrets.h")
 #include "secrets.h"
 #endif
-#ifndef WIFI_SSID
-#define WIFI_SSID ""
-#define WIFI_PASS ""
+#ifndef WIFI_N                        // no secrets.h -- fall back to the node's own AP
+#define WIFI_N 0
+static const char *WIFI_SSIDS[] = {""};
+static const char *WIFI_PASSES[] = {""};
 #endif
 
 #define AP_SSID   "dama-hear-node"
@@ -192,14 +193,20 @@ void setup() {
   boot_ms = millis();
   Serial.println("\n=== dama-hear night node ===");
 
-  if (strlen(WIFI_SSID)) {
-    WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.printf("wifi joining \"%s\"", WIFI_SSID);
-    for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) { delay(500); Serial.print("."); }
-    sta_ok = WiFi.status() == WL_CONNECTED;
-    Serial.println();
+  // Try each configured network in turn. An outdoor node may only reach one of them, and which
+  // one is not knowable from indoors.
+  if (WIFI_N > 0) {
+    WiFi.mode(WIFI_STA); WiFi.setSleep(false);
+    for (int k = 0; k < WIFI_N && !sta_ok; k++) {
+      Serial.printf("wifi  trying network %d/%d", k + 1, WIFI_N);
+      WiFi.begin(WIFI_SSIDS[k], WIFI_PASSES[k]);
+      for (int i = 0; i < 24 && WiFi.status() != WL_CONNECTED; i++) { delay(500); Serial.print("."); }
+      sta_ok = WiFi.status() == WL_CONNECTED;
+      Serial.println(sta_ok ? " joined" : " no");
+      if (!sta_ok) WiFi.disconnect();
+    }
   }
-  if (sta_ok) Serial.printf("wifi  STA  http://%s/\n", WiFi.localIP().toString().c_str());
+  if (sta_ok) Serial.printf("wifi  STA  \"%s\"  http://%s/\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
   else {
     WiFi.mode(WIFI_AP); WiFi.softAP(AP_SSID, AP_PASS);
     Serial.printf("wifi  AP   ssid \"%s\" pass \"%s\"  http://%s/\n",
@@ -259,6 +266,11 @@ void loop() {
     if (a > env_peak_seen) env_peak_seen = a;
   }
   g_samples += n;
+
+  if (sta_ok && WiFi.status() != WL_CONNECTED) {     // AP blipped; an overnight node reconnects
+    static uint32_t retry = 0;
+    if (millis() - retry > 15000) { retry = millis(); WiFi.reconnect(); }
+  }
 
   static uint32_t last = 0;
   if (millis() - last > 30000) {

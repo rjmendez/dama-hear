@@ -57,3 +57,18 @@ second time on the not-detected path, feeding the envelope samples that never ex
 `fix` 3+ with 6+ sats, `pps` climbing by 1 per second with `glitches` at 0, spread of tens of µs,
 and `fs` settling on a stable figure. **That figure is the deliverable** — if it is not 16000.000,
 every timestamp this platform has ever produced was scaled wrong, and now you know by how much.
+
+## Credentials and watching it
+
+    python3 firmware/night_node/gen_secrets.py     # reads ~/.wifi, writes gitignored secrets.h
+
+Takes every `WIFI_<n>_SSID`/`WIFI_<n>_PSK` pair and tries each in turn, because an outdoor node may
+only reach one of them and which one is not knowable from indoors. It prints a count and masked
+names, never the credentials. `secrets.h` is written 0600 and is gitignored.
+
+    nohup python3 firmware/night_node/watch.py http://<ip> 30 >> ~/dama-hear-night.log 2>&1 &
+
+`watch.py` polls `/status`, appends every sample to `~/dama-hear-night.jsonl`, and prints a line
+only when something *changes* — fix gained or lost, the first PPS edge, glitches climbing, a reboot,
+the node going away or coming back. A log that prints every poll is a log nobody reads in the
+morning. It runs detached and does not depend on any terminal staying open.
