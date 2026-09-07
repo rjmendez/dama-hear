@@ -2,24 +2,39 @@
 """Sustained tonal detection: cicadas, and the katydids that call low enough to hear.
 
 WHY THIS IS NOT hear/node/detect.py WITH DIFFERENT NUMBERS. That gate is a broadband level gate
-sized for an impulse, and the 2026-09-07 11.33 h capture measured exactly how far it is from this
-job. Its floor is 800 counts against a median ambient of 29.4 -- 28.7 dB over the background, and
-19.5 dB over ambient p95 (84.8). A chorus sitting a plausible 10 dB over ambient is ~19 dB under
+sized for an impulse, and the 2026-09-07 12.08 h capture measured exactly how far it is from this
+job. Its floor is 800 counts against a median ambient of 28.95 -- 28.8 dB over the background, and
+19.6 dB over ambient p95 (84.11). A chorus sitting a plausible 10 dB over ambient is ~19 dB under
 that gate and cannot fire it at any hour of the night. Worse, the gate's envelope is broadband,
 and the night's own sketches say what that costs.
 
-    RECIPE, so the numbers below are reproducible rather than asserted. dets.csv holds 59 rows;
-    11 set flags bit 1 (insufficient context -- the sketch is of a ring that had not filled) and
-    are excluded, leaving 48. Decode each `frame_hex` with hear.sketch.unpack and take the `db`
-    field, a 20x8 array. Reduce each band to its MAXIMUM over the 8 frames. Then:
-      - 46 of the 48 peak in mel band 0. At fs=16 kHz and nfft=256 the only rfft bins with
-        nonzero weight in band 0 are 312.5-500 Hz (the mel triangle nominally spans 300-527 Hz).
-      - median over the 48 of (band 0) - (mean of bands 16-19) = 20.4 dB. Bands 16-19 are the
-        four whose triangular support lies entirely above 4 kHz: 4425-7840 Hz.
-    The reduction is part of the measurement, not a detail: per-band MEAN over frames instead of
-    max gives 45 of 48 in band 0 and 16.5 dB, and comparing against the LOUDEST of bands 16-19
-    rather than their mean gives 17.2 dB. A bare "22.3 dB above the 4-8 kHz bands" was in this
-    docstring and reproduces under no reduction tried; it is gone.
+    RECIPE, so the numbers below are reproducible rather than asserted. Capture is
+    ~/dama-hear-night-2026-09-07/final/. health.csv holds 1450 rows; its utc_us spans
+    07:16:23.7 to 19:21:15.9 UTC and its uptime_s runs 28 s to 43521 s -- 12.081 h either way,
+    which is where "12.08 h" comes from. The ambient figures above are the median and the 95th
+    percentile of that file's `ambient` column over all 1450 rows, in counts, against the
+    firmware's fixed floor of 800: 20*log10(800/28.95) = 28.8 dB, 20*log10(800/84.11) = 19.6 dB.
+
+    dets.csv holds 62 rows. 14 carry uptime_s == 12 -- the boot-time burst -- and 11 of those 14
+    also set flags bit 1 (insufficient context: the sketch is of a ring that had not filled).
+    Dropping the 14 leaves the 48 in-run detections, and on this file the two filters agree: all
+    48 survivors have flags == 0. (An earlier revision of this docstring said "59 rows; 11 set
+    flags bit 1 ... leaving 48". The file has 62 rows and 62 - 11 = 51, so that arithmetic never
+    worked.) Decode each `frame_hex` with hear.sketch.unpack and take the `db` field, a 20x8
+    array. Reduce each band to its MAXIMUM over the 8 frames. Then:
+      - ALL 48 peak in mel band 0, and band 0 exceeds band 1 in 48 of 48 (median 5.50 dB), so the
+        spectrum is still climbing where the filterbank stops. At fs=16 kHz and nfft=256 the only
+        rfft bins with nonzero weight in band 0 are 312.5-500 Hz (bins 5-8; the mel triangle
+        nominally spans 300.0-526.6 Hz).
+      - median over the 48 of (band 0) - (mean of bands 16-19) = 24.6 dB. Bands 16-19 are the
+        four whose triangular support lies entirely above 4 kHz: mel edges 4425-7840 Hz, nonzero
+        bins 4437.5-7812.5 Hz.
+    The reduction moves the dB but not the count: per-band MEAN over frames instead of max still
+    puts all 48 in band 0, at 17.6 dB; comparing against the LOUDEST of bands 16-19 rather than
+    their mean gives 19.0 dB under the max reduction and 14.0 dB under the mean. Two earlier
+    revisions claimed "22.3 dB", then "46 of the 48 ... 20.4 dB" with "45 of 48 ... 16.5 dB" for
+    the mean reduction; none of those five figures reproduces under any reduction tried, and they
+    are gone.
 
 So low-frequency rumble sets the envelope and anything in the insect band is masked before the
 threshold is even consulted. And it is an amplitude detector: a sustained tonal source has a low
@@ -93,13 +108,40 @@ MAX_DURATION_S = 10.0
 # on field data: the 2026-09-07 capture contains no biological example to measure them on, and
 # saying so is the point -- these are provisional numbers to be refitted the first night this
 # detector records something a person has listened to.
-# Band-limited white noise: tonality 0.015 over a 1 s run (31 frames), 0.006 over 3 s. A 6 kHz
-# tone at 6.9 dB in-band SNR: 0.79. 0.20 clears the noise case by 13x and the weakest tonal case
-# by 4x, which is the widest gap available.
+# RECIPE for both thresholds: the helpers in tests/test_bioacoustic.py, at the shipped defaults,
+# on this box. `noise` is _band_noise(n, gain=8.0, seed=2); `buzz` is _buzz(4 s, snr_db=S) fed to
+# a TonalGate(16000) after 3 s of _noise, and the quoted tonality/periodicity/SNR are the fields
+# of the event the gate emits; `clicks` is _clicks(4 s, 20.0, gain=G) fed the same way.
+#
+# Band-limited white noise, averaged the way the gate averages -- frame at nfft=1024 and hop=512
+# through the Hanning window, keep the in-band bins, mean the periodograms, then take
+# 1 - spectral_flatness -- gives tonality 0.016 over a 1 s run (30 complete frames, not 31; 31 is
+# the hop count and the last hop does not hold a whole frame) and 0.0055 over 3 s (92 frames).
+# The shipped path agrees: a loud 4 s band-noise burst comes out at tonality 0.004. The weakest
+# buzz the gate will open a run on at all is snr_db=5.0, which it reports at 6.19 dB: tonality
+# 0.752. So 0.20 sits 12.5x above the worst noise case and 3.8x below the weakest tonal case,
+# which is the widest gap available.
 TONALITY_MIN = 0.20
-# The same band noise, unmodulated: periodicity 0.14 over 1 s, 0.065 over 3 s. A 20 Hz click
-# train at 5.7 dB in-band SNR: 0.80. Higher than TONALITY_MIN because the short-window value
-# (0.14) is the one that has to be cleared, and it is twice the long-window value.
+# The same band noise, unmodulated, measured over ANALYSIS_S = 2 s -- because that is all the raw
+# audio a run retains (see analysis_n), so no run's periodicity is ever measured over more,
+# whatever its duration: 0.056 at seed 2, and 0.073 worst over seeds 0-7. The shipped path agrees:
+# the loud band-noise burst comes out at periodicity 0.064. The weakest click train the gate will
+# open a run on is gain=2.5, reported at 5.15 dB: periodicity 0.785, rising to 0.907 at gain=10.
+# So 0.30 sits 4.1x above the worst noise case and 2.6x below the weakest pulsed case.
+#
+# ⚠️0.30 IS NOT THE WIDEST-GAP POINT, WHICH IS sqrt(0.073*0.785) = 0.24, AND IT IS HELD ANYWAY.
+# An unmodulated tone's envelope correlates with itself more strongly the further it is out of the
+# noise: the buzz reports periodicity 0.217 at 10.45 dB, 0.301 at 12.31 dB, 0.531 at 20.10 dB. So
+# `pulsed` is already loose on a plain tone above ~12 dB, and every dB taken off this threshold
+# makes it looser. It costs nothing in the gate -- structure is an OR and tonality carries those
+# events regardless -- but `pulsed` on a high-SNR event is not evidence of modulation, and the
+# threshold is not lowered to the widest-gap point for that reason.
+#
+# The justification this replaces read "periodicity 0.14 over 1 s ... the short-window value is
+# the one that has to be cleared". A 1 s envelope at the default (2, 100) Hz range returns
+# (None, None) from the shipped code -- two periods of the slowest rate asked for need just over
+# 1 s -- so that number was unobtainable, and 0.065 for a 3 s window described a window the gate
+# never uses.
 PERIODICITY_MIN = 0.30
 # Floor time constants. Fast down, slow up, and applied on EVERY frame -- see _update_floor.
 FLOOR_TAU_DOWN_S = 10.0
@@ -176,10 +218,11 @@ def spectral_flatness(p: Sequence[float]) -> float:
     It costs one log and two means over the in-band bins, which is what a node could afford later.
 
     ⚠️AVERAGE THE PERIODOGRAM FIRST. On a SINGLE frame this is near-useless: each bin of a white
-    periodogram is exponentially distributed, and exp(E[log X])/E[X] = e^-gamma = 0.561, so white
+    periodogram is exponentially distributed, and exp(E[log X])/E[X] = e^-gamma = 0.5615, so white
     noise scores 0.44 "tonal" on one frame. Averaging k frames pulls it to exp(psi(k) - ln k) --
-    0.98 at k=31, one second at the default hop. The caller must hand this an averaged spectrum,
-    and TonalGate does.
+    0.983 at k=30, which is how many complete frames fit in one second at the default nfft and
+    hop ((16000 - 1024) // 512 + 1). The caller must hand this an averaged spectrum, and TonalGate
+    does.
     """
     p = np.asarray(p, float)
     if p.size < 2:
@@ -241,13 +284,19 @@ def pulse_rate(env: Sequence[float], fs_env: float,
     ⚠️THE GUARD IS AGAINST rate_lo, THE SLOWEST RATE, AND IT USED TO BE AGAINST rate_hi. Guarding
     on the fastest rate lets a window that cannot hold one period of the true modulation be
     searched anyway; the search then lands on some multiple of the true rate, or on the edge of
-    the searched range, and reports it with full confidence. Measured on this box against the
-    shipped code before the fix, with env = 1 + 0.9*sin(2*pi*3*t) sampled at fs_env = 1000 Hz and
-    the default (2, 100) Hz range:
-        0.4 s of it  ->  (0.988, 100.0 Hz)     true rate 3 Hz, so 33x wrong
-        0.3 s of it  ->  (1.000, 100.0 Hz)     periodicity 1.000, at the top of the range
-        0.3 s of white noise -> (0.137, 12.3 Hz)   where this docstring promised None
-    All three now return (None, None).
+    the searched range, and reports it with full confidence.
+
+    RECIPE for the three pre-fix numbers below, because they cannot be got from this file as it
+    stands. Restore the old guard and the old clip -- replace the `n < 2 * lag_hi + 2` test with
+    `n < 2 * lag_lo + 2` and insert `lag_hi = min(lag_hi, n // 2)` above it -- and leave the rest
+    of the body alone. Then, at fs_env = 1000 Hz and the default (2, 100) Hz range:
+        env = 1 + 0.9*sin(2*pi*3*t), 0.4 s  ->  (0.988, 100.0 Hz)  true rate 3 Hz, so 33x wrong
+        the same, 0.3 s                     ->  (1.000, 100.0 Hz)  periodicity 1.000, top of range
+        np.random.RandomState(0).normal(0, 1, 300)
+                                            ->  (0.137, 12.3 Hz)  where this docstring promised
+                                                                  None
+    The two sine rows do not depend on the clip; the white-noise row does, and reproduces only
+    with `n // 2`. All three now return (None, None).
 
     The cost is stated rather than hidden: at the default rate_lo = 2 Hz a measurement needs
     2/2 Hz + 2 samples of envelope, i.e. just over 1 s, so a run near min_duration_s can come
@@ -260,8 +309,20 @@ def pulse_rate(env: Sequence[float], fs_env: float,
 
     ⚠️THE REPORTED LAG IS THE FUNDAMENTAL, NOT THE TALLEST PEAK. A periodic envelope correlates
     with itself at every multiple of its period, and the bias correction lifts the longer lags,
-    so argmax lands on a subharmonic: measured on a 20 Hz click train it reported 10 Hz, and on a
-    12 Hz train it reported 4 Hz. The first peak within FUND_FRAC of the tallest is taken instead.
+    so argmax lands on a subharmonic. RECIPE: take the argmax of `seg` instead of running the
+    FUND_FRAC loop below, on the envelope of 3 s of tests/test_bioacoustic.py's own
+    _clicks(n, rate) at fs = 16 kHz, decimated the way this module decimates it, at the default
+    (2, 100) Hz range:
+        true  8 Hz -> 4.00 Hz     true 12 Hz -> 4.00 Hz
+        true 20 Hz -> 2.86 Hz     true 45 Hz -> 2.50 Hz
+    Never the true rate, and for the faster trains it falls to within a hair of rate_lo, the
+    bottom of the searched range. (An earlier revision of this docstring said "10 Hz for a 20 Hz
+    train". No window length or variant tried reproduces 10 Hz; the 12 Hz row is the half of that
+    sentence that does reproduce, which is probably why the other half survived so long. Dropping
+    the bias correction instead of the FUND_FRAC rule recovers 20.00 Hz -- at the cost the
+    correction exists to prevent, a slow train scoring lower than a fast one for free.)
+    The first peak within FUND_FRAC of the tallest is taken instead: 8.00, 12.05, 20.00, 45.45 Hz
+    on those same four inputs.
     """
     e = np.asarray(env, float)
     n = e.size
@@ -320,10 +381,13 @@ class TonalGate:
     under a song that was still going". With the shipped configuration that boolean is
     structurally unreachable: floor_tau_up_s is 300 s and max_duration_s is 10 s, so the floor
     can close only 3.27% of the gap before the run is force-closed anyway, and clearing
-    close_hyst_db would take 91.7 dB of SNR (the arithmetic is beside FLOOR_TAU_UP_S). Measured:
-    False on every event at 12, 30, 60 and 90 dB SNR. A flag that cannot fire is worse than no
-    flag, so it is gone, replaced by `floor_rise_db` -- the dB the floor actually moved while the
-    run was open, a number rather than a verdict.
+    close_hyst_db would take 91.7 dB of SNR (the arithmetic is beside FLOOR_TAU_UP_S). MEASURED,
+    on 3 s of _noise then 30 s of _buzz(snr_db=S) from tests/test_bioacoustic.py at the shipped
+    defaults: the three segments' floor_rise_db come to 0.41/0.39/0.38 dB at S=12, 0.99/0.96/0.92
+    at 30, 1.98/1.91/1.84 at 60 and 2.96/2.87/2.76 at 90 -- under close_hyst_db = 3.0 even at a
+    physically absurd 90 dB, which is the same statement as the arithmetic. A flag that cannot
+    fire is worse than no flag, so it is gone, replaced by `floor_rise_db` -- the dB the floor
+    actually moved while the run was open, a number rather than a verdict.
 
     What absorption really looks like is a sequence: a chorus that outlasts floor_tau_up_s comes
     back as successive max_duration segments whose `floor_db` climbs and whose `snr_db` shrinks,
@@ -397,16 +461,23 @@ class TonalGate:
         # ⚠️TWO COUNTERS, BECAUSE ONE OF THEM IS A FUNCTION OF max_duration_s AND THE OTHER IS
         # NOT. A single shapeless stretch longer than max_duration_s is chopped into segments and
         # each segment is judged separately, so counting segments makes a 60 s wind gust score 6
-        # at max_duration_s=10 and 3 at 20. `n_unstructured` counts STRETCHES -- a segment that
+        # at max_duration_s=10 and 3 at 20 -- measured on 3 s of _noise then 60 s of
+        # _noise(seed=8) + _band_noise(gain=8.0) from tests/test_bioacoustic.py, which emits no
+        # events and leaves n_unstructured_segments at 6 and 3 while n_unstructured stays 1 for
+        # both. (The same signal at 25 s gives 3 and 2, and that is the case the tests pin.)
+        # `n_unstructured` counts STRETCHES -- a segment that
         # continues the previous one does not increment it -- and is the number that says
         # something about the site. `n_unstructured_segments` counts the discards and is a number
         # about this detector's settings.
         self.n_unstructured = 0
         self.n_unstructured_segments = 0
         # Stream discontinuities seen on the `block_start` the caller declares. Not cosmetic: the
-        # node had 18 one-second windows come up short across the 2026-09-07 capture. drop_s counts
-        # WINDOWS, not seconds of audio: drop_samples=42749 is about 2.7 s at 16 kHz (health.csv,
-        # final drop_s=18, drop_samples=42749). Either way a real stream HAS gaps.
+        # node had 20 one-second windows come up short across the 2026-09-07 capture. drop_s counts
+        # WINDOWS, not seconds of audio: drop_samples=57597 is 3.60 s at 16 kHz (health.csv, last
+        # row: drop_s=20, drop_samples=57597, both monotonic over the file). Either way a real
+        # stream HAS gaps. An earlier revision quoted drop_s=18 / drop_samples=42749 / 2.7 s as
+        # the final values; that pair is real but mid-run -- it first appears 1259 rows in, at
+        # uptime_s=37818 of 43521.
         self.n_gaps = 0
         self.n_gap_samples = 0
         self.n_discarded_samples = 0   # residual thrown away because a gap orphaned it
@@ -617,8 +688,12 @@ class TonalGate:
         # two target signals differ on which one they have: a cicada's continuous buzz is tonal
         # and barely modulated, a katydid's pulse train is strongly modulated and its carrier can
         # be broad. Wind and traffic are neither. Without this as a hard requirement a band-noise
-        # burst 18 dB over the floor scored confidence 0.52 (measured), because a geometric mean
-        # of three terms cannot be dragged low enough by one of them alone.
+        # burst 17.95 dB over the floor scores confidence 0.534, because a geometric mean of three
+        # terms cannot be dragged low enough by one of them alone. RECIPE: 3 s of _noise then 4 s
+        # of _noise(seed=8) + _band_noise(gain=8.0) from tests/test_bioacoustic.py, through a
+        # TonalGate(16000) whose `if structure < 0.0: return None` branch below is removed; the
+        # event comes back tonality 0.004, periodicity 0.064, structure -0.245. (An earlier
+        # revision rounded this to "18 dB" and "0.52"; 0.52 does not reproduce here.)
         ton_n = (tonality - self.tonality_min) / max(1e-9, 1.0 - self.tonality_min)
         if periodicity is None:
             per_n = None
@@ -628,10 +703,10 @@ class TonalGate:
             structure = max(ton_n, per_n)
         if structure < 0.0:
             # Loud, sustained, and shapeless. Counted, not silently dropped. Two counters, and
-            # only one of them is about the site: see their definitions in __init__. A 60 s wind
-            # gust is ONE unstructured stretch and six unstructured segments at the shipped
-            # max_duration_s; the old single counter reported six and called that a fact about
-            # the site, when six is a fact about max_duration_s.
+            # only one of them is about the site: see their definitions in __init__, which carry
+            # the recipe. A 60 s wind gust is ONE unstructured stretch and six unstructured
+            # segments at the shipped max_duration_s; the old single counter reported six and
+            # called that a fact about the site, when six is a fact about max_duration_s.
             self.n_unstructured_segments += 1
             if not r["continues"]:
                 self.n_unstructured += 1
@@ -647,7 +722,7 @@ class TonalGate:
         c_dur = _logistic((duration_s - self.min_duration_s) / max(1e-9, self.min_duration_s))
         confidence = float((c_snr * c_str * c_dur) ** (1.0 / 3.0))
 
-        # Peak against a wall. The 2026-09-07 capture is the cautionary case: 46 of its 48 usable
+        # Peak against a wall. The 2026-09-07 capture is the cautionary case: all 48 of its in-run
         # detections peak in mel band 0, whose nonzero bins run 312.5-500 Hz. That LOCATES THE
         # PEAK NO MORE PRECISELY THAN "at or below 500 Hz" -- it is equally consistent with a peak
         # inside band 0 and with one below 300 Hz, outside the representation entirely, and the

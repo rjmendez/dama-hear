@@ -26,6 +26,7 @@
 #include <Update.h>
 #include "esp_ota_ops.h"
 #include "mel16.h"
+#include "mel_scene.h"
 #include "esp_heap_caps.h"
 
 #if __has_include("secrets.h")
@@ -89,7 +90,13 @@ static volatile uint32_t g_samples = 0;      // updated by the audio loop, read 
 static const char HEALTH_HDR[] =
   "utc_us,time_valid,uptime_s,fix,sats,tacc_ns,pps,pps_bad,spread_us,esp_ppm,samples,fs_cum_hz,"
   "fs_clean_hz,fs_win_s,drop_s,drop_samples,samp_last_s,det_n,det_written,det_lost,ambient,"
-  "env_peak_win,heap,gate_armed,gate_thr,gate_e_max,gate_forced,sig_dc,sd_free_mb,write_fail";
+  "env_peak_win,heap,gate_armed,gate_thr,gate_e_max,gate_forced,sig_dc,sd_free_mb,write_fail,"
+  // gate_floor, because gate_thr only pins the floor down where the floor is the binding limb.
+  // The clip counters, because a card that filled and a night that went quiet must not look the
+  // same in the record -- clip_written advances only on a clip that landed, clip_skip_budget only
+  // on one that was wanted and refused.
+  "gate_floor,clip_written,clip_skip_budget,clip_skip_cardfull,clip_skip_dedupe,"
+  "clip_skip_ring,clip_fail,clip_budget_left";
 static double   fs_clean      = (double)FS_NOMINAL;
 static uint32_t fs_clean_secs = 0;    // length of the current unbroken window, in GPS seconds
 static uint32_t drop_seconds  = 0;    // seconds that came up short by a block or more
@@ -452,7 +459,42 @@ static int sketch_frame(uint8_t *out, uint32_t back, uint32_t node_us, uint16_t 
 // ---------------------------------------------------------------- gate (as hear/node/detect.py)
 static float g_amb = 0, env_sum = 0, env_buf[16]; static int env_i = 0, armed = 1;
 static const float ENV_INV = 1.0f / 16.0f, ALPHA = 1.0f / 10000.0f;
-static const float RATIO = 8.0f, FLOOR = 800.0f, REARM = 0.35f;
+static const float RATIO = 8.0f, FLOOR_DEFAULT = 800.0f, REARM = 0.35f;
+// THE FLOOR IS RUNTIME-SETTABLE (POST /gate?floor=N). It used to be a compile-time 800, and over
+// the 2026-09-07 capture it -- not the adaptive 8 x ambient limb -- was what the gate actually
+// ran on: gate_thr was exactly 800.0 in 1418 of 1450 health.csv rows (97.8%), max 1715. Median
+// ambient over those rows is 28.9, so 8 x ambient is ~231 and the floor was ~3.5x above it all
+// night. 800 was chosen for gunshots; retuning it for anything quieter meant a reflash and a walk
+// outside, which is why it never got retuned.
+//
+// GUARD, AND WHY THESE TWO BOUNDS.
+//   FLOOR_MIN = 100. Below roughly this value the knob stops doing anything: counting the 30 s
+//   health rows whose gate_e_max exceeded max(floor, 8 x ambient) -- windows that would have
+//   contained at least one crossing -- gives 1043 of 1450 at floor 100 and 1045 at floor 0, a
+//   0.2 pp difference, because the adaptive limb has taken over as the binding one. A setting
+//   that reads as a change and is not one is worse than a refusal. For scale on the same recipe:
+//   800 -> 38 (2.6%), 600 -> 100, 400 -> 443, 200 -> 982, 100 -> 1043 (71.9%).
+//   FLOOR_MAX = 32768. The envelope is a 16-sample mean of |int16|, so it cannot exceed 32768 by
+//   construction; a floor at or above that is a gate that can never fire, which is indis-
+//   tinguishable from a dead microphone -- the exact failure env_e_max_win exists to rule out.
+//
+// ⚠️NEITHER BOUND PROTECTS THE CARD, and it would be a lie to imply one does. Floor 100 gives 27x
+// the crossing rate of floor 800 on the measured night. What bounds the card is downstream:
+// det_flush writes at most 16 rows per second (16 x 437 B = 6992 B/s, so 19 MiB in 47 min at
+// the absolute cap), and the clip writer -- which at 128044 B a clip would fill the card in about
+// three minutes at that rate -- is held by its own byte budget (CLIP_BUDGET_B). Lower this floor
+// on an unattended node only with that budget in place.
+static const float FLOOR_MIN = 100.0f, FLOOR_MAX = 32768.0f;
+static float g_floor = FLOOR_DEFAULT;
+// "default" until something overrides it, then "file" or "http". Reported in /status so the
+// active value never has to be inferred from gate_thr, which only bounds it from above whenever
+// the adaptive limb is the binding one (32 of the capture's 1450 rows).
+static const char *g_floor_src = "default";
+// The value /gate.cfg currently holds, or NaN for "no file". Cached rather than re-read, and
+// reported as a NUMBER rather than a yes/no: a bare "persisted: true" beside an active floor of
+// 300 while the file still said 800 would be true and useless -- what the operator needs to know
+// is what the node will come back as after the plug timer cuts it.
+static float g_floor_saved = NAN;
 // A night that records nothing is ambiguous: was it quiet, or was the threshold set above
 // everything that happened? Track the highest envelope actually reached between health rows.
 // e_max well under thr all night says the gate was too high; e_max grazing thr says it was tuned
@@ -480,14 +522,18 @@ static uint32_t disarm_samples = 0, gate_forced = 0;
 static const float ALPHA_DC = 1.0f / 1600.0f;      // tau ~0.1 s at 16 kHz
 static float    sig_dc = 0.0f;                     // the pedestal being subtracted
 static bool     dc_ready = false;
-static float gate_thr() { float t = g_amb * RATIO; return t < FLOOR ? FLOOR : t; }
+static float gate_thr() { float t = g_amb * RATIO; return t < g_floor ? g_floor : t; }
 static int gate(int16_t s) {
   float a = fabsf((float)s);
   env_sum += a - env_buf[env_i]; env_buf[env_i] = a;
   if (++env_i >= 16) env_i = 0;
   float e = env_sum * ENV_INV;
   if (e > env_e_max_win) env_e_max_win = e;
-  float thr = g_amb * RATIO; if (thr < FLOOR) thr = FLOOR;
+  // g_floor, not a second literal: this used to recompute the threshold with FLOOR while
+  // gate_thr() above computed its own, so a runtime floor changed at one site only would have
+  // left /status and health.csv reporting a threshold the gate was not using -- a record that
+  // looks correct and is not. Both sites read the same variable now.
+  float thr = g_amb * RATIO; if (thr < g_floor) thr = g_floor;
   // Track the floor unconditionally: fast while below threshold, slow while above it. The slow
   // limb is what breaks the deadlock, and it is slow enough that a real transient is over long
   // before it shifts the estimate.
@@ -502,8 +548,14 @@ static int gate(int16_t s) {
   armed = 0; return 1;
 }
 
+// clip_st: what happened to this detection's WAV. PENDING is the only transient value, and
+// det_flush refuses to write a row while it is set -- see the clip writer for why the row has to
+// wait, and for the deadline that guarantees it stops waiting.
+enum { CLIP_PENDING = 0, CLIP_OK, CLIP_BUDGET, CLIP_CARDFULL, CLIP_DEDUPE, CLIP_RING,
+       CLIP_NOCARD, CLIP_FAIL, CLIP_STALLED };
 struct Det { uint32_t sample; uint32_t pps_n; int32_t us_since_pps; int64_t utc_us;
               int16_t trigger; uint16_t flags; uint32_t uptime_s; double fs_at;
+              uint8_t clip_st;
               uint8_t frame[MEL16_FRAME_BYTES]; };
 // A RING. dets[] used to be a hard cap -- past the 64th, a detection incremented the counter and
 // stored nothing, so a windy night reported hundreds of events and kept the first 64. det_n is
@@ -635,11 +687,16 @@ static double esp_clock_ppm(uint32_t *secs_out) {
 // ---------------------------------------------------------------- raw ring (PSRAM)
 // The sketch is 44 ms of log-mel and only exists when the gate fires. That is enough to say what
 // a transient sounded like to a classifier built beforehand, and useless for anything else: the
-// night produced 45 in-run detections and no way to listen to any of them. (47 is the figure
-// the counter ends on; 45 excludes the two that fired in the first 12 s of that boot, before the
-// mic settled. Both are in the capture.) This ring keeps the
-// last few minutes of actual PCM so a detection can be heard, or re-analysed off-box with a
-// feature the node has never been taught.
+// run produced 48 in-run detections and, until the clip writer below, no way to listen to any of
+// them. 48 is measured -- dets.csv from the 2026-09-07 capture holds 62 rows, 14 of them at
+// uptime_s == 12 (the first seconds of a boot, before the mic has settled) and 48 above it. This comment
+// used to say 45 with the counter "ending on 47"; neither reproduces from the capture and both
+// are deleted rather than adjusted. (The file holds 62 rows against a final det_n of 50 because
+// dets.csv survives a reboot and det_n does not: 48 in-run plus that boot's own 2 startup
+// triggers is exactly 50, and the other 12 are two apiece from six earlier boots. g_samples
+// resets too, which is why two sample values repeat across boots with different triggers.)
+// This ring keeps the last few minutes of actual PCM so a detection can be heard, or re-analysed
+// off-box with a feature the node has never been taught.
 //
 // 240 s x 16000 Hz x 2 B = 7 680 000 B = 7.68 MB, against the 8.34 MB of PSRAM this board
 // reported free at runtime. It fits -- but ps_malloc needs one CONTIGUOUS block and total-free is
@@ -703,15 +760,39 @@ static bool utc_to_sample(int64_t utc, uint32_t *s) {
 // ---------------------------------------------------------------- scene feature
 // The detection sketch is an IMPULSE descriptor: 8 frames at hop 64 = 704 samples = 44 ms, and it
 // is gated. Nothing in 11.33 h of running described the BACKGROUND, which is what separates a
-// chorus from a road. All 45 in-run sketches peaked in the bottom mel band, 312-500 Hz -- that
-// is measured, in modules/bioacoustic/README.md, not by this file. This is the
-// scene-scale counterpart -- the node's analogue of the 0.96 s patch hugbot's YAMNet consumes --
-// and it runs whether or not anything triggers.
+// chorus from a road. This is the scene-scale counterpart -- the node's analogue of the 0.96 s
+// patch hugbot's YAMNet consumes -- and it runs whether or not anything triggers.
 //
-// It re-uses the shipped filterbank and window UNCHANGED: MEL16_WIN and MEL16_FB_* are functions
-// of nfft and fs only, not of frame count, so a longer span needs no new tables. The measured
-// +10.6 ppm rate error (16000.169 Hz) is far inside one 62.5 Hz bin of a 256-point FFT, so tables
-// built for 16000.0 stay correct.
+// ⚠️IT NO LONGER SHARES THE DETECTION SKETCH'S FILTERBANK. It used to, and the comment here used
+// to say so. Two measurements moved it:
+//
+//   1. Every in-run detection peaked in the BOTTOM mel band and none of them peaked anywhere
+//      else. Recipe: decode frame_hex from the 48 rows of the 2026-09-07 capture's dets.csv that
+//      have uptime_s>12 and utc_us!=0, un-quantise to dB, take each band's peak over the 8
+//      frames. argmax == band 0 in 48 of 48; band 0 > band 1 in 48 of 48, median gap 5.5 dB. A
+//      feature whose extreme band is always the winner is reporting that the spectrum is still
+//      climbing where the filterbank stops, not that it has found the peak.
+//   2. A 10 s pull off this node's own ring, energy relative to the total:
+//        2-62 Hz -6.2 dB | 62-312 Hz -1.9 dB | 312-500 Hz -11.9 dB | 500-1k -16.2 dB
+//        1-2k -22.3 dB | 2-4k -27.8 dB | 4-8k -26.3 dB
+//      62-312 Hz carries +8.2 dB MORE than the whole 312-8000 Hz span the sketch can see.
+//
+// MEL16_FB_LO[0] is 5, so the detection bank's band 0 is FFT bins 5-8 = 312.5-500.0 Hz and
+// everything below is thrown away after the DC block has already paid for it. The scene bank
+// (mel_scene.h, from firmware/gen_mel_scene.py) starts at bin 1 instead: band 0 is bins 1-4 =
+// 62.5-250.0 Hz, band 2 lands exactly on the old band 0, and the top band still ends at bin 125
+// = 7812.5 Hz. No band is empty; the shipped bank has 227 nonzero weights, this one 233.
+//
+// The DETECTION bank is untouched, and must stay untouched: firmware/hear_poc checks it byte-
+// exact against golden vectors and hear/wire.py profile 0 IS the 20x8 f_lo=300 shape, so moving
+// it would silently reinterpret every frame already on the wire. The scene descriptor has no wire
+// profile and no model behind it, which is the whole reason this is the half that gets to move.
+//
+// The WINDOW is still shared: np.hanning(nfft) depends on nfft alone, so MEL16_WIN is bit-for-bit
+// what a scene-only generator would emit, and duplicating it would cost 1024 B of flash for a
+// second copy of the same numbers. The static_assert below is what makes that reuse checkable
+// rather than assumed. The measured +10.6 ppm rate error (16000.169 Hz) is far inside one 62.5 Hz
+// bin of a 256-point FFT, so tables built for 16000.0 stay correct for both banks.
 //
 // BLOCK is 256 and MEL16_NFFT is 256, so one I2S block IS one FFT frame. That is deliberate: it
 // lets the descriptor be built 16 ms at a time at a steady 62.5 FFT/s instead of a 64-FFT burst
@@ -721,15 +802,28 @@ static bool utc_to_sample(int64_t utc, uint32_t *s) {
 #define SCENE_FRAMES_PER_SLICE 16
 #define SCENE_FRAMES (SCENE_SLICES * SCENE_FRAMES_PER_SLICE)   // 64 x 256 = 16384 samples
 static_assert(BLOCK == MEL16_NFFT, "one I2S block must be exactly one scene FFT frame");
+// The window is shared with the detection bank; the filterbank is not. If the two NFFTs ever
+// diverge, MEL16_WIN stops being the right window for MELS_FB_* and the reuse becomes silent
+// nonsense rather than a build error.
+static_assert(MELS_NFFT == MEL16_NFFT, "scene bank and shared window must be the same NFFT");
 // Card arithmetic, because this writes continuously to a 40 MB partition with 19 MB free:
 // 20 bands x 4 slices = 80 B of mel, hex-encoded to 160 chars, plus ~66 chars of columns and the
 // newline = ~227 B a row. 16384 samples is 1.024 s, so 12 h is 42188 rows = 9.6 MB. That fits
 // alongside health.csv (1360 rows x ~200 B = 0.3 MB per 12 h) and dets.csv, and still leaves the
 // card about half empty. A finer slice would not: 8 slices would be 16 MB and would not fit.
+// Band COUNT is held at MEL16_BANDS for exactly that reason -- the span moved, the row size did
+// not, so the arithmetic above still describes the file being written.
+static_assert(MELS_BANDS == MEL16_BANDS, "scene row size arithmetic above assumes equal band counts");
+// The two f_lo/f_hi columns are the schema bump. They are appended AFTER mel_hex rather than
+// inserted next to bands/slices, because tools/hear_bridge.py checks the header as a PREFIX
+// (head[:len(columns)]) and documents trailing columns as the supported way to add one -- put
+// them in the middle and every existing reader breaks instead of carrying them. They also make
+// the file self-describing: a scene.csv on a card no longer needs the firmware version to say
+// what its band 0 covered.
 static const char SCENE_HDR[] =
-  "utc_us,uptime_s,sample,bands,slices,span_ms,ref_db4,frames,fft_us,mel_hex";
-static float    scene_acc[MEL16_BANDS];               // power summed over the slice in progress
-static float    scene_db[MEL16_BANDS * SCENE_SLICES]; // band-major, as sketch_frame's db[]
+  "utc_us,uptime_s,sample,bands,slices,span_ms,ref_db4,frames,fft_us,mel_hex,f_lo_hz,f_hi_hz";
+static float    scene_acc[MELS_BANDS];               // power summed over the slice in progress
+static float    scene_db[MELS_BANDS * SCENE_SLICES]; // band-major, as sketch_frame's db[]
 static uint32_t scene_frame_i = 0, scene_slice_i = 0;
 // Where the row in progress started. NOT derived from g_samples at emit time: a short I2S read is
 // skipped rather than padded, so the 64 frames of a row are not guaranteed to be 16384 contiguous
@@ -794,24 +888,26 @@ static void scene_emit() {
   int64_t utc = 0;
   sample_to_utc(start, &utc);               // 0 = no PPS anchor yet, same convention as dets.csv
   float ref = scene_db[0];
-  for (int i = 1; i < MEL16_BANDS * SCENE_SLICES; i++) if (scene_db[i] > ref) ref = scene_db[i];
+  for (int i = 1; i < MELS_BANDS * SCENE_SLICES; i++) if (scene_db[i] > ref) ref = scene_db[i];
   if (!sd_ok) return;
   if (!scenef) {
     scenef = csv_open("/scene.csv", "/scene-prev.csv", SCENE_HDR);
     if (!scenef) return;
   }
-  char line[MEL16_BANDS * SCENE_SLICES * 2 + 160];
+  char line[MELS_BANDS * SCENE_SLICES * 2 + 192];
   int m = snprintf(line, sizeof line, "%lld,%lu,%lu,%d,%d,%d,%d,%d,%lu,",
                    (long long)utc, (unsigned long)((millis() - boot_ms) / 1000),
-                   (unsigned long)start, MEL16_BANDS, SCENE_SLICES,
-                   (int)((uint32_t)SCENE_FRAMES * MEL16_NFFT * 1000u / FS_NOMINAL),
+                   (unsigned long)start, MELS_BANDS, SCENE_SLICES,
+                   (int)((uint32_t)SCENE_FRAMES * MELS_NFFT * 1000u / FS_NOMINAL),
                    (int)lrintf(ref * 4.0f), SCENE_FRAMES, (unsigned long)scene_fft_us_last);
   static const char hx[] = "0123456789abcdef";
-  for (int i = 0; i < MEL16_BANDS * SCENE_SLICES && m < (int)sizeof line - 3; i++) {
+  for (int i = 0; i < MELS_BANDS * SCENE_SLICES && m < (int)sizeof line - 24; i++) {
     float v = roundf((scene_db[i] - ref) * 2.0f);      // 0.5 dB steps, as the detection sketch
     uint8_t q = (uint8_t)(int8_t)(v < -128 ? -128 : (v > 127 ? 127 : v));
     line[m++] = hx[q >> 4]; line[m++] = hx[q & 0xF];
   }
+  int add = snprintf(line + m, sizeof line - m, ",%.1f,%.1f", MELS_F_LO, MELS_F_HI);
+  if (add > 0) m += (add < (int)sizeof line - m) ? add : ((int)sizeof line - m - 1);
   line[m++] = '\n';
   // Short write closes the handle so the next row reopens, exactly as det_flush does: leaving it
   // open turns a transient card error into a permanent silent stop.
@@ -823,15 +919,16 @@ static void scene_emit() {
 // is safe only because both are called from the loop task and never concurrently -- putting
 // either on a second FreeRTOS task would need its own buffers.
 static void scene_frame(const int16_t *s) {
-  if (!scene_frame_i && !scene_slice_i) scene_start = g_samples - MEL16_NFFT;
+  if (!scene_frame_i && !scene_slice_i) scene_start = g_samples - MELS_NFFT;
   uint32_t t0 = (uint32_t)esp_timer_get_time();
-  for (int i = 0; i < MEL16_NFFT; i++) {
+  // MEL16_WIN, not a scene copy: same nfft, same np.hanning, checked by the static_assert above.
+  for (int i = 0; i < MELS_NFFT; i++) {
     fft_re[i] = (float)s[i] * MEL16_WIN[i]; fft_im[i] = 0.0f;
   }
   fft256();
-  const float *w = MEL16_FB_W;
-  for (int b = 0; b < MEL16_BANDS; b++) {
-    int lo = MEL16_FB_LO[b], cnt = MEL16_FB_N[b];
+  const float *w = MELS_FB_W;
+  for (int b = 0; b < MELS_BANDS; b++) {
+    int lo = MELS_FB_LO[b], cnt = MELS_FB_N[b];
     float acc = 0.0f;
     for (int i = 0; i < cnt; i++) {
       int bin = lo + i; acc += w[i] * (fft_re[bin] * fft_re[bin] + fft_im[bin] * fft_im[bin]);
@@ -844,7 +941,7 @@ static void scene_frame(const int16_t *s) {
   scene_frame_i = 0;
   // Mean power over the slice, then dB. Averaging power and not dB, so a single loud frame does
   // not dominate the slice through the log.
-  for (int b = 0; b < MEL16_BANDS; b++) {
+  for (int b = 0; b < MELS_BANDS; b++) {
     scene_db[b * SCENE_SLICES + scene_slice_i] =
       10.0f * log10f(scene_acc[b] / (float)SCENE_FRAMES_PER_SLICE + 1e-12f);
     scene_acc[b] = 0.0f;
@@ -894,6 +991,254 @@ static void wav_header(uint8_t *h, uint32_t data_bytes, uint32_t fs) {
   h[40] = data_bytes; h[41] = data_bytes >> 8; h[42] = data_bytes >> 16; h[43] = data_bytes >> 24;
 }
 
+// ---------------------------------------------------------------- clips: a WAV per detection
+// The PSRAM ring already holds 240 s of PCM and /audio can already serve any window of it. What
+// it cannot do is outlive those 240 s: an event heard at 03:00 is gone by 03:04 unless somebody
+// was awake and fetching. This writes a fixed-length WAV around each detection to the card, so
+// the audio survives the night the same way dets.csv does.
+//
+// It addresses the ring BY SAMPLE, not by UTC. dets[].sample is a direct praw index (both are
+// counted in g_samples), so unlike /audio -- which refuses outright with "the ring cannot be
+// addressed by time" -- a clip still works for a detection stamped utc_us == 0. Three of the 62
+// rows in the 2026-09-07 capture's dets.csv are exactly that.
+//
+// LENGTH: 1 s before the trigger, 3 s after. The post-roll is the long half because the events
+// are longer than the descriptor: across the 8 frames of each in-run sketch the median energy
+// varies only ~4 dB and the peak frame is spread over all 8 positions, so what fired the gate is
+// not an impulse that has finished inside the 44 ms window.
+#define CLIP_PRE_SAMPLES  ((uint32_t)FS_NOMINAL)          // 1.0 s
+#define CLIP_POST_SAMPLES ((uint32_t)(3 * FS_NOMINAL))    // 3.0 s
+#define CLIP_SAMPLES      (CLIP_PRE_SAMPLES + CLIP_POST_SAMPLES)   // 64000
+#define CLIP_BYTES        (44u + CLIP_SAMPLES * 2u)       // 128044 B, header included
+// Every written clip is exactly CLIP_BYTES. A clip whose window has fallen off either end of the
+// ring is refused rather than shortened, which is what makes the budget arithmetic below exact
+// instead of an estimate -- and what stops a caller believing it has audio it does not have, the
+// same reason /audio sends X-Audio-Clipped.
+//
+// ONE CLIP PER EVENT, NOT PER TRIGGER. The capture's 48 in-run detections collapse to 33 distinct
+// events at 1 s clustering -- 16 of the 47 gaps are under 1 s, ~1.5 triggers an event, the gate
+// retriggering on a decay tail. Clipping per trigger would spend 1.5x the card for the same
+// audio, and the second clip is a 4 s window that overlaps the first by 3 s.
+#define CLIP_DEDUPE_SAMPLES ((uint32_t)FS_NOMINAL)        // 1.0 s, the clustering that gave 33
+//
+// BUDGET. Measured free space on this card is 19 MiB (sd_free_mb is a floor: (total-used)/1048576,
+// and it read 19 for most of the run). Over a 12 h night the CSVs take, from row sizes measured
+// on the capture's own files:
+//     scene.csv  42188 rows x 227 B  = 9576676 B     (rows = 12 h / 1.024 s)
+//     health.csv  1440 rows x 151.2 B =  217728 B    (219244 B / 1450 rows, measured)
+//     dets.csv      51 rows x  437 B  =   22287 B    (403.1 B measured + 34 B of clip columns:
+//                                                     ",<30 char path>,<2 char why>". The path
+//                                                     is fixed width -- 8 hex of boot id and a
+//                                                     %010lu sample -- so 437 is exact, not an
+//                                                     estimate, and it is the worst case: a row
+//                                                     with no clip is 411 B.)
+//                                      ---------
+//                                       9816691 B = 9.36 MiB, leaving 9.64 MiB
+// At the measured event rate -- 33 events in 11.33 h = 2.91/h = 35 over 12 h -- clips cost
+// 35 x 128044 = 4481540 B = 4.27 MiB, a 2.26x margin. The budget is set above that rather than at
+// it, because the events are not spread evenly: 34 of the 48 triggers fall in the two hours
+// 09:00-10:59, so a per-night average protects nothing. A byte budget does.
+#define CLIP_BUDGET_B  6291456u   // 6 MiB = 49 clips = 1.4x the measured 12 h event count, and
+                                  // leaves 3.64 MiB of the remainder for the CSVs to overrun into
+// And a live floor under that, because the budget assumes the card started at 19 MiB free and
+// nothing here can know that it did. 2 MiB is ~2.6 h of scene rows (227 B per 1.024 s = 221.7
+// B/s), so the record keeps running for hours after clips stop.
+#define CLIP_FREE_RESERVE_MB 2
+// Chunk size, and the reason there is one: a 128044 B write inside loop() would stall the I2S
+// reader far past the DMA's 6 x 240 frames = 90 ms and drop the audio this exists to keep. One
+// 4096 B chunk per loop iteration instead -- loop() calls audio_pump() every pass, so the DMA is
+// drained between chunks by the code that already does it, with no nested pump inside a card
+// write. 4096 B is what /audio streams for the same reason. A whole clip is 32 chunks, so at the
+// ~16 ms an I2S block takes it lands in about half a second. If the card is slower than that the
+// cost is not hidden: it shows up in drop_s, which is the instrument for exactly this.
+#define CLIP_CHUNK_B 4096
+#define CLIP_DIR "/clips"
+// Hard deadline on the PENDING state. det_flush will not write a detection's row until its clip
+// resolves, so a clip that can never resolve would stall dets.csv -- the record mattering more
+// than the audio, that must not be possible. 10 s is well past the 3 s post-roll and well short
+// of the 30 s health interval.
+#define CLIP_WAIT_MAX_S 10
+
+static uint32_t clip_written = 0;        // advances ONLY after the full CLIP_BYTES landed
+static uint32_t clip_skip_budget = 0;    // wanted, refused by CLIP_BUDGET_B -- working as designed
+static uint32_t clip_skip_full = 0;      // wanted, refused because the CARD is nearly out
+static uint32_t clip_skip_dedupe = 0;
+static uint32_t clip_skip_ring = 0;      // window not in the ring, or no PSRAM ring at all
+static uint32_t clip_nocard = 0;
+static uint32_t clip_fail = 0;           // short write or failed open
+static uint32_t clip_budget_left = CLIP_BUDGET_B;
+static uint32_t sd_free_mb_last = 0;     // sampled on the 30 s health tick, not per clip:
+                                         // SD.usedBytes() is a free-cluster walk on FATFS and its
+                                         // cost on this card has not been measured.
+static File     clipf;
+static bool     clip_busy = false;
+static uint32_t clip_k = 0, clip_at_sample = 0, clip_s = 0, clip_left = 0;
+static uint32_t clip_last_sample = 0;
+static bool     clip_have_last = false;
+// Boot-unique filename prefix. NOT derived from utc_us (three of 62 capture rows have utc_us == 0
+// and zeros collide) and not from det_n or sample alone (both restart at 0 every boot, so a
+// second night would overwrite the first's clips). esp_random() is seeded by hardware entropy and
+// needs no GPS fix, which a boot-time name must not wait for.
+static char clip_boot[9] = "00000000";
+
+static void clip_name(char *out, size_t n, uint32_t sample) {
+  snprintf(out, n, CLIP_DIR "/%s-%010lu.wav", clip_boot, (unsigned long)sample);
+}
+
+static const char *clip_why(uint8_t st) {
+  switch (st) {
+    case CLIP_OK:      return "ok";
+    case CLIP_BUDGET:  return "budget";
+    // Kept apart from "budget" on purpose. "budget" means this firmware refused to spend more
+    // than CLIP_BUDGET_B and everything else is still being recorded as designed; "cardfull"
+    // means the card is nearly out and health.csv and dets.csv are next. They want different
+    // responses from whoever reads the file, so they must not share a token.
+    case CLIP_CARDFULL: return "cardfull";
+    case CLIP_DEDUPE:  return "dedupe";
+    case CLIP_RING:    return "ring";
+    case CLIP_NOCARD:  return "nocard";
+    case CLIP_FAIL:    return "fail";
+    case CLIP_STALLED: return "stalled";
+    default:           return "pending";
+  }
+}
+
+// One chunk of work, called once per loop() pass. Either finishes a chunk of the clip in flight
+// or decides what to do with the oldest unresolved detection. Never blocks on audio that has not
+// been captured yet: if the post-roll is not in the ring, it returns and is asked again.
+static void clip_pump() {
+  if (clip_busy) {
+    uint32_t nsamp = clip_left > CLIP_CHUNK_B / 2 ? CLIP_CHUNK_B / 2 : clip_left;
+    static uint8_t cbuf[CLIP_CHUNK_B];
+    // The ring wraps mid-chunk; this is the same two-memcpy the /audio handler uses, and it is
+    // the only place in this file that knows how praw wraps.
+    uint32_t idx = clip_s % praw_cap;
+    uint32_t run = praw_cap - idx; if (run > nsamp) run = nsamp;
+    memcpy(cbuf, praw + idx, (size_t)run * 2);
+    if (run < nsamp) memcpy(cbuf + run * 2, praw, (size_t)(nsamp - run) * 2);
+    bool ok = clipf.write(cbuf, (size_t)nsamp * 2) == (size_t)nsamp * 2;
+    clip_s += nsamp; clip_left -= nsamp;
+    if (!ok || !clip_left) {
+      clipf.close();
+      clip_busy = false;
+      Det &d = dets[clip_k % MAXDET];
+      // The slot could in principle have been recycled under us -- 128 detections inside the half
+      // second a clip takes. Check rather than stamp a state onto somebody else's detection.
+      bool mine = (d.sample == clip_at_sample);
+      if (ok) {
+        clip_written++;                       // only here: the full CLIP_BYTES is on the card
+        clip_budget_left -= CLIP_BYTES;
+        clip_last_sample = clip_at_sample; clip_have_last = true;
+        if (mine) d.clip_st = CLIP_OK;
+      } else {
+        clip_fail++;
+        char p[48]; clip_name(p, sizeof p, clip_at_sample);
+        SD.remove(p);                         // a truncated WAV is worse than no WAV
+        if (mine) d.clip_st = CLIP_FAIL;
+      }
+    }
+    return;
+  }
+
+  // Oldest unresolved detection still in the ring. Anything older than that has been overwritten
+  // and det_flush counts it in det_lost; there is nothing left to clip.
+  uint32_t first = det_flushed;
+  if (det_n > MAXDET && det_n - MAXDET > first) first = det_n - MAXDET;
+  uint32_t k = first;
+  while (k < det_n && dets[k % MAXDET].clip_st != CLIP_PENDING) k++;
+  if (k >= det_n) return;
+  Det &d = dets[k % MAXDET];
+
+  if (!sd_ok)                        { d.clip_st = CLIP_NOCARD; clip_nocard++; return; }
+  if (!praw || !praw_cap)            { d.clip_st = CLIP_RING;   clip_skip_ring++; return; }
+  if (clip_have_last && d.sample - clip_last_sample < CLIP_DEDUPE_SAMPLES)
+                                     { d.clip_st = CLIP_DEDUPE; clip_skip_dedupe++; return; }
+  if (clip_budget_left < CLIP_BYTES) { d.clip_st = CLIP_BUDGET; clip_skip_budget++; return; }
+  if (sd_free_mb_last < CLIP_FREE_RESERVE_MB)
+                                     { d.clip_st = CLIP_CARDFULL; clip_skip_full++; return; }
+  if (d.sample < CLIP_PRE_SAMPLES)   { d.clip_st = CLIP_RING;   clip_skip_ring++; return; }
+
+  // Wait for the post-roll to exist. It does not yet at the instant the gate fires -- that is the
+  // whole reason this is a deferred queue and not something audio_pump could do inline.
+  uint32_t up = (millis() - boot_ms) / 1000;
+  if ((int32_t)(g_samples - (d.sample + CLIP_POST_SAMPLES)) < 0) {
+    if (up - d.uptime_s > CLIP_WAIT_MAX_S) { d.clip_st = CLIP_STALLED; clip_skip_ring++; }
+    return;                                   // otherwise: not an error, just not yet
+  }
+  uint32_t start = d.sample - CLIP_PRE_SAMPLES;
+  if ((int32_t)(start - praw_oldest()) < 0)   { d.clip_st = CLIP_RING; clip_skip_ring++; return; }
+
+  char path[48]; clip_name(path, sizeof path, d.sample);
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) { d.clip_st = CLIP_FAIL; clip_fail++; return; }
+  uint8_t hdr[44];
+  // The rate field is an integer and cannot carry the measured 16000.169 Hz, exactly as
+  // wav_header says. There are no HTTP headers on a file, so the exact rate travels in dets.csv's
+  // fs_hz column instead -- per detection, which is where it belongs anyway.
+  double fsu = fs_clean > 1000.0 ? fs_clean : (double)FS_NOMINAL;
+  wav_header(hdr, CLIP_SAMPLES * 2, (uint32_t)lrint(fsu));
+  if (f.write(hdr, sizeof hdr) != sizeof hdr) {
+    f.close(); SD.remove(path); d.clip_st = CLIP_FAIL; clip_fail++; return;
+  }
+  clipf = f; clip_busy = true; clip_k = k; clip_at_sample = d.sample;
+  clip_s = start; clip_left = CLIP_SAMPLES;
+}
+
+// ---------------------------------------------------------------- gate floor: set and persist
+// One line of decimal in /gate.cfg. Persisting it is what makes the knob useful on a node that
+// gets power-cycled by a plug timer -- and also the only thing here that can carry a bad setting
+// across a reboot, so the clamp is applied on LOAD as well as on set. A file written by hand with
+// "0" in it comes back as FLOOR_MIN, not as 0.
+#define GATE_CFG "/gate.cfg"
+
+static float gate_floor_clamp(float v) {
+  if (!(v == v)) return FLOOR_DEFAULT;                  // NaN: strtof on garbage
+  if (v < FLOOR_MIN) return FLOOR_MIN;
+  if (v > FLOOR_MAX) return FLOOR_MAX;
+  return v;
+}
+
+static void gate_floor_load() {
+  if (!sd_ok || !SD.exists(GATE_CFG)) return;
+  File f = SD.open(GATE_CFG, FILE_READ);
+  if (!f) return;
+  String s = f.readStringUntil('\n'); f.close(); s.trim();
+  if (!s.length()) return;
+  float v = gate_floor_clamp(strtof(s.c_str(), NULL));
+  g_floor = v; g_floor_src = "file"; g_floor_saved = v;
+  logf("gate  floor %.0f from " GATE_CFG " (file said \"%s\")\n", g_floor, s.c_str());
+}
+
+// Everything the operator needs to not have to guess, in one place: the active value, where it
+// came from, the bounds that could have altered it, and the live evidence (ambient, e_max, thr)
+// for judging whether it is anywhere near right.
+static String gate_json() {
+  char b[416], saved[16];
+  // JSON null, not 0 and not "none": there is no floor saved, which is a different fact from a
+  // saved floor that happens to be small.
+  if (g_floor_saved == g_floor_saved) snprintf(saved, sizeof saved, "%.1f", g_floor_saved);
+  else                                snprintf(saved, sizeof saved, "null");
+  snprintf(b, sizeof b,
+    "{\"floor\":%.1f,\"floor_default\":%.1f,\"floor_min\":%.1f,\"floor_max\":%.1f,"
+    "\"source\":\"%s\",\"floor_saved\":%s,\"ratio\":%.1f,\"rearm\":%.2f,"
+    "\"thr\":%.1f,\"ambient\":%.1f,\"e_max_win\":%.1f,\"armed\":%d,\"forced_rearms\":%lu,"
+    "\"usage\":\"POST /gate?floor=<n>[&persist=1] | POST /gate?reset=1\"}",
+    g_floor, FLOOR_DEFAULT, FLOOR_MIN, FLOOR_MAX, g_floor_src,
+    saved, RATIO, REARM,
+    gate_thr(), g_amb, env_e_max_win, armed, (unsigned long)gate_forced);
+  return String(b);
+}
+
+static bool gate_floor_persist() {
+  if (!sd_ok) return false;
+  File f = SD.open(GATE_CFG, FILE_WRITE);              // FILE_WRITE truncates: one value, no log
+  if (!f) return false;
+  f.printf("%.1f\n", g_floor);
+  f.close();
+  g_floor_saved = g_floor;
+  return true;
+}
+
 static double measured_fs() {
   if (pps_count < 3) return 0.0;
   double secs = (double)(pps_us_last - pps_us_first) / 1e6;
@@ -911,7 +1256,13 @@ static String status_json() {
   uint32_t r_held = praw_cap ? r_new - r_old : 0;
   int64_t  r_from = 0, r_to = 0;
   if (praw_cap) { sample_to_utc(r_old, &r_from); sample_to_utc(r_new, &r_to); }
-  char b[2048];
+  // static, not a stack frame: this grew from 2048 with the gate-floor and clips objects, and the
+  // Arduino loop task has 8 kB of stack that the WebServer is already using. Only ever called
+  // from the loop task (h_status), so there is no second caller to race it.
+  static char b[3072];
+  char floor_saved[16];
+  if (g_floor_saved == g_floor_saved) snprintf(floor_saved, sizeof floor_saved, "%.1f", g_floor_saved);
+  else                                snprintf(floor_saved, sizeof floor_saved, "null");
   snprintf(b, sizeof b,
     "{\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
@@ -924,15 +1275,29 @@ static String status_json() {
     "\"time\":{\"valid\":%s,\"utc_us\":%lld,\"since_edge_us\":%llu,\"navpvt_nano\":%ld,\"label_rejects\":%lu},"
     "\"audio\":{\"enabled\":true,\"detections\":%lu,\"written\":%lu,\"lost\":%lu,"
     "\"ambient\":%.1f,\"env_peak\":%.0f},"
+    // floor/floor_source: thr alone only BOUNDS the floor from above, and only while the
+    // adaptive limb is binding (32 of the capture's 1450 rows), so a settable floor that was not
+    // reported here would have to be guessed from the record.
     "\"gate\":{\"armed\":%d,\"thr\":%.0f,\"e_max_win\":%.1f,\"headroom\":%.2f,"
-    "\"forced_rearms\":%lu,\"dc\":%.1f},\"write_fail\":%lu,"
+    "\"forced_rearms\":%lu,\"dc\":%.1f,\"floor\":%.0f,\"floor_default\":%.0f,"
+    "\"floor_min\":%.0f,\"floor_max\":%.0f,\"floor_source\":\"%s\",\"floor_saved\":%s},"
+    "\"write_fail\":%lu,"
     // raw: what /audio can actually serve. span_s is what was allocated, held_s what has been
     // written into it so far -- they differ only for the first few minutes after a boot.
     "\"raw\":{\"span_s\":%.1f,\"cap_samples\":%lu,\"held_samples\":%lu,\"fill_pct\":%.1f,"
     "\"from_utc_us\":%lld,\"to_utc_us\":%lld,\"marks\":%lu,\"bytes\":%lu},"
     // scene: fft_us_per_row is MEASURED on this part, summed over the 64 frames of one row.
+    // bands/f_lo_hz/f_hi_hz: the scene bank is NOT the detection bank any more, and a reader
+    // that assumes MEL16's 312 Hz band 0 would misread every row. Say which bank produced them.
     "\"scene\":{\"rows\":%lu,\"written\":%lu,\"row_span_ms\":%d,\"fft_us_per_row\":%lu,\"fft_us_max\":%lu,"
-    "\"short_blocks\":%lu,\"write_fail\":%lu},"
+    "\"short_blocks\":%lu,\"write_fail\":%lu,\"bands\":%d,\"slices\":%d,\"f_lo_hz\":%.1f,\"f_hi_hz\":%.1f},"
+    // clips: written advances only on a full CLIP_BYTES landing, skip_budget only when one was
+    // wanted and refused. A card that filled at 03:00 and a night that went quiet at 03:00 differ
+    // here and nowhere else.
+    "\"clips\":{\"written\":%lu,\"skip_budget\":%lu,\"skip_cardfull\":%lu,"
+    "\"skip_dedupe\":%lu,\"skip_ring\":%lu,"
+    "\"nocard\":%lu,\"fail\":%lu,\"bytes_each\":%lu,\"budget_b\":%lu,\"budget_left_b\":%lu,"
+    "\"budget_left_clips\":%lu,\"pre_s\":%.1f,\"post_s\":%.1f,\"dir\":\"%s\",\"boot\":\"%s\"},"
     "\"sd\":%s,\"sd_free_mb\":%lu,\"sd_total_mb\":%lu,\"i2c\":\"%s\"}",
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
@@ -954,16 +1319,26 @@ static String status_json() {
     (unsigned long)det_n, (unsigned long)det_flushed, (unsigned long)det_lost,
     g_amb, env_peak_seen,
     armed, gate_thr(), env_e_max_win, env_e_max_win / gate_thr(),
-    (unsigned long)gate_forced, sig_dc, (unsigned long)det_write_fail,
+    (unsigned long)gate_forced, sig_dc,
+    g_floor, FLOOR_DEFAULT, FLOOR_MIN, FLOOR_MAX, g_floor_src, floor_saved,
+    (unsigned long)det_write_fail,
     praw_cap ? (double)praw_cap / (fs_clean > 1000.0 ? fs_clean : (double)FS_NOMINAL) : 0.0,
     (unsigned long)praw_cap, (unsigned long)r_held,
     praw_cap ? 100.0 * (double)r_held / (double)praw_cap : 0.0,
     (long long)r_from, (long long)r_to, (unsigned long)praw_mark_n,
     (unsigned long)(praw_cap * 2UL),
     (unsigned long)scene_rows, (unsigned long)scene_written,
-    (int)((uint32_t)SCENE_FRAMES * MEL16_NFFT * 1000u / FS_NOMINAL),
+    (int)((uint32_t)SCENE_FRAMES * MELS_NFFT * 1000u / FS_NOMINAL),
     (unsigned long)scene_fft_us_last, (unsigned long)scene_fft_us_max,
     (unsigned long)scene_short_blocks, (unsigned long)scene_write_fail,
+    MELS_BANDS, SCENE_SLICES, MELS_F_LO, MELS_F_HI,
+    (unsigned long)clip_written, (unsigned long)clip_skip_budget, (unsigned long)clip_skip_full,
+    (unsigned long)clip_skip_dedupe, (unsigned long)clip_skip_ring,
+    (unsigned long)clip_nocard, (unsigned long)clip_fail,
+    (unsigned long)CLIP_BYTES, (unsigned long)CLIP_BUDGET_B, (unsigned long)clip_budget_left,
+    (unsigned long)(clip_budget_left / CLIP_BYTES),
+    (double)CLIP_PRE_SAMPLES / FS_NOMINAL, (double)CLIP_POST_SAMPLES / FS_NOMINAL,
+    CLIP_DIR, clip_boot,
     sd_ok ? "true" : "false",
     (unsigned long)(sd_ok ? (SD.totalBytes() - SD.usedBytes()) / 1048576UL : 0UL),
     (unsigned long)(sd_ok ? SD.totalBytes() / 1048576UL : 0UL), i2c_found);
@@ -989,6 +1364,8 @@ static void h_root() {
              "`<tr><td>detections<td><b>${s.audio.detections}</b> (env peak ${s.audio.env_peak})`+"
              "`<tr><td>raw ring<td>${s.raw.span_s?s.raw.span_s.toFixed(0)+' s, '+s.raw.fill_pct.toFixed(0)+'% written, '+(s.raw.bytes/1048576).toFixed(2)+' MB PSRAM':'<b>not allocated</b>'}`+"
              "`<tr><td>scene<td>${s.scene.rows} rows &middot; FFT <b>${s.scene.fft_us_per_row} us</b> per ${s.scene.row_span_ms} ms (peak ${s.scene.fft_us_max})`+"
+             "`<tr><td>gate<td>floor <b>${s.gate.floor}</b> (${s.gate.floor_source}${s.gate.floor_saved!==null?', saved '+s.gate.floor_saved:''}) &middot; thr ${s.gate.thr} &middot; ambient ${s.audio.ambient} &middot; peak ${s.gate.e_max_win}`+"
+             "`<tr><td>clips<td><b>${s.clips.written}</b> written &middot; ${s.clips.budget_left_clips} left in budget &middot; skipped ${s.clips.skip_budget} budget / ${s.clips.skip_cardfull} cardfull / ${s.clips.skip_dedupe} dedupe / ${s.clips.skip_ring} ring / ${s.clips.fail} fail`+"
              "`<tr><td>SD<td>${s.sd}`+`<tr><td>I2C<td>${s.i2c}`+`<tr><td>heap / psram<td>${s.heap} / ${s.psram}`;}"
              "u();setInterval(u,2000);</script>";
   http.send(200, "text/html", p);
@@ -999,7 +1376,7 @@ static void h_dets() {
   uint32_t n = total < MAXDET ? total : MAXDET;
   uint32_t first = total - n;                 // ring: the newest n, oldest first
   String o = "[";
-  o.reserve(n * (MEL16_FRAME_BYTES * 2 + 200) + 64);
+  o.reserve(n * (MEL16_FRAME_BYTES * 2 + 280) + 64);
   for (uint32_t k = first; k < total; k++) {
     const Det &d = dets[k % MAXDET];
     char b[240];
@@ -1015,7 +1392,14 @@ static void h_dets() {
     for (int j = 0; j < MEL16_FRAME_BYTES; j++) {
       o += hx[d.frame[j] >> 4]; o += hx[d.frame[j] & 0xF];
     }
-    o += "\"}";
+    // ⚠️tools/hear_bridge.py's rows_from_detections() selects DETS_COLUMNS[:-1], so these two keys
+    // are dropped on that path until that list grows. They are here anyway: /detections is also
+    // read by hand, and the live ring is the only place a still-PENDING clip is visible at all.
+    char t[80];
+    char cp[48] = "";
+    if (d.clip_st == CLIP_OK) clip_name(cp, sizeof cp, d.sample);
+    snprintf(t, sizeof t, "\",\"clip\":\"%s\",\"clip_why\":\"%s\"}", cp, clip_why(d.clip_st));
+    o += t;
   }
   o += "]";
   http.send(200, "application/json", o);
@@ -1133,10 +1517,27 @@ void setup() {
 
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
   sd_cs = 0;
-  if (SD.begin(21, SPI, 20000000)) { sd_ok = true; sd_cs = 21; }
-  else if (SD.begin(3, SPI, 20000000)) { sd_ok = true; sd_cs = 3; }
+  // max_files 8, not the library's default 5 (SD.h:29). The clip writer holds a WAV open across
+  // loop iterations, so the long-lived set is now dets.csv + scene.csv + the clip = 3, and /ls
+  // holds a directory plus an entry while the 30 s health block opens health.csv -- which is 6,
+  // one past the default, and an SD.open past the limit just returns a falsy File. Raising it
+  // costs a pointer array; the per-file caches are allocated on open, not here.
+  if (SD.begin(21, SPI, 20000000, "/sd", 8)) { sd_ok = true; sd_cs = 21; }
+  else if (SD.begin(3, SPI, 20000000, "/sd", 8)) { sd_ok = true; sd_cs = 3; }
   logf("sd    %s%s", sd_ok ? "mounted, CS=" : "no card", sd_ok ? "" : "\n");
   if (sd_ok) logf("%d\n", sd_cs);
+  snprintf(clip_boot, sizeof clip_boot, "%08lx", (unsigned long)esp_random());
+  if (sd_ok) {
+    // A subdirectory, not the root: FAT root directory entries are finite and LFN is on for this
+    // FQBN (CONFIG_FATFS_MAX_LFN 255), so each long clip name burns several of them.
+    if (!SD.exists(CLIP_DIR)) SD.mkdir(CLIP_DIR);
+    sd_free_mb_last = (uint32_t)((SD.totalBytes() - SD.usedBytes()) / 1048576UL);
+    gate_floor_load();
+    logf("clip  %s/%s-*.wav, %lu B each, budget %lu B (%lu clips), %lu MB free\n",
+         CLIP_DIR, clip_boot, (unsigned long)CLIP_BYTES, (unsigned long)CLIP_BUDGET_B,
+         (unsigned long)(CLIP_BUDGET_B / CLIP_BYTES), (unsigned long)sd_free_mb_last);
+  }
+  logf("gate  floor %.0f (%s), min %.0f max %.0f\n", g_floor, g_floor_src, FLOOR_MIN, FLOOR_MAX);
 
   i2s.setPinsPdmRx(PDM_CLK, PDM_DIN);
   if (!i2s.begin(I2S_MODE_PDM_RX, FS_NOMINAL, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO))
@@ -1361,6 +1762,40 @@ void setup() {
     http.send(200, "text/plain", o);
   });
   http.on("/i2c", []() { i2c_scan(); http.send(200, "text/plain", i2c_found); });   // rescan on demand
+  // GET reads the floor, POST sets it. Two registrations, two methods -- and NOT two of the same
+  // method: this file already registers /tp twice with HTTP_ANY, and core 3.0.5's Parsing.cpp
+  // takes the FIRST handler that canHandle()s, so the second one is unreachable dead code with no
+  // diagnostic. WebServer's FunctionRequestHandler compares the method, so GET and POST on one
+  // URI are two distinct handlers and neither shadows the other.
+  http.on("/gate", HTTP_GET,  []() { http.send(200, "application/json", gate_json()); });
+  // POST, for the same reason /reboot is POST: a link prefetcher must not be able to deafen the
+  // node, and watch.py polls this endpoint's neighbours unattended every 30 s.
+  //   curl -X POST 'http://<ip>/gate?floor=300'              # this boot only
+  //   curl -X POST 'http://<ip>/gate?floor=300&persist=1'    # and across reboots
+  //   curl -X POST 'http://<ip>/gate?reset=1'                # back to the compiled-in default
+  http.on("/gate", HTTP_POST, []() {
+    if (http.hasArg("reset")) {
+      g_floor = FLOOR_DEFAULT; g_floor_src = "default";
+      if (sd_ok) SD.remove(GATE_CFG);
+      g_floor_saved = NAN;
+      logf("gate  floor reset to %.0f\n", g_floor);
+    } else if (http.hasArg("floor")) {
+      float want = strtof(http.arg("floor").c_str(), NULL);
+      g_floor = gate_floor_clamp(want);
+      g_floor_src = "http";
+      if (http.hasArg("persist") && !gate_floor_persist())
+        logln("gate  could NOT write " GATE_CFG " -- the floor is this boot only");
+      // Log what was ASKED for as well as what took effect. A request clamped from 20 to 100 that
+      // logged only "100" would read as an operator who typed 100.
+      logf("gate  floor %.0f (asked %.0f)%s\n", g_floor, want,
+           http.hasArg("persist") ? ", persisted" : ", this boot only");
+    } else {
+      http.send(400, "application/json",
+                "{\"error\":\"POST /gate?floor=<n> | ?floor=<n>&persist=1 | ?reset=1\"}");
+      return;
+    }
+    http.send(200, "application/json", gate_json());
+  });
   http.on("/audio", []() {
     // Bare /audio answers "what is retrievable?" so a caller never has to guess a window; with
     // ?from=<utc_us>&dur=<s> it returns that window as a playable WAV.
@@ -1470,11 +1905,23 @@ void setup() {
 // drops the very audio we are here to capture. Whatever that flush still costs now shows up in
 // drop_seconds, so the cost is measured rather than assumed.
 static File detf;
+// clip and clip_why are appended AFTER frame_hex, not inserted: tools/hear_bridge.py checks this
+// header as a prefix and documents trailing columns as the supported way to grow it. clip holds
+// the path of a WAV that IS on the card, or nothing; clip_why says which of the seven outcomes
+// happened, so an empty clip column is never ambiguous between "quiet", "budget spent" and "card
+// full". A row is not written until its clip has resolved, so the column never names a file that
+// does not exist -- see clip_pump() and the wait in det_flush.
 static const char DETS_HDR[] =
-  "utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,frame_hex";
+  "utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,frame_hex,clip,clip_why";
 
 static void det_flush() {
   if (!sd_ok || det_flushed == det_n) return;
+  // Peek before opening anything. The oldest unflushed detection blocks the whole batch while its
+  // clip resolves, and reaching csv_open only to break out of the write loop would pay a 20-50 ms
+  // open once a second for as long as that lasts.
+  { uint32_t f0 = det_flushed;
+    if (det_n > MAXDET && det_n - MAXDET > f0) f0 = det_n - MAXDET;
+    if (dets[f0 % MAXDET].clip_st == CLIP_PENDING) return; }
   if (!detf) {
     // The old det_hdr_done latch is gone: it was set even when the header had NOT been written,
     // so a card swapped mid-run could never get one.
@@ -1489,14 +1936,24 @@ static void det_flush() {
   static const char hx[] = "0123456789abcdef";
   for (uint32_t k = first; k < det_n && wrote < 16; k++, wrote++) {
     const Det &d = dets[k % MAXDET];
-    char line[MEL16_FRAME_BYTES * 2 + 160];
+    // A row whose clip has not resolved yet WAITS -- writing it now would either name a file that
+    // may never appear or record "no clip" for one that is about to. Bounded by CLIP_WAIT_MAX_S,
+    // so the delay a detection can suffer is ~10 s against the 1 s it used to be; the cost is
+    // that a power cut inside that window loses the row, and det_n vs det_written in health.csv
+    // is where that would show. Break, not continue: the file is append-only and in-order.
+    if (d.clip_st == CLIP_PENDING) break;
+    char line[MEL16_FRAME_BYTES * 2 + 224];
     int m = snprintf(line, sizeof line, "%lld,%lu,%lu,%lu,%ld,%d,%u,%.3f,",
                      (long long)d.utc_us, (unsigned long)d.uptime_s, (unsigned long)d.sample,
                      (unsigned long)d.pps_n, (long)d.us_since_pps, d.trigger,
                      (unsigned)d.flags, d.fs_at);
-    for (int j = 0; j < MEL16_FRAME_BYTES && m < (int)sizeof line - 3; j++) {
+    for (int j = 0; j < MEL16_FRAME_BYTES && m < (int)sizeof line - 64; j++) {
       line[m++] = hx[d.frame[j] >> 4]; line[m++] = hx[d.frame[j] & 0xF];
     }
+    char cp[48] = "";
+    if (d.clip_st == CLIP_OK) clip_name(cp, sizeof cp, d.sample);
+    int add = snprintf(line + m, sizeof line - m, ",%s,%s", cp, clip_why(d.clip_st));
+    if (add > 0) m += (add < (int)sizeof line - m) ? add : ((int)sizeof line - m - 1);
     line[m++] = '\n';
     if (detf.write((const uint8_t *)line, m) != (size_t)m) {
       // Close, so the next flush reopens. A short write that leaves the handle open turns a
@@ -1557,6 +2014,10 @@ static void audio_pump() {
           dets[idx].trigger = sac;
           dets[idx].fs_at = fsu;
           dets[idx].uptime_s = (millis() - boot_ms) / 1000;
+          // The slot is recycled, so this must be set here and not left over from whatever
+          // detection used it 128 events ago -- a stale CLIP_OK would name a file for the wrong
+          // event. Nothing is written from audio_pump(); clip_pump() picks it up from loop().
+          dets[idx].clip_st = CLIP_PENDING;
           // Sketch from a little BEFORE the trigger, so the rise the classifier needs is inside
           // the window rather than clipped off its front.
           uint32_t back = MEL16_NFFT + (MEL16_FRAMES - 1) * MEL16_HOP + 32;
@@ -1594,6 +2055,9 @@ static void audio_pump() {
 void loop() {
   http.handleClient();
   audio_pump();
+  // After audio_pump(), so the chunk written below is drained against a DMA that was emptied this
+  // pass. One CLIP_CHUNK_B per iteration; the pump is the pacing, exactly as in /audio.
+  clip_pump();
 
   // ---- one GPS second of audio, audited ------------------------------------
   // Each PPS edge is exactly one true second apart, so the samples between two edges ARE the
@@ -1676,6 +2140,10 @@ void loop() {
   static uint32_t last = 0;
   if (millis() - last > 30000) {
     last = millis();
+    // The clip budget's live floor. Sampled here and nowhere else: SD.usedBytes() is a free-
+    // cluster walk on FATFS whose cost on this card is unmeasured, and the health row was already
+    // paying for one call. clip_pump() reads the cached value instead of calling it per clip.
+    if (sd_ok) sd_free_mb_last = (uint32_t)((SD.totalBytes() - SD.usedBytes()) / 1048576UL);
     double fs = measured_fs();
     uint32_t up = (millis() - boot_ms) / 1000;
     logf("[%6lus] fix %d/%d sats  tAcc %lu ns  pps %lu (%lu bad)  spread %ld us\n",
@@ -1694,7 +2162,8 @@ void loop() {
       if (f) {
         int64_t tnow = 0; bool tok = local_to_utc((uint64_t)esp_timer_get_time(), &tnow);
         f.printf("%lld,%d,%lu,%d,%d,%lu,%lu,%lu,%ld,%.4f,%lu,%.4f,"
-                 "%.4f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.1f,%.0f,%lu,%d,%.0f,%.1f,%lu,%.1f,%lu,%lu\n",
+                 "%.4f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.1f,%.0f,%lu,%d,%.0f,%.1f,%lu,%.1f,%lu,%lu,"
+                 "%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
                  (long long)tnow, tok ? 1 : 0,
                  (unsigned long)up, gps_fix, gps_sats, (unsigned long)gps_tacc_ns,
                  (unsigned long)pps_count, (unsigned long)pps_glitch,
@@ -1705,8 +2174,12 @@ void loop() {
                  (unsigned long)det_n, (unsigned long)det_flushed, (unsigned long)det_lost,
                  g_amb, env_peak_win, (unsigned long)ESP.getFreeHeap(),
                  armed, gate_thr(), env_e_max_win, (unsigned long)gate_forced, sig_dc,
-                 (unsigned long)((SD.totalBytes() - SD.usedBytes()) / 1048576UL),
-                 (unsigned long)det_write_fail);
+                 (unsigned long)sd_free_mb_last,
+                 (unsigned long)det_write_fail,
+                 g_floor, (unsigned long)clip_written, (unsigned long)clip_skip_budget,
+                 (unsigned long)clip_skip_full,
+                 (unsigned long)clip_skip_dedupe, (unsigned long)clip_skip_ring,
+                 (unsigned long)clip_fail, (unsigned long)clip_budget_left);
         f.close();
       }
       // scene.csv is held open and written every 1.024 s; committing it costs the same 20-50 ms

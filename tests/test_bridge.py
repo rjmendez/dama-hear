@@ -148,14 +148,39 @@ class TestSceneCsv:
 
     def test_a_scene_record_carries_the_rows_own_geometry_and_span(self):
         rec = BR.to_record(_scene_row(), NODE, frame_key="mel_hex")
-        assert rec["embed_dim"] == 80 == len(rec["embed"])
-        assert rec["feature"]["kind"] == "mel_scene"
-        assert rec["feature"]["bands"] == 20 and rec["feature"]["frames"] == 4
-        assert rec["feature"]["span_ms"] == 1024.0        # the node's own number, not derived here
-        assert rec["feature"]["frames_summed"] == 64      # FFT frames behind the 4 slices
-        assert rec["feature"]["wire_version"] is None     # it is not a wire frame
-        assert rec["feature"]["peak"] is None             # not gated: there is no trigger peak
+        f = rec["feature"]
+        assert rec["embed_dim"] == 80 == len(rec["embed"]) == f["bands"] * f["slices"]
+        assert f["kind"] == "mel_scene"
+        assert f["bands"] == 20 and f["slices"] == 4
+        assert f["span_ms"] == 1024.0                     # the node's own number, not derived here
+        assert f["frames_summed"] == 64                   # FFT frames behind the 4 slices
+        assert f["wire_version"] is None                  # it is not a wire frame
+        assert f["peak"] is None                          # not gated: there is no trigger peak
         assert float(np.linalg.norm(rec["embed"])) == pytest.approx(1.0, abs=1e-5)
+
+    def test_the_second_axis_is_slices_and_frames_never_names_two_things(self):
+        # Defect: the record called the descriptor's second axis `frames` (4, the CSV's `slices`
+        # column) while the CSV's own `frames` column (64) travelled as `frames_summed`. Two
+        # numbers, one name, two files -- documented, and still one substitution away from a
+        # descriptor read as 64 slices or an average read as 4 frames.
+        row = _scene_row()
+        f = BR.to_record(row, NODE, frame_key="mel_hex")["feature"]
+        assert "frames" not in f, "a scene record has slices; only a sketch record has frames"
+        assert f["slices"] == int(row["slices"]) == 4     # the CSV's `slices` column
+        assert f["frames_summed"] == int(row["frames"]) == 64   # the CSV's `frames` column
+        assert f["slices"] != f["frames_summed"], "the two the old name conflated"
+        # and the sketch path keeps `frames`, because there the axis really is frames.
+        g = BR.to_record(_row(), NODE)["feature"]
+        assert g["frames"] == 8 and "slices" not in g
+
+    def test_the_scene_geometry_is_read_from_the_row_not_from_a_constant(self):
+        # The scene CSV's banding is firmware's to change. Nothing in the bridge may pin it, so a
+        # row of another shape must convert, not be measured with this build's numbers.
+        q = _scene_q(bands=32, slices=8)
+        rec = BR.to_record(_scene_row(q=q), NODE, frame_key="mel_hex")
+        assert rec["feature"]["bands"] == 32 and rec["feature"]["slices"] == 8
+        assert rec["embed_dim"] == 256 == len(rec["embed"])
+        assert rec["feature"]["span_ms"] == 1024.0, "still the row's own span, not one derived"
 
     def test_the_scene_pointer_is_the_rows_own_window(self):
         rec = BR.to_record(_scene_row(), NODE, frame_key="mel_hex",
@@ -208,10 +233,16 @@ class TestTimestamp:
     def test_the_microsecond_is_not_rounded_away(self):
         rec = BR.to_record(_row(), NODE)
         assert rec["utc_us"] == UTC_US, "the node's integer stamp travels verbatim"
-        # hugbot's own producer ships round(t, 3). Here that would discard 911 us: one microsecond
-        # is 343 um of range at 343 m/s, so 911 us is 312 mm, from a clock that measured 22 ns.
+        # hugbot's own producer ships round(t, 3), which quantises onto a 1 ms grid. Measured on
+        # this stamp rather than asserted: the round MOVES it 89.17 us, 30.6 mm at 343 m/s, and
+        # destroys the 911 us of sub-millisecond position it carried -- from a receiver whose
+        # tacc_ns ran 22-26 over the whole capture.
         assert round(rec["ts"], 3) != rec["ts"]
-        assert 0.000911 * 343.0 == pytest.approx(0.312473, abs=1e-6)
+        moved_us = abs(round(rec["ts"], 3) - rec["ts"]) * 1e6
+        assert moved_us == pytest.approx(89.17, abs=0.01)
+        assert moved_us * 1e-6 * 343.0 == pytest.approx(0.0306, abs=1e-4)   # metres
+        assert UTC_US % 1000 == 911, "the sub-millisecond position a 1 ms grid cannot hold"
+        assert 0.001 * 343.0 == 0.343, "and the grid itself is 343 mm of range"
 
     def test_ts_round_trips_the_integer_it_came_from(self):
         # float64 spacing at this epoch is 238 ns, finer than the 1 us the stamp is quantised to,
@@ -549,6 +580,22 @@ class TestAudioPointer:
         _, q = _qs(a["url"])
         assert int(q["from"][0]) == a["utc_us_from"]
 
+    def test_a_window_with_no_pre_roll_says_unknown_not_false(self):
+        # Defect: on the scene path pre_s is 0, so `sample - 0 < 0` could never be True and every
+        # scene record shipped clamped_to_boot: false -- a check reported as passed that was never
+        # run. None is the third state: the question was not asked.
+        a = BR.audio_pointer(NODE, UTC_US, sample=0, fs_hz=16000.0, pre_s=0.0, post_s=1.024)
+        assert a["clamped_to_boot"] is None
+        assert a["sample_from"] == 0, "the sample range is still exact; only the clamp is unasked"
+        # sample 0 is the tightest case there is, and even there the scene path cannot clamp.
+        rec = BR.to_record(_scene_row(sample=0), NODE, frame_key="mel_hex")
+        assert rec["audio"]["clamped_to_boot"] is None
+        assert rec["audio"]["sample_from"] == 0
+        # A detection, which does have a pre-roll, still answers True or False.
+        det = BR.to_record(_row(sample=0), NODE)["audio"]
+        assert det["clamped_to_boot"] is True
+        assert BR.audio_pointer(NODE, UTC_US, 10 ** 7, 16000.0)["clamped_to_boot"] is False
+
     def test_sample_zero_is_a_position_not_an_absence(self):
         rec = BR.to_record(_row(sample=0), NODE)
         assert rec["clock"]["sample"] == 0
@@ -653,6 +700,223 @@ class TestCommandLine:
         assert BR.main(["--scene-csv", str(p), "--out", str(out), "--node", NODE]) == 0
         recs = [json.loads(l) for f in out.iterdir() for l in f.read_text().splitlines()]
         assert len(recs) == 2 and {r["embed_dim"] for r in recs} == {80}
+
+
+class TestRejectIsTyped:
+    """to_record's docstring promises Reject, a ValueError carrying .reason, on any row that must
+    not ship. Defect: `float(row.get("fs_hz") or 0.0)` let a non-numeric fs_hz out as a BARE
+    ValueError. convert()'s backstop renamed it malformed_row so the batch contract held, but a
+    direct caller got the untyped error Reject exists to remove."""
+
+    def test_a_non_numeric_fs_hz_is_a_reject_with_a_reason(self):
+        row = _row()
+        row["fs_hz"] = "sixteen thousand"
+        with pytest.raises(BR.Reject) as e:
+            BR.to_record(row, NODE)
+        assert e.value.reason == "malformed_row"
+        assert "fs_hz" in e.value.why
+        assert isinstance(e.value, ValueError), "an `except ValueError` caller still catches it"
+
+    def test_every_reject_from_to_record_carries_a_reason(self):
+        # Whatever a caller feeds a row that cannot ship, the error names why in the vocabulary.
+        bad_fs, no_utc, unanchored, junk = _row(), dict(_row()), _row(utc_us=0), _row()
+        bad_fs["fs_hz"] = "fast"
+        del no_utc["utc_us"]
+        junk["frame_hex"] = "zz"
+        no_sample = _row()
+        no_sample["sample"] = "twenty"
+        for row in (bad_fs, no_utc, unanchored, junk, no_sample):
+            with pytest.raises(BR.Reject) as e:
+                BR.to_record(row, NODE)
+            assert e.value.reason in BR.REASONS
+
+    def test_a_blank_fs_hz_is_still_a_missing_value_not_a_rejection(self):
+        # Missing stays missing; only garbage is refused.
+        row = _row()
+        row["fs_hz"] = ""
+        rec = BR.to_record(row, NODE)
+        assert rec["clock"]["fs_hz"] is None
+        assert rec["audio"]["fs_hz"] == BR.NOMINAL_FS
+
+
+class TestEmptyIsNotSuccess:
+    """Defect: _parse_csv returned [] for an empty file, write_shards wrote nothing for an empty
+    dict, and main printed "0 row(s) -> 0 record(s) in 0 shard(s)" and returned 0. A zero-byte or
+    wiped dets.csv -- the exact SD failure DETS_COLUMNS exists to catch -- read as a completed
+    run."""
+
+    def test_a_zero_byte_file_is_refused_not_read_as_a_quiet_night(self):
+        for body in ("", "   ", "\n\n", "\n \t\n"):
+            with pytest.raises(ValueError, match="empty"):
+                BR.parse_dets_csv(body)
+            with pytest.raises(ValueError, match="empty"):
+                BR.parse_scene_csv(body)
+
+    def test_a_header_with_no_rows_is_a_real_empty_run(self):
+        # The other case, and it is legitimate: the node made the file, wrote the header, and had
+        # nothing to append. It must stay distinguishable from the one above.
+        assert BR.parse_dets_csv(",".join(BR.DETS_COLUMNS) + "\n") == []
+        assert BR.parse_scene_csv(",".join(BR.SCENE_COLUMNS) + "\n") == []
+
+    def test_write_shards_refuses_to_report_success_for_writing_nothing(self, tmp_path):
+        out = tmp_path / "sh"
+        with pytest.raises(ValueError):
+            BR.write_shards(str(out), {})
+        assert not out.exists(), "an empty --out looks exactly like a forwarded night"
+
+    def test_main_on_a_wiped_dets_csv_fails_loudly(self, tmp_path):
+        p = tmp_path / "dets.csv"
+        p.write_text("")
+        with pytest.raises(ValueError, match="empty"):
+            BR.main(["--dets-csv", str(p), "--out", str(tmp_path / "sh"), "--node", NODE])
+
+    def test_main_writes_nothing_and_returns_nonzero_when_there_are_no_records(
+            self, tmp_path, capsys):
+        p = tmp_path / "dets.csv"
+        p.write_text(",".join(BR.DETS_COLUMNS) + "\n")
+        out = tmp_path / "sh"
+        assert BR.main(["--dets-csv", str(p), "--out", str(out), "--node", NODE]) == 1
+        assert not out.exists()
+        cap = capsys.readouterr()
+        assert "NOTHING WAS WRITTEN" in cap.err
+        assert "0 record(s)" not in cap.out, "stdout must not report a completed run"
+
+    def test_a_night_that_was_entirely_rejected_is_not_a_completed_run(self, tmp_path, capsys):
+        # Every row unanchored: rows were read, nothing shippable came out. log_forwarder would
+        # glob an --out that does not exist, so the exit status has to say so.
+        body = [",".join(BR.DETS_COLUMNS)]
+        r = _row(utc_us=0)
+        body.append(",".join(str(r[c]) for c in BR.DETS_COLUMNS))
+        p = tmp_path / "dets.csv"
+        p.write_text("\n".join(body) + "\n")
+        out = tmp_path / "sh"
+        assert BR.main(["--dets-csv", str(p), "--out", str(out), "--node", NODE]) == 1
+        assert not out.exists()
+        err = capsys.readouterr().err
+        assert "1 row(s) -> 0 record(s)" in err
+        assert "unanchored_time" in err, "the zero is explained, not just reported"
+
+
+class TestFirmwareConstantsDoNotDrift:
+    """NODE_BANDS/FRAMES/HOP/NFFT and NODE_MAX_DUR_S are COPIES of firmware constants, and a copy
+    drifts. Bands and frames are on the wire, so a frame of another shape decodes to another shape
+    and span_ms goes honestly null. HOP and NFFT are NOT on the wire: edit MEL16_HOP alone and
+    to_record still calls the geometry `known`, and feature_span_ms goes quietly wrong by exactly
+    the edit. Nothing inside the module can see that, so this is the detector."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    MEL16 = os.path.join(ROOT, "firmware", "night_node", "mel16.h")
+    INO = os.path.join(ROOT, "firmware", "night_node", "night_node.ino")
+
+    @staticmethod
+    def _define(path, name):
+        import re
+        m = re.search(r"^#define\s+%s\s+([^\s/]+)" % re.escape(name),
+                      open(path, encoding="utf-8", errors="replace").read(), re.M)
+        assert m, "%s is not #defined in %s any more; this copy is now unanchored" % (name, path)
+        return m.group(1).rstrip("f")
+
+    def test_the_impulse_geometry_still_matches_mel16_h(self):
+        d = lambda n: int(self._define(self.MEL16, n))            # noqa: E731
+        assert (BR.NODE_BANDS, BR.NODE_FRAMES) == (d("MEL16_BANDS"), d("MEL16_FRAMES"))
+        assert (BR.NODE_HOP, BR.NODE_NFFT) == (d("MEL16_HOP"), d("MEL16_NFFT"))
+        assert BR.NOMINAL_FS == float(self._define(self.MEL16, "MEL16_FS"))
+
+    def test_the_span_this_module_reports_is_the_span_the_firmware_fetches(self):
+        # night_node.ino: `uint32_t back = MEL16_NFFT + (MEL16_FRAMES - 1) * MEL16_HOP + 32;`
+        # -- 736 samples, of which 32 is guard and 704 is span. 704 / 16000 * 1000 = 44.0 ms.
+        nfft = int(self._define(self.MEL16, "MEL16_NFFT"))
+        hop = int(self._define(self.MEL16, "MEL16_HOP"))
+        frames = int(self._define(self.MEL16, "MEL16_FRAMES"))
+        fs = float(self._define(self.MEL16, "MEL16_FS"))
+        span_samples = nfft + (frames - 1) * hop
+        assert (span_samples, span_samples + 32) == (704, 736)
+        assert BR.feature_span_ms(frames) == pytest.approx(span_samples / fs * 1000.0, abs=1e-9)
+        assert BR.feature_span_ms(BR.NODE_FRAMES) == 44.0
+        assert BR.to_record(_row(), NODE)["feature"]["span_ms"] == 44.0
+
+    def test_the_pointer_clamp_is_the_limit_the_node_actually_serves(self):
+        # A pointer promising more than AUDIO_MAX_S comes back short with no error.
+        assert BR.NODE_MAX_DUR_S == float(self._define(self.INO, "AUDIO_MAX_S"))
+
+
+@needs_capture
+class TestMeasuredNumbers:
+    """The house rule, enforced: every number quoted in tools/hear_bridge.py's comments is
+    recomputed here from ~/dama-hear-night-2026-09-07, with the recipe the comment states."""
+
+    def _health(self):
+        import csv as _csv
+        with open(os.path.join(CAPTURE, "health.csv"), encoding="utf-8") as fh:
+            return list(_csv.DictReader(fh))
+
+    def test_the_capture_is_the_run_the_module_docstring_describes(self):
+        h = self._health()
+        up = [int(r["uptime_s"]) for r in h]
+        assert (len(h), len(_capture_rows())) == (1360, 59)
+        assert (min(up), max(up)) == (28, 40819)
+        assert (max(up) - min(up)) / 3600.0 == pytest.approx(11.33, abs=0.005)
+
+    def test_the_clock_discipline_quoted_for_the_timestamp(self):
+        h = self._health()
+        tacc = [int(r["tacc_ns"]) for r in h]
+        spread = [float(r["spread_us"]) for r in h]
+        assert {r["fix"] for r in h} == {"3"}
+        assert (min(tacc), max(tacc)) == (22, 26)
+        assert (min(spread), max(spread), np.median(spread)) == (2.0, 15.0, 10.0)
+        assert int(h[-1]["pps"]) == 40817 and max(int(r["pps_bad"]) for r in h) == 0
+
+    def test_float64_at_this_epoch_holds_the_microsecond_but_not_the_nanosecond(self):
+        import math
+        assert math.ulp(UTC_US / 1e6) == pytest.approx(2.384e-07, rel=1e-3)   # 238 ns
+        assert math.ulp(UTC_US / 1e6) * 1e9 > 26, "coarser than the tAcc the receiver reported"
+
+    def test_the_nominal_rate_fallback_is_the_last_health_rows_own_numbers(self):
+        last = self._health()[-1]
+        assert float(last["fs_clean_hz"]) == 16000.1690
+        assert int(last["fs_win_s"]) == 3030
+        assert float(last["fs_cum_hz"]) == 15991.4821
+        ppm = (float(last["fs_clean_hz"]) - BR.NOMINAL_FS) / BR.NOMINAL_FS * 1e6
+        assert ppm == pytest.approx(10.5625, abs=1e-4)
+        assert 2.0 * ppm == pytest.approx(21.1, abs=0.1)        # us over a 2 s window
+        assert 1e6 / BR.NOMINAL_FS == 62.5                      # one sample
+
+    def test_the_gate_and_ambient_numbers_beside_det_peak_quartiles(self):
+        h = self._health()
+        gt = [float(r["gate_thr"]) for r in h]
+        assert (min(gt), max(gt)) == (800.0, 1715.0)
+        assert sum(1 for x in gt if x == 800.0) == 1328
+        ep = [float(r["env_peak_win"]) for r in h]
+        # Defect: the comment claimed median 368.9 and p95 692.0. Neither reproduces on either
+        # snapshot of this capture; these are what the column actually holds.
+        assert np.median(ep) == 380.0
+        assert np.percentile(ep, 95) == 708.0
+        pk = [abs(int(r["trigger"])) for r in _capture_rows() if int(r["utc_us"]) > 0]
+        assert np.percentile(ep, 95) < min(pk), "banding on ambient puts all 48 in one bucket"
+
+    def test_the_final_snapshot_is_a_different_capture_with_different_edges(self):
+        # The warning beside DET_PEAK_QUARTILES: same run, longer snapshot, three more detections
+        # and three different quartiles. Quoting one file's number against the other is the
+        # unreproducible-number failure in its purest form.
+        import csv as _csv
+        f = os.path.join(CAPTURE, "final", "dets.csv")
+        if not os.path.exists(f):
+            pytest.skip("final/ snapshot not retrieved beside this capture")
+        with open(f, encoding="utf-8") as fh:
+            rows = list(_csv.DictReader(fh))
+        pk = sorted(abs(int(r["trigger"])) for r in rows if int(r["utc_us"]) > 0)
+        assert (len(rows), len(pk)) == (62, 51)
+        assert tuple(np.percentile(pk, [25, 50, 75])) == (860.5, 965.0, 1283.5)
+        assert tuple(np.percentile(pk, [25, 50, 75])) != BR.DET_PEAK_QUARTILES
+
+    def test_the_unanchored_share_the_comment_quotes(self):
+        rows = _capture_rows()
+        assert sum(1 for r in rows if int(r["utc_us"]) == 0) == 11
+        assert len(rows) == 59
+        assert 1788763952 / 86400 / 365.25 == pytest.approx(56.7, abs=0.05)   # "a 56-year event"
+
+    def test_the_ring_arithmetic_in_the_pointer_docstring(self):
+        assert 240 * 16000 * 2 / 1e6 == 7.68        # MB of int16 for the 240 s the node asks for
 
 
 @needs_capture

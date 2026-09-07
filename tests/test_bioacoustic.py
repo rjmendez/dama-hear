@@ -10,7 +10,8 @@ from modules.bioacoustic import detect as BA  # noqa: E402
 
 FS = 16000.0            # the node's PDM rate. Nyquist 8 kHz, and that is the whole band story.
 CICADA_HZ = 6000.0      # mid-band, well clear of both walls
-NOISE_SD = 30.0         # 2026-09-07 capture: ambient median 29.4 counts over 11.33 h
+NOISE_SD = 30.0         # 2026-09-07 capture: median of health.csv's `ambient` column over all
+                        # 1450 rows is 28.95 counts, across 12.08 h (uptime_s 28 -> 43521 s).
 BAND = BA.CICADA_BAND_HZ
 
 
@@ -166,8 +167,14 @@ class TestPulseRate:
     @pytest.mark.parametrize("rate", [8.0, 12.0, 20.0, 45.0])
     def test_recovers_the_fundamental_not_a_subharmonic(self, rate):
         # THE REGRESSION. Autocorrelation peaks at every multiple of the period, and the
-        # (n-lag)/n bias correction lifts the longer lags, so argmax lands on a subharmonic:
-        # measured 10 Hz for a 20 Hz train and 4 Hz for a 12 Hz one before the fundamental rule.
+        # (n-lag)/n bias correction lifts the longer lags, so argmax lands on a subharmonic.
+        # Measured on this box by taking seg.argmax() instead of pulse_rate's FUND_FRAC loop, on
+        # these exact 3 s envelopes at the default (2, 100) Hz range: 4.00 Hz for the 8 Hz train,
+        # 4.00 Hz for the 12 Hz one, 2.86 Hz for the 20 Hz one and 2.50 Hz for the 45 Hz one --
+        # never the true rate, and for the fast trains within a hair of rate_lo. This comment
+        # used to say "10 Hz for a 20 Hz train"; no window length or variant tried reproduces
+        # 10 Hz, and it is gone. (Dropping the bias correction instead recovers 20.00 Hz, at the
+        # cost that correction exists to prevent.)
         n = int(3 * FS)
         env, fs_env = BA.decimate(BA.band_envelope(_clicks(n, rate), FS, *BAND), FS)
         p, got = BA.pulse_rate(env, fs_env)
@@ -191,10 +198,11 @@ class TestPulseRate:
         # THE REGRESSION. The guard used to compare against lag_lo, the lag of the FASTEST rate,
         # while the docstring promised the slowest. A window that cannot hold one period of the
         # true modulation was searched anyway, and the search reported a confident wrong answer.
-        # Measured on the shipped code before the fix, on this exact envelope at the default
-        # (2, 100) Hz range: 0.4 s -> (0.988, 100.0 Hz) and 0.3 s -> (1.000, 100.0 Hz), against a
-        # true rate of 3 Hz. Two periods at rate_lo=2 Hz need just over 1 s, so all three of
-        # these are unmeasurable and must say so.
+        # Measured on this box against the pre-fix code, which test_the_prefix_guard_numbers_
+        # reproduce below rebuilds so the numbers stay checkable: on this exact envelope at the
+        # default (2, 100) Hz range, 0.4 s -> (0.988, 100.0 Hz) and 0.3 s -> (1.000, 100.0 Hz),
+        # against a true rate of 3 Hz. Two periods at rate_lo=2 Hz need just over 1 s, so all
+        # three of these are unmeasurable and must say so.
         t = np.arange(int(dur_s * 1000.0)) / 1000.0
         env = 1.0 + 0.9 * np.sin(2 * np.pi * 3.0 * t)
         assert BA.pulse_rate(env, 1000.0) == (None, None)
@@ -213,6 +221,117 @@ class TestPulseRate:
         env = 1.0 + 0.9 * np.sin(2 * np.pi * 3.0 * t)
         p, rate = BA.pulse_rate(env, 1000.0)
         assert p > 0.5 and rate == pytest.approx(3.0, rel=0.05)
+
+    @pytest.mark.parametrize("rate,subharmonic", [(8.0, 4.00), (12.0, 4.00),
+                                                  (20.0, 2.86), (45.0, 2.50)])
+    def test_the_subharmonic_the_fundamental_rule_exists_to_avoid(self, rate, subharmonic):
+        # The number quoted in pulse_rate's docstring and in the test above, made executable so it
+        # cannot rot again: seg.argmax() with everything else held identical. It is the argmax,
+        # not the search range or the bias correction, that the FUND_FRAC loop replaces.
+        n = int(3 * FS)
+        env, fs_env = BA.decimate(BA.band_envelope(_clicks(n, rate), FS, *BAND), FS)
+        e = env - env.mean()
+        lag_lo = max(1, int(round(fs_env / BA.PULSE_RATE_HZ[1])))
+        lag_hi = int(round(fs_env / BA.PULSE_RATE_HZ[0]))
+        nf = 1 << int(np.ceil(np.log2(2 * e.size)))
+        ac = np.fft.irfft(np.abs(np.fft.rfft(e, nf)) ** 2, nf)[:e.size]
+        ac = ac / ac[0] * (e.size / np.maximum(e.size - np.arange(e.size), 1.0))
+        seg = ac[lag_lo:lag_hi + 1]
+        got = fs_env / (lag_lo + int(np.argmax(seg)))
+        assert got == pytest.approx(subharmonic, abs=0.01)
+        assert got != pytest.approx(rate, rel=0.05), "argmax never lands on the true rate"
+
+    def test_the_prefix_guard_numbers_reproduce(self):
+        # The three numbers pulse_rate's docstring quotes for the code BEFORE the guard fix. They
+        # cannot be got from the shipped function -- it returns (None, None) for all three -- so
+        # the pre-fix body is rebuilt here exactly as the docstring's recipe describes it: the
+        # guard against lag_lo instead of lag_hi, and lag_hi clipped to n // 2.
+        def prefix(env, fs_env, rate_lo=2.0, rate_hi=100.0):
+            e = np.asarray(env, float)
+            n = e.size
+            lag_lo = max(1, int(round(fs_env / rate_hi)))
+            lag_hi = min(int(round(fs_env / rate_lo)), n // 2)
+            if lag_hi <= lag_lo or n < 2 * lag_lo + 2:
+                return None, None
+            e = e - e.mean()
+            nf = 1 << int(np.ceil(np.log2(2 * n)))
+            ac = np.fft.irfft(np.abs(np.fft.rfft(e, nf)) ** 2, nf)[:n]
+            ac = ac / ac[0] * (n / np.maximum(n - np.arange(n), 1.0))
+            seg = ac[lag_lo:lag_hi + 1]
+            top, k = float(seg.max()), int(np.argmax(seg))
+            for j in range(1, seg.size - 1):
+                if seg[j] >= BA.FUND_FRAC * top and seg[j] >= seg[j - 1] and seg[j] >= seg[j + 1]:
+                    k = j
+                    break
+            # Same clamp the shipped function applies; without it the 0.3 s sine reads 1.0039,
+            # which is how a bias correction at a lag of n//2 leaves it.
+            return float(min(1.0, max(0.0, seg[k]))), float(fs_env / (lag_lo + k))
+
+        for dur, want_p in ((0.4, 0.988), (0.3, 1.000)):
+            t = np.arange(int(dur * 1000.0)) / 1000.0
+            p, r = prefix(1.0 + 0.9 * np.sin(2 * np.pi * 3.0 * t), 1000.0)
+            assert (p, r) == (pytest.approx(want_p, abs=5e-4), pytest.approx(100.0)), \
+                "true rate is 3 Hz; the pre-fix code answered at the top of the searched range"
+        p, r = prefix(np.random.RandomState(0).normal(0, 1, 300), 1000.0)
+        assert p == pytest.approx(0.137, abs=5e-4) and r == pytest.approx(12.3, abs=0.05)
+        # And every one of the three is (None, None) now.
+        for env in (1.0 + 0.9 * np.sin(2 * np.pi * 3.0 * np.arange(400) / 1000.0),
+                    1.0 + 0.9 * np.sin(2 * np.pi * 3.0 * np.arange(300) / 1000.0),
+                    np.random.RandomState(0).normal(0, 1, 300)):
+            assert BA.pulse_rate(env, 1000.0) == (None, None)
+
+
+class TestThresholdsAreDefensible:
+    """The numbers that justify TONALITY_MIN and PERIODICITY_MIN, made executable.
+
+    Both constants are defended in detect.py by measurements on these helpers. Those measurements
+    had drifted out of reach of the shipped code -- the periodicity ones quoted a 1 s window that
+    now returns None and a 3 s one the gate never uses, since a run retains only ANALYSIS_S = 2 s
+    of raw audio. Pinning them here is what stops that happening again.
+    """
+
+    def test_the_periodicity_measurement_never_sees_more_than_analysis_s(self):
+        # Why 2 s is the window the threshold must be argued on, whatever a run's duration.
+        g = BA.TonalGate(FS)
+        assert g.analysis_n == int(round(BA.ANALYSIS_S * FS))
+        _run(g, _noise(int(3 * FS)), _buzz(int(25 * FS)))
+        assert BA.ANALYSIS_S == 2.0
+
+    def test_unmodulated_noise_stays_far_under_periodicity_min(self):
+        n = int(BA.ANALYSIS_S * FS)
+        p2, _ = BA.pulse_rate(*BA.decimate(BA.band_envelope(_band_noise(n, 8.0), FS, *BAND), FS))
+        assert p2 == pytest.approx(0.056, abs=5e-4)
+        worst = max(BA.pulse_rate(*BA.decimate(
+            BA.band_envelope(_band_noise(n, 8.0, seed=s), FS, *BAND), FS))[0] for s in range(8))
+        assert worst == pytest.approx(0.073, abs=5e-4)
+        assert BA.PERIODICITY_MIN / worst == pytest.approx(4.1, abs=0.1)
+
+    def test_the_weakest_signals_the_gate_will_open_still_clear_both_thresholds(self):
+        # The other side of each gap: the faintest buzz and the faintest click train that get past
+        # the 6 dB SNR trigger at all. If either of these fell below its threshold the threshold
+        # would be excluding real detections, not noise.
+        buzz = _run(BA.TonalGate(FS), _noise(int(3 * FS)), _buzz(int(4 * FS), snr_db=5.0))[0]
+        assert buzz["snr_db"] == pytest.approx(6.19, abs=0.01)
+        assert buzz["tonality"] == pytest.approx(0.752, abs=5e-4)
+        assert buzz["tonality"] / BA.TONALITY_MIN == pytest.approx(3.8, abs=0.1)
+        clk = _run(BA.TonalGate(FS), _noise(int(3 * FS)), _clicks(int(4 * FS), 20.0, gain=2.5))[0]
+        assert clk["snr_db"] == pytest.approx(5.15, abs=0.01)
+        assert clk["periodicity"] == pytest.approx(0.785, abs=5e-4)
+        assert clk["periodicity"] / BA.PERIODICITY_MIN == pytest.approx(2.6, abs=0.1)
+
+    def test_pulsed_is_loose_on_a_loud_plain_tone_and_that_is_why_0_30_is_not_lowered(self):
+        # An unmodulated tone's envelope correlates with itself more strongly the further it is
+        # out of the noise, so periodicity climbs with SNR on a signal with no modulation at all.
+        # The widest-gap point would be sqrt(0.073*0.785) = 0.24; every dB below 0.30 makes this
+        # worse. It costs nothing -- structure is an OR and tonality carries these events -- but
+        # `pulsed` on a high-SNR event is not evidence of modulation, and that is worth pinning.
+        got = {}
+        for snr in (10.0, 12.0, 20.0):
+            d = _run(BA.TonalGate(FS), _noise(int(3 * FS)), _buzz(int(4 * FS), snr_db=snr))[0]
+            got[snr] = (round(d["snr_db"], 2), round(d["periodicity"], 3), d["pulsed"])
+        assert got == {10.0: (10.45, 0.217, False),
+                       12.0: (12.31, 0.301, True),
+                       20.0: (20.10, 0.531, True)}
 
 
 class TestSustainedTonal:
@@ -248,9 +367,10 @@ class TestSustainedTonal:
 
     def test_a_short_gap_does_not_split_one_song_into_many(self):
         # The 2026-09-07 capture is the cautionary case. Measured on its dets.csv, over the 48
-        # rows that carry a usable sketch (11 of the 59 set flags bit 1, insufficient context):
-        # 16 of the 47 inter-detection intervals are under a second, so grouping at a 1 s gap
-        # turns 48 rows into 32 events -- a 50% inflation in the raw count.
+        # in-run rows (62 total, less the 14 at uptime_s == 12, of which 11 also set flags bit 1
+        # for insufficient context), sorted by utc_us: 16 of the 47 inter-detection intervals are
+        # under a second, so grouping at a 1 s gap turns 48 triggers into 32 events -- 1.50
+        # triggers per event, a 50% inflation in the raw count.
         n = int(2 * FS)
         gap = _noise(int(0.1 * FS))
         g = BA.TonalGate(FS)
@@ -270,8 +390,10 @@ class TestRejection:
 
     def test_sustained_broadband_noise_is_not_a_call(self):
         # Loud and long but shapeless: wind, traffic, a generator. Without structure as a hard
-        # requirement this scored confidence 0.52, because a geometric mean of three terms cannot
-        # be dragged low enough by one of them alone.
+        # requirement -- delete the `if structure < 0.0` branch in _close and this exact signal
+        # comes back -- it scores confidence 0.534 at snr_db 17.95 (tonality 0.004, periodicity
+        # 0.064, structure -0.245), because a geometric mean of three terms cannot be dragged low
+        # enough by one of them alone. The comment here used to say 0.52; that does not reproduce.
         g = BA.TonalGate(FS)
         n = int(4 * FS)
         ev = _run(g, _noise(int(3 * FS)), _noise(n, seed=8) + _band_noise(n, 8.0))
@@ -286,9 +408,10 @@ class TestRejection:
 class TestBandEdge:
     """Reporting when the signal is pressed against a wall, which the 2026-09-07 capture did not.
 
-    46 of that night's 48 usable detections peak in mel band 0. Band 0's nonzero rfft bins run
-    312.5-500 Hz, so a peak there is equally consistent with a source inside band 0 and with one
-    below 300 Hz that the filterbank cannot see; the sketch cannot separate those. The conclusion
+    All 48 of that day's in-run detections peak in mel band 0, and band 0 beats band 1 in 48 of 48
+    (median 5.50 dB). Band 0's nonzero rfft bins run 312.5-500 Hz, so a peak there is equally
+    consistent with a source inside band 0 and with one below 300 Hz that the filterbank cannot
+    see; the sketch cannot separate those. The conclusion
     that survives is the weaker one -- the energy sat at the bottom edge of the representation --
     and nothing in the output said even that. These fields exist to say it.
     """
@@ -446,10 +569,10 @@ class TestAbsoluteIndex:
     process() takes the absolute index of block[0]. It used to re-anchor to it only when the
     residual buffer happened to be empty, which is almost never, so on essentially every call the
     caller's index was read and discarded. This matters because real streams have holes: the
-    2026-09-07 capture had 18 one-second windows come up short (health.csv, final drop_s=18),
-    totalling drop_samples=42749 -- about 2.7 s of audio across 11.33 h, not 18 s,
-    and every hole shifted every subsequent index, t_s and end_index by the size of the hole with
-    nothing in the output saying so.
+    2026-09-07 capture had 20 one-second windows come up short (health.csv, last row: drop_s=20,
+    drop_samples=57597) -- 3.60 s of audio at 16 kHz across 12.08 h, not 20 s -- and every hole
+    shifted every subsequent index, t_s and end_index by the size of the hole with nothing in the
+    output saying so.
     """
 
     def test_block_start_is_honoured_on_every_call_not_just_the_first(self):
