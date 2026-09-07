@@ -161,3 +161,26 @@ names, never the credentials. `secrets.h` is written 0600 and is gitignored.
 only when something *changes* — fix gained or lost, the first PPS edge, glitches climbing, a reboot,
 the node going away or coming back. A log that prints every poll is a log nobody reads in the
 morning. It runs detached and does not depend on any terminal staying open.
+
+## Reaching it without the cable
+
+| | |
+|---|---|
+| `GET /log` | the boot log, from a 6 kB RAM ring |
+| `POST /reboot` | restart. POST only, so a link prefetcher cannot reboot a node by looking at it |
+| `POST /update` | firmware, `curl -F firmware=@<bin>` |
+| `GET /sd?tail=N` | `night.csv` off the card |
+
+Every diagnosis worth having so far — the 230400-baud UBX scan, the driven-vs-floating pin probes,
+the I²C scan — came out of the boot log, which used to exist only on USB. It survives the cable now.
+
+⚠️**`/log` does not print the network name.** It says `network 1/3`. These endpoints are
+unauthenticated and the node is meant to sit outdoors; handing the SSID to anyone who can reach
+port 80 is not a trade worth making for a line of log.
+
+⚠️**The failback will not revert a proven image.** Carrying the node out of WiFi range means no
+join, never healthy, reboot at 90 s — three of those and the old logic would have rolled back
+working firmware because the node had *moved*. `proven_ok` in RTC memory records that a build once
+reached healthy; after that, unreachable is treated as what it usually is. The failback still
+guards the first boots after an OTA, which is the only window where unreachable really does mean
+bad image.

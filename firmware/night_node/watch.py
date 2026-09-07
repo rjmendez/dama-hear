@@ -28,6 +28,7 @@ def poll():
         return json.load(r)
 
 
+pps_announced = False      # reset on a detected reboot, below
 say("watching %s every %.0fs -> %s" % (BASE, EVERY, JSONL))
 prev, up, misses = None, None, 0
 while True:
@@ -45,7 +46,13 @@ while True:
             if s["gps"]["fix"] != prev["gps"]["fix"]:
                 say("GPS fix %d -> %d (%d sats, %s UTC)" % (prev["gps"]["fix"], s["gps"]["fix"],
                                                             s["gps"]["sats"], s["gps"]["utc"]))
-            if prev["pps"]["edges"] == 0 and s["pps"]["edges"] > 0:
+            # Announce the first edge once per BOOT. Comparing only against the previous poll
+            # made every reflash a fresh "first", so the log said something untrue twice while
+            # PPS was in fact still reading zero.
+            if s["uptime_s"] < prev["uptime_s"]:
+                pps_announced = False          # new boot: the next edge is genuinely a first
+            if s["pps"]["edges"] > 0 and not pps_announced:
+                pps_announced = True
                 say("*** FIRST PPS EDGE *** -- the sample-rate measurement has started")
             if s["pps"]["glitches"] > prev["pps"]["glitches"]:
                 say("PPS glitches %d -> %d (noise on the wire, not a fast clock)"

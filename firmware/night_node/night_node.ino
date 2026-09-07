@@ -187,7 +187,7 @@ static void i2c_scan() {
     n++;
   }
   if (!n) snprintf(i2c_found, sizeof i2c_found, "nothing on the bus");
-  Serial.printf("i2c   SDA=%d SCL=%d: %s\n", I2C_SDA, I2C_SCL, i2c_found);
+  logf("i2c   SDA=%d SCL=%d: %s\n", I2C_SDA, I2C_SCL, i2c_found);
 }
 
 // ---------------------------------------------------------------- u-blox UBX
@@ -457,17 +457,49 @@ static uint32_t boot_ms = 0;
 #endif
 RTC_NOINIT_ATTR static uint32_t boot_magic;
 RTC_NOINIT_ATTR static uint32_t boot_try;
+RTC_NOINIT_ATTR static uint32_t proven_ok;   // this image reached healthy at least once
 static bool marked_healthy = false;
 static char ota_msg[96] = "idle";
 
+// ---------------------------------------------------------------- log ring
+// Every diagnosis tonight -- the 230400/UBX baud scan, the driven-vs-floating pin probes, the I2C
+// scan -- came out of the boot log, which only existed on the USB cable. Once the node is carried
+// somewhere there is no cable, so the log has to be readable over the link that remains.
+#define LOGBUF 6144
+static char logbuf[LOGBUF];
+static volatile size_t log_w = 0;
+static volatile bool log_wrapped = false;
+
+static void log_put(const char *s, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    logbuf[log_w] = s[i];
+    log_w = (log_w + 1) % LOGBUF;
+    if (log_w == 0) log_wrapped = true;
+  }
+}
+static void logf(const char *fmt, ...) {
+  char b[256]; va_list ap; va_start(ap, fmt);
+  int n = vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+  if (n < 0) return;
+  if (n > (int)sizeof b - 1) n = sizeof b - 1;
+  Serial.write((const uint8_t *)b, n); log_put(b, n);
+}
+static void logln(const char *s) { logf("%s\n", s); }
+static void logln(const String &s) { logf("%s\n", s.c_str()); }
+
 static void boot_guard() {
-  if (boot_magic != BOOT_MAGIC) { boot_magic = BOOT_MAGIC; boot_try = 0; }   // cold power-on
+  if (boot_magic != BOOT_MAGIC) { boot_magic = BOOT_MAGIC; boot_try = 0; proven_ok = 0; }
   boot_try++;
+  // ⚠️Only ever revert an UNPROVEN image. Once this build has reached healthy, being unreachable
+  // means the node moved, the AP changed, or the weather did -- not that the firmware is bad.
+  // Without this, carrying the node out of WiFi range for three boots would roll back a working
+  // image, which is the failback doing real harm in the name of safety.
+  if (proven_ok) { boot_try = 0; return; }
   if (boot_try > BOOT_MAX_TRIES) {
     const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
     boot_try = 0;
     if (other && esp_ota_set_boot_partition(other) == ESP_OK) {
-      Serial.printf("\nBOOT GUARD: %d boots without reaching healthy -- reverting to %s\n",
+      logf("\nBOOT GUARD: %d boots without reaching healthy -- reverting to %s\n",
                     BOOT_MAX_TRIES, other->label);
       Serial.flush(); delay(200); esp_restart();
     }
@@ -478,16 +510,16 @@ static void mark_healthy_once() {
   // An image that runs happily but never joins WiFi cannot be recovered over the air and will
   // never reboot on its own, so the boot counter never advances. Force it: unreachable for long
   // enough is a failed boot, and three of those revert the partition.
-  if (!marked_healthy && millis() - boot_ms > UNHEALTHY_REBOOT_MS) {
-    Serial.println("boot  never became reachable -- rebooting so the failback counter advances");
+  if (!marked_healthy && !proven_ok && millis() - boot_ms > UNHEALTHY_REBOOT_MS) {
+    logln("boot  never became reachable -- rebooting so the failback counter advances");
     Serial.flush(); delay(200); esp_restart();
   }
   if (marked_healthy || millis() - boot_ms < HEALTHY_AFTER_MS) return;
   if (!sta_ok) return;                       // healthy MUST include "reachable", or a node that
   marked_healthy = true;                     // boots into a corner cannot be recovered over the air
-  boot_try = 0;
+  boot_try = 0; proven_ok = 1;               // this image has earned the benefit of the doubt
   esp_ota_mark_app_valid_cancel_rollback();  // harmless if the bootloader ignores it
-  Serial.println("boot  marked healthy; failback counter cleared");
+  logln("boot  marked healthy; failback counter cleared");
 }
 static float env_peak_seen = 0;
 
@@ -599,31 +631,38 @@ void setup() {
   Serial.begin(115200);
   delay(1500);
   boot_ms = millis();
-  Serial.printf("boot  attempt %lu on partition %s\n", (unsigned long)boot_try,
+  logf("boot  attempt %lu on partition %s\n", (unsigned long)boot_try,
                 esp_ota_get_running_partition()->label);
-  Serial.println("\n=== dama-hear night node ===");
+  logln("\n=== dama-hear night node ===");
 
   // Try each configured network in turn. An outdoor node may only reach one of them, and which
   // one is not knowable from indoors.
+  int joined_idx = 0;
   if (WIFI_N > 0) {
     WiFi.mode(WIFI_STA); WiFi.setSleep(false);
     for (int k = 0; k < WIFI_N && !sta_ok; k++) {
-      Serial.printf("wifi  trying network %d/%d", k + 1, WIFI_N);
+      logf("wifi  trying network %d/%d", k + 1, WIFI_N);
       WiFi.begin(WIFI_SSIDS[k], WIFI_PASSES[k]);
       for (int i = 0; i < 24 && WiFi.status() != WL_CONNECTED; i++) { delay(500); Serial.print("."); }
       sta_ok = WiFi.status() == WL_CONNECTED;
-      Serial.println(sta_ok ? " joined" : " no");
+      if (sta_ok) joined_idx = k + 1;
+      logln(sta_ok ? " joined" : " no");
       if (!sta_ok) WiFi.disconnect();
     }
   }
-  if (sta_ok) Serial.printf("wifi  STA  \"%s\"  http://%s/\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+  if (sta_ok) {
+    // Network NAME deliberately not logged: /log is unauthenticated and this node is meant to sit
+    // outdoors. The index is enough to tell which of the configured networks answered.
+    logf("wifi  STA  network %d/%d  http://%s/\n", joined_idx, WIFI_N,
+         WiFi.localIP().toString().c_str());
+  }
   else {
     WiFi.mode(WIFI_AP); WiFi.softAP(AP_SSID, AP_PASS);
-    Serial.printf("wifi  AP   ssid \"%s\" pass \"%s\"  http://%s/\n",
+    logf("wifi  AP   ssid \"%s\" pass \"%s\"  http://%s/\n",
                   AP_SSID, AP_PASS, WiFi.softAPIP().toString().c_str());
-    Serial.println("      (no secrets.h, or the join failed -- see firmware/night_node/README)");
+    logln("      (no secrets.h, or the join failed -- see firmware/night_node/README)");
   }
-  if (MDNS.begin("damahear")) Serial.println("mdns  http://damahear.local/");
+  if (MDNS.begin("damahear")) logln("mdns  http://damahear.local/");
 
   // PULLDOWN, not bare INPUT. An unconnected CMOS input floats and self-oscillates -- measured
   // ~3.4 kHz of phantom edges, which the rate maths happily turned into a plausible +626 ppm.
@@ -632,7 +671,7 @@ void setup() {
   // silence here can only be the wire or the tap point -- worth stating rather than inferring.
   { int high = 0, edges = 0, last = digitalRead(PPS_PIN); uint32_t t0 = millis();
     while (millis() - t0 < 1500) { int v = digitalRead(PPS_PIN); if (v) high++; if (v != last) { edges++; last = v; } }
-    Serial.printf("pps   pin (D0/GPIO%d) over 1.5 s: %d edges, %s\n", PPS_PIN, edges,
+    logf("pps   pin (D0/GPIO%d) over 1.5 s: %d edges, %s\n", PPS_PIN, edges,
                   edges ? "something is pulsing it" : "flat -- nothing connected to the tap"); }
   attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
   // D6/D7 are GPIO43/44 -- the ESP32-S3's DEFAULT UART0 pins. With USB-CDC carrying Serial, UART0
@@ -649,7 +688,7 @@ void setup() {
     int high = 0, edges = 0, last = digitalRead(GPS_RX);
     uint32_t t0 = millis();
     while (millis() - t0 < 300) { int v = digitalRead(GPS_RX); if (v) high++; if (v != last) { edges++; last = v; } }
-    Serial.printf("gps   RX pin (D7/GPIO%d) with pulldown: %s (%d edges)\n", GPS_RX,
+    logf("gps   RX pin (D7/GPIO%d) with pulldown: %s (%d edges)\n", GPS_RX,
                   high > 20 ? "DRIVEN high -- a transmitter is connected"
                             : "follows the pulldown -- NOTHING is driving it", edges);
   }
@@ -679,20 +718,20 @@ void setup() {
           } else if (c != '\r' && c >= 32 && c < 127) ln[i++] = (char)c;
         }
       }
-      Serial.printf("gps   %6lu baud -> %d NMEA, %d UBX\n", (unsigned long)cand[k], nm, ub);
+      logf("gps   %6lu baud -> %d NMEA, %d UBX\n", (unsigned long)cand[k], nm, ub);
       int score = nm + ub;
       if (score > best_score) { best_score = score; best_b = cand[k]; best_ubx = (ub > nm); }
       Serial1.end();
     }
     gps_baud = best_b ? best_b : 9600;
     Serial1.begin(gps_baud, SERIAL_8N1, GPS_RX, GPS_TX);
-    Serial.printf("gps   using %lu baud (%s)%s\n", (unsigned long)gps_baud,
+    logf("gps   using %lu baud (%s)%s\n", (unsigned long)gps_baud,
                   best_ubx ? "UBX binary" : "NMEA",
                   best_b ? "" : " -- nothing decoded at any rate");
   }
   delay(300);
   gps_configure();
-  Serial.println("gps   UBX config sent (TP1 1 Hz locked+unlocked, NAV-PVT, TIM-TP; RAM layer)");
+  logln("gps   UBX config sent (TP1 1 Hz locked+unlocked, NAV-PVT, TIM-TP; RAM layer)");
 
   Wire.begin(I2C_SDA, I2C_SCL, 100000);
   i2c_scan();
@@ -701,13 +740,13 @@ void setup() {
   sd_cs = 0;
   if (SD.begin(21, SPI, 20000000)) { sd_ok = true; sd_cs = 21; }
   else if (SD.begin(3, SPI, 20000000)) { sd_ok = true; sd_cs = 3; }
-  Serial.printf("sd    %s%s", sd_ok ? "mounted, CS=" : "no card", sd_ok ? "" : "\n");
-  if (sd_ok) Serial.printf("%d\n", sd_cs);
+  logf("sd    %s%s", sd_ok ? "mounted, CS=" : "no card", sd_ok ? "" : "\n");
+  if (sd_ok) logf("%d\n", sd_cs);
 
   i2s.setPinsPdmRx(PDM_CLK, PDM_DIN);
   if (!i2s.begin(I2S_MODE_PDM_RX, FS_NOMINAL, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO))
-    Serial.println("i2s   FAILED");
-  else Serial.printf("i2s   PDM %d Hz on CLK=%d DIN=%d\n", FS_NOMINAL, PDM_CLK, PDM_DIN);
+    logln("i2s   FAILED");
+  else logf("i2s   PDM %d Hz on CLK=%d DIN=%d\n", FS_NOMINAL, PDM_CLK, PDM_DIN);
 
   http.on("/", h_root); http.on("/status", h_status); http.on("/detections", h_dets);
   http.on("/update", HTTP_POST,
@@ -739,6 +778,16 @@ void setup() {
       run->label, (unsigned long)run->address, (unsigned long)boot_try, BOOT_MAX_TRIES,
       marked_healthy ? "yes" : "not yet", (int)st, ota_msg);
     http.send(200, "text/plain", b);
+  });
+  http.on("/log", []() {
+    String o;
+    if (log_wrapped) { o.reserve(LOGBUF + 1); for (size_t i = log_w; i < LOGBUF; i++) o += logbuf[i]; }
+    for (size_t i = 0; i < log_w; i++) o += logbuf[i];
+    http.send(200, "text/plain", o);
+  });
+  http.on("/reboot", HTTP_POST, []() {      // POST, so a link prefetcher cannot reboot the node
+    http.send(200, "text/plain", "rebooting\n");
+    delay(300); ESP.restart();
   });
   http.on("/sd", []() {
     // night.csv was described as the durable record. A record that can only be read by walking
@@ -884,7 +933,7 @@ void setup() {
   http.on("/i2c", []() { i2c_scan(); http.send(200, "text/plain", i2c_found); });   // rescan on demand
   fft_init();
   http.begin();
-  Serial.println("http  up\n");
+  logln("http  up\n");
 }
 
 static int16_t blk[BLOCK];
@@ -941,7 +990,7 @@ void loop() {
     if (cfg_try) gps_configure();
     cfg_try++;
     if (cfg_try == 6)
-      Serial.println("gps   no ACK/NAK after 6 tries -- node TX (D6/GPIO43) -> module RX is not "
+      logln("gps   no ACK/NAK after 6 tries -- node TX (D6/GPIO43) -> module RX is not "
                      "connected. Running the module's stock config; PPS will appear only on fix.");
   }
 
@@ -957,7 +1006,7 @@ void loop() {
     last = millis();
     double fs = measured_fs();
     uint32_t up = (millis() - boot_ms) / 1000;
-    Serial.printf("[%6lus] fix %d/%d sats  tAcc %lu ns  pps %lu (%lu bad)  spread %ld us\n",
+    logf("[%6lus] fix %d/%d sats  tAcc %lu ns  pps %lu (%lu bad)  spread %ld us\n",
                   (unsigned long)up, gps_fix, gps_sats, (unsigned long)gps_tacc_ns,
                   (unsigned long)pps_count, (unsigned long)pps_glitch,
                   (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0));
