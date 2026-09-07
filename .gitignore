@@ -6,3 +6,4 @@ __pycache__/
 *.raw
 *.npz
 *.log
+firmware/**/secrets.h
