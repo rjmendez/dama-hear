@@ -8,7 +8,15 @@ wrong by that angle.
 
 The shock reaches a node at
 
-    t(P) = t0 + a/V + m * (V/c^2 - sqrt(V^2 - c^2)/(V*c))
+    t(P) = t0 + a/V + m * sqrt(V^2 - c^2)/(V*c)
+
+Derivation, because this coefficient was wrong for a long time and nothing caught it: the bullet
+reaches along-track x at x/V, sound then covers sqrt((a-x)^2 + m^2)/c. Minimising over the emission
+point x gives a-x = c*m/sqrt(V^2-c^2), and substituting back collapses to the form above. The
+sanity check that should have been here from the start is that a shock front cannot arrive LATER
+than plain sound from closest approach, m/c -- the previous coefficient implied a front moving at
+205 m/s and solve() could not see it, because solve() reused the same k and the round-trip agreed
+with itself.
 
 where `a` is the along-track distance to P's closest approach and `m` is the miss distance. With
 V known from the round, a 2D trajectory has three unknowns -- bearing, perpendicular offset, and
@@ -58,7 +66,7 @@ def shock_time(P, bearing_rad: float, offset_m: float, v_mps: float, c: float) -
     w = np.asarray(P, float)[:2] - n * float(offset_m)
     a = float(np.dot(w, u))
     m = abs(float(np.dot(w, n)))
-    k = v_mps / c ** 2 - math.sqrt(v_mps * v_mps - c * c) / (v_mps * c)
+    k = math.sqrt(v_mps * v_mps - c * c) / (v_mps * c)
     return a / v_mps + m * k
 
 
@@ -91,7 +99,7 @@ def solve(positions: Sequence, arrivals: Sequence[float], v_mps: float = 900.0,
     # Vectorised over offset: the along-track term is INDEPENDENT of offset (the normal is
     # orthogonal to the track), so only the miss term moves. Scalar nesting took 8 minutes for
     # a handful of solves; this is the same arithmetic.
-    k = v_mps / c ** 2 - math.sqrt(v_mps * v_mps - c * c) / (v_mps * c)
+    k = math.sqrt(v_mps * v_mps - c * c) / (v_mps * c)
     offs = np.arange(-offset_range_m, offset_range_m, offset_step_m)
     best = None
     for bd in np.arange(0.0, 360.0, bearing_step_deg):

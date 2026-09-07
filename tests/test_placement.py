@@ -118,3 +118,164 @@ def test_cli_runs(capsys):
     assert PL.main(["--nodes", "0,0;100,0;100,100;0,100", "--step", "40"]) == 0
     out = capsys.readouterr().out
     assert "median DOP" in out and "thinnest bearing" in out
+
+
+FLAT_SQUARE_3D = [(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 100.0, 0.0), (0.0, 100.0, 0.0)]
+RAISED_SQUARE = [(0.0, 0.0, 30.0), (100.0, 0.0, 0.0), (100.0, 100.0, 0.0), (0.0, 100.0, 0.0)]
+# Square plus a mast in the middle: the only 5-node set here with real vertical extent.
+TOWER = FLAT_SQUARE_3D + [(50.0, 50.0, 30.0)]
+
+
+class TestVerticalObservability:
+    """The same-side trap rotated into the vertical: a source raised above a flat array adds the
+    same delay to every node and cancels in TDoA, exactly as +/-6 m of track shift gave 0.000 ms."""
+
+    def test_a_flat_array_cannot_see_the_source_rise(self):
+        r = PL.height_sensitivity(FLAT_SQUARE_3D, (50.0, 50.0, 0.0), delta_m=6.0)
+        assert r["max_tdoa_swing_ms"] == pytest.approx(0.0, abs=1e-9), \
+            "coplanar nodes see a common delay, which cancels -- by construction, not by noise"
+        assert r["observable"] is False
+
+    def test_one_raised_node_makes_it_observable(self):
+        r = PL.height_sensitivity(RAISED_SQUARE, (50.0, 50.0, 0.0), delta_m=6.0)
+        assert r["observable"] is True
+        assert r["max_tdoa_swing_ms"] > PL.RESOLVABLE_SWING_MS
+
+    def test_the_verdict_is_measured_not_inferred_from_planarity(self):
+        """RAISED_SQUARE is far from coplanar AND observable; a flat one is neither. If
+        `observable` were read off COPLANAR_RMS_M the two would agree for the wrong reason, so
+        pin the swing itself as the thing that decides."""
+        flat = PL.vertical_observability(FLAT_SQUARE_3D)
+        up = PL.vertical_observability(RAISED_SQUARE, (50.0, 50.0, 0.0))
+        assert flat["observable"] is False and "UNOBSERVABLE" in flat["note"]
+        assert up["observable"] is True and up["note"] is None
+        assert up["max_tdoa_swing_ms"] > 100.0 * flat["max_tdoa_swing_ms"] + 1.0
+
+    def test_a_horizontal_coplanar_array_is_mirror_ambiguous(self):
+        assert PL.vertical_observability(FLAT_SQUARE_3D)["mirror_ambiguous"] is True
+        assert PL.vertical_observability(RAISED_SQUARE)["mirror_ambiguous"] is False
+
+    def test_c_comes_from_shockwave(self):
+        r = PL.height_sensitivity(RAISED_SQUARE, (50.0, 50.0, 0.0), temp_c=23.0)
+        assert r["sound_speed_mps"] == pytest.approx(345.238, abs=1e-3)
+
+
+class TestCoplanarity:
+    def test_three_nodes_are_coplanar_by_construction_whatever_their_heights(self):
+        """Three points define a plane, so s[2] is 0 exactly. Breaks if planarity is faked from
+        vertical spread, which would call this layout wildly non-planar."""
+        r = PL.coplanarity([(0.0, 0.0, 0.0), (10.0, 0.0, 5.0), (0.0, 10.0, -7.0)])
+        assert r["coplanar"] is True
+        assert r["planarity_rms_m"] == pytest.approx(0.0, abs=1e-9)
+        assert r["vertical_spread_m"] == pytest.approx(12.0, abs=1e-9)
+
+    def test_a_flat_array_has_an_upward_plane_normal(self):
+        r = PL.coplanarity(FLAT_SQUARE_3D)
+        assert r["near_horizontal"] is True
+        assert r["plane_normal"][2] == pytest.approx(1.0, abs=1e-9)
+
+    def test_relief_breaks_coplanarity(self):
+        r = PL.coplanarity(RAISED_SQUARE)
+        assert r["coplanar"] is False and r["planarity_rms_m"] > PL.COPLANAR_RMS_M
+
+    def test_two_vectors_are_read_as_ground_level(self):
+        assert PL.coplanarity(SQUARE)["vertical_spread_m"] == 0.0
+
+
+class TestDop3:
+    def test_does_not_depend_on_which_node_is_called_first(self):
+        base = PL.dop3(TOWER, (30.0, 20.0, 10.0))["vdop"]
+        for k in range(1, len(TOWER)):
+            rot = TOWER[k:] + TOWER[:k]
+            assert PL.dop3(rot, (30.0, 20.0, 10.0))["vdop"] == pytest.approx(base, rel=1e-9)
+        assert PL.dop3(list(reversed(TOWER)), (30.0, 20.0, 10.0))["vdop"] \
+            == pytest.approx(base, rel=1e-9)
+
+    def test_a_coplanar_layout_is_singular_in_the_vertical_while_2d_dop_is_fine(self):
+        """The whole point of a separate dop3: the 2D Fisher matrix of this layout is perfectly
+        well conditioned and says nothing about height."""
+        r = PL.dop3(FLAT_SQUARE_3D, (50.0, 50.0, 0.0))
+        assert r["singular"] is True and r["vdop"] == float("inf")
+        assert math.isfinite(PL.dop(FLAT_SQUARE_3D, (50.0, 50.0))["dop"])
+
+    def test_dof_counts_three_unknowns_not_two(self):
+        n = len(TOWER)
+        assert PL.dop3(TOWER, (30.0, 20.0, 10.0))["dof"] == (n - 1) - 3
+        assert PL.dop(TOWER, (30.0, 20.0))["dof"] == (n - 1) - 2
+
+    def test_four_nodes_are_the_floor(self):
+        with pytest.raises(ValueError, match="4 nodes"):
+            PL.dop3(FLAT_SQUARE_3D[:3], (50.0, 50.0, 10.0))
+
+
+class TestNodeCounts:
+    """t0 cancels in TDoA, so N nodes give N-1 equations. Breaks if anyone 'simplifies' the
+    table to unknowns+1, which would call an exactly-determined fit self-checking."""
+
+    def test_the_table(self):
+        assert PL.node_counts("trajectory", 3) == \
+            {"model": "trajectory", "dims": 3, "unknowns": 4, "exact_n": 5, "meaningful_n": 6}
+        assert PL.node_counts("point", 3) == \
+            {"model": "point", "dims": 3, "unknowns": 3, "exact_n": 4, "meaningful_n": 5}
+        for m in ("trajectory", "point"):
+            assert PL.node_counts(m, 2) == \
+                {"model": m, "dims": 2, "unknowns": 2, "exact_n": 3, "meaningful_n": 4}
+
+    def test_an_unknown_model_is_refused_not_guessed(self):
+        with pytest.raises(ValueError):
+            PL.node_counts("banana", 2)
+        with pytest.raises(ValueError):
+            PL.node_counts("point", 4)
+
+
+class TestLinearity:
+    """hear/backend/survey.py and hear/solve/point.py import this and compare it against
+    COLLINEAR_LINEARITY. Pin an exact value so the formula cannot drift under them."""
+
+    def test_a_rectangle_reports_its_aspect_ratio(self):
+        assert PL.linearity([(0.0, 0.0), (100.0, 0.0), (100.0, 20.0), (0.0, 20.0)]) \
+            == pytest.approx(0.2, abs=1e-12)
+
+    def test_a_square_is_isotropic_and_a_line_is_not(self):
+        assert PL.linearity(SQUARE) > 0.5
+        line = [(0.0, 0.0), (50.0, 0.0), (100.0, 0.0), (150.0, 0.0)]
+        assert PL.linearity(line) == pytest.approx(0.0, abs=1e-12)
+        assert PL.linearity(line) < PL.COLLINEAR_LINEARITY
+        assert PL.dop(line, (75.0, 0.0))["singular"] is True
+
+    def test_height_does_not_enter_it(self):
+        """It is a HORIZONTAL measure -- the 2D solvers are what it advises."""
+        assert PL.linearity(RAISED_SQUARE) == pytest.approx(PL.linearity(SQUARE), rel=1e-12)
+
+    def test_three_nodes_are_the_floor(self):
+        with pytest.raises(ValueError, match="3 nodes"):
+            PL.linearity(SQUARE[:2])
+
+
+class TestPlan3d:
+    def test_reports_dop3_only_when_there_are_enough_nodes(self):
+        assert PL.plan_3d(FLAT_SQUARE_3D[:3])["dop3"] is None
+        assert PL.plan_3d(TOWER)["dop3"] is not None
+
+    def test_a_flat_site_is_told_it_cannot_do_3d_and_what_3d_would_cost(self):
+        p = PL.plan_3d(FLAT_SQUARE_3D)
+        assert p["vertical"]["observable"] is False
+        assert p["counts"]["trajectory_3d"]["meaningful_n"] == 6
+        assert p["n_nodes"] == 4
+
+
+class TestParsePoints:
+    def test_arity_is_preserved_and_never_mixed(self):
+        """np.asarray on a ragged list builds an object array and every downstream slice then
+        lies about the geometry. Refused at the parse instead."""
+        assert PL._parse_points("0,0,0;10,0,0") == [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0)]
+        assert PL._parse_points("0,0;10,0") == [(0.0, 0.0), (10.0, 0.0)]
+        with pytest.raises(ValueError, match="mixed 2D and 3D"):
+            PL._parse_points("0,0;10,0,5")
+
+
+def test_cli_prints_the_vertical_block_for_3d_nodes(capsys):
+    assert PL.main(["--nodes", "0,0,0;100,0,0;100,100,0;0,100,30", "--step", "40"]) == 0
+    out = capsys.readouterr().out
+    assert "median DOP" in out, "the 2D block must survive untouched"
+    assert "vertical spread" in out and "VDOP" in out and "3D costs" in out

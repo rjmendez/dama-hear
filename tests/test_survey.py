@@ -1,0 +1,188 @@
+"""Node survey: what it loads, and the eleven things it refuses to load."""
+import json
+import math
+import os
+import sys
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hear.backend import survey as SV       # noqa: E402
+from hear.solve import placement as PL      # noqa: E402
+
+SQUARE = [(1, 0.0, 0.0, 0.0), (2, 100.0, 0.0, 0.0), (3, 100.0, 100.0, 0.0), (4, 0.0, 100.0, 0.0)]
+LINE = [(1, 0.0, 0.0, 0.0), (2, 50.0, 0.0, 0.0), (3, 100.0, 0.0, 0.0), (4, 150.0, 0.0, 0.0)]
+
+
+def doc(rows, **over):
+    d = {"frame": "enu_local", "units": "m",
+         "nodes": [{"node_id": i, "e_m": e, "n_m": n, "u_m": u} for i, e, n, u in rows]}
+    d.update(over)
+    return d
+
+
+class TestOrdering:
+    def test_ids_sort_but_positions_keep_the_order_asked_for(self):
+        """The backend aligns arrivals to node_ids positionally. A method that quietly sorted its
+        rows would mislabel every arrival in the array and no residual would show it."""
+        sv = SV.from_dict(doc([SQUARE[2], SQUARE[0], SQUARE[3], SQUARE[1]]))
+        assert sv.ids == [1, 2, 3, 4]
+        P = sv.positions([3, 1, 2])
+        assert P.shape == (3, 3)
+        assert [float(r[0]) for r in P] == [100.0, 0.0, 100.0]
+        assert [float(r[1]) for r in P] == [100.0, 0.0, 0.0]
+
+    def test_position_is_three_float64_metres_of_east_north_up(self):
+        sv = SV.from_dict(doc([(1, 3.0, -4.0, 5.0), (2, 100.0, 0.0, 0.0), (3, 0.0, 100.0, 0.0)]))
+        p = sv.position(1)
+        assert p.shape == (3,) and p.dtype == np.float64
+        assert list(p) == [3.0, -4.0, 5.0]
+        assert 1 in sv and 99 not in sv and len(sv) == 3
+
+    def test_projecting_to_2d_drops_up_and_only_up(self):
+        rows = [(1, 0.0, 0.0, 7.0), (2, 100.0, 0.0, -3.0), (3, 50.0, 80.0, 12.0)]
+        sv = SV.from_dict(doc(rows))
+        ids = [3, 1, 2]
+        assert np.allclose(sv.positions_2d(ids), sv.positions(ids)[:, :2])
+        assert sv.positions_2d(ids).shape == (3, 2)
+        assert float(np.abs(sv.positions(ids)[:, 2]).max()) > 0.0, "the fixture must have relief"
+
+    def test_an_unsurveyed_node_has_no_position(self):
+        sv = SV.from_dict(doc(SQUARE))
+        with pytest.raises(SV.SurveyError, match="77"):
+            sv.position(77)
+
+
+class TestRefusals:
+    def test_wrong_frame_or_units_are_refused(self):
+        """The file that is silently in the wrong frame is the failure this module exists for:
+        lat/lon read as metres puts every node ~100 km from where it is, at no residual."""
+        with pytest.raises(SV.SurveyError, match="frame"):
+            SV.from_dict(doc(SQUARE, frame="wgs84"))
+        with pytest.raises(SV.SurveyError, match="units"):
+            SV.from_dict(doc(SQUARE, units="ft"))
+
+    def test_duplicate_node_id_is_refused_and_named(self):
+        d = doc(SQUARE)
+        d["nodes"][3]["node_id"] = 2
+        with pytest.raises(SV.SurveyError, match=r"duplicate node_id 2\b"):
+            SV.from_dict(d)
+
+    def test_a_missing_coordinate_is_refused_not_zeroed(self):
+        """Same reason telemetry.pack sends a sentinel (hear/node/telemetry.py:55-58): a node
+        defaulted to up=0 looks exactly like a node that was surveyed at ground level."""
+        d = doc([(1, 0.0, 0.0, 4.0), (2, 100.0, 0.0, 0.0), (3, 0.0, 100.0, 0.0)])
+        del d["nodes"][0]["u_m"]
+        with pytest.raises(SV.SurveyError, match="node 1 has no u_m"):
+            SV.from_dict(d)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+    def test_non_finite_coordinates_are_refused(self, bad):
+        d = doc(SQUARE)
+        d["nodes"][1]["n_m"] = bad
+        with pytest.raises(SV.SurveyError, match="non-finite"):
+            SV.from_dict(d)
+
+    def test_a_non_numeric_coordinate_is_refused(self):
+        d = doc(SQUARE)
+        d["nodes"][1]["e_m"] = "100.0"
+        with pytest.raises(SV.SurveyError, match="not a number"):
+            SV.from_dict(d)
+
+    def test_two_entries_five_centimetres_apart_are_one_node(self):
+        d = doc(SQUARE)
+        d["nodes"][2]["e_m"] = 100.05
+        d["nodes"][2]["n_m"] = 0.0
+        with pytest.raises(SV.SurveyError, match=r"nodes 2 and 3 are 0\.050 m apart"):
+            SV.from_dict(d)
+
+    @pytest.mark.parametrize("bad", [70000, -1, True, 1.0, "1", None])
+    def test_a_node_id_the_wire_cannot_carry_is_refused(self, bad):
+        """node_id is a uint16 on the v2 frame. An id outside that range can be surveyed but can
+        never arrive, so the survey is the last place it can be caught."""
+        d = doc(SQUARE)
+        d["nodes"][1]["node_id"] = bad
+        with pytest.raises(SV.SurveyError, match="node_id"):
+            SV.from_dict(d)
+
+    def test_min_nodes_names_both_counts(self):
+        with pytest.raises(SV.SurveyError, match=r"has 3 nodes, solver needs 4"):
+            SV.from_dict(doc(SQUARE[:3]), min_nodes=4)
+
+    def test_an_empty_node_list_is_refused(self):
+        with pytest.raises(SV.SurveyError, match="0 nodes"):
+            SV.from_dict(doc([]))
+
+    def test_collinear_is_refused_and_placement_agrees_it_is_singular(self):
+        """Cross-module: survey's refusal and placement.dop's singularity must fire on the SAME
+        layout. If these two ever disagree, MIN_LINEARITY has drifted away from the geometry it
+        stands in for. The probe sits ON the node line, which is where dop actually goes infinite;
+        off it a collinear array still has a mirror twin dop cannot see, which is the other half
+        of why this is a refusal and not a verdict."""
+        with pytest.raises(SV.SurveyError, match="collinear"):
+            SV.from_dict(doc(LINE))
+        assert PL.dop([(e, n) for _, e, n, _ in LINE], (75.0, 0.0))["singular"] is True
+
+        bent = list(LINE)
+        bent[2] = (3, 100.0, 20.0, 0.0)
+        sv = SV.from_dict(doc(bent))
+        assert sv.linearity() >= SV.MIN_LINEARITY
+        assert math.isfinite(PL.dop(sv.positions_2d(sv.ids), (75.0, 0.0))["dop"])
+
+    def test_min_linearity_is_placements_number_not_a_second_copy(self):
+        assert SV.MIN_LINEARITY is PL.COLLINEAR_LINEARITY
+
+
+class TestGeometry:
+    RELIEF = [(1, 0.0, 0.0, 0.0), (2, 100.0, 0.0, 0.0), (3, 100.0, 100.0, 0.0),
+              (4, 0.0, 100.0, 30.0)]
+
+    def test_diameter_is_the_3d_distance_not_the_horizontal_one(self):
+        """associate turns this into its window bound. Computed horizontally it would be 4 m of
+        propagation short on this layout, and the window would be too tight by that much."""
+        sv = SV.from_dict(doc(self.RELIEF))
+        assert sv.diameter_m() == pytest.approx(math.sqrt(100.0 ** 2 + 100.0 ** 2 + 30.0 ** 2),
+                                                abs=1e-9)      # exact arithmetic, no fit involved
+        assert sv.diameter_m() > math.sqrt(2) * 100.0
+
+    def test_flat_survey_passes_the_2d_assumption_and_a_hilly_one_costs_its_relief(self):
+        flat = SV.from_dict(doc(SQUARE)).validate_2d_assumption()
+        assert flat["ok"] is True and flat["note"] is None
+        assert flat["vertical_spread_m"] == pytest.approx(0.0, abs=1e-9)
+
+        hilly = SV.from_dict(doc(self.RELIEF)).validate_2d_assumption()
+        assert hilly["ok"] is False
+        assert hilly["vertical_spread_m"] == pytest.approx(30.0, abs=1e-9)
+        assert "30.0" in hilly["note"]
+
+    def test_linearity_matches_placement_on_the_same_nodes(self):
+        sv = SV.from_dict(doc(SQUARE))
+        assert sv.linearity() == PL.linearity(sv.positions(sv.ids))
+        assert sv.linearity() > 0.5, "a square is nowhere near a line"
+
+
+class TestFile:
+    def test_load_survey_round_trips_through_to_dict(self, tmp_path):
+        d = doc(TestGeometry.RELIEF, origin={"lat_deg": 34.0, "lon_deg": -118.0, "alt_m": 120.0})
+        d["nodes"][0]["name"] = "rear"
+        d["nodes"][0]["sigma_m"] = 0.05
+        p = tmp_path / "survey.json"
+        p.write_text(json.dumps(d))
+
+        sv = SV.load_survey(str(p))
+        assert sv.names[1] == "rear" and sv.sigma_m[1] == 0.05
+        assert sv.names[2] == "" and sv.sigma_m[2] == 0.0
+        assert sv.origin == {"lat_deg": 34.0, "lon_deg": -118.0, "alt_m": 120.0}
+
+        again = SV.from_dict(sv.to_dict())
+        assert again.ids == sv.ids
+        assert np.allclose(again.positions(again.ids), sv.positions(sv.ids))
+        assert again.origin == sv.origin
+
+    def test_origin_is_carried_and_never_applied_to_the_coordinates(self):
+        """Metadata only. If anyone wires geodesy in here, these coordinates would move."""
+        d = doc(SQUARE, origin={"lat_deg": 34.0, "lon_deg": -118.0, "alt_m": 120.0})
+        sv = SV.from_dict(d)
+        assert list(sv.position(1)) == [0.0, 0.0, 0.0]
+        assert sv.diameter_m() == pytest.approx(math.sqrt(2) * 100.0, abs=1e-9)

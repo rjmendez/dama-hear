@@ -107,3 +107,39 @@ class TestResidualHonesty:
     def test_too_few_nodes_is_refused(self):
         with pytest.raises(ValueError, match="3 nodes"):
             SW.solve([(0, 0), (10, 10)], [0.0, 0.1], v_mps=V, temp_c=T)
+
+
+class TestShockCoefficientIsPhysical:
+    """The Mach-cone coefficient was wrong for a long time and the suite could not see it, because
+    solve() reuses the same k as shock_time() and a round-trip agrees with itself however wrong the
+    constant is. These check it against physics instead of against itself."""
+
+    V, M = 900.0, 100.0
+
+    def _brute(self, v, c, m, a=0.0):
+        """Arrival minimised over the emission point, from first principles: the bullet reaches
+        along-track x at x/v, sound then covers the hypotenuse. No shared algebra with the module."""
+        x = np.linspace(-3000.0, a, 3_000_001)
+        return float(np.min(x / v + np.sqrt((a - x) ** 2 + m * m) / c))
+
+    def test_matches_a_brute_force_minimisation_over_the_emission_point(self):
+        c = SW.sound_speed(23.0)
+        got = SW.shock_time((0.0, self.M), math.radians(90.0), 0.0, self.V, c)
+        assert got == pytest.approx(self._brute(self.V, c, self.M), abs=2e-5)
+
+    def test_a_shock_cannot_arrive_later_than_plain_sound(self):
+        """The bound that would have caught it on day one. The old coefficient put a 100 m miss at
+        0.4876 s against 0.2897 s for sound over the same distance -- a front doing 205 m/s."""
+        c = SW.sound_speed(23.0)
+        for m in (1.0, 10.0, 100.0, 300.0):
+            t = SW.shock_time((0.0, m), math.radians(90.0), 0.0, self.V, c)
+            assert t < m / c, "miss %.0f m: shock %.4f s vs sound %.4f s" % (m, t, m / c)
+
+    def test_arrival_is_bounded_by_the_mach_cone_geometry(self):
+        """t = a/V + m*sqrt(V^2-c^2)/(V*c), so the miss term must scale linearly in m and its slope
+        must be 1/(V*tan(theta)) for cone half-angle theta = asin(c/V)."""
+        c = SW.sound_speed(23.0)
+        t1 = SW.shock_time((0.0, 50.0), math.radians(90.0), 0.0, self.V, c)
+        t2 = SW.shock_time((0.0, 150.0), math.radians(90.0), 0.0, self.V, c)
+        theta = math.asin(c / self.V)
+        assert (t2 - t1) / 100.0 == pytest.approx(1.0 / (self.V * math.tan(theta)), rel=1e-9)
