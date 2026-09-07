@@ -76,6 +76,8 @@ static void IRAM_ATTR pps_isr() {
 }
 
 // ---------------------------------------------------------------- GPS (minimal NMEA)
+static volatile uint32_t gps_tacc_ns = 0, ubx_pvt = 0, ubx_timtp = 0, ubx_nak = 0, ubx_ack = 0;
+static volatile int32_t  gps_qerr_ps = 0;
 static char nmea[100]; static int nmea_i = 0;
 static volatile int gps_fix = 0, gps_sats = 0;
 static char gps_utc[16] = "--:--:--";
@@ -84,6 +86,7 @@ static uint32_t gps_sentences = 0;
 static void nmea_line(const char *s) {
   gps_sentences++;
   // $xxGGA,hhmmss.ss,lat,N,lon,E,fix,sats,...
+  if (ubx_pvt) return;                          // UBX is authoritative once it arrives
   if (!(s[0] == '$' && s[3] == 'G' && s[4] == 'G' && s[5] == 'A')) return;
   int f = 0; const char *p = s; char tm[12] = {0};
   while (*p && f < 8) {
@@ -97,6 +100,90 @@ static void nmea_line(const char *s) {
   }
   if (strlen(tm) >= 6)
     snprintf(gps_utc, sizeof gps_utc, "%c%c:%c%c:%c%c", tm[0], tm[1], tm[2], tm[3], tm[4], tm[5]);
+}
+
+
+// ---------------------------------------------------------------- u-blox UBX
+// Key IDs and message layouts taken from u-blox M10 SPG 5.10 Interface Description UBX-21035062,
+// not from memory. The top nibble of a key encodes its size: 0x1=1 bit, 0x2=1 B, 0x4=4 B.
+#define K_TP1_ENA        0x10050007UL   // L
+#define K_SYNC_GNSS_TP1  0x10050008UL   // L  set: sync to GNSS when valid, else local clock
+#define K_USE_LOCKED_TP1 0x10050009UL   // L  set: *_LOCK_* apply once locked
+#define K_ALIGN_TOW_TP1  0x1005000aUL   // L
+#define K_POL_TP1        0x1005000bUL   // L  1 = rising edge at top of second
+#define K_PULSE_DEF      0x20050023UL   // E1 0 = period
+#define K_PULSE_LEN_DEF  0x20050030UL   // E1 1 = length (so LEN_* are used, not DUTY_*)
+#define K_PERIOD_TP1     0x40050002UL   // U4 us, unlocked
+#define K_PERIOD_LOCK    0x40050003UL   // U4 us, locked
+#define K_LEN_TP1        0x40050004UL   // U4 us, unlocked
+#define K_LEN_LOCK       0x40050005UL   // U4 us, locked
+#define K_MSG_NAV_PVT    0x20910007UL   // U1 rate on UART1
+#define K_MSG_TIM_TP     0x2091017eUL   // U1 rate on UART1
+
+static uint8_t ubx_buf[256];
+
+static void ubx_send(uint8_t cls, uint8_t id, const uint8_t *pl, uint16_t n) {
+  uint8_t h[6] = {0xB5, 0x62, cls, id, (uint8_t)(n & 0xFF), (uint8_t)(n >> 8)};
+  uint8_t a = 0, b = 0;
+  for (int i = 2; i < 6; i++) { a += h[i]; b += a; }
+  for (uint16_t i = 0; i < n; i++) { a += pl[i]; b += a; }
+  Serial1.write(h, 6); if (n) Serial1.write(pl, n);
+  uint8_t ck[2] = {a, b}; Serial1.write(ck, 2);
+}
+
+static uint16_t vs_i;
+static void vs_begin() { vs_i = 0; ubx_buf[vs_i++] = 0; ubx_buf[vs_i++] = 0x01;   // version 0, RAM layer
+                         ubx_buf[vs_i++] = 0; ubx_buf[vs_i++] = 0; }
+static void vs_add(uint32_t key, uint32_t val) {
+  int w = ((key >> 28) & 0x7) == 4 ? 4 : 1;                 // 0x4... is U4, everything used here is 1 B
+  for (int i = 0; i < 4; i++) ubx_buf[vs_i++] = (key >> (8 * i)) & 0xFF;
+  for (int i = 0; i < w; i++) ubx_buf[vs_i++] = (val >> (8 * i)) & 0xFF;
+}
+static void vs_send() { ubx_send(0x06, 0x8A, ubx_buf, vs_i); }
+
+// Applied at every boot into the RAM layer only -- the module's own flash is never written, so
+// nothing here is a permanent change to the operator's hardware. Power-cycle and it is stock.
+static void gps_configure() {
+  vs_begin();
+  vs_add(K_PULSE_DEF, 0); vs_add(K_PULSE_LEN_DEF, 1);
+  vs_add(K_PERIOD_TP1, 1000000); vs_add(K_PERIOD_LOCK, 1000000);   // 1 Hz locked AND unlocked
+  vs_add(K_LEN_TP1, 100000); vs_add(K_LEN_LOCK, 100000);           // 100 ms, visible on the LED
+  vs_add(K_TP1_ENA, 1); vs_add(K_USE_LOCKED_TP1, 1);
+  vs_add(K_ALIGN_TOW_TP1, 1); vs_add(K_POL_TP1, 1);
+  vs_add(K_SYNC_GNSS_TP1, 1);
+  vs_add(K_MSG_NAV_PVT, 1); vs_add(K_MSG_TIM_TP, 1);
+  vs_send();
+}
+
+// UBX receive: NAV-PVT for fix/sats/tAcc, TIM-TP for the pulse quantisation error.
+static uint8_t ux[128]; static int ux_n = 0, ux_state = 0; static uint16_t ux_len = 0;
+static uint8_t ux_cls, ux_id, ux_a, ux_b;
+
+static void ubx_msg() {
+  if (ux_cls == 0x01 && ux_id == 0x07 && ux_len >= 24) {          // NAV-PVT
+    gps_tacc_ns = (uint32_t)ux[12] | ((uint32_t)ux[13] << 8) | ((uint32_t)ux[14] << 16) | ((uint32_t)ux[15] << 24);
+    gps_fix = ux[20]; gps_sats = ux[23];
+    snprintf(gps_utc, sizeof gps_utc, "%02u:%02u:%02u", ux[8], ux[9], ux[10]);
+    ubx_pvt++;
+  } else if (ux_cls == 0x0D && ux_id == 0x01 && ux_len >= 16) {   // TIM-TP
+    gps_qerr_ps = (int32_t)((uint32_t)ux[8] | ((uint32_t)ux[9] << 8) | ((uint32_t)ux[10] << 16) | ((uint32_t)ux[11] << 24));
+    ubx_timtp++;
+  } else if (ux_cls == 0x05) { if (ux_id == 0x01) ubx_ack++; else ubx_nak++; }
+}
+
+static void ubx_feed(uint8_t c) {
+  switch (ux_state) {
+    case 0: if (c == 0xB5) ux_state = 1; break;
+    case 1: ux_state = (c == 0x62) ? 2 : 0; break;
+    case 2: ux_cls = c; ux_a = c; ux_b = c; ux_state = 3; break;
+    case 3: ux_id = c; ux_a += c; ux_b += ux_a; ux_state = 4; break;
+    case 4: ux_len = c; ux_a += c; ux_b += ux_a; ux_state = 5; break;
+    case 5: ux_len |= (uint16_t)c << 8; ux_a += c; ux_b += ux_a; ux_n = 0;
+            ux_state = (ux_len > sizeof(ux)) ? 0 : (ux_len ? 6 : 7); break;
+    case 6: ux[ux_n++] = c; ux_a += c; ux_b += ux_a; if (ux_n >= (int)ux_len) ux_state = 7; break;
+    case 7: ux_state = (c == ux_a) ? 8 : 0; break;
+    case 8: if (c == ux_b) ubx_msg(); ux_state = 0; break;
+  }
 }
 
 // ---------------------------------------------------------------- gate (as hear/node/detect.py)
@@ -136,13 +223,17 @@ static String status_json() {
   char b[1024];
   snprintf(b, sizeof b,
     "{\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
-    "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu},"
+    "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,"
+    "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s},"
     "\"pps\":{\"edges\":%lu,\"glitches\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,\"spread_us\":%ld},"
     "\"i2s\":{\"nominal_hz\":%d,\"measured_hz\":%.4f,\"ppm\":%.1f,\"samples\":%lu},"
     "\"audio\":{\"detections\":%lu,\"env_peak\":%.0f},\"sd\":%s}",
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
     gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences,
+    (unsigned long)gps_tacc_ns, (long)gps_qerr_ps, (unsigned long)ubx_pvt,
+    (unsigned long)ubx_timtp, (unsigned long)ubx_ack, (unsigned long)ubx_nak,
+    (ubx_ack ? "true" : "false"),
     (unsigned long)pps_count, (unsigned long)pps_glitch,
     (unsigned long)(pps_count > 1 ? pps_int_min : 0), (unsigned long)(pps_count > 1 ? pps_int_max : 0),
     (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0),
@@ -163,7 +254,7 @@ static void h_root() {
              "const f=s.i2s.measured_hz?s.i2s.measured_hz.toFixed(4)+' Hz ('+s.i2s.ppm.toFixed(1)+' ppm)':'waiting for 3 PPS edges';"
              "document.getElementById('t').innerHTML="
              "`<tr><td>uptime<td><b>${s.uptime_s} s</b>`+"
-             "`<tr><td>GPS<td><b>fix ${s.gps.fix}, ${s.gps.sats} sats, ${s.gps.utc} UTC</b> (${s.gps.sentences} sentences)`+"
+             "`<tr><td>GPS<td><b>fix ${s.gps.fix}, ${s.gps.sats} sats, ${s.gps.utc} UTC</b>`+`<tr><td>time accuracy<td><b>${s.gps.tacc_ns} ns</b> &middot; pulse qErr ${s.gps.qerr_ps} ps`+`<tr><td>UBX<td>pvt ${s.gps.ubx_pvt}, tim-tp ${s.gps.ubx_timtp}, ack ${s.gps.ubx_ack}, nak ${s.gps.ubx_nak}`+`<tr><td>config<td><b>${s.gps.config_acked?'accepted':'NOT acked - node TX to module RX unwired?'}</b>`+"
              "`<tr><td>PPS edges<td><b>${s.pps.edges}</b> spread ${s.pps.spread_us} us, ${s.pps.glitches} rejected`+"
              "`<tr><td>I2S measured<td><b>${f}</b>`+"
              "`<tr><td>samples<td>${s.i2s.samples}`+"
@@ -220,6 +311,9 @@ void setup() {
   pinMode(PPS_PIN, INPUT_PULLDOWN);
   attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
   Serial1.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  delay(300);
+  gps_configure();
+  Serial.println("gps   UBX config sent (TP1 1 Hz locked+unlocked, NAV-PVT, TIM-TP; RAM layer)");
 
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
   sd_ok = SD.begin(21, SPI, 20000000) || SD.begin(3, SPI, 20000000);
@@ -242,6 +336,7 @@ void loop() {
 
   while (Serial1.available()) {
     char c = Serial1.read();
+    ubx_feed((uint8_t)c);                       // UBX and NMEA share the port; parse both
     if (c == '\n' || nmea_i >= (int)sizeof(nmea) - 1) { nmea[nmea_i] = 0; if (nmea_i > 6) nmea_line(nmea); nmea_i = 0; }
     else if (c != '\r') nmea[nmea_i++] = c;
   }
@@ -267,6 +362,18 @@ void loop() {
   }
   g_samples += n;
 
+  // The module ACKs or NAKs a VALSET. Silence means nothing reached it -- almost always the
+  // node->GPS TX wire, since NMEA arriving proves only the other direction. Retry, then say which.
+  static uint32_t cfg_try = 0, cfg_at = 0;
+  if (!ubx_ack && !ubx_nak && cfg_try < 6 && millis() - cfg_at > 5000) {
+    cfg_at = millis();
+    if (cfg_try) gps_configure();
+    cfg_try++;
+    if (cfg_try == 6)
+      Serial.println("gps   no ACK/NAK after 6 tries -- node TX (D6/GPIO43) -> module RX is not "
+                     "connected. Running the module's stock config; PPS will appear only on fix.");
+  }
+
   if (sta_ok && WiFi.status() != WL_CONNECTED) {     // AP blipped; an overnight node reconnects
     static uint32_t retry = 0;
     if (millis() - retry > 15000) { retry = millis(); WiFi.reconnect(); }
@@ -277,10 +384,10 @@ void loop() {
     last = millis();
     double fs = measured_fs();
     uint32_t up = (millis() - boot_ms) / 1000;
-    Serial.printf("[%6lus] fix %d/%d sats  pps %lu (%lu bad)  fs %.3f Hz (%+.1f ppm)  dets %lu\n",
-                  (unsigned long)up, gps_fix, gps_sats, (unsigned long)pps_count,
-                  (unsigned long)pps_glitch, fs, fs > 0 ? (fs / FS_NOMINAL - 1.0) * 1e6 : 0.0,
-                  (unsigned long)det_n);
+    Serial.printf("[%6lus] fix %d/%d sats  tAcc %lu ns  qErr %ld ps  pps %lu (%lu bad)  fs %.3f Hz (%+.1f ppm)  dets %lu\n",
+                  (unsigned long)up, gps_fix, gps_sats, (unsigned long)gps_tacc_ns, (long)gps_qerr_ps,
+                  (unsigned long)pps_count, (unsigned long)pps_glitch, fs,
+                  fs > 0 ? (fs / FS_NOMINAL - 1.0) * 1e6 : 0.0, (unsigned long)det_n);
     if (sd_ok) {   // the radio is a convenience; the card is the record
       File f = SD.open("/night.csv", FILE_APPEND);
       if (f) {
