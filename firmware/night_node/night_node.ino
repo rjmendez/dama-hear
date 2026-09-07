@@ -505,6 +505,20 @@ static void gps_valget() {           // ask the module what TP1 is actually set 
   ubx_send(0x06, 0x8B, ubx_buf, vs_i);
 }
 
+// Change ONLY the pulse length, live, without disturbing anything else. For finding the timepulse
+// on a bench: a 100 ms pulse in 1000 ms is a 10% duty that a multimeter averages to ~0.33 V and
+// that is easy to miss, whereas 500 ms is a square wave reading ~1.65 V -- unmistakably different
+// from both a 0 V ground and a 3.3 V rail, with no scope needed.
+//
+// RAM layer only, like every other write here, so a power cycle restores the shipped 100 ms even
+// if nobody remembers to. That is the safety property that makes this endpoint reasonable to
+// expose at all.
+static void gps_set_pulse_len(uint32_t us) {
+  vs_begin();
+  vs_add(K_LEN_TP1, us); vs_add(K_LEN_LOCK, us);
+  vs_send();
+}
+
 static void gps_configure() {
   vs_begin();
   vs_add(K_PULSE_DEF, 0); vs_add(K_PULSE_LEN_DEF, 1);
@@ -1962,6 +1976,77 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
     (void)watching;
     http.send(200, "text/plain", o);
+  });
+  http.on("/ppsv", []() {
+    // digitalRead answers "is this above the logic threshold", which is the wrong question when a
+    // tap reads a flat 100% high. GPIO1 is ADC1_CH0, so ask for the VOLTAGE instead. The two
+    // candidate faults look identical to a digital read and completely different to this one:
+    //   flat ~3.3 V            -> a supply rail. The wire has to move; nothing here can help.
+    //   swinging, low ~1-2 V   -> the LED/resistor midpoint. The signal IS present, but its low
+    //                             level never gets under the ~0.25*VDD input-low threshold, so no
+    //                             edge is ever seen. Also fixable only by moving the wire, but to
+    //                             a different place: the module's own timepulse pad, where the
+    //                             swing is rail to rail.
+    // Worth the distinction: one of those means "you are on the wrong net", the other means "you
+    // are on the right net at the wrong point", and they send you to different places on the board.
+    detachInterrupt(digitalPinToInterrupt(PPS_PIN));
+    analogSetPinAttenuation(PPS_PIN, ADC_11db);          // full ~0-3.3 V range
+    uint32_t n = 0, lo = 4095, hi = 0; uint64_t sum = 0;
+    uint32_t t0 = millis();
+    while (millis() - t0 < 2500) {
+      uint32_t v = analogRead(PPS_PIN);
+      if (v < lo) lo = v; if (v > hi) hi = v;
+      sum += v; n++;
+    }
+    pinMode(PPS_PIN, INPUT_PULLDOWN);
+    attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
+    double mv = 3300.0 / 4095.0;
+    double vlo = lo * mv / 1000.0, vhi = hi * mv / 1000.0, vavg = (double)sum / n * mv / 1000.0;
+    char b[640];
+    snprintf(b, sizeof b,
+      "pin D0/GPIO%d sampled as an ANALOGUE input over 2.5 s (%lu samples)\n"
+      "  min   %.2f V\n  max   %.2f V\n  mean  %.2f V\n  swing %.2f V\n\n%s\n",
+      PPS_PIN, (unsigned long)n, vlo, vhi, vavg, vhi - vlo,
+      (vhi - vlo) < 0.25
+        ? "FLAT. This is a supply rail, not a signal -- the wire is on the wrong net. Move it to\n"
+          "the module's timepulse pad."
+      : vlo > 0.8
+        ? "SWINGING, but the low level never reaches the input-low threshold (~0.83 V), which is\n"
+          "why digitalRead sees a constant high and no edge ever fires. You are on the right net\n"
+          "at the wrong point -- almost certainly across the LED. Move to the module's timepulse\n"
+          "pad for a rail-to-rail swing."
+        : "SWINGING rail to rail. If /pps still shows no edges the fault is elsewhere, which would\n"
+          "be a surprise.");
+    http.send(200, "text/plain", b);
+  });
+  http.on("/tplen", HTTP_POST, []() {
+    // POST, not GET: this changes hardware state, and /reboot is POST for the same reason.
+    if (!http.hasArg("ms")) {
+      http.send(400, "text/plain",
+                "POST /tplen?ms=<10..900>   set the timepulse length, RAM layer\n"
+                "POST /tplen?ms=100         back to the shipped value\n\n"
+                "500 ms is a square wave: a meter reads ~1.65 V on the switched leg against 3.3 V\n"
+                "on the supply leg, which tells the two apart without a scope. RAM only, so a\n"
+                "power cycle restores 100 ms regardless.\n");
+      return;
+    }
+    long ms = http.arg("ms").toInt();
+    // Bounded well inside the 1 s period: a length at or past the period is not a pulse, and a
+    // module asked for one can stop toggling altogether -- which would look exactly like the
+    // fault being chased.
+    if (ms < 10 || ms > 900) { http.send(400, "text/plain", "ms must be 10..900\n"); return; }
+    gps_set_pulse_len((uint32_t)ms * 1000UL);
+    strcpy(tp_readback, "(no response)");
+    uint32_t t0 = millis();
+    while (millis() - t0 < 600) { while (Serial1.available()) ubx_feed((uint8_t)Serial1.read()); }
+    gps_valget();
+    t0 = millis();
+    while (millis() - t0 < 600) { while (Serial1.available()) ubx_feed((uint8_t)Serial1.read()); }
+    char b[320];
+    snprintf(b, sizeof b, "asked for %ld ms\nmodule now reports: %s\n\n"
+                          "check the pin with: curl http://%s.local/pps\n",
+             ms, tp_readback, node_id);
+    http.send(200, "text/plain", b);
   });
   http.on("/tp", []() {
     strcpy(tp_readback, "(no response)");
