@@ -841,26 +841,39 @@ void setup() {
     }
   });
   http.on("/pins", []() {          // the compiled-in map, so it can be checked rather than trusted
-    char b[640];
-    snprintf(b, sizeof b,
-      "pad   GPIO  assignment\n"
-      "D0    1     free (I2S BCLK when the external mic lands)\n"
-      "D1    2     free (I2S WS)\n"
-      "D2    3     microSD CS%s\n"
-      "D3    4     free (I2S DIN)\n"
-      "D4    %d     I2C SDA  (IST8310 0x0E, BMP280 0x76)\n"
-      "D5    %d     I2C SCL\n"
-      "D6    %d    GPS TX -> module RX\n"
-      "D7    %d    GPS RX <- module TX  (230400 baud, UBX)\n"
-      "D8    %d     microSD SCK\n"
-      "D9    %d     microSD MISO\n"
-      "D10   %d     microSD MOSI\n"
-      "D11   %d    GPS PPS in  <-- this build\n"
-      "D12   41    free (was PDM mic DATA; mic disabled)\n",
-      sd_cs == 21 ? " (mounted on GPIO21, NOT GPIO3 -- expansion board wiring)" :
-      sd_cs == 3 ? " (mounted on GPIO3)" : " (no card)",
-      I2C_SDA, I2C_SCL, GPS_TX, GPS_RX, SD_SCK, SD_MISO, SD_MOSI, PPS_PIN);
-    http.send(200, "text/plain", b);
+    // Every row is DERIVED from the pin #defines and the runtime SD chip-select. This table used
+    // to be a literal, and it went stale the moment a pin moved -- naming pad D11 for GPIO1, and
+    // still calling the mic "disabled" long after it came back. A map that names the wrong pad is
+    // worse than no map, because it is the thing you check the wiring against.
+    static const struct { const char *pad; int gpio; } PADS[] = {
+      {"D0", 1}, {"D1", 2}, {"D2", 3}, {"D3", 4}, {"D4", 5}, {"D5", 6}, {"D6", 43},
+      {"D7", 44}, {"D8", 7}, {"D9", 8}, {"D10", 9}, {"D11", 42}, {"D12", 41},
+    };
+    String out = "pad   GPIO  assignment\n";
+    for (auto &e : PADS) {
+      const char *role = "free";
+      if      (e.gpio == PPS_PIN) role = "GPS PPS in  <-- this build";
+      else if (e.gpio == I2C_SDA) role = "I2C SDA  (IST8310 0x0E, BMP280 0x76)";
+      else if (e.gpio == I2C_SCL) role = "I2C SCL";
+      else if (e.gpio == GPS_TX)  role = "GPS TX -> module RX";
+      else if (e.gpio == GPS_RX)  role = "GPS RX <- module TX  (230400 baud, UBX)";
+      else if (e.gpio == SD_SCK)  role = "microSD SCK   (driven output -- do not tap)";
+      else if (e.gpio == SD_MISO) role = "microSD MISO  (driven output -- do not tap)";
+      else if (e.gpio == SD_MOSI) role = "microSD MOSI  (driven output -- do not tap)";
+      else if (e.gpio == PDM_CLK) role = "PDM mic CLK   (driven output -- do not tap)";
+      else if (e.gpio == PDM_DIN) role = "PDM mic DATA";
+      else if (e.gpio == (int)sd_cs) role = "microSD CS";
+      char row[96];
+      snprintf(row, sizeof row, "%-5s %-5d %s\n", e.pad, e.gpio, role);
+      out += row;
+    }
+    // sd_cs is a runtime discovery, and on this expansion board it is NOT on a numbered pad.
+    char tail[128];
+    snprintf(tail, sizeof tail, "\nmicroSD CS is on GPIO%d%s\n", (int)sd_cs,
+             sd_cs == 21 ? " (expansion-board wiring, not the D2 pad the silkscreen implies)" : "");
+    out += tail;
+    out += "a pad marked 'free' is safe to tap. anything else is driven by this build.\n";
+    http.send(200, "text/plain", out);
   });
   http.on("/tp", []() {
     // Answers "did you measure it right?" without relying on my two assumptions: that the wire
