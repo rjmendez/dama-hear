@@ -36,11 +36,10 @@ static const char *WIFI_PASSES[] = {""};
 #define AP_SSID   "dama-hear-node"
 #define AP_PASS   "damahear"          // >=8 chars or the AP silently refuses to start
 
-#define PPS_PIN   1                   // D0
+#define PPS_PIN   42                  // D11 -- was the PDM mic CLK, an OUTPUT. The mic is disabled
+                                      // below; two push-pull drivers on one pin is not a config
 #define GPS_RX    44                  // D7  <- module TX
 #define GPS_TX    43                  // D6  -> module RX
-#define PDM_CLK   42
-#define PDM_DIN   41
 #define I2C_SDA 5                    // D4
 #define I2C_SCL 6                    // D5
 #define SD_SCK 7
@@ -296,8 +295,20 @@ static Det dets[MAXDET]; static volatile uint32_t det_n = 0;
 static I2SClass i2s;
 static WebServer http(80);
 static bool sd_ok = false, sta_ok = false;
+static int sd_cs = 0;
 static uint32_t boot_ms = 0;
 static float env_peak_seen = 0;
+
+// ppm error of the ESP32's own oscillator against GPS. esp_timer should advance exactly 1e6 us
+// between edges; whatever it actually does is the crystal error, and every I2S rate on this part
+// is derived from that same crystal. Works with no microphone attached.
+static double esp_clock_ppm(uint32_t *secs_out) {
+  if (pps_count < 3) return 0.0;
+  uint32_t n = pps_count - 1;                       // intervals between first and last edge
+  double us = (double)(pps_us_last - pps_us_first);
+  if (secs_out) *secs_out = n;
+  return (us / (double)n / 1e6 - 1.0) * 1e6;
+}
 
 static double measured_fs() {
   if (pps_count < 3) return 0.0;
@@ -315,7 +326,8 @@ static String status_json() {
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
     "\"pps\":{\"edges\":%lu,\"glitches\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,\"spread_us\":%ld},"
     "\"i2s\":{\"nominal_hz\":%d,\"measured_hz\":%.4f,\"ppm\":%.1f,\"samples\":%lu},"
-    "\"audio\":{\"detections\":%lu,\"env_peak\":%.0f},\"sd\":%s,\"i2c\":\"%s\"}",
+    "\"esp_clock\":{\"ppm_vs_gps\":%.3f,\"pps_intervals\":%lu},"
+    "\"audio\":{\"enabled\":false,\"note\":\"PDM mic off: GPIO42 is PPS in\"},\"sd\":%s,\"i2c\":\"%s\"}",
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
     gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences,
@@ -328,7 +340,8 @@ static String status_json() {
     (unsigned long)(pps_count > 1 ? pps_int_min : 0), (unsigned long)(pps_count > 1 ? pps_int_max : 0),
     (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0),
     FS_NOMINAL, fs, fs > 0 ? (fs / FS_NOMINAL - 1.0) * 1e6 : 0.0, (unsigned long)g_samples,
-    (unsigned long)det_n, env_peak_seen, sd_ok ? "true" : "false", i2c_found);
+    esp_clock_ppm(NULL), (unsigned long)(pps_count > 1 ? pps_count - 1 : 0),
+    sd_ok ? "true" : "false", i2c_found);
   return String(b);
 }
 
@@ -346,9 +359,9 @@ static void h_root() {
              "`<tr><td>uptime<td><b>${s.uptime_s} s</b>`+"
              "`<tr><td>GPS<td><b>fix ${s.gps.fix}, ${s.gps.sats} sats, ${s.gps.utc} UTC</b> @ ${s.gps.baud} baud, ${s.gps.valid_nmea} valid lines`+`<tr><td>time accuracy<td><b>${s.gps.tacc_ns} ns</b> &middot; pulse qErr ${s.gps.qerr_ps} ps`+`<tr><td>UBX<td>pvt ${s.gps.ubx_pvt}, tim-tp ${s.gps.ubx_timtp}, ack ${s.gps.ubx_ack}, nak ${s.gps.ubx_nak}`+`<tr><td>config<td><b>${s.gps.config_acked?'accepted':'NOT acked - node TX to module RX unwired?'}</b>`+"
              "`<tr><td>PPS edges<td><b>${s.pps.edges}</b> spread ${s.pps.spread_us} us, ${s.pps.glitches} rejected`+"
-             "`<tr><td>I2S measured<td><b>${f}</b>`+"
+             "`<tr><td>I2S measured<td><b>${f}</b>`+`<tr><td>ESP clock vs GPS<td><b>${s.esp_clock.pps_intervals>2?s.esp_clock.ppm_vs_gps.toFixed(3)+' ppm':'need 3 PPS edges'}</b> over ${s.esp_clock.pps_intervals} s`+"
              "`<tr><td>samples<td>${s.i2s.samples}`+"
-             "`<tr><td>detections<td><b>${s.audio.detections}</b> (env peak ${s.audio.env_peak})`+"
+             "`<tr><td>audio<td>${s.audio.note}`+"
              "`<tr><td>SD<td>${s.sd}`+`<tr><td>I2C<td>${s.i2c}`+`<tr><td>heap / psram<td>${s.heap} / ${s.psram}`;}"
              "u();setInterval(u,2000);</script>";
   http.send(200, "text/html", p);
@@ -469,15 +482,72 @@ void setup() {
   i2c_scan();
 
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
-  sd_ok = SD.begin(21, SPI, 20000000) || SD.begin(3, SPI, 20000000);
-  Serial.printf("sd    %s\n", sd_ok ? "mounted" : "no card");
+  sd_cs = 0;
+  if (SD.begin(21, SPI, 20000000)) { sd_ok = true; sd_cs = 21; }
+  else if (SD.begin(3, SPI, 20000000)) { sd_ok = true; sd_cs = 3; }
+  Serial.printf("sd    %s%s", sd_ok ? "mounted, CS=" : "no card", sd_ok ? "" : "\n");
+  if (sd_ok) Serial.printf("%d\n", sd_cs);
 
-  i2s.setPinsPdmRx(PDM_CLK, PDM_DIN);
-  if (!i2s.begin(I2S_MODE_PDM_RX, FS_NOMINAL, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO))
-    Serial.println("i2s   FAILED");
-  else Serial.printf("i2s   PDM %d Hz nominal\n", FS_NOMINAL);
+  // PDM mic DISABLED. Its CLK is GPIO42, which now carries PPS in from the module. Starting I2S
+  // would drive that pin against the GPS. The acoustic chain is already proven byte-exact against
+  // the Python (firmware/hear_poc); what this run needs is the edge.
+  Serial.println("i2s   PDM mic DISABLED -- GPIO42 reassigned to PPS input");
 
   http.on("/", h_root); http.on("/status", h_status); http.on("/detections", h_dets);
+  http.on("/pins", []() {          // the compiled-in map, so it can be checked rather than trusted
+    char b[640];
+    snprintf(b, sizeof b,
+      "pad   GPIO  assignment\n"
+      "D0    1     free (I2S BCLK when the external mic lands)\n"
+      "D1    2     free (I2S WS)\n"
+      "D2    3     microSD CS%s\n"
+      "D3    4     free (I2S DIN)\n"
+      "D4    %d     I2C SDA  (IST8310 0x0E, BMP280 0x76)\n"
+      "D5    %d     I2C SCL\n"
+      "D6    %d    GPS TX -> module RX\n"
+      "D7    %d    GPS RX <- module TX  (230400 baud, UBX)\n"
+      "D8    %d     microSD SCK\n"
+      "D9    %d     microSD MISO\n"
+      "D10   %d     microSD MOSI\n"
+      "D11   %d    GPS PPS in  <-- this build\n"
+      "D12   41    free (was PDM mic DATA; mic disabled)\n",
+      sd_cs == 21 ? " (mounted on GPIO21, NOT GPIO3 -- expansion board wiring)" :
+      sd_cs == 3 ? " (mounted on GPIO3)" : " (no card)",
+      I2C_SDA, I2C_SCL, GPS_TX, GPS_RX, SD_SCK, SD_MISO, SD_MOSI, PPS_PIN);
+    http.send(200, "text/plain", b);
+  });
+  http.on("/tp", []() {
+    // Answers "did you measure it right?" without relying on my two assumptions: that the wire
+    // landed on D0, and that a ~45k internal pulldown cannot drag down a weakly-coupled tap.
+    // Every free pin, all three pull modes. A 1 Hz / 100 ms pulse = ~2-3 edges and ~10% high.
+    static const int pins[] = {1, 2, 4};              // D0, D1, D3 -- the rest are in use
+    static const char *nm[] = {"D0/GPIO1", "D1/GPIO2", "D3/GPIO4"};
+    static const int modes[] = {INPUT_PULLDOWN, INPUT, INPUT_PULLUP};
+    static const char *mn[] = {"pulldown", "float   ", "pullup  "};
+    String o = "1 Hz / 100 ms pulse looks like ~2-3 edges and ~10% high.\n"
+               "thousands of edges = floating noise, not signal.\n\n";
+    bool watching = true;
+    detachInterrupt(digitalPinToInterrupt(PPS_PIN));
+    for (unsigned q = 0; q < 3; q++) {
+      o += String(nm[q]) + "\n";
+      for (unsigned m = 0; m < 3; m++) {
+        pinMode(pins[q], modes[m]); delay(30);
+        int high = 0, n = 0, edges = 0, last = digitalRead(pins[q]);
+        uint32_t t0 = millis();
+        while (millis() - t0 < 2500) { int v = digitalRead(pins[q]); if (v) high++; n++;
+                                       if (v != last) { edges++; last = v; } }
+        char b[96];
+        snprintf(b, sizeof b, "  %s  edges %6d   high %5.1f%%   %s\n", mn[m], edges,
+                 n ? 100.0 * high / n : 0.0,
+                 (edges >= 2 && edges <= 12) ? "<-- looks like 1 Hz" : (edges > 200 ? "noise" : ""));
+        o += b;
+      }
+    }
+    pinMode(PPS_PIN, INPUT_PULLDOWN);
+    attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
+    (void)watching;
+    http.send(200, "text/plain", o);
+  });
   http.on("/tp", []() {
     strcpy(tp_readback, "(no response)");
     gps_valget();
@@ -532,26 +602,6 @@ void loop() {
     else if (c != '\r') nmea[nmea_i++] = c;
   }
 
-  size_t got = i2s.readBytes((char *)blk, sizeof blk);
-  int n = got / 2;
-  for (int i = 0; i < n; i++) {
-    // gate() is stateful -- exactly one call per sample, or the envelope is fed samples that
-    // never existed. An earlier version called it twice on the not-detected path.
-    int fired = gate(blk[i]);
-    if (fired) {
-      uint32_t idx = det_n++;                       // count every detection; store the first MAXDET
-      if (idx < MAXDET) {
-        dets[idx].sample = g_samples + i;
-        dets[idx].pps_n = pps_count;
-        dets[idx].us_since_pps = (uint32_t)((uint64_t)esp_timer_get_time() - pps_us_last);
-        dets[idx].trigger = blk[i];
-        dets[idx].uptime_s = (millis() - boot_ms) / 1000;
-      }
-    }
-    float a = fabsf((float)blk[i]);
-    if (a > env_peak_seen) env_peak_seen = a;
-  }
-  g_samples += n;
 
   // The module ACKs or NAKs a VALSET. Silence means nothing reached it -- almost always the
   // node->GPS TX wire, since NMEA arriving proves only the other direction. Retry, then say which.
@@ -575,18 +625,19 @@ void loop() {
     last = millis();
     double fs = measured_fs();
     uint32_t up = (millis() - boot_ms) / 1000;
-    Serial.printf("[%6lus] fix %d/%d sats  tAcc %lu ns  qErr %ld ps  pps %lu (%lu bad)  fs %.3f Hz (%+.1f ppm)  dets %lu\n",
-                  (unsigned long)up, gps_fix, gps_sats, (unsigned long)gps_tacc_ns, (long)gps_qerr_ps,
-                  (unsigned long)pps_count, (unsigned long)pps_glitch, fs,
-                  fs > 0 ? (fs / FS_NOMINAL - 1.0) * 1e6 : 0.0, (unsigned long)det_n);
+    Serial.printf("[%6lus] fix %d/%d sats  tAcc %lu ns  pps %lu (%lu bad)  spread %ld us\n",
+                  (unsigned long)up, gps_fix, gps_sats, (unsigned long)gps_tacc_ns,
+                  (unsigned long)pps_count, (unsigned long)pps_glitch,
+                  (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0));
     if (sd_ok) {   // the radio is a convenience; the card is the record
       File f = SD.open("/night.csv", FILE_APPEND);
       if (f) {
-        if (f.size() == 0) f.println("uptime_s,fix,sats,utc,pps,pps_bad,samples,fs_hz,ppm,dets");
-        f.printf("%lu,%d,%d,%s,%lu,%lu,%lu,%.4f,%.2f,%lu\n", (unsigned long)up, gps_fix, gps_sats,
-                 gps_utc, (unsigned long)pps_count, (unsigned long)pps_glitch,
-                 (unsigned long)g_samples, fs, fs > 0 ? (fs / FS_NOMINAL - 1.0) * 1e6 : 0.0,
-                 (unsigned long)det_n);
+        if (f.size() == 0) f.println("uptime_s,fix,sats,utc,tacc_ns,pps,pps_bad,spread_us,esp_ppm,samples,fs_hz");
+        f.printf("%lu,%d,%d,%s,%lu,%lu,%lu,%ld,%.4f,%lu,%.4f\n", (unsigned long)up, gps_fix,
+                 gps_sats, gps_utc, (unsigned long)gps_tacc_ns, (unsigned long)pps_count,
+                 (unsigned long)pps_glitch,
+                 (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0),
+                 esp_clock_ppm(NULL), (unsigned long)g_samples, fs);
         f.close();
       }
     }

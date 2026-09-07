@@ -25,8 +25,16 @@ Leaves the onboard PDM mic in place, since the good mic has not arrived.
 |---|---|
 | D7 (GPIO44) | module TX |
 | D6 (GPIO43) | module RX |
-| **D0 (GPIO1)** | **PPS** |
+| **D11 (GPIO42)** | **PPS** |
+| D4 / D5 (GPIO5/6) | SDA / SCL — IST8310 + BMP280 |
 | 3V3, GND | VCC, GND |
+
+⚠️**D11 is the PDM microphone's CLK, an output.** This build disables the mic so nothing drives
+that pin against the module. Do not re-enable I2S PDM while PPS is wired here.
+
+`/pins` dumps the compiled-in map so it can be checked against the wiring rather than trusted.
+⚠️**microSD CS is GPIO21, not GPIO3.** The Seeed wiki says GPIO3; this board mounts on 21, which is
+not a castellated pad at all. That leaves D2/GPIO3 genuinely free — five spare pads, not four.
 
 Power the module at **3V3**, not 5V — the XIAO is 3.3 V logic.
 
@@ -70,6 +78,17 @@ second time on the not-detected path, feeding the envelope samples that never ex
 noise and data were indistinguishable; `valid_nmea` requires a `$` and a talker id, and told the
 truth immediately. Every pin now gets probed rather than assumed — a pulldown says whether anything
 is driving a line, which separates "not wired" from "wired but silent" without a meter.
+
+## Measuring the clock without a microphone
+
+With the mic off there are no samples to count, but PPS still disciplines the ESP32's own crystal,
+and every I2S rate on this part derives from it. `esp_clock.ppm_vs_gps` compares `esp_timer` against
+GPS seconds: **measured +10.23 ppm over 74 s**, with PPS spread 2 µs and zero glitches.
+
+That is the same class of error the 48000-vs-47619 trap belongs to, measured against an independent
+reference instead of a datasheet. Over a 300 ms capture window 10 ppm is 3 µs — small, but it is
+now a number rather than an assumption, and it is the floor the I2S rate will be measured against
+once the external mic lands.
 
 ## What a good night looks like
 
