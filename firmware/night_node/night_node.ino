@@ -1978,46 +1978,49 @@ void setup() {
     http.send(200, "text/plain", o);
   });
   http.on("/ppsv", []() {
-    // digitalRead answers "is this above the logic threshold", which is the wrong question when a
-    // tap reads a flat 100% high. GPIO1 is ADC1_CH0, so ask for the VOLTAGE instead. The two
-    // candidate faults look identical to a digital read and completely different to this one:
-    //   flat ~3.3 V            -> a supply rail. The wire has to move; nothing here can help.
-    //   swinging, low ~1-2 V   -> the LED/resistor midpoint. The signal IS present, but its low
-    //                             level never gets under the ~0.25*VDD input-low threshold, so no
-    //                             edge is ever seen. Also fixable only by moving the wire, but to
-    //                             a different place: the module's own timepulse pad, where the
-    //                             swing is rail to rail.
-    // Worth the distinction: one of those means "you are on the wrong net", the other means "you
-    // are on the right net at the wrong point", and they send you to different places on the board.
+    // Sweep the pull modes as well as reading the voltage, because the obvious way for THIS
+    // firmware to be the fault is for its own ~45k pulldown to be flattening a weak or
+    // high-impedance source -- in which case the signal is real and I am destroying it before
+    // measuring it. A source that can drive the pin against a pulldown will show the same swing
+    // in all three modes; one that cannot will show a swing with the pulldown off and none with
+    // it on, and that difference is the whole question.
     detachInterrupt(digitalPinToInterrupt(PPS_PIN));
-    analogSetPinAttenuation(PPS_PIN, ADC_11db);          // full ~0-3.3 V range
-    uint32_t n = 0, lo = 4095, hi = 0; uint64_t sum = 0;
-    uint32_t t0 = millis();
-    while (millis() - t0 < 2500) {
-      uint32_t v = analogRead(PPS_PIN);
-      if (v < lo) lo = v; if (v > hi) hi = v;
-      sum += v; n++;
+    analogSetPinAttenuation(PPS_PIN, ADC_11db);
+    String o = "pin D0/GPIO" + String(PPS_PIN) + ", 800 ms per mode\n\n";
+    o += "mode      n      min V   max V   mean V  swing   digital-high\n";
+    const int modes[3] = {INPUT_PULLDOWN, INPUT, INPUT_PULLUP};
+    const char *mn[3] = {"pulldown", "float   ", "pullup  "};
+    float best_swing = 0;
+    for (int m = 0; m < 3; m++) {
+      pinMode(PPS_PIN, modes[m]);
+      delay(30);
+      uint32_t n = 0, lo = 4095, hi = 0, dh = 0; uint64_t sum = 0;
+      uint32_t t0 = millis();
+      while (millis() - t0 < 800) {
+        uint32_t v = analogRead(PPS_PIN);
+        if (v < lo) lo = v; if (v > hi) hi = v; sum += v; n++;
+        if (digitalRead(PPS_PIN)) dh++;
+      }
+      double k = 3300.0 / 4095.0 / 1000.0;
+      float sw = (float)((hi - lo) * k);
+      if (sw > best_swing) best_swing = sw;
+      char b[160];
+      snprintf(b, sizeof b, "%s  %-6lu %6.2f  %6.2f  %6.2f  %6.2f  %5.1f%%\n",
+               mn[m], (unsigned long)n, lo * k, hi * k, (double)sum / n * k, sw,
+               100.0 * dh / n);
+      o += b;
     }
     pinMode(PPS_PIN, INPUT_PULLDOWN);
     attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
-    double mv = 3300.0 / 4095.0;
-    double vlo = lo * mv / 1000.0, vhi = hi * mv / 1000.0, vavg = (double)sum / n * mv / 1000.0;
-    char b[640];
-    snprintf(b, sizeof b,
-      "pin D0/GPIO%d sampled as an ANALOGUE input over 2.5 s (%lu samples)\n"
-      "  min   %.2f V\n  max   %.2f V\n  mean  %.2f V\n  swing %.2f V\n\n%s\n",
-      PPS_PIN, (unsigned long)n, vlo, vhi, vavg, vhi - vlo,
-      (vhi - vlo) < 0.25
-        ? "FLAT. This is a supply rail, not a signal -- the wire is on the wrong net. Move it to\n"
-          "the module's timepulse pad."
-      : vlo > 0.8
-        ? "SWINGING, but the low level never reaches the input-low threshold (~0.83 V), which is\n"
-          "why digitalRead sees a constant high and no edge ever fires. You are on the right net\n"
-          "at the wrong point -- almost certainly across the LED. Move to the module's timepulse\n"
-          "pad for a rail-to-rail swing."
-        : "SWINGING rail to rail. If /pps still shows no edges the fault is elsewhere, which would\n"
-          "be a surprise.");
-    http.send(200, "text/plain", b);
+    o += "\n";
+    o += best_swing < 0.25
+       ? "NO SWING IN ANY MODE. Whatever is on this pin is static, and it is static with the\n"
+         "pulldown removed as well -- so this firmware is not the thing flattening it.\n"
+       : "A SWING APPEARS. Compare the modes above: if it is present with the pulldown off and\n"
+         "absent with it on, the source cannot drive against 45k and the pulldown was the fault.\n";
+    o += "\nControl: nyquist runs this same build, same GPIO, same pinMode and same RISING\n"
+         "interrupt, and counts real edges. Ask it: curl http://nyquist.local/pps\n";
+    http.send(200, "text/plain", o);
   });
   http.on("/tplen", HTTP_POST, []() {
     // POST, not GET: this changes hardware state, and /reboot is POST for the same reason.
