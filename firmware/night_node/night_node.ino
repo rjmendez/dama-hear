@@ -347,9 +347,29 @@ static float sound_speed_mps() {
 // always contains at least one isolated bit somewhere in ordinary traffic. digitalRead() costs
 // under a microsecond here, so the floor of what this can resolve is a few hundred kbaud -- ample
 // for anything a GPS module ships with.
+static uint32_t gps_bit_time_us(int pin, uint32_t window_ms, uint32_t *hist_out, uint32_t *min_out);
 static uint32_t gps_min_pulse_us(int pin, uint32_t window_ms) {
+  return gps_bit_time_us(pin, window_ms, NULL, NULL);
+}
+
+// The MINIMUM run length is the wrong statistic and measuring it taught me so: on mach, with a
+// link provably healthy at 115200 (3440 sentences, fix 3, a UBX ACK), the minimum run was 3 us,
+// implying 333 kbaud, and the endpoint duly announced that no standard rate fitted and that two
+// drivers must be fighting. One sub-bit glitch -- from digitalRead's own sampling jitter or from
+// the line itself -- is enough to do that, because a minimum has no defence against a single
+// outlier. It was a diagnostic contradicting a working link, which is worse than no diagnostic.
+//
+// So: histogram the run lengths and take the shortest one that happens OFTEN. A real bit time
+// recurs thousands of times in 400 ms of traffic; a glitch does not. `min_out` still reports the
+// raw minimum, because the gap between the two is itself the evidence that glitches are present.
+#define GPS_RUN_MAX 400          // us; anything longer is idle, not a bit
+#define GPS_RUN_QUORUM 20        // a run length must recur this often to count as the bit time
+static uint32_t gps_bit_time_us(int pin, uint32_t window_ms,
+                                uint32_t *hist_out, uint32_t *min_out) {
   pinMode(pin, INPUT);
-  uint32_t minrun = 0xFFFFFFFFu;
+  static uint32_t h[GPS_RUN_MAX + 1];
+  memset(h, 0, sizeof h);
+  uint32_t rawmin = 0xFFFFFFFFu;
   uint64_t t0 = (uint64_t)esp_timer_get_time(), tlast = t0;
   int last = digitalRead(pin);
   while ((uint64_t)esp_timer_get_time() - t0 < (uint64_t)window_ms * 1000ULL) {
@@ -357,11 +377,17 @@ static uint32_t gps_min_pulse_us(int pin, uint32_t window_ms) {
     if (v != last) {
       uint64_t now = (uint64_t)esp_timer_get_time();
       uint32_t run = (uint32_t)(now - tlast);
-      if (run && run < minrun) minrun = run;
+      if (run) {
+        if (run < rawmin) rawmin = run;
+        if (run <= GPS_RUN_MAX) h[run]++;
+      }
       tlast = now; last = v;
     }
   }
-  return minrun == 0xFFFFFFFFu ? 0 : minrun;
+  if (min_out) *min_out = (rawmin == 0xFFFFFFFFu) ? 0 : rawmin;
+  if (hist_out) memcpy(hist_out, h, sizeof h);
+  for (uint32_t r = 1; r <= GPS_RUN_MAX; r++) if (h[r] >= GPS_RUN_QUORUM) return r;
+  return 0;                      // nothing recurred often enough to be a bit time
 }
 
 // Snap a measured bit time to the nearest standard rate, and report how far off it was. A big
@@ -379,6 +405,36 @@ static uint32_t gps_snap_baud(uint32_t bit_us, float *err_pct_out) {
   }
   if (err_pct_out) *err_pct_out = (float)(bestrel * 100.0);
   return best;
+}
+
+// ---------------------------------------------------------------- which pin is the module on
+// GPS_RX / GPS_TX are the DOCUMENTED wiring, and on mach the pair is reversed. A swapped UART pair
+// is invisible from the protocol side -- you get a silent line and no ACK, which reads exactly like
+// a dead module -- so it gets found by measurement instead. Only one of the two can be carrying a
+// transmitter, and gps_min_pulse_us() says which without needing to know the baud or the protocol.
+//
+// Run BEFORE Serial1.begin(), while both pins are still inputs; afterwards one of them is an output
+// this node drives, and probing it would only measure ourselves.
+static int gps_rx_pin = GPS_RX, gps_tx_pin = GPS_TX;
+static const char *gps_pin_src = "default (not probed)";
+static uint32_t gps_pulse_d7 = 0, gps_pulse_d6 = 0;
+
+static void gps_pick_pins() {
+  gps_pulse_d7 = gps_min_pulse_us(GPS_RX, 250);
+  gps_pulse_d6 = gps_min_pulse_us(GPS_TX, 250);
+  if (gps_pulse_d7 && !gps_pulse_d6) {
+    gps_rx_pin = GPS_RX; gps_tx_pin = GPS_TX; gps_pin_src = "measured: as documented";
+  } else if (gps_pulse_d6 && !gps_pulse_d7) {
+    // The wires are reversed. Follow the hardware rather than refuse it: the node's job is to hear
+    // the module, and which copper it arrives on is not a thing worth being principled about.
+    gps_rx_pin = GPS_TX; gps_tx_pin = GPS_RX; gps_pin_src = "measured: SWAPPED at the module";
+  } else if (gps_pulse_d6 && gps_pulse_d7) {
+    gps_pin_src = "both pins toggled -- ambiguous, using documented wiring";
+  } else {
+    gps_pin_src = "neither pin toggled -- module silent, using documented wiring";
+  }
+  logf("gps   pins %s (D7 %lu us, D6 %lu us) -> RX=GPIO%d TX=GPIO%d\n", gps_pin_src,
+       (unsigned long)gps_pulse_d7, (unsigned long)gps_pulse_d6, gps_rx_pin, gps_tx_pin);
 }
 
 static void i2c_scan() {
@@ -1632,19 +1688,12 @@ void setup() {
 #ifdef ARDUINO_USB_CDC_ON_BOOT
   Serial0.end();
 #endif
-  // Is anything DRIVING the RX line? A floating UART input frames noise into bytes that look like
-  // data, which is how "22 sentences" and 1236 received bytes coexisted with zero valid NMEA. A
-  // real transmitter idles HIGH and holds it high against a pulldown; a floating pin follows the
-  // pulldown to 0. Same trick that settled the phantom PPS edges.
-  {
-    pinMode(GPS_RX, INPUT_PULLDOWN); delay(20);
-    int high = 0, edges = 0, last = digitalRead(GPS_RX);
-    uint32_t t0 = millis();
-    while (millis() - t0 < 300) { int v = digitalRead(GPS_RX); if (v) high++; if (v != last) { edges++; last = v; } }
-    logf("gps   RX pin (D7/GPIO%d) with pulldown: %s (%d edges)\n", GPS_RX,
-                  high > 20 ? "DRIVEN high -- a transmitter is connected"
-                            : "follows the pulldown -- NOTHING is driving it", edges);
-  }
+  // Which pin is the module actually transmitting on, and is it transmitting at all. This replaces
+  // an earlier pulldown probe that asked only "does D7 read high", and answered "DRIVEN high -- a
+  // transmitter is connected" on mach for a pin with nothing on it: a pulled-up module input reads
+  // exactly like a transmitter idling high, so the test could not tell the two apart. Counting
+  // RECURRING run lengths on both pins can, and it also says which way round the pair is wired.
+  gps_pick_pins();
 
   // Find the module's baud instead of assuming it. Assuming 9600 produced a stream that a lenient
   // parser happily counted as 22 "sentences" while zero of them were valid NMEA -- a wrong number
@@ -1656,7 +1705,7 @@ void setup() {
     static const uint32_t cand[] = {9600, 38400, 115200, 57600, 19200, 230400, 460800, 4800};
     uint32_t best_b = 0; int best_score = 0; bool best_ubx = false;
     for (unsigned k = 0; k < sizeof(cand) / sizeof(cand[0]); k++) {
-      Serial1.begin(cand[k], SERIAL_8N1, GPS_RX, GPS_TX);
+      Serial1.begin(cand[k], SERIAL_8N1, gps_rx_pin, gps_tx_pin);
       delay(60); while (Serial1.available()) Serial1.read();
       int nm = 0, ub = 0, i = 0; char ln[100]; uint8_t prev = 0; uint32_t t0 = millis();
       while (millis() - t0 < 1200) {
@@ -1677,7 +1726,7 @@ void setup() {
       Serial1.end();
     }
     gps_baud = best_b ? best_b : 9600;
-    Serial1.begin(gps_baud, SERIAL_8N1, GPS_RX, GPS_TX);
+    Serial1.begin(gps_baud, SERIAL_8N1, gps_rx_pin, gps_tx_pin);
     logf("gps   using %lu baud (%s)%s\n", (unsigned long)gps_baud,
                   best_ubx ? "UBX binary" : "NMEA",
                   best_b ? "" : " -- nothing decoded at any rate");
@@ -1953,25 +2002,39 @@ void setup() {
     // Detaching the UART for the measurement and putting it straight back: the pin is shared, and
     // a diagnostic that leaves the GPS silent afterwards would be worse than no diagnostic.
     Serial1.end();
-    uint32_t bit_us = gps_min_pulse_us(GPS_RX, 400);
+    uint32_t rawmin = 0;
+    uint32_t bit_us = gps_bit_time_us(gps_rx_pin, 400, NULL, &rawmin);
+    uint32_t other_us = gps_min_pulse_us(gps_rx_pin == GPS_RX ? GPS_TX : GPS_RX, 250);
+    // The UART is the authority on whether the link works. This endpoint measures the wire, and
+    // where the two disagree the decoded traffic wins and the measurement is reported as suspect.
+    bool decoding = nmea_valid > 0 || ubx_pvt > 0;
     float err = 0; uint32_t snap = gps_snap_baud(bit_us, &err);
-    Serial1.begin(gps_baud, SERIAL_8N1, GPS_RX, GPS_TX);
-    char b[512];
+    Serial1.begin(gps_baud, SERIAL_8N1, gps_rx_pin, gps_tx_pin);
+    char b[700];
     snprintf(b, sizeof b,
-      "pin      D7/GPIO%d (GPS RX, module TX side)\n"
-      "min run  %lu us   <- shortest single level seen in 400 ms\n"
+      "pins     %s\n"
+      "listen   GPIO%d   talk GPIO%d\n"
+      "other    GPIO%d min run %lu us %s\n"
+      "bit time %lu us  (shortest run seen at least %d times in 400 ms)\n"
+      "raw min  %lu us  (single shortest run -- a glitch moves this and not the figure above)\n"
       "implies  %.0f baud\n"
-      "nearest  %lu baud, %.1f%% away\n\n"
+      "nearest  %lu baud, %.1f%% away\n"
+      "decoding %s\n\n"
       "%s\n"
       "currently open at %lu baud.\n",
-      GPS_RX, (unsigned long)bit_us,
+      gps_pin_src, gps_rx_pin, gps_tx_pin,
+      gps_rx_pin == GPS_RX ? GPS_TX : GPS_RX, (unsigned long)other_us,
+      other_us ? "<-- A TRANSMITTER IS ON THE OTHER PIN. The pair is reversed." : "(idle, as expected)",
+      (unsigned long)bit_us, GPS_RUN_QUORUM, (unsigned long)rawmin,
       bit_us ? 1e6 / (double)bit_us : 0.0, (unsigned long)snap, err,
-      !bit_us ? "NOTHING TOGGLED. The line is idle: module not powered, not transmitting, or the\n"
-                "wire is on the module's RX rather than its TX."
-      : err < 5.0 ? "Clean match. If the firmware still decodes nothing at this rate the framing is\n"
-                    "wrong rather than the rate -- inverted logic, or not 8N1."
-      : "NO STANDARD RATE FITS. Either the line is not an 8N1 UART, or two drivers are fighting\n"
-        "on it -- which is what a swapped TX/RX pair looks like from here.",
+      decoding ? "YES -- the UART is producing valid sentences right now" : "no",
+      decoding ? "Link is up; treat any mismatch above as a limit of this measurement, not of the\n"
+                 "link. digitalRead sampling cannot resolve a bit time reliably much under 10 us."
+      : !bit_us ? "NOTHING RECURRED. The line is idle or only glitching: module not powered, not\n"
+                  "transmitting, or the wire is on the module's RX rather than its TX."
+      : err < 15.0 ? "Plausible rate and nothing decoding, so suspect framing rather than speed --\n"
+                     "inverted logic, or not 8N1."
+      : "No standard rate fits and nothing is decoding. Check the wiring before the settings.",
       (unsigned long)gps_baud);
     http.send(200, "text/plain", b);
   });
