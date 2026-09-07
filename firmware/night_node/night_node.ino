@@ -91,6 +91,7 @@ static const char HEALTH_HDR[] =
   "utc_us,time_valid,uptime_s,fix,sats,tacc_ns,pps,pps_bad,spread_us,esp_ppm,samples,fs_cum_hz,"
   "fs_clean_hz,fs_win_s,drop_s,drop_samples,samp_last_s,det_n,det_written,det_lost,ambient,"
   "env_peak_win,heap,gate_armed,gate_thr,gate_e_max,gate_forced,sig_dc,sd_free_mb,write_fail,"
+  "temp_c,press_hpa,c_mps,"
   // gate_floor, because gate_thr only pins the floor down where the floor is the binding limb.
   // The clip counters, because a card that filled and a night that went quiet must not look the
   // same in the record -- clip_written advances only on a clip that landed, clip_skip_budget only
@@ -219,6 +220,97 @@ static const char *i2c_name(uint8_t a) {
       return "0x76/0x77 present, chip id unreadable";
     default: return "unknown";
   }
+}
+
+// ---------------------------------------------------------------- BMP280 (temperature, pressure)
+// Sound speed is the one environmental term that does NOT cancel in TDoA: it biases every node in
+// the same direction, so a shared error in c moves every range together and the residual never
+// sees it. c = 331.3 + 0.606*T, so 0.6 m/s per degree -- a 10 C overnight swing is 1.8% on every
+// range. Without this the node assumes a temperature, and the assumption is invisible downstream.
+//
+// The part is identified by CHIP ID, not by the address it answers on. The board fitted here is
+// LABELLED BME280 and reports 0x58, which is BMP280 silicon -- temperature and pressure, no
+// humidity. Common with these modules. Humidity would have been worth about 0.5 m/s between dry
+// and saturated air at 20 C (0.15%); temperature is the term that matters and it is present.
+#define BMP_ADDR_A 0x76
+#define BMP_ADDR_B 0x77
+static uint8_t bmp_addr = 0;                 // 0 = not present
+static uint16_t bmp_T1; static int16_t bmp_T2, bmp_T3;
+static uint16_t bmp_P1; static int16_t bmp_P2, bmp_P3, bmp_P4, bmp_P5, bmp_P6, bmp_P7, bmp_P8, bmp_P9;
+static float bmp_temp_c = NAN, bmp_press_hpa = NAN;
+static uint32_t bmp_reads = 0, bmp_fail = 0;
+
+static bool bmp_block(uint8_t reg, uint8_t *buf, uint8_t n) {
+  Wire.beginTransmission(bmp_addr); Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)bmp_addr, (int)n) != n) return false;
+  for (uint8_t i = 0; i < n; i++) buf[i] = Wire.read();
+  return true;
+}
+static bool bmp_w8(uint8_t reg, uint8_t v) {
+  Wire.beginTransmission(bmp_addr); Wire.write(reg); Wire.write(v);
+  return Wire.endTransmission() == 0;
+}
+
+static bool bmp_begin() {
+  for (uint8_t a = BMP_ADDR_A; a <= BMP_ADDR_B; a++) {
+    uint8_t id;
+    bmp_addr = a;
+    if (!i2c_reg(a, 0xD0, &id)) continue;
+    if (id != 0x58 && id != 0x60 && id != 0x61) continue;   // BMP280 / BME280 / BME680
+    uint8_t c[24];
+    if (!bmp_block(0x88, c, 24)) continue;
+    bmp_T1 = (uint16_t)(c[1] << 8 | c[0]);  bmp_T2 = (int16_t)(c[3] << 8 | c[2]);
+    bmp_T3 = (int16_t)(c[5] << 8 | c[4]);   bmp_P1 = (uint16_t)(c[7] << 8 | c[6]);
+    bmp_P2 = (int16_t)(c[9] << 8 | c[8]);   bmp_P3 = (int16_t)(c[11] << 8 | c[10]);
+    bmp_P4 = (int16_t)(c[13] << 8 | c[12]); bmp_P5 = (int16_t)(c[15] << 8 | c[14]);
+    bmp_P6 = (int16_t)(c[17] << 8 | c[16]); bmp_P7 = (int16_t)(c[19] << 8 | c[18]);
+    bmp_P8 = (int16_t)(c[21] << 8 | c[20]); bmp_P9 = (int16_t)(c[23] << 8 | c[22]);
+    // A dig_T1 of 0 or 0xFFFF means the calibration block did not really read: the compensation
+    // would then return a confident wrong temperature rather than failing, which is worse.
+    if (bmp_T1 == 0 || bmp_T1 == 0xFFFF) continue;
+    bmp_w8(0xF5, 0xA0);                  // t_sb 1000 ms, filter off -- this is a slow variable
+    bmp_w8(0xF4, (2 << 5) | (2 << 2) | 3);   // osrs_t x2, osrs_p x2, NORMAL mode (free-running)
+    logf("bmp   0x%02X chip 0x%02X, dig_T1=%u -- temperature live\n", a, id, bmp_T1);
+    return true;
+  }
+  bmp_addr = 0;
+  return false;
+}
+
+// Datasheet compensation, integer path for temperature (t_fine) and 64-bit for pressure.
+static void bmp_read() {
+  if (!bmp_addr) return;
+  uint8_t d[6];
+  if (!bmp_block(0xF7, d, 6)) { bmp_fail++; return; }
+  int32_t adc_P = ((int32_t)d[0] << 12) | ((int32_t)d[1] << 4) | (d[2] >> 4);
+  int32_t adc_T = ((int32_t)d[3] << 12) | ((int32_t)d[4] << 4) | (d[5] >> 4);
+  if (adc_T == 0x80000 || adc_P == 0x80000) { bmp_fail++; return; }   // reset value = no sample yet
+  int32_t v1 = ((((adc_T >> 3) - ((int32_t)bmp_T1 << 1))) * ((int32_t)bmp_T2)) >> 11;
+  int32_t v2 = (((((adc_T >> 4) - ((int32_t)bmp_T1)) * ((adc_T >> 4) - ((int32_t)bmp_T1))) >> 12) *
+                ((int32_t)bmp_T3)) >> 14;
+  int32_t t_fine = v1 + v2;
+  bmp_temp_c = ((t_fine * 5 + 128) >> 8) / 100.0f;
+  int64_t p1 = ((int64_t)t_fine) - 128000;
+  int64_t p2 = p1 * p1 * (int64_t)bmp_P6;
+  p2 = p2 + ((p1 * (int64_t)bmp_P5) << 17);
+  p2 = p2 + (((int64_t)bmp_P4) << 35);
+  p1 = ((p1 * p1 * (int64_t)bmp_P3) >> 8) + ((p1 * (int64_t)bmp_P2) << 12);
+  p1 = (((((int64_t)1) << 47) + p1)) * ((int64_t)bmp_P1) >> 33;
+  if (p1 == 0) { bmp_press_hpa = NAN; bmp_reads++; return; }          // divide-by-zero guard
+  int64_t p = 1048576 - adc_P;
+  p = (((p << 31) - p2) * 3125) / p1;
+  p1 = (((int64_t)bmp_P9) * (p >> 13) * (p >> 13)) >> 25;
+  p2 = (((int64_t)bmp_P8) * p) >> 19;
+  p = ((p + p1 + p2) >> 8) + (((int64_t)bmp_P7) << 4);
+  bmp_press_hpa = (float)p / 25600.0f;                                // Q24.8 Pa -> hPa
+  bmp_reads++;
+}
+
+// The whole point of measuring temperature. NAN in, NAN out -- a node that does not know its
+// temperature must say so rather than quietly returning the 20 C answer.
+static float sound_speed_mps() {
+  return (bmp_temp_c == bmp_temp_c) ? 331.3f + 0.606f * bmp_temp_c : NAN;
 }
 
 static void i2c_scan() {
@@ -1260,6 +1352,13 @@ static String status_json() {
   // Arduino loop task has 8 kB of stack that the WebServer is already using. Only ever called
   // from the loop task (h_status), so there is no second caller to race it.
   static char b[3072];
+  // JSON has no NaN. A node that does not know its temperature emits null, which every parser
+  // reads as absent -- printing nan would be invalid JSON, and a downstream coercion of it to 0.0
+  // would look like a freezing night rather than a missing sensor.
+  char envs_t[16], envs_p[16], envs_c[16];
+  #define ENVF(dst, v) do { if ((v) == (v)) snprintf(dst, sizeof dst, "%.2f", (double)(v)); \
+                            else snprintf(dst, sizeof dst, "null"); } while (0)
+  ENVF(envs_t, bmp_temp_c); ENVF(envs_p, bmp_press_hpa); ENVF(envs_c, sound_speed_mps());
   char floor_saved[16];
   if (g_floor_saved == g_floor_saved) snprintf(floor_saved, sizeof floor_saved, "%.1f", g_floor_saved);
   else                                snprintf(floor_saved, sizeof floor_saved, "null");
@@ -1298,6 +1397,7 @@ static String status_json() {
     "\"skip_dedupe\":%lu,\"skip_ring\":%lu,"
     "\"nocard\":%lu,\"fail\":%lu,\"bytes_each\":%lu,\"budget_b\":%lu,\"budget_left_b\":%lu,"
     "\"budget_left_clips\":%lu,\"pre_s\":%.1f,\"post_s\":%.1f,\"dir\":\"%s\",\"boot\":\"%s\"},"
+    "\"env\":{\"temp_c\":%s,\"press_hpa\":%s,\"c_mps\":%s,\"reads\":%lu,\"fail\":%lu},"
     "\"sd\":%s,\"sd_free_mb\":%lu,\"sd_total_mb\":%lu,\"i2c\":\"%s\"}",
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
@@ -1339,6 +1439,7 @@ static String status_json() {
     (unsigned long)(clip_budget_left / CLIP_BYTES),
     (double)CLIP_PRE_SAMPLES / FS_NOMINAL, (double)CLIP_POST_SAMPLES / FS_NOMINAL,
     CLIP_DIR, clip_boot,
+    envs_t, envs_p, envs_c, (unsigned long)bmp_reads, (unsigned long)bmp_fail,
     sd_ok ? "true" : "false",
     (unsigned long)(sd_ok ? (SD.totalBytes() - SD.usedBytes()) / 1048576UL : 0UL),
     (unsigned long)(sd_ok ? SD.totalBytes() / 1048576UL : 0UL), i2c_found);
@@ -1513,7 +1614,12 @@ void setup() {
   logln("gps   UBX config sent (TP1 1 Hz locked+unlocked, NAV-PVT, TIM-TP; RAM layer)");
 
   Wire.begin(I2C_SDA, I2C_SCL, 100000);
+  // Bounded, because every I2C call here runs on the loop task that also drains the I2S DMA.
+  // A sensor that stops ACKing mid-transfer must cost a failed read and a counter, not a
+  // blocked loop and a watchdog reset.
+  Wire.setTimeOut(25);
   i2c_scan();
+  if (!bmp_begin()) logln("bmp   no BMP280/BME280 -- sound speed reported as null");
 
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
   sd_cs = 0;
@@ -2105,6 +2211,10 @@ void loop() {
     }
   }
 
+  { static uint32_t last_env = 0;   // the part free-runs at ~1 Hz; 5 s is fresh enough for a
+    if (millis() - last_env > 5000) { last_env = millis(); bmp_read(); }   // variable this slow
+  }
+
   { static uint32_t last_fl = 0;                  // batch, so the stall is once a second not once a hit
     if (det_n != det_flushed && millis() - last_fl > 1000) { last_fl = millis(); det_flush(); }
   }
@@ -2161,8 +2271,16 @@ void loop() {
       File f = csv_open("/health.csv", "/health-prev.csv", HEALTH_HDR);
       if (f) {
         int64_t tnow = 0; bool tok = local_to_utc((uint64_t)esp_timer_get_time(), &tnow);
+        // An EMPTY field for a sensor that is not there, never a number. "nan" parses as a float
+        // in some readers and as a string in others; 0.0 would read as a freezing night. Empty is
+        // the one value every CSV reader already agrees means absent.
+        char ct[16], cp[16], cc[16];
+        #define CSVF(dst, v) do { if ((v) == (v)) snprintf(dst, sizeof dst, "%.2f", (double)(v)); \
+                                  else dst[0] = 0; } while (0)
+        CSVF(ct, bmp_temp_c); CSVF(cp, bmp_press_hpa); CSVF(cc, sound_speed_mps());
         f.printf("%lld,%d,%lu,%d,%d,%lu,%lu,%lu,%ld,%.4f,%lu,%.4f,"
                  "%.4f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.1f,%.0f,%lu,%d,%.0f,%.1f,%lu,%.1f,%lu,%lu,"
+                 "%s,%s,%s,"
                  "%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
                  (long long)tnow, tok ? 1 : 0,
                  (unsigned long)up, gps_fix, gps_sats, (unsigned long)gps_tacc_ns,
@@ -2176,6 +2294,7 @@ void loop() {
                  armed, gate_thr(), env_e_max_win, (unsigned long)gate_forced, sig_dc,
                  (unsigned long)sd_free_mb_last,
                  (unsigned long)det_write_fail,
+                 ct, cp, cc,
                  g_floor, (unsigned long)clip_written, (unsigned long)clip_skip_budget,
                  (unsigned long)clip_skip_full,
                  (unsigned long)clip_skip_dedupe, (unsigned long)clip_skip_ring,
