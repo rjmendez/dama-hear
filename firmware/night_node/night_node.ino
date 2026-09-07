@@ -82,12 +82,16 @@ static void IRAM_ATTR pps_isr() {
 static volatile uint32_t gps_tacc_ns = 0, ubx_pvt = 0, ubx_timtp = 0, ubx_nak = 0, ubx_ack = 0;
 static volatile int32_t  gps_qerr_ps = 0;
 static char nmea[100]; static int nmea_i = 0;
+static uint8_t rawbuf[512]; static volatile uint16_t raw_i = 0; static volatile uint32_t raw_tot = 0;
+static volatile uint32_t nmea_valid = 0;      // lines that actually start '$' and carry a talker id
+static uint32_t gps_baud = 0;
 static volatile int gps_fix = 0, gps_sats = 0;
 static char gps_utc[16] = "--:--:--";
 static uint32_t gps_sentences = 0;
 
 static void nmea_line(const char *s) {
   gps_sentences++;
+  if (s[0] == '$' && s[1] >= 'A' && s[1] <= 'Z' && s[2] >= 'A' && s[2] <= 'Z') nmea_valid++;
   // $xxGGA,hhmmss.ss,lat,N,lon,E,fix,sats,...
   if (ubx_pvt) return;                          // UBX is authoritative once it arrives
   if (!(s[0] == '$' && s[3] == 'G' && s[4] == 'G' && s[5] == 'A')) return;
@@ -277,7 +281,7 @@ static String status_json() {
   char b[1024];
   snprintf(b, sizeof b,
     "{\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
-    "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,"
+    "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s},"
     "\"pps\":{\"edges\":%lu,\"glitches\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,\"spread_us\":%ld},"
     "\"i2s\":{\"nominal_hz\":%d,\"measured_hz\":%.4f,\"ppm\":%.1f,\"samples\":%lu},"
@@ -285,6 +289,7 @@ static String status_json() {
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
     gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences,
+    (unsigned long)nmea_valid, (unsigned long)gps_baud,
     (unsigned long)gps_tacc_ns, (long)gps_qerr_ps, (unsigned long)ubx_pvt,
     (unsigned long)ubx_timtp, (unsigned long)ubx_ack, (unsigned long)ubx_nak,
     (ubx_ack ? "true" : "false"),
@@ -308,7 +313,7 @@ static void h_root() {
              "const f=s.i2s.measured_hz?s.i2s.measured_hz.toFixed(4)+' Hz ('+s.i2s.ppm.toFixed(1)+' ppm)':'waiting for 3 PPS edges';"
              "document.getElementById('t').innerHTML="
              "`<tr><td>uptime<td><b>${s.uptime_s} s</b>`+"
-             "`<tr><td>GPS<td><b>fix ${s.gps.fix}, ${s.gps.sats} sats, ${s.gps.utc} UTC</b>`+`<tr><td>time accuracy<td><b>${s.gps.tacc_ns} ns</b> &middot; pulse qErr ${s.gps.qerr_ps} ps`+`<tr><td>UBX<td>pvt ${s.gps.ubx_pvt}, tim-tp ${s.gps.ubx_timtp}, ack ${s.gps.ubx_ack}, nak ${s.gps.ubx_nak}`+`<tr><td>config<td><b>${s.gps.config_acked?'accepted':'NOT acked - node TX to module RX unwired?'}</b>`+"
+             "`<tr><td>GPS<td><b>fix ${s.gps.fix}, ${s.gps.sats} sats, ${s.gps.utc} UTC</b> @ ${s.gps.baud} baud, ${s.gps.valid_nmea} valid lines`+`<tr><td>time accuracy<td><b>${s.gps.tacc_ns} ns</b> &middot; pulse qErr ${s.gps.qerr_ps} ps`+`<tr><td>UBX<td>pvt ${s.gps.ubx_pvt}, tim-tp ${s.gps.ubx_timtp}, ack ${s.gps.ubx_ack}, nak ${s.gps.ubx_nak}`+`<tr><td>config<td><b>${s.gps.config_acked?'accepted':'NOT acked - node TX to module RX unwired?'}</b>`+"
              "`<tr><td>PPS edges<td><b>${s.pps.edges}</b> spread ${s.pps.spread_us} us, ${s.pps.glitches} rejected`+"
              "`<tr><td>I2S measured<td><b>${f}</b>`+"
              "`<tr><td>samples<td>${s.i2s.samples}`+"
@@ -363,8 +368,68 @@ void setup() {
   // PULLDOWN, not bare INPUT. An unconnected CMOS input floats and self-oscillates -- measured
   // ~3.4 kHz of phantom edges, which the rate maths happily turned into a plausible +626 ppm.
   pinMode(PPS_PIN, INPUT_PULLDOWN);
+  // Same probe as the RX line. Once the module has a fix and has ACKed TP1, it IS pulsing, so
+  // silence here can only be the wire or the tap point -- worth stating rather than inferring.
+  { int high = 0, edges = 0, last = digitalRead(PPS_PIN); uint32_t t0 = millis();
+    while (millis() - t0 < 1500) { int v = digitalRead(PPS_PIN); if (v) high++; if (v != last) { edges++; last = v; } }
+    Serial.printf("pps   pin (D0/GPIO%d) over 1.5 s: %d edges, %s\n", PPS_PIN, edges,
+                  edges ? "something is pulsing it" : "flat -- nothing connected to the tap"); }
   attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
-  Serial1.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  // D6/D7 are GPIO43/44 -- the ESP32-S3's DEFAULT UART0 pins. With USB-CDC carrying Serial, UART0
+  // is still instantiated and can drive GPIO43, contending with Serial1's TX. Release it first.
+#ifdef ARDUINO_USB_CDC_ON_BOOT
+  Serial0.end();
+#endif
+  // Is anything DRIVING the RX line? A floating UART input frames noise into bytes that look like
+  // data, which is how "22 sentences" and 1236 received bytes coexisted with zero valid NMEA. A
+  // real transmitter idles HIGH and holds it high against a pulldown; a floating pin follows the
+  // pulldown to 0. Same trick that settled the phantom PPS edges.
+  {
+    pinMode(GPS_RX, INPUT_PULLDOWN); delay(20);
+    int high = 0, edges = 0, last = digitalRead(GPS_RX);
+    uint32_t t0 = millis();
+    while (millis() - t0 < 300) { int v = digitalRead(GPS_RX); if (v) high++; if (v != last) { edges++; last = v; } }
+    Serial.printf("gps   RX pin (D7/GPIO%d) with pulldown: %s (%d edges)\n", GPS_RX,
+                  high > 20 ? "DRIVEN high -- a transmitter is connected"
+                            : "follows the pulldown -- NOTHING is driving it", edges);
+  }
+
+  // Find the module's baud instead of assuming it. Assuming 9600 produced a stream that a lenient
+  // parser happily counted as 22 "sentences" while zero of them were valid NMEA -- a wrong number
+  // that looked like a working link. Count VALID lines and let the module tell us.
+  {
+    // Count UBX frames as well as NMEA lines. A module that came off a flight controller is very
+    // often configured UBX-binary only with NMEA disabled -- so a NMEA-only scan sees a live,
+    // driven, busy line and reports nothing at every rate, which is exactly what happened.
+    static const uint32_t cand[] = {9600, 38400, 115200, 57600, 19200, 230400, 460800, 4800};
+    uint32_t best_b = 0; int best_score = 0; bool best_ubx = false;
+    for (unsigned k = 0; k < sizeof(cand) / sizeof(cand[0]); k++) {
+      Serial1.begin(cand[k], SERIAL_8N1, GPS_RX, GPS_TX);
+      delay(60); while (Serial1.available()) Serial1.read();
+      int nm = 0, ub = 0, i = 0; char ln[100]; uint8_t prev = 0; uint32_t t0 = millis();
+      while (millis() - t0 < 1200) {
+        while (Serial1.available()) {
+          uint8_t c = (uint8_t)Serial1.read();
+          if (prev == 0xB5 && c == 0x62) ub++;            // UBX sync word
+          prev = c;
+          if (c == '\n' || i >= 99) {
+            ln[i] = 0;
+            if (i > 6 && ln[0] == '$' && ln[1] >= 'A' && ln[1] <= 'Z' && ln[2] >= 'A' && ln[2] <= 'Z') nm++;
+            i = 0;
+          } else if (c != '\r' && c >= 32 && c < 127) ln[i++] = (char)c;
+        }
+      }
+      Serial.printf("gps   %6lu baud -> %d NMEA, %d UBX\n", (unsigned long)cand[k], nm, ub);
+      int score = nm + ub;
+      if (score > best_score) { best_score = score; best_b = cand[k]; best_ubx = (ub > nm); }
+      Serial1.end();
+    }
+    gps_baud = best_b ? best_b : 9600;
+    Serial1.begin(gps_baud, SERIAL_8N1, GPS_RX, GPS_TX);
+    Serial.printf("gps   using %lu baud (%s)%s\n", (unsigned long)gps_baud,
+                  best_ubx ? "UBX binary" : "NMEA",
+                  best_b ? "" : " -- nothing decoded at any rate");
+  }
   delay(300);
   gps_configure();
   Serial.println("gps   UBX config sent (TP1 1 Hz locked+unlocked, NAV-PVT, TIM-TP; RAM layer)");
@@ -382,6 +447,16 @@ void setup() {
   else Serial.printf("i2s   PDM %d Hz nominal\n", FS_NOMINAL);
 
   http.on("/", h_root); http.on("/status", h_status); http.on("/detections", h_dets);
+  http.on("/gpsraw", []() {           // what the module is ACTUALLY sending, not what a parser counted
+    String o = "bytes=" + String((unsigned long)raw_tot) + " valid_nmea_lines=" + String((unsigned long)nmea_valid) +
+               " ubx_ack=" + String((unsigned long)ubx_ack) + " ubx_nak=" + String((unsigned long)ubx_nak) + "\n\n";
+    uint16_t st = raw_i;
+    for (uint16_t k = 0; k < sizeof(rawbuf); k++) {
+      char c = (char)rawbuf[(st + k) % sizeof(rawbuf)];
+      o += (c >= 32 && c < 127) ? c : (c == '\n' ? '\n' : '.');
+    }
+    http.send(200, "text/plain", o);
+  });
   http.on("/i2c", []() { i2c_scan(); http.send(200, "text/plain", i2c_found); });   // rescan on demand
   http.begin();
   Serial.println("http  up\n");
@@ -394,6 +469,7 @@ void loop() {
 
   while (Serial1.available()) {
     char c = Serial1.read();
+    rawbuf[raw_i] = (uint8_t)c; raw_i = (raw_i + 1) % sizeof(rawbuf); raw_tot++;
     ubx_feed((uint8_t)c);                       // UBX and NMEA share the port; parse both
     if (c == '\n' || nmea_i >= (int)sizeof(nmea) - 1) { nmea[nmea_i] = 0; if (nmea_i > 6) nmea_line(nmea); nmea_i = 0; }
     else if (c != '\r') nmea[nmea_i++] = c;

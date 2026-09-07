@@ -41,6 +41,20 @@ LED swings: through an LED and series resistor only one side is a usable edge.
 The SD card is the actual record — `night.csv`, appended every 30 s. WiFi is a convenience and an
 overnight run must not depend on it.
 
+## What the GPS actually was
+
+The HGLRC HG-M10-02 came off a flight controller and was configured accordingly: **230400 baud,
+UBX binary, NMEA disabled**. Assuming 9600/NMEA found nothing, and a lenient line counter reported
+22 "sentences" from pure framing noise — a wrong number that looked like a working link.
+
+The scan now walks eight rates and counts **UBX sync words as well as NMEA lines**, because a
+module that has ever met Betaflight or INAV will not be speaking NMEA. Once found, the module ACKs
+the VALSET and reports 3D fix with 12 satellites and `tAcc` **23 ns** — indoors.
+
+That 23 ns is the number `docs/architecture.md` has been asserting without evidence.
+
+Its I²C carries an **IST8310** magnetometer and a **BMP280** at `0x76`, both already wired.
+
 ## Two traps this hit on the bench, both now guarded
 
 **A floating PPS input self-oscillates.** Bare `INPUT` on an unconnected pin produced ~3.4 kHz of
@@ -51,6 +65,11 @@ not a fast clock.
 
 **`gate()` is stateful and must be called exactly once per sample.** An earlier version called it a
 second time on the not-detected path, feeding the envelope samples that never existed.
+
+**Counters must count the thing they are named after.** `sentences` incremented on any line, so
+noise and data were indistinguishable; `valid_nmea` requires a `$` and a talker id, and told the
+truth immediately. Every pin now gets probed rather than assumed — a pulldown says whether anything
+is driving a line, which separates "not wired" from "wired but silent" without a meter.
 
 ## What a good night looks like
 
