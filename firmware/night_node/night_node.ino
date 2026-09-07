@@ -81,6 +81,10 @@ static void IRAM_ATTR pps_isr() {
 // ---------------------------------------------------------------- GPS (minimal NMEA)
 static volatile uint32_t gps_tacc_ns = 0, ubx_pvt = 0, ubx_timtp = 0, ubx_nak = 0, ubx_ack = 0;
 static volatile int32_t  gps_qerr_ps = 0;
+static volatile uint8_t  timtp_flags = 0xFF;
+// Read-back of what the module says its timepulse config actually is. An ACK to VALSET means the
+// keys were accepted, not that the pin is driving anything -- so ask.
+static char tp_readback[160] = "(not read)";
 static char nmea[100]; static int nmea_i = 0;
 static uint8_t rawbuf[512]; static volatile uint16_t raw_i = 0; static volatile uint32_t raw_tot = 0;
 static volatile uint32_t nmea_valid = 0;      // lines that actually start '$' and carry a talker id
@@ -201,6 +205,16 @@ static void vs_send() { ubx_send(0x06, 0x8A, ubx_buf, vs_i); }
 
 // Applied at every boot into the RAM layer only -- the module's own flash is never written, so
 // nothing here is a permanent change to the operator's hardware. Power-cycle and it is stock.
+static void gps_valget() {           // ask the module what TP1 is actually set to
+  vs_i = 0; ubx_buf[vs_i++] = 0; ubx_buf[vs_i++] = 0x00;   // version 0, layer 0 = RAM
+  ubx_buf[vs_i++] = 0; ubx_buf[vs_i++] = 0;
+  const uint32_t keys[] = {K_TP1_ENA, K_PULSE_DEF, K_PERIOD_TP1, K_PERIOD_LOCK,
+                           K_LEN_TP1, K_LEN_LOCK, K_USE_LOCKED_TP1};
+  for (unsigned k = 0; k < sizeof(keys) / sizeof(keys[0]); k++)
+    for (int i = 0; i < 4; i++) ubx_buf[vs_i++] = (keys[k] >> (8 * i)) & 0xFF;
+  ubx_send(0x06, 0x8B, ubx_buf, vs_i);
+}
+
 static void gps_configure() {
   vs_begin();
   vs_add(K_PULSE_DEF, 0); vs_add(K_PULSE_LEN_DEF, 1);
@@ -225,7 +239,23 @@ static void ubx_msg() {
     ubx_pvt++;
   } else if (ux_cls == 0x0D && ux_id == 0x01 && ux_len >= 16) {   // TIM-TP
     gps_qerr_ps = (int32_t)((uint32_t)ux[8] | ((uint32_t)ux[9] << 8) | ((uint32_t)ux[10] << 16) | ((uint32_t)ux[11] << 24));
+    timtp_flags = ux[14];          // bit0 timeBase, bit1 utc, bit4 qErrInvalid
     ubx_timtp++;
+  } else if (ux_cls == 0x06 && ux_id == 0x8B && ux_len > 4) {     // CFG-VALGET response
+    char o[160]; int n = 0; uint16_t i = 4;
+    while (i + 4 <= ux_len && n < (int)sizeof(o) - 24) {
+      uint32_t key = (uint32_t)ux[i] | ((uint32_t)ux[i+1] << 8) | ((uint32_t)ux[i+2] << 16) | ((uint32_t)ux[i+3] << 24);
+      int w = (((key >> 28) & 0x7) == 4) ? 4 : 1;
+      uint32_t v = 0;
+      for (int k = 0; k < w && i + 4 + k < ux_len; k++) v |= (uint32_t)ux[i + 4 + k] << (8 * k);
+      const char *nm = key == K_TP1_ENA ? "TP1_ENA" : key == K_PERIOD_TP1 ? "PERIOD"
+                     : key == K_PERIOD_LOCK ? "PERIOD_LOCK" : key == K_LEN_TP1 ? "LEN"
+                     : key == K_LEN_LOCK ? "LEN_LOCK" : key == K_PULSE_DEF ? "PULSE_DEF"
+                     : key == K_USE_LOCKED_TP1 ? "USE_LOCKED" : "?";
+      n += snprintf(o + n, sizeof(o) - n, "%s%s=%lu", n ? " " : "", nm, (unsigned long)v);
+      i += 4 + w;
+    }
+    strncpy(tp_readback, o, sizeof(tp_readback) - 1); tp_readback[sizeof(tp_readback) - 1] = 0;
   } else if (ux_cls == 0x05) { if (ux_id == 0x01) ubx_ack++; else ubx_nak++; }
 }
 
@@ -282,7 +312,7 @@ static String status_json() {
   snprintf(b, sizeof b,
     "{\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
-    "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s},"
+    "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
     "\"pps\":{\"edges\":%lu,\"glitches\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,\"spread_us\":%ld},"
     "\"i2s\":{\"nominal_hz\":%d,\"measured_hz\":%.4f,\"ppm\":%.1f,\"samples\":%lu},"
     "\"audio\":{\"detections\":%lu,\"env_peak\":%.0f},\"sd\":%s,\"i2c\":\"%s\"}",
@@ -292,7 +322,8 @@ static String status_json() {
     (unsigned long)nmea_valid, (unsigned long)gps_baud,
     (unsigned long)gps_tacc_ns, (long)gps_qerr_ps, (unsigned long)ubx_pvt,
     (unsigned long)ubx_timtp, (unsigned long)ubx_ack, (unsigned long)ubx_nak,
-    (ubx_ack ? "true" : "false"),
+    (ubx_ack ? "true" : "false"), (unsigned)timtp_flags,
+    ((timtp_flags != 0xFF && !(timtp_flags & 0x10)) ? "true" : "false"),
     (unsigned long)pps_count, (unsigned long)pps_glitch,
     (unsigned long)(pps_count > 1 ? pps_int_min : 0), (unsigned long)(pps_count > 1 ? pps_int_max : 0),
     (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0),
@@ -447,6 +478,32 @@ void setup() {
   else Serial.printf("i2s   PDM %d Hz nominal\n", FS_NOMINAL);
 
   http.on("/", h_root); http.on("/status", h_status); http.on("/detections", h_dets);
+  http.on("/tp", []() {
+    strcpy(tp_readback, "(no response)");
+    gps_valget();
+    // The UBX parser lives in loop(), which is blocked while this handler runs -- so pump the
+    // port here instead of delay()ing and wondering why nothing arrived.
+    uint32_t t0 = millis();
+    while (millis() - t0 < 900) { while (Serial1.available()) ubx_feed((uint8_t)Serial1.read()); }
+    http.send(200, "text/plain", tp_readback);
+  });
+  http.on("/pps", []() {              // live probe: wire the tap, hit this, no reboot needed
+    detachInterrupt(digitalPinToInterrupt(PPS_PIN));
+    pinMode(PPS_PIN, INPUT_PULLDOWN);
+    int high = 0, n = 0, edges = 0, last = digitalRead(PPS_PIN);
+    uint32_t t0 = millis();
+    while (millis() - t0 < 2500) { int v = digitalRead(PPS_PIN); if (v) high++; n++; if (v != last) { edges++; last = v; } }
+    attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
+    char b[300];
+    snprintf(b, sizeof b,
+      "pin D0/GPIO%d over 2.5 s\n  edges   %d\n  high    %.1f%% of samples\n  verdict %s\n\n"
+      "expect ~2-3 edges and ~10%% high for a 1 Hz / 100 ms pulse.\n"
+      "flat at 0%%  = nothing driving the pin (tap not connected, or wrong side of the LED)\n"
+      "flat at 100%% = tap sits on a rail, not the switched end\n",
+      PPS_PIN, edges, n ? 100.0 * high / n : 0.0,
+      edges ? "PULSING" : (high > n / 2 ? "STUCK HIGH" : "FLAT LOW"));
+    http.send(200, "text/plain", b);
+  });
   http.on("/gpsraw", []() {           // what the module is ACTUALLY sending, not what a parser counted
     String o = "bytes=" + String((unsigned long)raw_tot) + " valid_nmea_lines=" + String((unsigned long)nmea_valid) +
                " ubx_ack=" + String((unsigned long)ubx_ack) + " ubx_nak=" + String((unsigned long)ubx_nak) + "\n\n";
