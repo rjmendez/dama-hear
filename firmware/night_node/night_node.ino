@@ -96,6 +96,16 @@ static volatile uint32_t pps_samp_exact = 0;   // interpolated sample index AT t
 static volatile uint32_t pps_samp_prev_exact = 0;  // and the one before it, for the mark
 static volatile uint32_t pps_int_min = 0xFFFFFFFF, pps_int_max = 0;
 static volatile uint32_t pps_glitch = 0;
+// Set whenever the ISR has been detached and put back. /pps, /ppsv and /pinsweep take the
+// interrupt away for a couple of seconds to sample the pin directly, and edges passing in that
+// window are not counted -- so the NEXT interval looks like 2 or 3 seconds and sits in pps_int_max
+// for the rest of the boot. Measured: one /pps call on mach turned a 4 us spread into 3000037 us.
+// A diagnostic that damages the record it reports on is worse than none, and it is the same shape
+// as the cumulative i2s rate one boot stall poisons for good. So the first interval after a detach
+// is discarded, and the clean-rate window restarts too: samples kept accruing across the gap while
+// edges did not, so any ratio spanning it is meaningless.
+static volatile bool pps_resync = false;
+static volatile uint32_t pps_resyncs = 0;
 // A 1 Hz pulse cannot have edges closer than this. Anything faster is noise on the wire, and it
 // must be counted rather than averaged in: a floating input self-oscillated at ~3.4 kHz on the
 // bench and produced a confident +626 ppm sample-rate figure out of nothing.
@@ -149,10 +159,12 @@ static void IRAM_ATTR pps_isr() {
   uint64_t now = (uint64_t)esp_timer_get_time();
   uint32_t sm = g_samples;
   if (pps_count && (uint32_t)(now - pps_us_last) < PPS_MIN_GAP_US) { pps_glitch++; return; }
-  if (pps_count) {
+  if (pps_count && !pps_resync) {
     uint32_t d = (uint32_t)(now - pps_us_last);
     if (d < pps_int_min) pps_int_min = d;
     if (d > pps_int_max) pps_int_max = d;
+  } else if (pps_resync) {
+    pps_resync = false;          // this interval spans the probe; every later one is real
   } else {
     pps_us_first = now; pps_samp_first = sm;
   }
@@ -1512,7 +1524,7 @@ static String status_json() {
     "{\"node\":\"%s\",\"class\":\"%s\",\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
-    "\"pps\":{\"edges\":%lu,\"glitches\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,\"spread_us\":%ld},"
+    "\"pps\":{\"edges\":%lu,\"glitches\":%lu,\"probe_resyncs\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,\"spread_us\":%ld},"
     "\"i2s\":{\"nominal_hz\":%d,\"measured_hz\":%.4f,\"ppm\":%.1f,\"samples\":%lu},"
     // measured_hz above is cumulative and stays poisoned by any stall. acq is the one to trust.
     "\"acq\":{\"fs_clean_hz\":%.4f,\"win_s\":%lu,\"drop_s\":%lu,\"drop_samples\":%lu,\"last_s\":%lu},"
@@ -1554,7 +1566,7 @@ static String status_json() {
     (unsigned long)ubx_timtp, (unsigned long)ubx_ack, (unsigned long)ubx_nak,
     (ubx_ack ? "true" : "false"), (unsigned)timtp_flags,
     ((timtp_flags != 0xFF && !(timtp_flags & 0x10)) ? "true" : "false"),
-    (unsigned long)pps_count, (unsigned long)pps_glitch,
+    (unsigned long)pps_count, (unsigned long)pps_glitch, (unsigned long)pps_resyncs,
     (unsigned long)(pps_count > 1 ? pps_int_min : 0), (unsigned long)(pps_count > 1 ? pps_int_max : 0),
     (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0),
     FS_NOMINAL, fs, fs > 0 ? (fs / FS_NOMINAL - 1.0) * 1e6 : 0.0, (unsigned long)g_samples,
@@ -1973,6 +1985,7 @@ void setup() {
       }
     }
     pinMode(PPS_PIN, INPUT_PULLDOWN);
+    pps_resync = true; pps_resyncs++; fs_clean_secs = 0;
     attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
     (void)watching;
     http.send(200, "text/plain", o);
@@ -2021,6 +2034,7 @@ void setup() {
       o += b;
     }
     pinMode(PPS_PIN, INPUT_PULLDOWN);
+    pps_resync = true; pps_resyncs++; fs_clean_secs = 0;
     if (pin == PPS_PIN) attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
     o += "\n";
     o += best_swing < 0.25
@@ -2077,6 +2091,7 @@ void setup() {
     int high = 0, n = 0, edges = 0, last = digitalRead(PPS_PIN);
     uint32_t t0 = millis();
     while (millis() - t0 < 2500) { int v = digitalRead(PPS_PIN); if (v) high++; n++; if (v != last) { edges++; last = v; } }
+    pps_resync = true; pps_resyncs++; fs_clean_secs = 0;
     attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
     char b[300];
     snprintf(b, sizeof b,
