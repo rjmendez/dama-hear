@@ -495,7 +495,11 @@ static void gps_valget() {           // ask the module what TP1 is actually set 
   vs_i = 0; ubx_buf[vs_i++] = 0; ubx_buf[vs_i++] = 0x00;   // version 0, layer 0 = RAM
   ubx_buf[vs_i++] = 0; ubx_buf[vs_i++] = 0;
   const uint32_t keys[] = {K_TP1_ENA, K_PULSE_DEF, K_PERIOD_TP1, K_PERIOD_LOCK,
-                           K_LEN_TP1, K_LEN_LOCK, K_USE_LOCKED_TP1};
+                           K_LEN_TP1, K_LEN_LOCK, K_USE_LOCKED_TP1,
+                           // POL decides which way round the pulse is, and /pps's "~10% high"
+                           // verdict is only true for POL=1. Reading everything EXCEPT the field
+                           // that could invalidate the reading was not a useful read-back.
+                           K_POL_TP1, K_ALIGN_TOW_TP1, K_SYNC_GNSS_TP1};
   for (unsigned k = 0; k < sizeof(keys) / sizeof(keys[0]); k++)
     for (int i = 0; i < 4; i++) ubx_buf[vs_i++] = (keys[k] >> (8 * i)) & 0xFF;
   ubx_send(0x06, 0x8B, ubx_buf, vs_i);
@@ -577,7 +581,9 @@ static void ubx_msg() {
       const char *nm = key == K_TP1_ENA ? "TP1_ENA" : key == K_PERIOD_TP1 ? "PERIOD"
                      : key == K_PERIOD_LOCK ? "PERIOD_LOCK" : key == K_LEN_TP1 ? "LEN"
                      : key == K_LEN_LOCK ? "LEN_LOCK" : key == K_PULSE_DEF ? "PULSE_DEF"
-                     : key == K_USE_LOCKED_TP1 ? "USE_LOCKED" : "?";
+                     : key == K_USE_LOCKED_TP1 ? "USE_LOCKED" : key == K_POL_TP1 ? "POL"
+                     : key == K_ALIGN_TOW_TP1 ? "ALIGN_TOW" : key == K_SYNC_GNSS_TP1 ? "SYNC_GNSS"
+                     : "?";
       n += snprintf(o + n, sizeof(o) - n, "%s%s=%lu", n ? " " : "", nm, (unsigned long)v);
       i += 4 + w;
     }
