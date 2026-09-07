@@ -46,8 +46,42 @@ LED swings: through an LED and series resistor only one side is a usable edge.
 `http://damahear.local/` or the printed IP. The page refreshes every 2 s; `/status` is JSON,
 `/detections` lists what the gate fired on.
 
-The SD card is the actual record — `night.csv`, appended every 30 s. WiFi is a convenience and an
-overnight run must not depend on it.
+The SD card is the actual record. WiFi is a convenience and an overnight run must not depend on
+it. Two files, both fetchable over the same link with `/sd?file=/dets.csv&tail=20000`:
+
+| file | written | holds |
+|---|---|---|
+| `dets.csv` | as detections fire, batched once a second | one row per detection: `utc_us`, `sample`, `pps_n`, signed `us_since_pps`, `trigger`, `flags`, the rate it was timed at, and the log-mel sketch as hex |
+| `health.csv` | every 30 s | GPS and PPS quality, the acquisition audit, gate state, detection counters, card space |
+
+`night.csv` is the older, narrower health schema and is no longer written. If the health schema
+changes again the node rolls the old file to `health-prev.csv` rather than appending wider rows
+under a narrower header, which would make every row in it ambiguous.
+
+`us_since_pps` is **signed**. A sample back-dated across an edge belongs to the second before it,
+and reporting that unsigned would put the event 999 ms — 343 m — from where it happened.
+
+### Three things that made the record worthless before they were found
+
+Each was invisible from outside, and each is now a field you can read.
+
+**The gate could go deaf and look quiet.** Ambient was only learned while armed, so a noise floor
+that rose above the threshold could never be learned, so it could never fall back below
+`thr * REARM`, so the gate never re-armed. Measured outdoors: 156 s solid disarmed, ambient frozen
+at 73.2, two detections all night, both from before it locked. The floor is now tracked whether
+armed or not — fast below threshold, ~12.5 s above it — with a 30 s forced re-arm under that.
+`gate.armed` and `gate.forced_rearms` say so.
+
+**The mic sits on a DC pedestal.** `mean(s)` measured 1285.8 against `mean(|s|)` 1285.3 — the same
+number, which can only happen if the waveform never crosses zero. The envelope detector was
+therefore measuring the offset rather than any sound, and pinned the threshold at 8 × 1285 =
+10280: an event had to swing 27% of full scale to register. Samples are DC-blocked at ~1.6 Hz
+before anything sees them; the true acoustic floor turns out to be 15–70. `gate.dc` reports the
+pedestal being subtracted.
+
+**A full card fails by returning a short write, not by raising anything.** The counter used to
+advance regardless, so a card that filled at 03:00 looked exactly like a night that went quiet at
+03:00. `write_fail` and `sd_free_mb` make the difference visible.
 
 ## What the GPS actually was
 
@@ -144,8 +178,21 @@ the first statement of `setup()` to make that window as small as possible.
 ## What a good night looks like
 
 `fix` 3+ with 6+ sats, `pps` climbing by 1 per second with `glitches` at 0, spread of tens of µs,
-and `fs` settling on a stable figure. **That figure is the deliverable** — if it is not 16000.000,
-every timestamp this platform has ever produced was scaled wrong, and now you know by how much.
+and `acq.fs_clean_hz` settling. **That figure is the deliverable** — if it is not 16000.000, every
+timestamp this platform has ever produced was scaled wrong, and now you know by how much. Measured
+here: **16001**, about +60 ppm.
+
+Read `acq.fs_clean_hz`, never `i2s.measured_hz`. The latter divides cumulative samples by
+cumulative seconds, so a single stall poisons it for the rest of the run — it read 13730 Hz while
+the node was really clocking 16001. `fs_clean_hz` averages only over unbroken runs of GPS seconds
+and discards any second that lost a block; those discarded seconds are `acq.drop_s`, which is the
+number that says whether the audio has holes in it. Expect it flat at the one or two seconds the
+I2S peripheral takes to start. It rises while you poll the node over WiFi: `loop()` reads I2S,
+serves HTTP and parses GPS in one thread, so talking to the node makes it briefly deaf.
+
+Also worth a glance: `gate.armed` should be 1, and `gate.headroom` (`e_max_win / thr`) says how
+close the night came to triggering. Sustained headroom far below 1 means the threshold is above
+everything that happens out there — a distinguishable outcome from silence, which is the point.
 
 ## Credentials and watching it
 
