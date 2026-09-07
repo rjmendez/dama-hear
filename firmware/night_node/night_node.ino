@@ -79,7 +79,7 @@ static volatile uint32_t g_samples = 0;      // updated by the audio loop, read 
 static const char HEALTH_HDR[] =
   "utc_us,time_valid,uptime_s,fix,sats,tacc_ns,pps,pps_bad,spread_us,esp_ppm,samples,fs_cum_hz,"
   "fs_clean_hz,fs_win_s,drop_s,drop_samples,samp_last_s,det_n,det_written,det_lost,ambient,"
-  "env_peak_win,heap,gate_armed,gate_thr,gate_e_max,gate_forced,sig_dc";
+  "env_peak_win,heap,gate_armed,gate_thr,gate_e_max,gate_forced,sig_dc,sd_free_mb,write_fail";
 static double   fs_clean      = (double)FS_NOMINAL;
 static uint32_t fs_clean_secs = 0;    // length of the current unbroken window, in GPS seconds
 static uint32_t drop_seconds  = 0;    // seconds that came up short by a block or more
@@ -494,6 +494,11 @@ static Det dets[MAXDET];
 static uint32_t det_n = 0;        // total ever detected
 static uint32_t det_flushed = 0;  // total written to the card
 static uint32_t det_lost = 0;     // overwritten in the ring before they could be written
+// The card the node is on exposes a 40 MB FAT partition, ~20 MB of it free. That is ~50k
+// detections -- ample for a night, but not infinite, and a full card fails by returning a short
+// write, not by raising anything. Counting failures is what stops a card that filled at 03:00
+// from looking exactly like a night that went quiet at 03:00.
+static uint32_t det_write_fail = 0;
 // us_since_pps is SIGNED: a sample captured a few hundred us before an edge is back-dated across
 // it, and belongs to the previous second. Reporting that as a huge unsigned number would put the
 // event 999 ms from where it happened -- 343 m.
@@ -636,8 +641,8 @@ static String status_json() {
     "\"audio\":{\"enabled\":true,\"detections\":%lu,\"written\":%lu,\"lost\":%lu,"
     "\"ambient\":%.1f,\"env_peak\":%.0f},"
     "\"gate\":{\"armed\":%d,\"thr\":%.0f,\"e_max_win\":%.1f,\"headroom\":%.2f,"
-    "\"forced_rearms\":%lu,\"dc\":%.1f},"
-    "\"sd\":%s,\"i2c\":\"%s\"}",
+    "\"forced_rearms\":%lu,\"dc\":%.1f},\"write_fail\":%lu,"
+    "\"sd\":%s,\"sd_free_mb\":%lu,\"sd_total_mb\":%lu,\"i2c\":\"%s\"}",
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
     gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences,
@@ -658,8 +663,10 @@ static String status_json() {
     (unsigned long)det_n, (unsigned long)det_flushed, (unsigned long)det_lost,
     g_amb, env_peak_seen,
     armed, gate_thr(), env_e_max_win, env_e_max_win / gate_thr(),
-    (unsigned long)gate_forced, sig_dc,
-    sd_ok ? "true" : "false", i2c_found);
+    (unsigned long)gate_forced, sig_dc, (unsigned long)det_write_fail,
+    sd_ok ? "true" : "false",
+    (unsigned long)(sd_ok ? (SD.totalBytes() - SD.usedBytes()) / 1048576UL : 0UL),
+    (unsigned long)(sd_ok ? SD.totalBytes() / 1048576UL : 0UL), i2c_found);
   return String(b);
 }
 
@@ -1069,8 +1076,9 @@ static void det_flush() {
     for (int j = 0; j < MEL16_FRAME_BYTES && m < (int)sizeof line - 3; j++) {
       line[m++] = hx[d.frame[j] >> 4]; line[m++] = hx[d.frame[j] & 0xF];
     }
-    line[m++] = '\n'; detf.write((const uint8_t *)line, m);
-    det_flushed = k + 1;
+    line[m++] = '\n';
+    if (detf.write((const uint8_t *)line, m) != (size_t)m) { det_write_fail++; break; }
+    det_flushed = k + 1;      // only advance on a write that actually landed
   }
   detf.flush();          // commit: the plug timer can cut power between any two loop iterations
 }
@@ -1227,7 +1235,7 @@ void loop() {
         if (f.size() == 0) f.println(HEALTH_HDR);
         int64_t tnow = 0; bool tok = local_to_utc((uint64_t)esp_timer_get_time(), &tnow);
         f.printf("%lld,%d,%lu,%d,%d,%lu,%lu,%lu,%ld,%.4f,%lu,%.4f,"
-                 "%.4f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.1f,%.0f,%lu,%d,%.0f,%.1f,%lu,%.1f\n",
+                 "%.4f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.1f,%.0f,%lu,%d,%.0f,%.1f,%lu,%.1f,%lu,%lu\n",
                  (long long)tnow, tok ? 1 : 0,
                  (unsigned long)up, gps_fix, gps_sats, (unsigned long)gps_tacc_ns,
                  (unsigned long)pps_count, (unsigned long)pps_glitch,
@@ -1237,7 +1245,9 @@ void loop() {
                  (unsigned long)drop_samples, (unsigned long)samp_sec_last,
                  (unsigned long)det_n, (unsigned long)det_flushed, (unsigned long)det_lost,
                  g_amb, env_peak_win, (unsigned long)ESP.getFreeHeap(),
-                 armed, gate_thr(), env_e_max_win, (unsigned long)gate_forced, sig_dc);
+                 armed, gate_thr(), env_e_max_win, (unsigned long)gate_forced, sig_dc,
+                 (unsigned long)((SD.totalBytes() - SD.usedBytes()) / 1048576UL),
+                 (unsigned long)det_write_fail);
         f.close();
       }
       env_peak_win = 0.0f;      // per-row peak, so a single loud event does not flatten the night
