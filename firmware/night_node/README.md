@@ -185,10 +185,21 @@ here: **16001**, about +60 ppm.
 Read `acq.fs_clean_hz`, never `i2s.measured_hz`. The latter divides cumulative samples by
 cumulative seconds, so a single stall poisons it for the rest of the run — it read 13730 Hz while
 the node was really clocking 16001. `fs_clean_hz` averages only over unbroken runs of GPS seconds
-and discards any second that lost a block; those discarded seconds are `acq.drop_s`, which is the
-number that says whether the audio has holes in it. Expect it flat at the one or two seconds the
-I2S peripheral takes to start. It rises while you poll the node over WiFi: `loop()` reads I2S,
-serves HTTP and parses GPS in one thread, so talking to the node makes it briefly deaf.
+and discards any second that lost a block; those discarded seconds are `acq.drop_s`. Expect it
+flat at the one or two seconds the I2S peripheral takes to start.
+
+**`drop_s` cannot see a single lost block.** Blocks are 256 samples, so a clean second delivers
+either 62 or 63 of them (15872 or 16128) — one missing block lands inside that legitimate spread
+and is indistinguishable from it at one-second granularity. The detector is deliberately set to
+0.97 to avoid crying wolf at the quantisation, which means it catches losses of two blocks (32 ms)
+and up. The number that bounds the small stuff is `fs_clean_hz` over a long window: held at
+16000.00 across 466 s, total loss is under 0.1% however it is distributed.
+
+Polling the node does **not** measurably cost audio, though `loop()` does read I2S, serve HTTP and
+parse GPS in one thread. Measured: 16 minutes at 15-30 s intervals with two concurrent pollers,
+`drop_s` flat at the two boot seconds and `fs_clean_hz` still 16000.00. An earlier build appeared
+to lose 14% under polling, but that reading came from `i2s.measured_hz`, which is cumulative and
+was still carrying the boot-second loss — the poller was not the cause.
 
 Also worth a glance: `gate.armed` should be 1, and `gate.headroom` (`e_max_win / thr`) says how
 close the night came to triggering. Sustained headroom far below 1 means the threshold is above
