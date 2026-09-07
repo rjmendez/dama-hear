@@ -13,6 +13,14 @@ is independent of it.
 | I2S mic — Adafruit ICS-43434 #6049 | $8.95 | $26.85 |
 | BME280 — temperature, pressure, humidity | ~$10 | ~$30 |
 
+⚠️**Check the GPS module before buying this too.** A drone GPS with a compass usually carries a
+barometer on the same I²C bus, and it is already wired. Measured on an HGLRC HG-M10-02: `0x0E`
+IST8310 magnetometer and `0x76` **BMP280** — temperature and pressure, no humidity. Humidity is a
+~0.1% effect on `c` at these temperatures (`hear/node/telemetry.py`), so a BMP280 buys essentially
+the whole acoustic-thermometer argument for nothing. Note where it sits: on the GPS, which has to
+be in the open for sky view, so watch for solar heating of the enclosure biasing the air
+temperature it reports.
+
 ⚠️**Check the GPS modules you already own first.** Most u-blox breakouts have PPS. Power one
 outdoors and watch for an LED blinking *once per second* on fix — that blink IS the PPS signal,
 and if it is not on a header you can tap it at the LED pad. Cheaper equivalents: ATGM336H ~$8,

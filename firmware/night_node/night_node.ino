@@ -22,6 +22,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include "driver/gpio.h"
+#include <Wire.h>
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -40,6 +41,8 @@ static const char *WIFI_PASSES[] = {""};
 #define GPS_TX    43                  // D6  -> module RX
 #define PDM_CLK   42
 #define PDM_DIN   41
+#define I2C_SDA 5                    // D4
+#define I2C_SCL 6                    // D5
 #define SD_SCK 7
 #define SD_MISO 8
 #define SD_MOSI 9
@@ -102,6 +105,57 @@ static void nmea_line(const char *s) {
     snprintf(gps_utc, sizeof gps_utc, "%c%c:%c%c:%c%c", tm[0], tm[1], tm[2], tm[3], tm[4], tm[5]);
 }
 
+
+
+// ---------------------------------------------------------------- I2C
+// Whatever is on the bus, named. A bare address list makes you go and look it up at 2 am; the
+// ambiguous ones are resolved by reading the part's own ID register instead of guessing.
+static char i2c_found[256];
+
+static bool i2c_reg(uint8_t addr, uint8_t reg, uint8_t *out) {
+  Wire.beginTransmission(addr); Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)addr, 1) != 1) return false;
+  *out = Wire.read(); return true;
+}
+
+static const char *i2c_name(uint8_t a) {
+  uint8_t id;
+  switch (a) {
+    case 0x0C: return "IST8308 magnetometer";
+    case 0x0D: return "QMC5883L magnetometer";
+    case 0x0E:                                   // IST8310 WHO_AM_I (reg 0x00) reads 0x10
+      return (i2c_reg(a, 0x00, &id) && id == 0x10) ? "IST8310 magnetometer"
+                                                   : "magnetometer? (0x0E, WHO_AM_I mismatch)";
+    case 0x1E: return "HMC5883L / LIS3MDL magnetometer";
+    case 0x30: return "MMC5883 magnetometer";
+    case 0x3C: case 0x3D: return "SSD1306 OLED";
+    case 0x68: case 0x69: return "MPU6050/ICM IMU or DS3231 RTC";
+    case 0x76: case 0x77:                        // chip id 0xD0: BME280 0x60, BMP280 0x58
+      if (i2c_reg(a, 0xD0, &id)) {
+        if (id == 0x60) return "BME280 (temp+pressure+HUMIDITY)";
+        if (id == 0x58) return "BMP280 (temp+pressure, NO humidity)";
+        if (id == 0x61) return "BME680";
+        return "BMx280-family, unrecognised chip id";
+      }
+      return "0x76/0x77 present, chip id unreadable";
+    default: return "unknown";
+  }
+}
+
+static void i2c_scan() {
+  int n = 0; i2c_found[0] = 0;
+  for (uint8_t a = 0x08; a < 0x78; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() != 0) continue;
+    char b[80];
+    snprintf(b, sizeof b, "%s0x%02X %s", n ? "; " : "", a, i2c_name(a));
+    if (strlen(i2c_found) + strlen(b) < sizeof(i2c_found) - 1) strcat(i2c_found, b);
+    n++;
+  }
+  if (!n) snprintf(i2c_found, sizeof i2c_found, "nothing on the bus");
+  Serial.printf("i2c   SDA=%d SCL=%d: %s\n", I2C_SDA, I2C_SCL, i2c_found);
+}
 
 // ---------------------------------------------------------------- u-blox UBX
 // Key IDs and message layouts taken from u-blox M10 SPG 5.10 Interface Description UBX-21035062,
@@ -227,7 +281,7 @@ static String status_json() {
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s},"
     "\"pps\":{\"edges\":%lu,\"glitches\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,\"spread_us\":%ld},"
     "\"i2s\":{\"nominal_hz\":%d,\"measured_hz\":%.4f,\"ppm\":%.1f,\"samples\":%lu},"
-    "\"audio\":{\"detections\":%lu,\"env_peak\":%.0f},\"sd\":%s}",
+    "\"audio\":{\"detections\":%lu,\"env_peak\":%.0f},\"sd\":%s,\"i2c\":\"%s\"}",
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
     gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences,
@@ -238,7 +292,7 @@ static String status_json() {
     (unsigned long)(pps_count > 1 ? pps_int_min : 0), (unsigned long)(pps_count > 1 ? pps_int_max : 0),
     (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0),
     FS_NOMINAL, fs, fs > 0 ? (fs / FS_NOMINAL - 1.0) * 1e6 : 0.0, (unsigned long)g_samples,
-    (unsigned long)det_n, env_peak_seen, sd_ok ? "true" : "false");
+    (unsigned long)det_n, env_peak_seen, sd_ok ? "true" : "false", i2c_found);
   return String(b);
 }
 
@@ -259,7 +313,7 @@ static void h_root() {
              "`<tr><td>I2S measured<td><b>${f}</b>`+"
              "`<tr><td>samples<td>${s.i2s.samples}`+"
              "`<tr><td>detections<td><b>${s.audio.detections}</b> (env peak ${s.audio.env_peak})`+"
-             "`<tr><td>SD<td>${s.sd}`+`<tr><td>heap / psram<td>${s.heap} / ${s.psram}`;}"
+             "`<tr><td>SD<td>${s.sd}`+`<tr><td>I2C<td>${s.i2c}`+`<tr><td>heap / psram<td>${s.heap} / ${s.psram}`;}"
              "u();setInterval(u,2000);</script>";
   http.send(200, "text/html", p);
 }
@@ -315,6 +369,9 @@ void setup() {
   gps_configure();
   Serial.println("gps   UBX config sent (TP1 1 Hz locked+unlocked, NAV-PVT, TIM-TP; RAM layer)");
 
+  Wire.begin(I2C_SDA, I2C_SCL, 100000);
+  i2c_scan();
+
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
   sd_ok = SD.begin(21, SPI, 20000000) || SD.begin(3, SPI, 20000000);
   Serial.printf("sd    %s\n", sd_ok ? "mounted" : "no card");
@@ -325,6 +382,7 @@ void setup() {
   else Serial.printf("i2s   PDM %d Hz nominal\n", FS_NOMINAL);
 
   http.on("/", h_root); http.on("/status", h_status); http.on("/detections", h_dets);
+  http.on("/i2c", []() { i2c_scan(); http.send(200, "text/plain", i2c_found); });   // rescan on demand
   http.begin();
   Serial.println("http  up\n");
 }
