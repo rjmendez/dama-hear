@@ -90,6 +90,31 @@ reference instead of a datasheet. Over a 300 ms capture window 10 ppm is 3 µs �
 now a number rather than an assumption, and it is the floor the I2S rate will be measured against
 once the external mic lands.
 
+## Is the output tagged with the exact time?
+
+Now yes, and it was not before. Rows used to carry `hh:mm:ss` lifted from NAV-PVT -- one-second
+resolution, stale by up to a second, tied to no PPS edge at all.
+
+A PPS edge IS a top-of-second, so the anchor is: latch the local clock at the edge, learn which
+second it was from the NAV-PVT that follows, then
+
+    utc_us = edge_unix_us + (local_us - edge_local_us)
+
+`night.csv` now leads with `utc_us` and a `time_valid` column. Measured against an NTP-synced host:
+**within 20-30 ms**, which confirms the SECOND is right. It says nothing about microsecond accuracy
+-- the host clock is not a reference -- but the second is the part that costs 343 m.
+
+⚠️**The hazard is picking the wrong second, and it looks entirely normal when you do.** NAV-PVT's
+epoch sits ~200 ms past the second on this module, so a late report can arrive just after the NEXT
+edge and land inside a naive time window, labelling that edge with the previous second. A window
+alone cannot catch it. The label must also advance exactly one second per edge; when it does not,
+the labelling is rejected and counted in `time.label_rejects` rather than quietly believed.
+
+Two bugs on the way, both worth remembering. Blanking the anchor on every edge left the node unable
+to timestamp for the ~200 ms each second before the report arrived -- the last good anchor now
+persists, and local and UTC are committed together as one matched pair. And it is the PENDING edge
+that must be named, not "the most recent edge", or a late report renames the wrong one.
+
 ## What a good night looks like
 
 `fix` 3+ with 6+ sats, `pps` climbing by 1 per second with `glitches` at 0, spread of tens of µs,

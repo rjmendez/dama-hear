@@ -50,8 +50,15 @@ while True:
             if s["pps"]["glitches"] > prev["pps"]["glitches"]:
                 say("PPS glitches %d -> %d (noise on the wire, not a fast clock)"
                     % (prev["pps"]["glitches"], s["pps"]["glitches"]))
-            if s["audio"]["detections"] != prev["audio"]["detections"]:
-                say("detections %d -> %d" % (prev["audio"]["detections"], s["audio"]["detections"]))
+            a, pa = s.get("audio", {}), prev.get("audio", {})
+            if a.get("detections") != pa.get("detections") and a.get("detections") is not None:
+                say("detections %s -> %s" % (pa.get("detections"), a.get("detections")))
+            t_, pt = s.get("time", {}), prev.get("time", {})
+            if t_.get("valid") != pt.get("valid"):
+                say("UTC anchor %s" % ("ACQUIRED" if t_.get("valid") else "LOST"))
+            if t_.get("label_rejects", 0) > pt.get("label_rejects", 0):
+                say("*** SECOND-LABEL REJECTED *** %s -> %s -- a 1 s mislabel is 343 m; it was caught"
+                    % (pt.get("label_rejects"), t_.get("label_rejects")))
             if s["uptime_s"] < prev["uptime_s"]:
                 say("NODE REBOOTED (uptime went %ss -> %ss)" % (prev["uptime_s"], s["uptime_s"]))
             # the deliverable: report it once it is real, then only when it moves

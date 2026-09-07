@@ -62,6 +62,23 @@ static volatile uint32_t pps_glitch = 0;
 #define PPS_MIN_GAP_US 500000
 static volatile uint32_t g_samples = 0;      // updated by the audio loop, read in the ISR
 
+// ---- the anchor: local microseconds <-> UTC ---------------------------------
+// A PPS edge IS a top-of-second. Latch the local clock at the edge, then learn which second it was
+// from the NAV-PVT that follows it. Any local timestamp then converts exactly:
+//     utc_us = edge_unix_us + (local_us - edge_local_us)
+// The whole hazard is picking the WRONG second: 1 s is 343 m, and nothing downstream can see it.
+// So the association is bounded in time and the result carries its own validity rather than being
+// assumed good.
+static volatile uint64_t pend_local_us = 0;    // esp_timer at the most recent edge, not yet named
+static volatile uint32_t pend_edge_n   = 0;
+static volatile uint64_t edge_local_us = 0;    // last edge that NAV-PVT successfully named
+static volatile int64_t  edge_unix_us  = 0;    // UTC of that edge, in us since the Unix epoch
+static volatile bool     time_valid    = false;
+static volatile int32_t  last_nano     = 0;    // NAV-PVT fractional part; large = epoch not at TOS
+static volatile uint32_t time_glitch   = 0;    // labellings rejected as inconsistent
+static int64_t  prev_unix_s = 0;               // last accepted label, for the +1s/edge check
+static uint32_t prev_edge_n = 0;
+
 static void IRAM_ATTR pps_isr() {
   uint64_t now = (uint64_t)esp_timer_get_time();
   uint32_t sm = g_samples;
@@ -75,6 +92,9 @@ static void IRAM_ATTR pps_isr() {
   }
   pps_us_last = now; pps_samp_last = sm;
   pps_count++;
+  pend_local_us = now; pend_edge_n = pps_count;   // pending: named by the NAV-PVT that follows.
+  // The previous anchor stays VALID meanwhile -- blanking it here left the node unable to
+  // timestamp for the ~200 ms each second before the report arrived.
 }
 
 // ---------------------------------------------------------------- GPS (minimal NMEA)
@@ -232,6 +252,46 @@ static uint8_t ux_cls, ux_id, ux_a, ux_b;
 
 static void ubx_msg() {
   if (ux_cls == 0x01 && ux_id == 0x07 && ux_len >= 24) {          // NAV-PVT
+    {
+      uint16_t yr = (uint16_t)ux[4] | ((uint16_t)ux[5] << 8);
+      uint8_t mo = ux[6], dy = ux[7], hh = ux[8], mi = ux[9], ss = ux[10], vf = ux[11];
+      last_nano = (int32_t)((uint32_t)ux[16] | ((uint32_t)ux[17] << 8) |
+                            ((uint32_t)ux[18] << 16) | ((uint32_t)ux[19] << 24));
+      // validDate|validTime|fullyResolved = bits 0|1|2
+      if ((vf & 0x07) == 0x07 && yr > 2000) {
+        // days from civil (Howard Hinnant's algorithm) -- no time.h, no timezone, no surprises
+        int y = yr; int m = mo;
+        y -= m <= 2;
+        int era = (y >= 0 ? y : y - 399) / 400;
+        unsigned yoe = (unsigned)(y - era * 400);
+        unsigned doy = (153u * (m + (m > 2 ? -3 : 9)) + 2u) / 5u + dy - 1;
+        unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        long long days = (long long)era * 146097 + (long long)doe - 719468;
+        long long unix_s = days * 86400LL + hh * 3600LL + mi * 60LL + ss;
+        uint64_t now_us = (uint64_t)esp_timer_get_time();
+        // Only label an edge we actually saw, and only if this solution is for THAT second: the
+        // report follows its own epoch by well under a second. Outside that window we do not
+        // guess -- an unlabelled edge is honest, a mislabelled one is 343 m of lie.
+        if (pend_edge_n && (now_us - pend_local_us) < 900000ULL) {
+          // The time window alone is not enough. NAV-PVT's own epoch sits ~200 ms past the second
+          // here, so a LATE report can arrive just after the NEXT edge and land inside the window
+          // -- labelling that edge with the previous second. That is the 343 m error, and it looks
+          // completely normal. So require the label to advance exactly one second per edge.
+          bool ok = true;
+          if (prev_edge_n && prev_unix_s) {
+            long long d_sec = (long long)unix_s - prev_unix_s;
+            long long d_edge = (long long)pend_edge_n - (long long)prev_edge_n;
+            if (d_sec != d_edge) { ok = false; time_glitch++; }
+          }
+          if (ok) {                                   // commit local+utc as one matched pair
+            edge_local_us = pend_local_us;
+            edge_unix_us = (int64_t)unix_s * 1000000LL;
+            time_valid = true;
+          }
+          prev_unix_s = unix_s; prev_edge_n = pend_edge_n;   // re-sync either way
+        }
+      }
+    }
     gps_tacc_ns = (uint32_t)ux[12] | ((uint32_t)ux[13] << 8) | ((uint32_t)ux[14] << 16) | ((uint32_t)ux[15] << 24);
     gps_fix = ux[20]; gps_sats = ux[23];
     snprintf(gps_utc, sizeof gps_utc, "%02u:%02u:%02u", ux[8], ux[9], ux[10]);
@@ -302,6 +362,13 @@ static float env_peak_seen = 0;
 // ppm error of the ESP32's own oscillator against GPS. esp_timer should advance exactly 1e6 us
 // between edges; whatever it actually does is the crystal error, and every I2S rate on this part
 // is derived from that same crystal. Works with no microphone attached.
+// Local esp_timer microseconds -> UTC microseconds. Returns false when the anchor is not trusted.
+static bool local_to_utc(uint64_t local_us, int64_t *utc_us) {
+  if (!time_valid || !edge_unix_us) return false;
+  *utc_us = edge_unix_us + (int64_t)(local_us - edge_local_us);
+  return true;
+}
+
 static double esp_clock_ppm(uint32_t *secs_out) {
   if (pps_count < 3) return 0.0;
   uint32_t n = pps_count - 1;                       // intervals between first and last edge
@@ -319,6 +386,10 @@ static double measured_fs() {
 
 static String status_json() {
   double fs = measured_fs();
+  int64_t utc_now = 0; uint64_t nowl = (uint64_t)esp_timer_get_time();
+  bool tv = local_to_utc(nowl, &utc_now);
+  uint64_t since_edge = pps_count ? (nowl - edge_local_us) : 0;
+  (void)tv;
   char b[1024];
   snprintf(b, sizeof b,
     "{\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
@@ -327,6 +398,7 @@ static String status_json() {
     "\"pps\":{\"edges\":%lu,\"glitches\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,\"spread_us\":%ld},"
     "\"i2s\":{\"nominal_hz\":%d,\"measured_hz\":%.4f,\"ppm\":%.1f,\"samples\":%lu},"
     "\"esp_clock\":{\"ppm_vs_gps\":%.3f,\"pps_intervals\":%lu},"
+    "\"time\":{\"valid\":%s,\"utc_us\":%lld,\"since_edge_us\":%llu,\"navpvt_nano\":%ld,\"label_rejects\":%lu},"
     "\"audio\":{\"enabled\":false,\"note\":\"PDM mic off: GPIO42 is PPS in\"},\"sd\":%s,\"i2c\":\"%s\"}",
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
@@ -341,6 +413,8 @@ static String status_json() {
     (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0),
     FS_NOMINAL, fs, fs > 0 ? (fs / FS_NOMINAL - 1.0) * 1e6 : 0.0, (unsigned long)g_samples,
     esp_clock_ppm(NULL), (unsigned long)(pps_count > 1 ? pps_count - 1 : 0),
+    time_valid ? "true" : "false", (long long)utc_now, (unsigned long long)since_edge,
+    (long)last_nano, (unsigned long)time_glitch,
     sd_ok ? "true" : "false", i2c_found);
   return String(b);
 }
@@ -359,7 +433,7 @@ static void h_root() {
              "`<tr><td>uptime<td><b>${s.uptime_s} s</b>`+"
              "`<tr><td>GPS<td><b>fix ${s.gps.fix}, ${s.gps.sats} sats, ${s.gps.utc} UTC</b> @ ${s.gps.baud} baud, ${s.gps.valid_nmea} valid lines`+`<tr><td>time accuracy<td><b>${s.gps.tacc_ns} ns</b> &middot; pulse qErr ${s.gps.qerr_ps} ps`+`<tr><td>UBX<td>pvt ${s.gps.ubx_pvt}, tim-tp ${s.gps.ubx_timtp}, ack ${s.gps.ubx_ack}, nak ${s.gps.ubx_nak}`+`<tr><td>config<td><b>${s.gps.config_acked?'accepted':'NOT acked - node TX to module RX unwired?'}</b>`+"
              "`<tr><td>PPS edges<td><b>${s.pps.edges}</b> spread ${s.pps.spread_us} us, ${s.pps.glitches} rejected`+"
-             "`<tr><td>I2S measured<td><b>${f}</b>`+`<tr><td>ESP clock vs GPS<td><b>${s.esp_clock.pps_intervals>2?s.esp_clock.ppm_vs_gps.toFixed(3)+' ppm':'need 3 PPS edges'}</b> over ${s.esp_clock.pps_intervals} s`+"
+             "`<tr><td>I2S measured<td><b>${f}</b>`+`<tr><td>UTC now<td><b>${s.time.valid?new Date(s.time.utc_us/1000).toISOString():'anchor not valid'}</b> &middot; ${(s.time.since_edge_us/1000).toFixed(0)} ms since edge, ${s.time.label_rejects} rejected`+`<tr><td>ESP clock vs GPS<td><b>${s.esp_clock.pps_intervals>2?s.esp_clock.ppm_vs_gps.toFixed(3)+' ppm':'need 3 PPS edges'}</b> over ${s.esp_clock.pps_intervals} s`+"
              "`<tr><td>samples<td>${s.i2s.samples}`+"
              "`<tr><td>audio<td>${s.audio.note}`+"
              "`<tr><td>SD<td>${s.sd}`+`<tr><td>I2C<td>${s.i2c}`+`<tr><td>heap / psram<td>${s.heap} / ${s.psram}`;}"
@@ -632,10 +706,11 @@ void loop() {
     if (sd_ok) {   // the radio is a convenience; the card is the record
       File f = SD.open("/night.csv", FILE_APPEND);
       if (f) {
-        if (f.size() == 0) f.println("uptime_s,fix,sats,utc,tacc_ns,pps,pps_bad,spread_us,esp_ppm,samples,fs_hz");
-        f.printf("%lu,%d,%d,%s,%lu,%lu,%lu,%ld,%.4f,%lu,%.4f\n", (unsigned long)up, gps_fix,
-                 gps_sats, gps_utc, (unsigned long)gps_tacc_ns, (unsigned long)pps_count,
-                 (unsigned long)pps_glitch,
+        if (f.size() == 0) f.println("utc_us,time_valid,uptime_s,fix,sats,tacc_ns,pps,pps_bad,spread_us,esp_ppm,samples,fs_hz");
+        int64_t tnow = 0; bool tok = local_to_utc((uint64_t)esp_timer_get_time(), &tnow);
+        f.printf("%lld,%d,%lu,%d,%d,%lu,%lu,%lu,%ld,%.4f,%lu,%.4f\n", (long long)tnow, tok ? 1 : 0,
+                 (unsigned long)up, gps_fix, gps_sats, (unsigned long)gps_tacc_ns,
+                 (unsigned long)pps_count, (unsigned long)pps_glitch,
                  (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0),
                  esp_clock_ppm(NULL), (unsigned long)g_samples, fs);
         f.close();
