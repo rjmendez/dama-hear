@@ -65,20 +65,26 @@ static void node_identity() {
 #define AP_SSID   "dama-hear-node"
 #define AP_PASS   "damahear"          // >=8 chars or the AP silently refuses to start
 
-#define PPS_PIN   1                   // D0. PPS must NOT sit on D11: that is the PDM mic's CLK,
-                                      // an output, and two push-pull drivers on one pin is not a
-                                      // configuration. D0 keeps mic and PPS coexisting.
-#define PDM_CLK   42                  // D11
-#define PDM_DIN   41                  // D12
-#define GPS_RX    44                  // D7  <- module TX
-#define GPS_TX    43                  // D6  -> module RX
-#define I2C_SDA 5                    // D4
-#define I2C_SCL 6                    // D5
-#define SD_SCK 7
-#define SD_MISO 8
-#define SD_MOSI 9
+// Pins and part facts now live in one place per hardware build, so a third node is wired from a
+// document rather than from whichever #define someone finds first. See firmware/boards/README.md.
+#define GPS_UBX  1
+#define GPS_PMTK 2
+#define MIC_PDM  1
+#define MIC_I2S  2
+#include "../boards/xiao_s3_sense.h"
 
-#define FS_NOMINAL 16000
+// Local aliases, kept so this file's 2700 lines do not all churn in one commit. The profile is
+// the source of truth; these are the names the existing code already uses.
+#define PDM_CLK   MIC_CLK_PIN
+#define PDM_DIN   MIC_DIN_PIN
+#define GPS_RX    GPS_RX_PIN
+#define GPS_TX    GPS_TX_PIN
+#define I2C_SDA   I2C_SDA_PIN
+#define I2C_SCL   I2C_SCL_PIN
+#define SD_SCK    SD_SCK_PIN
+#define SD_MISO   SD_MISO_PIN
+#define SD_MOSI   SD_MOSI_PIN
+
 #define BLOCK      256                // finer block -> finer sample-count granularity per PPS
 #define MAXDET     128               // ring, not a cap: the 65th detection used to vanish
 
