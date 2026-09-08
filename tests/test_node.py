@@ -320,6 +320,56 @@ class TestOnset:
         assert max(abs(e) for e in errs) <= 2.0, "worst %+.2f samples" % \
             max(errs, key=abs)
 
+    def test_a_round_inside_the_previous_one_s_tail_is_timed_not_clamped(self):
+        """⚠️THE 18.4% CASE, WITH KNOWN TRUTH.
+
+        A round landing inside the previous round's decay tail never sees its envelope fall to
+        20% of the NEW peak, because the old one is still ringing. Referred to zero, the walk ran
+        to the clamp edge and returned it -- 25 ms early, 8.6 m of range. Referred to the local
+        trough it lands on the event.
+
+        Measured on the real corpus this takes the never-timed count from 42 of 228 to 0.
+        """
+        rng = np.random.default_rng(7)
+        n, truth = int(0.30 * FS), int(0.045 * FS)
+
+        def blip(count, amp, rise_s, decay_s):
+            t = np.arange(count) / FS
+            env = np.where(t < rise_s, t / max(rise_s, 1e-9), np.exp(-(t - rise_s) / decay_s))
+            return amp * env * rng.normal(0, 1, count)
+
+        # previous round at -3 dB still ringing, so the floor sits at ~0.23 of the new peak
+        x = blip(n, 20000.0 * 10 ** (-3 / 20.0), 0.001, 0.060)
+        x[truth:] += blip(n - truth, 20000.0, 0.0016, 0.030)
+        x += rng.normal(0, 20.0, n)
+
+        e = DT.envelope(x, FS)
+        peak = int(np.argmax(e))
+        idx, found = DT.onset_index_checked(e, peak, DT.ONSET_FRAC, back=int(DT.GUARD_S * FS))
+        assert found is True, "still cannot time a round inside a decay tail"
+        err_ms = (idx - truth) / FS * 1e3
+        assert abs(err_ms) < 3.0, "onset off by %.1f ms" % err_ms
+
+    def test_referring_to_the_floor_cannot_regress_a_quiet_event(self):
+        """Where the floor is zero the two references are identical -- a strict generalisation."""
+        e = np.concatenate([np.zeros(2000), np.linspace(0.0, 1.0, 500)])
+        peak = len(e) - 1
+        idx, found = DT.onset_index_checked(e, peak, 0.20, back=2400)
+        assert found is True
+        # the 20% crossing of a clean rise off a zero floor
+        assert abs(idx - (2000 + 0.20 * 500)) < 2.0
+
+    def test_a_trough_at_the_window_edge_is_not_a_baseline(self):
+        """⚠️A window that TRUNCATES a rise has its minimum at the left edge. Referring the
+        fraction to that turns an honest 'clamped, cannot see further back' into a confidently
+        LATE onset. Only an interior trough is a baseline. All 228 real events have one; a
+        truncated block does not, by construction."""
+        e = np.linspace(0.5, 1.0, 1200)          # descending out of the window: never a trough
+        peak = len(e) - 1
+        idx, found = DT.onset_index_checked(e, peak, 0.20, back=1000)
+        assert found is False, "a truncated rise must not be referred to its own edge"
+        assert idx == peak - 1000
+
     def test_a_rise_that_predates_the_block_is_clamped_to_the_edge(self):
         # The gate is block-local. Hand it a block that starts partway up the rise, so the 20%
         # crossing is already behind it: the answer must be the edge, not an extrapolation.
