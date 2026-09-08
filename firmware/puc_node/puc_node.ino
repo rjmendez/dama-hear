@@ -80,6 +80,23 @@ static void mark_healthy_once() {
   Serial.println("boot  marked healthy");
 }
 
+// Whether power was actually removed is not something to infer from "I plugged it back in", and a
+// low uptime proves nothing when OTAs reboot this thing several times an hour. The chip knows:
+// ESP_RST_POWERON means the supply was genuinely interrupted, SW/EXT/PANIC mean it was not.
+static const char *reset_name() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_SW:        return "SW";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_EXT:       return "EXT";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    default:                return "OTHER";
+  }
+}
+
 static void node_identity() {
 #ifdef NODE_ID
   snprintf(node_id, sizeof node_id, "%s", NODE_ID);
@@ -236,13 +253,15 @@ static void routes() {
   http.on("/status", []() {
     char b[900];
     snprintf(b, sizeof b,
-      "{\"node\":\"%s\",\"class\":\"%s\",\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
+      "{\"node\":\"%s\",\"class\":\"%s\",\"uptime_s\":%lu,"
+      "\"reset\":\"%s\",\"power_cycled\":%s,\"heap\":%lu,\"psram\":%lu,"
       "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid\":%lu,"
       "\"baud\":%d,\"rx_pin\":%d,\"tx_pin\":%d,\"last\":\"%s\"},"
       "\"pps\":{\"pin\":%d,\"edges\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,"
       "\"wired\":%s},"
       "\"wifi\":{\"sta\":%s,\"rssi\":%d,\"ip\":\"%s\"}}",
       node_id, NODE_CLASS, (unsigned long)(millis() / 1000),
+      reset_name(), esp_reset_reason() == ESP_RST_POWERON ? "true" : "false",
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getFreePsram(),
       gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences, (unsigned long)gps_valid,
       GPS_BAUD, GPS_RX_PIN, GPS_TX_PIN, gps_last,
@@ -278,6 +297,89 @@ static void routes() {
   http.on("/scanpd", []() { http.send(200, "text/plain", pin_scan(4000, 1)); });
   http.on("/scanpu", []() { http.send(200, "text/plain", pin_scan(4000, 2)); });
 
+  http.on("/gpsreset", HTTP_POST, []() {
+    // I hung the L86 with PMTK285,4,500 and it will not answer anything, so the only way back is
+    // to cycle its power or reset line. The vendor firmware configured GPIO2, 10, 21, 40, 41 and
+    // 42 as OUTPUTS at boot and this firmware drives none of them -- so one of them plausibly
+    // gates the GPS. Pulse each in turn and watch the module's TX line for it coming back.
+    //
+    // Bounded and reversible: each pin is driven for 200 ms and then returned to a high-impedance
+    // input, so nothing is left asserted. They are pins the vendor firmware drives itself, which
+    // is the only reason driving them is reasonable at all.
+    static const int CAND[] = {2, 10, 21, 40, 41, 42};
+    String o = "pulsing the vendor's output pins, watching GPIO44 for the L86 waking up\n\n";
+    for (int pin : CAND) {
+      Serial1.end(); delay(10);
+      pinMode(pin, OUTPUT);
+      digitalWrite(pin, LOW);  delay(200);      // assert (most resets/enables are active low)
+      digitalWrite(pin, HIGH); delay(200);
+      pinMode(pin, INPUT);                      // leave nothing asserted
+      // give it time to boot and start talking, then look at the copper rather than the UART
+      delay(1500);
+      pinMode(GPS_RX_PIN, INPUT);
+      uint32_t ed = 0, n = 0, hi = 0; int last = digitalRead(GPS_RX_PIN);
+      uint64_t t0 = esp_timer_get_time();
+      while ((uint64_t)esp_timer_get_time() - t0 < 1500000ULL) {
+        int v = digitalRead(GPS_RX_PIN); n++; if (v) hi++;
+        if (v != last) { ed++; last = v; }
+      }
+      char b[120];
+      snprintf(b, sizeof b, "GPIO%-3d pulsed -> RX edges %-7lu high %5.1f%%  %s\n",
+               pin, (unsigned long)ed, 100.0 * hi / n,
+               ed > 100 ? "<== THE MODULE IS TALKING AGAIN" : "");
+      o += b;
+      Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+      if (ed > 100) { o += "\nstopping here -- that pin gates the GPS.\n"; break; }
+    }
+    http.send(200, "text/plain", o);
+  });
+
+  http.on("/uart", []() {
+    // Is the L86 transmitting AT ALL? /gps reading nothing means the UART decoded nothing, which
+    // is not the same as the line being quiet -- a wrong baud, a wrong pin or a dead module all
+    // look identical through a UART. The whole-bank scan cannot answer it either, because 43/44
+    // are excluded from it precisely BECAUSE they are the UART. So drop the driver and look at
+    // the copper.
+    Serial1.end();
+    delay(20);
+    String o = "";
+    // Three pull modes on the module's TX. Plain INPUT cannot tell a line DRIVEN low from one
+    // that is simply not driven at all -- both read 0. Against a pullup they differ: a driving
+    // output holds it low, a high-impedance one (module in reset, unpowered, or tri-stated) is
+    // pulled high. That distinction is the difference between "hung firmware" and "not running".
+    for (int pin : {GPS_RX_PIN, GPS_RX_PIN, GPS_RX_PIN, GPS_TX_PIN}) {
+      static int pass = 0;
+      int mode = (pin == GPS_RX_PIN && pass < 3) ? (pass == 0 ? INPUT : pass == 1 ? INPUT_PULLUP : INPUT_PULLDOWN) : INPUT;
+      const char *pmode = (pin == GPS_TX_PIN) ? "float" : (pass == 0 ? "float" : pass == 1 ? "PULLUP" : "plldn");
+      if (pin == GPS_RX_PIN) pass++;
+      pinMode(pin, mode);
+      delay(30);
+      uint32_t hi = 0, n = 0, ed = 0, mn = 0xFFFFFFFF;
+      int last = digitalRead(pin);
+      uint64_t t0 = esp_timer_get_time(), lastch = t0;
+      while ((uint64_t)esp_timer_get_time() - t0 < 2000000ULL) {
+        int v = digitalRead(pin); n++;
+        if (v) hi++;
+        if (v != last) {
+          uint64_t now = esp_timer_get_time();
+          uint32_t r = (uint32_t)(now - lastch);
+          if (r && r < mn) mn = r;
+          ed++; lastch = now; last = v;
+        }
+      }
+      char b[200];
+      snprintf(b, sizeof b, "GPIO%-3d %-3s %-6s edges %-7lu high %5.1f%%  shortest run %lu us  %s\n",
+               pin, pin == GPS_RX_PIN ? "RX" : "TX", pmode, (unsigned long)ed, 100.0 * hi / n,
+               (unsigned long)(mn == 0xFFFFFFFF ? 0 : mn),
+               ed > 100 ? "<== TRANSMITTING" : ed ? "<== a few edges only" : "<== SILENT");
+      o += b;
+    }
+    Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    o += "\nRX float+pullup both LOW  -> the module is DRIVING it low.\n"
+         "RX float LOW but pullup HIGH -> the module is NOT driving at all (reset/unpowered/tri-state).\n";
+    http.send(200, "text/plain", o);
+  });
+
   http.on("/gps", []() {
     // Raw NMEA for a few seconds, pumped here because the parser lives in loop() and a handler
     // that only delay()s would return an empty buffer.
@@ -301,22 +403,23 @@ static void routes() {
       return;
     }
     String c = http.arg("cmd");
-    // BOUND PMTK285. A 500 ms width in a 1000 ms period is a 50% duty timepulse, and the MT3333
-    // does not accept it -- sending one stopped this module transmitting entirely and it then
-    // ignored PMTK101, PMTK104 and even a bare PMTK605. Only a power cycle brought it back.
-    // night_node's /tplen has clamped to 10..900 ms since it was written, for exactly this reason;
-    // this endpoint was built as an unbounded passthrough and I used it to do the thing that guard
-    // exists to prevent. A passthrough that can hang the hardware is not a diagnostic.
+    // Guard PMTK285 against the DOCUMENTED range, which is 2..998 ms (Protocol Spec V1.5 sec
+    // 3.19, Type 0/1/2/3/4 and PPSPulseWidth 2~998). An earlier version of this guard clamped to
+    // 10..400 and said in its own comment that 500 ms was out of range and had hung the module.
+    // That was wrong: 500 is squarely inside the range the datasheet allows. The module did stop
+    // talking on that command, but the reason I gave for it was invented, so the bound is now the
+    // datasheet's and the comment no longer claims to know why.
+    //
+    // Still guarded, because a width approaching the 1000 ms period is not a pulse and the module
+    // is currently in an unknown state -- but the number comes from the document now.
     if (c.startsWith("PMTK285")) {
       int comma = c.indexOf(',', 8);
       long w = comma > 0 ? c.substring(comma + 1).toInt() : -1;
-      if (w < 10 || w > 400) {
+      if (w < 2 || w > 998) {
         http.send(400, "text/plain",
-          "PMTK285 pulse width must be 10..400 ms.\n\n"
-          "500 ms hung this module: it stopped transmitting and ignored every command including a\n"
-          "cold start, and needed a power cycle. The period is 1000 ms and a width near it is not a\n"
-          "pulse. 100 ms is the module default and what /pps expects; 300 ms is about as wide as is\n"
-          "worth going to make it easier to catch on a meter (~1.0 V average against 3.3 V).\n");
+          "PMTK285 PPSPulseWidth must be 2..998 ms (L86 Protocol Spec V1.5, section 3.19).\n"
+          "Type is 0=disable 1=after first fix 2=3D only 3=2D/3D 4=always.\n\n"
+          "100 ms is the module default and what /pps expects.\n");
         return;
       }
     }
