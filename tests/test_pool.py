@@ -123,6 +123,46 @@ class TestOneDataset:
         assert k1 != k2
 
 
+class TestNothingIsDroppedOnTheWayOut:
+    """⚠️records() must not quietly lose a field the store held.
+
+    `extra` was a fixed whitelist and was already dropping `onset_found` -- the flag
+    hear/backend/associate.py refuses arrivals on. A phone honestly reporting that its own onset
+    was not a measurement had that report deleted between the pool and the gate that exists to
+    read it. A whitelist loses whatever a producer adds next; the remainder cannot.
+    """
+
+    def test_a_phone_quality_flag_survives_the_round_trip(self, tmp_path):
+        pl = P.Pool(str(tmp_path / "pool"))
+        pl.ingest_mqtt_jsonl(_mqtt(tmp_path, "sketches-2026-09-08.jsonl", 2))
+        r = pl.records(source="phone")[0]
+        assert r.extra["onset_found"] is True
+
+    def test_a_field_no_one_anticipated_still_arrives(self, tmp_path):
+        # The property, not the instance: add a key to the store and it must reach extra with
+        # no change to records().
+        pl = P.Pool(str(tmp_path / "pool"))
+        pl.ingest_dets(_dets(tmp_path, "dets.csv", 1))
+        day = os.listdir(os.path.join(pl.records_dir))[0]
+        p = os.path.join(pl.records_dir, day, "node.jsonl")
+        rows = [json.loads(l) for l in open(p) if l.strip()]
+        rows[0]["utc_trusted"] = False
+        open(p, "w").write("\n".join(json.dumps(x, sort_keys=True) for x in rows) + "\n")
+        assert P.Pool(str(tmp_path / "pool")).records()[0].extra["utc_trusted"] is False
+
+    def test_the_fields_that_became_attributes_are_not_duplicated_into_extra(self, tmp_path):
+        pl = P.Pool(str(tmp_path / "pool"))
+        pl.ingest_dets(_dets(tmp_path, "dets.csv", 1))
+        r = pl.records()[0]
+        for k in ("node", "source", "fs_hz", "ref_db", "frame_b64"):
+            assert k not in r.extra, k
+        # ...and the remainder is there. `layout` comes from the FRAME, not the CSV flags column,
+        # so it is whatever the fixture packed -- the point here is that it survived at all.
+        assert r.extra["layout"] == SK.unpack(base64.b64decode(
+            next(iter(pl.raw()))["frame_b64"]))["layout"]
+        assert "key" in r.extra and "no_context" in r.extra
+
+
 class TestTime:
     def test_an_unanchored_row_is_kept_and_marked_not_dropped(self, tmp_path):
         pl = P.Pool(str(tmp_path / "pool"))
