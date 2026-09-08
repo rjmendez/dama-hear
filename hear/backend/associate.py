@@ -49,7 +49,67 @@ MARGIN_S: float = 0.030
 
 REASONS: frozenset = frozenset({
     "unknown_node", "duplicate_seq", "duplicate_node_in_group",
-    "pairwise_dt_exceeds_geometry", "too_few_nodes"})
+    "pairwise_dt_exceeds_geometry", "too_few_nodes", "unusable_arrival"})
+
+# ---------------------------------------------------------------------------------------------
+# ARRIVAL QUALITY. A detection can be perfectly real and still not carry a usable arrival TIME,
+# and until now there was no door to refuse one at -- every detection that named a known node was
+# admitted, and any defect in its timestamp went straight into the solve.
+#
+# Two producers already know when their own timestamp is not a measurement and had nowhere to say
+# so:
+#
+#   onset_found   The node gate walks back from the envelope peak to a constant fraction of it.
+#                 When the envelope never falls that far the walk reaches the clamp and returns
+#                 the CLAMP EDGE, which is numerically indistinguishable from a genuine slow
+#                 rise -- 25 ms early, 8.6 m of range at 343 m/s.
+#
+#                 ⚠️THIS IS NOW A BACKSTOP, NOT THE MITIGATION. When this gate was written the
+#                 case was 42 of the 228 reference events (18.4%) -- retriggers sitting inside
+#                 the previous round's decay tail, where the envelope never falls to 20% of the
+#                 NEW peak because the old one is still ringing. detect.onset_index_checked now
+#                 refers the fraction to the LOCAL TROUGH instead of to zero, which takes that
+#                 count to ZERO on the same corpus: those events are timed rather than refused,
+#                 which is strictly better than discarding 18.4% of them.
+#
+#                 It still fires, and must stay: the trough reference is deliberately NOT applied
+#                 when the window's minimum sits at its left edge, because that means the rise
+#                 predates the window and referring to it would report a confidently LATE onset.
+#                 Those are still clamp edges, and they are still not measurements.
+#
+#   utc_trusted   The phone's audio path. False means the HAL supplied no AudioTimestamp or the
+#                 GPS anchor was stale, so the stamp still carries the input-buffer and HAL
+#                 latency -- tens of milliseconds, constant per handset.
+#
+# ⚠️THE TIMESTAMP IS NOT MOVED. Rewriting arrival times that are already in a shipped pipeline
+# would change every historical answer silently, which is worse than the defect. This refuses the
+# detection instead, by the same discipline as nodeclass.require_arrival() and survey's load-time
+# raises: a measurement that is known to be wrong is refused at the door, not corrected in place
+# and not quietly averaged in.
+#
+# ⚠️ABSENT MEANS USABLE. A producer that does not publish these fields is not thereby suspect --
+# most of them predate the fields. Only an EXPLICIT false is a refusal, so this is a strict no-op
+# on every detection recorded before the producers started emitting them.
+_QUALITY_FLAGS = ("onset_found", "utc_trusted")
+
+
+def arrival_is_usable(d: Dict) -> bool:
+    """True unless a producer has explicitly said its own timestamp is not a measurement."""
+    return all(d.get(k, True) is not False for k in _QUALITY_FLAGS)
+
+
+def _unusable_reason(d: Dict) -> str:
+    bad = [k for k in _QUALITY_FLAGS if d.get(k, True) is False]
+    detail = {
+        "onset_found": "the constant-fraction onset was never crossed even against the local "
+                       "trough, so the timestamp is the clamp edge and not a measurement "
+                       "(~25 ms early, ~8.6 m)",
+        "utc_trusted": "no HAL audio timestamp or no fresh GPS anchor, so the stamp still "
+                       "carries the input-buffer and HAL latency",
+    }
+    return "node %d at %.6f s: %s" % (
+        int(d["node_id"]), float(d["t_utc_s"]),
+        "; ".join("%s=false -- %s" % (k, detail[k]) for k in bad))
 
 
 def _xyz(p) -> np.ndarray:
@@ -108,6 +168,8 @@ def associate(detections: Sequence[Dict], survey, temp_c: float = 20.0,
         if int(d["node_id"]) not in survey:
             rejected.append(_row(d, "unknown_node", "node %d at %.6f s is not in the survey"
                                  % (int(d["node_id"]), float(d["t_utc_s"]))))
+        elif not arrival_is_usable(d):
+            rejected.append(_row(d, "unusable_arrival", _unusable_reason(d)))
         else:
             known.append(d)
     known.sort(key=lambda d: (float(d["t_utc_s"]), int(d["node_id"]), int(d["seq"])))

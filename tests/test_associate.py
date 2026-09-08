@@ -57,6 +57,101 @@ def _round(base_t, seq):
     return [_det(1, base_t, seq), _det(2, base_t + 0.005, seq), _det(3, base_t + 0.008, seq)]
 
 
+class TestArrivalQuality:
+    """A detection can be real and still not carry a usable arrival TIME.
+
+    Before this gate existed there was no door to refuse one at: anything naming a known node was
+    admitted and any defect in its timestamp went straight into the solve. The two producers that
+    already know their own stamp is not a measurement -- the node gate's `onset_found` and the
+    phone's `utc_trusted` -- had nowhere to say so.
+    """
+
+    def test_absent_flags_mean_usable_so_this_is_a_no_op_on_old_data(self):
+        """Most recorded detections predate these fields. Treating absence as suspect would
+        retroactively reject the entire existing corpus."""
+        got = AS.associate(_round(100.0, 0), TIGHT)
+        _conserved(got, 3)
+        assert len(got["events"]) == 1
+        assert got["events"][0]["n_nodes"] == 3
+
+    def test_a_fabricated_onset_is_refused_not_solved(self):
+        """The walk returns the clamp edge, and the arrival is 25 ms early -- 8.6 m.
+
+        ⚠️This was 18.4% of the 228-event reference corpus when the gate was written. Referring
+        the fraction to the local trough took that to ZERO, so this is now a BACKSTOP for the
+        residual case the trough reference deliberately does not cover: a window whose minimum
+        sits at its left edge, where the rise predates the window and referring to it would
+        report a confidently late onset instead of an honest clamp."""
+        dets = _round(100.0, 0)
+        dets[1]["onset_found"] = False
+        # min_nodes=2 so the survivors can still form an event. At the default of 3 they cannot,
+        # and they are then rejected as too_few_nodes -- which is correct but tests a different
+        # thing, and asserting on it here would hide whether the quality gate fired at all.
+        got = AS.associate(dets, TIGHT, min_nodes=2)
+        _conserved(got, 3)
+        assert [r["reason"] for r in got["rejected"]] == ["unusable_arrival"]
+        assert "clamp edge" in got["rejected"][0]["detail"]
+        # The other two still form an event; one bad node does not cost the others theirs.
+        assert got["events"][0]["n_nodes"] == 2
+
+    def test_a_refused_arrival_can_starve_an_event_below_min_nodes(self):
+        """The cost, stated rather than discovered later. Refusing one node of three leaves two,
+        which the default min_nodes rejects -- so a single fabricated onset can remove an event
+        entirely. That is the right trade against solving it 8.6 m wrong, but it is a trade, and
+        conservation still names every detection."""
+        dets = _round(100.0, 0)
+        dets[1]["onset_found"] = False
+        got = AS.associate(dets, TIGHT)
+        _conserved(got, 3)
+        assert got["events"] == []
+        # One too_few_nodes row PER GROUP MEMBER (associate.py:237), so the two survivors give
+        # two rows, plus the one refused arrival.
+        assert sorted(r["reason"] for r in got["rejected"]) == [
+            "too_few_nodes", "too_few_nodes", "unusable_arrival"]
+
+    def test_an_untrusted_phone_stamp_is_refused(self):
+        dets = _round(100.0, 0)
+        dets[2]["utc_trusted"] = False
+        got = AS.associate(dets, TIGHT)
+        _conserved(got, 3)
+        assert got["rejected"][0]["reason"] == "unusable_arrival"
+        assert "HAL" in got["rejected"][0]["detail"]
+
+    def test_both_flags_false_names_both(self):
+        dets = _round(100.0, 0)
+        dets[0]["onset_found"] = False
+        dets[0]["utc_trusted"] = False
+        got = AS.associate(dets, TIGHT)
+        detail = got["rejected"][0]["detail"]
+        assert "onset_found=false" in detail and "utc_trusted=false" in detail
+
+    def test_true_flags_pass_through(self):
+        dets = _round(100.0, 0)
+        for d in dets:
+            d["onset_found"] = True
+            d["utc_trusted"] = True
+        got = AS.associate(dets, TIGHT)
+        _conserved(got, 3)
+        assert got["events"][0]["n_nodes"] == 3
+
+    def test_only_an_explicit_false_refuses(self):
+        """None is not False. A producer that emits the key but could not evaluate it must not be
+        read as having declared the arrival bad."""
+        assert AS.arrival_is_usable({"onset_found": None}) is True
+        assert AS.arrival_is_usable({"onset_found": True}) is True
+        assert AS.arrival_is_usable({}) is True
+        assert AS.arrival_is_usable({"onset_found": False}) is False
+
+    def test_losing_every_node_leaves_no_event_and_still_conserves(self):
+        dets = _round(100.0, 0)
+        for d in dets:
+            d["onset_found"] = False
+        got = AS.associate(dets, TIGHT)
+        _conserved(got, 3)
+        assert got["events"] == []
+        assert len(got["rejected"]) == 3
+
+
 class TestCadences:
     """Measured spacings: 85 ms at 700 rpm, ~328 ms burst, 522 ms across a 19-round string."""
 
