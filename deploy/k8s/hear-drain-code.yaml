@@ -1,0 +1,1544 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hear-drain-code
+  namespace: dama
+  labels:
+    app: hear-drain
+  annotations:
+    dama-hear/commit: '68e7ac7-dirty'
+    dama-hear/generated-by: deploy/k8s/gen_configmap.py
+data:
+  hear__init__.py: |
+    
+  hear_sketch.py: |
+    #!/usr/bin/env python3
+    """Log-mel sketch: what a node ships instead of audio, sized to one Meshtastic packet.
+    
+    A Meshtastic payload is 237 bytes, ~200 usable after protobuf framing. The sketch is
+    MEL_BANDS x FRAMES int8 values -- 160 B at the default 20x8 -- leaving room for a header.
+    
+    WHY A SKETCH AND NOT A LEARNED EMBEDDING. A learned embedding is only as general as the classes
+    it was trained on, and it goes stale the day you add a new sound. A log-mel sketch is just a
+    coarse spectrogram: the node commits to no interpretation, and the central side can train new
+    classifiers on the same bytes forever -- gunshots today, cicadas next, whatever after. That is
+    the whole point of putting the hard maths elsewhere.
+    
+    ⚠️QUANTISATION IS PER-EVENT AND THE SCALE MUST TRAVEL. Levels span the noise floor to a clipped
+    rifle report; a fixed int8 scale would either saturate or waste its range. The reference level is
+    sent in the header so the central side can undo it. Without that the sketch carries shape but not
+    amplitude, and amplitude is the single strongest feature this project has measured.
+    """
+    from __future__ import annotations
+    
+    import math
+    import struct
+    from typing import Dict, Optional, Tuple
+    
+    import numpy as np
+    
+    MEL_BANDS = 20
+    FRAMES = 8
+    F_LO, F_HI = 300.0, 20000.0
+    HOP_S = 0.004
+    NFFT = 256
+    MESHTASTIC_PAYLOAD = 237
+    
+    # ⚠️THE BAND EDGES DEPEND ON fs AND THE FRAME COULD NOT SAY SO.
+    # `mel_filterbank` clamps its top edge to Nyquist, so 20 bands span 300 Hz-20 kHz on a 48 kHz
+    # phone and 300 Hz-7.84 kHz on a 16 kHz node. Band 12 is 4.6 kHz on one and 1.9 kHz on the other.
+    # The header carried `bands` and `frames` but never `fs`, so two frames that mean entirely
+    # different things were byte-indistinguishable -- and the whole point of the phones emitting this
+    # format is that one corpus is built from both. Four bits of the flags word now carry a sample
+    # rate code. 0 stays "unstated", which is what every frame written before this said implicitly.
+    FS_CODES = {8000.0: 1, 16000.0: 2, 22050.0: 3, 24000.0: 4, 32000.0: 5,
+                44100.0: 6, 48000.0: 7, 96000.0: 8, 192000.0: 9}
+    FS_BY_CODE = {v: k for k, v in FS_CODES.items()}
+    FS_SHIFT = 8                      # flags bits 8-11; bits 0-7 stay event flags (bit0 = retrigger)
+    FS_MASK = 0x0F
+    
+    # The event bits, named. ⚠️These are v1 positions and must be read off `event_flags` (flags &
+    # 0xFF), never off the raw word: in v2 bit 1 is a profile-id bit, so masking the raw flags tags a
+    # good v2 frame as context-starved.
+    FLAG_RETRIGGER = 0x0001
+    FLAG_NO_CONTEXT = 0x0002
+    
+    LAYOUT_NYQUIST = "nyquist"      # legacy: edges rescaled to each node's Nyquist
+    LAYOUT_FIXED = "fixed"          # edges always over [F_LO, F_HI]; bands above Nyquist go empty
+    LAYOUT_BIT = 1 << 12            # flags bit 12 set => LAYOUT_FIXED
+    
+    #: Above this rate the two layouts are IDENTICAL, because min(F_HI, fs/2*0.98) == F_HI.
+    #: Every 48 kHz sensor in this fleet is above it, so the flag changes not one byte a phone sends.
+    LAYOUT_EQUIVALENT_ABOVE_HZ = F_HI / 0.49    # 40816.3 Hz at F_HI = 20 kHz
+    
+    
+    
+    
+    def fs_code(fs: Optional[float]) -> int:
+        """Code for `fs`, or 0 when it is not one this format can name.
+    
+        0 rather than an error: an odd rate is still worth sketching, and "unstated" is an honest
+        thing for the frame to say. It is NOT the same as a stated rate, and `unpack` keeps them apart.
+        """
+        return 0 if fs is None else FS_CODES.get(float(fs), 0)
+    
+    
+    def band_edges_hz(fs: float, bands: int = MEL_BANDS,
+                      f_lo: float = F_LO, f_hi: float = F_HI,
+                      layout: str = LAYOUT_NYQUIST) -> np.ndarray:
+        """The bands+2 triangle edges this fs and layout produce. What a consumer needs to know
+        whether two frames are comparable at all."""
+        hi = f_hi if layout == LAYOUT_FIXED else min(f_hi, fs / 2.0 * 0.98)
+        return _mel_to_hz(np.linspace(_hz_to_mel(f_lo), _hz_to_mel(hi), bands + 2))
+    
+    
+    def valid_bands(fs: float, bands: int = MEL_BANDS, f_lo: float = F_LO, f_hi: float = F_HI,
+                    layout: str = LAYOUT_FIXED, strict: bool = False) -> int:
+        """How many of `bands` carry any FFT bin at this rate. Under `fixed` a slow node's top bands
+        are empty and must be MASKED, not fed to a model as if they were measurements of silence:
+        unmasked they cost 1.7 points of cross-rate AUC (0.9306 against 0.9473).
+    
+        ⚠️`strict=False` (the default, and what the 0.9473 was measured with) counts every band with
+        a bin below Nyquist, so the TOP one is partially covered and reads systematically low. That
+        band is still worth more than nothing on this corpus; `strict=True` drops it if you would
+        rather have fewer, cleaner bands."""
+        if layout == LAYOUT_NYQUIST:
+            return int(bands)
+        e = band_edges_hz(fs, bands, f_lo, f_hi, LAYOUT_FIXED)
+        nyq = fs / 2.0
+        if strict:
+            # every triangle wholly below Nyquist. Excludes the one straddling band, whose energy is
+            # systematically low because part of its passband does not exist on this node.
+            return int(sum(1 for b in range(bands) if e[b + 2] <= nyq))
+        return int(sum(1 for b in range(bands) if e[b] < nyq))
+    
+    
+    def common_bands(rates: "Sequence[float]", bands: int = MEL_BANDS, **kw) -> int:
+        """Bands usable by EVERY rate in `rates` -- the width of a matrix they can share."""
+        return min(valid_bands(float(r), bands, layout=LAYOUT_FIXED, **kw) for r in rates)
+    
+    
+    def _hz_to_mel(f):
+        return 2595.0 * np.log10(1.0 + np.asarray(f, float) / 700.0)
+    
+    
+    def _mel_to_hz(m):
+        return 700.0 * (10 ** (np.asarray(m, float) / 2595.0) - 1.0)
+    
+    
+    def mel_filterbank(fs: float, nfft: int = NFFT, bands: int = MEL_BANDS,
+                       f_lo: float = F_LO, f_hi: float = F_HI,
+                       layout: str = LAYOUT_NYQUIST) -> np.ndarray:
+        """Triangular mel bank, area-normalised.
+    
+        ⚠️`layout` DECIDES WHETHER TWO SENSORS ARE COMPARABLE AT ALL.
+    
+        `nyquist` (the shipped default) rescales the whole bank to each node's Nyquist, so band 12 is
+        5826 Hz at 48 kHz and 3072 Hz at 16 kHz. Measured on the 228 labelled events: a model trained
+        on 48 kHz sketches and applied to the same audio at 16 kHz drops from AUC 0.9634 to **0.9141**,
+        purely from the axis moving.
+    
+        `fixed` puts the edges over [f_lo, f_hi] whatever the rate. Bands whose support is wholly
+        above a node's Nyquist get no FFT bins, so their power is zero and they quantise to the floor;
+        the rest mean the same frequency everywhere. With those empty bands masked off
+        (`valid_bands`), the same cross-rate transfer is **0.9473 / 0.9485** in both directions.
+    
+        The cost, stated rather than hidden: at 16 kHz only 15 of 20 bands are usable, so a slow node
+        resolves its own spectrum more coarsely than the rescaled bank would. That is the trade -- one
+        model across the fleet, against per-node resolution.
+        """
+        if layout not in (LAYOUT_NYQUIST, LAYOUT_FIXED):
+            raise ValueError("layout must be %r or %r" % (LAYOUT_NYQUIST, LAYOUT_FIXED))
+        hi = f_hi if layout == LAYOUT_FIXED else min(f_hi, fs / 2.0 * 0.98)
+        edges = _mel_to_hz(np.linspace(_hz_to_mel(f_lo), _hz_to_mel(hi), bands + 2))
+        freqs = np.fft.rfftfreq(nfft, 1.0 / fs)
+        fb = np.zeros((bands, len(freqs)))
+        for b in range(bands):
+            lo, mid, up = edges[b], edges[b + 1], edges[b + 2]
+            if up <= lo:
+                continue
+            rise = (freqs - lo) / max(mid - lo, 1e-9)
+            fall = (up - freqs) / max(up - mid, 1e-9)
+            fb[b] = np.clip(np.minimum(rise, fall), 0.0, None)
+            s = fb[b].sum()
+            if s > 0:
+                fb[b] /= s
+        return fb
+    
+    
+    def sketch(x: np.ndarray, fs: float, bands: int = MEL_BANDS, frames: int = FRAMES,
+               hop_s: float = HOP_S, nfft: int = NFFT,
+               layout: str = LAYOUT_NYQUIST) -> Tuple[np.ndarray, float]:
+        """(int8 [bands x frames], ref_db). Frames start at the sample the caller passes as index 0.
+    
+        `layout` decides what band k MEANS -- see [mel_filterbank]. At any rate above
+        LAYOUT_EQUIVALENT_ABOVE_HZ the two are the same bytes."""
+        x = np.asarray(x, float)
+        fb = mel_filterbank(fs, nfft, bands, layout=layout)
+        hop = max(1, int(hop_s * fs))
+        win = np.hanning(nfft)
+        out = np.zeros((bands, frames))
+        for t in range(frames):
+            s = t * hop
+            seg = x[s:s + nfft]
+            if len(seg) < nfft:
+                seg = np.pad(seg, (0, nfft - len(seg)))
+            P = np.abs(np.fft.rfft(seg * win, nfft)) ** 2
+            out[:, t] = fb @ P
+        db = 10.0 * np.log10(out + 1e-12)
+        ref = float(db.max())
+        # 0.5 dB per step over a 64 dB window: enough to hold a spectrum's shape, and 64 dB is
+        # wider than the useful dynamic range between this site's noise floor and a clipped report.
+        q = np.clip(np.round((db - ref) * 2.0), -128, 127).astype(np.int8)
+        return q, ref
+    
+    
+    def pack(node_us: int, ref_db: float, peak: int, q: np.ndarray, flags: int = 0,
+             fs: Optional[float] = None, layout: str = LAYOUT_NYQUIST) -> bytes:
+        """Wire format. Header is 12 B; the sketch is bands*frames int8.
+    
+        `node_us` is microseconds within the PPS second -- the whole second comes from the mesh's own
+        clock, so the timestamp costs 4 bytes rather than 8 and still resolves to 1 us.
+    
+        `fs` is folded into flags bits 8-11 (see FS_CODES). Pass it: a frame that cannot say what its
+        bands mean is only comparable to frames from an identical node.
+        """
+        body = q.astype(np.int8).tobytes()
+        f = (int(flags) & 0xFFFF) | ((fs_code(fs) & FS_MASK) << FS_SHIFT)
+        if layout == LAYOUT_FIXED:
+            f |= LAYOUT_BIT
+        elif layout != LAYOUT_NYQUIST:
+            raise ValueError("layout must be %r or %r" % (LAYOUT_NYQUIST, LAYOUT_FIXED))
+        hdr = struct.pack("<IhHBBH", int(node_us) & 0xFFFFFFFF, int(round(ref_db * 4)),
+                          min(int(peak), 0xFFFF), q.shape[0], q.shape[1], f)
+        return hdr + body
+    
+    
+    def unpack(b: bytes) -> Dict:
+        """Decode a wire frame. Raises ValueError on anything that is not one.
+    
+        ⚠️A radio DELIVERS TRUNCATED FRAMES. This used to slice the body and reshape it, so a short
+        packet surfaced as numpy's "cannot reshape array of size 157 into shape (20,8)" from three
+        frames down the stack -- and a body that was short by a whole row of the sketch, with the
+        slice landing on a multiple of `frames`, would have reshaped CLEANLY into the wrong geometry.
+        """
+        if len(b) < 12:
+            raise ValueError("frame is %d B, shorter than the 12 B header" % len(b))
+        node_us, ref4, peak, bands, frames, flags = struct.unpack("<IhHBBH", b[:12])
+        if bands <= 0 or frames <= 0:
+            raise ValueError("header declares a %dx%d sketch" % (bands, frames))
+        want = 12 + bands * frames
+        if len(b) != want:
+            raise ValueError("frame is %d B; header declares %dx%d, so it must be %d"
+                             % (len(b), bands, frames, want))
+        q = np.frombuffer(b[12:want], dtype=np.int8).reshape(bands, frames)
+        code = (flags >> FS_SHIFT) & FS_MASK
+        fs = FS_BY_CODE.get(code)
+        layout = LAYOUT_FIXED if (flags & LAYOUT_BIT) else LAYOUT_NYQUIST
+        return {"node_us": node_us, "ref_db": ref4 / 4.0, "peak": peak,
+                "flags": flags, "event_flags": flags & 0xFF, "retrigger": bool(flags & 1),
+                "fs_code": code, "fs_hz": fs, "layout": layout,
+                # how many of this frame's bands carry a measurement. None when the rate is unstated:
+                # without it there is no way to know which bands a slow node left empty.
+                "valid_bands": None if fs is None else valid_bands(fs, bands, layout=layout),
+                # None, not a guess: two frames whose band edges are unknown must not be silently
+                # stacked into one feature matrix. See hear/corpus.py.
+                "band_edges_hz": None if fs is None else band_edges_hz(fs, bands, layout=layout),
+                "q": q, "db": q.astype(float) / 2.0 + ref4 / 4.0}
+    
+    
+    def wire_size(bands: int = MEL_BANDS, frames: int = FRAMES) -> int:
+        return 12 + bands * frames
+    
+    
+    def fits_meshtastic(bands: int = MEL_BANDS, frames: int = FRAMES, overhead: int = 37) -> bool:
+        """237 B payload minus protobuf/portnum overhead. Default 20x8 leaves headroom."""
+        return wire_size(bands, frames) <= MESHTASTIC_PAYLOAD - overhead
+    
+  hear_corpus.py: |
+    #!/usr/bin/env python3
+    """One corpus from two kinds of sensor.
+    
+    A Tier-1 node ships a 172-byte sketch over Meshtastic because that is all the airtime it has. A
+    dama phone ships the SAME 172 bytes over MQTT because it does not need to -- it holds an 8 s ring
+    and a fat link. The phones are the only sensors carrying operator labels, so emitting the node's
+    format is what makes them the nodes' training corpus instead of a second, incompatible dataset.
+    
+    This module is where the two meet. It decodes both, keeps what each can honestly say about
+    itself, and REFUSES to stack frames whose bands do not mean the same frequencies.
+    
+    ⚠️THE FS GUARD IS THE POINT. `mel_filterbank` clamps its top edge to Nyquist, so 20 bands span
+    300 Hz-20 kHz at 48 kHz and 300 Hz-7.84 kHz at 16 kHz. Band 12 is 4.6 kHz on one and 1.9 kHz on
+    the other. Stacking them into one feature matrix trains a model on a frequency axis that moves
+    between rows, and nothing about the resulting number looks wrong. `feature_matrix` will not do it
+    without being told, in as many words, which rate it is building for.
+    """
+    from __future__ import annotations
+    
+    import base64
+    import json
+    from dataclasses import dataclass, field
+    from typing import Any, Dict, Iterable, List, Optional, Tuple
+    
+    import numpy as np
+    
+    from . import sketch as SK
+    
+    
+    @dataclass
+    class Record:
+        """One decoded sketch, from either kind of sensor."""
+        node_id: str
+        source: str                      # "phone" | "node"
+        q: np.ndarray                    # int8 [bands, frames]
+        ref_db: float
+        peak: int
+        bands: int
+        frames: int
+        fs_hz: Optional[float]           # None == the frame did not state it
+        node_us: int
+        retrigger: bool
+        ts_utc_s: Optional[float] = None
+        clipped: Optional[bool] = None
+        clock_tier: Optional[str] = None
+        sync_sigma_ns: Optional[float] = None
+        extra: Dict[str, Any] = field(default_factory=dict)
+    
+        @property
+        def db(self) -> np.ndarray:
+            """Absolute dB. The int8 carries shape; `ref_db` is what puts it back on a scale."""
+            return self.q.astype(float) / 2.0 + self.ref_db
+    
+        def band_edges_hz(self) -> Optional[np.ndarray]:
+            return None if self.fs_hz is None else SK.band_edges_hz(self.fs_hz, self.bands)
+    
+    
+    class SkipReason(Exception):
+        """Why a message produced no record. Raised, never returned as an empty Record: a caller that
+        silently drops rows cannot tell an absent sensor from a broken decoder."""
+    
+    
+    def _decode(frame: bytes) -> Dict:
+        """SK.unpack's ValueErrors become SkipReason: a malformed frame is a message this corpus
+        could not use, not a crash in the reader."""
+        try:
+            return SK.unpack(frame)
+        except ValueError as e:
+            raise SkipReason(str(e))
+    
+    
+    def from_phone(payload: Dict[str, Any], node_id: Optional[str] = None) -> Record:
+        """Decode one `dama/<node>/acoustic_sketch` message.
+    
+        The phone states `sketch_skipped` when it could not sketch an onset -- a capture drop, a ring
+        that had not caught up. That is a real event with no sketch, not a malformed message, and it
+        is raised as a skip with its own reason rather than fabricated into a record.
+        """
+        if "sketch_skipped" in payload:
+            raise SkipReason("phone skipped: %s" % payload["sketch_skipped"])
+        b64 = payload.get("sketch_b64")
+        if not b64:
+            raise SkipReason("no sketch_b64")
+        d = _decode(base64.b64decode(b64))
+        nid = node_id or payload.get("node_id") or payload.get("node") or "?"
+        # The JSON repeats geometry the header already carries. If they disagree, one of the two
+        # producers is not what we think it is -- do not pick a winner.
+        for key, got in (("bands", d["q"].shape[0]), ("frames", d["q"].shape[1])):
+            if key in payload and int(payload[key]) != got:
+                raise SkipReason("%s: json says %s, header says %d" % (key, payload[key], got))
+        # The layout decides what band k MEANS, so a disagreement between the frame and the JSON
+        # beside it is not cosmetic -- one of the two producers is not the version we think it is.
+        if "layout" in payload and payload["layout"] != d["layout"]:
+            raise SkipReason("layout: json says %r, frame flags say %r"
+                             % (payload["layout"], d["layout"]))
+        fs = d["fs_hz"]
+        if fs is None and payload.get("fs"):
+            # An older phone build that packed no rate code but reported it alongside. Believable,
+            # and recorded as coming from the JSON rather than the frame.
+            fs = float(payload["fs"])
+        ts = payload.get("ts_utc_ms")
+        return Record(
+            node_id=str(nid), source="phone", q=d["q"], ref_db=d["ref_db"], peak=d["peak"],
+            bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=d["node_us"],
+            retrigger=bool(d["retrigger"]),
+            ts_utc_s=None if ts is None else float(ts) / 1000.0,
+            clipped=payload.get("clipped"),
+            clock_tier=payload.get("clock_tier"),
+            sync_sigma_ns=payload.get("sync_sigma_ns"),
+            extra=dict({k: payload[k] for k in
+                        ("trigger_ts_utc_ms", "onset_offset_us", "onset_dated", "since_prev_s")
+                        if k in payload},
+                       # from the FRAME, not the JSON: it decides whether this row can be aligned
+                       # with a row from a sensor running at another rate.
+                       layout=d["layout"], valid_bands=d["valid_bands"]),
+        )
+    
+    
+    def from_node(frame: bytes, node_id: str, second_utc_s: Optional[int] = None,
+                  fs_hz: Optional[float] = None) -> Record:
+        """Decode one Meshtastic frame.
+    
+        `node_us` is microseconds WITHIN a second; the second itself comes from the mesh's own clock
+        and is not in the frame. Pass `second_utc_s` if the gateway knows it -- without it the record
+        carries no absolute time, which is the truth, not a defect to paper over with arrival time.
+        """
+        d = _decode(frame)
+        fs = d["fs_hz"] if d["fs_hz"] is not None else fs_hz
+        ts = None if second_utc_s is None else float(second_utc_s) + d["node_us"] / 1e6
+        return Record(
+            node_id=str(node_id), source="node", q=d["q"], ref_db=d["ref_db"], peak=d["peak"],
+            bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=d["node_us"],
+            retrigger=bool(d["retrigger"]), ts_utc_s=ts,
+            extra={"layout": d["layout"], "valid_bands": d["valid_bands"]},
+        )
+    
+    
+    def feature_matrix(records: Iterable[Record], fs_hz: float,
+                       mode: str = "db") -> Tuple[np.ndarray, List[Record]]:
+        """[n, bands*frames] for the records that belong on `fs_hz`'s frequency axis, and those records.
+    
+        `fs_hz` is REQUIRED and is not inferred from the data. Inferring it makes the common mistake
+        -- a corpus of mostly-48 kHz phones with a handful of 16 kHz nodes -- silent: the majority
+        wins the inference and the minority is stacked onto an axis it was never measured on.
+    
+        Records with no stated rate are excluded. They may well be `fs_hz`; nothing in the frame says
+        so, and a training matrix is the wrong place to guess.
+    
+        mode "db"  -- absolute dB, ref_db restored. Amplitude alone was worth AUC 0.90 on the 2026-09-05
+                      corpus, so this is the default.
+        mode "q"   -- the raw int8, shape only. Use when levels are not comparable across sites.
+        """
+        if mode not in ("db", "q"):
+            raise ValueError("mode must be 'db' or 'q'")
+        kept: List[Record] = []
+        rows: List[np.ndarray] = []
+        for r in records:
+            if r.fs_hz is None or float(r.fs_hz) != float(fs_hz):
+                continue
+            v = r.db if mode == "db" else r.q.astype(float)
+            rows.append(v.reshape(-1))
+            kept.append(r)
+        if not rows:
+            return np.zeros((0, 0)), []
+        w = {len(r) for r in rows}
+        if len(w) != 1:
+            raise ValueError("mixed sketch geometry in one matrix: %s" % sorted(w))
+        return np.vstack(rows), kept
+    
+    
+    def aligned_matrix(records: Iterable[Record], mode: str = "db",
+                       strict: bool = False) -> Tuple[np.ndarray, List[Record], Dict[str, Any]]:
+        """ONE matrix across sensors running at DIFFERENT rates, over the bands they share.
+    
+        This is the thing `feature_matrix` refuses to do, and it is only safe because of the fixed
+        band layout: under `LAYOUT_FIXED` band k is the same frequency at every rate, so a 16 kHz
+        node's bands 0-14 are the SAME MEASUREMENT as a 48 kHz phone's bands 0-14. The bands a slow
+        node cannot reach are dropped from every row, including the fast ones -- a matrix is only as
+        wide as its narrowest sensor.
+    
+        Measured on the 228 labelled events (train 48 kHz, score the same audio at 16 kHz):
+    
+            rescaled bank, all 20 bands       0.9141   <- what shipping without this does
+            fixed bank, all 20 bands          0.9306   <- fixed axis, empty bands NOT masked
+            fixed bank, common 15 bands       0.9473   <- this function
+    
+        ⚠️REFUSES ANY `nyquist`-LAYOUT RECORD. Those bands are rescaled per rate, so "band 14" is a
+        different frequency in every row and the alignment this function performs would be fiction.
+        A frame that does not state its rate is dropped for the same reason.
+    
+        Returns (X, kept, info). `info` names the rates included and the band count, because a matrix
+        whose width silently depends on which sensors happened to report is not reproducible.
+        """
+        if mode not in ("db", "q"):
+            raise ValueError("mode must be 'db' or 'q'")
+        recs = [r for r in records if r.fs_hz is not None]
+        bad = [r for r in recs if r.extra.get("layout", SK.LAYOUT_FIXED) != SK.LAYOUT_FIXED]
+        if bad:
+            raise ValueError(
+                "%d record(s) use the %r layout, whose band edges are rescaled per rate; they cannot "
+                "be aligned with anything. Re-sketch them or use feature_matrix() per rate."
+                % (len(bad), SK.LAYOUT_NYQUIST))
+        if not recs:
+            return np.zeros((0, 0)), [], {"bands": 0, "frames": 0, "rates_hz": [], "dropped": 0}
+        geom = {(r.bands, r.frames) for r in recs}
+        if len(geom) != 1:
+            raise ValueError("mixed sketch geometry: %s" % sorted(geom))
+        bands, frames = geom.pop()
+        rates = sorted({float(r.fs_hz) for r in recs})
+        k = min(SK.valid_bands(fs, bands, layout=SK.LAYOUT_FIXED, strict=strict) for fs in rates)
+        if k <= 0:
+            raise ValueError("no band is usable by every rate in %s" % rates)
+        rows = []
+        for r in recs:
+            v = r.db if mode == "db" else r.q.astype(float)
+            rows.append(v[:k, :].reshape(-1))
+        info = {"bands": k, "frames": frames, "rates_hz": rates, "strict": bool(strict),
+                "dropped_bands": bands - k,
+                "top_edge_hz": float(SK.band_edges_hz(max(rates), bands,
+                                                      layout=SK.LAYOUT_FIXED)[k + 1])}
+        return np.vstack(rows), recs, info
+    
+    
+    def summarise(records: Iterable[Record]) -> Dict[str, Any]:
+        """What a corpus can defend about itself: how it splits by rate and by source.
+    
+        A single count would hide the split that matters -- rows on different frequency axes are not
+        one corpus, however much they look like one in a row count.
+        """
+        recs = list(records)
+        by_fs: Dict[str, int] = {}
+        by_src: Dict[str, int] = {}
+        for r in recs:
+            by_fs[str(r.fs_hz)] = by_fs.get(str(r.fs_hz), 0) + 1
+            by_src[r.source] = by_src.get(r.source, 0) + 1
+        return {
+            "records": len(recs),
+            "by_fs_hz": by_fs,
+            "by_source": by_src,
+            "unstated_fs": by_fs.get("None", 0),
+            "retriggers": sum(1 for r in recs if r.retrigger),
+            "clipped": sum(1 for r in recs if r.clipped),
+            "nodes": sorted({r.node_id for r in recs}),
+        }
+    
+    
+    def read_mqtt_jsonl(path: str) -> Tuple[List[Record], List[str]]:
+        """Read a JSONL capture of `dama/+/acoustic_sketch` -- one {"topic":..., "payload":{...}} per
+        line, or a bare payload with `node_id` in it. Returns (records, skip reasons).
+    
+        Skips are RETURNED, not logged and dropped: a corpus that cannot say how much it discarded and
+        why is not auditable.
+        """
+        out: List[Record] = []
+        skips: List[str] = []
+        with open(path) as fh:
+            for n, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError as e:
+                    skips.append("line %d: bad json: %s" % (n, e))
+                    continue
+                payload = obj.get("payload", obj)
+                # The node can be stated three ways and they are checked in order of how load-bearing
+                # they are: the corpus worker records it at the top level having taken it from the
+                # TOPIC (the only place the broker guarantees), a raw capture has the topic itself,
+                # and a bare payload may carry its own claim. A payload's self-report is last because
+                # it is the one a misconfigured device can get wrong.
+                nid = obj.get("node_id")
+                if not nid:
+                    topic = obj.get("topic")
+                    if topic:
+                        parts = str(topic).split("/")
+                        if len(parts) >= 3:
+                            nid = parts[1]
+                try:
+                    out.append(from_phone(payload, node_id=nid))
+                except SkipReason as e:
+                    skips.append("line %d: %s" % (n, e))
+                except Exception as e:                     # malformed base64, short frame, ...
+                    skips.append("line %d: %r" % (n, e))
+        return out, skips
+    
+    
+    def main(argv=None) -> int:
+        import argparse
+        ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+        ap.add_argument("jsonl", help="captured dama/+/acoustic_sketch messages, one per line")
+        ap.add_argument("--fs", type=float, help="build a feature matrix for this rate")
+        ap.add_argument("--mode", choices=("db", "q"), default="db")
+        ap.add_argument("--npz", help="write the matrix here")
+        a = ap.parse_args(argv)
+    
+        recs, skips = read_mqtt_jsonl(a.jsonl)
+        s = summarise(recs)
+        print(json.dumps(s, indent=2))
+        if skips:
+            print("\nskipped %d:" % len(skips))
+            for r in skips[:20]:
+                print("  " + r)
+            if len(skips) > 20:
+                print("  ... %d more" % (len(skips) - 20))
+        if a.fs:
+            X, kept = feature_matrix(recs, a.fs, a.mode)
+            print("\nmatrix for %.0f Hz: %s (%d of %d records)"
+                  % (a.fs, X.shape, len(kept), len(recs)))
+            if a.npz:
+                np.savez(a.npz, X=X, node_id=np.array([r.node_id for r in kept]),
+                         ts_utc_s=np.array([-1.0 if r.ts_utc_s is None else r.ts_utc_s for r in kept]),
+                         retrigger=np.array([r.retrigger for r in kept]),
+                         source=np.array([r.source for r in kept]))
+                print("wrote %s" % a.npz)
+        return 0
+    
+    
+    if __name__ == "__main__":
+        raise SystemExit(main())
+    
+  hear_detsfile.py: |
+    #!/usr/bin/env python3
+    """Read a node's `dets.csv` at any of the five column layouts the firmware has written.
+    
+    WHY THIS IS NOT `csv.DictReader`. Five generations of `dets.csv` exist on the cards and in the
+    drains, and one of them writes a header that does not describe its own rows:
+    
+        G1   9 cols   utc_us..frame_hex                          the 2026-09-07 night
+        G2  11 cols   + clip, clip_why
+        G3  12 cols DECLARED, 11 WRITTEN  ⚠️ header says `node,` and the writer never emits it
+        G4  12 cols   node_id, ...                               fs/layout build, node_id populated
+        G5  13 cols   + sketch_back before frame_hex             the window fix
+    
+    ⚠️G3 IS THE WHOLE REASON THIS MODULE EXISTS. `csv.DictReader` on a G3 file silently shifts every
+    value one column left of its name: `utc_us` gets the node name, `uptime_s` gets the timestamp,
+    `frame_hex` gets the clip path. Nothing raises. Reading the 2026-09-07 drain by header name
+    returned 0 usable rows from 730 detections and printed no error -- the rows were there, the
+    decoder just never saw a frame where it looked. Dispatching on the DECLARED header and then
+    CHECKING the row width against it is what turns that into a counted refusal.
+    
+    The discriminator between G3 and G4 is the first column name and it is exact: G3 says `node`,
+    G4 says `node_id`. The rename was made in firmware precisely to force the file to roll, so the
+    name change and the writer fix travel together and a file cannot be ambiguous between them.
+    
+    WHAT IT REFUSES. An unknown header, a header-less file, and an empty file are all errors and all
+    say which. A row whose width does not match its file's generation is a counted skip carrying its
+    reason, never a silently short dict -- see `DetsRead.skips`. `hear/backend` and every corpus
+    consumer read counts off that object rather than off `len(rows)`, because a reader that cannot
+    say what it dropped is how 730 detections go missing twice.
+    """
+    from __future__ import annotations
+    
+    import csv
+    import io
+    from dataclasses import dataclass, field
+    from typing import Any, Dict, List, Optional, Sequence, Tuple
+    
+    _BASE = ("utc_us", "uptime_s", "sample", "pps_n", "us_since_pps", "trigger", "flags", "fs_hz")
+    
+    
+    @dataclass(frozen=True)
+    class Generation:
+        """One firmware-era column layout.
+    
+        `declared` is what the header line says. `written` is what the rows actually carry, and it is
+        a SEPARATE field rather than a derived one because G3's two differ -- the only honest way to
+        describe a writer that disagrees with its own header.
+        """
+        name: str
+        declared: Tuple[str, ...]
+        written: Tuple[str, ...]
+    
+        @property
+        def broken_header(self) -> bool:
+            return self.declared != self.written
+    
+    
+    G1 = Generation("G1", _BASE + ("frame_hex",), _BASE + ("frame_hex",))
+    G2 = Generation("G2", _BASE + ("frame_hex", "clip", "clip_why"),
+                    _BASE + ("frame_hex", "clip", "clip_why"))
+    # ⚠️declared carries `node`; written does not. Not a guess -- measured on both nodes' 2026-09-07
+    # drains, where every data row is 11 wide under a 12-wide header.
+    G3 = Generation("G3", ("node",) + _BASE + ("frame_hex", "clip", "clip_why"),
+                    _BASE + ("frame_hex", "clip", "clip_why"))
+    G4 = Generation("G4", ("node_id",) + _BASE + ("frame_hex", "clip", "clip_why"),
+                    ("node_id",) + _BASE + ("frame_hex", "clip", "clip_why"))
+    G5 = Generation("G5", ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why"),
+                    ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why"))
+    
+    GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5)
+    LATEST = G5
+    
+    # One packed v1 sketch is 172 bytes; the column holds it as hex.
+    FRAME_HEX_LEN = 344
+    
+    
+    class UnknownSchema(ValueError):
+        """The header matches no generation. Carries the header so the caller can add one."""
+    
+    
+    @dataclass
+    class DetsRead:
+        """Rows, and everything that did not become a row.
+    
+        `skips` is a list of (line number, reason) and `counts` tallies reasons. Both are populated
+        even on a fully clean file, so a caller can assert on them rather than on their absence.
+        """
+        generation: Generation
+        rows: List[Dict[str, Any]] = field(default_factory=list)
+        skips: List[Tuple[int, str]] = field(default_factory=list)
+        counts: Dict[str, int] = field(default_factory=dict)
+        header: Tuple[str, ...] = ()
+    
+        def _skip(self, line: int, reason: str) -> None:
+            self.skips.append((line, reason))
+            self.counts[reason] = self.counts.get(reason, 0) + 1
+    
+        def summary(self) -> Dict[str, Any]:
+            return {"generation": self.generation.name, "rows": len(self.rows),
+                    "skipped": len(self.skips), "reasons": dict(self.counts)}
+    
+    
+    def identify(header: Sequence[str]) -> Generation:
+        """Which generation wrote this file, by its declared header. Exact match only."""
+        h = tuple(c.strip() for c in header)
+        for g in GENERATIONS:
+            if h == g.declared:
+                return g
+        # A file whose header starts like a known generation but carries extra trailing columns is a
+        # newer firmware than this module knows. Say that, rather than truncating to fit -- a column
+        # inserted BEFORE frame_hex (which is exactly what G5 did to G4) would otherwise be read as a
+        # trailing addition and shift the frame.
+        for g in GENERATIONS:
+            if h[:len(g.declared)] == g.declared:
+                raise UnknownSchema(
+                    "header extends %s with %r. A column APPENDED is safe, but G5 inserted "
+                    "`sketch_back` BEFORE frame_hex, so extension cannot be assumed harmless: add "
+                    "the generation to hear/detsfile.py rather than reading this file blind."
+                    % (g.name, list(h[len(g.declared):])))
+        raise UnknownSchema("dets.csv header %r matches no known generation (%s)"
+                            % (list(h), ", ".join(g.name for g in GENERATIONS)))
+    
+    
+    def read_text(text: str, default_node: Optional[str] = None) -> DetsRead:
+        """Parse a dets.csv's text. Never returns [] for a file that had no header.
+    
+        `default_node` names the node for G1-G3, which do not carry one. It is recorded as
+        `node_from` = "argument" so a later reader can tell a node the FILE named from one the
+        operator asserted; getting that backwards is how a two-node corpus becomes a one-node corpus.
+        """
+        lines = text.splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        if not lines:
+            raise ValueError(
+                "dets.csv is empty: %d byte(s), no header and no rows. A file the node created but "
+                "never wrote, and a file whose content was lost, both read like this; neither is a "
+                "quiet night. An empty night still carries its header." % len(text))
+        header = tuple(c.strip() for c in next(csv.reader([lines[0]])))
+        gen = identify(header)
+        out = DetsRead(generation=gen, header=header)
+        width = len(gen.written)
+    
+        for n, row in enumerate(csv.reader(lines[1:]), start=2):
+            if not row or not any(c.strip() for c in row):
+                continue
+            if len(row) != width:
+                out._skip(n, "row_width_%d_expected_%d" % (len(row), width))
+                continue
+            d = dict(zip(gen.written, (c.strip() for c in row)))
+            fh = d.get("frame_hex", "")
+            if not fh:
+                out._skip(n, "no_frame")
+                continue
+            if len(fh) != FRAME_HEX_LEN:
+                out._skip(n, "frame_hex_len_%d" % len(fh))
+                continue
+            if "node_id" in d and d["node_id"]:
+                d["node"], d["node_from"] = d["node_id"], "file"
+            else:
+                if not default_node:
+                    out._skip(n, "no_node")
+                    continue
+                d["node"], d["node_from"] = default_node, "argument"
+            d["schema"] = gen.name
+            # G1-G4 have no sketch_back column. Absent means "not stated", which is NOT the same as
+            # the pre-fix value -- the pre-fix builds took the window at a `back` this file cannot
+            # know. None travels; nothing here invents 736.
+            d.setdefault("sketch_back", None)
+            out.rows.append(d)
+        return out
+    
+    
+    def read_file(path: str, default_node: Optional[str] = None) -> DetsRead:
+        with open(path, "r", errors="replace") as fh:
+            return read_text(fh.read(), default_node=default_node)
+    
+  hear_pool.py: |
+    #!/usr/bin/env python3
+    """One append-only pool holding every sketch both kinds of sensor have ever produced.
+    
+        from hear import pool
+        p = pool.Pool("~/hear-pool")
+        p.ingest_dets("nyquist_dets.csv", default_node="nyquist")   # node, off the SD card
+        p.ingest_mqtt_jsonl("2026-09-08.jsonl")                     # phone, off MQTT
+        recs = p.records()                                          # hear.corpus.Record, both sources
+    
+    WHAT THE POOL IS FOR. TDoA needs arrivals from several sensors on one clock, and the two sensors
+    that exist emit the same 172-byte sketch over different transports: a node writes it to an SD
+    card as hex in `dets.csv`, a phone publishes it to MQTT as base64. Until they are in one store
+    with one dedup rule, "all the data" is a directory listing someone has to remember, and it has
+    already gone wrong twice -- see the ledger note below.
+    
+    ⚠️IDEMPOTENT INGEST IS THE POINT, NOT A FEATURE. The node's card holds `dets.csv` and
+    `dets-prev.csv`, both roll on reflash, and every drain so far has been a hand-run `curl` into a
+    dated directory. So the same detection arrives repeatedly: in a live file, again in that file's
+    `-prev` after the roll, and again in every earlier drain someone kept. Ingest is therefore keyed
+    on CONTENT -- `key()` below -- so re-ingesting a file, a whole directory, or two overlapping
+    drains adds nothing. Draining more often is then always safe, which is what lets it be automatic.
+    
+    ⚠️THE LEDGER IS NOT A LOG. `ledger.jsonl` records, per source file, its sha256 and byte length,
+    which schema generation was recognised, and the full skip tally by reason. It exists because a
+    reader that could not say what it dropped has twice returned a confident wrong answer here: the
+    G3 header/writer mismatch turned 730 detections into 0 rows with no error, and a `flags & 2`
+    filter silently removed 88 more. `stats()` reads the ledger, so "how much data do we have" is
+    answered from what was actually written, never from a file count.
+    
+    TIME. `utc_us == 0` means the node had no PPS lock yet; the row is KEPT and marked
+    `anchored: false`. Dropping it at ingest would make the pool's own count depend on GPS state, and
+    the frame is still a valid training example. Solvers filter on `anchored`.
+    """
+    from __future__ import annotations
+    
+    import base64
+    import binascii
+    import hashlib
+    import json
+    import os
+    from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+    
+    from . import corpus as C
+    from . import detsfile as DF
+    from . import sketch as SK
+    
+    SCHEMA_VERSION = 1
+    
+    
+    def key(source: str, node: str, utc_us: int, sample: Optional[str], frame: bytes) -> str:
+        """The content address of one sketch. Same detection from any drain -> same key.
+    
+        `frame` is in it because `utc_us` is 0 for every pre-lock row, and a node emitting several
+        unanchored detections in one boot would otherwise collapse them all into one record. `sample`
+        is the node's own monotonic counter and separates them within a boot; the frame separates
+        them across boots, where `sample` restarts.
+        """
+        h = hashlib.sha256()
+        for part in (source, node, str(utc_us), "" if sample is None else str(sample)):
+            h.update(part.encode())
+            h.update(b"\x1f")
+        h.update(frame)
+        return h.hexdigest()[:32]
+    
+    
+    def _day(ts_utc_s: Optional[float]) -> str:
+        """UTC day partition. Unanchored rows go to `unanchored` rather than to a guessed day."""
+        if not ts_utc_s:
+            return "unanchored"
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(ts_utc_s, _dt.timezone.utc).strftime("%Y-%m-%d")
+    
+    
+    def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
+        frame = binascii.unhexlify(row["frame_hex"])
+        d = SK.unpack(frame)
+        utc_us = int(row.get("utc_us") or 0)
+        node = row["node"]
+        # fs: the FRAME is authoritative when it states a rate, because the CSV column is the node's
+        # running estimate and the fs_clean latch has already put 22624.0 in it for a whole boot.
+        fs_csv = row.get("fs_hz")
+        fs_csv = float(fs_csv) if fs_csv not in (None, "") else None
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "key": key("node", node, utc_us, row.get("sample"), frame),
+            "source": "node",
+            "node": node,
+            "node_from": row.get("node_from"),
+            "utc_us": utc_us,
+            "anchored": utc_us > 0,
+            "ts_utc_s": (utc_us / 1e6) if utc_us > 0 else None,
+            "frame_b64": base64.b64encode(frame).decode(),
+            "fs_hz": d["fs_hz"] if d["fs_hz"] is not None else fs_csv,
+            "fs_stated_by": "frame" if d["fs_hz"] is not None else ("csv" if fs_csv else None),
+            "fs_csv_hz": fs_csv,
+            "layout": d["layout"],
+            "valid_bands": d["valid_bands"],
+            "bands": int(d["q"].shape[0]),
+            "frames": int(d["q"].shape[1]),
+            "peak": d["peak"],
+            "ref_db": d["ref_db"],
+            "node_us": d["node_us"],
+            "retrigger": bool(d["retrigger"]),
+            # event_flags, not the raw flags word: bit 1 is "no context" only in v1, and is a profile
+            # bit in v2. Masking the raw word tags good v2 frames as broken.
+            "no_context": bool(d["event_flags"] & SK.FLAG_NO_CONTEXT),
+            "sketch_back": (int(row["sketch_back"]) if row.get("sketch_back") not in (None, "")
+                            else None),
+            "sample": row.get("sample"),
+            "uptime_s": row.get("uptime_s"),
+            "trigger": row.get("trigger"),
+            "clip": row.get("clip") or None,
+            "dets_schema": row.get("schema"),
+        }
+    
+    
+    
+    class Pool:
+        """An append-only, content-addressed store of sketches under one directory."""
+    
+        def __init__(self, root: str):
+            self.root = os.path.expanduser(root)
+            self.records_dir = os.path.join(self.root, "records")
+            self.ledger_path = os.path.join(self.root, "ledger.jsonl")
+            self.state_dir = os.path.join(self.root, "state")
+            for d in (self.root, self.records_dir, self.state_dir):
+                os.makedirs(d, exist_ok=True)
+            self._keys: Optional[set] = None
+    
+        # ---------------------------------------------------------------- keys
+    
+        def keys(self) -> set:
+            """Every key already stored. Read once and cached for the life of the object."""
+            if self._keys is None:
+                ks = set()
+                for day in sorted(os.listdir(self.records_dir)):
+                    p = os.path.join(self.records_dir, day)
+                    if not os.path.isdir(p):
+                        continue
+                    for fn in sorted(os.listdir(p)):
+                        if not fn.endswith(".jsonl"):
+                            continue
+                        with open(os.path.join(p, fn)) as fh:
+                            for line in fh:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    ks.add(json.loads(line)["key"])
+                                except Exception:
+                                    continue
+                self._keys = ks
+            return self._keys
+    
+        # ---------------------------------------------------------------- write
+    
+        def _append(self, recs: Iterable[Dict[str, Any]]) -> int:
+            """Append new records, skipping any key already held. Returns how many were written."""
+            seen = self.keys()
+            buckets: Dict[Tuple[str, str], List[str]] = {}
+            n = 0
+            for r in recs:
+                if r["key"] in seen:
+                    continue
+                seen.add(r["key"])
+                buckets.setdefault((_day(r.get("ts_utc_s")), r["source"]), []).append(
+                    json.dumps(r, sort_keys=True))
+                n += 1
+            for (day, source), lines in buckets.items():
+                d = os.path.join(self.records_dir, day)
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, "%s.jsonl" % source), "a") as fh:
+                    fh.write("\n".join(lines) + "\n")
+            return n
+    
+        def _ledger(self, entry: Dict[str, Any]) -> None:
+            with open(self.ledger_path, "a") as fh:
+                fh.write(json.dumps(entry, sort_keys=True) + "\n")
+    
+        # ---------------------------------------------------------------- ingest
+    
+        def ingest_dets(self, path: str, default_node: Optional[str] = None,
+                        origin: Optional[str] = None) -> Dict[str, Any]:
+            """Ingest one node `dets.csv`. Idempotent: re-ingesting adds 0.
+    
+            Refuses nothing quietly -- an unknown schema raises, and every unusable row is counted by
+            reason into the ledger entry this returns.
+            """
+            raw = open(path, "rb").read()
+            sha = hashlib.sha256(raw).hexdigest()
+            read = DF.read_text(raw.decode("utf-8", "replace"), default_node=default_node)
+            recs, bad = [], {}
+            for row in read.rows:
+                try:
+                    recs.append(_record_from_node_row(row))
+                except Exception as e:                       # short frame, bad hex, bad header
+                    r = type(e).__name__
+                    bad[r] = bad.get(r, 0) + 1
+            added = self._append(recs)
+            # ⚠️THE ARITHMETIC MUST CLOSE. `rows_seen == added + duplicate + skipped` for every file,
+            # and decode failures are counted into `skipped` rather than living in a field nothing
+            # totals. A 5-row file that reported "0 new, 0 duplicate, 0 skipped" is what a whole
+            # deploy of this tool actually printed while discarding all five, and the reason it could
+            # is that `skipped` counted only the READER's refusals and not the decoder's.
+            reasons = dict(read.counts)
+            for k, v in bad.items():
+                reasons["decode_" + k] = reasons.get("decode_" + k, 0) + v
+            skipped = len(read.skips) + sum(bad.values())
+            entry = {
+                "kind": "dets.csv", "path": os.path.abspath(path), "origin": origin or path,
+                "sha256": sha, "bytes": len(raw), "generation": read.generation.name,
+                "rows": len(read.rows) + len(read.skips), "decoded": len(recs), "added": added,
+                "duplicate": len(recs) - added,
+                "skipped": skipped, "skip_reasons": reasons,
+                "decode_errors": bad, "schema_version": SCHEMA_VERSION,
+            }
+            assert entry["rows"] == added + entry["duplicate"] + skipped, entry
+            self._ledger(entry)
+            return entry
+    
+        def ingest_mqtt_jsonl(self, path: str, origin: Optional[str] = None) -> Dict[str, Any]:
+            """Ingest one day of captured `dama/+/acoustic_sketch`. Idempotent, same as above."""
+            raw = open(path, "rb").read()
+            sha = hashlib.sha256(raw).hexdigest()
+            recs: List[Dict[str, Any]] = []
+            skips: Dict[str, int] = {}
+            rows_seen = 0
+            for n, line in enumerate(raw.decode("utf-8", "replace").splitlines(), 1):
+                line = line.strip()
+                if not line:
+                    continue
+                rows_seen += 1
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    skips["bad_json"] = skips.get("bad_json", 0) + 1
+                    continue
+                payload = obj.get("payload", obj)
+                nid = obj.get("node_id")
+                if not nid:
+                    topic = str(obj.get("topic", ""))
+                    parts = topic.split("/")
+                    nid = parts[1] if len(parts) >= 3 else None
+                b64 = payload.get("sketch_b64")
+                if not b64:
+                    r = "phone_skipped" if "sketch_skipped" in payload else "no_sketch_b64"
+                    skips[r] = skips.get(r, 0) + 1
+                    continue
+                try:
+                    frame = base64.b64decode(b64)
+                    d = SK.unpack(frame)
+                except Exception as e:
+                    r = type(e).__name__
+                    skips[r] = skips.get(r, 0) + 1
+                    continue
+                ts_ms = payload.get("ts_utc_ms")
+                ts = None if ts_ms is None else float(ts_ms) / 1000.0
+                utc_us = int(round(ts * 1e6)) if ts else 0
+                node = str(nid or payload.get("node_id") or "?")
+                recs.append({
+                    "schema_version": SCHEMA_VERSION,
+                    "key": key("phone", node, utc_us, payload.get("trigger_ts_utc_ms"), frame),
+                    "source": "phone", "node": node, "node_from": "topic" if nid else "payload",
+                    "utc_us": utc_us, "anchored": bool(ts), "ts_utc_s": ts,
+                    "frame_b64": base64.b64encode(frame).decode(),
+                    "fs_hz": d["fs_hz"] if d["fs_hz"] is not None else payload.get("fs"),
+                    "fs_stated_by": "frame" if d["fs_hz"] is not None else
+                                    ("json" if payload.get("fs") else None),
+                    "layout": d["layout"], "valid_bands": d["valid_bands"],
+                    "bands": int(d["q"].shape[0]), "frames": int(d["q"].shape[1]),
+                    "peak": d["peak"], "ref_db": d["ref_db"], "node_us": d["node_us"],
+                    "retrigger": bool(d["retrigger"]),
+                    "no_context": bool(d["event_flags"] & SK.FLAG_NO_CONTEXT),
+                    "sketch_back": None,
+                    "clipped": payload.get("clipped"),
+                    "clock_tier": payload.get("clock_tier"),
+                    "sync_sigma_ns": payload.get("sync_sigma_ns"),
+                    "onset_found": payload.get("onset_found"),
+                    "onset_offset_us": payload.get("onset_offset_us"),
+                })
+            added = self._append(recs)
+            entry = {"kind": "mqtt.jsonl", "path": os.path.abspath(path), "origin": origin or path,
+                     "sha256": sha, "bytes": len(raw), "rows": rows_seen, "decoded": len(recs),
+                     "added": added, "duplicate": len(recs) - added, "skipped": sum(skips.values()),
+                     "skip_reasons": skips, "schema_version": SCHEMA_VERSION}
+            assert entry["rows"] == added + entry["duplicate"] + entry["skipped"], entry
+            self._ledger(entry)
+            return entry
+    
+        # ---------------------------------------------------------------- read
+    
+        def raw(self, source: Optional[str] = None, day: Optional[str] = None
+                ) -> Iterator[Dict[str, Any]]:
+            """Every stored record as its stored dict, oldest partition first."""
+            for d in sorted(os.listdir(self.records_dir)):
+                if day and d != day:
+                    continue
+                p = os.path.join(self.records_dir, d)
+                if not os.path.isdir(p):
+                    continue
+                for fn in sorted(os.listdir(p)):
+                    if not fn.endswith(".jsonl"):
+                        continue
+                    if source and fn != "%s.jsonl" % source:
+                        continue
+                    with open(os.path.join(p, fn)) as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if line:
+                                yield json.loads(line)
+    
+        def records(self, source: Optional[str] = None, anchored_only: bool = False,
+                    usable_only: bool = False) -> List[C.Record]:
+            """Stored records as `hear.corpus.Record`, so the existing matrix and solve code reads
+            the pool with no adapter.
+    
+            `usable_only` drops the frames a solver must not use: no stated rate, no context, or the
+            nyquist band layout. It is OFF by default -- the pool's job is to hold everything and say
+            what it holds; deciding what is usable is the caller's, and a reader that quietly applied
+            it would make the pool's count disagree with the ledger's.
+            """
+            out: List[C.Record] = []
+            for r in self.raw(source=source):
+                if anchored_only and not r.get("anchored"):
+                    continue
+                if usable_only and (r.get("fs_hz") is None or r.get("no_context")
+                                    or r.get("layout") != SK.LAYOUT_FIXED):
+                    continue
+                d = SK.unpack(base64.b64decode(r["frame_b64"]))
+                out.append(C.Record(
+                    node_id=r["node"], source=r["source"], q=d["q"], ref_db=d["ref_db"],
+                    peak=d["peak"], bands=d["q"].shape[0], frames=d["q"].shape[1],
+                    fs_hz=r.get("fs_hz"), node_us=d["node_us"], retrigger=bool(d["retrigger"]),
+                    ts_utc_s=r.get("ts_utc_s"), clipped=r.get("clipped"),
+                    clock_tier=r.get("clock_tier"), sync_sigma_ns=r.get("sync_sigma_ns"),
+                    extra={"layout": r.get("layout"), "valid_bands": r.get("valid_bands"),
+                           "key": r["key"], "no_context": r.get("no_context"),
+                           "sketch_back": r.get("sketch_back"), "utc_us": r.get("utc_us"),
+                           "anchored": r.get("anchored")},
+                ))
+            return out
+    
+        # ---------------------------------------------------------------- report
+    
+        def ledger(self) -> List[Dict[str, Any]]:
+            if not os.path.exists(self.ledger_path):
+                return []
+            out = []
+            with open(self.ledger_path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        out.append(json.loads(line))
+            return out
+    
+        def stats(self) -> Dict[str, Any]:
+            """What the pool holds, and what ingest threw away getting there.
+    
+            The skip tally comes from the LEDGER, not from the records: by the time a row is a record
+            the reasons it might not have been are gone, and those reasons are the whole audit.
+            """
+            by_source: Dict[str, int] = {}
+            by_node: Dict[str, int] = {}
+            by_fs: Dict[str, int] = {}
+            by_day: Dict[str, int] = {}
+            anchored = no_ctx = unstated = 0
+            n = 0
+            for r in self.raw():
+                n += 1
+                by_source[r["source"]] = by_source.get(r["source"], 0) + 1
+                by_node[r["node"]] = by_node.get(r["node"], 0) + 1
+                by_fs[str(r.get("fs_hz"))] = by_fs.get(str(r.get("fs_hz")), 0) + 1
+                by_day[_day(r.get("ts_utc_s"))] = by_day.get(_day(r.get("ts_utc_s")), 0) + 1
+                anchored += bool(r.get("anchored"))
+                no_ctx += bool(r.get("no_context"))
+                unstated += r.get("fs_hz") is None
+            led = self.ledger()
+            skips: Dict[str, int] = {}
+            for e in led:
+                for k, v in (e.get("skip_reasons") or {}).items():
+                    skips[k] = skips.get(k, 0) + v
+                for k, v in (e.get("decode_errors") or {}).items():
+                    skips[k] = skips.get(k, 0) + v
+            return {"records": n, "by_source": by_source, "by_node": by_node, "by_fs_hz": by_fs,
+                    "by_day": by_day, "anchored": anchored, "unanchored": n - anchored,
+                    "no_context": no_ctx, "fs_unstated": unstated,
+                    "ingests": len(led),
+                    "files_seen": len({e["sha256"] for e in led}),
+                    "skipped_at_ingest": skips,
+                    "generations": sorted({e.get("generation") for e in led if e.get("generation")})}
+    
+  tools_hear_drain.py: |
+    #!/usr/bin/env python3
+    """Drain every hear sensor into one pool, on a timer, and say loudly when one stops.
+    
+        python3 tools/hear_drain.py --pool ~/hear-pool \
+            --node nyquist=172.16.100.105 --node mach=172.16.100.116 \
+            --phone-corpus ~/sketch_corpus
+    
+        python3 tools/hear_drain.py --pool ~/hear-pool --check     # exit 1 if a sensor has gone quiet
+    
+    WHY THIS EXISTS. Until now every byte of node data was moved by a hand-run `curl` into a dated
+    directory, and the only scheduled process touching the nodes was `watch.py` polling ONE node's
+    `/status` -- health, not data, and not even both nodes. The cost was not theoretical:
+    
+      * the 2026-09-07 drain sat on a laptop, was not in any corpus, and was found only by asking
+      * 730 of its detections read as 0 rows under a header-name parser and raised nothing
+      * `dets.csv` rolls to `dets-prev.csv` on reflash, so a missed window loses a file outright
+    
+    ⚠️FETCH BOTH `dets.csv` AND `dets-prev.csv`, ALWAYS. The roll happens on reflash and on a schema
+    change, and whichever one this run did not fetch is the one that rolls off next. They are cheap
+    (tens of KB) and the pool deduplicates, so fetching both every time costs nothing and closes the
+    window that would otherwise silently drop a boot's worth of detections.
+    
+    ⚠️IDENTITY IS CHECKED, NOT ASSUMED. A node is named by `--node <name>=<ip>`, and `/status` is
+    read back before anything it served is ingested. DHCP moves; two nodes swapping leases would
+    otherwise file each other's detections under each other's names, and every TDoA solution built on
+    that pool would be wrong in a way no later check could find. A mismatch refuses THAT node and the
+    run continues with the others -- one bad lease must not stop the drain.
+    
+    ⚠️RAW BYTES ARE ARCHIVED BEFORE THEY ARE PARSED. `<pool>/raw/<node>/<utc>-<file>` keeps exactly
+    what the node served. Every parser in this repo has been wrong at least once about a real file;
+    re-parsing an archive is free, re-fetching a file the node has since rolled is impossible.
+    
+    STALENESS IS THE FAILURE MODE THAT MATTERS, and it is silent by nature: a drainer whose HTTP
+    succeeds and whose node has stopped detecting exits 0 forever. `--check` reads the heartbeat and
+    fails if any sensor's last SUCCESSFUL fetch is older than `--max-stale-s`, which is what a timer
+    or a monitor should key on -- not on this script's own exit status during a normal run.
+    """
+    from __future__ import annotations
+    
+    import argparse
+    import glob
+    import hashlib
+    import json
+    import os
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+    from typing import Any, Dict, List, Optional, Tuple
+    
+    sys.path.insert(0, __file__.rsplit("/tools/", 1)[0])
+    from hear import pool as P                                          # noqa: E402
+    
+    # The card files worth pulling every run. `dets.csv` and its rolled predecessor carry the
+    # sketches; `health.csv` carries the PPS/fs context a later reader needs to judge them and is
+    # archived but NOT ingested -- the pool holds sketches, and mixing a second row shape into it
+    # would make its counts mean two things.
+    DETS_FILES = ("dets.csv", "dets-prev.csv")
+    CONTEXT_FILES = ("health.csv",)
+    
+    DEFAULT_TIMEOUT_S = 30.0
+    # A node reporting detections at the measured night rate goes quiet for hours in daylight, so
+    # staleness is measured on the FETCH, not on new rows. 2 h is comfortably longer than any timer
+    # interval and short enough to catch a node that fell off the wifi before a night is lost.
+    DEFAULT_MAX_STALE_S = 7200.0
+    
+    
+    def _get(url: str, timeout: float = DEFAULT_TIMEOUT_S) -> bytes:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.read()
+    
+    
+    def fetch_status(ip: str, timeout: float = DEFAULT_TIMEOUT_S) -> Dict[str, Any]:
+        return json.loads(_get("http://%s/status" % ip, timeout).decode("utf-8", "replace"))
+    
+    
+    def fetch_sd(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S) -> Optional[bytes]:
+        """One file off the card, or None if the node does not have it.
+    
+        A missing `dets-prev.csv` is NORMAL -- it exists only after a roll -- so it is not an error.
+        The node answers a missing file with a short body rather than a 404, so the body is checked:
+        anything that is not a CSV header is treated as absent and recorded as such.
+        """
+        try:
+            body = _get("http://%s/sd?file=%s" % (ip, name), timeout)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            raise
+        head = body[:200].lstrip()
+        if not head or not (head.startswith(b"node") or head.startswith(b"utc_us")):
+            return None
+        return body
+    
+    
+    def archive(root: str, node: str, name: str, body: bytes, stamp: int) -> str:
+        d = os.path.join(root, "raw", node)
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "%d-%s" % (stamp, name))
+        with open(p, "wb") as fh:
+            fh.write(body)
+        return p
+    
+    
+    def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOUT_S,
+                   stamp: Optional[int] = None) -> Dict[str, Any]:
+        """Fetch, archive and ingest one node. Never raises for a node-side problem; reports it."""
+        stamp = int(stamp if stamp is not None else time.time())
+        out: Dict[str, Any] = {"node": node, "ip": ip, "at": stamp, "ok": False,
+                               "files": [], "added": 0, "errors": []}
+        try:
+            st = fetch_status(ip, timeout)
+        except Exception as e:
+            out["errors"].append("status: %r" % (e,))
+            return out
+        said = str(st.get("node", ""))
+        out["identity"] = said
+        out["uptime_s"] = st.get("uptime_s")
+        if said != node:
+            out["errors"].append(
+                "identity: %s answers as %r, not %r -- refusing to file its rows under the wrong "
+                "name (check the DHCP lease)" % (ip, said, node))
+            return out
+    
+        for name in CONTEXT_FILES:
+            try:
+                body = fetch_sd(ip, name, timeout)
+                if body:
+                    out["files"].append({"name": name, "bytes": len(body), "ingested": False,
+                                         "archived": archive(pl.root, node, name, body, stamp)})
+            except Exception as e:
+                out["errors"].append("%s: %r" % (name, e))
+    
+        for name in DETS_FILES:
+            try:
+                body = fetch_sd(ip, name, timeout)
+            except Exception as e:
+                out["errors"].append("%s: %r" % (name, e))
+                continue
+            if body is None:
+                out["files"].append({"name": name, "absent": True})
+                continue
+            path = archive(pl.root, node, name, body, stamp)
+            try:
+                entry = pl.ingest_dets(path, default_node=node, origin="%s:/%s" % (node, name))
+            except Exception as e:
+                out["errors"].append("%s: ingest: %r" % (name, e))
+                continue
+            out["added"] += entry["added"]
+            out["files"].append({"name": name, "bytes": len(body), "ingested": True,
+                                 "archived": path, **{k: entry[k] for k in
+                                                      ("generation", "rows", "added", "duplicate",
+                                                       "skipped", "skip_reasons")}})
+        out["ok"] = not out["errors"]
+        return out
+    
+    
+    def drain_phone_corpus(pl: "P.Pool", corpus_dir: str, days: int = 3) -> Dict[str, Any]:
+        """Ingest the most recent `sketches-*.jsonl` the phone corpus worker has written.
+    
+        Only the last `days` files are re-read: they are the only ones that can still grow, and the
+        pool deduplicates whatever overlaps. Older days are already in and re-reading a month of them
+        on every timer tick is wasted I/O, not extra safety.
+        """
+        out: Dict[str, Any] = {"dir": corpus_dir, "files": [], "added": 0, "errors": []}
+        if not os.path.isdir(corpus_dir):
+            out["errors"].append("no such directory: %s" % corpus_dir)
+            return out
+        paths = sorted(glob.glob(os.path.join(corpus_dir, "sketches-*.jsonl")))[-days:]
+        for p in paths:
+            try:
+                e = pl.ingest_mqtt_jsonl(p, origin="phone:%s" % os.path.basename(p))
+            except Exception as ex:
+                out["errors"].append("%s: %r" % (os.path.basename(p), ex))
+                continue
+            out["added"] += e["added"]
+            out["files"].append({"name": os.path.basename(p), **{k: e[k] for k in
+                                                                 ("decoded", "added", "duplicate",
+                                                                  "skipped", "skip_reasons")}})
+        out["ok"] = not out["errors"]
+        return out
+    
+    
+    def backfill(pl: "P.Pool", paths: List[str], default_node: Optional[str] = None
+                 ) -> List[Dict[str, Any]]:
+        """Ingest historical files: a dets.csv, a sketches-*.jsonl, or a directory of either.
+    
+        ⚠️A REFUSAL IS RECORDED, NOT SWALLOWED. An unreadable file returns an entry carrying `error`
+        and the run reports a non-zero status. A backfill that skipped a file quietly is how the
+        2026-09-07 drain sat unnoticed on a laptop for a day; the whole point of this path is that it
+        can be re-run over everything anyone has kept and the pool's ledger then says what it made of
+        each one.
+    
+        The node name for a G1-G3 file cannot come from the file -- those schemas have no node
+        column -- so it comes from `default_node` and is recorded as asserted. When a directory is
+        given, a file whose NAME begins `<something>_` is allowed to name its own node from that
+        prefix, which is how the existing hand-made drains are laid out.
+        """
+        out: List[Dict[str, Any]] = []
+        todo: List[str] = []
+        for p in paths:
+            p = os.path.expanduser(p)
+            if os.path.isdir(p):
+                todo += sorted(glob.glob(os.path.join(p, "**", "*dets*.csv"), recursive=True))
+                todo += sorted(glob.glob(os.path.join(p, "**", "sketches-*.jsonl"), recursive=True))
+            else:
+                todo.append(p)
+        for p in todo:
+            base = os.path.basename(p)
+            try:
+                if base.startswith("sketches-") and base.endswith(".jsonl"):
+                    out.append(pl.ingest_mqtt_jsonl(p))
+                else:
+                    node = default_node
+                    for known in ("nyquist", "mach", "puc"):
+                        if known in p:
+                            node = known
+                            break
+                    out.append(pl.ingest_dets(p, default_node=node))
+            except Exception as e:
+                out.append({"path": os.path.abspath(p), "error": "%s: %s" % (type(e).__name__, e)})
+        return out
+    
+    
+    # ---------------------------------------------------------------- heartbeat
+    
+    def heartbeat_path(root: str) -> str:
+        return os.path.join(root, "heartbeat.json")
+    
+    
+    def write_heartbeat(root: str, results: List[Dict[str, Any]], phone: Optional[Dict[str, Any]],
+                        now: Optional[float] = None) -> Dict[str, Any]:
+        """Merge this run into the heartbeat, keeping each sensor's last SUCCESS.
+    
+        ⚠️A failed run must not overwrite a sensor's last-success time with `now`. That is exactly how
+        a staleness check becomes a no-op: it would report the drainer's liveness, which is never in
+        doubt when it is the thing doing the reporting, instead of the sensor's.
+        """
+        now = time.time() if now is None else now
+        p = heartbeat_path(root)
+        hb: Dict[str, Any] = {"sensors": {}}
+        if os.path.exists(p):
+            try:
+                hb = json.load(open(p))
+                hb.setdefault("sensors", {})
+            except Exception:
+                hb = {"sensors": {}}
+        hb["last_run_s"] = now
+        for r in results:
+            s = hb["sensors"].setdefault(r["node"], {})
+            s["kind"] = "node"
+            s["last_attempt_s"] = now
+            s["last_error"] = r["errors"][0] if r["errors"] else None
+            if r["ok"]:
+                s["last_success_s"] = now
+                s["last_added"] = r["added"]
+                s["uptime_s"] = r.get("uptime_s")
+        if phone is not None:
+            s = hb["sensors"].setdefault("phones", {})
+            s["kind"] = "phone-corpus"
+            s["last_attempt_s"] = now
+            s["last_error"] = phone["errors"][0] if phone.get("errors") else None
+            if phone.get("ok"):
+                s["last_success_s"] = now
+                s["last_added"] = phone["added"]
+        tmp = p + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(hb, fh, indent=2, sort_keys=True)
+        os.replace(tmp, p)
+        return hb
+    
+    
+    def check(root: str, max_stale_s: float = DEFAULT_MAX_STALE_S,
+              now: Optional[float] = None) -> Tuple[int, List[str]]:
+        """(exit code, lines). Non-zero if any sensor's last SUCCESS is older than `max_stale_s`."""
+        now = time.time() if now is None else now
+        p = heartbeat_path(root)
+        if not os.path.exists(p):
+            return 1, ["no heartbeat at %s -- the drain has never completed a run" % p]
+        hb = json.load(open(p))
+        lines, bad = [], 0
+        sensors = hb.get("sensors") or {}
+        if not sensors:
+            return 1, ["heartbeat names no sensors"]
+        for name in sorted(sensors):
+            s = sensors[name]
+            last = s.get("last_success_s")
+            if last is None:
+                lines.append("%-10s NEVER succeeded (last error: %s)" % (name, s.get("last_error")))
+                bad += 1
+                continue
+            age = now - float(last)
+            state = "STALE" if age > max_stale_s else "ok"
+            bad += state == "STALE"
+            lines.append("%-10s %-5s last success %.0f s ago%s"
+                         % (name, state, age, "" if not s.get("last_error")
+                            else "  (last error: %s)" % s["last_error"]))
+        return (1 if bad else 0), lines
+    
+    
+    # ---------------------------------------------------------------- cli
+    
+    def main(argv=None) -> int:
+        ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+        ap.add_argument("--pool", default="~/hear-pool", help="pool root (created if absent)")
+        ap.add_argument("--node", action="append", default=[], metavar="NAME=IP",
+                        help="a node to drain; repeatable")
+        ap.add_argument("--phone-corpus", default=None,
+                        help="directory of sketches-YYYY-MM-DD.jsonl from the corpus worker")
+        ap.add_argument("--phone-days", type=int, default=3)
+        ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
+        ap.add_argument("--max-stale-s", type=float, default=DEFAULT_MAX_STALE_S)
+        ap.add_argument("--check", action="store_true",
+                        help="report sensor staleness from the heartbeat and exit; drains nothing")
+        ap.add_argument("--ingest", action="append", default=[], metavar="PATH",
+                        help="backfill a dets.csv / sketches-*.jsonl, or a directory of them; "
+                             "repeatable and idempotent. Node name is taken from the file when it "
+                             "carries one and from --ingest-node otherwise")
+        ap.add_argument("--ingest-node", default=None,
+                        help="node name for backfilled dets.csv files whose schema carries none "
+                             "(G1-G3). Recorded as asserted, not as read from the file")
+        ap.add_argument("--stats", action="store_true", help="print what the pool holds and exit")
+        ap.add_argument("--json", action="store_true", help="machine-readable run report on stdout")
+        a = ap.parse_args(argv)
+    
+        root = os.path.expanduser(a.pool)
+        if a.check:
+            code, lines = check(root, a.max_stale_s)
+            print("\n".join(lines))
+            return code
+    
+        pl = P.Pool(root)
+        if a.stats:
+            print(json.dumps(pl.stats(), indent=2, sort_keys=True))
+            return 0
+    
+        if a.ingest:
+            entries = backfill(pl, a.ingest, default_node=a.ingest_node)
+            for e in entries:
+                print("%-46s %s" % (os.path.basename(e["path"]),
+                                    {k: e[k] for k in ("generation", "rows", "added", "duplicate",
+                                                       "skipped")
+                                     if k in e} if "error" not in e else "REFUSED " + e["error"]))
+            print("\n" + json.dumps(pl.stats(), indent=2, sort_keys=True))
+            return 0 if all("error" not in e for e in entries) else 1
+    
+        nodes: List[Tuple[str, str]] = []
+        for spec in a.node:
+            if "=" not in spec:
+                ap.error("--node wants NAME=IP, got %r" % spec)
+            name, ip = spec.split("=", 1)
+            nodes.append((name.strip(), ip.strip()))
+    
+        results = [drain_node(pl, n, ip, a.timeout) for n, ip in nodes]
+        phone = drain_phone_corpus(pl, os.path.expanduser(a.phone_corpus), a.phone_days) \
+            if a.phone_corpus else None
+        write_heartbeat(root, results, phone)
+    
+        report = {"results": results, "phone": phone, "stats": pl.stats()}
+        if a.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            for r in results:
+                print("%-9s %-4s +%d record(s)%s" % (
+                    r["node"], "ok" if r["ok"] else "FAIL", r["added"],
+                    "" if r["ok"] else "  " + "; ".join(r["errors"])))
+                for f in r["files"]:
+                    if f.get("absent"):
+                        print("    %-14s absent" % f["name"])
+                    elif f.get("ingested"):
+                        print("    %-14s %s  %d row(s) -> +%d new, %d dup, %d skipped %s"
+                              % (f["name"], f["generation"], f["rows"], f["added"], f["duplicate"],
+                                 f["skipped"], f["skip_reasons"] or ""))
+                    else:
+                        print("    %-14s %d B archived" % (f["name"], f["bytes"]))
+            if phone is not None:
+                print("phones    %-4s +%d record(s)%s"
+                      % ("ok" if phone.get("ok") else "FAIL", phone["added"],
+                         "" if phone.get("ok") else "  " + "; ".join(phone["errors"])))
+            s = report["stats"]
+            print("\npool %s: %d record(s), %s, %d anchored / %d not"
+                  % (root, s["records"], s["by_source"], s["anchored"], s["unanchored"]))
+    
+        # A run where every sensor failed is a failure. A run where one of several failed is not --
+        # the pool still gained the others, and a timer that gives up on all of them because one node
+        # is off the wifi is how the remaining nodes' data goes missing too.
+        if results and all(not r["ok"] for r in results):
+            return 1
+        return 0
+    
+    
+    if __name__ == "__main__":
+        raise SystemExit(main())
+    
