@@ -177,6 +177,63 @@ class TestLedger:
         assert s["ingests"] == 2 and s["files_seen"] == 1 and s["records"] == 2
 
 
+class TestTheArithmeticCloses:
+    """⚠️rows == added + duplicate + skipped, for every file, always.
+
+    A deploy of this tool printed "5 row(s) -> +0 new, 0 dup, 0 skipped" while discarding all
+    five: `skipped` counted the reader's refusals but not the decoder's, so a decode failure was
+    in no total at all. An invariant is the only version of this that cannot rot.
+    """
+
+    def _closed(self, e):
+        assert e["rows"] == e["added"] + e["duplicate"] + e["skipped"], e
+
+    def test_a_clean_dets_file_closes(self, tmp_path):
+        pl = P.Pool(str(tmp_path / "pool"))
+        self._closed(pl.ingest_dets(_dets(tmp_path, "dets.csv", 5)))
+
+    def test_a_re_ingest_closes_through_duplicate(self, tmp_path):
+        pl = P.Pool(str(tmp_path / "pool"))
+        f = _dets(tmp_path, "dets.csv", 5)
+        pl.ingest_dets(f)
+        self._closed(pl.ingest_dets(f))
+
+    def test_a_reader_refusal_closes_through_skipped(self, tmp_path):
+        pl = P.Pool(str(tmp_path / "pool"))
+        fh = binascii.hexlify(_frame()).decode()
+        p = tmp_path / "d.csv"
+        p.write_text(",".join(DF.G5.declared) + "\n"
+                     + "nyquist,1788763952189911,1,2,3,4,5,4608,16000.000,64,%s,,\n" % fh
+                     + "nyquist,1788763952189912,1,2,3,4,5,4608,16000.000,64,dead,,\n")
+        e = pl.ingest_dets(str(p))
+        self._closed(e)
+        assert e["rows"] == 2 and e["added"] == 1 and e["skipped"] == 1
+
+    def test_a_decoder_failure_is_counted_not_lost(self, tmp_path):
+        # The exact regression: a row the READER accepts and the DECODER cannot use.
+        import hear.pool as _P
+        pl = P.Pool(str(tmp_path / "pool"))
+        f = _dets(tmp_path, "dets.csv", 3)
+        real = _P._record_from_node_row
+
+        def boom(row):
+            raise AttributeError("module 'hear.sketch' has no attribute 'FLAG_NO_CONTEXT'")
+        _P._record_from_node_row = boom
+        try:
+            e = pl.ingest_dets(f)
+        finally:
+            _P._record_from_node_row = real
+        self._closed(e)
+        assert e["skipped"] == 3 and e["added"] == 0
+        assert e["skip_reasons"] == {"decode_AttributeError": 3}
+
+    def test_an_mqtt_file_closes_too(self, tmp_path):
+        pl = P.Pool(str(tmp_path / "pool"))
+        f = _mqtt(tmp_path, "sketches-2026-09-08.jsonl", 4)
+        self._closed(pl.ingest_mqtt_jsonl(f))
+        self._closed(pl.ingest_mqtt_jsonl(f))
+
+
 class TestHeartbeat:
     def test_a_failed_run_does_not_overwrite_the_last_success(self, tmp_path):
         # ⚠️The whole point of the staleness check. If a failure stamped last_success with now,
