@@ -35,7 +35,10 @@ class Pipeline:
         out: List[Dict] = []
         for s in range(0, len(x), block):
             for d in self.gate.process(x[s:s + block], s):
-                i = d["index"]
+                # ⚠️`sketch_index`, NOT `index`. `index` is the TIMESTAMP onset, walked back up
+                # to the 25 ms guard; starting a 33 ms sketch there slides it off the event --
+                # 0.9443 against 0.9732 nested AUC. See detect.SKETCH_BACK_S.
+                i = d["sketch_index"]
                 seg = x[i:min(len(x), i + int(POST_S * self.fs))]
                 if len(seg) < int(0.01 * self.fs):
                     continue

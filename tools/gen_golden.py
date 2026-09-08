@@ -138,21 +138,33 @@ def build_window_golden() -> dict:
         idx = int(lo + np.argmax(env[lo:hi]))
         # a sparse sample of the envelope: enough to catch an offset error, small enough to read
         probes = sorted(set(int(v) for v in np.linspace(0, len(x) - 1, 41)))
+        # ⚠️THE SKETCH STARTS AT THE CONSTANT-FRACTION ONSET, NOT THE PEAK. detect.onset_index
+        # walks back from the envelope peak to the last sample below ONSET_FRAC of it. A port
+        # that uses the argmax instead is peak-aligned, and peak-vs-onset sketches differ on
+        # every one of the 228 labelled events -- median 1.56 ms apart but p90 at the 25 ms guard
+        # clamp, which is 6.25 of the 8 frames.
+        con = DT.onset_index(env, idx, DT.ONSET_FRAC, back=int(DT.GUARD_S * fs))
         cases.append({
             "name": name, "fs": fs,
             "pcm_b64": _b64(pcm.tobytes()),
             "env_taps": int(max(1, int(1e-3 * fs))),
             "search_lo": lo, "search_hi": hi,
+            "peak_index": idx,
+            "onset_frac": DT.ONSET_FRAC,
+            "onset_back": int(DT.GUARD_S * fs),
+            "constant_fraction_onset": float(con),
             "onset_index": idx,
             "probe_index": probes,
             "probe_env": [float(env[i]) for i in probes],
         })
     return {
-        "schema": "hear.window.golden.v1",
-        "env_ms": 1.0,
+        "schema": "hear.window.golden.v2",
+        "env_ms": 1.0, "onset_frac": DT.ONSET_FRAC,
         "guard_s": DT.GUARD_S, "retrigger_s": DT.RETRIGGER_S,
         "note": ("x = int16 pcm / 32767.0, the scale AudioPullFormat and the capture ring use. "
-                 "env is a 1 ms moving average of |x| with numpy 'same' alignment."),
+                 "env is a 1 ms moving average of |x| with numpy 'same' alignment. "
+                 "`peak_index` is the envelope argmax; `constant_fraction_onset` is what the "
+                 "sketch must actually start at -- they are NOT the same sample."),
         "cases": cases,
     }
 
