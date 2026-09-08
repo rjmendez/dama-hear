@@ -85,10 +85,19 @@ spec:
 # success, which is what a monitor should alert on.
 #
 # ⚠️IT ALSO ASSERTS THAT THE SCENE TAIL REACHED BACK FAR ENOUGH. A drain whose HTTP succeeded and
-# whose window started hours after the previous one ended is fresh, adds rows and exits 0; the
-# 2 MB tail now covers 2.42 h against boots longer than that, and two outages have already cost
-# 3.11 h of scene this way. `--check` fails on any whole row the fetch never asked for; see the
-# byte watermark in tools/hear_drain.py. Threshold: --max-unfetched-bytes, default 0.
+# whose window started hours after the previous one ended is fresh, adds rows and exits 0. The
+# 2 MB tail covers 2.42 h on nyquist and 2.45 h on mach (derived from the pool ledger's own
+# 235.0 / 232.1 B per row at 1.024 s per row), which is not comfortably longer than a boot. How
+# much has already been lost that way is NOT asserted here: it was never measured, which is the
+# reason the drain now measures it. `--check` fails on any whole row the fetch never asked for;
+# see the byte watermark in tools/hear_drain.py. Threshold: --max-unfetched-bytes, default 0.
+#
+# ⚠️THIS JOB RUNS ONE FIFTH AS OFTEN AS THE DRAIN ABOVE (`*/15 * * * *` vs `17 * * * *`), so four
+# drains land between two checks. A per-run heartbeat field would be overwritten three times
+# before the gate looked at it, so the heartbeat keeps a ring and `--unfetched-window-s` says how
+# much of it to sum. It is passed explicitly BECAUSE it is coupled to these two schedules: change
+# either cron and this number has to move with it. 7200 s is two check periods, so one missed
+# check run still reports the loss.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -117,7 +126,8 @@ spec:
               args:
                 - |
                   export PYTHONPATH=/pool/pylib:/app
-                  python /app/tools/hear_drain.py --pool /pool/corpus --check
+                  python /app/tools/hear_drain.py --pool /pool/corpus --check \
+                    --unfetched-window-s 7200
                   echo "--- pool ---"
                   python /app/tools/hear_drain.py --pool /pool/corpus --stats
               volumeMounts:
