@@ -58,6 +58,28 @@ from **−21.62 ms to +0.43 ms**. On the real corpus the never-timed count goes 
 across node, phone and training script. (An earlier draft of this line quoted 0.9712/0.9690;
 those were measured before the interior-trough guard and are superseded by the refit.)
 
+### ⚠️ NFFT: the case for shortening it died with the window fix
+
+Re-measured on the same 228 events with the **current onset-aligned window**, nested grouped CV:
+
+| geometry | AUC | wire bytes |
+|---|---|---|
+| **NFFT 256, 20×8** (shipped) | **0.9728** | 172 |
+| NFFT 128, 20×12 | 0.9677 | 252 |
+| NFFT 128, 20×8 | 0.9667 | 172 |
+| NFFT 128, 15×8 | 0.9663 | 132 |
+| NFFT 64, 20×8 | 0.9444 | 172 |
+
+A 2026-09-08 research pass costed NFFT 128/64 at **+0.0104 to +0.0171** and ranked it worth
+doing. That gain was measured against the **pre-fix** window, which ended 2 ms *before* the
+trigger — with the event at the very edge, finer time resolution helps. Once the window is placed
+correctly the frequency resolution of NFFT 256 matters more, and every shorter NFFT is worse.
+
+⚠️ 256 vs 128 is 0.006, inside the ±0.017 noise band, so the honest claim is *not better*, not
+*worse*. NFFT 64 at 0.9444 is outside the band and genuinely worse. Either way there is no longer
+a measured case for changing NFFT, and it would have cost new profile ids, regenerated goldens,
+both ports and a model refit.
+
 ⚠️**The sketch cannot resolve a crack's rise, and should stop being asked to.** One analysis
 frame is NFFT/fs = 5.33 ms; the measured peak-to-onset distance is a **median of 1.56 ms**. Frame
 0 contains the peak at every rise from 1 ms to 20 ms. If the rise must be resolved the lever is
