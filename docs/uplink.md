@@ -33,8 +33,8 @@ score they reported, and they are superseded:
 
 | | nested AUC | superseded figure |
 |---|---|---|
-| **172 B sketch**, absolute dB, one-hop onset | **0.9712** | 0.9631 |
-| sketch, 15 bands (whole fleet) | 0.9690 | — |
+| **172 B sketch**, absolute dB, one-hop onset | **0.9728** | 0.9631 |
+| sketch, 15 bands (whole fleet) | 0.9665 | — |
 | sketch, peak-aligned | 0.9634 | — |
 | hand-crafted 6 features | 0.9584 | 0.9589 |
 | band/frame summaries (36 dims) | 0.9554 | — |
@@ -53,8 +53,10 @@ the previous round's decay tail never sees its envelope fall to 20 % of the *new
 walk ran to the clamp edge and returned it: **42 of 228 events (18.4 %)** timestamped exactly
 25 ms early, **8.6 m of range**. Against known synthetic truth at that condition the error goes
 from **−21.62 ms to +0.43 ms**. On the real corpus the never-timed count goes 42 → 0, and
-**27.6 % of all events move by more than 1 ms**. Cost to the sketch: 0.9732 → 0.9712, inside the
-noise band, and worth one definition of "onset" across node, phone and training script.
+**27.6 % of all events move by more than 1 ms**. Cost to the sketch: 0.9732 → **0.9728** at 20 bands and
+0.9705 → **0.9665** at 15 — inside the noise band either way, and worth one definition of "onset"
+across node, phone and training script. (An earlier draft of this line quoted 0.9712/0.9690;
+those were measured before the interior-trough guard and are superseded by the refit.)
 
 ⚠️**The sketch cannot resolve a crack's rise, and should stop being asked to.** One analysis
 frame is NFFT/fs = 5.33 ms; the measured peak-to-onset distance is a **median of 1.56 ms**. Frame
