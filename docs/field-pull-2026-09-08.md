@@ -60,8 +60,27 @@ now **accepts** it while the 20-band model still refuses it by name.
 ⚠️`gen_mel.py` wrote only `path_test/mel16.h` while `night_node/` carried its own copy. They
 happened to be identical; that was luck, and it now writes both.
 
-⚠️**Not compiled and not flashed** — there is no ESP32 toolchain on this machine, and the nodes
-are mid-recording. Until they are flashed they keep emitting `fs=None/layout=nyquist`. When they
+**Compiled clean** (`esp32:esp32:XIAO_ESP32S3:PSRAM=opi`, core 3.3.11): 1 122 054 B of program
+storage (**33 %**) and 120 460 B of RAM (**36 %**). Built against a throwaway `secrets.h` with
+deliberately unusable credentials, so the image could never have joined anything; the stub and the
+build tree were deleted immediately.
+
+⚠️**Not flashed, and cannot be from here.** `flash.py` regenerates `secrets.h` from `~/.wifi`,
+which does not exist on this machine — `gen_secrets.py` exits 1 and `flash.py` aborts at step 1
+before it builds. That is the tooling failing closed, and it is the right behaviour: flashing a
+node with credentials for a network it cannot reach makes it unreachable and needs USB. The
+nodes'  `/status` does not report the SSID they are on, so there is nothing here to reconstruct it
+from.
+
+⚠️**When.** These are night nodes. Detections run 20:00–08:00 local and peak at 22:00–00:00
+(191 of 392 in those two hours); the last on either node was **08:46 local**. The safe window is
+**09:00–19:00 local**, and it is 10:20 now. Flash `nyquist` first, confirm it comes back and is
+recording, then `mach` — never both at once, so a bad image never takes out both ears.
+mach has **19 clips of budget left** and a reboot resets it, so it benefits either way.
+
+The failback covers this change: an RTC boot counter flips the partition back after 3 unhealthy
+boots, and only for an image that has never proven healthy. What it cannot save is a fault before
+`setup()`; this change adds no global constructors, only a POD table and a format string. Until they are flashed they keep emitting `fs=None/layout=nyquist`. When they
 are, their frames CHANGE (at 16 kHz the two layouts are genuinely different bytes), so old and
 new frames are not comparable — the `dets.csv` header rename forces a roll at the same moment,
 which separates them cleanly.
