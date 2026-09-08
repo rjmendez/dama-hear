@@ -29,6 +29,7 @@
 #include <esp_ota_ops.h>
 #include <esp_mac.h>
 #include "soc/gpio_struct.h"
+#include <Wire.h>
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -185,6 +186,187 @@ static const int NSAFE = sizeof(SAFE) / sizeof(SAFE[0]);
 // pull is applied, so it reads HIGH. A pin wired to a push-pull driver that is currently low does
 // NOT follow it, and reads LOW. Reset-state and pulldown cannot tell those apart -- both read low
 // either way, which is exactly what GPIO18 does with a 1PPS testpoint soldered to it.
+// ---- I2C discovery ---------------------------------------------------------------------------
+// The DS3231, the light sensor and the rest of the environmental suite are all on I2C and NONE of
+// their pins are known. /scan cannot find them and never will: an idle I2C bus does not toggle, so
+// a passive listener sees two pins sitting high and nothing else. What /scan CAN do is narrow the
+// search, and it did -- a line with an external pullup stays high against the ESP32's ~45k internal
+// pulldown, and on this board exactly eleven do: 6 7 9 10 11 12 13 14 45 47 48. That set is I2C
+// plus the SD card's CMD and D0-D3, which carry pullups for the same reason. Telling the two apart
+// needs a START and an address, which is what this is.
+//
+// SAFETY. I2C is open-drain: this only ever pulls a line LOW, never drives it high. Against a pin
+// that turns out to be someone else's output the worst case is a brief contention current, not two
+// push-pull drivers fighting -- which is why this is an acceptable thing to do to an unmapped board
+// and driving a candidate I2S clock is not. Each pair is released before the next is tried, so a
+// pair that wedges the bus is named in the output instead of poisoning every row after it.
+//
+// GPIO45 and 46 are strapping pins. They are sampled at reset, not at runtime, so using them now is
+// harmless -- but a hit on either is reported with that caveat attached rather than as a plain find.
+static const int I2C_CAND[] = {6, 7, 9, 10, 11, 12, 13, 14, 45, 47, 48};
+static const int NI2C_CAND = sizeof(I2C_CAND) / sizeof(I2C_CAND[0]);
+
+// An address is an address. Several real parts share one, so these are CANDIDATES and the output
+// says so; only the ones with a readable ID register below get upgraded from guess to confirmed.
+static const char *i2c_hint(uint8_t a) {
+  switch (a) {
+    case 0x0D: return "QMC5883 magnetometer";
+    case 0x10: return "VEML7700/VEML6030/VEML6075 light";
+    case 0x18: case 0x19: return "LIS3DH accel";
+    case 0x23: return "BH1750 light";
+    case 0x29: return "TSL2591/TSL2561 light";
+    case 0x38: return "AHT20 humidity";
+    case 0x39: return "APDS9960 light+gesture / TSL2561";
+    case 0x40: return "HTU21/Si7021 humidity";
+    case 0x44: case 0x45: return "SHT3x/SHT4x humidity  OR  OPT3001 light";
+    case 0x46: case 0x47: return "OPT3001 light";
+    case 0x4A: case 0x4B: return "MAX44009 light";
+    case 0x51: return "PCF8563 RTC";
+    case 0x53: return "LTR390 UV/ambient light";
+    case 0x57: return "AT24C32 EEPROM (ships ON DS3231 breakouts)";
+    case 0x58: return "SGP30 VOC";
+    case 0x5C: return "BH1750 (ADDR high) OR LPS22 pressure";
+    case 0x60: return "SI1145 light/UV";
+    case 0x62: return "SCD4x CO2";
+    case 0x68: return "DS3231/DS1307 RTC  OR  MPU6050 IMU";
+    case 0x76: case 0x77: return "BME280/BMP280/BME680 environmental";
+    default:   return "";
+  }
+}
+
+static bool i2c_rd(uint8_t a, uint8_t reg, uint8_t *v) {
+  Wire.beginTransmission(a); Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)a, 1) != 1) return false;
+  *v = Wire.read(); return true;
+}
+
+// Turn a guess into a measurement where the part offers a way. Anything not listed here stays a
+// guess and is printed as one -- an address that ACKs proves something answered, not what it is.
+static String i2c_confirm(uint8_t a) {
+  uint8_t v;
+  if ((a == 0x76 || a == 0x77) && i2c_rd(a, 0xD0, &v)) {
+    if (v == 0x60) return " CONFIRMED BME280 (id 0x60)";
+    if (v == 0x61) return " CONFIRMED BME680 (id 0x61)";
+    if (v == 0x58) return " CONFIRMED BMP280 (id 0x58)";
+    return " id reg 0xD0 = 0x" + String(v, HEX) + ", not a BME/BMP";
+  }
+  if (a == 0x29 && i2c_rd(a, 0xB2, &v) && v == 0x50) return " CONFIRMED TSL2591 (id 0x50)";
+  if (a == 0x53 && i2c_rd(a, 0x06, &v) && (v & 0xF0) == 0xB0) return " CONFIRMED LTR390 (part 0xB)";
+  if (a == 0x68) {
+    // DS3231 carries a temperature register pair the DS1307 and MPU6050 do not. A plausible room
+    // reading is weak evidence on its own, so the status register's reserved bits are checked too.
+    uint8_t t, st;
+    if (i2c_rd(a, 0x11, &t) && i2c_rd(a, 0x0F, &st) && !(st & 0x70) && (int8_t)t > -40 && (int8_t)t < 85)
+      return " CONFIRMED DS3231 (temp " + String((int8_t)t) + " C, status 0x" + String(st, HEX) + ")";
+    return " 0x68 answered but does not look like a DS3231";
+  }
+  return "";
+}
+
+static String i2c_try(int sda, int scl) {
+  Wire.end();
+  if (!Wire.begin(sda, scl, 100000)) { Wire.end(); return ""; }
+  Wire.setTimeOut(10);
+  int hits = 0; String found = "";
+  for (uint8_t a = 0x08; a <= 0x77; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) {
+      hits++;
+      if (hits <= 12) {
+        found += "      0x" + String(a, HEX) + "  " + i2c_hint(a) + i2c_confirm(a) + "\n";
+      }
+    }
+  }
+  String head = "";
+  // EVERY address acking is not 112 devices, it is SDA held low -- the classic scanner result that
+  // reads as a jackpot. It is reported as the wiring fault it is, and the pair is not a find.
+  if (hits > 20) head = "  SDA=" + String(sda) + " SCL=" + String(scl) + ": " + String(hits) +
+                        " addresses ACKed -- SDA is stuck low, this is NOT a bus\n";
+  else if (hits)  head = "  SDA=" + String(sda) + " SCL=" + String(scl) + ": " + String(hits) +
+                        " device(s)\n" + found +
+                        ((sda == 45 || scl == 45 || sda == 46 || scl == 46)
+                         ? "      (uses a strapping pin -- fine at runtime, note it before soldering)\n" : "");
+  Wire.end();
+  pinMode(sda, INPUT); pinMode(scl, INPUT);
+  return head;
+}
+
+// Generic register read. An address that ACKs proves something answered, not what it is, and the
+// hint table above is a list of suspects rather than an identification. This is how a suspect gets
+// eliminated -- WHO_AM_I on 0x0F, a part ID at 0x92, an EEPROM byte -- without a reflash per guess.
+static String i2c_regread(int sda, int scl, uint8_t addr, uint8_t reg, int n, bool raw) {
+  Wire.end();
+  if (!Wire.begin(sda, scl, 100000)) { Wire.end(); return "bus would not start\n"; }
+  Wire.setTimeOut(10);
+  String o = "";
+  if (n < 1) n = 1;
+  if (n > 32) n = 32;
+  Wire.beginTransmission(addr);
+  if (!raw) Wire.write(reg);
+  int tx = Wire.endTransmission(false);
+  if (tx != 0) { Wire.end(); return "0x" + String(addr, HEX) + ": no ACK on the register write (" +
+                                    String(tx) + ")\n"; }
+  int got = Wire.requestFrom((int)addr, n);
+  o = "0x" + String(addr, HEX) + " reg 0x" + String(reg, HEX) + " x" + String(n) + " ->";
+  for (int i = 0; i < got; i++) { uint8_t v = Wire.read(); o += " 0x" + String(v, HEX); }
+  if (!got) o += " (no data)";
+  o += "\n";
+  Wire.end();
+  pinMode(sda, INPUT); pinMode(scl, INPUT);
+  return o;
+}
+
+// The DS3231 decoded, because "0x68 answered" and "the clock has kept time" are different claims
+// and only the second one is worth anything for holdover. OSF is the load-bearing bit: set means
+// the oscillator stopped at some point, so whatever the registers say is not a time.
+static String rtc_read(int sda, int scl) {
+  Wire.end();
+  if (!Wire.begin(sda, scl, 100000)) { Wire.end(); return "bus would not start\n"; }
+  Wire.setTimeOut(10);
+  uint8_t r[19];
+  Wire.beginTransmission(0x68); Wire.write((uint8_t)0x00);
+  if (Wire.endTransmission(false) != 0) { Wire.end(); return "no DS3231 at 0x68\n"; }
+  int got = Wire.requestFrom(0x68, 19);
+  for (int i = 0; i < got && i < 19; i++) r[i] = Wire.read();
+  Wire.end();
+  pinMode(sda, INPUT); pinMode(scl, INPUT);
+  if (got < 19) return "short read (" + String(got) + " of 19)\n";
+  auto bcd = [](uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); };
+  char b[420];
+  snprintf(b, sizeof b,
+    "DS3231 on SDA=%d SCL=%d\n"
+    "  time    20%02d-%02d-%02d %02d:%02d:%02d  (register contents, timezone unknown)\n"
+    "  status  0x%02X   OSF=%d %s\n"
+    "  ctrl    0x%02X   EN32kHz=%d  INTCN=%d  alarms=%d%d\n"
+    "  aging   %d\n"
+    "  temp    %.2f C\n",
+    sda, scl, bcd(r[6]), bcd(r[5] & 0x1F), bcd(r[4]), bcd(r[2] & 0x3F), bcd(r[1]), bcd(r[0] & 0x7F),
+    r[15], (r[15] >> 7) & 1,
+    (r[15] >> 7) & 1 ? "-- THE OSCILLATOR STOPPED; this is not a time" : "-- ran continuously",
+    r[14], (r[15] >> 3) & 1, r[14] & 4, (r[14] >> 1) & 1, r[14] & 1,
+    (int8_t)r[16], (int8_t)r[17] + ((r[18] >> 6) * 0.25));
+  return String(b);
+}
+
+static String i2c_sweep() {
+  String o = "I2C sweep over the 11 externally-pulled-up pins (both orders; SDA/SCL is not symmetric)\n"
+             "candidates: 6 7 9 10 11 12 13 14 45 47 48   -- from /scan vs /scanpd\n\n";
+  int pairs = 0, found = 0;
+  for (int i = 0; i < NI2C_CAND; i++) {
+    for (int j = 0; j < NI2C_CAND; j++) {
+      if (i == j) continue;
+      pairs++;
+      String r = i2c_try(I2C_CAND[i], I2C_CAND[j]);
+      if (r.length()) { o += r; found++; }
+    }
+  }
+  o += "\n" + String(pairs) + " pairs tried, " + String(found) + " answered.\n";
+  if (!found) o += "NOTHING ANSWERED. That is a result, not a failure: it means the bus is not among\n"
+                   "these eleven, or its devices are unpowered. Next is a sweep over every SAFE pin.\n";
+  return o;
+}
+
 static String pin_scan(uint32_t window_ms, int mode) {
   uint32_t *b0 = (uint32_t *)ps_malloc((size_t)SCAN_N * 4);
   uint32_t *b1 = (uint32_t *)ps_malloc((size_t)SCAN_N * 4);
@@ -242,7 +424,7 @@ static void routes() {
       "uptime  %lus\nheap    %lu   psram %lu\n"
       "gps     fix %d, %d sats, %s   sentences %lu (%lu valid)\n"
       "pps     %lu edges on GPIO%d\n\n"
-      "/status /pins /scan /scanpd /scanpu /gps /pmtk?cmd= /pps /ota /update /reboot\n</pre>",
+      "/status /pins /i2c /i2creg /rtc /scan /scanpd /scanpu /gps /pmtk?cmd= /pps /ota /update /reboot\n</pre>",
       node_id, NODE_CLASS, (unsigned long)(millis() / 1000),
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getFreePsram(),
       gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences, (unsigned long)gps_valid,
@@ -296,6 +478,38 @@ static void routes() {
   http.on("/scan",   []() { http.send(200, "text/plain", pin_scan(4000, 0)); });
   http.on("/scanpd", []() { http.send(200, "text/plain", pin_scan(4000, 1)); });
   http.on("/scanpu", []() { http.send(200, "text/plain", pin_scan(4000, 2)); });
+
+  // /i2c sweeps the pullup candidates; /i2c?sda=N&scl=M tries exactly one pair, which is how a
+  // find gets re-checked without waiting for all 110 again.
+  http.on("/i2c", []() {
+    if (http.hasArg("sda") && http.hasArg("scl")) {
+      int sda = http.arg("sda").toInt(), scl = http.arg("scl").toInt();
+      String r = i2c_try(sda, scl);
+      http.send(200, "text/plain", r.length() ? r : "  SDA=" + String(sda) + " SCL=" + String(scl) +
+                                                     ": no device answered\n");
+      return;
+    }
+    http.send(200, "text/plain", i2c_sweep());
+  });
+
+  // /i2creg?addr=0x39&reg=0x92[&n=1][&sda=47&scl=48][&raw=1] -- raw skips the register write, for
+  // parts that answer a bare read. Defaults to the bus /i2c found.
+  http.on("/i2creg", []() {
+    int sda = http.hasArg("sda") ? http.arg("sda").toInt() : 47;
+    int scl = http.hasArg("scl") ? http.arg("scl").toInt() : 48;
+    long addr = strtol(http.arg("addr").c_str(), nullptr, 0);
+    long reg  = strtol(http.arg("reg").c_str(), nullptr, 0);
+    int n = http.hasArg("n") ? http.arg("n").toInt() : 1;
+    if (addr < 0x08 || addr > 0x77) { http.send(400, "text/plain", "addr out of range\n"); return; }
+    http.send(200, "text/plain",
+              i2c_regread(sda, scl, (uint8_t)addr, (uint8_t)reg, n, http.hasArg("raw")));
+  });
+
+  http.on("/rtc", []() {
+    int sda = http.hasArg("sda") ? http.arg("sda").toInt() : 47;
+    int scl = http.hasArg("scl") ? http.arg("scl").toInt() : 48;
+    http.send(200, "text/plain", rtc_read(sda, scl));
+  });
 
   http.on("/gpshold", HTTP_POST, []() {
     // FORCE_ON must be HELD logic high to leave backup mode -- Hardware Design 3.4.3: "FORCE_ON
