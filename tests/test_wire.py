@@ -27,7 +27,9 @@ class TestRoundTrip:
         assert got["seq"] == 200
         assert got["peak"] == 31000
         assert got["retrigger"] is True
-        assert got["profile_id"] == 0
+        # ⚠️the DEFAULT changed from 0 to DEFAULT_PROFILE: pack_v2 no longer derives the id from
+        # q.shape, because a shape cannot say what rate or band layout produced it.
+        assert got["profile_id"] == WR.DEFAULT_PROFILE
         assert (got["bands"], got["frames"]) == (20, 8)
         assert got["ref_db"] == pytest.approx(-13.75, abs=0.25)   # 0.25 dB header quantisation
         assert np.array_equal(got["q"], _q())
@@ -39,7 +41,7 @@ class TestRoundTrip:
             for retrig in (False, True):
                 got = WR.unpack_v2(WR.pack_v2(1, 1, seq, 0.0, 0, _q(), retrigger=retrig))
                 assert (got["seq"], got["retrigger"], got["profile_id"], got["version"]) \
-                    == (seq, retrig, 0, 2)
+                    == (seq, retrig, WR.DEFAULT_PROFILE, 2)
 
     def test_db_is_recoverable_the_same_way_v1_recovers_it(self):
         q, ref = SK.sketch(np.random.RandomState(0).normal(0, 300, 4096), 48000.0)
@@ -177,9 +179,13 @@ class TestTheHeaderIsPinnedToBytesNotToItself:
     # profile 0, retrigger. ts LE uint40 | ref4 <h> | peak <H> | node_id <H> | flags <H>.
     GOLDEN = bytes.fromhex("351cdcdf02" "c9ff" "3412" "efbe" "41c8")
 
-    def _frame(self):
+    def _frame(self, profile_id=0):
+        # ⚠️profile 0 EXPLICITLY. It used to be what pack_v2 derived from the shape; the default
+        # is now DEFAULT_PROFILE (1, 48 kHz, fixed layout) because a frame must state its rate.
+        # These tests pin the header BYTES, so they name the profile they pin rather than
+        # inheriting whichever one is currently default.
         return WR.pack_v2(us_of_day=12_345_678_901, node_id=0xBEEF, seq=200, ref_db=-13.75,
-                          peak=0x1234, q=_q(), retrigger=True)
+                          peak=0x1234, q=_q(), retrigger=True, profile_id=profile_id)
 
     def test_the_header_bytes_are_exactly_these(self):
         h = self._frame()[:WR.HDR_V2]
@@ -198,17 +204,26 @@ class TestTheHeaderIsPinnedToBytesNotToItself:
         assert struct.unpack_from("<H", self._frame(), 7)[0] == 0x1234
 
     def test_the_profile_field_starts_at_bit_1(self):
-        """Only profile 0 exists, so a round trip cannot see the profile shift at all -- pid 0
-        encodes as zero bits wherever you put it. Forcing a bit is the only way to locate it."""
-        b = bytearray(self._frame())
+        """Force bit 1 on a profile-0 frame: if the field starts there, the id reads as 1.
+
+        ⚠️This used to assert the frame was REFUSED, because profile 1 did not exist. It does now
+        (20x8 at 48 kHz, fixed layout), so the same bit flip is observed by what it decodes to
+        instead -- a stronger check, since it reads the field rather than only its absence."""
+        b = bytearray(self._frame(profile_id=0))
         b[11] |= 0x02                                   # bit 1 -> profile 1 if the field is there
-        with pytest.raises(ValueError, match="unknown profile id 1"):
-            WR.unpack_v2(bytes(b))
+        got = WR.unpack_v2(bytes(b))
+        assert got["profile_id"] == 1
+        assert WR.profile_geometry(got["profile_id"]).fs_hz == 48000.0
+        # and an id nothing defines is still refused, from the same base
+        b2 = bytearray(self._frame(profile_id=0))
+        b2[11] |= 0x08                                  # bit 3 -> profile 4
+        with pytest.raises(ValueError, match="unknown profile id 4"):
+            WR.unpack_v2(bytes(b2))
 
     def test_the_profile_field_is_4_bits_and_stops_below_the_version_field(self):
         """Profile ids 8-15 use bit 4. If profile and version overlap, an id in that half is read
         as a version bump and the frame is rejected for the wrong reason -- or accepted."""
-        b = bytearray(self._frame())
+        b = bytearray(self._frame(profile_id=0))        # from a ZERO base, so bit 4 alone is id 8
         b[11] |= 0x10                                   # bit 4 -> profile 8, version still 2
         with pytest.raises(ValueError, match="unknown profile id 8"):
             WR.unpack_v2(bytes(b))
