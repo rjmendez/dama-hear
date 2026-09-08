@@ -6,7 +6,7 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'd146ee4-dirty'
+    dama-hear/commit: '99e95ff'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
 data:
   hear__init__.py: |
@@ -1678,30 +1678,48 @@ data:
     fails if any sensor's last SUCCESSFUL fetch is older than `--max-stale-s`, which is what a timer
     or a monitor should key on -- not on this script's own exit status during a normal run.
     
-    ⚠️THE SECOND SILENT FAILURE IS THE TAIL OUTGROWING ITSELF, and it is already happening. The scene
-    fetch takes the last `SCENE_TAIL_BYTES` of a file that grows forever, so it reaches back a fixed
-    number of BYTES, not a fixed number of hours. When the comment below was written that was ~2.3 h
-    and every run overlapped the last one. Measured 2026-09-08: scene.csv is 16.6 MB on nyquist and
-    16.3 MB on mach, and at the measured 235.0 / 232.0 B per row the 2 MB window reaches back
-    8,510 / 8,620 rows = 2.42 / 2.45 h -- against a current nyquist boot of 11,706 rows = 3.33 h. The
-    window no longer covers a boot, and 60.05% of every scene row ever read was already a duplicate,
-    so a shrinking overlap is invisible in every count the ledger keeps. Two outages have already cost
-    11,205 s = 3.11 h of scene rows that no run will ever ask for again.
+    ⚠️THE SECOND SILENT FAILURE IS THE TAIL OUTGROWING ITSELF. The scene fetch takes the last
+    `SCENE_TAIL_BYTES` of a file that grows forever, so it reaches back a fixed number of BYTES, not a
+    fixed number of hours. When the comment below was written that was assumed to be ~2.3 h and to
+    overlap every previous run. Derived from this pool's own ledger (54 entries, 10 scene tails per
+    node): 235.0 B per row on nyquist and 232.1 B on mach, at one row per 1.024 s, so the 2 MB window
+    reaches back 8,510 / 8,620 rows = 2.42 / 2.45 h. That is a measurement of the WINDOW, not of the
+    loss, and it is shrinking as the row size grows.
     
-    So the drain now measures the reach-back instead of assuming it, and CLOSES it:
+    ⚠️THE LOSS ITSELF WAS NEVER MEASURED, WHICH IS WHY THE DRAIN NOW MEASURES IT. 60.05% of every
+    scene row this pool has read was already a duplicate (62,410 of 103,927 in the same ledger), so a
+    window that stopped overlapping would look identical in every count the ledger keeps: the drain
+    would fetch, add rows, and exit 0 while a stretch of the file aged past the tail untouched. No
+    figure is asserted here for how much has already been lost that way. The exported corpus at
+    `~/hear-corpus-export/corpus` cannot supply one -- its two dominant holes are ~58,000 s each on
+    both nodes, which is the drain not running at all rather than the tail falling short, and the
+    sub-hour inter-row gaps sum to 1,858 s across both nodes with no way to attribute any of it to
+    reach-back. That is the point: the quantity was unmeasurable, and the change below is what makes
+    it measurable from now on.
+    
+    So the drain MEASURES the reach-back instead of assuming it, and does not try to close it:
     
       * `/ls` gives the file's size. `window_start = size_now - len(body)` is the first byte this
         fetch actually saw, and `<pool>/state/scene_fetch.json` remembers where the last successful
         fetch ended. `unfetched_bytes = window_start - prev_size` is arithmetic over the FILE, not
         over the window, and it is immune to the 7.6% of scene rows that carry no PPS anchor.
-      * a positive gap is then REFETCHED with a bigger `tail=` -- the node's only reach-back control
-        (`f.seek(size - tail)`; there is no offset argument and no Range) -- capped by
-        `--max-catchup-bytes`. Whatever the cap refuses is reported as the residual that is genuinely
-        lost. An accounting that stopped at naming the gap would leave the rows on the card.
       * the watermark advances only to the size measured BEFORE the fetch, and only after a
         successful ingest. Both directions of that are deliberate: the file grows during the fetch,
         so the pre-fetch size is the one the body is guaranteed to have reached, and a run that
         failed must not move the mark past rows it never stored.
+      * `None` is a first-class answer. A run that could not measure says so -- it never says zero.
+    
+    ⚠️A CATCH-UP REFETCH IS DELIBERATELY ABSENT, AND THIS IS THE SECOND TIME THAT HAS BEEN DECIDED.
+    The node has no offset argument and no Range header, so the only reach-back control is a bigger
+    `tail=` -- and `/sd` seeks against the size AT REFETCH TIME (night_node.ino:1985-1986,
+    `size_t remain = f.size(); if (tail > 0 && remain > (size_t)tail) f.seek(remain - tail)`). The
+    file grows underneath for the whole of the first fetch (2 MB at the measured 40-135 KB/s is
+    15-50 s, ~3.5-12 KB at ~235 B/s), so a tail sized against the pre-fetch `size_now` lands FORWARD
+    of where the gap is. Measured against a fixture whose file grows during the fetch: the refetch
+    left 40 of 520 rows on the card and the drain reported 0 B unfetched, because the residual was
+    recomputed against the same stale `size_now`. It did not merely fail to close the gap -- it
+    erased the measurement. Reaching back is a second mechanism with its own failure modes; what this
+    module owes its caller is an honest number.
     
     ⚠️THE GAP IS BIASED TOWARDS SILENCE, ON PURPOSE. `size_now` is read before the body, and the file
     grows ~235 B/s underneath, so `window_start` is understated by roughly the round trip -- a few
@@ -1737,25 +1755,18 @@ data:
     SCENE_FILES = ("scene.csv", "scene-prev.csv")
     CONTEXT_FILES = ("health.csv",)
     
-    # ⚠️SCENE IS FETCHED BY TAIL, NOT WHOLE. It grows without bound (16.6 MB on 2026-09-08; 2-7
-    # minutes to pull at the node's measured 40-135 KB/s) and re-fetching all of it every 15 minutes
-    # would spend the whole interval on rows already stored. The ingest is content-addressed, so the
-    # overlap costs nothing.
+    # ⚠️SCENE IS FETCHED BY TAIL, NOT WHOLE. It grows without bound (16,771,742 B on nyquist and
+    # 16,435,916 B on mach in tests/fixtures/ls_*.txt, captured 2026-09-08; 2-7 minutes to pull at the
+    # node's measured 40-135 KB/s) and re-fetching all of it every 15 minutes would spend the whole
+    # interval on rows already stored. The ingest is content-addressed, so the overlap costs nothing.
     #
     # ⚠️THIS WINDOW IS A BYTE COUNT AND ITS REACH-BACK IN HOURS SHRINKS AS THE ROW RATE OR ROW SIZE
     # RISES. It is NOT self-healing by construction; it is self-healing only while it is still wider
     # than the interval between two successful runs, and that is now a measurement, not an assumption:
-    # 2 MB / 235.0 B per row / (1024 ms per row) = 2.42 h on nyquist, 2.45 h on mach. See
-    # `scene_gap()` -- the drain measures its own reach-back every run and refetches past it.
+    # 2 MB / 235.0 B per row / (1024 ms per row) = 2.42 h on nyquist, 2.45 h on mach, both derived
+    # from the pool's ledger. See `scene_gap()` -- the drain measures its own reach-back every run and
+    # REPORTS what it did not cover. It does not refetch; see the module docstring for why not.
     SCENE_TAIL_BYTES = 2_000_000
-    
-    # How far back a catch-up refetch may reach in one go. Sized against the CronJob period, not
-    # against the file: at the measured 40 KB/s floor, 8 MB is ~3.4 min and at 135 KB/s ~1 min, both
-    # comfortably inside the 15 min in deploy/k8s/hear-drain.yaml even with the normal tail, the dets
-    # files and a second node in the same run. That CronJob is `concurrencyPolicy: Forbid` (verified,
-    # hear-drain.yaml:30), so an overrun would SKIP the next tick rather than double up -- which is
-    # still a missed window, so raising this trades a bounded catch-up for a skipped run.
-    DEFAULT_MAX_CATCHUP_BYTES = 8_000_000
     
     # `<pool>/state/scene_fetch.json`: per node, per file, the file SIZE at the end of the last
     # successful window. Pool already creates `state/`.
@@ -1765,6 +1776,18 @@ data:
     # has already clamped anything smaller than one row to zero: what survives to the heartbeat is a
     # whole row of scene the pool will never see, and there is no acceptable number of those.
     DEFAULT_MAX_UNFETCHED_BYTES = 0
+    
+    # ⚠️THE CHECK RUNS ONE FIFTH AS OFTEN AS THE DRAIN, so a per-run field it reads is 4 runs out of
+    # date the moment it is written. deploy/k8s/hear-drain.yaml schedules the drain `*/15 * * * *` and
+    # the check `17 * * * *`: 4 drains land between two checks and the 5th, 6th and 7th most recent
+    # measurements are already gone by the time anything looks. So the heartbeat keeps a RING of
+    # per-run measurements and `check()` sums the ones inside this window rather than reading the last
+    # one. 7200 s is two check periods, so one missed check run does not lose a report -- and it is
+    # the same tolerance `DEFAULT_MAX_STALE_S` already uses for a silence.
+    DEFAULT_UNFETCHED_WINDOW_S = 7200.0
+    # How many per-run measurements the ring keeps. At the CronJob's 15 min that is 16 h of history,
+    # comfortably longer than the window above even if the check stops running for most of a day.
+    UNFETCHED_RING = 64
     
     # The advisory boot cross-check walks stored scene partitions, so its cost grows with how long the
     # node has been up. Past this it is SKIPPED and says so -- the byte watermark is the number that
@@ -1906,7 +1929,7 @@ data:
     
           size_unknown  `/ls` failed or did not list the file. `unfetched_bytes` is None, NOT 0 --
                         an absent measurement must never render as a clean one.
-          first_run     no watermark yet. The 16.6 MB behind the first window is not loss; it is
+          first_run     no watermark yet. The ~16.8 MB behind the first window is not loss; it is
                         history this drain was never running for, and reporting it as loss on every
                         fresh pool would train everyone to ignore the field.
           rolled        `size_now < prev_size`: scene.csv rolled to scene-prev.csv on a schema change
@@ -1982,11 +2005,21 @@ data:
         `now - status.uptime_s`. Counting the stored rows that land on it gives what the pool holds
         for this boot, against what the node says it wrote.
     
-        ⚠️7.6% OF SCENE ROWS (3,175 of 41,507) CARRY `utc_us == 0` AND CANNOT BE CLUSTERED THIS WAY.
-        They are not attributed to a boot by guesswork -- an attribution rule that got them wrong
-        would report ~7.6% phantom loss. They are counted into their own bucket and the outstanding
-        figure is reported as the RANGE they make it: `outstanding_max` assumes none of them belong to
-        this boot, `outstanding_min` assumes all of them do. The truth is inside.
+        ⚠️7.6% OF SCENE ROWS (3,175 of 41,507 in `~/hear-corpus-export/corpus`) CARRY `utc_us == 0`
+        AND CANNOT BE CLUSTERED THIS WAY. They are not attributed to a boot by guesswork -- an
+        attribution rule that got them wrong would report ~7.6% phantom loss. They bound the answer
+        instead: `outstanding_max` assumes none of them belong to this boot, `outstanding_min` assumes
+        as many as possibly could.
+    
+        ⚠️"AS MANY AS POSSIBLY COULD" IS NOT "ALL OF THEM", AND READING IT THAT WAY MADE THE LOWER
+        BOUND MEANINGLESS. An unanchored row still carries `uptime_s`, and within one boot `uptime_s`
+        is strictly increasing (rows are 1.024 s apart, so consecutive integer seconds differ by 1 or
+        2 and never repeat). So this boot can hold at most ONE unanchored row per distinct `uptime_s`
+        value, and none at all above the node's current `uptime_s`. Measured on the exported corpus:
+        mach has 2,896 unanchored rows across only 786 distinct `uptime_s` values (13-808 s -- they
+        are the cold-start window before the PPS lock), so counting them all made the lower bound
+        subtract roughly 3.7 boots' worth of rows from ONE boot. The distinct-value count is a real
+        upper bound; the raw count was not a bound on anything.
     
         ⚠️ADVISORY, AND SUBORDINATE TO THE BYTE WATERMARK. `scene_gap()` is the number to trust. This
         one depends on GPS state, on the pool's day partitioning and on the node's uptime clock; when
@@ -2013,11 +2046,24 @@ data:
                       if os.path.isdir(os.path.join(pl.scene_dir, d))) \
             if os.path.isdir(pl.scene_dir) else []
         boot_day = P._day(boot_epoch)
-        on_boot, unanchored = 0, 0
+        on_boot = 0
+        # Distinct `uptime_s` values, not rows: see the docstring. A value above the node's current
+        # uptime cannot have been produced by the boot that is still running.
+        unanchored_uptimes: set = set()
+        unanchored_rows = 0
         for d in days:
             if d == "unanchored":
-                for _r in pl.scene(node=node, day=d):
-                    unanchored += 1
+                for r in pl.scene(node=node, day=d):
+                    unanchored_rows += 1
+                    ru = r.get("uptime_s")
+                    if ru in (None, ""):
+                        continue
+                    try:
+                        ru = int(float(ru))
+                    except (TypeError, ValueError):
+                        continue
+                    if ru <= float(uptime):
+                        unanchored_uptimes.add(ru)
                 continue
             if d < boot_day:
                 continue
@@ -2033,11 +2079,12 @@ data:
                 if abs(epoch - boot_epoch) <= tolerance_s:
                     on_boot += 1
         out["ingested_this_boot"] = on_boot
-        out["unattributed_unanchored"] = unanchored
+        out["unanchored_rows_stored"] = unanchored_rows
+        out["unanchored_attributable_max"] = len(unanchored_uptimes)
         if out["written"] is not None:
             w = int(out["written"])
             out["outstanding_max"] = max(0, w - on_boot)
-            out["outstanding_min"] = max(0, w - on_boot - unanchored)
+            out["outstanding_min"] = max(0, w - on_boot - len(unanchored_uptimes))
         return out
     
     
@@ -2050,74 +2097,31 @@ data:
         return p
     
     
-    def _catch_up(ip: str, name: str, timeout: float, body: bytes, gap: Dict[str, Any],
-                  size_now: Optional[int], prev_size: Optional[int], max_catchup_bytes: int,
-                  out: Dict[str, Any]) -> Tuple[bytes, Dict[str, Any]]:
-        """Refetch with a bigger `tail=` so the gap is CLOSED, not merely named.
-    
-        The node has no offset argument and no Range header -- `/sd` does `f.seek(size - tail)` and
-        nothing else -- so a larger tail is the only reach-back that exists. The request is
-        `fetched + gap + one row`, capped by `--max-catchup-bytes`; the extra row is there because
-        the first byte of a window lands mid-row and is dropped by the reader.
-    
-        Whatever the cap refuses stays in `unfetched_bytes`: bounded and stated, never absorbed. The
-        residual is recomputed against the SAME `size_now` the first window used, so both windows are
-        measured on one basis and the residual carries the same sub-row uncertainty as the original.
-        """
-        wanted = int(len(body) + gap["unfetched_bytes"] + (gap.get("mean_row_bytes") or 0) + 1)
-        tail = min(wanted, int(max_catchup_bytes))
-        info = {"gap_before_bytes": gap["unfetched_bytes"], "wanted_tail": wanted,
-                "requested_tail": tail, "capped": tail < wanted}
-        if tail <= len(body):
-            # The cap is already below what the first window took; a refetch would move backwards.
-            info["skipped"] = "cap %d is not larger than the window already fetched" % tail
-            gap["catchup"] = info
-            return body, gap
-        try:
-            bigger = fetch_sd(ip, name, timeout, tail=tail)
-        except Exception as e:
-            info["error"] = repr(e)
-            gap["catchup"] = info
-            return body, gap
-        if not bigger or len(bigger) <= len(body):
-            info["error"] = "refetch returned %s, not more than the %d B already held" % (
-                "nothing" if not bigger else "%d B" % len(bigger), len(body))
-            gap["catchup"] = info
-            return body, gap
-        info["fetched_bytes"] = len(bigger)
-        info["gained_bytes"] = len(bigger) - len(body)
-        gap2 = scene_gap(size_now, len(bigger), prev_size, mean_row_bytes(bigger))
-        gap2["catchup"] = info
-        gap2["first_window"] = {k: gap.get(k) for k in
-                                ("fetched_bytes", "window_start", "raw_gap_bytes",
-                                 "unfetched_bytes", "mean_row_bytes")}
-        if gap2.get("unfetched_bytes"):
-            out["errors"].append(
-                "%s: %d B (~%s row(s)) of scene were never fetched and the catch-up cap of %d B could "
-                "not reach them" % (name, gap2["unfetched_bytes"], gap2.get("unfetched_rows_est"),
-                                    max_catchup_bytes))
-        return bigger, gap2
-    
-    
     def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOUT_S,
-                   stamp: Optional[int] = None,
-                   max_catchup_bytes: int = DEFAULT_MAX_CATCHUP_BYTES) -> Dict[str, Any]:
+                   stamp: Optional[int] = None) -> Dict[str, Any]:
         """Fetch, archive and ingest one node. Never raises for a node-side problem; reports it.
     
-        The scene fetch also measures its own reach-back against the file on the card and refetches
-        past whatever the last successful window did not cover -- see the module docstring and
-        `scene_gap()`. `unfetched_bytes` on the result is what survived the catch-up cap: rows that
-        are on the card, are not in the pool, and will roll off it. Zero is the normal answer and
-        None means the measurement itself failed, which is not the same thing.
+        The scene fetch also measures its own reach-back against the file on the card -- see the
+        module docstring and `scene_gap()`. `unfetched_bytes` is the number of bytes of scene.csv no
+        fetch has ever asked for: rows that are on the card, are not in the pool, and will roll off it.
+    
+        ⚠️THREE ANSWERS, NOT TWO, AND THE THIRD IS THE POINT OF THE MODULE. `unfetched_bytes` is an
+        integer only when a measurement actually happened; it is `None` whenever one did not, and
+        `unfetched_unknown` says so alongside `unfetched_reason`. A run that could not reach `/status`
+        at all, or that refused the node on identity, has measured NOTHING -- and a module whose whole
+        contract is that an unmeasured thing must not read as a clean one cannot then return 0 for it.
+        `unfetched_unknown` therefore starts True and is cleared only by a completed measurement.
         """
         stamp = int(stamp if stamp is not None else time.time())
         out: Dict[str, Any] = {"node": node, "ip": ip, "at": stamp, "ok": False,
                                "files": [], "added": 0, "scene_added": 0, "errors": [],
-                               "unfetched_bytes": 0, "unfetched_unknown": False}
+                               "unfetched_bytes": None, "unfetched_unknown": True,
+                               "unfetched_reason": "the run ended before any scene tail was measured"}
         try:
             st = fetch_status(ip, timeout)
         except Exception as e:
             out["errors"].append("status: %r" % (e,))
+            out["unfetched_reason"] = "/status was unreachable, so nothing about this node was measured"
             return out
         said = str(st.get("node", ""))
         out["identity"] = said
@@ -2126,6 +2130,8 @@ data:
             out["errors"].append(
                 "identity: %s answers as %r, not %r -- refusing to file its rows under the wrong "
                 "name (check the DHCP lease)" % (ip, said, node))
+            out["unfetched_reason"] = ("%s answered as %r, so no file of %r's was measured"
+                                       % (ip, said, node))
             return out
     
         for name in CONTEXT_FILES:
@@ -2166,9 +2172,13 @@ data:
                 body = fetch_sd(ip, name, timeout, tail=tail)
             except Exception as e:
                 out["errors"].append("%s: %r" % (name, e))
+                if tail:
+                    out["unfetched_reason"] = "%s could not be fetched, so it was not measured" % name
                 continue
             if body is None:
                 out["files"].append({"name": name, "absent": True})
+                if tail:
+                    out["unfetched_reason"] = "the node served no %s to measure" % name
                 continue
     
             if not tail:
@@ -2179,9 +2189,18 @@ data:
                 size_now = sizes.get(name) if sizes is not None else None
                 prev = (node_wm.get(name) or {}).get("size")
                 gap = scene_gap(size_now, len(body), prev, mean_row_bytes(body))
-                if gap.get("unfetched_bytes"):
-                    body, gap = _catch_up(ip, name, timeout, body, gap, size_now, prev,
-                                          max_catchup_bytes, out)
+                # ⚠️THE MEASUREMENT IS BOOKED HERE, BEFORE THE INGEST, BECAUSE IT IS A PROPERTY OF THE
+                # FETCH. Booking it after the store meant an ingest that raised took the number with
+                # it: a run that measured a real gap and then failed to write reported 0 -- the exact
+                # unmeasured-reads-as-clean failure this module exists to prevent, reintroduced by
+                # control flow. Whether the fetched rows landed is a SEPARATE loss, on `errors`.
+                if gap.get("unfetched_bytes") is None:
+                    out["unfetched_reason"] = ("/ls gave no size for %s, so its reach-back is "
+                                               "unmeasured" % name)
+                else:
+                    out["unfetched_bytes"] = (out["unfetched_bytes"] or 0) + int(gap["unfetched_bytes"])
+                    out["unfetched_unknown"] = False
+                    out["unfetched_reason"] = None
     
             path = archive(pl.root, node, name, body, stamp)
             audit = {"file": name, "gap": gap, "status": status_block}
@@ -2199,10 +2218,6 @@ data:
                 out["errors"].append("%s: ingest: %r" % (name, e))
                 continue
             if tail:
-                if gap.get("unfetched_bytes") is None:
-                    out["unfetched_unknown"] = True
-                else:
-                    out["unfetched_bytes"] += int(gap["unfetched_bytes"])
                 if gap.get("size_now") is not None:
                     node_wm[name] = {"size": int(gap["size_now"]), "at": stamp,
                                      "mean_row_bytes": gap.get("mean_row_bytes")}
@@ -2346,12 +2361,21 @@ data:
             s["kind"] = "node"
             s["last_attempt_s"] = now
             s["last_error"] = r["errors"][0] if r["errors"] else None
-            # ⚠️RECORDED ON EVERY ATTEMPT, NOT ONLY ON SUCCESS. A capped catch-up is exactly the run
-            # that both loses rows AND reports an error, so filing the loss under `if r["ok"]` would
-            # hide it in the one case it exists for. `None` means the measurement failed and is kept
-            # distinct from 0, which means it succeeded and found nothing missing.
-            s["last_unfetched_bytes"] = (None if r.get("unfetched_unknown")
-                                         else r.get("unfetched_bytes"))
+            # ⚠️RECORDED ON EVERY ATTEMPT, NOT ONLY ON SUCCESS. The run that loses rows is often the
+            # same run that reports an error, so filing the loss under `if r["ok"]` would hide it in
+            # the one case it exists for. `None` means the measurement did not happen and is kept
+            # distinct from 0, which means it happened and found nothing missing.
+            measured = None if r.get("unfetched_unknown") else r.get("unfetched_bytes")
+            s["last_unfetched_bytes"] = measured
+            s["last_unfetched_reason"] = r.get("unfetched_reason")
+            # ⚠️APPENDED, NOT OVERWRITTEN. The drain runs every 15 min and the check hourly, so a
+            # per-run field is 4 runs stale by the time anything reads it and 3 of every 4 loss
+            # reports were invisible to the gate. The ring keeps them; `check()` sums a window of it.
+            ring = s.get("unfetched_recent")
+            if not isinstance(ring, list):
+                ring = []
+            ring.append({"at": now, "bytes": measured, "reason": r.get("unfetched_reason")})
+            s["unfetched_recent"] = ring[-UNFETCHED_RING:]
             if r["ok"]:
                 s["last_success_s"] = now
                 s["last_added"] = r["added"]
@@ -2371,22 +2395,67 @@ data:
         return hb
     
     
+    def _unfetched_note(s: Dict[str, Any], now: float, max_unfetched_bytes: int,
+                        window_s: float) -> Tuple[str, bool]:
+        """(text for the check line, is-it-a-failure) for one sensor's reach-back accounting.
+    
+        ⚠️READS THE RING, NOT THE LAST RUN. `unfetched_recent` holds one entry per drain; the drain
+        runs 4x as often as this check, so keying on `last_unfetched_bytes` discarded 3 of every 4
+        measurements before anything looked at them. Every entry inside `window_s` counts.
+    
+        ⚠️THREE STATES, KEPT APART. A ring entry whose `bytes` is None is a run that MEASURED NOTHING
+        -- an unreachable node, a refused identity, a failed `/ls`. It is reported as UNKNOWN with the
+        run's own reason, never as a clean zero, and deliberately not fatal on its own: a check that
+        fails on an unreachable node duplicates the staleness check below and cries wolf. A sensor
+        with no ring at all is a heartbeat written before this existed and reads `n/a`.
+        """
+        ring = s.get("unfetched_recent")
+        if not isinstance(ring, list) or not ring:
+            # Fall back to the single pre-ring field so an old heartbeat still says something true.
+            if "last_unfetched_bytes" not in s:
+                return "  unfetched n/a", False
+            v = s["last_unfetched_bytes"]
+            if v is None:
+                why = s.get("last_unfetched_reason") or "not measured"
+                return "  unfetched UNKNOWN (%s)" % why, False
+            if int(v) > max_unfetched_bytes:
+                return "  UNFETCHED %d B of scene never asked for" % int(v), True
+            return "", False
+    
+        recent = [e for e in ring if float(e.get("at") or 0) >= now - window_s]
+        if not recent:
+            return "  unfetched none in the last %.0f s" % window_s, False
+        total = sum(int(e["bytes"]) for e in recent if e.get("bytes") is not None)
+        unknown = [e for e in recent if e.get("bytes") is None]
+        lossy = [e for e in recent if e.get("bytes")]
+        note, bad = "", False
+        if total > max_unfetched_bytes:
+            note += ("  UNFETCHED %d B of scene never asked for, by %d of the %d run(s) in the last "
+                     "%.0f s" % (total, len(lossy), len(recent), window_s))
+            bad = True
+        if unknown:
+            note += ("  unfetched UNKNOWN for %d of %d run(s) (%s)"
+                     % (len(unknown), len(recent),
+                        unknown[-1].get("reason") or "no reason recorded"))
+        return note, bad
+    
+    
     def check(root: str, max_stale_s: float = DEFAULT_MAX_STALE_S,
               now: Optional[float] = None,
-              max_unfetched_bytes: int = DEFAULT_MAX_UNFETCHED_BYTES) -> Tuple[int, List[str]]:
+              max_unfetched_bytes: int = DEFAULT_MAX_UNFETCHED_BYTES,
+              unfetched_window_s: float = DEFAULT_UNFETCHED_WINDOW_S) -> Tuple[int, List[str]]:
         """(exit code, lines). Non-zero on a stale sensor OR on a sensor that skipped scene bytes.
     
         ⚠️STALENESS WAS ONLY HALF OF IT. A drain whose HTTP succeeded, whose ingest succeeded and
-        whose window silently started three hours after the last one ended looks perfect here: it is
-        fresh, it added rows, it exits 0. That is the case this check could not see and the case that
-        has already cost 3.11 h of scene. `last_unfetched_bytes` is per sensor and is already
-        thresholded at one row by `scene_gap()`, so the default of 0 means "any whole row skipped".
+        whose window silently started hours after the last one ended looks perfect here: it is fresh,
+        it added rows, it exits 0. That is the case this check could not see. The reach-back
+        measurement is already thresholded at one row by `scene_gap()`, so the default of 0 means
+        "any whole row skipped" -- there is no acceptable number of scene rows nobody ever asked for.
     
-        A missing `last_unfetched_bytes` is a heartbeat written before this existed and reads as
-        `n/a`, not as 0 -- all 54 ledger entries and every heartbeat predating this change lack it.
-        `None` means the run's `/ls` failed: reported as UNKNOWN, and deliberately not fatal, because
-        an unreachable `/ls` beside a successful fetch is a flaky endpoint rather than evidence of
-        loss, and a check that cries wolf gets switched off. It is never printed as a clean zero.
+        ⚠️AND IT HAS TO LOOK AT MORE THAN THE LAST RUN. deploy/k8s/hear-drain.yaml runs the drain
+        `*/15 * * * *` and this check `17 * * * *`, so four drains land between two checks. Reading a
+        field the drain overwrites each run meant 3 of every 4 measurements were gone before the gate
+        saw them. `_unfetched_note` sums the heartbeat's ring over `unfetched_window_s` instead.
         """
         now = time.time() if now is None else now
         p = heartbeat_path(root)
@@ -2399,15 +2468,8 @@ data:
             return 1, ["heartbeat names no sensors"]
         for name in sorted(sensors):
             s = sensors[name]
-            if "last_unfetched_bytes" not in s:
-                gap_note = "  unfetched n/a"
-            elif s["last_unfetched_bytes"] is None:
-                gap_note = "  unfetched UNKNOWN (/ls failed)"
-            elif int(s["last_unfetched_bytes"]) > max_unfetched_bytes:
-                gap_note = "  UNFETCHED %d B of scene never asked for" % s["last_unfetched_bytes"]
-                bad += 1
-            else:
-                gap_note = ""
+            gap_note, gap_bad = _unfetched_note(s, now, max_unfetched_bytes, unfetched_window_s)
+            bad += gap_bad
             last = s.get("last_success_s")
             if last is None:
                 lines.append("%-10s NEVER succeeded (last error: %s)%s"
@@ -2435,14 +2497,14 @@ data:
         ap.add_argument("--phone-days", type=int, default=3)
         ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
         ap.add_argument("--max-stale-s", type=float, default=DEFAULT_MAX_STALE_S)
-        ap.add_argument("--max-catchup-bytes", type=int, default=DEFAULT_MAX_CATCHUP_BYTES,
-                        help="how far back one catch-up refetch may reach when the scene tail did "
-                             "not cover the gap since the last successful run. Whatever this refuses "
-                             "is reported as still-unfetched, not absorbed")
         ap.add_argument("--max-unfetched-bytes", type=int, default=DEFAULT_MAX_UNFETCHED_BYTES,
                         help="--check fails above this many scene bytes no fetch has asked for. "
                              "Sub-row gaps are already clamped to 0, so the default of 0 means "
                              "'any whole row skipped'")
+        ap.add_argument("--unfetched-window-s", type=float, default=DEFAULT_UNFETCHED_WINDOW_S,
+                        help="--check sums the heartbeat's per-run reach-back measurements over this "
+                             "many seconds. Must cover every drain since the previous check ran or "
+                             "the measurements in between are never looked at")
         ap.add_argument("--check", action="store_true",
                         help="report sensor staleness from the heartbeat and exit; drains nothing")
         ap.add_argument("--ingest", action="append", default=[], metavar="PATH",
@@ -2458,7 +2520,8 @@ data:
     
         root = os.path.expanduser(a.pool)
         if a.check:
-            code, lines = check(root, a.max_stale_s, max_unfetched_bytes=a.max_unfetched_bytes)
+            code, lines = check(root, a.max_stale_s, max_unfetched_bytes=a.max_unfetched_bytes,
+                                unfetched_window_s=a.unfetched_window_s)
             print("\n".join(lines))
             return code
     
@@ -2485,8 +2548,7 @@ data:
             name, ip = spec.split("=", 1)
             nodes.append((name.strip(), ip.strip()))
     
-        results = [drain_node(pl, n, ip, a.timeout, max_catchup_bytes=a.max_catchup_bytes)
-                   for n, ip in nodes]
+        results = [drain_node(pl, n, ip, a.timeout) for n, ip in nodes]
         phone = drain_phone_corpus(pl, os.path.expanduser(a.phone_corpus), a.phone_days) \
             if a.phone_corpus else None
         write_heartbeat(root, results, phone)
@@ -2503,6 +2565,9 @@ data:
                 if r.get("ls_error"):
                     print("    /ls failed (%s) -- reach-back UNMEASURED this run, not clean"
                           % r["ls_error"])
+                elif r.get("unfetched_unknown"):
+                    print("    reach-back UNMEASURED this run, not clean: %s"
+                          % r.get("unfetched_reason"))
                 for f in r["files"]:
                     if f.get("absent"):
                         print("    %-14s absent" % f["name"])
@@ -2515,12 +2580,9 @@ data:
                         if g.get("unfetched_bytes") is None and not g.get("whole_file"):
                             print("      reach-back UNKNOWN: /ls gave no size for this file")
                         elif g.get("unfetched_bytes"):
-                            print("      ⚠️%d B (~%s row(s)) never fetched; caught up %s"
-                                  % (g["unfetched_bytes"], g.get("unfetched_rows_est"),
-                                     (g.get("catchup") or {}).get("gained_bytes", 0)))
-                        elif g.get("catchup"):
-                            print("      caught up %s B the tail did not cover"
-                                  % (g["catchup"].get("gained_bytes"),))
+                            print("      ⚠️%d B (~%s row(s)) of this file were never fetched by any "
+                                  "run and will roll off the card"
+                                  % (g["unfetched_bytes"], g.get("unfetched_rows_est")))
                     else:
                         print("    %-14s %d B archived" % (f["name"], f["bytes"]))
             if phone is not None:
