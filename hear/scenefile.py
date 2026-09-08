@@ -17,9 +17,13 @@ comes from the row's `bands` and `slices` columns -- which is why they are colum
 length is CHECKED against them, because a truncated line is otherwise indistinguishable from a
 smaller descriptor.
 
-⚠️THE SECOND AXIS IS `slices`, NOT `frames`. The row's `frames` column is how many FFT frames the
-node summed into each slice; it says how much averaging is behind a cell and it is NOT the shape.
-Conflating them silently changes what a feature vector means.
+⚠️THE SECOND AXIS IS `slices`, NOT `frames`, AND `frames` IS A ROW TOTAL. The column carries
+`SCENE_FRAMES = SCENE_SLICES * SCENE_FRAMES_PER_SLICE` (night_node.ino:1138-1140, written at
+:1239) -- 64 for the whole row, at 4 slices of 16. The per-slice averaging divides by
+SCENE_FRAMES_PER_SLICE, so a reader that takes this column as the per-slice count is out by a
+factor of `slices`. Neither number is the shape. `frames_per_slice()` derives the per-slice count
+rather than leaving every caller to divide, and the stored field keeps the name `frames_summed`
+because 41,507 rows already carry it.
 
 The generations, all with headers that describe their own rows (unlike `dets.csv` G3):
 
@@ -141,6 +145,24 @@ def decode_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return {"q": np.frombuffer(b, dtype=np.int8).reshape(bands, slices),
             "ref_db": ref4 / 4.0, "bands": bands, "slices": slices,
             "span_ms": span, "frames_summed": _int("frames")}
+
+
+def frames_per_slice(row_or_decoded: Dict[str, Any]) -> Optional[int]:
+    """FFT frames averaged into ONE slice: the row's `frames` total divided by its `slices`.
+
+    ⚠️The column is the ROW total, not this. Taking it directly as the per-slice count is wrong by
+    a factor of `slices` (4 today), and nothing about the resulting number looks wrong -- it is
+    exactly the class of error the band-axis and header-shape guards exist for.
+    """
+    n = row_or_decoded.get("frames_summed")
+    if n is None:
+        n = row_or_decoded.get("frames")
+        n = int(n) if n not in (None, "") else None
+    sl = row_or_decoded.get("slices")
+    sl = int(sl) if sl not in (None, "") else None
+    if not n or not sl:
+        return None
+    return n // sl
 
 
 def read_text(text: str, default_node: Optional[str] = None,
