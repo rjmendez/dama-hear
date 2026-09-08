@@ -65,6 +65,32 @@ storage (**33 %**) and 120 460 B of RAM (**36 %**). Built against a throwaway `s
 deliberately unusable credentials, so the image could never have joined anything; the stub and the
 build tree were deleted immediately.
 
+## ✅ FLASHED 2026-09-08 11:0x-11:2x local, both nodes
+
+`~/.wifi` was on **mrpink**, not here; copied it, built locally, OTA'd via `flash.py`. Both came
+back reporting their own identity, and both logged `boot marked healthy; failback counter
+cleared`, so neither can be reverted by the boot counter.
+
+| | before | after |
+|---|---|---|
+| `dets.csv` | 12-col header, **11-col rows** | **12/12, `node_id` populated** |
+| frame | `fs=None, layout=nyquist` | **`fs=16000, layout=fixed, valid_bands=15`** |
+| fleet model | refused every frame | **scores them** |
+
+Both cards logged `sd rolled /dets.csv -> /dets-prev.csv (header changed)` — the rename did
+exactly what it was renamed for, and the pre-flash rows are preserved on the card as well as
+pulled to `~/hear-pull-2026-09-08/*_dets_preflash.csv`.
+
+⚠️**mach's GPS took ~7 minutes to come back**, sitting at `fix=0 sats=0 baud=9600 acked=false`
+while the baud/pin auto-detect re-ran — expected on the node whose GPS TX/RX is wired reversed,
+but it looks alarming for several minutes. It settled to fix 3, 18 sats, tAcc 24 ns, 115200,
+acked. nyquist relocked immediately. ⚠️mach's `probe_resyncs` went 2 → 5 during that scan.
+
+⚠️The mrpink collector (`watch.py`, polling nyquist every 30 s for 1 d 10 h) **survived** the
+reboot — it kept writing across the gap rather than dying.
+
+**Superseded:** the note below was written before the flash.
+
 ⚠️**Not flashed, and cannot be from here.** `flash.py` regenerates `secrets.h` from `~/.wifi`,
 which does not exist on this machine — `gen_secrets.py` exits 1 and `flash.py` aborts at step 1
 before it builds. That is the tooling failing closed, and it is the right behaviour: flashing a
