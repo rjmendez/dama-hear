@@ -1,9 +1,10 @@
 {
-  "schema": "hear.window.golden.v1",
+  "schema": "hear.window.golden.v2",
   "env_ms": 1.0,
+  "onset_frac": 0.2,
   "guard_s": 0.025,
   "retrigger_s": 0.06,
-  "note": "x = int16 pcm / 32767.0, the scale AudioPullFormat and the capture ring use. env is a 1 ms moving average of |x| with numpy 'same' alignment.",
+  "note": "x = int16 pcm / 32767.0, the scale AudioPullFormat and the capture ring use. env is a 1 ms moving average of |x| with numpy 'same' alignment. `peak_index` is the envelope argmax; `constant_fraction_onset` is what the sketch must actually start at -- they are NOT the same sample.",
   "cases": [
     {
       "name": "impulse_48k",
@@ -12,6 +13,10 @@
       "env_taps": 48,
       "search_lo": 0,
       "search_hi": 4096,
+      "peak_index": 536,
+      "onset_frac": 0.2,
+      "onset_back": 1200,
+      "constant_fraction_onset": 496.8781582733813,
       "onset_index": 536,
       "probe_index": [
         0,
@@ -107,6 +112,10 @@
       "env_taps": 48,
       "search_lo": 0,
       "search_hi": 4096,
+      "peak_index": 3560,
+      "onset_frac": 0.2,
+      "onset_back": 1200,
+      "constant_fraction_onset": 3371.6364265927978,
       "onset_index": 3560,
       "probe_index": [
         0,
@@ -202,6 +211,10 @@
       "env_taps": 48,
       "search_lo": 100,
       "search_hi": 900,
+      "peak_index": 484,
+      "onset_frac": 0.2,
+      "onset_back": 1200,
+      "constant_fraction_onset": 0.0,
       "onset_index": 484,
       "probe_index": [
         0,
@@ -297,6 +310,10 @@
       "env_taps": 16,
       "search_lo": 0,
       "search_hi": 4096,
+      "peak_index": 8,
+      "onset_frac": 0.2,
+      "onset_back": 400,
+      "constant_fraction_onset": 0.0,
       "onset_index": 8,
       "probe_index": [
         0,

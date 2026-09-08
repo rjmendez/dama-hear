@@ -61,9 +61,26 @@ GRID = [0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0]
 
 
 def _onset(xi, fs):
+    """Where the sketch starts: the CONSTANT-FRACTION onset, not the envelope peak.
+
+    ⚠️This changed twice. It used to return the argmax (peak-aligned). Then the node gate grew
+    a constant-fraction onset clamped to the 25 ms re-trigger guard, which is right for the
+    TIMESTAMP and wrong for a 33 ms feature window. Nested grouped CV on the same 228 events,
+    varying only where the sketch starts:
+
+        peak (no back-walk)            0.9634
+        onset, back <= 4 ms (one hop)  0.9732   <- this
+        onset, back <= 25 ms (guard)   0.9443
+
+    Must match detect.SKETCH_BACK_S and the phone's SketchWindow, or a model fitted here is
+    applied to bytes cut differently.
+    """
     e = DT.envelope(xi, fs)
     lo, hi = int(SEARCH_S[0] * fs), int(SEARCH_S[1] * fs)
-    return lo + int(np.argmax(e[lo:hi]))
+    peak = lo + int(np.argmax(e[lo:hi]))
+    # SKETCH_BACK_S, not GUARD_S: the same one-hop clamp the gate now uses for `sketch_index`.
+    return int(DT.onset_index(e, peak, DT.ONSET_FRAC,
+                              back=max(1, int(DT.SKETCH_BACK_S * fs))))
 
 
 def sketch_of(xi, fs, layout=SK.LAYOUT_FIXED):
