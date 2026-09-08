@@ -6,7 +6,7 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'd146ee4-dirty'
+    dama-hear/commit: '3dd6aa9'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
 data:
   hear__init__.py: |
@@ -1092,10 +1092,49 @@ data:
         the scene bank spans 62.5-7812.5 Hz where the detection bank spans 312.5-8000 -- so a key that
         named only the shape would report one geometry for two axes. `?` marks an edge the row never
         declared (an S0 row has no f_lo_hz/f_hi_hz columns); it is not the same as any stated edge.
+    
+        ⚠️THE KEY MUST NOT ROUND TWO AXES TOGETHER. `%g` is 6 significant digits, so a bare `%g` would
+        print 62.5 for both 62.5 and 62.50000001 -- and this string is `scene_stats`' dict key, the one
+        place a mix is counted WITHOUT raising, so a collapsed key undercounts distinct geometries
+        exactly where nothing else would notice. `scene_matrix` compares the exact tuple, so a bare
+        `%g` also lets it refuse two rows while printing one key for both. Every edge is therefore
+        round-tripped: `%g` is kept only when it reads back as the same float, else `repr`. Today's
+        firmware writes MELS_F_LO/MELS_F_HI at one decimal, so this never fires on shipped rows.
         """
         bands, slices, lo, hi = g
-        fmt = lambda v: "?" if v is None else ("%g" % float(v))       # noqa: E731
+    
+        def fmt(v):
+            if v is None:
+                return "?"
+            v = float(v)
+            s = "%g" % v
+            return s if float(s) == v else repr(v)
+    
         return "%sx%s@%s-%s" % (bands, slices, fmt(lo), fmt(hi))
+    
+    
+    def _why_geoms_differ(a: Tuple[Any, Any, Any, Any], b: Tuple[Any, Any, Any, Any]) -> str:
+        """Name what actually differs between two scene geometries, not what might have.
+    
+        ⚠️Keyed on the DIFFERENCE, not on the presence of a None. A message that decided by asking
+        "is any edge undeclared?" reported band EDGES for a pure shape change whose edges were
+        byte-identical (20x4@300-7840 against 16x4@300-7840), and reported an undeclared axis for two
+        S0 rows whose edges were equally undeclared and therefore not different at all. A refusal that
+        misnames its own cause sends the reader to the wrong firmware constant.
+        """
+        why = []
+        if (a[0], a[1]) != (b[0], b[1]):
+            why.append("the SHAPE differs -- %sx%s against %sx%s, which is not one matrix width"
+                       % (a[0], a[1], b[0], b[1]))
+        if (a[2], a[3]) != (b[2], b[3]):
+            if None in (a[2], a[3], b[2], b[3]):
+                why.append("one of them leaves its band axis UNDECLARED (an S0 row carries no "
+                           "f_lo_hz/f_hi_hz, shown as ?). An axis that is not stated cannot be "
+                           "shown to be the axis that is, so it is refused rather than assumed")
+            else:
+                why.append("the shape can match while the band EDGES do not, and then band k is "
+                           "a different frequency in the two")
+        return "; and ".join(why) if why else "they compare unequal on no named field"
     
     
     def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -1480,6 +1519,14 @@ data:
             unknown cannot be shown to share an axis with one whose axis is known, so an S0 row and an
             S1/S2 row refuse to stack even if the same firmware wrote both. That is the intended
             reading of an undeclared axis, not a bug; select a day or node to get one generation.
+    
+            ⚠️`limit` BOUNDS WHAT IS BUILT, NOT WHAT IS CHECKED. The selection is walked to the end
+            whatever the limit, and a differing row past it still raises. Stopping the walk at the
+            limit would have made the keyword silently disable the guard the paragraph above promises,
+            and it would have handed back a sample drawn only from whichever geometry sorted first --
+            biased in a way the caller has no way to see. Measured on a 41,507-row pool: the full walk
+            costs 0.240 s against 0.009 s for the old early break, while the full build is 0.818 s. The
+            limit still bounds MEMORY, which is what it is for; only `limit` rows are ever decoded.
             """
             if mode not in ("db", "q"):
                 raise ValueError("mode must be 'db' or 'q'")
@@ -1490,22 +1537,15 @@ data:
                 if geom is None:
                     geom = g
                 elif g != geom:
-                    if None in (geom[2], geom[3], g[2], g[3]):
-                        why = ("one of them leaves its band axis UNDECLARED (an S0 row carries no "
-                               "f_lo_hz/f_hi_hz, shown as ?). An axis that is not stated cannot be "
-                               "shown to be the axis that is, so it is refused rather than assumed")
-                    else:
-                        why = ("the shape can match while the band EDGES do not, and then band k is "
-                               "a different frequency in the two")
                     raise ValueError("mixed scene geometry: %s then %s -- %s. Select a day or node "
                                      "whose firmware did not change."
-                                     % (_geom_str(geom), _geom_str(g), why))
+                                     % (_geom_str(geom), _geom_str(g), _why_geoms_differ(geom, g)))
+                if limit and len(rows) >= limit:
+                    continue                    # keep CHECKING; stop collecting
                 q = np.frombuffer(base64.b64decode(r["mel_b64"]), dtype=np.int8) \
                     .reshape(r["bands"], r["slices"]).astype(float)
                 rows.append((q / 2.0 + r["ref_db"] if mode == "db" else q).reshape(-1))
                 out.append(r)
-                if limit and len(rows) >= limit:
-                    break
             if not rows:
                 return np.zeros((0, 0)), []
             return np.vstack(rows), out
