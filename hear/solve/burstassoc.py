@@ -24,14 +24,23 @@ ambiguous rather than resolved, because that is exactly the 13-of-55 case above 
 of two equally-good answers is how a plausible wrong association enters a solve. `margin` is the
 separation, and `MIN_MARGIN` the default demand.
 
-⚠️A CONSTANT ECHO DELAY IS AN UNRESOLVABLE TIE, AND IT IS THE REALISTIC CASE. A stationary
-source in a fixed room echoes at a near-constant delay -- same paths, same geometry, every event
--- so the echo train IS the direct train shifted, and tau and tau+echo explain the arrivals
-equally well. Nothing in the timing separates them. This refuses rather than picking. Two things
-would break it and neither is here yet: the geometric bound already does when tau+echo exceeds
-d/c (such a tau is never even proposed), and AMPLITUDE would, since the direct path is louder and
-the 172-byte frame already carries `peak`. Resolution needs the echo delay to VARY across the
-burst by more than the tolerance.
+⚠️A CONSTANT ECHO DELAY IS AN UNRESOLVABLE TIE IN THE TIMING, AND IT IS THE REALISTIC CASE. A
+stationary source in a fixed room echoes at a near-constant delay -- same paths, same geometry,
+every event -- so the echo train IS the direct train shifted, and tau and tau+echo explain the
+arrivals equally well.
+
+Three things break it, in order of authority. The geometric bound settles it for free when
+tau+echo exceeds d/c: such a tau is never proposed. A varying echo delay settles it when the
+variation exceeds the tolerance. Otherwise pass `peak_a`/`peak_b` -- the per-event amplitude the
+frame already carries -- and the louder pairing wins, because a direct arrival is louder than its
+own reflection.
+
+⚠️AMPLITUDE IS A PRIOR AND IS RANKED BELOW TIMING ACCORDINGLY. It only ever breaks a tie the pair
+COUNT could not; a hypothesis explaining more pairs wins however quiet it is. A shadowed or
+off-axis node genuinely can receive a reflection stronger than the direct arrival, so a winner
+that is quieter on any differing side is refused outright rather than inverted, the margin is
+taken on the MEDIAN of the matched set, and a zero or missing peak disables the tiebreaker
+instead of counting as silence. `decided_by` records which rule settled it.
 
 ⚠️VALIDATED ON SYNTHETIC GROUND TRUTH ONLY. The field data cannot test it: over a 15.0 h overlap
 those two nodes shared only 3 bursts with 3+ events on both sides, and 30% of one node's events
@@ -52,6 +61,17 @@ MIN_MARGIN: int = 1
 #: Two taus closer than this count as the same hypothesis when measuring the margin.
 TAU_SEPARATION_FACTOR: float = 2.0
 
+#: How much louder, in dB of median matched peak, one hypothesis must be before amplitude is
+#: allowed to break a tie the pair COUNT could not.
+#:
+#: ⚠️NOT MEASURED FROM FIELD DATA, because the field data has no usable bursts to measure it on.
+#: It is sized against what IS measured: event-to-event peak on these nodes spans 23.6 dB
+#: (nyquist) and 25.1 dB (mach) from p10 to p90, so a small threshold would fire on ordinary
+#: variation. 6 dB is a factor of two in amplitude, taken on the MEDIAN of the matched set rather
+#: than any single event, so ordinary spread averages down while a systematic direct-vs-echo
+#: offset does not. Revisit it the first time a burst both nodes heard is recorded.
+MIN_AMPLITUDE_MARGIN_DB: float = 6.0
+
 
 @dataclass
 class BurstMatch:
@@ -64,10 +84,61 @@ class BurstMatch:
     margin: int = 0
     tau_spread_s: Optional[float] = None
     runner_up_tau_s: Optional[float] = None
+    #: "count" when the pair count settled it, "amplitude" when peaks broke a count tie.
+    decided_by: str = "count"
+    #: dB by which the winner's median matched peak beat the runner-up's, when amplitude was used.
+    amplitude_margin_db: Optional[float] = None
 
     def __bool__(self) -> bool:
         return self.ok
 
+
+def _median_db(peaks: Sequence[float], idx: Sequence[int]) -> Optional[float]:
+    """Median of the selected peaks in dB, or None if any is missing or non-positive.
+
+    None rather than a substitute: a zero peak is an absent measurement, and treating it as
+    -inf dB would let one missing value decide the tie.
+    """
+    if not idx:
+        return None
+    vals = []
+    for k in idx:
+        if k >= len(peaks):
+            return None
+        v = float(peaks[k])
+        if not np.isfinite(v) or v <= 0:
+            return None
+        vals.append(20.0 * np.log10(v))
+    return float(np.median(vals))
+
+
+def _amplitude_prefers(a_pk, b_pk, cand_a, cand_b, margin_db):
+    """Is `cand_a` louder than `cand_b` on every side that differs, by at least `margin_db`?
+
+    ⚠️THE DIRECT PATH BEING LOUDER THAN ITS ECHO IS A PRIOR, NOT A LAW. A shadowed or
+    off-axis node can receive a reflection stronger than the direct arrival. So this demands a
+    real margin, demands the winner is not QUIETER on either side, and reports the margin it
+    used so the decision can be second-guessed.
+
+    Returns (prefers, margin_db) with margin None when amplitude cannot decide.
+    """
+    if a_pk is None or b_pk is None:
+        return False, None
+    best = None
+    for peaks, ia, ib in ((a_pk, [i for i, _ in cand_a], [i for i, _ in cand_b]),
+                          (b_pk, [j for _, j in cand_a], [j for _, j in cand_b])):
+        if sorted(ia) == sorted(ib):
+            continue                      # this side is the same set: it says nothing
+        da, db_ = _median_db(peaks, ia), _median_db(peaks, ib)
+        if da is None or db_ is None:
+            return False, None
+        d = da - db_
+        if d < 0:
+            return False, None            # quieter on a side that differs: refuse outright
+        best = d if best is None else min(best, d)
+    if best is None or best < margin_db:
+        return False, best
+    return True, best
 
 def _monotone_pairs(a: np.ndarray, b: np.ndarray, tau: float, tol: float) -> List[Tuple[int, int]]:
     """Order-preserving greedy matching of `a + tau` against `b`, within `tol`.
@@ -91,11 +162,26 @@ def _monotone_pairs(a: np.ndarray, b: np.ndarray, tau: float, tol: float) -> Lis
 
 def associate_burst(t_a: Sequence[float], t_b: Sequence[float], max_tau_s: float,
                     tol_s: float, min_pairs: int = 3,
-                    min_margin: int = MIN_MARGIN) -> BurstMatch:
+                    min_margin: int = MIN_MARGIN,
+                    peak_a: Optional[Sequence[float]] = None,
+                    peak_b: Optional[Sequence[float]] = None,
+                    min_amp_margin_db: float = MIN_AMPLITUDE_MARGIN_DB) -> BurstMatch:
     """Fit one delay to a whole burst.
 
     `max_tau_s` is the geometry's bound, d/c. `tol_s` is what a pairing may be off by -- the
     onset noise, NOT the bound. Passing the bound as the tolerance admits everything.
+
+    `peak_a`/`peak_b` are the per-event peak amplitudes the 172-byte frame already carries, one
+    per event, in the same order as the times. When given they break a tie the pair COUNT could
+    not -- the constant-echo case, where tau and tau+echo explain the arrivals equally well. The
+    direct path is louder than its reflection, so the louder pairing is preferred.
+
+    ⚠️AMPLITUDE ONLY EVER BREAKS A TIE. It cannot overturn a count: a hypothesis explaining more
+    pairs wins regardless of how loud the loser is. Timing is the measurement; loudness is a
+    prior, and a shadowed node really can hear a reflection louder than the direct arrival. So it
+    also refuses when the winner is QUIETER on any side whose matched set differs, and demands
+    `min_amp_margin_db` of separation on the MEDIAN of the matched set rather than any single
+    event. `decided_by` says which rule settled it.
     """
     a = np.asarray(sorted(t_a), dtype=float)
     b = np.asarray(sorted(t_b), dtype=float)
@@ -132,12 +218,23 @@ def associate_burst(t_a: Sequence[float], t_b: Sequence[float], max_tau_s: float
         return BurstMatch(False, "best tau explains only %d pairs, need %d" % (n, min_pairs),
                           tau_s=tau, pairs=pairs, n_pairs=n, margin=margin)
     if margin < min_margin:
+        prefers, amp_db = _amplitude_prefers(peak_a, peak_b, pairs, runner[2], min_amp_margin_db)
+        if prefers:
+            spread = float(np.ptp([b[j] - a[i] for i, j in pairs])) if len(pairs) > 1 else 0.0
+            return BurstMatch(True, "", tau_s=tau, pairs=pairs, n_pairs=n, margin=margin,
+                              tau_spread_s=spread, runner_up_tau_s=runner[1],
+                              decided_by="amplitude", amplitude_margin_db=amp_db)
+        extra = ""
+        if peak_a is not None and peak_b is not None:
+            extra = ("; amplitude did not settle it either (%s)"
+                     % ("margin %.1f dB, need %.1f" % (amp_db, min_amp_margin_db)
+                        if amp_db is not None else "peaks missing, equal, or favouring the runner-up"))
         return BurstMatch(False,
                           "ambiguous: tau %+.2f ms explains %d pairs and %+.2f ms explains %d -- "
-                          "margin %d, need %d"
-                          % (tau * 1e3, n, runner[1] * 1e3, runner[0], margin, min_margin),
+                          "margin %d, need %d%s"
+                          % (tau * 1e3, n, runner[1] * 1e3, runner[0], margin, min_margin, extra),
                           tau_s=tau, pairs=pairs, n_pairs=n, margin=margin,
-                          runner_up_tau_s=runner[1])
+                          runner_up_tau_s=runner[1], amplitude_margin_db=amp_db)
     spread = float(np.ptp([b[j] - a[i] for i, j in pairs])) if len(pairs) > 1 else 0.0
     return BurstMatch(True, "", tau_s=tau, pairs=pairs, n_pairs=n, margin=margin,
                       tau_spread_s=spread,

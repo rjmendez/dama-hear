@@ -131,6 +131,64 @@ class TestItRefuses:
         assert not m
 
 
+class TestAmplitudeTiebreaker:
+    """⚠️Amplitude is a PRIOR, not a measurement. These pin the ways it must not be used."""
+
+    @staticmethod
+    def _echo_case(direct_pk=4000.0, echo_pk=900.0, echo=0.012, tau=0.031, n=5):
+        a = np.arange(n) * 0.085
+        d = a + tau
+        b = np.sort(np.concatenate([d, d + echo]))
+        pk_b = [direct_pk if min(abs(t - x) for x in d) < 1e-9 else echo_pk for t in b]
+        return a, b, [direct_pk] * n, pk_b
+
+    def test_it_breaks_the_constant_echo_tie_that_timing_cannot(self):
+        a, b, pa, pb = self._echo_case()
+        assert not BA.associate_burst(a, b, BOUND, TOL)          # timing alone: ambiguous
+        m = BA.associate_burst(a, b, BOUND, TOL, peak_a=pa, peak_b=pb)
+        assert m and abs(m.tau_s - 0.031) < 0.001
+        assert m.decided_by == "amplitude"
+        assert m.amplitude_margin_db > 6.0
+
+    def test_it_refuses_when_the_echo_is_LOUDER_than_the_direct(self):
+        """A shadowed or off-axis node really can receive a reflection stronger than the direct
+        arrival. Preferring the louder pairing would then be confidently wrong, so a winner that
+        is quieter on a differing side is refused outright rather than inverted."""
+        a, b, pa, pb = self._echo_case(direct_pk=900.0, echo_pk=4000.0)
+        m = BA.associate_burst(a, b, BOUND, TOL, peak_a=pa, peak_b=pb)
+        assert not m
+
+    def test_a_margin_below_threshold_does_not_decide(self):
+        a, b, pa, pb = self._echo_case(direct_pk=4000.0, echo_pk=3000.0)   # 2.5 dB
+        m = BA.associate_burst(a, b, BOUND, TOL, peak_a=pa, peak_b=pb)
+        assert not m
+        assert m.amplitude_margin_db is not None and m.amplitude_margin_db < 6.0
+        assert "amplitude did not settle it" in m.reason
+
+    def test_amplitude_cannot_overturn_a_pair_COUNT(self):
+        """Timing is the measurement. A hypothesis explaining more pairs wins however quiet it
+        is -- otherwise a loud coincidence could outvote the geometry."""
+        a, b = _burst(n=5)
+        loud = [1.0] * len(a)            # the true pairing is the quietest possible
+        m = BA.associate_burst(a, b, BOUND, TOL, peak_a=loud, peak_b=[1.0] * len(b))
+        assert m and m.decided_by == "count"
+        assert abs(m.tau_s - 0.031) < 0.001
+
+    def test_a_missing_or_zero_peak_disables_the_tiebreaker(self):
+        """A zero peak is an absent measurement. Treating it as -inf dB would let one missing
+        value decide the tie."""
+        a, b, pa, pb = self._echo_case()
+        pb = list(pb); pb[0] = 0.0
+        assert not BA.associate_burst(a, b, BOUND, TOL, peak_a=pa, peak_b=pb)
+        assert not BA.associate_burst(a, b, BOUND, TOL, peak_a=pa, peak_b=pb[:-2])
+
+    def test_peaks_are_optional_and_change_nothing_when_counts_decide(self):
+        a, b = _burst()
+        m1 = BA.associate_burst(a, b, BOUND, TOL)
+        m2 = BA.associate_burst(a, b, BOUND, TOL, peak_a=[100.0] * 5, peak_b=[100.0] * 5)
+        assert m1.ok == m2.ok and m1.tau_s == m2.tau_s and m2.decided_by == "count"
+
+
 class TestAgainstANull:
     def test_it_beats_matched_density_noise(self):
         """The control the field analysis needed: same event COUNT in the same window, no shared
