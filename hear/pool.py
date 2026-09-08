@@ -35,13 +35,17 @@ from __future__ import annotations
 
 import base64
 import binascii
+import gzip
 import hashlib
 import json
 import os
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
+import numpy as np
+
 from . import corpus as C
 from . import detsfile as DF
+from . import scenefile as SF
 from . import sketch as SK
 
 SCHEMA_VERSION = 1
@@ -122,9 +126,15 @@ class Pool:
     def __init__(self, root: str):
         self.root = os.path.expanduser(root)
         self.records_dir = os.path.join(self.root, "records")
+        # ⚠️A SEPARATE STORE, ON PURPOSE. A scene row is one every ~1.024 s whether or not
+        # anything happened; a detection row exists only when the gate fired. Putting ~168k
+        # continuous rows a day beside 1045 event rows would make `records` a number that means
+        # two things at once, and every ratio computed from it wrong. Same discipline that keeps
+        # health.csv archived but not ingested.
+        self.scene_dir = os.path.join(self.root, "scene")
         self.ledger_path = os.path.join(self.root, "ledger.jsonl")
         self.state_dir = os.path.join(self.root, "state")
-        for d in (self.root, self.records_dir, self.state_dir):
+        for d in (self.root, self.records_dir, self.scene_dir, self.state_dir):
             os.makedirs(d, exist_ok=True)
         self._keys: Optional[set] = None
 
@@ -288,6 +298,210 @@ class Pool:
         self._ledger(entry)
         return entry
 
+    # ---------------------------------------------------------------- scene
+
+    def _scene_path(self, day: str, node: str) -> str:
+        d = os.path.join(self.scene_dir, day)
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, "%s.jsonl.gz" % node)
+
+    def _scene_keys(self, day: str, node: str) -> set:
+        """Keys already stored for ONE day and node.
+
+        ⚠️Deliberately NOT a whole-pool key set. Scene is ~84k rows per node per day, so a month
+        is millions of keys and holding them all to deduplicate one 15-minute fetch trades a
+        bounded problem for an unbounded one. A fetch only ever appends to the day(s) it covers,
+        so only those days need loading.
+        """
+        p = self._scene_path(day, node)
+        ks = set()
+        if not os.path.exists(p):
+            return ks
+        with gzip.open(p, "rt") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ks.add(json.loads(line)["key"])
+                except Exception:
+                    continue
+        return ks
+
+    def ingest_scene(self, path: str, default_node: Optional[str] = None,
+                     origin: Optional[str] = None, partial: bool = False) -> Dict[str, Any]:
+        """Ingest one `scene.csv` (or a byte-range tail of one). Idempotent.
+
+        `partial=True` says this text came from `GET /sd?file=scene.csv&tail=N`, which starts
+        mid-line and carries no header. The leading fragment is DROPPED and the drop is reported
+        -- see `hear.scenefile.read_text`. Off by default so a whole file that begins mid-row
+        still reads as the corruption it is.
+        """
+        raw = open(path, "rb").read()
+        sha = hashlib.sha256(raw).hexdigest()
+        read = SF.read_text(raw.decode("utf-8", "replace"), default_node=default_node,
+                            allow_partial_first_line=partial)
+
+        recs: List[Dict[str, Any]] = []
+        bad: Dict[str, int] = {}
+        for row in read.rows:
+            try:
+                d = SF.decode_row(row)
+            except ValueError as e:
+                r = "decode_" + str(e).split(":")[0].split(",")[0].strip().replace(" ", "_")[:40]
+                bad[r] = bad.get(r, 0) + 1
+                continue
+            except Exception as e:
+                r = "decode_" + type(e).__name__
+                bad[r] = bad.get(r, 0) + 1
+                continue
+            utc_us = int(row.get("utc_us") or 0)
+            node = row["node"]
+            ts = (utc_us / 1e6) if utc_us > 0 else None
+            recs.append({
+                "schema_version": SCHEMA_VERSION,
+                # The mel bytes are in the key for the same reason the sketch frame is: utc_us is
+                # 0 for every pre-PPS row, and a boot's worth of them would otherwise collapse
+                # into one record.
+                "key": key("scene", node, utc_us, row.get("sample"), d["q"].tobytes()),
+                "source": "scene", "node": node, "node_from": row.get("node_from"),
+                "utc_us": utc_us, "anchored": utc_us > 0, "ts_utc_s": ts,
+                "mel_b64": base64.b64encode(d["q"].tobytes()).decode(),
+                "ref_db": d["ref_db"], "bands": d["bands"],
+                # `slices`, never `frames`. The row's `frames` column is how many FFT frames were
+                # summed into each slice -- the averaging behind a cell, not the shape.
+                "slices": d["slices"], "frames_summed": d["frames_summed"],
+                "span_ms": d["span_ms"],
+                "f_lo_hz": float(row["f_lo_hz"]) if row.get("f_lo_hz") else None,
+                "f_hi_hz": float(row["f_hi_hz"]) if row.get("f_hi_hz") else None,
+                "fft_us": row.get("fft_us"),
+                "sample": row.get("sample"), "uptime_s": row.get("uptime_s"),
+                "scene_schema": row.get("schema"),
+            })
+
+        by_bucket: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for r in recs:
+            by_bucket.setdefault((_day(r.get("ts_utc_s")), r["node"]), []).append(r)
+        added = 0
+        for (day, node), rows in by_bucket.items():
+            seen = self._scene_keys(day, node)
+            fresh = []
+            for r in rows:
+                if r["key"] in seen:
+                    continue
+                seen.add(r["key"])
+                fresh.append(json.dumps(r, sort_keys=True))
+            if not fresh:
+                continue
+            with gzip.open(self._scene_path(day, node), "at") as fh:
+                fh.write("\n".join(fresh) + "\n")
+            added += len(fresh)
+
+        reasons = dict(read.counts)
+        for k, v in bad.items():
+            reasons[k] = reasons.get(k, 0) + v
+        skipped = len(read.skips) + sum(bad.values())
+        entry = {
+            "kind": "scene.csv", "path": os.path.abspath(path), "origin": origin or path,
+            "sha256": sha, "bytes": len(raw), "generation": read.generation.name,
+            "rows": len(read.rows) + len(read.skips), "decoded": len(recs), "added": added,
+            "duplicate": len(recs) - added, "skipped": skipped, "skip_reasons": reasons,
+            "decode_errors": bad, "partial_first_line": read.partial_first_line,
+            "schema_version": SCHEMA_VERSION,
+        }
+        assert entry["rows"] == added + entry["duplicate"] + skipped, entry
+        self._ledger(entry)
+        return entry
+
+    def scene(self, node: Optional[str] = None, day: Optional[str] = None,
+              anchored_only: bool = False) -> Iterator[Dict[str, Any]]:
+        """Every stored scene row, oldest partition first. A generator: a month of these is
+        millions of rows and materialising them as a list is not something a caller should do by
+        accident."""
+        if not os.path.isdir(self.scene_dir):
+            return
+        for d in sorted(os.listdir(self.scene_dir)):
+            if day and d != day:
+                continue
+            p = os.path.join(self.scene_dir, d)
+            if not os.path.isdir(p):
+                continue
+            for fn in sorted(os.listdir(p)):
+                if not fn.endswith(".jsonl.gz"):
+                    continue
+                if node and fn != "%s.jsonl.gz" % node:
+                    continue
+                with gzip.open(os.path.join(p, fn), "rt") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        r = json.loads(line)
+                        if anchored_only and not r.get("anchored"):
+                            continue
+                        yield r
+
+    def scene_matrix(self, node: Optional[str] = None, day: Optional[str] = None,
+                     mode: str = "db", limit: Optional[int] = None
+                     ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+        """[n, bands*slices] over stored scene rows, and the rows behind it.
+
+        Refuses to stack rows of differing geometry rather than reshaping to fit: `bands` and
+        `slices` are firmware's to change, and a matrix whose width silently depends on which
+        firmware happened to be running is not a dataset.
+        """
+        if mode not in ("db", "q"):
+            raise ValueError("mode must be 'db' or 'q'")
+        rows, out = [], []
+        geom = None
+        for r in self.scene(node=node, day=day):
+            g = (r["bands"], r["slices"])
+            if geom is None:
+                geom = g
+            elif g != geom:
+                raise ValueError("mixed scene geometry: %s then %s -- select a day or node "
+                                 "whose firmware did not change" % (geom, g))
+            q = np.frombuffer(base64.b64decode(r["mel_b64"]), dtype=np.int8) \
+                .reshape(r["bands"], r["slices"]).astype(float)
+            rows.append((q / 2.0 + r["ref_db"] if mode == "db" else q).reshape(-1))
+            out.append(r)
+            if limit and len(rows) >= limit:
+                break
+        if not rows:
+            return np.zeros((0, 0)), []
+        return np.vstack(rows), out
+
+    def scene_stats(self) -> Dict[str, Any]:
+        """What the scene store holds. Counted by walking it, because a row count taken from the
+        ledger would credit rows a later gzip write could have lost."""
+        n = 0
+        by_node: Dict[str, int] = {}
+        by_day: Dict[str, int] = {}
+        geom: Dict[str, int] = {}
+        anchored = 0
+        first = last = None
+        for r in self.scene():
+            n += 1
+            by_node[r["node"]] = by_node.get(r["node"], 0) + 1
+            d = _day(r.get("ts_utc_s"))
+            by_day[d] = by_day.get(d, 0) + 1
+            g = "%dx%d" % (r["bands"], r["slices"])
+            geom[g] = geom.get(g, 0) + 1
+            anchored += bool(r.get("anchored"))
+            t = r.get("ts_utc_s")
+            if t:
+                first = t if first is None else min(first, t)
+                last = t if last is None else max(last, t)
+        bytes_on_disk = 0
+        for dirpath, _dirs, files in os.walk(self.scene_dir):
+            for f in files:
+                bytes_on_disk += os.path.getsize(os.path.join(dirpath, f))
+        return {"rows": n, "by_node": by_node, "by_day": by_day, "geometry": geom,
+                "anchored": anchored, "unanchored": n - anchored,
+                "first_utc_s": first, "last_utc_s": last,
+                "bytes_on_disk": bytes_on_disk,
+                "bytes_per_row": round(bytes_on_disk / n, 1) if n else None}
+
     # ---------------------------------------------------------------- read
 
     def raw(self, source: Optional[str] = None, day: Optional[str] = None
@@ -375,7 +589,11 @@ class Pool:
             anchored += bool(r.get("anchored"))
             no_ctx += bool(r.get("no_context"))
             unstated += r.get("fs_hz") is None
-        led = self.ledger()
+        # ⚠️ONLY THE SKETCH INGESTS. The ledger is one log for both stores, so an unfiltered read
+        # here credited this summary with scene.csv's S1/S2 generations and scene's skip tallies
+        # -- a count describing two different things again, which is the bug this pool exists to
+        # not commit.
+        led = [e for e in self.ledger() if e.get("kind") in ("dets.csv", "mqtt.jsonl")]
         skips: Dict[str, int] = {}
         for e in led:
             for k, v in (e.get("skip_reasons") or {}).items():

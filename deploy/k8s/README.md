@@ -14,6 +14,28 @@ kubectl apply -f deploy/k8s/hear-drain-code.yaml -f deploy/k8s/hear-drain.yaml
 | `hear-drain` CronJob | every 15 min: fetch, archive, ingest |
 | `hear-drain-check` CronJob | hourly: fails if a sensor's last SUCCESS is stale |
 
+## Two stores, on purpose
+
+`dets.csv` rows exist only where the impulse gate fired. `scene.csv` carries a row every
+~1.024 s regardless, and that is the corpus this project is actually about — dama-hear is not a
+gunshot project, and a pool built only from gated events structurally cannot represent the
+ambient world. They are stored separately so `records` keeps meaning "gated events" and every
+ratio taken from it stays true.
+
+| store | path | cadence | reader |
+|---|---|---|---|
+| sketches | `records/<day>/<source>.jsonl` | on gate | `Pool.records()` -> `hear.corpus.Record` |
+| scene | `scene/<day>/<node>.jsonl.gz` | ~1.024 s | `Pool.scene()`, `Pool.scene_matrix()` |
+
+⚠️**Scene is fetched by tail, not whole.** It grows without bound (11 MB seen, 2-4 min to pull),
+so each run takes the last `SCENE_TAIL_BYTES` — about 2.3 hours of rows. The overlap costs
+nothing because ingest is content-addressed, and the leading fragment that a byte-range fetch
+always starts with is dropped AND counted as `partial_first_line`. A gap longer than that window
+is real loss, which is what `hear-drain-check` exists to make visible.
+
+Measured: **112 B/row compressed**, so about **19 MB/day** for two nodes — roughly 8 months in
+the 5 Gi PVC.
+
 ## Reading the pool
 
 ```

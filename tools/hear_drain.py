@@ -56,7 +56,20 @@ from hear import pool as P                                          # noqa: E402
 # archived but NOT ingested -- the pool holds sketches, and mixing a second row shape into it
 # would make its counts mean two things.
 DETS_FILES = ("dets.csv", "dets-prev.csv")
+# ⚠️THE SCENE IS THE CORPUS. dets.csv only exists where the impulse gate fired, so a pool built
+# from it alone can hold nothing but impulsive events. scene.csv carries a row every ~1.024 s
+# regardless -- the ambient world this project is also about. See hear/scenefile.py.
+SCENE_FILES = ("scene.csv", "scene-prev.csv")
 CONTEXT_FILES = ("health.csv",)
+
+# ⚠️SCENE IS FETCHED BY TAIL, NOT WHOLE. It grows without bound (11 MB seen; 2-4 minutes to pull
+# at the node's 40-135 KB/s) and re-fetching all of it every 15 minutes would spend the whole
+# interval on rows already stored. At ~245 B/row and ~1.024 s/row this window covers about 2.3
+# hours, so it is self-healing across a run that fails or a node that drops off briefly -- the
+# ingest is content-addressed, so the overlap costs nothing. A gap LONGER than this is real loss,
+# which is what hear-drain-check exists to make visible rather than to paper over.
+SCENE_TAIL_BYTES = 2_000_000
+SCENE_TAIL_HOURS = 2.3
 
 DEFAULT_TIMEOUT_S = 30.0
 # A node reporting detections at the measured night rate goes quiet for hours in daylight, so
@@ -74,21 +87,32 @@ def fetch_status(ip: str, timeout: float = DEFAULT_TIMEOUT_S) -> Dict[str, Any]:
     return json.loads(_get("http://%s/status" % ip, timeout).decode("utf-8", "replace"))
 
 
-def fetch_sd(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S) -> Optional[bytes]:
+def fetch_sd(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S,
+             tail: Optional[int] = None) -> Optional[bytes]:
     """One file off the card, or None if the node does not have it.
 
     A missing `dets-prev.csv` is NORMAL -- it exists only after a roll -- so it is not an error.
     The node answers a missing file with a short body rather than a 404, so the body is checked:
     anything that is not a CSV header is treated as absent and recorded as such.
     """
+    url = "http://%s/sd?file=%s" % (ip, name)
+    if tail:
+        url += "&tail=%d" % int(tail)
     try:
-        body = _get("http://%s/sd?file=%s" % (ip, name), timeout)
+        body = _get(url, timeout)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
         raise
+    if not body.strip():
+        return None
+    # A whole-file fetch must start with a header. A TAIL fetch starts mid-row and legitimately
+    # does not, so it is only checked for having a complete row in it -- the reader drops the
+    # leading fragment and says that it did.
     head = body[:200].lstrip()
-    if not head or not (head.startswith(b"node") or head.startswith(b"utc_us")):
+    if tail:
+        return body if b"\n" in body else None
+    if not (head.startswith(b"node") or head.startswith(b"utc_us")):
         return None
     return body
 
@@ -107,7 +131,7 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
     """Fetch, archive and ingest one node. Never raises for a node-side problem; reports it."""
     stamp = int(stamp if stamp is not None else time.time())
     out: Dict[str, Any] = {"node": node, "ip": ip, "at": stamp, "ok": False,
-                           "files": [], "added": 0, "errors": []}
+                           "files": [], "added": 0, "scene_added": 0, "errors": []}
     try:
         st = fetch_status(ip, timeout)
     except Exception as e:
@@ -130,6 +154,32 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
                                      "archived": archive(pl.root, node, name, body, stamp)})
         except Exception as e:
             out["errors"].append("%s: %r" % (name, e))
+
+    for name in SCENE_FILES:
+        # scene-prev.csv is the rolled predecessor and does not grow, so it is fetched whole --
+        # once. The live file is tailed.
+        tail = SCENE_TAIL_BYTES if name == "scene.csv" else None
+        try:
+            body = fetch_sd(ip, name, timeout, tail=tail)
+        except Exception as e:
+            out["errors"].append("%s: %r" % (name, e))
+            continue
+        if body is None:
+            out["files"].append({"name": name, "absent": True})
+            continue
+        path = archive(pl.root, node, name, body, stamp)
+        try:
+            entry = pl.ingest_scene(path, default_node=node, origin="%s:/%s" % (node, name),
+                                   partial=bool(tail))
+        except Exception as e:
+            out["errors"].append("%s: ingest: %r" % (name, e))
+            continue
+        out["scene_added"] = out.get("scene_added", 0) + entry["added"]
+        out["files"].append({"name": name, "bytes": len(body), "ingested": True,
+                             "scene": True, "archived": path,
+                             **{k: entry[k] for k in
+                                ("generation", "rows", "added", "duplicate", "skipped",
+                                 "skip_reasons", "partial_first_line")}})
 
     for name in DETS_FILES:
         try:
@@ -202,6 +252,7 @@ def backfill(pl: "P.Pool", paths: List[str], default_node: Optional[str] = None
         p = os.path.expanduser(p)
         if os.path.isdir(p):
             todo += sorted(glob.glob(os.path.join(p, "**", "*dets*.csv"), recursive=True))
+            todo += sorted(glob.glob(os.path.join(p, "**", "*scene*.csv"), recursive=True))
             todo += sorted(glob.glob(os.path.join(p, "**", "sketches-*.jsonl"), recursive=True))
         else:
             todo.append(p)
@@ -210,6 +261,13 @@ def backfill(pl: "P.Pool", paths: List[str], default_node: Optional[str] = None
         try:
             if base.startswith("sketches-") and base.endswith(".jsonl"):
                 out.append(pl.ingest_mqtt_jsonl(p))
+            elif "scene" in base:
+                node = default_node
+                for known in ("nyquist", "mach", "puc"):
+                    if known in p:
+                        node = known
+                        break
+                out.append(pl.ingest_scene(p, default_node=node))
             else:
                 node = default_node
                 for known in ("nyquist", "mach", "puc"):
@@ -331,7 +389,8 @@ def main(argv=None) -> int:
 
     pl = P.Pool(root)
     if a.stats:
-        print(json.dumps(pl.stats(), indent=2, sort_keys=True))
+        print(json.dumps({"sketches": pl.stats(), "scene": pl.scene_stats()},
+                         indent=2, sort_keys=True))
         return 0
 
     if a.ingest:
@@ -356,21 +415,23 @@ def main(argv=None) -> int:
         if a.phone_corpus else None
     write_heartbeat(root, results, phone)
 
-    report = {"results": results, "phone": phone, "stats": pl.stats()}
+    report = {"results": results, "phone": phone, "stats": pl.stats(),
+              "scene_stats": pl.scene_stats()}
     if a.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         for r in results:
-            print("%-9s %-4s +%d record(s)%s" % (
-                r["node"], "ok" if r["ok"] else "FAIL", r["added"],
+            print("%-9s %-4s +%d sketch, +%d scene%s" % (
+                r["node"], "ok" if r["ok"] else "FAIL", r["added"], r.get("scene_added", 0),
                 "" if r["ok"] else "  " + "; ".join(r["errors"])))
             for f in r["files"]:
                 if f.get("absent"):
                     print("    %-14s absent" % f["name"])
                 elif f.get("ingested"):
-                    print("    %-14s %s  %d row(s) -> +%d new, %d dup, %d skipped %s"
+                    print("    %-15s %s %6d row(s) -> +%-6d new, %6d dup, %d skipped %s%s"
                           % (f["name"], f["generation"], f["rows"], f["added"], f["duplicate"],
-                             f["skipped"], f["skip_reasons"] or ""))
+                             f["skipped"], f["skip_reasons"] or "",
+                             "  [tail]" if f.get("partial_first_line") else ""))
                 else:
                     print("    %-14s %d B archived" % (f["name"], f["bytes"]))
         if phone is not None:
@@ -378,8 +439,12 @@ def main(argv=None) -> int:
                   % ("ok" if phone.get("ok") else "FAIL", phone["added"],
                      "" if phone.get("ok") else "  " + "; ".join(phone["errors"])))
         s = report["stats"]
-        print("\npool %s: %d record(s), %s, %d anchored / %d not"
+        print("\npool %s\n  sketches %d  %s  (%d anchored / %d not)"
               % (root, s["records"], s["by_source"], s["anchored"], s["unanchored"]))
+        sc = report["scene_stats"]
+        print("  scene    %d rows  %s  geom %s  %.1f MB on disk (%s B/row)"
+              % (sc["rows"], sc["by_node"], sc["geometry"],
+                 sc["bytes_on_disk"] / 1e6, sc["bytes_per_row"]))
 
     # A run where every sensor failed is a failure. A run where one of several failed is not --
     # the pool still gained the others, and a timer that gives up on all of them because one node
