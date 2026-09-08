@@ -6,7 +6,7 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: '07a2fda-dirty'
+    dama-hear/commit: 'e14cf97-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
 data:
   hear__init__.py: |
@@ -1031,6 +1031,13 @@ data:
     
     SCHEMA_VERSION = 1
     
+    #: Stored keys that become `hear.corpus.Record` fields. Everything else a record holds travels in
+    #: `Record.extra` -- see `Pool.records`. Listed here rather than inline so the two cannot drift.
+    _RECORD_FIELDS = frozenset({
+        "node", "source", "frame_b64", "ref_db", "peak", "bands", "frames", "fs_hz", "node_us",
+        "retrigger", "ts_utc_s", "clipped", "clock_tier", "sync_sigma_ns", "schema_version",
+    })
+    
     
     def key(source: str, node: str, utc_us: int, sample: Optional[str], frame: bytes) -> str:
         """The content address of one sketch. Same detection from any drain -> same key.
@@ -1529,10 +1536,14 @@ data:
                     fs_hz=r.get("fs_hz"), node_us=d["node_us"], retrigger=bool(d["retrigger"]),
                     ts_utc_s=r.get("ts_utc_s"), clipped=r.get("clipped"),
                     clock_tier=r.get("clock_tier"), sync_sigma_ns=r.get("sync_sigma_ns"),
-                    extra={"layout": r.get("layout"), "valid_bands": r.get("valid_bands"),
-                           "key": r["key"], "no_context": r.get("no_context"),
-                           "sketch_back": r.get("sketch_back"), "utc_us": r.get("utc_us"),
-                           "anchored": r.get("anchored")},
+                    # ⚠️EVERYTHING THE STORE HELD THAT IS NOT ALREADY A FIELD. This was a fixed
+                    # whitelist, and a whitelist silently drops whatever a producer adds next: it
+                    # was already losing `onset_found`, which hear/backend/associate.py REFUSES
+                    # arrivals on, so a phone that honestly reported its onset was unmeasurable had
+                    # that report deleted between the pool and the gate meant to read it. Passing
+                    # the remainder through means a new quality flag arrives by default and the
+                    # failure mode becomes an unexpected key rather than a missing measurement.
+                    extra={k: v for k, v in r.items() if k not in _RECORD_FIELDS},
                 ))
             return out
     
