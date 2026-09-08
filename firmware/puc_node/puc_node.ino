@@ -32,6 +32,16 @@
 #include <Wire.h>
 #include "driver/gpio.h"
 #include <ESP_I2S.h>
+#include <WiFiUdp.h>
+#include <time.h>
+
+// Declared up here because the .ino preprocessor inserts function prototypes ahead of the file's
+// own declarations; a type named in one of those prototypes must already exist.
+struct NtpResult {
+  bool ok = false; const char *err = "";
+  double offset_s = 0, rtt_best = 0, rtt_min = 0, rtt_max = 0, root_dist_s = 0;
+  int n = 0; uint8_t stratum = 0; char refid[5] = {0};
+};
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -234,6 +244,13 @@ static const char *i2c_hint(uint8_t a) {
     case 0x76: case 0x77: return "BME280/BMP280/BME680 environmental";
     default:   return "";
   }
+}
+
+static bool i2c_begin_default() {
+  Wire.end();
+  if (!Wire.begin(47, 48, 100000)) return false;
+  Wire.setTimeOut(10);
+  return true;
 }
 
 static bool i2c_rd(uint8_t a, uint8_t reg, uint8_t *v) {
@@ -488,6 +505,108 @@ static String mic_capture(int clk, int din, int fs, bool stereo) {
   return o;
 }
 
+// ---- time ------------------------------------------------------------------------------------
+// This board is called puc-ntp and until now had NO time client of any kind: no NTP, no RTC read,
+// no `time` in /status. hear/nodeclass.py credits the class with t_sigma 3 ms = 1.03 m, which was
+// describing a capability that did not exist. The L86 is not answering, so GPS PPS is not the
+// route; the route is the LAN's own stratum-1 server and the DS3231 for holdover between syncs.
+//
+// ⚠️WHAT IS MEASURED VERSUS WHAT IS CLAIMED. Arduino's configTime() sets the clock and tells you
+// nothing about how well, which is exactly the shape of claim this repo keeps having to retract.
+// So this speaks SNTP itself and keeps all four timestamps, because the useful number is not the
+// offset -- it is the bound on the offset. NTP's error from path asymmetry is bounded by HALF THE
+// ROUND TRIP: if the request and reply take different times, the midpoint is wrong by at most
+// (rtt/2). That bound is honest, it needs no assumption about the network being symmetric, and it
+// is what /time reports as the node's timestamp uncertainty. rtt_spread across samples says
+// whether the link is steady enough for the best-rtt sample to mean anything.
+#define NTP_DEFAULT_SERVER "172.16.100.9"      // rtk-base: stratum 1, refid PPS, root distance 23 us
+#define NTP_SAMPLES 8
+
+
+static NtpResult ntp_query(const char *host, int want) {
+  NtpResult r;
+  WiFiUDP udp;
+  if (!udp.begin(0)) { r.err = "no local UDP port"; return r; }
+  double best_off = 0, best_rtt = 1e9, mn = 1e9, mx = 0;
+  for (int i = 0; i < want; i++) {
+    uint8_t pkt[48] = {0}; pkt[0] = 0x1B;               // LI 0, VN 3, mode 3 (client)
+    uint64_t t1 = (uint64_t)esp_timer_get_time();
+    struct timeval tv1; gettimeofday(&tv1, nullptr);
+    udp.beginPacket(host, 123); udp.write(pkt, 48); udp.endPacket();
+    uint32_t deadline = millis() + 400;
+    int len = 0;
+    while (millis() < deadline && !(len = udp.parsePacket())) delay(1);
+    if (len < 48) continue;
+    udp.read(pkt, 48);
+    uint64_t t4 = (uint64_t)esp_timer_get_time();
+    double rtt = (t4 - t1) / 1e6;
+    auto be32 = [&](int o) { return ((uint32_t)pkt[o] << 24) | ((uint32_t)pkt[o+1] << 16) |
+                                    ((uint32_t)pkt[o+2] << 8) | pkt[o+3]; };
+    auto ts = [&](int o) { return (double)be32(o) - 2208988800.0 + be32(o + 4) / 4294967296.0; };
+    double local1 = tv1.tv_sec + tv1.tv_usec / 1e6;
+    double t2 = ts(32), t3 = ts(40), local4 = local1 + rtt;
+    double off = ((t2 - local1) + (t3 - local4)) / 2.0;
+    if (rtt < best_rtt) { best_rtt = rtt; best_off = off; r.stratum = pkt[1];
+                          memcpy(r.refid, pkt + 12, 4);
+                          r.root_dist_s = (be32(4) / 65536.0) / 2.0 + be32(8) / 65536.0; }
+    if (rtt < mn) mn = rtt;
+    if (rtt > mx) mx = rtt;
+    r.n++;
+    delay(60);
+  }
+  udp.stop();
+  if (!r.n) { r.err = "no reply"; return r; }
+  // The BEST round trip is the least-delayed exchange seen, so it carries the tightest asymmetry
+  // bound. Taking a median offset instead would average in the queued samples, which is the
+  // opposite of what is wanted.
+  r.ok = true; r.offset_s = best_off; r.rtt_best = best_rtt; r.rtt_min = mn; r.rtt_max = mx;
+  return r;
+}
+
+static bool ds3231_write_time(int sda, int scl, time_t utc) {
+  struct tm t; gmtime_r(&utc, &t);
+  auto b = [](int v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); };
+  Wire.end();
+  if (!Wire.begin(sda, scl, 100000)) return false;
+  Wire.beginTransmission(0x68);
+  Wire.write((uint8_t)0x00);
+  Wire.write(b(t.tm_sec)); Wire.write(b(t.tm_min)); Wire.write(b(t.tm_hour));
+  Wire.write((uint8_t)(t.tm_wday + 1)); Wire.write(b(t.tm_mday));
+  Wire.write(b(t.tm_mon + 1)); Wire.write(b(t.tm_year % 100));
+  bool ok = Wire.endTransmission() == 0;
+  // Clear OSF. It latches on any oscillator stop and stays set until written, so leaving it set
+  // after a deliberate set would make every later read say "this is not a time".
+  if (ok) { uint8_t st; if (i2c_rd(0x68, 0x0F, &st)) {
+      Wire.beginTransmission(0x68); Wire.write((uint8_t)0x0F); Wire.write((uint8_t)(st & 0x7F));
+      Wire.endTransmission(); } }
+  Wire.end(); pinMode(sda, INPUT); pinMode(scl, INPUT);
+  return ok;
+}
+
+static bool ds3231_read_time(int sda, int scl, time_t *out, bool *osf) {
+  Wire.end();
+  if (!Wire.begin(sda, scl, 100000)) return false;
+  uint8_t r[19];
+  Wire.beginTransmission(0x68); Wire.write((uint8_t)0x00);
+  if (Wire.endTransmission(false) != 0) { Wire.end(); return false; }
+  int got = Wire.requestFrom(0x68, 19);
+  for (int i = 0; i < got && i < 19; i++) r[i] = Wire.read();
+  Wire.end(); pinMode(sda, INPUT); pinMode(scl, INPUT);
+  if (got < 19) return false;
+  auto d = [](uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); };
+  struct tm t = {};
+  t.tm_sec = d(r[0] & 0x7F); t.tm_min = d(r[1]); t.tm_hour = d(r[2] & 0x3F);
+  t.tm_mday = d(r[4]); t.tm_mon = d(r[5] & 0x1F) - 1; t.tm_year = d(r[6]) + 100;
+  *osf = (r[15] >> 7) & 1;
+  *out = mktime(&t) - _timezone;      // registers are UTC by our own convention; see /timesync
+  return true;
+}
+
+static double  g_sync_bound_s = -1;   // rtt/2 of the exchange the clock was last set from
+static uint32_t g_sync_at_ms  = 0;
+static double  g_sync_off_s   = 0;
+static int     g_sync_count   = 0;
+
 static String i2c_sweep() {
   String o = "I2C sweep over the 11 externally-pulled-up pins (both orders; SDA/SCL is not symmetric)\n"
              "candidates: 6 7 9 10 11 12 13 14 45 47 48   -- from /scan vs /scanpd\n\n";
@@ -563,7 +682,7 @@ static void routes() {
       "uptime  %lus\nheap    %lu   psram %lu\n"
       "gps     fix %d, %d sats, %s   sentences %lu (%lu valid)\n"
       "pps     %lu edges on GPIO%d\n\n"
-      "/status /pins /i2c /i2creg /rtc /pdmscan /mic /scan /scanpd /scanpu /gps /pmtk?cmd= /pps /ota /update /reboot\n</pre>",
+      "/status /pins /i2c /i2creg /rtc /time /timesync /sqw /pdmscan /mic /scan /scanpd /scanpu /gps /pmtk?cmd= /pps /ota /update /reboot\n</pre>",
       node_id, NODE_CLASS, (unsigned long)(millis() / 1000),
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getFreePsram(),
       gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences, (unsigned long)gps_valid,
@@ -610,6 +729,7 @@ static void routes() {
       "33-37 octal PSRAM                            do not touch\n\n"
       "   6  PDM mic CLK -> both mics             measured: /pdmscan, then real audio on /mic\n"
       "   7  PDM mic DIN <- both mics (stereo)     measured: L rms 46.1, R rms 36.1, they differ\n"
+      "  38  DS3231 SQW <- 1 Hz, open-drain        measured: /sqw then /scanpu; off/on is causal\n"
       "  47  I2C SDA                               measured: /i2c, 6 devices answered\n"
       "  48  I2C SCL                               measured: /i2c\n\n"
       "On the bus: 0x18 LIS3DH, 0x1C LIS3MDL, 0x39 AS7341(likely), 0x50 blank EEPROM,\n"
@@ -659,6 +779,113 @@ static void routes() {
     int din = http.hasArg("din") ? http.arg("din").toInt() : 7;
     int fs  = http.hasArg("fs")  ? http.arg("fs").toInt()  : 16000;
     http.send(200, "text/plain", mic_capture(clk, din, fs, !http.hasArg("mono")));
+  });
+
+  // /timesync -- POST because it WRITES the system clock and the RTC. Reports the bound it
+  // achieved, not just that it succeeded.
+  http.on("/timesync", HTTP_POST, []() {
+    String host = http.hasArg("server") ? http.arg("server") : String(NTP_DEFAULT_SERVER);
+    NtpResult r = ntp_query(host.c_str(), NTP_SAMPLES);
+    if (!r.ok) { http.send(503, "text/plain", String("ntp ") + host + ": " + r.err + "\n"); return; }
+    struct timeval tv; gettimeofday(&tv, nullptr);
+    double now = tv.tv_sec + tv.tv_usec / 1e6 + r.offset_s;
+    tv.tv_sec = (time_t)now; tv.tv_usec = (suseconds_t)((now - tv.tv_sec) * 1e6);
+    settimeofday(&tv, nullptr);
+    bool rtc_ok = ds3231_write_time(47, 48, (time_t)now);
+    g_sync_bound_s = r.rtt_best / 2.0; g_sync_at_ms = millis();
+    g_sync_off_s = r.offset_s; g_sync_count++;
+    char b[520];
+    snprintf(b, sizeof b,
+      "synced to %s\n"
+      "  server   stratum %d  refid %.4s  root distance %.3f ms\n"
+      "  samples  %d of %d answered, rtt best %.3f ms, min %.3f, max %.3f (spread %.3f)\n"
+      "  applied  offset %+.3f ms\n"
+      "  BOUND    +/- %.3f ms  = +/- %.3f m of sound  <- rtt/2, the asymmetry bound\n"
+      "  rtc      %s\n",
+      host.c_str(), r.stratum, r.refid, r.root_dist_s * 1000,
+      r.n, NTP_SAMPLES, r.rtt_best * 1000, r.rtt_min * 1000, r.rtt_max * 1000,
+      (r.rtt_max - r.rtt_min) * 1000, r.offset_s * 1000,
+      r.rtt_best / 2 * 1000, r.rtt_best / 2 * 343.0,
+      rtc_ok ? "set from this sync, OSF cleared" : "WRITE FAILED -- holdover is not armed");
+    http.send(200, "text/plain", b);
+  });
+
+  // /time -- read only. Says what the clock is AND how well it is known, because a timestamp with
+  // no stated uncertainty is what put a phone into a TDoA solve at 8.6 m in the first place.
+  http.on("/time", []() {
+    struct timeval tv; gettimeofday(&tv, nullptr);
+    time_t sysu = tv.tv_sec, rtcu = 0; bool osf = true;
+    bool have_rtc = ds3231_read_time(47, 48, &rtcu, &osf);
+    char sb[32], rb[32];
+    struct tm t;
+    gmtime_r(&sysu, &t); strftime(sb, sizeof sb, "%Y-%m-%dT%H:%M:%SZ", &t);
+    gmtime_r(&rtcu, &t); strftime(rb, sizeof rb, "%Y-%m-%dT%H:%M:%SZ", &t);
+    double age_s = g_sync_at_ms ? (millis() - g_sync_at_ms) / 1000.0 : -1;
+    char b[700];
+    snprintf(b, sizeof b,
+      "system   %s  (%s)\n"
+      "rtc      %s  %s\n"
+      "delta    %+lld s  (rtc - system)\n"
+      "sync     %s"
+      "%s%s",
+      sb, sysu > 1700000000 ? "set" : "NEVER SET -- this is uptime, not a time",
+      have_rtc ? rb : "unreadable", osf ? "OSF=1 THE OSCILLATOR STOPPED, not a time" : "OSF=0 ran continuously",
+      have_rtc ? (long long)(rtcu - sysu) : 0LL,
+      g_sync_at_ms ? "" : "never. There is no NTP client running on a timer; /timesync is manual.\n",
+      g_sync_at_ms ? "" : "Until then this node cannot state a timestamp uncertainty and must not\n",
+      g_sync_at_ms ? "" : "be admitted as a TDoA arrival at any tier.\n");
+    String o = b;
+    if (g_sync_at_ms) {
+      char c[420];
+      snprintf(c, sizeof c,
+        "#%d, %.0f s ago, offset applied %+.3f ms\n"
+        "BOUND    +/- %.3f ms = +/- %.3f m at sync\n"
+        "         the DS3231 is uncalibrated (aging 0) so holdover drift since then is NOT in this\n"
+        "         number; two syncs are what measure it, and none of that makes this a PPS tier.\n",
+        g_sync_count, age_s, g_sync_off_s * 1000, g_sync_bound_s * 1000, g_sync_bound_s * 343.0);
+      o += c;
+    }
+    http.send(200, "text/plain", o);
+  });
+
+  // /sqw?hz=1|1024|4096|8192|off -- the DS3231's square-wave output.
+  //
+  // WHY THIS IS THE INTERESTING ENDPOINT. The L86's 1PPS is not routed and the module is not
+  // answering, so the GPS route to a hardware tick is shut. But the DS3231 has its own SQW pin and
+  // can drive 1 Hz from a TCXO-compensated oscillator (+/-2 ppm over temperature, against the bare
+  // ESP crystal's tens of ppm). The board has been shipping with INTCN=1 -- interrupt mode, no
+  // alarms enabled -- so that pin has been sitting idle since it left the factory and NOBODY HAS
+  // EVER LOOKED to see whether it reaches a GPIO. Turn 1 Hz on, then run /scan: its verdict column
+  // already flags a 1 Hz pulse, because it was written to look for the L86's.
+  //
+  // ⚠️A LOCAL TICK IS NOT A PPS. This edge is stable, not correct: it says a second has elapsed,
+  // never which second it is, and it is disciplined by a crystal rather than by GPS. That is the
+  // same shape as the ESP audioboards' anchor, where the board owns the rate and a host names the
+  // second -- which is exactly why it is worth having next to an NTP that can name the second to
+  // +/-5 ms but cannot subdivide it.
+  http.on("/sqw", []() {
+    String hz = http.hasArg("hz") ? http.arg("hz") : "1";
+    uint8_t ctrl;
+    if (!i2c_begin_default() || !i2c_rd(0x68, 0x0E, &ctrl)) {
+      http.send(503, "text/plain", "no DS3231 at 0x68\n"); return; }
+    uint8_t rs;
+    if      (hz == "1")    rs = 0x00;
+    else if (hz == "1024") rs = 0x08;
+    else if (hz == "4096") rs = 0x10;
+    else if (hz == "8192") rs = 0x18;
+    else if (hz == "off")  rs = 0xFF;
+    else { http.send(400, "text/plain", "hz must be 1, 1024, 4096, 8192 or off\n"); return; }
+    uint8_t nv = (rs == 0xFF) ? (uint8_t)(ctrl | 0x04)              // INTCN=1, SQW off
+                              : (uint8_t)((ctrl & ~0x1C) | rs);     // RS2/RS1 set, INTCN=0
+    Wire.beginTransmission(0x68); Wire.write((uint8_t)0x0E); Wire.write(nv);
+    bool ok = Wire.endTransmission() == 0;
+    Wire.end(); pinMode(47, INPUT); pinMode(48, INPUT);
+    char b[300];
+    snprintf(b, sizeof b, "DS3231 control 0x%02X -> 0x%02X (%s)  %s\n"
+             "Now run /scan and look at the verdict column. A 1 Hz pulse there means the SQW pin\n"
+             "reaches a GPIO and this board has a hardware tick after all.\n",
+             ctrl, nv, rs == 0xFF ? "SQW off" : (hz + " Hz").c_str(), ok ? "written" : "WRITE FAILED");
+    http.send(200, "text/plain", b);
   });
 
   http.on("/rtc", []() {

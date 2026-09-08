@@ -32,6 +32,29 @@
 #define PPS_PIN        18
 #define PPS_WIRED      0         // flip to 1 only when /pps has actually reported edges
 
+// ---- the tick that DOES exist ---------------------------------------------------------------
+// ⚠️FOUND 2026-09-08: the DS3231's SQW/INT pin is on GPIO38 and it emits 1 Hz. The GPS route to a
+// hardware tick is shut -- the L86 is not answering and its 1PPS was never routed -- but the RTC
+// has its own and nobody had looked, because the part ships INTCN=1 (interrupt mode, no alarms) so
+// that pin sits idle from the factory.
+//
+// HOW IT WAS ESTABLISHED, and why the first attempt said "nothing":
+//   * SQW is OPEN-DRAIN. A floating /scan cannot see it -- the same trap the GPS-TX probe above
+//     documents. Against an internal pullup it appears immediately: 8 edges per 4 s, 50% duty.
+//   * Causally, not by correlation: SQW off -> gpio38 static and held high (twice); SQW on ->
+//     1 Hz returns. That on/off control is what makes this an identification.
+// ⚠️IT IGNORES THE RATE BITS. RS2/RS1 set for 1024, 4096 and 8192 Hz all still give 1 Hz, with the
+// control register reading back exactly what was written each time. That is the documented
+// behaviour of the DS3231M -- the MEMS variant, whose SQW is 1 Hz only -- or of a clone that
+// hardwires it. NOT CONFIRMED; the part answers the DS3231's temperature and status registers.
+//
+// ⚠️A LOCAL TICK IS NOT A PPS, and this pin must never be treated as one. The edge is STABLE, not
+// CORRECT: it says a second elapsed, never which second, and it is disciplined by a crystal rather
+// than by GPS. What it is good for is subdividing a second that NTP named -- the same split the ESP
+// audioboards use, where the board owns the rate and a host names the second.
+#define RTC_SQW_PIN    38        // measured; open-drain, needs a pullup to be seen at all
+#define RTC_SQW_HZ     1         // fixed at 1 regardless of RS2/RS1 on this part
+
 // ---- microphone --------------------------------------------------------------------------
 // Two MEMS mics. The vendor firmware records 48 kHz and SUMS them to mono ("mono_sum_left_right"),
 // throwing away the inter-mic delay -- but it computes LeftSPL/RightSPL/LeftPSD/RightPSD
