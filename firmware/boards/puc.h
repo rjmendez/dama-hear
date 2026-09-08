@@ -37,14 +37,23 @@
 // throwing away the inter-mic delay -- but it computes LeftSPL/RightSPL/LeftPSD/RightPSD
 // separately, so the stereo path exists in hardware. Two mics on a fixed baseline is a bearing,
 // which neither XIAO node can produce at all.
-// ⚠️PINS NOT YET KNOWN. The pin scan runs with the peripherals unpowered, so the I2S lines were
-// static. /scan and /scanpd on the beachhead firmware are how they get found.
+// ⚠️FOUND 2026-09-08 on the live board: CLK=6, DIN=7, and the two mics are stereo on that one
+// DIN as the dump implied. Method and evidence, because "a pin toggles" is not "a microphone":
+//   * /pdmscan drives ONE candidate clock and watches every other pin. clk=6 woke gpio 7 at ~5900
+//     transitions per 12k samples, repeatably. clk=7 woke NOTHING -- and capacitive coupling
+//     between adjacent pads is symmetric, so that asymmetry is what rules out crosstalk.
+//   * /mic then ran real I2S PDM RX on the pair: left rms 46.1 / right rms 36.1 at 16 kHz, both
+//     channels non-zero, nothing pinned, and the two channels differ. The negative control at
+//     clk=9 din=10 returned a DC constant, mean -30935 rms 0.0 -- which is what no-mic looks like.
+// ⚠️The claim above that the pin scan saw static I2S lines because "the peripherals are unpowered"
+// is FALSE: six I2C devices answer on 47/48, so the sensor rail is live. The lines were static
+// because nothing was clocking them.
 // The vendor app links i2s_pdm_rx_set_gpio -- this is a PDM microphone path, the same kind as the
 // XIAO, NOT the generic I2S I first wrote here. From the flash dump, not from the product page.
 #define MIC_KIND       MIC_PDM
 #define MIC_COUNT      2
-#define MIC_CLK_PIN    -1        // unknown -- PDM needs CLK + DIN only, there is no BCLK/WS pair
-#define MIC_DIN_PIN    -1        // unknown
+#define MIC_CLK_PIN    6         // measured: clocking this makes DIN drive; the reverse does not
+#define MIC_DIN_PIN    7         // measured: real PDM audio, L and R differ, control is a constant
 #define FS_NOMINAL     48000     // vendor config: "sampleRateHz": 48000
 #define MIC_BAND_LO_HZ 50
 #define MIC_BAND_HI_HZ 20000     // unverified part; at 48 kHz Nyquist is 24 kHz so the mic binds
@@ -76,3 +85,17 @@
 // 19,20 USB D-/D+ -- reconfiguring these killed the console once already and cost a replug caught
 // inside a four-second window. 26-32 SPI flash. 33-37 octal PSRAM. Never touch any of them.
 #define FREE_PADS      {15, 16, 17, 18, 21, 38, 39}
+
+// ---- I2C ------------------------------------------------------------------------------------
+// Found 2026-09-08 by /i2c. /scan alone never could: an idle bus does not toggle. The narrowing is
+// that an external pullup beats the ESP32's ~45k internal pulldown, which left eleven candidates;
+// the other nine are the SD card's CMD and D0-D3, which carry pullups for the same reason.
+#define I2C_SDA_PIN    47
+#define I2C_SCL_PIN    48
+// Confirmed by ID register; the rest ACK an address, which proves something answered, not what.
+#define I2C_ADDR_LIS3DH   0x18   // CONFIRMED WHO_AM_I 0x33
+#define I2C_ADDR_LIS3MDL  0x1C   // CONFIRMED WHO_AM_I 0x3D
+#define I2C_ADDR_AS7341   0x39   // ID reg 0x92 = 0x24; NOT second-sourced, verify before relying
+#define I2C_ADDR_EEPROM   0x50   // AT24C-series, reads 0xFF throughout (blank)
+#define I2C_ADDR_DS3231   0x68   // CONFIRMED by temp + status decode; OSF=0, has never lost time
+#define I2C_ADDR_BME680   0x76   // CONFIRMED chip id 0x61
