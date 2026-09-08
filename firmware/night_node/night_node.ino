@@ -2607,7 +2607,15 @@ static void audio_pump() {
           // ⚠️Before the ring has filled, the window behind the trigger is zeros, and a sketch of
           // silence is a legitimate-looking frame of all-equal bands. Flag it rather than ship a
           // number that means nothing. Bit 1 = insufficient context. (Bit 0 is retrigger.)
-          uint16_t fl = (aring_total < back) ? 0x0002 : 0x0000;
+          //
+          // MEL16_FLAG_BITS carries the rate code (bits 8-11) and the fixed-layout bit (12), both
+          // generated alongside the filterbank by gen_mel.py so they cannot disagree with it.
+          // Without them a frame does not say what band k MEANS: at 16 kHz band 12 is 3072 Hz
+          // under the old rescaled bank and 5826 Hz under the shared axis, and a consumer had no
+          // way to tell this node's frames from a 48 kHz phone's. Frames pulled from nyquist and
+          // mach on 2026-09-08 all decoded as fs=None/layout=nyquist, so the shipped classifier
+          // refused every one of them -- correctly, and uselessly.
+          uint16_t fl = MEL16_FLAG_BITS | ((aring_total < back) ? 0x0002 : 0x0000);
           dets[idx].flags = fl;
           sketch_frame(dets[idx].frame, back,
                        (uint32_t)(dets[idx].us_since_pps),
