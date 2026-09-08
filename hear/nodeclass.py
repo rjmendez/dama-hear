@@ -205,6 +205,49 @@ register(NodeClass(
 ))
 
 
+register(NodeClass(
+    name="gotchi-phone",
+    time_source="none",
+    # NOT "ntp". The phone HAS a good clock -- GPSTimingSync anchors (UTC, CLOCK_BOOTTIME) at each
+    # GPS fix and claims 1-5 ms, which would be a usable NTP-class node. The problem is upstream of
+    # the clock: the audio path never asks it what time it is.
+    #
+    # AcousticAntCollector.java:240 takes System.nanoTime() AFTER record.read() returns and calls
+    # that the event time. Read as an arrival, that number carries:
+    #
+    #   hop quantisation        HOP_SIZE 1024 @ 44100 Hz = 23.2 ms, one stamp for the whole chunk
+    #                           -> 6.7 ms sd and an 11.6 ms bias, before anything else
+    #   AudioRecord buffering   max(minBuf, 8192 B) = 4096 frames = 92.9 ms of slack
+    #   Android input HAL       20-100 ms, device-specific, NEVER MEASURED on this fleet
+    #   ---------------------------------------------------------------------------------
+    #   about 25 ms of scatter on about 70 ms of per-device BIAS = 8.6 m on 24.6 m
+    #
+    # The bias is the disqualifying part. Scatter averages down over events; a constant per-device
+    # offset does not, and in TDoA it moves that node's range by 24.6 m -- half again the entire
+    # nyquist-mach baseline. It is also invisible: it shifts the answer without touching the
+    # residual in a 3-node exactly-determined fit.
+    #
+    # Two further facts, both from the source:
+    #   - AudioRecord.getTimestamp() is never called anywhere in the app. GPSTimingSync's own
+    #     docstring names it as the intended input and nothing uses it.
+    #   - The impulse callback DISCARDS the timestamp it is handed:
+    #     DeviceMetricsPoller.java:869 is `(peakDb, riseDb, ns) -> takAcou.onAcousticImpulse(
+    #     peakDb, riseDb)`. There is no arrival time leaving the phone today at all.
+    #   - No raw PCM is retained, so cross-correlation against a node is not possible either --
+    #     only onsets, and onsets are what the timestamp problem ruins.
+    t_sigma_s=25.1e-3,
+    mic_count=1,
+    fs_hz=44100.0,
+    band_hz=(50.0, 20000.0),
+    env=("temp", "press"),
+    raw_retain_s=0.0,
+    notes="dama-gotchi Android node. EXCELLENT sensor platform and a good clock; the audio path "
+          "does not use either. Refused for arrivals until AcousticAntCollector stamps frames "
+          "with AudioRecord.getTimestamp() converted through GPSTimingSync.toUtcMs(), and the "
+          "impulse callback stops dropping the timestamp. Fixed, it would be ~2.8 ms (0.98 m).",
+))
+
+
 def get(name: str) -> NodeClass:
     try:
         return CLASSES[name]
