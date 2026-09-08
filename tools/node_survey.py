@@ -48,7 +48,11 @@ import urllib.request
 from typing import Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, __file__.rsplit("/tools/", 1)[0])
-from hear import geodesy as G           # noqa: E402
+from hear import geodesy as G                    # noqa: E402
+# The frame/units strings come from the loader that will read this file back, never from a
+# literal here. Hardcoding "enu" produced a survey the loader refused -- it wants "enu_local" --
+# so the tool emitted a file it could not itself load, and nothing caught it until it was run.
+from hear.backend.survey import _FRAME, _UNITS    # noqa: E402
 
 # Above this, the receiver is telling us the epoch is bad and we believe it. This is a floor on
 # obvious garbage, NOT a quality bar -- the epochs that survive it are still multipath-biased.
@@ -226,7 +230,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                           "e_m": round(s["e_m"], 3), "n_m": round(s["n_m"], 3),
                           "u_m": heights[name],
                           "sigma_m": round(s["horiz_sigma_m"], 3)})
-        doc = {"frame": "enu", "units": "m",
+        doc = {"frame": _FRAME, "units": _UNITS,
                "origin": {"lat_deg": origin[0], "lon_deg": origin[1], "h_ell_m": 0.0,
                           "source": "median of %s; height datum is the --heights argument, "
                                     "NOT GNSS" % a.nodes[0]},
