@@ -20,6 +20,7 @@
 #include <ESPmDNS.h>
 #include <ESP_I2S.h>
 #include <SD.h>
+#include "ff.h"        // f_mkfs, for /format
 #include <SPI.h>
 #include "driver/gpio.h"
 #include <Wire.h>
@@ -1665,6 +1666,10 @@ static void h_dets() {
   http.send(200, "application/json", o);
 }
 
+// Hoisted above setup(): /format must close this before it unmounts, and the section that
+// uses it sits further down the file. scenef is already declared earlier.
+static File detf;
+
 void setup() {
   boot_guard();                    // first statement: a later fault still counts as a failed boot
   Serial.begin(115200);
@@ -1990,6 +1995,76 @@ void setup() {
     (void)watching;
     http.send(200, "text/plain", o);
   });
+  http.on("/format", HTTP_POST, []() {
+    // Both nodes shipped on Raspberry Pi boot cards, so the ESP32 only ever sees the small FAT
+    // partition the Pi put there -- 40 MB on nyquist, about half of it kernel images that will
+    // never be read again. scene.csv costs 0.8 MB/h, so a card's useful life is hours rather than
+    // weeks purely because of how it was partitioned.
+    //
+    // f_mkfs rewrites the PARTITION TABLE, not just the volume: FM_ANY without FM_SFD lays down a
+    // fresh MBR with one FAT partition spanning the whole device, so the Pi boot partition and its
+    // ext4 root both go and the card comes back at its real capacity.
+    //
+    // Guarded by the node's OWN NAME rather than confirm=yes, because there are two of these on
+    // similar addresses. A typo should cost you an error, not a night.
+    if (http.arg("confirm") != String(node_id)) {
+      char b[440];
+      snprintf(b, sizeof b,
+        "POST /format?confirm=%s\n\n"
+        "DESTROYS EVERYTHING ON THE CARD, partition table included. Drain first:\n"
+        "  curl 'http://%s.local/sd?file=/scene.csv' -o scene.csv   (and dets, health, *-prev)\n\n"
+        "card now: %lu MB free of %lu MB total\n"
+        "That total is small because of the Pi partitioning; this is what fixes it.\n",
+        node_id, node_id,
+        (unsigned long)(sd_ok ? (SD.totalBytes() - SD.usedBytes()) / 1048576UL : 0UL),
+        (unsigned long)(sd_ok ? SD.totalBytes() / 1048576UL : 0UL));
+      http.send(400, "text/plain", b);
+      return;
+    }
+    if (!sd_ok) { http.send(503, "text/plain", "no card mounted\n"); return; }
+
+    uint64_t before = SD.totalBytes();
+    // Every handle must be shut first, or FatFs flushes a dirty FAT onto a volume that is about
+    // to stop existing.
+    if (detf) { detf.flush(); detf.close(); }
+    if (scenef) { scenef.flush(); scenef.close(); }
+    logln("sd    FORMAT requested -- closing files and unmounting");
+    // f_mkfs blocks loop() for seconds, so PPS edges pass uncounted and the interval spanning the
+    // format lands in pps_int_max. Same discard the pin probes needed: mach came back from its
+    // format reading a 46 us spread against the 3-4 us it actually holds.
+    pps_resync = true; pps_resyncs++; fs_clean_secs = 0;
+
+    BYTE *work = (BYTE *)malloc(FF_MAX_SS);
+    if (!work) { http.send(500, "text/plain", "no memory for the mkfs work buffer\n"); return; }
+    f_mount(NULL, "0:", 0);                        // drop the volume; the diskio driver stays
+    MKFS_PARM opt = {(BYTE)FM_ANY, 0, 0, 0, 0};    // no FM_SFD -> keep an MBR, one full-size part
+    FRESULT r = f_mkfs("0:", &opt, work, FF_MAX_SS);
+    free(work);
+
+    SD.end();                                      // remount by the same path setup() uses, so
+    sd_ok = false; sd_cs = 0;                      // there is only one way a card gets mounted
+    if (SD.begin(21, SPI, 20000000, "/sd", 8)) { sd_ok = true; sd_cs = 21; }
+    else if (SD.begin(3, SPI, 20000000, "/sd", 8)) { sd_ok = true; sd_cs = 3; }
+
+    det_flushed = det_n;                           // these counted a card that no longer exists
+    scene_rows = 0; scene_written = 0;
+    det_write_fail = 0; scene_write_fail = 0;
+    clip_written = 0; clip_skip_full = 0; clip_budget_left = CLIP_BUDGET_B;
+
+    char b[440];
+    snprintf(b, sizeof b,
+      "f_mkfs -> %s (%d)\nremount: %s\n\nbefore: %llu MB total\nafter:  %llu MB total, %llu MB free\n\n%s\n",
+      r == FR_OK ? "OK" : "FAILED", (int)r, sd_ok ? "mounted" : "FAILED TO MOUNT",
+      (unsigned long long)(before / 1048576ULL),
+      (unsigned long long)(sd_ok ? SD.totalBytes() / 1048576ULL : 0ULL),
+      (unsigned long long)(sd_ok ? (SD.totalBytes() - SD.usedBytes()) / 1048576ULL : 0ULL),
+      (r == FR_OK && sd_ok)
+        ? "csv_open recreates health.csv, dets.csv and scene.csv with headers on the next write."
+        : "If the card did not come back it needs a reader. This is the one operation a reflash "
+          "cannot undo.");
+    logln(b);
+    http.send(r == FR_OK && sd_ok ? 200 : 500, "text/plain", b);
+  });
   http.on("/ppsv", []() {
     // Sweep the pull modes as well as reading the voltage, because the obvious way for THIS
     // firmware to be the fault is for its own ~45k pulldown to be flattening a weak or
@@ -2305,7 +2380,6 @@ void setup() {
 // open/write/close per detection costs 20-50 ms inside loop(), which stalls the I2S reader and
 // drops the very audio we are here to capture. Whatever that flush still costs now shows up in
 // drop_seconds, so the cost is measured rather than assumed.
-static File detf;
 // clip and clip_why are appended AFTER frame_hex, not inserted: tools/hear_bridge.py checks this
 // header as a prefix and documents trailing columns as the supported way to grow it. clip holds
 // the path of a WAV that IS on the card, or nothing; clip_why says which of the seven outcomes
