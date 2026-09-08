@@ -76,22 +76,53 @@ def onset_index_checked(e: np.ndarray, peak: int, frac: float = ONSET_FRAC,
                         back: int = 0) -> Tuple[float, bool]:
     """As [onset_index], plus whether the fraction was actually CROSSED.
 
-    ⚠️WHEN IT IS NOT, THE RETURNED INDEX IS THE CLAMP EDGE AND IS NOT AN ONSET. It is
-    `peak - back`, an arbitrary distance set by the caller's clamp, and it is numerically
-    indistinguishable from a genuine slow rise that happened to start there.
+    ⚠️THE FRACTION IS REFERRED TO THE LOCAL FLOOR, NOT TO ZERO. `target = floor + frac*(peak -
+    floor)`, where `floor` is the minimum envelope in the search window.
 
-    This is not rare. On the 228 hand-labelled 2026-09-05 events, **42 (18.4%) never cross 20% of
-    their own peak within the 25 ms guard** -- they are retriggers sitting inside the decay tail
-    of the round before, so the envelope never gets low enough. Every one of them was reported
-    with an onset exactly 25 ms early. At 345 m/s that is **8.6 m of range** on a project whose
-    output is acoustic localisation, and nothing downstream could tell those 42 from the other
-    186.
+    Referred to zero it asks the envelope to fall to 20% of the NEW peak, which a round landing
+    inside the previous round's decay tail never does -- the old one is still ringing. The walk
+    then ran to the clamp edge and returned it, an arbitrary `peak - back` numerically
+    indistinguishable from a genuine slow rise. On the 228 hand-labelled 2026-09-05 events that
+    was **42 of them (18.4%)**, every one timestamped exactly 25 ms early.
 
-    Callers must branch on the flag: fall back to the peak, widen the search, or drop the event --
-    but not treat the number as measured.
+    Measured against known truth (a synthetic previous round still ringing 45 ms later, onset
+    truth 45.0 ms, swept by tail level):
+
+        floor/peak   referred to zero        referred to the floor
+        0.17         -0.55 ms   11/12 found  +0.45 ms   12/12
+        0.23        -21.62 ms    0/12 found  +0.43 ms   12/12
+
+    On the real corpus it takes the never-found count from **42 to 0**, moves those 42 by a
+    median of **+22.5 ms** toward the event, and leaves 63% of the rest within 0.05 ms. 27.6% of
+    all events shift by more than 1 ms and 19.3% by more than 10 ms; the largest is 24.27 ms,
+    which is **8.4 m of range** at 345 m/s.
+
+    ⚠️It is a STRICT GENERALISATION: where the floor is zero the two are identical, so a quiet
+    event cannot regress. Nor can a truncated one -- see the interior-trough guard below. Cost on the sketch, whose one-hop window barely sees the floor: nested
+    AUC 0.9732 -> 0.9712, inside the noise band, and worth it for one definition of "onset"
+    across the node, the phone and the training script.
+
+    ⚠️WHAT IT STILL CANNOT FIX: when the previous round is as loud as or louder than this one,
+    `peak` is the WRONG PEAK -- argmax finds the old event -- and no onset rule helps. Measured
+    at tail 0 dB and +3 dB the error is -22 ms and -45 ms for both methods. That is a
+    peak-picking failure, not an onset failure, and `found` does not catch it.
+
+    `found` is False only when no crossing exists even against the floor (an empty window, or a
+    peak at its very edge). Callers must not treat the index as measured when it is False.
     """
     lo = max(0, peak - back) if back > 0 else 0
-    target = frac * float(e[peak])
+    if peak <= lo:
+        return float(lo), False
+    # ⚠️ONLY AN *INTERIOR* TROUGH IS A BASELINE. If the minimum sits at the window's left edge the
+    # envelope is still descending out of the window -- the rise predates it -- and referring the
+    # fraction to that edge value turns an honest "clamped, cannot see further back" into a
+    # confidently LATE onset. So that case keeps the zero reference, which clamps to the edge and
+    # reports found=False, exactly as before. The two are cleanly separable in practice: all 228
+    # of the 2026-09-05 events have an interior trough (including all 42 that could not be timed),
+    # and a block that truncates a rise has its trough at the edge by construction.
+    am = int(np.argmin(e[lo:peak]))
+    floor = float(e[lo + am]) if am > 0 else 0.0
+    target = floor + frac * (float(e[peak]) - floor)
     below = np.nonzero(e[lo:peak] < target)[0]
     if below.size == 0:
         return float(lo), False

@@ -33,8 +33,8 @@ score they reported, and they are superseded:
 
 | | nested AUC | superseded figure |
 |---|---|---|
-| **172 B sketch**, absolute dB, one-hop onset | **0.9732** | 0.9631 |
-| sketch, 15 bands (whole fleet) | 0.9705 | — |
+| **172 B sketch**, absolute dB, one-hop onset | **0.9712** | 0.9631 |
+| sketch, 15 bands (whole fleet) | 0.9690 | — |
 | sketch, peak-aligned | 0.9634 | — |
 | hand-crafted 6 features | 0.9584 | 0.9589 |
 | band/frame summaries (36 dims) | 0.9554 | — |
@@ -47,6 +47,14 @@ is walked back to the 25 ms re-trigger guard, which is right for the TIMESTAMP a
 walking back at all. Clamped to one hop it is **0.9732**. That 2.9-point spread is larger than
 every representation difference on this page put together, and it is a constant doing two jobs
 with one number (`detect.SKETCH_BACK_S`).
+
+⚠️**The onset itself is now referred to the local floor, not to zero.** A round landing inside
+the previous round's decay tail never sees its envelope fall to 20 % of the *new* peak, so the
+walk ran to the clamp edge and returned it: **42 of 228 events (18.4 %)** timestamped exactly
+25 ms early, **8.6 m of range**. Against known synthetic truth at that condition the error goes
+from **−21.62 ms to +0.43 ms**. On the real corpus the never-timed count goes 42 → 0, and
+**27.6 % of all events move by more than 1 ms**. Cost to the sketch: 0.9732 → 0.9712, inside the
+noise band, and worth one definition of "onset" across node, phone and training script.
 
 ⚠️**The sketch cannot resolve a crack's rise, and should stop being asked to.** One analysis
 frame is NFFT/fs = 5.33 ms; the measured peak-to-onset distance is a **median of 1.56 ms**. Frame
