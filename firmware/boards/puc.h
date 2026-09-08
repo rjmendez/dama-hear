@@ -16,6 +16,10 @@
 #define GPS_RX_PIN     44        // measured: 9600-baud traffic idling high, ~1 s gaps
 #define GPS_TX_PIN     43        // measured: the module replies to commands sent here
 #define GPS_BAUD_FIXED 9600
+// Vendor GPS power modes, lifted verbatim from the dump's command strings -- useful because they
+// are the states this module can be parked in: $PMTK225,0 continuous, $PMTK225,8 AlwaysLocate,
+// $PMTK161,0 standby, $PMTK104 full cold start. The vendor also calls the part "L80" in one log
+// string while the module answers Quectel-L86; the round-trip answer is the one to trust.
 
 // ⚠️1PPS IS NOT ROUTED ON STOCK HARDWARE. The L86 exposes it on pin 11; it was forced on with
 // $PMTK285,4,100 (always, regardless of fix) and NO GPIO saw a 1 Hz edge across repeated
@@ -35,23 +39,25 @@
 // which neither XIAO node can produce at all.
 // ⚠️PINS NOT YET KNOWN. The pin scan runs with the peripherals unpowered, so the I2S lines were
 // static. /scan and /scanpd on the beachhead firmware are how they get found.
-#define MIC_KIND       MIC_I2S
+// The vendor app links i2s_pdm_rx_set_gpio -- this is a PDM microphone path, the same kind as the
+// XIAO, NOT the generic I2S I first wrote here. From the flash dump, not from the product page.
+#define MIC_KIND       MIC_PDM
 #define MIC_COUNT      2
-#define MIC_BCLK_PIN   -1        // unknown
-#define MIC_WS_PIN     -1        // unknown
+#define MIC_CLK_PIN    -1        // unknown -- PDM needs CLK + DIN only, there is no BCLK/WS pair
 #define MIC_DIN_PIN    -1        // unknown
 #define FS_NOMINAL     48000     // vendor config: "sampleRateHz": 48000
 #define MIC_BAND_LO_HZ 50
 #define MIC_BAND_HI_HZ 20000     // unverified part; at 48 kHz Nyquist is 24 kHz so the mic binds
 
 // ---- storage -----------------------------------------------------------------------------
-// A microSD slot exists (the vendor writes /sdcard/YYYYMMDD/*.flac). Pins unknown. There is also
-// 25.94 MB of onboard FAT in the custom partition table, which needs no pins at all.
-#define SD_SCK_PIN     -1
-#define SD_MISO_PIN    -1
-#define SD_MOSI_PIN    -1
-#define SD_CS_PROBE_A  -1
-#define SD_CS_PROBE_B  -1
+// A microSD slot exists (the vendor writes /sdcard/YYYYMMDD/*.flac). The dump links sdmmc_host_*,
+// diskio_sdmmc and logs "Using SDMMC peripheral" -- so the card is on the NATIVE SDMMC peripheral,
+// not SPI. I had declared SCK/MISO/MOSI/CS here, which is the wrong bus entirely and would have
+// sent whoever wires this to the wrong pads. The roles are CLK, CMD and D0..D3.
+#define SD_BUS         SD_SDMMC
+#define SD_CLK_PIN     -1
+#define SD_CMD_PIN     -1
+#define SD_D0_PIN      -1        // bus width not yet established (1-bit or 4-bit)
 
 // ---- I2C ---------------------------------------------------------------------------------
 // DS3231 RTC plus temperature, humidity, pressure, VOC, eCO2, IAQ, a 3-axis magnetometer, a 3-axis

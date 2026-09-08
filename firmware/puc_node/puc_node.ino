@@ -297,6 +297,49 @@ static void routes() {
   http.on("/scanpd", []() { http.send(200, "text/plain", pin_scan(4000, 1)); });
   http.on("/scanpu", []() { http.send(200, "text/plain", pin_scan(4000, 2)); });
 
+  http.on("/gpshold", HTTP_POST, []() {
+    // FORCE_ON must be HELD logic high to leave backup mode -- Hardware Design 3.4.3: "FORCE_ON
+    // logic high can turn off the switch (backup -> full on)". /gpsreset pulsed each candidate low
+    // then high then RELEASED it to floating, which is the right shape for an active-low RESET and
+    // the wrong shape for FORCE_ON. If one of the vendor's output pins is wired to FORCE_ON, a
+    // pulse would never have woken it.
+    //
+    // So: drive each candidate HIGH and HOLD it while watching the module's TX for signs of life.
+    // If one works, leave it asserted and say which -- that pin is then the wake line.
+    static const int CAND[] = {2, 10, 21, 40, 41, 42};
+    String o = "holding each vendor output HIGH in turn, watching GPIO44 for the L86 waking\n\n";
+    int found = -1;
+    for (int pin : CAND) {
+      Serial1.end(); delay(10);
+      pinMode(pin, OUTPUT);
+      digitalWrite(pin, HIGH);
+      delay(3000);                       // held, not pulsed
+      pinMode(GPS_RX_PIN, INPUT);
+      uint32_t ed = 0, n = 0, hi = 0; int last = digitalRead(GPS_RX_PIN);
+      uint64_t t0 = esp_timer_get_time();
+      while ((uint64_t)esp_timer_get_time() - t0 < 2000000ULL) {
+        int v = digitalRead(GPS_RX_PIN); n++; if (v) hi++;
+        if (v != last) { ed++; last = v; }
+      }
+      char b[130];
+      snprintf(b, sizeof b, "GPIO%-3d held HIGH 3 s -> RX edges %-7lu high %5.1f%%  %s\n",
+               pin, (unsigned long)ed, 100.0 * hi / n, ed > 100 ? "<== AWAKE" : "");
+      o += b;
+      if (ed > 100) { found = pin; break; }
+      digitalWrite(pin, LOW); delay(50); pinMode(pin, INPUT);   // release before the next one
+      Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    }
+    Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    if (found >= 0) {
+      char b[160];
+      snprintf(b, sizeof b, "\nGPIO%d is the wake line and is LEFT ASSERTED HIGH.\n", found);
+      o += b;
+    } else {
+      o += "\nNone of them. Either FORCE_ON is not on any of these pins, or this is not backup mode.\n";
+    }
+    http.send(200, "text/plain", o);
+  });
+
   http.on("/gpsreset", HTTP_POST, []() {
     // I hung the L86 with PMTK285,4,500 and it will not answer anything, so the only way back is
     // to cycle its power or reset line. The vendor firmware configured GPIO2, 10, 21, 40, 41 and
