@@ -244,3 +244,92 @@ class TestCrossRateAlignment:
     def test_empty_input_is_empty_not_an_error(self):
         X, kept, info = C.aligned_matrix([])
         assert X.shape == (0, 0) and kept == [] and info["bands"] == 0
+
+
+class TestUtcTrusted:
+    """⚠️`utc_trusted` is DERIVED from `clock_tier`, which the phone has published all along.
+
+    hear/backend/associate.py refuses arrivals on a `utc_trusted` key and nothing publishes one.
+    The obvious fix -- add the boolean to the phone payload -- is the wrong one: a new key is
+    ABSENT on every row recorded before its rollout, and associate.arrival_is_usable reads absent
+    as usable, so exactly the wall-clock stamps the flag exists to refuse would pass. Deriving it
+    from a field already on the wire answers correctly for history too.
+    """
+
+    def test_a_disciplined_tier_is_trusted(self):
+        for tier in ("gnss", "location"):
+            p, _, _ = _phone_payload(clock_tier=tier)
+            assert C.from_phone(p).utc_trusted is True, tier
+
+    def test_the_wall_clock_fallback_is_not(self):
+        p, _, _ = _phone_payload(clock_tier="wall")
+        r = C.from_phone(p)
+        assert r.utc_trusted is False
+        # ...and it still carries a timestamp, which is the whole trap: the stamp exists.
+        assert r.ts_utc_s is not None
+
+    def test_network_is_not_a_gps_anchor_and_is_refused(self):
+        """⚠️NOT a naming quibble. "network" is a NETWORK_PROVIDER fallback, not a GPS anchor.
+        GPSTimingSync.java:612-616 calls it deliberately NOT clock-trustworthy, same as "wall";
+        dama-gotchi's own GOOD_CLOCK_TIERS is {gnss, location}; EskfFusion.kt:318 lists it in
+        BAD_PEER_CLOCK_TIERS. Its declared sigma is 25 ms -- 8.6 m at 343 m/s. Admitting it would
+        make dama-hear disagree with the producer fleet about the same string.
+        """
+        p, _, _ = _phone_payload(clock_tier="network")
+        assert C.from_phone(p).utc_trusted is False
+        assert "network" not in C.TRUSTED_CLOCK_TIERS
+
+    def test_a_tier_this_version_never_heard_of_is_not_trusted(self):
+        p, _, _ = _phone_payload(clock_tier="ptp")
+        assert C.from_phone(p).utc_trusted is False
+
+    def test_an_unstated_tier_is_not_stated_not_false(self):
+        """None means the producer did not say, and associate.arrival_is_usable treats that as
+        usable BY DESIGN. Returning False here would refuse every pre-clock_tier phone row."""
+        p, _, _ = _phone_payload()
+        del p["clock_tier"]
+        assert C.from_phone(p).utc_trusted is None
+
+    def test_an_undated_onset_is_refused_at_any_tier(self):
+        """The guard against an older build publishing a tier without the `stamp != null`
+        coupling AcousticRangingCollector.kt:3479-3500 gives it today."""
+        for tier in ("gnss", "location", "wall"):
+            p, _, _ = _phone_payload(clock_tier=tier, onset_dated=False)
+            assert C.from_phone(p).utc_trusted is False, tier
+
+    def test_a_dated_onset_does_not_promote_a_wall_stamp(self):
+        p, _, _ = _phone_payload(clock_tier="wall", onset_dated=True)
+        assert C.from_phone(p).utc_trusted is False
+
+    def test_a_node_is_none_because_its_clock_is_a_different_measurement(self):
+        """A node's time comes from PPS lock and tAcc, not from clock_tier. Asserting node trust
+        off a field nodes never set would be inventing a measurement."""
+        frame, _, _ = _frame(fs=16000.0)
+        assert C.from_node(frame, "nyquist", second_utc_s=1788700000).utc_trusted is None
+
+    def test_a_producer_stating_it_outright_outranks_the_derivation(self):
+        p, _, _ = _phone_payload(clock_tier="gnss", utc_trusted=False)
+        assert C.from_phone(p).utc_trusted is False
+
+    def test_it_cannot_be_set_to_something_that_disagrees_with_the_tier(self):
+        """A property, not a dataclass field: no Record can be constructed whose stored
+        `utc_trusted` contradicts the tier it was derived from."""
+        p, _, _ = _phone_payload(clock_tier="wall")
+        r = C.from_phone(p)
+        with pytest.raises(AttributeError):
+            r.utc_trusted = True
+
+    def test_onset_found_reaches_the_record_at_all(self):
+        """⚠️REGRESSION. from_phone dropped `onset_found` on the floor, and it is the OTHER key
+        associate._QUALITY_FLAGS refuses on -- a Record could not answer the gate's question."""
+        p, _, _ = _phone_payload(onset_found=False)
+        assert C.from_phone(p).extra["onset_found"] is False
+        p2, _, _ = _phone_payload(onset_found=True)
+        assert C.from_phone(p2).extra["onset_found"] is True
+
+    def test_the_shared_function_is_what_the_property_calls(self):
+        """One definition, so a second reader (pool.stats) cannot answer differently."""
+        assert C.utc_trusted_of({"source": "phone", "clock_tier": "gnss"}) is True
+        assert C.utc_trusted_of({"source": "phone", "clock_tier": "wall"}) is False
+        assert C.utc_trusted_of({"source": "phone"}) is None
+        assert C.utc_trusted_of({"source": "node", "clock_tier": "gnss"}) is None

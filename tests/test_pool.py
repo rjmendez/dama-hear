@@ -192,6 +192,121 @@ class TestTime:
         assert len(pl.records(anchored_only=True)) == 3
 
 
+def _mqtt_payloads(tmp_path, name, payloads, node="phone-a", ts0=1788763952189):
+    """One jsonl per payload override, each with its own frame so the pool does not dedup them."""
+    lines = []
+    for i, extra in enumerate(payloads):
+        frame = _frame(fs=48000.0, seed=200 + i, node_us=2000 + i)
+        p = {"sketch_b64": base64.b64encode(frame).decode(), "ts_utc_ms": ts0 + i * 1000}
+        p.update(extra)
+        lines.append(json.dumps({"topic": "dama/%s/acoustic_sketch" % node, "payload": p}))
+    f = tmp_path / name
+    f.write_text("\n".join(lines) + "\n")
+    return str(f)
+
+
+class TestAnchoredIsNotTrusted:
+    """⚠️THE FALSE FRIEND. `anchored` answers "is there a stamp"; a solver wants "is the stamp a
+    measurement". For a node those coincide -- `utc_us > 0` IS PPS lock. For a PHONE they do not:
+    ingest sets `anchored = bool(ts)`, and GPSTimingSync publishes a `ts_utc_ms` on the "wall"
+    tier too, at a declared 50 ms -- about 17 m at 343 m/s, which is not a TDoA arrival.
+
+    The two are deliberately left disagreeing. `anchored` is content-addressed into every row
+    already written and redefining it would change what those rows assert, so the trust question
+    moved to `Record.utc_trusted` instead. Do not "fix" one to match the other.
+    """
+
+    def test_a_wall_tier_row_is_anchored_and_is_not_trusted(self, tmp_path):
+        pl = P.Pool(str(tmp_path / "pool"))
+        pl.ingest_mqtt_jsonl(_mqtt_payloads(tmp_path, "w.jsonl", [{"clock_tier": "wall"}]))
+        assert next(iter(pl.raw()))["anchored"] is True
+        assert pl.records()[0].utc_trusted is False
+
+    def test_a_gnss_row_is_both(self, tmp_path):
+        pl = P.Pool(str(tmp_path / "pool"))
+        pl.ingest_mqtt_jsonl(_mqtt_payloads(tmp_path, "g.jsonl", [{"clock_tier": "gnss"}]))
+        assert next(iter(pl.raw()))["anchored"] is True
+        assert pl.records()[0].utc_trusted is True
+
+    def test_onset_dated_survives_the_pool_so_the_guard_rung_still_works(self, tmp_path):
+        """⚠️corpus.from_phone can evaluate the `onset_dated` rung; before this the pool could
+        not, because ingest_mqtt_jsonl never stored the key. Two readers of one message giving
+        two answers is the bug -- so the round trip is asserted, not assumed."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        pl.ingest_mqtt_jsonl(_mqtt_payloads(tmp_path, "u.jsonl",
+                                            [{"clock_tier": "gnss", "onset_dated": False}]))
+        r = pl.records()[0]
+        assert r.extra["onset_dated"] is False
+        assert r.clock_tier == "gnss"
+        assert r.utc_trusted is False
+
+    def test_the_quality_flags_all_round_trip(self, tmp_path):
+        """The stored-then-dropped leak, in both directions: what ingest wrote must reach the
+        Record, or the gate meant to read it never sees the producer's own report."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        pl.ingest_mqtt_jsonl(_mqtt_payloads(
+            tmp_path, "q.jsonl",
+            [{"clock_tier": "location", "onset_found": False, "onset_dated": True,
+              "onset_offset_us": 4321}]))
+        e = pl.records()[0].extra
+        assert e["onset_found"] is False
+        assert e["onset_dated"] is True
+        assert e["onset_offset_us"] == 4321
+
+    def test_stats_counts_the_wall_population_instead_of_hiding_it(self, tmp_path):
+        """⚠️A selector that drops rows without saying how many is this pool's named failure --
+        the G3 730 and the `flags & 2` 88. So the tiers are COUNTED."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        pl.ingest_mqtt_jsonl(_mqtt_payloads(tmp_path, "m.jsonl", [
+            {"clock_tier": "wall"}, {"clock_tier": "wall"}, {"clock_tier": "gnss"},
+            {"clock_tier": "network"}, {},
+        ]))
+        s = pl.stats()
+        assert s["by_clock_tier"] == {"wall": 2, "gnss": 1, "network": 1, "None": 1}
+        # ...and the tiers total the phone rows: a breakdown that loses rows is the same bug.
+        assert sum(s["by_clock_tier"].values()) == s["by_source"]["phone"]
+        assert s["phone_utc_trusted"] == {"true": 1, "false": 3, "not_stated": 1}
+        assert sum(s["phone_utc_trusted"].values()) == s["by_source"]["phone"]
+        assert s["trusted_clock_tiers"] == ["gnss", "location"]
+
+    def test_the_summary_agrees_with_the_records_it_summarises(self, tmp_path):
+        """stats() asks corpus.utc_trusted_of the same question records() does. If it re-derived
+        from by_clock_tier it would miss the onset_dated rung and quietly disagree."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        pl.ingest_mqtt_jsonl(_mqtt_payloads(tmp_path, "a.jsonl", [
+            {"clock_tier": "gnss"}, {"clock_tier": "gnss", "onset_dated": False},
+            {"clock_tier": "wall"}, {},
+        ]))
+        got = pl.stats()["phone_utc_trusted"]
+        recs = [r.utc_trusted for r in pl.records(source="phone")]
+        assert got == {"true": sum(t is True for t in recs),
+                       "false": sum(t is False for t in recs),
+                       "not_stated": sum(t is None for t in recs)}
+        assert got == {"true": 1, "false": 2, "not_stated": 1}
+
+    def test_nodes_are_absent_from_the_tier_breakdown(self, tmp_path):
+        """A node has no clock_tier -- its time is PPS. Folding it into a `None` bucket would
+        read as a phone that failed to state one."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        pl.ingest_dets(_dets(tmp_path, "dets.csv", 3))
+        s = pl.stats()
+        assert s["by_clock_tier"] == {}
+        assert s["phone_utc_trusted"] == {"true": 0, "false": 0, "not_stated": 0}
+        assert s["records"] == 3
+
+    def test_a_node_record_has_no_opinion_about_utc_trust(self, tmp_path):
+        pl = P.Pool(str(tmp_path / "pool"))
+        pl.ingest_dets(_dets(tmp_path, "dets.csv", 1))
+        assert pl.records()[0].utc_trusted is None
+
+    def test_the_mqtt_arithmetic_still_closes_with_the_new_columns(self, tmp_path):
+        pl = P.Pool(str(tmp_path / "pool"))
+        f = _mqtt_payloads(tmp_path, "c.jsonl", [{"clock_tier": "wall"}, {"clock_tier": "gnss"}])
+        e = pl.ingest_mqtt_jsonl(f)
+        assert e["rows"] == e["added"] + e["duplicate"] + e["skipped"]
+        assert e["added"] == 2
+
+
 class TestLedger:
     def test_it_records_the_generation_and_the_skips_not_just_the_wins(self, tmp_path):
         pl = P.Pool(str(tmp_path / "pool"))
