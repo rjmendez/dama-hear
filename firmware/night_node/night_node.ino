@@ -2508,8 +2508,16 @@ void setup() {
 // header STRING changes, so keeping the name would have appended 12-column rows under the same
 // header as the 11-column ones already on the card. Renaming forces the roll. Pulled from
 // nyquist and mach on 2026-09-08: 147 and 268 rows, every one 11 wide.
+// ⚠️`sketch_back` IS IN THE HEADER SO A ROW SAYS WHERE ITS OWN WINDOW STARTED. The frame's
+// meaning changed when the window went from [T-46 ms, T-2 ms] to running forward from one hop
+// before the trigger, and nothing in a row recorded which convention produced it -- so new-window
+// frames would have appended under the same header as old-window ones, indistinguishable. That is
+// the ambiguity csv_open's roll exists to prevent, and a changed header string is what triggers
+// it. Recording the value rather than bumping a version number also makes the NEXT window change
+// visible in the data instead of only in the firmware.
 static const char DETS_HDR[] =
-  "node_id,utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,frame_hex,clip,clip_why";
+  "node_id,utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,sketch_back,frame_hex,"
+  "clip,clip_why";
 
 // ⚠️THE SKETCH IS TAKEN HERE, NOT AT THE GATE EDGE, BECAUSE THE AUDIO DOES NOT EXIST YET.
 // The window runs forward from one hop before the trigger, so it needs SKETCH_SPAN - SKETCH_BACK
@@ -2574,11 +2582,11 @@ static void det_flush() {
     // is where that would show. Break, not continue: the file is append-only and in-order.
     if (d.clip_st == CLIP_PENDING || !d.sk_st) break;
     char line[MEL16_FRAME_BYTES * 2 + 224];
-    int m = snprintf(line, sizeof line, "%s,%lld,%lu,%lu,%lu,%ld,%d,%u,%.3f,",
+    int m = snprintf(line, sizeof line, "%s,%lld,%lu,%lu,%lu,%ld,%d,%u,%.3f,%lu,",
                      node_id,
                      (long long)d.utc_us, (unsigned long)d.uptime_s, (unsigned long)d.sample,
                      (unsigned long)d.pps_n, (long)d.us_since_pps, d.trigger,
-                     (unsigned)d.flags, d.fs_at);
+                     (unsigned)d.flags, d.fs_at, (unsigned long)SKETCH_BACK);
     for (int j = 0; j < MEL16_FRAME_BYTES && m < (int)sizeof line - 64; j++) {
       line[m++] = hx[d.frame[j] >> 4]; line[m++] = hx[d.frame[j] & 0xF];
     }

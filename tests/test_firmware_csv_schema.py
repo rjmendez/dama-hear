@@ -21,7 +21,7 @@ INO = pathlib.Path(__file__).resolve().parents[1] / "firmware" / "night_node" / 
 
 #: (header constant, the literal that starts the row, trailing fields appended after the payload)
 CASES = [
-    ("DETS_HDR", '"%s,%lld,%lu,%lu,%lu,%ld,%d,%u,%.3f,"', 3),    # frame_hex + clip + clip_why
+    ("DETS_HDR", '"%s,%lld,%lu,%lu,%lu,%ld,%d,%u,%.3f,%lu,"', 3),  # frame_hex + clip + clip_why
     ("SCENE_HDR", '"%s,%lld,%lu,%lu,%d,%d,%d,%d,%d,%lu,"', 3),   # mel_hex + f_lo_hz + f_hi_hz
 ]
 
@@ -33,9 +33,15 @@ def _source():
 
 
 def _header_fields(src, name):
-    m = re.search(re.escape(name) + r"\[\]\s*=\s*\n?\s*\"([^\"]+)\"", src)
+    """Join ADJACENT string literals: C concatenates them and so must this.
+
+    ⚠️The first version read only the first literal, so wrapping the header across two lines --
+    which is exactly what adding a column made necessary -- silently halved the declared column
+    count and made the guard fail on a correct header.
+    """
+    m = re.search(re.escape(name) + r"\[\]\s*=\s*((?:\s*\"[^\"]*\")+)\s*;", src)
     assert m, "could not find %s" % name
-    return m.group(1).split(",")
+    return "".join(re.findall(r"\"([^\"]*)\"", m.group(1))).split(",")
 
 
 def _format_fields(fmt_literal):
@@ -63,6 +69,7 @@ def test_the_dets_header_names_the_node_and_the_writer_supplies_it():
     assert fields[0] == "node_id", "dets.csv must lead with the node identity"
     fmt = CASES[0][1]
     assert fmt.startswith('"%s,'), "the first written field must be the node id"
+    assert "sketch_back" in fields, "a row must say where its own sketch window started"
 
 
 def test_renaming_the_column_is_what_forces_the_roll():
@@ -70,5 +77,5 @@ def test_renaming_the_column_is_what_forces_the_roll():
     `node` would append 12-column rows under the same header as the 11-column ones already on
     every card in the field."""
     src = _source()
-    assert '"node_id,utc_us' in src
+    assert '"node_id,utc_us' in src and 'sketch_back' in src
     assert '"node,utc_us,uptime_s,sample,pps_n' not in src, "the old dets header is back"
