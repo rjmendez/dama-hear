@@ -43,6 +43,12 @@ FS_BY_CODE = {v: k for k, v in FS_CODES.items()}
 FS_SHIFT = 8                      # flags bits 8-11; bits 0-7 stay event flags (bit0 = retrigger)
 FS_MASK = 0x0F
 
+# The event bits, named. ⚠️These are v1 positions and must be read off `event_flags` (flags &
+# 0xFF), never off the raw word: in v2 bit 1 is a profile-id bit, so masking the raw flags tags a
+# good v2 frame as context-starved.
+FLAG_RETRIGGER = 0x0001
+FLAG_NO_CONTEXT = 0x0002
+
 LAYOUT_NYQUIST = "nyquist"      # legacy: edges rescaled to each node's Nyquist
 LAYOUT_FIXED = "fixed"          # edges always over [F_LO, F_HI]; bands above Nyquist go empty
 LAYOUT_BIT = 1 << 12            # flags bit 12 set => LAYOUT_FIXED

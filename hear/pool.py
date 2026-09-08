@@ -198,14 +198,24 @@ class Pool:
                 r = type(e).__name__
                 bad[r] = bad.get(r, 0) + 1
         added = self._append(recs)
+        # ⚠️THE ARITHMETIC MUST CLOSE. `rows_seen == added + duplicate + skipped` for every file,
+        # and decode failures are counted into `skipped` rather than living in a field nothing
+        # totals. A 5-row file that reported "0 new, 0 duplicate, 0 skipped" is what a whole
+        # deploy of this tool actually printed while discarding all five, and the reason it could
+        # is that `skipped` counted only the READER's refusals and not the decoder's.
+        reasons = dict(read.counts)
+        for k, v in bad.items():
+            reasons["decode_" + k] = reasons.get("decode_" + k, 0) + v
+        skipped = len(read.skips) + sum(bad.values())
         entry = {
             "kind": "dets.csv", "path": os.path.abspath(path), "origin": origin or path,
             "sha256": sha, "bytes": len(raw), "generation": read.generation.name,
-            "rows": len(read.rows), "decoded": len(recs), "added": added,
+            "rows": len(read.rows) + len(read.skips), "decoded": len(recs), "added": added,
             "duplicate": len(recs) - added,
-            "skipped": len(read.skips), "skip_reasons": dict(read.counts),
+            "skipped": skipped, "skip_reasons": reasons,
             "decode_errors": bad, "schema_version": SCHEMA_VERSION,
         }
+        assert entry["rows"] == added + entry["duplicate"] + skipped, entry
         self._ledger(entry)
         return entry
 
@@ -215,10 +225,12 @@ class Pool:
         sha = hashlib.sha256(raw).hexdigest()
         recs: List[Dict[str, Any]] = []
         skips: Dict[str, int] = {}
+        rows_seen = 0
         for n, line in enumerate(raw.decode("utf-8", "replace").splitlines(), 1):
             line = line.strip()
             if not line:
                 continue
+            rows_seen += 1
             try:
                 obj = json.loads(line)
             except ValueError:
@@ -269,9 +281,10 @@ class Pool:
             })
         added = self._append(recs)
         entry = {"kind": "mqtt.jsonl", "path": os.path.abspath(path), "origin": origin or path,
-                 "sha256": sha, "bytes": len(raw), "decoded": len(recs), "added": added,
-                 "duplicate": len(recs) - added, "skipped": sum(skips.values()),
+                 "sha256": sha, "bytes": len(raw), "rows": rows_seen, "decoded": len(recs),
+                 "added": added, "duplicate": len(recs) - added, "skipped": sum(skips.values()),
                  "skip_reasons": skips, "schema_version": SCHEMA_VERSION}
+        assert entry["rows"] == added + entry["duplicate"] + entry["skipped"], entry
         self._ledger(entry)
         return entry
 
