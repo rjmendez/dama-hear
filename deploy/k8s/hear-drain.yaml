@@ -82,7 +82,13 @@ spec:
 # ⚠️STALENESS IS THE FAILURE THAT MATTERS AND IT IS SILENT. The drain above exits 0 whenever its
 # HTTP succeeds, so a node that fell off the wifi -- or one whose SD card stopped being written --
 # produces a green CronJob history forever. This second job asserts on the SENSOR's own last
-# success, which is the only thing that actually goes stale, and is what a monitor should alert on.
+# success, which is what a monitor should alert on.
+#
+# ⚠️IT ALSO ASSERTS THAT THE SCENE TAIL REACHED BACK FAR ENOUGH. A drain whose HTTP succeeded and
+# whose window started hours after the previous one ended is fresh, adds rows and exits 0; the
+# 2 MB tail now covers 2.42 h against boots longer than that, and two outages have already cost
+# 3.11 h of scene this way. `--check` fails on any whole row the fetch never asked for; see the
+# byte watermark in tools/hear_drain.py. Threshold: --max-unfetched-bytes, default 0.
 apiVersion: batch/v1
 kind: CronJob
 metadata:

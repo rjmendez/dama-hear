@@ -336,13 +336,19 @@ class Pool:
         return ks
 
     def ingest_scene(self, path: str, default_node: Optional[str] = None,
-                     origin: Optional[str] = None, partial: bool = False) -> Dict[str, Any]:
+                     origin: Optional[str] = None, partial: bool = False,
+                     fetch_audit: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Ingest one `scene.csv` (or a byte-range tail of one). Idempotent.
 
         `partial=True` says this text came from `GET /sd?file=scene.csv&tail=N`, which starts
         mid-line and carries no header. The leading fragment is DROPPED and the drop is reported
         -- see `hear.scenefile.read_text`. Off by default so a whole file that begins mid-row
         still reads as the corruption it is.
+
+        `fetch_audit` is what the FETCH knows and this file cannot: how far back the tail reached
+        against the file it was cut from, and therefore how many bytes of that file no fetch has
+        ever asked for. It lands as its own top-level ledger key. Rows this read refused are
+        `skipped`; bytes never requested are not rows and are counted apart from them.
         """
         raw = open(path, "rb").read()
         sha = hashlib.sha256(raw).hexdigest()
@@ -417,7 +423,18 @@ class Pool:
             "decode_errors": bad, "partial_first_line": read.partial_first_line,
             "schema_version": SCHEMA_VERSION,
         }
+        if fetch_audit is not None:
+            # ⚠️TOP LEVEL, NOT INSIDE `skip_reasons`. `skipped` is len(read.skips)+sum(bad) and
+            # `skip_reasons` is the breakdown that must sum to it; a byte-accounting key filed in
+            # there would make one counter mean two things, which is the bug class this whole
+            # audit exists to catch. Bytes the fetch never asked for are not rows this read
+            # skipped, so they are counted somewhere else entirely.
+            entry["fetch_audit"] = fetch_audit
+        # This file's rows are fully accounted for, and the breakdown totals the count it breaks
+        # down. The second half was true before it was checked, which is exactly how it stops
+        # being true silently.
         assert entry["rows"] == added + entry["duplicate"] + skipped, entry
+        assert sum(reasons.values()) == skipped, entry
         self._ledger(entry)
         return entry
 
