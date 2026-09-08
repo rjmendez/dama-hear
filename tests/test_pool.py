@@ -262,7 +262,7 @@ class TestAnchoredIsNotTrusted:
             {"clock_tier": "network"}, {},
         ]))
         s = pl.stats()
-        assert s["by_clock_tier"] == {"wall": 2, "gnss": 1, "network": 1, "None": 1}
+        assert s["by_clock_tier"] == {"wall": 2, "gnss": 1, "network": 1, "(unstated)": 1}
         # ...and the tiers total the phone rows: a breakdown that loses rows is the same bug.
         assert sum(s["by_clock_tier"].values()) == s["by_source"]["phone"]
         assert s["phone_utc_trusted"] == {"true": 1, "false": 3, "not_stated": 1}

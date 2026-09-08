@@ -50,13 +50,25 @@ def utc_trusted_of(fields: Dict[str, Any]) -> Optional[bool]:
     `fields` is anything with `source`, `clock_tier`, `onset_dated` and `utc_trusted` keys, absent
     meaning not stated: a stored pool row, or a Record's own attributes plus its `extra`.
     """
-    stated = fields.get("utc_trusted")
-    if isinstance(stated, bool):
-        return stated
+    # ⚠️THE GUARDS RUN FIRST, AND A PRODUCER'S STATEMENT DOES NOT DEFEAT THEM. An earlier version
+    # honoured a stated bool before either, so `{"source": "node", "utc_trusted": True}` returned
+    # True for a sensor whose clock trust is a different measurement entirely, and
+    # `{"onset_dated": False, "utc_trusted": True}` returned True for an onset the producer had
+    # just said it could not date. A statement that contradicts a refusal the same producer made
+    # is not extra information; the conservative reading is the one that does not admit it.
     if fields.get("source") != "phone":
         return None
     if fields.get("onset_dated") is False:
         return False
+    stated = fields.get("utc_trusted")
+    if stated is not None:
+        # ⚠️A NON-BOOL STATEMENT IS REFUSED, NOT DISCARDED. `isinstance(stated, bool)` alone let
+        # `utc_trusted: 0` and `utc_trusted: "false"` fall through to the derivation and come back
+        # TRUE -- a producer saying "do not trust me" read as trustworthy, which is this project's
+        # recurring failure pointing the worst possible way. An unparseable statement is a
+        # producer this version does not understand, and that is exactly the case the unknown-tier
+        # rule already refuses.
+        return stated if isinstance(stated, bool) else False
     tier = fields.get("clock_tier")
     if tier is None:
         return None
@@ -110,16 +122,19 @@ class Record:
         build that published a tier without that coupling would over-trust here, which is what
         rung (b) is for, and why `onset_dated` must be carried through the pool alongside it.
 
-        Rungs, in order:
-          (0) `extra["utc_trusted"]` is an actual bool -- a producer stating it outright outranks
-              anything inferred on its behalf.
+        Rungs, in order -- and the GUARDS COME FIRST, deliberately:
           (a) `source != "phone"` -> None. A node's timestamp trust is a DIFFERENT measurement
-              (PPS lock, tAcc, `pps_bad` in health.csv); reading it off `clock_tier` would be
-              inventing one, and nodes do not set that field at all.
-          (b) `extra["onset_dated"] is False` -> False. The phone says outright that the onset
-              could not be dated.
-          (c) `clock_tier is None` -> None. The producer did not say.
-          (d) else `clock_tier in TRUSTED_CLOCK_TIERS`.
+              (PPS lock, tAcc, `pps_bad` in health.csv). ⚠️A node DOES set `clock_tier` --
+              `hear/node/telemetry.py:110` emits "pps" or "free" -- which is precisely why this
+              rung tests the SOURCE and not the presence of the field: neither of those labels
+              is in TRUSTED_CLOCK_TIERS, so reading a node off this scale would silently call
+              every PPS-locked node untrusted.
+          (b) `onset_dated is False` -> False. The phone says outright it could not date it.
+          (c) `utc_trusted` stated -> that value if it is a bool, else False. A producer stating
+              it outright outranks the DERIVATION, but not the two refusals above: a statement
+              contradicting the same producer's own "could not date" is not new information.
+          (d) `clock_tier is None` -> None. The producer did not say.
+          (e) else `clock_tier in TRUSTED_CLOCK_TIERS`.
 
         None means NOT STATED, and `associate.arrival_is_usable` treats that as usable by design.
         That is deliberate, not an oversight -- see tests/test_associate.py.
