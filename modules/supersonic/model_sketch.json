@@ -1,5 +1,8 @@
 {
  "kind": "sketch_db",
+ "nfft": 256,
+ "hop_s": 0.004,
+ "window_start": "constant_fraction_onset_minus_one_hop",
  "layout": "fixed",
  "bands": 20,
  "frames": 8,

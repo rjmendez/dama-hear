@@ -170,6 +170,13 @@ def export(X, y, g, auc, layout, bands, frames):
     ins = m.predict_proba(X)[:, 1]
     return {
         "kind": "sketch_db",
+        # ⚠️THE WINDOW GEOMETRY IS PART OF THE MODEL. Without it a refit at a different NFFT, hop
+        # or window placement is indistinguishable from this file, and the bytes a model is
+        # applied to would silently stop being the bytes it was fitted on. Where the window
+        # STARTS is worth more than any representation choice measured here: 0.9443 at the 25 ms
+        # guard, 0.9634 at the peak, 0.9732 one hop before it.
+        "nfft": int(SK.NFFT), "hop_s": float(SK.HOP_S),
+        "window_start": "constant_fraction_onset_minus_one_hop",
         "layout": layout, "bands": int(bands), "frames": int(frames),
         "order": "band_major",          # x[b*frames + t], matching SK.sketch's own reshape
         "w": w.tolist(), "b": b,
