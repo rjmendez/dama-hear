@@ -17,7 +17,8 @@ def _mel(bands=20, slices=4, seed=1):
     return q, binascii.hexlify(q.tobytes()).decode()
 
 
-def _row(gen, utc, node="nyquist", bands=20, slices=4, seed=1, mel=None):
+def _row(gen, utc, node="nyquist", bands=20, slices=4, seed=1, mel=None,
+         f_lo="300", f_hi="7840"):
     _q, hexs = _mel(bands, slices, seed)
     if mel is not None:
         hexs = mel
@@ -25,7 +26,7 @@ def _row(gen, utc, node="nyquist", bands=20, slices=4, seed=1, mel=None):
         "node": node, "utc_us": str(utc), "uptime_s": "5158", "sample": "81854464",
         "bands": str(bands), "slices": str(slices), "span_ms": "1024", "ref_db4": "251",
         "frames": "64", "fft_us": "18987", "mel_hex": hexs,
-        "f_lo_hz": "300", "f_hi_hz": "7840",
+        "f_lo_hz": f_lo, "f_hi_hz": f_hi,
     }
     return ",".join(vals[c] for c in gen.written)
 
@@ -231,6 +232,39 @@ class TestScenePool:
         pl.ingest_scene(str(b))
         with pytest.raises(ValueError, match="mixed scene geometry"):
             pl.scene_matrix()
+
+    def test_the_matrix_refuses_two_band_axes_at_one_geometry(self, tmp_path):
+        """⚠️THE CASE THAT USED TO RETURN A NUMBER. Both rows are 20x4, so a (bands, slices) key
+        calls them one geometry -- but one was filtered at f_lo 62.5 Hz and the other at 300, so
+        column k is a different frequency in the two and the stacked matrix is a lie about a
+        spectrum. The band edges are what separate them; the shape cannot."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        a = tmp_path / "a.csv"
+        a.write_text(_csv(SF.S2, [_row(SF.S2, 1788813341984000, f_lo="62.5")]))
+        b = tmp_path / "b.csv"
+        b.write_text(_csv(SF.S2, [_row(SF.S2, 1788813343984000, seed=9, f_lo="300")]))
+        pl.ingest_scene(str(a))
+        pl.ingest_scene(str(b))
+        assert pl.scene_stats()["geometry"] == {"20x4@62.5-7840": 1, "20x4@300-7840": 1}
+        with pytest.raises(ValueError, match="band EDGES") as e:
+            pl.scene_matrix()
+        assert "20x4@62.5-7840" in str(e.value) and "20x4@300-7840" in str(e.value)
+
+    def test_the_matrix_refuses_an_undeclared_band_axis(self, tmp_path):
+        """An S0 row carries no f_lo_hz/f_hi_hz at all. It cannot be SHOWN to share an axis with
+        a row that states one, so it is refused rather than assumed to match -- and the message
+        has to say that, not print a bare None."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        a = tmp_path / "a.csv"
+        a.write_text(_csv(SF.S0, [_row(SF.S0, 1788813341984000)]))
+        b = tmp_path / "b.csv"
+        b.write_text(_csv(SF.S2, [_row(SF.S2, 1788813343984000, seed=9)]))
+        pl.ingest_scene(str(a), default_node="nyquist")
+        pl.ingest_scene(str(b))
+        assert pl.scene_stats()["geometry"] == {"20x4@?-?": 1, "20x4@300-7840": 1}
+        with pytest.raises(ValueError, match="UNDECLARED") as e:
+            pl.scene_matrix()
+        assert "20x4@?-?" in str(e.value) and "None" not in str(e.value)
 
     def test_the_matrix_restores_the_reference_level(self, tmp_path):
         pl = P.Pool(str(tmp_path / "pool"))

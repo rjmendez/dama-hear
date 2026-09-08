@@ -74,8 +74,10 @@ def score_sketch(frame, model: Dict[str, Any]) -> float:
     the node measured silence above 9.4 kHz when it measured nothing at all. Scoring the same
     audio that way costs 3.3 points of AUC (0.9141 against 0.9473). Use FLEET_SKETCH_MODEL.
 
-    ⚠️LAYOUT MUST MATCH. Under the legacy `nyquist` layout band k is a different frequency at
-    every rate, so a model's weight for band k means nothing on a frame from another rate.
+    ⚠️LAYOUT MUST MATCH, AND MUST BE STATED. Under the legacy `nyquist` layout band k is a
+    different frequency at every rate, so a model's weight for band k means nothing on a frame
+    from another rate. A frame that names no layout is refused for the same reason rather than
+    skipping the check: an unstated axis is not a shared one.
     """
     if isinstance(frame, (bytes, bytearray)):
         from hear import sketch as _sk
@@ -87,7 +89,13 @@ def score_sketch(frame, model: Dict[str, Any]) -> float:
         raise SketchMismatch("frame has %d time frames, model wants %d" % (frames, want_f))
     if bands < want_b:
         raise SketchMismatch("frame carries %d bands, model wants %d" % (bands, want_b))
-    if frame.get("layout") is not None and frame["layout"] != model.get("layout"):
+    if frame.get("layout") is None:
+        raise SketchMismatch(
+            "this frame does not state its layout, so band k has no stated frequency and cannot "
+            "be matched against a model trained on %r. An unstated axis is not a shared axis; "
+            "hear.sketch.unpack always sets `layout`, so a frame reaching here without one was "
+            "hand-built." % (model.get("layout"),))
+    if frame["layout"] != model.get("layout"):
         raise SketchMismatch("frame layout %r, model trained on %r -- band k is not the same "
                              "frequency in the two" % (frame["layout"], model.get("layout")))
     valid = frame.get("valid_bands")

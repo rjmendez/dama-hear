@@ -1085,6 +1085,19 @@ data:
         return _dt.datetime.fromtimestamp(ts_utc_s, _dt.timezone.utc).strftime("%Y-%m-%d")
     
     
+    def _geom_str(g: Tuple[Any, Any, Any, Any]) -> str:
+        """A scene row's geometry as one printable key: `20x4@62.5-7812.5`.
+    
+        The band EDGES are part of it. Two banks can share 20x4 and disagree about what band k is --
+        the scene bank spans 62.5-7812.5 Hz where the detection bank spans 312.5-8000 -- so a key that
+        named only the shape would report one geometry for two axes. `?` marks an edge the row never
+        declared (an S0 row has no f_lo_hz/f_hi_hz columns); it is not the same as any stated edge.
+        """
+        bands, slices, lo, hi = g
+        fmt = lambda v: "?" if v is None else ("%g" % float(v))       # noqa: E731
+        return "%sx%s@%s-%s" % (bands, slices, fmt(lo), fmt(hi))
+    
+    
     def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
         frame = binascii.unhexlify(row["frame_hex"])
@@ -1457,21 +1470,36 @@ data:
                          ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
             """[n, bands*slices] over stored scene rows, and the rows behind it.
     
-            Refuses to stack rows of differing geometry rather than reshaping to fit: `bands` and
-            `slices` are firmware's to change, and a matrix whose width silently depends on which
-            firmware happened to be running is not a dataset.
+            Refuses to stack rows of differing geometry rather than reshaping to fit. The geometry is
+            `bands`, `slices` AND the band edges `f_lo_hz`/`f_hi_hz`: all four are firmware's to
+            change, and two banks at one 20x4 shape stack into a matrix whose column k is a different
+            frequency in different rows -- which reads as a dataset and is not one. The edges are what
+            separate them; `bands`/`slices` alone cannot.
+    
+            ⚠️An S0 row declares no edges at all (the columns arrive as None). A row whose axis is
+            unknown cannot be shown to share an axis with one whose axis is known, so an S0 row and an
+            S1/S2 row refuse to stack even if the same firmware wrote both. That is the intended
+            reading of an undeclared axis, not a bug; select a day or node to get one generation.
             """
             if mode not in ("db", "q"):
                 raise ValueError("mode must be 'db' or 'q'")
             rows, out = [], []
             geom = None
             for r in self.scene(node=node, day=day):
-                g = (r["bands"], r["slices"])
+                g = (r["bands"], r["slices"], r.get("f_lo_hz"), r.get("f_hi_hz"))
                 if geom is None:
                     geom = g
                 elif g != geom:
-                    raise ValueError("mixed scene geometry: %s then %s -- select a day or node "
-                                     "whose firmware did not change" % (geom, g))
+                    if None in (geom[2], geom[3], g[2], g[3]):
+                        why = ("one of them leaves its band axis UNDECLARED (an S0 row carries no "
+                               "f_lo_hz/f_hi_hz, shown as ?). An axis that is not stated cannot be "
+                               "shown to be the axis that is, so it is refused rather than assumed")
+                    else:
+                        why = ("the shape can match while the band EDGES do not, and then band k is "
+                               "a different frequency in the two")
+                    raise ValueError("mixed scene geometry: %s then %s -- %s. Select a day or node "
+                                     "whose firmware did not change."
+                                     % (_geom_str(geom), _geom_str(g), why))
                 q = np.frombuffer(base64.b64decode(r["mel_b64"]), dtype=np.int8) \
                     .reshape(r["bands"], r["slices"]).astype(float)
                 rows.append((q / 2.0 + r["ref_db"] if mode == "db" else q).reshape(-1))
@@ -1484,7 +1512,12 @@ data:
     
         def scene_stats(self) -> Dict[str, Any]:
             """What the scene store holds. Counted by walking it, because a row count taken from the
-            ledger would credit rows a later gzip write could have lost."""
+            ledger would credit rows a later gzip write could have lost.
+    
+            `geometry` keys on `_geom_str` -- shape AND band edges, e.g. `20x4@62.5-7812.5`. This is
+            the only place a mix of banks is visible WITHOUT raising, so the key has to carry enough
+            to tell two 20x4 banks apart; a bare `20x4` would total two axes into one number.
+            """
             n = 0
             by_node: Dict[str, int] = {}
             by_day: Dict[str, int] = {}
@@ -1496,7 +1529,7 @@ data:
                 by_node[r["node"]] = by_node.get(r["node"], 0) + 1
                 d = _day(r.get("ts_utc_s"))
                 by_day[d] = by_day.get(d, 0) + 1
-                g = "%dx%d" % (r["bands"], r["slices"])
+                g = _geom_str((r["bands"], r["slices"], r.get("f_lo_hz"), r.get("f_hi_hz")))
                 geom[g] = geom.get(g, 0) + 1
                 anchored += bool(r.get("anchored"))
                 t = r.get("ts_utc_s")
