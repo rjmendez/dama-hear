@@ -154,13 +154,16 @@ class Backend:
         for ev in grouped["events"]:
             cls = self.classify(ev) if self.classify is not None else self.source_class
             model = "cone" if cls in PT.CONE_CLASSES else "point"
-            # positions_2d is called WITH ev['node_ids'] so rows pair with ev['arrivals'] by index.
-            P = self.survey.positions_2d(ev["node_ids"])
+            # Called WITH ev['node_ids'] so rows pair with ev['arrivals'] by index.
+            # The point solver is 3D and takes node height as a distance; the cone solver is not
+            # yet, and projecting for it is done HERE and named, rather than by handing both the
+            # same silently-flattened array.
+            P = self.survey.positions(ev["node_ids"])
             sol: Optional[Dict] = None
             err: Optional[str] = None
             try:
                 if model == "cone":
-                    sol = SW.solve(P, ev["arrivals"], v_mps=self.v_mps, temp_c=self.temp_c)
+                    sol = SW.solve(P[:, :2], ev["arrivals"], v_mps=self.v_mps, temp_c=self.temp_c)
                 else:
                     sol = PT.solve(P, ev["arrivals"], cls, temp_c=self.temp_c)
             except ValueError as e:
@@ -183,6 +186,9 @@ class Backend:
             "unknown_nodes": list(self._unknown_nodes),
             "window_s": grouped["window_s"], "margin_s": grouped["margin_s"],
             "sound_speed_mps": grouped["sound_speed_mps"], "diameter_m": grouped["diameter_m"],
+            # Still reported, but it now describes ONLY the cone path: the point solver consumes
+            # `up` as a real distance, so vertical spread is information there rather than an
+            # unmodelled error. A single flag covering both would have been wrong for one of them.
             "vertical_assumption": self.survey.validate_2d_assumption(),
             "n_frames": self._n_frames, "n_published": self._n_published,
         }

@@ -19,8 +19,11 @@ line (hear/solve/placement.py:90-96) so there is nothing to decorate.
 (hear/node/telemetry.py:55-58): an absent `u_m` defaulted to zero is a plausible-looking node at
 ground level and there is no later measurement that can catch it.
 
-⚠️`origin` IS CARRIED AND NEVER USED. Naming a lat/lon anchor is what makes a survey reproducible
-between sessions; this module does no geodesy and will not convert it into the local frame.
+`origin` IS NOW USED. It was carried and ignored, which meant every WGS84-to-local conversion got
+hand-rolled by whoever needed one -- and the hand-rolled version was a sphere with the height
+thrown away. `enu_of()` and `from_wgs84_nodes()` do it through hear.geodesy instead. The origin's
+height must be `h_ell_m`, above the ELLIPSOID; an `hmsl_m` is REFUSED rather than quietly accepted,
+because the difference is the local geoid undulation and nothing downstream could detect it.
 """
 from __future__ import annotations
 
@@ -30,6 +33,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
+from .. import geodesy as GEO
 from ..solve import placement as PL
 
 # Two entries this close are one point entered twice. JUDGEMENT: it sits below the node survey
@@ -100,13 +104,45 @@ class Survey:
         return np.array([self.position(i) for i in node_ids], float).reshape(len(node_ids), 3)
 
     def positions_2d(self, node_ids: Sequence[int]) -> np.ndarray:
-        """(N,2) east/north, rows IN THE ORDER GIVEN. This is what hear/solve/*.py consumes.
+        """(N,2) east/north, rows IN THE ORDER GIVEN.
 
-        ⚠️DROPS `up`. Valid only while the solvers are 2D (hear/solve/shockwave.py:66,76,96,137 and
-        hear/solve/placement.py:83,84,130,158,199,239). This is the one site that projects; call
-        validate_2d_assumption() to get the assumption back as data instead of as a comment.
+        ⚠️DROPS `up`, and there is now only one caller left that should: hear/solve/shockwave.py
+        is still a planar cone model. hear/solve/point.py is 3D and must be given positions(),
+        not this -- feeding it the projection throws away node height that it would otherwise use
+        as a real distance, and no residual can see the difference.
+
+        Kept rather than deleted because the cone path genuinely needs a projection, and doing it
+        through a named method beats an anonymous [:2] at the call site. Call
+        validate_2d_assumption() to get the cost of the projection back as data.
         """
         return self.positions(node_ids)[:, :2]
+
+    def enu_of(self, lat_deg: float, lon_deg: float, h_ell_m: float) -> np.ndarray:
+        """A WGS84 point in THIS survey's local frame. Requires an `origin` with lat/lon/h_ell.
+
+        This is what `origin` was always for and never did: a survey whose anchor is only a
+        comment cannot place anything measured in the field, so every conversion got hand-rolled
+        at the call site -- which is where the spherical-earth formula came from.
+        """
+        o = self.origin_geodetic()
+        return np.asarray(GEO.geodetic_to_enu(lat_deg, lon_deg, h_ell_m, *o), float)
+
+    def origin_geodetic(self):
+        """(lat, lon, h_ell) of the frame origin, or raises. HEIGHT IS ABOVE THE ELLIPSOID: a
+        survey that anchors itself with hMSL is off by the geoid undulation and nothing downstream
+        can detect it, so the key is named h_ell_m and an hmsl_m is refused rather than accepted
+        as a synonym."""
+        o = self.origin
+        if not isinstance(o, dict):
+            raise SurveyError("survey has no origin: cannot convert WGS84 into this frame")
+        if "hmsl_m" in o and "h_ell_m" not in o:
+            raise SurveyError(
+                "survey origin gives hmsl_m but not h_ell_m. %s" % GEO.GEOID_NOTE)
+        try:
+            return (float(o["lat_deg"]), float(o["lon_deg"]), float(o["h_ell_m"]))
+        except (KeyError, TypeError, ValueError):
+            raise SurveyError("survey origin needs numeric lat_deg, lon_deg and h_ell_m; got %r"
+                              % (o,))
 
     def diameter_m(self) -> float:
         """Largest pairwise 3D distance, metres. 3D and not horizontal because it bounds
@@ -225,6 +261,48 @@ def from_dict(d: Dict, min_nodes: int = 3) -> Survey:
             raise SurveyError("nodes are collinear (linearity %.4f): point-source DOP is singular"
                               % lin)
     return sv
+
+
+def from_wgs84_nodes(entries: Sequence[Dict], origin: Optional[Dict] = None,
+                     min_nodes: int = 3) -> Survey:
+    """Build a Survey from what the nodes actually report: lat, lon and ELLIPSOID height.
+
+    This is the missing half of the loop. The node firmware measures its own position and every
+    solver wants local ENU metres, and until now nothing joined the two -- so the conversion was
+    done by hand at the point of use, with a spherical earth and the height dropped.
+
+    ⚠️`h_ell_m`, NOT `hmsl_m`. Both come off the same NAV-PVT and they differ by the local geoid
+    undulation (about -33 m in southern Pennsylvania). Passing hMSL puts every node at the wrong
+    height by very nearly the same amount, so it largely cancels in a baseline and would not show
+    up in a residual -- which is exactly why it is refused here rather than silently accepted.
+
+    With no `origin`, the geodetic centroid of the nodes is used and recorded in the survey, so
+    the frame is reproducible and the file says where it came from.
+    """
+    pts = []
+    for i, e in enumerate(entries):
+        if "hmsl_m" in e and "h_ell_m" not in e:
+            raise SurveyError("node at index %d gives hmsl_m but not h_ell_m. %s"
+                              % (i, GEO.GEOID_NOTE))
+        try:
+            pts.append((float(e["lat_deg"]), float(e["lon_deg"]), float(e["h_ell_m"])))
+        except (KeyError, TypeError, ValueError):
+            raise SurveyError("node at index %d needs numeric lat_deg, lon_deg and h_ell_m; "
+                              "got %r" % (i, e))
+    if not pts:
+        raise SurveyError("no nodes given")
+    if origin is None:
+        olat, olon, oh = GEO.centroid(pts)
+        origin = {"lat_deg": olat, "lon_deg": olon, "h_ell_m": oh, "source": "node centroid"}
+    o = (float(origin["lat_deg"]), float(origin["lon_deg"]), float(origin["h_ell_m"]))
+    nodes = []
+    for e, p in zip(entries, pts):
+        en = GEO.geodetic_to_enu(p[0], p[1], p[2], *o)
+        nodes.append({"node_id": e["node_id"], "name": e.get("name", ""),
+                      "e_m": en[0], "n_m": en[1], "u_m": en[2],
+                      "sigma_m": float(e.get("sigma_m", 0.0))})
+    return from_dict({"frame": _FRAME, "units": _UNITS, "origin": origin, "nodes": nodes},
+                     min_nodes=min_nodes)
 
 
 def load_survey(path: str, min_nodes: int = 3) -> Survey:

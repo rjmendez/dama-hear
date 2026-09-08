@@ -31,14 +31,26 @@ def _rot(pts, deg):
 LINE_30 = _rot(LINE, 30.0)
 
 
-CRACK_ARRAY = [(-200.0, -200.0), (200.0, 200.0), (175.0, -150.0), (-150.0, 175.0)]
+# Five nodes, not four. In 2D, four was where a residual began to carry information; the third
+# unknown moved that to five, so the "the residual screams" test needs one more node than it did
+# to make the same point. The original four are unchanged so the geometry is comparable.
+CRACK_ARRAY = [(-200.0, -200.0), (200.0, 200.0), (175.0, -150.0), (-150.0, 175.0), (0.0, -220.0)]
 CRACK_BEARING_DEG, CRACK_OFFSET_M, CRACK_V_MPS = 20.0, 8.0, 900.0
 
 
+def _p3(v):
+    """Pad to (e, n, u); a 2-vector means ground level. The helper used to slice [:2] instead,
+    which quietly made every fixture's height zero AND made the test blind to a solver that
+    ignored height -- the assertion and the thing it was checking shared the same bug."""
+    a = np.asarray(v, float)
+    return np.concatenate([a, np.zeros(3 - len(a))]) if len(a) < 3 else a[:3]
+
+
 def _arrivals(P, source, t0=T0_UTC, temp_c=T):
+    """TRUE 3D slant ranges. Sound travels through the air, not across a map."""
     c = SW.sound_speed(temp_c)
-    s = np.asarray(source, float)[:2]
-    return [t0 + float(np.linalg.norm(s - np.asarray(p, float)[:2])) / c for p in P]
+    s = _p3(source)
+    return [t0 + float(np.linalg.norm(s - _p3(p))) / c for p in P]
 
 
 def _crack_fitted_as_a_blast(P):
@@ -101,13 +113,39 @@ class TestRecovery:
         assert rev["east_m"] == pytest.approx(base["east_m"], abs=1e-3)
         assert rev["north_m"] == pytest.approx(base["north_m"], abs=1e-3)
 
-    def test_a_three_vector_position_is_sliced_not_rejected(self):
-        """Fact 1: the solver is 2D. Pinned rather than left implicit in shockwave.py:88's [:2]."""
-        P3 = [(e, n, 7.5) for e, n in SQUARE]
-        t = _arrivals(SQUARE, self.SRC)
-        a, b = PT.solve(P3, t, "blast", temp_c=T), PT.solve(SQUARE, t, "blast", temp_c=T)
-        assert a["east_m"] == pytest.approx(b["east_m"], rel=1e-9)
-        assert a["north_m"] == pytest.approx(b["north_m"], rel=1e-9)
+    def test_differential_node_height_changes_the_answer_because_it_is_no_longer_sliced(self):
+        """The inverse of what this test used to assert. It previously pinned that a 3-vector was
+        SLICED -- a deliberate statement that the solver was 2D. Height is a distance now.
+
+        It has to be DIFFERENTIAL height. Lifting the whole array uniformly is invisible in the
+        horizontal: it lengthens every slant range by the same amount and _residual subtracts the
+        mean, so the common part cancels exactly. Nodes at DIFFERENT heights do not cancel, and
+        that is the case where slicing [:2] throws away real information.
+        """
+        P3 = [(e, n, u) for (e, n), u in zip(SQUARE, (0.0, 12.0, 3.0, 25.0))]
+        t = _arrivals(P3, self.SRC)                     # arrivals from the real, uneven array
+        uneven = PT.solve(P3, t, "blast", temp_c=T)
+        flat = PT.solve(SQUARE, t, "blast", temp_c=T)   # same times, heights thrown away
+        assert uneven["east_m"] == pytest.approx(self.SRC[0], abs=0.5)
+        assert uneven["north_m"] == pytest.approx(self.SRC[1], abs=0.5)
+        moved = math.hypot(uneven["east_m"] - flat["east_m"], uneven["north_m"] - flat["north_m"])
+        assert moved > 1.0, "ignoring node height would have to move the answer to matter"
+
+    def test_a_broken_node_plane_makes_height_observable(self):
+        """Coplanar nodes cannot separate a source above the plane from its reflection below.
+        Spread the nodes in height and they can -- which is the whole reason for carrying u."""
+        src = (260.0, 40.0, 55.0)
+        flat = [(e, n, 0.0) for e, n in SQUARE]
+        broken = [(e, n, u) for (e, n), u in zip(SQUARE, (0.0, 30.0, 5.0, 45.0))]
+        a = PT.solve(flat, _arrivals(flat, src), "blast", temp_c=T)
+        assert a["up_observable"] is False
+        assert a["up_mirror_m"] == pytest.approx(-a["up_m"], abs=0.5)
+        assert "HEIGHT is unobservable" in a["note"]
+        b = PT.solve(broken, _arrivals(broken, src), "blast", temp_c=T)
+        assert b["up_observable"] is True
+        assert b["up_m"] == pytest.approx(55.0, abs=1.0)
+        assert b["up_mirror_m"] is None
+        assert b["note"] is None
 
     def test_c_comes_from_shockwave_not_a_literal(self):
         t = _arrivals(SQUARE, self.SRC)
@@ -116,24 +154,37 @@ class TestRecovery:
 
 
 class TestRedundancy:
-    """Three nodes give two equations for two unknowns. The residual is zero BY CONSTRUCTION and
-    proves nothing -- which is exactly why a perfect-looking residual there is dangerous."""
+    """FOUR nodes give three equations for three unknowns. The residual is zero BY CONSTRUCTION
+    and proves nothing -- which is exactly why a perfect-looking residual there is dangerous.
 
-    SRC = (260.0, 40.0)
+    These counts moved by one when the solver became 3D. In 2D it was three nodes that fitted
+    exactly and four that carried information; the third unknown costs one more node at both
+    ends. The hazard is unchanged and so is what this class is guarding.
+    """
 
-    def test_three_nodes_look_perfect_and_mean_nothing(self):
-        P = SQUARE[:3]
-        got = PT.solve(P, _arrivals(P, self.SRC), "blast", temp_c=T)
-        assert got["n_equations"] == 2
+    SRC = (260.0, 40.0, 0.0)
+
+    def test_four_nodes_look_perfect_and_mean_nothing(self):
+        got = PT.solve(SQUARE, _arrivals(SQUARE, self.SRC), "blast", temp_c=T)
+        assert got["n_equations"] == 3
+        assert got["n_unknowns"] == 3
         assert got["residual_is_meaningful"] is False
         # abs=1e-3 ms == 1 us: noise-free synthetic arrivals, so anything above the refine's own
         # convergence floor would mean the model is wrong, not that the data is.
         assert got["rms_residual_ms"] == pytest.approx(0.0, abs=1e-3)
 
-    def test_four_nodes_are_where_a_residual_starts_meaning_something(self):
-        got = PT.solve(SQUARE, _arrivals(SQUARE, self.SRC), "blast", temp_c=T)
-        assert got["n_equations"] == 3
+    def test_five_nodes_are_where_a_residual_starts_meaning_something(self):
+        P = SQUARE + [(75.0, 40.0)]
+        got = PT.solve(P, _arrivals(P, self.SRC), "blast", temp_c=T)
+        assert got["n_equations"] == 4
         assert got["residual_is_meaningful"] is True
+
+    def test_three_nodes_are_refused_outright(self):
+        """Underdetermined in 3D: two equations, three unknowns. Refusing beats returning a
+        confident coordinate off a fit that cannot constrain one of its own axes."""
+        P = SQUARE[:3]
+        with pytest.raises(ValueError, match="4 nodes"):
+            PT.solve(P, _arrivals(P, self.SRC), "blast", temp_c=T)
 
 
 class TestCollinear:
@@ -196,31 +247,47 @@ class TestSourceClassGate:
     def test_feeding_it_a_crack_as_a_blast_costs_this_much(self):
         """The gate cannot catch a caller who lies about the class, so pin the damage. Arrivals
         from a real M855 track, labelled 'blast': the fit is confident and far off the track.
-        Four nodes at least make the residual scream -- 188 ms, run here."""
+        Five nodes at least make the residual scream -- measured here."""
         got, closest = _crack_fitted_as_a_blast(CRACK_ARRAY)
         assert got["position_observable"] is True, "it does not hesitate; that is the problem"
         fitted = np.array([got["east_m"], got["north_m"]])
         assert float(np.linalg.norm(fitted - closest)) > 50.0
         assert got["residual_is_meaningful"] is True and got["rms_residual_ms"] > 10.0
 
-    def test_at_three_nodes_the_same_lie_is_silent(self):
-        """The worst case in the repo, and it is arithmetic, not bad luck: the same crack fed to
-        three nodes lands 145 m off the track (run here) at rms_residual_ms 0.00001. Two
-        equations, two unknowns -- the residual CANNOT report the model is wrong."""
-        got, closest = _crack_fitted_as_a_blast(CRACK_ARRAY[:3])
+    def test_at_the_minimum_node_count_the_lie_is_no_longer_silent(self):
+        """This was the worst case in the repo. In 2D, a crack fed to the minimum node count
+        landed 145 m off the track at rms_residual_ms 0.00001: two equations, two unknowns, and
+        nothing in the result said the model was wrong.
+
+        Going 3D removed that particular silence. The third unknown is not free -- a real source
+        has a real height, and the refine is bounded to the region the grid actually searched --
+        so cone arrivals can no longer be absorbed by sliding the fit somewhere convenient. The
+        solver now pins at the edge of the search box and says so twice: `at_search_bound` and a
+        160 ms residual.
+
+        This is NOT a claim that a minimum-count fit is now trustworthy in general. Data the model
+        CAN produce still fits exactly at four nodes with a meaningless residual -- that hazard is
+        unchanged and is pinned in TestRedundancy. What changed is that this specific silent
+        failure now announces itself.
+        """
+        got, closest = _crack_fitted_as_a_blast(CRACK_ARRAY[:4])
         fitted = np.array([got["east_m"], got["north_m"]])
         assert float(np.linalg.norm(fitted - closest)) > 50.0
-        assert got["residual_is_meaningful"] is False
-        assert got["rms_residual_ms"] == pytest.approx(0.0, abs=1e-3)
+        assert got["at_search_bound"] is True
+        assert got["rms_residual_ms"] > 100.0
+        assert "pinned at the edge" in got["note"]
 
 
 class TestPreconditions:
     def test_two_nodes_raise(self):
-        with pytest.raises(ValueError, match="3 nodes"):
+        with pytest.raises(ValueError, match="4 nodes"):
             PT.solve(SQUARE[:2], [0.0, 1.0], "blast", temp_c=T)
 
-    def test_mismatched_lengths_raise(self):
-        with pytest.raises(ValueError, match="3 nodes"):
+    def test_mismatched_lengths_say_so_rather_than_blaming_the_node_count(self):
+        """4 positions and 3 arrivals is a length bug, not a "you need more nodes" bug. Reporting
+        it as the latter -- "need >= 4 nodes ... got 4" -- sends the reader to count nodes they
+        already have enough of."""
+        with pytest.raises(ValueError, match="same length"):
             PT.solve(SQUARE, [0.0, 1.0, 2.0], "blast", temp_c=T)
 
     def test_a_non_finite_arrival_raises_rather_than_returning_nan(self):
