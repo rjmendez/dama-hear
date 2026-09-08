@@ -142,7 +142,7 @@ static const char HEALTH_HDR[] =
   // 3D fixes, which is the number to use as a TDoA focus. hacc_m is the receiver's own estimate
   // for the last epoch -- it does NOT shrink as the mean improves, so do not read it as the
   // accuracy of the mean; pos_n is what says how good the mean is.
-  "lat,lon,hmsl_m,hacc_m,pos_n,mean_lat,mean_lon,mean_hmsl_m";
+  "lat,lon,hell_m,hmsl_m,hacc_m,vacc_m,pos_n,mean_lat,mean_lon,mean_hell_m,mean_hmsl_m";
 static double   fs_clean      = (double)FS_NOMINAL;
 static uint32_t fs_clean_secs = 0;    // length of the current unbroken window, in GPS seconds
 static uint32_t drop_seconds  = 0;    // seconds that came up short by a block or more
@@ -218,9 +218,18 @@ static volatile int gps_fix = 0, gps_sats = 0;
 // are kept -- last for liveness, mean for geometry -- and the count is reported so nobody uses a
 // 12-sample mean as if it were an 8-hour one.
 static volatile int32_t  pos_lat_e7 = 0, pos_lon_e7 = 0;   // 1e-7 deg, as the wire carries them
-static volatile int32_t  pos_hmsl_mm = 0;
-static volatile uint32_t pos_hacc_mm = 0;
-static double  pos_sum_lat = 0, pos_sum_lon = 0, pos_sum_h = 0;
+// TWO heights, deliberately. hMSL is the one a person reads; `height` is above the WGS84
+// ELLIPSOID and is the one that belongs in a geodetic transform. lat/lon/h -> ECEF is defined on
+// the ellipsoid, so feeding it hMSL silently injects the geoid undulation (about -33 m here) as
+// a height error. It is largely common-mode between two nodes 18 m apart and would therefore
+// mostly cancel in a baseline -- which is exactly why it would never have been noticed.
+static volatile int32_t  pos_hell_mm = 0;   // above WGS84 ellipsoid: USE THIS FOR GEOMETRY
+static volatile int32_t  pos_hmsl_mm = 0;   // above mean sea level: for reading, not for maths
+static volatile uint32_t pos_hacc_mm = 0, pos_vacc_mm = 0;
+// vAcc is reported separately from hAcc because the vertical is the weak axis of any GNSS fix --
+// typically 1.5-2x worse -- and a 3D solution that quotes one accuracy for all three components
+// is claiming a precision it does not have in z.
+static double  pos_sum_lat = 0, pos_sum_lon = 0, pos_sum_hell = 0, pos_sum_hmsl = 0;
 static uint32_t pos_n = 0;
 #define POS_HACC_MAX_MM 25000u   // 25 m: reject the garbage epochs, keep everything plausible
 static char gps_utc[16] = "--:--:--";
@@ -637,13 +646,17 @@ static void ubx_msg() {
     if (ux_len >= 48) {
       int32_t lon = (int32_t)((uint32_t)ux[24] | ((uint32_t)ux[25] << 8) | ((uint32_t)ux[26] << 16) | ((uint32_t)ux[27] << 24));
       int32_t lat = (int32_t)((uint32_t)ux[28] | ((uint32_t)ux[29] << 8) | ((uint32_t)ux[30] << 16) | ((uint32_t)ux[31] << 24));
+      int32_t hel = (int32_t)((uint32_t)ux[32] | ((uint32_t)ux[33] << 8) | ((uint32_t)ux[34] << 16) | ((uint32_t)ux[35] << 24));
       int32_t hms = (int32_t)((uint32_t)ux[36] | ((uint32_t)ux[37] << 8) | ((uint32_t)ux[38] << 16) | ((uint32_t)ux[39] << 24));
       uint32_t ha = (uint32_t)ux[40] | ((uint32_t)ux[41] << 8) | ((uint32_t)ux[42] << 16) | ((uint32_t)ux[43] << 24);
-      pos_lat_e7 = lat; pos_lon_e7 = lon; pos_hmsl_mm = hms; pos_hacc_mm = ha;
+      uint32_t va = (uint32_t)ux[44] | ((uint32_t)ux[45] << 8) | ((uint32_t)ux[46] << 16) | ((uint32_t)ux[47] << 24);
+      pos_lat_e7 = lat; pos_lon_e7 = lon;
+      pos_hell_mm = hel; pos_hmsl_mm = hms; pos_hacc_mm = ha; pos_vacc_mm = va;
       // Only a 3D fix inside the accuracy cap joins the average. A 2D fix has no height and a
       // wandering horizontal solution, and averaging it in makes the mean worse, not noisier.
       if (gps_fix == 3 && ha && ha < POS_HACC_MAX_MM) {
-        pos_sum_lat += (double)lat; pos_sum_lon += (double)lon; pos_sum_h += (double)hms; pos_n++;
+        pos_sum_lat += (double)lat; pos_sum_lon += (double)lon;
+        pos_sum_hell += (double)hel; pos_sum_hmsl += (double)hms; pos_n++;
       }
     }
     snprintf(gps_utc, sizeof gps_utc, "%02u:%02u:%02u", ux[8], ux[9], ux[10]);
@@ -1585,8 +1598,11 @@ static String status_json() {
     "{\"node\":\"%s\",\"class\":\"%s\",\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
-    "\"pos\":{\"lat\":%.7f,\"lon\":%.7f,\"hmsl_m\":%.3f,\"hacc_m\":%.2f,"
-      "\"n\":%lu,\"mean_lat\":%.7f,\"mean_lon\":%.7f,\"mean_hmsl_m\":%.3f},"
+    // hell_m is height above the WGS84 ELLIPSOID and is the field a geodetic transform wants;
+    // hmsl_m is the human-readable one and must not be fed to lat/lon/h -> ECEF.
+    "\"pos\":{\"lat\":%.7f,\"lon\":%.7f,\"hell_m\":%.3f,\"hmsl_m\":%.3f,"
+      "\"hacc_m\":%.2f,\"vacc_m\":%.2f,\"n\":%lu,"
+      "\"mean_lat\":%.7f,\"mean_lon\":%.7f,\"mean_hell_m\":%.3f,\"mean_hmsl_m\":%.3f},"
     "\"pps\":{\"edges\":%lu,\"glitches\":%lu,\"probe_resyncs\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,\"spread_us\":%ld},"
     "\"i2s\":{\"nominal_hz\":%d,\"measured_hz\":%.4f,\"ppm\":%.1f,\"samples\":%lu},"
     // measured_hz above is cumulative and stays poisoned by any stall. acq is the one to trust.
@@ -1629,10 +1645,11 @@ static String status_json() {
     (unsigned long)ubx_timtp, (unsigned long)ubx_ack, (unsigned long)ubx_nak,
     (ubx_ack ? "true" : "false"), (unsigned)timtp_flags,
     ((timtp_flags != 0xFF && !(timtp_flags & 0x10)) ? "true" : "false"),
-    pos_lat_e7 * 1e-7, pos_lon_e7 * 1e-7, pos_hmsl_mm / 1000.0, pos_hacc_mm / 1000.0,
-    (unsigned long)pos_n,
-    pos_n ? pos_sum_lat / pos_n * 1e-7 : 0.0, pos_n ? pos_sum_lon / pos_n * 1e-7 : 0.0,
-    pos_n ? pos_sum_h / pos_n / 1000.0 : 0.0,
+    pos_lat_e7 * 1e-7, pos_lon_e7 * 1e-7,
+    pos_hell_mm / 1000.0, pos_hmsl_mm / 1000.0,
+    pos_hacc_mm / 1000.0, pos_vacc_mm / 1000.0, (unsigned long)pos_n,
+    pos_n ? pos_sum_lat  / pos_n * 1e-7   : 0.0, pos_n ? pos_sum_lon  / pos_n * 1e-7   : 0.0,
+    pos_n ? pos_sum_hell / pos_n / 1000.0 : 0.0, pos_n ? pos_sum_hmsl / pos_n / 1000.0 : 0.0,
     (unsigned long)pps_count, (unsigned long)pps_glitch, (unsigned long)pps_resyncs,
     (unsigned long)(pps_count > 1 ? pps_int_min : 0), (unsigned long)(pps_count > 1 ? pps_int_max : 0),
     (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0),
@@ -2762,17 +2779,18 @@ void loop() {
         CSVF(ct, bmp_temp_c); CSVF(cp, bmp_press_hpa); CSVF(cc, sound_speed_mps());
         // Before the first 3D fix there is no mean. Writing 0.0000000 there would put the node
         // in the Gulf of Guinea, and a reader averaging the column would never notice.
-        char mlat[20] = "", mlon[20] = "", mh[16] = "";
+        char mlat[20] = "", mlon[20] = "", mhe[16] = "", mhm[16] = "";
         if (pos_n) {
-          snprintf(mlat, sizeof mlat, "%.7f", pos_sum_lat / pos_n * 1e-7);
-          snprintf(mlon, sizeof mlon, "%.7f", pos_sum_lon / pos_n * 1e-7);
-          snprintf(mh,   sizeof mh,   "%.3f", pos_sum_h  / pos_n / 1000.0);
+          snprintf(mlat, sizeof mlat, "%.7f", pos_sum_lat  / pos_n * 1e-7);
+          snprintf(mlon, sizeof mlon, "%.7f", pos_sum_lon  / pos_n * 1e-7);
+          snprintf(mhe,  sizeof mhe,  "%.3f", pos_sum_hell / pos_n / 1000.0);
+          snprintf(mhm,  sizeof mhm,  "%.3f", pos_sum_hmsl / pos_n / 1000.0);
         }
         f.printf("%s,%lld,%d,%lu,%d,%d,%lu,%lu,%lu,%ld,%.4f,%lu,%.4f,"
                  "%.4f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.1f,%.0f,%lu,%d,%.0f,%.1f,%lu,%.1f,%lu,%lu,"
                  "%s,%s,%s,"
                  "%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
-                 "%.7f,%.7f,%.3f,%.2f,%lu,%s,%s,%s\n",
+                 "%.7f,%.7f,%.3f,%.3f,%.2f,%.2f,%lu,%s,%s,%s,%s\n",
                  node_id, (long long)tnow, tok ? 1 : 0,
                  (unsigned long)up, gps_fix, gps_sats, (unsigned long)gps_tacc_ns,
                  (unsigned long)pps_count, (unsigned long)pps_glitch,
@@ -2790,8 +2808,10 @@ void loop() {
                  (unsigned long)clip_skip_full,
                  (unsigned long)clip_skip_dedupe, (unsigned long)clip_skip_ring,
                  (unsigned long)clip_fail, (unsigned long)clip_budget_left,
-                 pos_lat_e7 * 1e-7, pos_lon_e7 * 1e-7, pos_hmsl_mm / 1000.0,
-                 pos_hacc_mm / 1000.0, (unsigned long)pos_n, mlat, mlon, mh);
+                 pos_lat_e7 * 1e-7, pos_lon_e7 * 1e-7,
+                 pos_hell_mm / 1000.0, pos_hmsl_mm / 1000.0,
+                 pos_hacc_mm / 1000.0, pos_vacc_mm / 1000.0,
+                 (unsigned long)pos_n, mlat, mlon, mhe, mhm);
         f.close();
       }
       // scene.csv is held open and written every 1.024 s; committing it costs the same 20-50 ms
