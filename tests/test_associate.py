@@ -142,6 +142,23 @@ class TestArrivalQuality:
         assert AS.arrival_is_usable({}) is True
         assert AS.arrival_is_usable({"onset_found": False}) is False
 
+    def test_the_three_values_utc_trusted_can_actually_take(self):
+        """⚠️PINS THE OTHER HALF OF THE CONTRACT. `hear.corpus.Record.utc_trusted` returns
+        exactly True / False / None -- None for "the producer did not say", which includes every
+        node record and every phone row with no clock_tier. Whoever writes the phone-Record ->
+        det-dict adapter must not turn that None into a refusal: it would throw away every node
+        arrival, which is all of them today.
+        """
+        assert AS.arrival_is_usable({"utc_trusted": True}) is True
+        assert AS.arrival_is_usable({"utc_trusted": None}) is True
+        assert AS.arrival_is_usable({"utc_trusted": False}) is False
+        # ...and the derived property feeds it the same three values, straight through.
+        from hear import corpus as C
+        assert AS.arrival_is_usable(
+            {"utc_trusted": C.utc_trusted_of({"source": "phone", "clock_tier": "wall"})}) is False
+        assert AS.arrival_is_usable(
+            {"utc_trusted": C.utc_trusted_of({"source": "node"})}) is True
+
     def test_losing_every_node_leaves_no_event_and_still_conserves(self):
         dets = _round(100.0, 0)
         for d in dets:
