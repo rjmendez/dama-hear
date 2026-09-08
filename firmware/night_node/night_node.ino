@@ -2486,8 +2486,15 @@ void setup() {
 // happened, so an empty clip column is never ambiguous between "quiet", "budget spent" and "card
 // full". A row is not written until its clip has resolved, so the column never names a file that
 // does not exist -- see clip_pump() and the wait in det_flush.
+// ⚠️`node_id` AND NOT `node`, WHICH scene.csv USES, DELIBERATELY. The old header said `node`
+// and the row never wrote it -- 12 columns declared, 11 written, so every field a consumer read
+// by name was shifted one left and the missing one was the column saying WHICH NODE the row came
+// from, in the file that exists for multi-node TDoA. csv_open() rolls a file aside only when the
+// header STRING changes, so keeping the name would have appended 12-column rows under the same
+// header as the 11-column ones already on the card. Renaming forces the roll. Pulled from
+// nyquist and mach on 2026-09-08: 147 and 268 rows, every one 11 wide.
 static const char DETS_HDR[] =
-  "node,utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,frame_hex,clip,clip_why";
+  "node_id,utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,frame_hex,clip,clip_why";
 
 static void det_flush() {
   if (!sd_ok || det_flushed == det_n) return;
@@ -2518,7 +2525,8 @@ static void det_flush() {
     // is where that would show. Break, not continue: the file is append-only and in-order.
     if (d.clip_st == CLIP_PENDING) break;
     char line[MEL16_FRAME_BYTES * 2 + 224];
-    int m = snprintf(line, sizeof line, "%lld,%lu,%lu,%lu,%ld,%d,%u,%.3f,",
+    int m = snprintf(line, sizeof line, "%s,%lld,%lu,%lu,%lu,%ld,%d,%u,%.3f,",
+                     node_id,
                      (long long)d.utc_us, (unsigned long)d.uptime_s, (unsigned long)d.sample,
                      (unsigned long)d.pps_n, (long)d.us_since_pps, d.trigger,
                      (unsigned)d.flags, d.fs_at);
