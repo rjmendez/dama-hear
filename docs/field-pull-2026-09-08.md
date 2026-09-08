@@ -40,9 +40,31 @@ and the fixed band axis (bit 12). So `corpus.feature_matrix` **excludes** them a
 are *not* the same bytes, so scoring them with a 48 kHz-trained model would be exactly the
 0.9141 error the axis work exists to prevent.
 
-**Bits 0–1 are taken** on the node (`retrigger`, `insufficient context`); **8–12 are free**, so
-setting them is additive. That is the one firmware change needed to make these nodes' output
-usable by the shipped models.
+**Bits 0–1 are taken** on the node (`retrigger`, `insufficient context`); **8–12 were free**.
+
+**Now set.** ⚠️A node cannot just set the layout bit — that would ship a frame *claiming* the
+shared axis while carrying rescaled data, which is worse than leaving it unset. The bit and the
+filterbank are emitted together by `firmware/gen_mel.py` from one call to `hear.sketch`, so they
+cannot disagree: `MEL16_FS_CODE 2`, `MEL16_LAYOUT_BIT 0x1000`, `MEL16_VALID_BANDS 15`.
+
+At 16 kHz the fixed axis leaves **15 of 20 bands** below Nyquist; the other five get no bins and
+quantise to the floor. The frame stays 20 bands and 172 B on purpose — a 15-band frame would be
+smaller but would not stack with a phone's 20.
+
+Verified without hardware by reimplementing `sketch_frame()` from the generated header:
+filterbank matches `hear.mel_filterbank(layout=fixed)` to 4.8e-11, window matches `np.hanning`,
+and the arithmetic reproduces `hear.sketch` **byte-for-byte over 6 cases**. A frame carrying
+those flags decodes as `fs=16000, layout=fixed, valid_bands=15`, and `FLEET_SKETCH_MODEL`
+now **accepts** it while the 20-band model still refuses it by name.
+
+⚠️`gen_mel.py` wrote only `path_test/mel16.h` while `night_node/` carried its own copy. They
+happened to be identical; that was luck, and it now writes both.
+
+⚠️**Not compiled and not flashed** — there is no ESP32 toolchain on this machine, and the nodes
+are mid-recording. Until they are flashed they keep emitting `fs=None/layout=nyquist`. When they
+are, their frames CHANGE (at 16 kHz the two layouts are genuinely different bytes), so old and
+new frames are not comparable — the `dets.csv` header rename forces a roll at the same moment,
+which separates them cleanly.
 
 ## The two nodes hear the same events — and the bound alone does not prove it
 
