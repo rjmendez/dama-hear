@@ -79,6 +79,24 @@ class TestDecode:
         assert d["q"].shape == (d["bands"], d["slices"])
         assert d["frames_summed"] == 64 and d["frames_summed"] != d["slices"]
 
+    def test_frames_is_the_row_total_and_frames_per_slice_derives_the_other(self):
+        # ⚠️Firmware writes SCENE_FRAMES = SCENE_SLICES * SCENE_FRAMES_PER_SLICE = 4 * 16 = 64.
+        # Reading that column as the per-slice count is wrong by a factor of `slices`, and the
+        # wrong number looks entirely plausible.
+        r = SF.read_text(_csv(SF.S2, [_row(SF.S2, 1788813341984000)]))
+        d = SF.decode_row(r.rows[0])
+        assert d["frames_summed"] == 64
+        assert SF.frames_per_slice(d) == 16
+        assert SF.frames_per_slice(d) * d["slices"] == d["frames_summed"]
+
+    def test_frames_per_slice_reads_a_raw_row_too(self):
+        r = SF.read_text(_csv(SF.S2, [_row(SF.S2, 1)]))
+        assert SF.frames_per_slice(r.rows[0]) == 16
+
+    def test_frames_per_slice_is_none_when_the_row_cannot_say(self):
+        assert SF.frames_per_slice({"slices": 4}) is None
+        assert SF.frames_per_slice({"frames_summed": 64}) is None
+
     def test_a_truncated_mel_is_refused_against_the_rows_own_geometry(self):
         r = SF.read_text(_csv(SF.S2, [_row(SF.S2, 1, mel="dead")]))
         with pytest.raises(ValueError, match="needs 160"):

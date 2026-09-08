@@ -375,8 +375,9 @@ class Pool:
                 "utc_us": utc_us, "anchored": utc_us > 0, "ts_utc_s": ts,
                 "mel_b64": base64.b64encode(d["q"].tobytes()).decode(),
                 "ref_db": d["ref_db"], "bands": d["bands"],
-                # `slices`, never `frames`. The row's `frames` column is how many FFT frames were
-                # summed into each slice -- the averaging behind a cell, not the shape.
+                # `slices`, never `frames`. ⚠️And `frames_summed` is the ROW TOTAL (firmware
+                # SCENE_FRAMES = slices * frames_per_slice = 4 * 16 = 64), NOT the per-slice
+                # count -- use scenefile.frames_per_slice() for that. Neither is the shape.
                 "slices": d["slices"], "frames_summed": d["frames_summed"],
                 "span_ms": d["span_ms"],
                 "f_lo_hz": float(row["f_lo_hz"]) if row.get("f_lo_hz") else None,

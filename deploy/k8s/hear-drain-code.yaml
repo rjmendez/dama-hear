@@ -6,7 +6,7 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'e14cf97-dirty'
+    dama-hear/commit: 'd146ee4-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
 data:
   hear__init__.py: |
@@ -774,9 +774,13 @@ data:
     length is CHECKED against them, because a truncated line is otherwise indistinguishable from a
     smaller descriptor.
     
-    ⚠️THE SECOND AXIS IS `slices`, NOT `frames`. The row's `frames` column is how many FFT frames the
-    node summed into each slice; it says how much averaging is behind a cell and it is NOT the shape.
-    Conflating them silently changes what a feature vector means.
+    ⚠️THE SECOND AXIS IS `slices`, NOT `frames`, AND `frames` IS A ROW TOTAL. The column carries
+    `SCENE_FRAMES = SCENE_SLICES * SCENE_FRAMES_PER_SLICE` (night_node.ino:1138-1140, written at
+    :1239) -- 64 for the whole row, at 4 slices of 16. The per-slice averaging divides by
+    SCENE_FRAMES_PER_SLICE, so a reader that takes this column as the per-slice count is out by a
+    factor of `slices`. Neither number is the shape. `frames_per_slice()` derives the per-slice count
+    rather than leaving every caller to divide, and the stored field keeps the name `frames_summed`
+    because 41,507 rows already carry it.
     
     The generations, all with headers that describe their own rows (unlike `dets.csv` G3):
     
@@ -898,6 +902,24 @@ data:
         return {"q": np.frombuffer(b, dtype=np.int8).reshape(bands, slices),
                 "ref_db": ref4 / 4.0, "bands": bands, "slices": slices,
                 "span_ms": span, "frames_summed": _int("frames")}
+    
+    
+    def frames_per_slice(row_or_decoded: Dict[str, Any]) -> Optional[int]:
+        """FFT frames averaged into ONE slice: the row's `frames` total divided by its `slices`.
+    
+        ⚠️The column is the ROW total, not this. Taking it directly as the per-slice count is wrong by
+        a factor of `slices` (4 today), and nothing about the resulting number looks wrong -- it is
+        exactly the class of error the band-axis and header-shape guards exist for.
+        """
+        n = row_or_decoded.get("frames_summed")
+        if n is None:
+            n = row_or_decoded.get("frames")
+            n = int(n) if n not in (None, "") else None
+        sl = row_or_decoded.get("slices")
+        sl = int(sl) if sl not in (None, "") else None
+        if not n or not sl:
+            return None
+        return n // sl
     
     
     def read_text(text: str, default_node: Optional[str] = None,
@@ -1356,8 +1378,9 @@ data:
                     "utc_us": utc_us, "anchored": utc_us > 0, "ts_utc_s": ts,
                     "mel_b64": base64.b64encode(d["q"].tobytes()).decode(),
                     "ref_db": d["ref_db"], "bands": d["bands"],
-                    # `slices`, never `frames`. The row's `frames` column is how many FFT frames were
-                    # summed into each slice -- the averaging behind a cell, not the shape.
+                    # `slices`, never `frames`. ⚠️And `frames_summed` is the ROW TOTAL (firmware
+                    # SCENE_FRAMES = slices * frames_per_slice = 4 * 16 = 64), NOT the per-slice
+                    # count -- use scenefile.frames_per_slice() for that. Neither is the shape.
                     "slices": d["slices"], "frames_summed": d["frames_summed"],
                     "span_ms": d["span_ms"],
                     "f_lo_hz": float(row["f_lo_hz"]) if row.get("f_lo_hz") else None,
