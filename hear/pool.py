@@ -124,7 +124,12 @@ def _why_geoms_differ(a: Tuple[Any, Any, Any, Any], b: Tuple[Any, Any, Any, Any]
         why.append("the SHAPE differs -- %sx%s against %sx%s, which is not one matrix width"
                    % (a[0], a[1], b[0], b[1]))
     if (a[2], a[3]) != (b[2], b[3]):
-        if None in (a[2], a[3], b[2], b[3]):
+        # ⚠️"Undeclared" only when the DIFFERENCE is itself a declared-vs-absent one. Asking
+        # "is any edge None?" put an UNDECLARED message on a pair whose f_lo genuinely differed
+        # (62.5 against 300) merely because both left f_hi absent -- the same misnaming one level
+        # down from the bug this function replaced.
+        differing = [i for i in (2, 3) if a[i] != b[i]]
+        if any((a[i] is None) != (b[i] is None) for i in differing):
             why.append("one of them leaves its band axis UNDECLARED (an S0 row carries no "
                        "f_lo_hz/f_hi_hz, shown as ?). An axis that is not stated cannot be "
                        "shown to be the axis that is, so it is refused rather than assumed")
@@ -432,8 +437,15 @@ class Pool:
                 # count -- use scenefile.frames_per_slice() for that. Neither is the shape.
                 "slices": d["slices"], "frames_summed": d["frames_summed"],
                 "span_ms": d["span_ms"],
-                "f_lo_hz": float(row["f_lo_hz"]) if row.get("f_lo_hz") else None,
-                "f_hi_hz": float(row["f_hi_hz"]) if row.get("f_hi_hz") else None,
+                # `not in (None, "")` rather than truthiness, as stated intent. ⚠️It changes
+                # NOTHING on the CSV path: the value arrives as a string and "0" is truthy, so
+                # both forms agree on "62.5", "0", "" and absent -- measured. Only a float 0.0
+                # differs, which no CSV yields. Written this way so the rule ("empty means
+                # undeclared, zero means zero") is legible if a non-CSV caller ever appears.
+                "f_lo_hz": (float(row["f_lo_hz"]) if row.get("f_lo_hz") not in (None, "")
+                            else None),
+                "f_hi_hz": (float(row["f_hi_hz"]) if row.get("f_hi_hz") not in (None, "")
+                            else None),
                 "fft_us": row.get("fft_us"),
                 "sample": row.get("sample"), "uptime_s": row.get("uptime_s"),
                 "scene_schema": row.get("schema"),
@@ -537,7 +549,7 @@ class Pool:
                 raise ValueError("mixed scene geometry: %s then %s -- %s. Select a day or node "
                                  "whose firmware did not change."
                                  % (_geom_str(geom), _geom_str(g), _why_geoms_differ(geom, g)))
-            if limit and len(rows) >= limit:
+            if limit is not None and len(rows) >= limit:
                 continue                    # keep CHECKING; stop collecting
             q = np.frombuffer(base64.b64decode(r["mel_b64"]), dtype=np.int8) \
                 .reshape(r["bands"], r["slices"]).astype(float)
