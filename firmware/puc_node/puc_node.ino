@@ -30,6 +30,8 @@
 #include <esp_mac.h>
 #include "soc/gpio_struct.h"
 #include <Wire.h>
+#include "driver/gpio.h"
+#include <ESP_I2S.h>
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -349,6 +351,143 @@ static String rtc_read(int sda, int scl) {
   return String(b);
 }
 
+// ---- PDM microphone discovery ----------------------------------------------------------------
+// The two mics are the last unmapped thing on the board and /scan cannot see them: a PDM mic emits
+// nothing until it is clocked, so with no clock running its DIN sits static and looks like an
+// unconnected pin. The board profile blames "peripherals unpowered" for that; the I2C sweep
+// falsified it -- six devices answer on 47/48, so the sensor rail IS live. The mic is silent
+// because nobody is clocking it, which is a thing we can change.
+//
+// SEARCH SHAPE. Not CLK x DIN pairs -- drive ONE candidate clock and watch every other pin at once,
+// which turns an N*M sweep into N passes and drives exactly one pin at a time. The sampler runs at
+// ~29 kHz/pin and a clocked PDM line toggles near CLK/2, so it is aliased far beyond resolving --
+// but resolving it is not the question. "This pin started changing state when I applied a clock,
+// and was static before" is the whole measurement, and aliasing preserves that.
+//
+// WHY THIS IS SAFE TO DO TO AN UNMAPPED BOARD, stated because the I2C sweep's safety argument does
+// NOT carry over. I2C is open-drain and only ever pulls low; this drives push-pull, so a pin that
+// turns out to be someone else's output means two drivers fighting. The evidence that bounds it:
+// under an internal pullup only GPIO 8, 18 and 39 stayed low, so only those three are actively
+// driven -- every other SAFE pin followed a ~45k resistor, which nothing was contesting. Those
+// three are excluded, 47/48 are excluded because the I2C bus lives there, and the drive strength is
+// set to the weakest the part offers so even a wrong guess is current-limited.
+#define PDM_PROBE_HZ   2000000
+#define PDM_SAMP       12000
+
+static const int PDM_SKIP[] = {8, 18, 39, 47, 48};   // 8/18/39 driven; 47/48 are the I2C bus
+static bool pdm_skip(int g) {
+  for (unsigned i = 0; i < sizeof(PDM_SKIP) / sizeof(PDM_SKIP[0]); i++) if (PDM_SKIP[i] == g) return true;
+  return false;
+}
+
+// Edge count per SAFE pin over a short window. Returned by value so a caller can diff two passes.
+static void pdm_sample(uint32_t *edges) {
+  uint32_t last0 = GPIO.in, last1 = GPIO.in1.val;
+  for (int k = 0; k < NSAFE; k++) edges[k] = 0;
+  for (uint32_t i = 0; i < PDM_SAMP; i++) {
+    uint32_t v0 = GPIO.in, v1 = GPIO.in1.val;
+    uint32_t d0 = v0 ^ last0, d1 = v1 ^ last1;
+    if (d0 || d1) {
+      for (int k = 0; k < NSAFE; k++) {
+        int g = SAFE[k];
+        uint32_t m = 1u << (g < 32 ? g : g - 32);
+        if ((g < 32 ? d0 : d1) & m) edges[k]++;
+      }
+    }
+    last0 = v0; last1 = v1;
+  }
+}
+
+static String pdm_scan(int only_clk) {
+  uint32_t base[NSAFE], live[NSAFE];
+  String o = "PDM mic hunt: drive one candidate clock at " + String(PDM_PROBE_HZ / 1000) +
+             " kHz, watch every other pin.\n"
+             "skipped: 8 18 39 (actively driven) 47 48 (I2C bus). Drive strength: weakest.\n\n";
+  pdm_sample(base);
+  String basel = "";
+  for (int k = 0; k < NSAFE; k++) if (base[k]) basel += " " + String(SAFE[k]) + ":" + String(base[k]);
+  o += basel.length() ? "baseline, no clock -- ALREADY TOGGLING:" + basel + "\n\n"
+                      : "baseline, no clock -- every pin static, as expected\n\n";
+  int hits = 0;
+  for (int k = 0; k < NSAFE; k++) {
+    int clk = SAFE[k];
+    if (pdm_skip(clk)) continue;
+    if (only_clk >= 0 && clk != only_clk) continue;
+    gpio_set_drive_capability((gpio_num_t)clk, GPIO_DRIVE_CAP_0);
+    if (!ledcAttach(clk, PDM_PROBE_HZ, 2)) { o += "  clk " + String(clk) + ": ledc refused\n"; continue; }
+    ledcWrite(clk, 2);
+    delay(5);
+    pdm_sample(live);
+    ledcDetach(clk);
+    pinMode(clk, INPUT);
+    String woke = "";
+    for (int j = 0; j < NSAFE; j++) {
+      if (SAFE[j] == clk) continue;
+      // 8x the quiet-pass count and at least 50 transitions: a pin that merely picked up a little
+      // crosstalk from a 2 MHz neighbour is not a microphone answering.
+      if (live[j] > 50 && live[j] > base[j] * 8 + 50)
+        woke += "  DIN? gpio " + String(SAFE[j]) + " " + String(live[j]) + " edges (was " +
+                String(base[j]) + ")\n";
+    }
+    if (woke.length()) { hits++; o += "clk " + String(clk) + " ->\n" + woke; }
+  }
+  o += "\n";
+  if (!hits) o += "No pin answered any candidate clock. That is a result: either the mics are on a\n"
+                  "rail this firmware has not enabled, or their CLK is one of the excluded pins, or\n"
+                  "the DIN is outside SAFE. It is NOT evidence that there are no mics.\n";
+  return o;
+}
+
+// ---- microphone confirmation -----------------------------------------------------------------
+// /pdmscan finds a pin that DRIVES when another is clocked. That is not a microphone; it is a pin
+// that drives. The Sense bring-up set the bar for this board family -- "16 kHz, 99% non-zero, room
+// noise at rms 2573 / peak 7923" -- and it is the right bar, because a stuck line, a floating input
+// and a mic all produce edges while only one of them produces a signal with structure.
+//
+// What is reported: mean, rms about the mean, peak, and the fraction of samples that are non-zero
+// and that are rail-pinned. A DC-offset constant reads rms ~0. A line stuck at a rail reads
+// pinned ~100%. Only a mic reads a small mean, a non-trivial rms and no pinning.
+static I2SClass pdm_i2s;
+
+static String mic_capture(int clk, int din, int fs, bool stereo) {
+  static int16_t buf[4096];
+  pdm_i2s.end();
+  pdm_i2s.setPinsPdmRx(clk, din);
+  if (!pdm_i2s.begin(I2S_MODE_PDM_RX, fs, I2S_DATA_BIT_WIDTH_16BIT,
+                     stereo ? I2S_SLOT_MODE_STEREO : I2S_SLOT_MODE_MONO))
+    return "i2s PDM RX would not start on clk=" + String(clk) + " din=" + String(din) + "\n";
+  // A PDM mic has a wake-up: the first blocks after the clock starts are its filter settling, not
+  // the room. Read one buffer and throw it away before measuring anything.
+  pdm_i2s.readBytes((char *)buf, sizeof buf);
+  int got = pdm_i2s.readBytes((char *)buf, sizeof buf);
+  pdm_i2s.end();
+  pinMode(clk, INPUT); pinMode(din, INPUT);
+  int n = got / 2;
+  if (n < 64) return "only " + String(n) + " samples came back\n";
+
+  auto stat = [&](int off, int step, String tag) {
+    double sum = 0; int cnt = 0;
+    for (int i = off; i < n; i += step) { sum += buf[i]; cnt++; }
+    double mean = sum / cnt, ss = 0; int nz = 0, pinned = 0, peak = 0;
+    for (int i = off; i < n; i += step) {
+      double d = buf[i] - mean; ss += d * d;
+      if (buf[i]) nz++;
+      if (buf[i] >= 32700 || buf[i] <= -32700) pinned++;
+      if (abs(buf[i]) > peak) peak = abs(buf[i]);
+    }
+    char b[160];
+    snprintf(b, sizeof b, "  %-5s n=%4d  mean %8.1f  rms %8.1f  peak %6d  non-zero %5.1f%%  pinned %5.1f%%\n",
+             tag.c_str(), cnt, mean, sqrt(ss / cnt), peak, 100.0 * nz / cnt, 100.0 * pinned / cnt);
+    return String(b);
+  };
+  String o = "PDM capture clk=" + String(clk) + " din=" + String(din) + " at " + String(fs) +
+             " Hz, " + String(stereo ? "stereo" : "mono") + ", " + String(n) + " samples\n";
+  if (stereo) { o += stat(0, 2, "left"); o += stat(1, 2, "right"); }
+  else o += stat(0, 1, "mono");
+  o += "  (a constant reads rms ~0; a line stuck at a rail reads pinned ~100%)\n";
+  return o;
+}
+
 static String i2c_sweep() {
   String o = "I2C sweep over the 11 externally-pulled-up pins (both orders; SDA/SCL is not symmetric)\n"
              "candidates: 6 7 9 10 11 12 13 14 45 47 48   -- from /scan vs /scanpd\n\n";
@@ -424,7 +563,7 @@ static void routes() {
       "uptime  %lus\nheap    %lu   psram %lu\n"
       "gps     fix %d, %d sats, %s   sentences %lu (%lu valid)\n"
       "pps     %lu edges on GPIO%d\n\n"
-      "/status /pins /i2c /i2creg /rtc /scan /scanpd /scanpu /gps /pmtk?cmd= /pps /ota /update /reboot\n</pre>",
+      "/status /pins /i2c /i2creg /rtc /pdmscan /mic /scan /scanpd /scanpu /gps /pmtk?cmd= /pps /ota /update /reboot\n</pre>",
       node_id, NODE_CLASS, (unsigned long)(millis() / 1000),
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getFreePsram(),
       gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences, (unsigned long)gps_valid,
@@ -469,8 +608,13 @@ static void routes() {
       "  20  USB D+                                 do not touch\n"
       "26-32 SPI flash                              do not touch\n"
       "33-37 octal PSRAM                            do not touch\n\n"
-      "Two 48 kHz mics, a DS3231, an environmental suite and a microSD slot are all on this board\n"
-      "and their pins are NOT yet known. /scan and /scanpd are how they get found.\n",
+      "   6  PDM mic CLK -> both mics             measured: /pdmscan, then real audio on /mic\n"
+      "   7  PDM mic DIN <- both mics (stereo)     measured: L rms 46.1, R rms 36.1, they differ\n"
+      "  47  I2C SDA                               measured: /i2c, 6 devices answered\n"
+      "  48  I2C SCL                               measured: /i2c\n\n"
+      "On the bus: 0x18 LIS3DH, 0x1C LIS3MDL, 0x39 AS7341(likely), 0x50 blank EEPROM,\n"
+      "0x68 DS3231 (confirmed, OSF=0), 0x76 BME680 (confirmed). The microSD pins are still\n"
+      "unknown -- the nine remaining pulled-up pins are where its CMD and D0-D3 should be.\n",
       GPS_RX_PIN, GPS_BAUD, GPS_TX_PIN, PPS_PIN);
     http.send(200, "text/plain", b);
   });
@@ -503,6 +647,18 @@ static void routes() {
     if (addr < 0x08 || addr > 0x77) { http.send(400, "text/plain", "addr out of range\n"); return; }
     http.send(200, "text/plain",
               i2c_regread(sda, scl, (uint8_t)addr, (uint8_t)reg, n, http.hasArg("raw")));
+  });
+
+  http.on("/pdmscan", []() {
+    http.send(200, "text/plain", pdm_scan(http.hasArg("clk") ? http.arg("clk").toInt() : -1));
+  });
+
+  // /mic?clk=6&din=7[&fs=16000][&mono=1]
+  http.on("/mic", []() {
+    int clk = http.hasArg("clk") ? http.arg("clk").toInt() : 6;
+    int din = http.hasArg("din") ? http.arg("din").toInt() : 7;
+    int fs  = http.hasArg("fs")  ? http.arg("fs").toInt()  : 16000;
+    http.send(200, "text/plain", mic_capture(clk, din, fs, !http.hasArg("mono")));
   });
 
   http.on("/rtc", []() {
