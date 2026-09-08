@@ -137,7 +137,12 @@ static const char HEALTH_HDR[] =
   // same in the record -- clip_written advances only on a clip that landed, clip_skip_budget only
   // on one that was wanted and refused.
   "gate_floor,clip_written,clip_skip_budget,clip_skip_cardfull,clip_skip_dedupe,"
-  "clip_skip_ring,clip_fail,clip_budget_left";
+  "clip_skip_ring,clip_fail,clip_budget_left,"
+  // Position. lat/lon are the LAST epoch; mean_lat/mean_lon are the running average over pos_n
+  // 3D fixes, which is the number to use as a TDoA focus. hacc_m is the receiver's own estimate
+  // for the last epoch -- it does NOT shrink as the mean improves, so do not read it as the
+  // accuracy of the mean; pos_n is what says how good the mean is.
+  "lat,lon,hmsl_m,hacc_m,pos_n,mean_lat,mean_lon,mean_hmsl_m";
 static double   fs_clean      = (double)FS_NOMINAL;
 static uint32_t fs_clean_secs = 0;    // length of the current unbroken window, in GPS seconds
 static uint32_t drop_seconds  = 0;    // seconds that came up short by a block or more
@@ -203,6 +208,21 @@ static uint8_t rawbuf[512]; static volatile uint16_t raw_i = 0; static volatile 
 static volatile uint32_t nmea_valid = 0;      // lines that actually start '$' and carry a talker id
 static uint32_t gps_baud = 0;
 static volatile int gps_fix = 0, gps_sats = 0;
+// Node POSITION. NAV-PVT has carried lat/lon all along and this firmware parsed the same message
+// for time and threw the position away -- which left the array unable to do the one thing it is
+// for: a TDoA is a hyperbola, and without the focus coordinates it is a number with no geometry.
+//
+// A single epoch is good to a few metres, which is the same order as the path differences we are
+// trying to resolve (28 ms of dog is 9.8 m). These nodes do not move, so the fix averages down:
+// the mean of N independent epochs improves as sqrt(N), and an overnight run is ~30k epochs. Both
+// are kept -- last for liveness, mean for geometry -- and the count is reported so nobody uses a
+// 12-sample mean as if it were an 8-hour one.
+static volatile int32_t  pos_lat_e7 = 0, pos_lon_e7 = 0;   // 1e-7 deg, as the wire carries them
+static volatile int32_t  pos_hmsl_mm = 0;
+static volatile uint32_t pos_hacc_mm = 0;
+static double  pos_sum_lat = 0, pos_sum_lon = 0, pos_sum_h = 0;
+static uint32_t pos_n = 0;
+#define POS_HACC_MAX_MM 25000u   // 25 m: reject the garbage epochs, keep everything plausible
 static char gps_utc[16] = "--:--:--";
 static uint32_t gps_sentences = 0;
 
@@ -612,6 +632,20 @@ static void ubx_msg() {
     }
     gps_tacc_ns = (uint32_t)ux[12] | ((uint32_t)ux[13] << 8) | ((uint32_t)ux[14] << 16) | ((uint32_t)ux[15] << 24);
     gps_fix = ux[20]; gps_sats = ux[23];
+    // lon/lat/hMSL/hAcc live at 24/28/36/40 -- so this needs a payload of 48, not the 24 the
+    // guard above asks for. Check before reading rather than trusting the message length.
+    if (ux_len >= 48) {
+      int32_t lon = (int32_t)((uint32_t)ux[24] | ((uint32_t)ux[25] << 8) | ((uint32_t)ux[26] << 16) | ((uint32_t)ux[27] << 24));
+      int32_t lat = (int32_t)((uint32_t)ux[28] | ((uint32_t)ux[29] << 8) | ((uint32_t)ux[30] << 16) | ((uint32_t)ux[31] << 24));
+      int32_t hms = (int32_t)((uint32_t)ux[36] | ((uint32_t)ux[37] << 8) | ((uint32_t)ux[38] << 16) | ((uint32_t)ux[39] << 24));
+      uint32_t ha = (uint32_t)ux[40] | ((uint32_t)ux[41] << 8) | ((uint32_t)ux[42] << 16) | ((uint32_t)ux[43] << 24);
+      pos_lat_e7 = lat; pos_lon_e7 = lon; pos_hmsl_mm = hms; pos_hacc_mm = ha;
+      // Only a 3D fix inside the accuracy cap joins the average. A 2D fix has no height and a
+      // wandering horizontal solution, and averaging it in makes the mean worse, not noisier.
+      if (gps_fix == 3 && ha && ha < POS_HACC_MAX_MM) {
+        pos_sum_lat += (double)lat; pos_sum_lon += (double)lon; pos_sum_h += (double)hms; pos_n++;
+      }
+    }
     snprintf(gps_utc, sizeof gps_utc, "%02u:%02u:%02u", ux[8], ux[9], ux[10]);
     ubx_pvt++;
   } else if (ux_cls == 0x0D && ux_id == 0x01 && ux_len >= 16) {   // TIM-TP
@@ -1551,6 +1585,8 @@ static String status_json() {
     "{\"node\":\"%s\",\"class\":\"%s\",\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
+    "\"pos\":{\"lat\":%.7f,\"lon\":%.7f,\"hmsl_m\":%.3f,\"hacc_m\":%.2f,"
+      "\"n\":%lu,\"mean_lat\":%.7f,\"mean_lon\":%.7f,\"mean_hmsl_m\":%.3f},"
     "\"pps\":{\"edges\":%lu,\"glitches\":%lu,\"probe_resyncs\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,\"spread_us\":%ld},"
     "\"i2s\":{\"nominal_hz\":%d,\"measured_hz\":%.4f,\"ppm\":%.1f,\"samples\":%lu},"
     // measured_hz above is cumulative and stays poisoned by any stall. acq is the one to trust.
@@ -1593,6 +1629,10 @@ static String status_json() {
     (unsigned long)ubx_timtp, (unsigned long)ubx_ack, (unsigned long)ubx_nak,
     (ubx_ack ? "true" : "false"), (unsigned)timtp_flags,
     ((timtp_flags != 0xFF && !(timtp_flags & 0x10)) ? "true" : "false"),
+    pos_lat_e7 * 1e-7, pos_lon_e7 * 1e-7, pos_hmsl_mm / 1000.0, pos_hacc_mm / 1000.0,
+    (unsigned long)pos_n,
+    pos_n ? pos_sum_lat / pos_n * 1e-7 : 0.0, pos_n ? pos_sum_lon / pos_n * 1e-7 : 0.0,
+    pos_n ? pos_sum_h / pos_n / 1000.0 : 0.0,
     (unsigned long)pps_count, (unsigned long)pps_glitch, (unsigned long)pps_resyncs,
     (unsigned long)(pps_count > 1 ? pps_int_min : 0), (unsigned long)(pps_count > 1 ? pps_int_max : 0),
     (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0),
@@ -1696,6 +1736,62 @@ static void h_dets() {
 // uses it sits further down the file. scenef is already declared earlier.
 static File detf;
 
+// GPS bring-up: choose the pins, then find the baud, then configure. Extracted from setup()
+// so it can be RUN AGAIN, because running it exactly once at boot turned out to be the bug.
+//
+// mach is wired with its TX/RX pair reversed, and gps_pick_pins() reads which pin actually
+// carries a transmitter. After an OTA reboot the ESP is serving HTTP in under a second while
+// the module is still starting, so NEITHER pin was toggling yet -- the probe fell back to
+// "documented wiring", which is the pinout mach does not have. It then autobauded against a
+// pin with nothing on it, settled on 9600, and sat at fix 0 with zero UBX frames for as long
+// as it was left. The boot-time answer was wrong and nothing ever revisited it.
+//
+// The configure() is inside the retry deliberately: re-detecting the pins without re-sending
+// CFG-VALSET would leave the module at whatever rate it shipped with, which is the 5 Hz/10 Hz
+// asymmetry that cost mach two rejected UTC labellings a second.
+static void gps_bringup() {
+  gps_pick_pins();
+
+  // Find the module's baud instead of assuming it. Assuming 9600 produced a stream that a lenient
+  // parser happily counted as 22 "sentences" while zero of them were valid NMEA -- a wrong number
+  // that looked like a working link. Count VALID lines and let the module tell us.
+  {
+    // Count UBX frames as well as NMEA lines. A module that came off a flight controller is very
+    // often configured UBX-binary only with NMEA disabled -- so a NMEA-only scan sees a live,
+    // driven, busy line and reports nothing at every rate, which is exactly what happened.
+    static const uint32_t cand[] = {9600, 38400, 115200, 57600, 19200, 230400, 460800, 4800};
+    uint32_t best_b = 0; int best_score = 0; bool best_ubx = false;
+    for (unsigned k = 0; k < sizeof(cand) / sizeof(cand[0]); k++) {
+      Serial1.begin(cand[k], SERIAL_8N1, gps_rx_pin, gps_tx_pin);
+      delay(60); while (Serial1.available()) Serial1.read();
+      int nm = 0, ub = 0, i = 0; char ln[100]; uint8_t prev = 0; uint32_t t0 = millis();
+      while (millis() - t0 < 1200) {
+        while (Serial1.available()) {
+          uint8_t c = (uint8_t)Serial1.read();
+          if (prev == 0xB5 && c == 0x62) ub++;            // UBX sync word
+          prev = c;
+          if (c == '\n' || i >= 99) {
+            ln[i] = 0;
+            if (i > 6 && ln[0] == '$' && ln[1] >= 'A' && ln[1] <= 'Z' && ln[2] >= 'A' && ln[2] <= 'Z') nm++;
+            i = 0;
+          } else if (c != '\r' && c >= 32 && c < 127) ln[i++] = (char)c;
+        }
+      }
+      logf("gps   %6lu baud -> %d NMEA, %d UBX\n", (unsigned long)cand[k], nm, ub);
+      int score = nm + ub;
+      if (score > best_score) { best_score = score; best_b = cand[k]; best_ubx = (ub > nm); }
+      Serial1.end();
+    }
+    gps_baud = best_b ? best_b : 9600;
+    Serial1.begin(gps_baud, SERIAL_8N1, gps_rx_pin, gps_tx_pin);
+    logf("gps   using %lu baud (%s)%s\n", (unsigned long)gps_baud,
+                  best_ubx ? "UBX binary" : "NMEA",
+                  best_b ? "" : " -- nothing decoded at any rate");
+  }
+  delay(300);
+  gps_configure();
+}
+
 void setup() {
   boot_guard();                    // first statement: a later fault still counts as a failed boot
   Serial.begin(115200);
@@ -1756,46 +1852,7 @@ void setup() {
   // transmitter is connected" on mach for a pin with nothing on it: a pulled-up module input reads
   // exactly like a transmitter idling high, so the test could not tell the two apart. Counting
   // RECURRING run lengths on both pins can, and it also says which way round the pair is wired.
-  gps_pick_pins();
-
-  // Find the module's baud instead of assuming it. Assuming 9600 produced a stream that a lenient
-  // parser happily counted as 22 "sentences" while zero of them were valid NMEA -- a wrong number
-  // that looked like a working link. Count VALID lines and let the module tell us.
-  {
-    // Count UBX frames as well as NMEA lines. A module that came off a flight controller is very
-    // often configured UBX-binary only with NMEA disabled -- so a NMEA-only scan sees a live,
-    // driven, busy line and reports nothing at every rate, which is exactly what happened.
-    static const uint32_t cand[] = {9600, 38400, 115200, 57600, 19200, 230400, 460800, 4800};
-    uint32_t best_b = 0; int best_score = 0; bool best_ubx = false;
-    for (unsigned k = 0; k < sizeof(cand) / sizeof(cand[0]); k++) {
-      Serial1.begin(cand[k], SERIAL_8N1, gps_rx_pin, gps_tx_pin);
-      delay(60); while (Serial1.available()) Serial1.read();
-      int nm = 0, ub = 0, i = 0; char ln[100]; uint8_t prev = 0; uint32_t t0 = millis();
-      while (millis() - t0 < 1200) {
-        while (Serial1.available()) {
-          uint8_t c = (uint8_t)Serial1.read();
-          if (prev == 0xB5 && c == 0x62) ub++;            // UBX sync word
-          prev = c;
-          if (c == '\n' || i >= 99) {
-            ln[i] = 0;
-            if (i > 6 && ln[0] == '$' && ln[1] >= 'A' && ln[1] <= 'Z' && ln[2] >= 'A' && ln[2] <= 'Z') nm++;
-            i = 0;
-          } else if (c != '\r' && c >= 32 && c < 127) ln[i++] = (char)c;
-        }
-      }
-      logf("gps   %6lu baud -> %d NMEA, %d UBX\n", (unsigned long)cand[k], nm, ub);
-      int score = nm + ub;
-      if (score > best_score) { best_score = score; best_b = cand[k]; best_ubx = (ub > nm); }
-      Serial1.end();
-    }
-    gps_baud = best_b ? best_b : 9600;
-    Serial1.begin(gps_baud, SERIAL_8N1, gps_rx_pin, gps_tx_pin);
-    logf("gps   using %lu baud (%s)%s\n", (unsigned long)gps_baud,
-                  best_ubx ? "UBX binary" : "NMEA",
-                  best_b ? "" : " -- nothing decoded at any rate");
-  }
-  delay(300);
-  gps_configure();
+  gps_bringup();
   logln("gps   UBX config sent (TP1 1 Hz locked+unlocked, NAV-PVT, TIM-TP; RAM layer)");
 
   Wire.begin(I2C_SDA, I2C_SCL, 100000);
@@ -2556,6 +2613,29 @@ static void audio_pump() {
 void loop() {
   http.handleClient();
   audio_pump();
+
+  // ---- GPS link watchdog ---------------------------------------------------
+  // The boot-time pin/baud detection is a measurement of a module that may not have started
+  // transmitting yet, and it was never revisited. On mach -- the node whose TX/RX pair is
+  // reversed -- an OTA reboot beat the module to the punch, the probe saw neither pin toggle,
+  // fell back to the documented pinout mach does not have, and the node ran for 8 minutes with
+  // fix 0 and ubx_pvt 0. It would have run all night.
+  //
+  // Retry only while NOTHING has ever decoded. Once a single sentence or UBX frame lands, the
+  // link is proven and this never fires again -- so a node that is merely waiting for sky is
+  // left alone, and a working node never pays the ~11 s the sweep costs.
+  { static uint32_t last_try_ms = 0, gps_retries = 0;
+    uint32_t up_ms = millis() - boot_ms;
+    if (nmea_valid == 0 && ubx_pvt == 0 && up_ms > 45000UL &&
+        (last_try_ms == 0 || millis() - last_try_ms > 120000UL)) {
+      last_try_ms = millis();
+      logf("gps   nothing decoded in %lus -- re-running bring-up (attempt %lu)\n",
+           (unsigned long)(up_ms / 1000), (unsigned long)(++gps_retries));
+      gps_bringup();
+      logf("gps   bring-up retry done: %s, RX=GPIO%d, %lu baud\n",
+           gps_pin_src, gps_rx_pin, (unsigned long)gps_baud);
+    }
+  }
   // After audio_pump(), so the chunk written below is drained against a DMA that was emptied this
   // pass. One CLIP_CHUNK_B per iteration; the pump is the pacing, exactly as in /audio.
   clip_pump();
@@ -2673,10 +2753,19 @@ void loop() {
         #define CSVF(dst, v) do { if ((v) == (v)) snprintf(dst, sizeof dst, "%.2f", (double)(v)); \
                                   else dst[0] = 0; } while (0)
         CSVF(ct, bmp_temp_c); CSVF(cp, bmp_press_hpa); CSVF(cc, sound_speed_mps());
+        // Before the first 3D fix there is no mean. Writing 0.0000000 there would put the node
+        // in the Gulf of Guinea, and a reader averaging the column would never notice.
+        char mlat[20] = "", mlon[20] = "", mh[16] = "";
+        if (pos_n) {
+          snprintf(mlat, sizeof mlat, "%.7f", pos_sum_lat / pos_n * 1e-7);
+          snprintf(mlon, sizeof mlon, "%.7f", pos_sum_lon / pos_n * 1e-7);
+          snprintf(mh,   sizeof mh,   "%.3f", pos_sum_h  / pos_n / 1000.0);
+        }
         f.printf("%s,%lld,%d,%lu,%d,%d,%lu,%lu,%lu,%ld,%.4f,%lu,%.4f,"
                  "%.4f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.1f,%.0f,%lu,%d,%.0f,%.1f,%lu,%.1f,%lu,%lu,"
                  "%s,%s,%s,"
-                 "%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+                 "%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
+                 "%.7f,%.7f,%.3f,%.2f,%lu,%s,%s,%s\n",
                  node_id, (long long)tnow, tok ? 1 : 0,
                  (unsigned long)up, gps_fix, gps_sats, (unsigned long)gps_tacc_ns,
                  (unsigned long)pps_count, (unsigned long)pps_glitch,
@@ -2693,7 +2782,9 @@ void loop() {
                  g_floor, (unsigned long)clip_written, (unsigned long)clip_skip_budget,
                  (unsigned long)clip_skip_full,
                  (unsigned long)clip_skip_dedupe, (unsigned long)clip_skip_ring,
-                 (unsigned long)clip_fail, (unsigned long)clip_budget_left);
+                 (unsigned long)clip_fail, (unsigned long)clip_budget_left,
+                 pos_lat_e7 * 1e-7, pos_lon_e7 * 1e-7, pos_hmsl_mm / 1000.0,
+                 pos_hacc_mm / 1000.0, (unsigned long)pos_n, mlat, mlon, mh);
         f.close();
       }
       // scene.csv is held open and written every 1.024 s; committing it costs the same 20-50 ms
@@ -2706,3 +2797,4 @@ void loop() {
     }
   }
 }
+
