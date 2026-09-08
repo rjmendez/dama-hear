@@ -324,7 +324,12 @@ class TestBadFrames:
     def test_corruption_does_not_take_the_array_down(self):
         good = _frames(range(1, 6), _shock_arrivals(RING, BEARING, OFFSET))
         bent = bytearray(good[0][0])
-        bent[11] ^= 0x02                       # profile bits: the frame's own length now lies
+        # ⚠️0x08, NOT 0x02. Flipping bit 1 used to move profile 1 -> an id nothing defined; now
+        # profiles 0, 1 and 2 all exist, so that flip lands on a DEFINED id and is not a
+        # corruption the frame can detect at all -- see
+        # test_a_bit_flip_between_defined_profiles_is_NOT_detectable below. Bit 3 reaches id 9,
+        # which nothing defines, so the length genuinely lies.
+        bent[11] ^= 0x08
         b = BP.Backend(_survey(RING), temp_c=T, v_mps=V)
         for junk in (b"", b"\x00" * 50, bytes(bent)):
             r = b.ingest(junk, "lora0", T0)
@@ -335,6 +340,26 @@ class TestBadFrames:
         assert len(got["decode_errors"]) == 3
         assert len(got["events"]) == 1
         assert _bearing_error(got["events"][0]["solution"]["bearing_deg"], BEARING) < 1.0
+
+    def test_a_bit_flip_between_defined_profiles_is_NOT_detectable(self):
+        """⚠️A LIMITATION, PINNED SO IT IS NOT ASSUMED AWAY.
+
+        Profiles 0, 1 and 2 are all 20x8 and differ only in rate and band layout, so a single bit
+        flip in the profile field changes what a frame CLAIMS its bands mean -- 48 kHz to 16 kHz,
+        or to rate-unstated -- without changing its length. Nothing inside the frame can catch
+        that; the transport CRC is the only thing standing between a flipped bit and a silently
+        relabelled measurement.
+
+        The alternative was worse: leaving the rate out of the profile entirely, which is what
+        made v2 frames unable to say what their bands meant in the first place.
+        """
+        good = _frames(range(1, 6), _shock_arrivals(RING, BEARING, OFFSET))
+        bent = bytearray(good[0][0])
+        bent[11] ^= 0x02                                  # DEFAULT_PROFILE (1) -> 0
+        b = BP.Backend(_survey(RING), temp_c=T, v_mps=V)
+        r = b.ingest(bytes(bent), "lora0", T0)
+        assert r["ok"] is True, "a flip between defined profiles decodes -- that is the point"
+        assert WR.unpack_v2(bytes(bent))["profile_id"] != WR.DEFAULT_PROFILE
 
     def test_a_node_outside_the_survey_never_reaches_an_event(self):
         fr = _frames(range(1, 6), _shock_arrivals(RING, BEARING, OFFSET))
