@@ -152,3 +152,37 @@ def test_puc_pps_is_marked_unverified():
     routing has never been confirmed. A provisional class that stops announcing itself as
     provisional is how a guess becomes a fact."""
     assert "UNVERIFIED" in nc.get("puc-pps").notes
+
+
+class TestGotchiPhone:
+    """The phone is refused for arrivals, and the reason is NOT its clock.
+
+    Pinned because the obvious assumption -- "a phone has no PPS, so it is an NTP-class node" --
+    is wrong in a way that would let it in. GPSTimingSync really does anchor (UTC, CLOCK_BOOTTIME)
+    per GPS fix at a claimed 1-5 ms, which is puc-ntp territory. The audio path just never asks it.
+    """
+
+    def test_it_is_refused_for_arrivals(self):
+        with pytest.raises(nc.CapabilityError):
+            nc.require_arrival("gotchi-phone")
+
+    def test_its_timing_is_worse_than_the_ntp_class_not_better(self):
+        """If the phone were limited by GPSTimingSync it would beat puc-ntp's 3 ms. It is limited
+        by the audio path instead, which is an order of magnitude worse."""
+        phone = nc.get("gotchi-phone")
+        ntp = nc.get("puc-ntp")
+        assert phone.t_sigma_s > ntp.t_sigma_s
+        assert phone.t_sigma_s / ntp.t_sigma_s > 5.0
+
+    def test_the_error_exceeds_the_whole_surveyed_baseline(self):
+        """nyquist->mach is 16.6 m. A node whose 1-sigma range error is half that cannot be
+        averaged in with nodes at 3 cm -- it sets the answer on its own."""
+        phone = nc.get("gotchi-phone")
+        assert phone.t_sigma_s * 343.0 > 8.0
+
+    def test_it_is_still_a_good_listener(self):
+        """The refusal is about arrivals only. Refusing the whole node would throw away a 44.1 kHz
+        microphone with a wider band than either XIAO node can reach."""
+        phone = nc.get("gotchi-phone")
+        assert phone.usable_band_hz()[1] > nc.get("xiao-s3-pps").usable_band_hz()[1]
+        assert phone.fs_hz > nc.get("xiao-s3-pps").fs_hz

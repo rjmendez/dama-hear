@@ -132,9 +132,90 @@ def _mirror_through_plane(s: np.ndarray, P: np.ndarray, normal: Sequence[float])
     return s - 2.0 * float((s - P.mean(axis=0)) @ n) * n
 
 
+def _report(s, P, t, c, n_eq, n_unk, rms_ms, t0, at_bound, source_class,
+            search_margin_m, fixed_up_m):
+    """Everything the solver says about a fit. One definition, shared by the 3-unknown and
+    the declared-height paths, so the two cannot disagree about what a result means.
+    """
+    lin = PL.linearity(P)
+    obs = lin >= PL.COLLINEAR_LINEARITY
+
+    # Height observability is a SEPARATE question from horizontal observability, and for this
+    # project it is usually the one that bites: nodes sitting on the ground are coplanar, and a
+    # coplanar array cannot tell a source above the plane from its reflection below it. Both fit
+    # to the last digit, so this is not something a better optimiser or a longer capture fixes.
+    cop = PL.coplanarity(P)
+    d3 = (PL.dop3(P, s) if len(P) >= 4
+          else {"hdop": float("inf"), "vdop": float("inf"), "pdop": float("inf"),
+                "dof": 0, "singular": True})
+    # A DECLARED height is not an observed one. Saying up_observable True here because the number
+    # happens to be exact would be the worst possible lie: it is exact because it was assumed.
+    up_obs = obs and not cop["coplanar"] and fixed_up_m is None
+    mirror = (_mirror_through_plane(s, P, cop["plane_normal"])
+              if (obs and fixed_up_m is None) else None)
+
+    # When the node plane is near-horizontal, "the other one is below the array" is a physical
+    # statement and not a coordinate accident, so it is worth naming. This is a PREFERENCE from
+    # outside the data, never a measurement: up_observable stays False either way.
+    up_pref = None
+    if obs and not up_obs and mirror is not None and cop["near_horizontal"]:
+        hi = s if s[2] >= mirror[2] else mirror
+        up_pref = ("the node plane is within 26 deg of horizontal, so the twin at up=%.1f m is "
+                   "below it -- preferring up=%.1f m is an assumption that the source is above "
+                   "the array, not a measurement" % (min(s[2], mirror[2]), hi[2]))
+
+    return {
+        "east_m": float(s[0]) if obs else None,
+        "north_m": float(s[1]) if obs else None,
+        "up_m": float(s[2]) if obs else None,
+        "position_observable": obs,
+        "up_observable": up_obs,
+        "up_mirror_m": float(mirror[2]) if (mirror is not None and not up_obs) else None,
+        "up_preferred_reason": up_pref,
+        "t0_utc_s": t0 if obs else None,
+        "range_m": float(np.linalg.norm(s - P.mean(axis=0))) if obs else None,
+        "ground_range_m": float(np.linalg.norm(s[:2] - P.mean(axis=0)[:2])) if obs else None,
+        "rms_residual_ms": rms_ms,
+        "at_search_bound": at_bound,
+        # Three unknowns now, so four nodes give an exact fit whose residual is ~0 by
+        # construction. Five is where it starts carrying information -- one more than before.
+        "residual_is_meaningful": n_eq > n_unk,
+        "n_nodes": len(P), "n_equations": n_eq, "n_unknowns": n_unk,
+        "up_assumed_m": float(fixed_up_m) if fixed_up_m is not None else None,
+        "sound_speed_mps": c,
+        "dop": PL.dop(P, s)["dop"],
+        # hdop/vdop reported separately because they are not interchangeable: the vertical is the
+        # weak axis of a ground-based array by construction, and a single combined figure hides
+        # exactly the component this project keeps getting wrong.
+        "hdop": d3["hdop"], "vdop": d3["vdop"], "pdop": d3["pdop"],
+        "dop_dof": d3["dof"], "dop_singular": d3["singular"],
+        "linearity": lin,
+        "planarity_rms_m": cop["planarity_rms_m"],
+        "vertical_spread_m": cop["vertical_spread_m"],
+        "source_class": source_class,
+        "note": (
+            "source height was DECLARED as %.2f m, not measured: two unknowns, so three nodes "
+            "suffice. Every reported coordinate is conditional on that height being right -- if "
+            "the source is 10 m up and this said 0, the horizontal answer absorbs the error."
+            % fixed_up_m if (fixed_up_m is not None and obs and not at_bound) else
+            "solution is pinned at the edge of the searched region (search_margin_m=%.0f): the "
+            "source is outside it, or a point-source model does not fit this data. The "
+            "coordinates are the box edge, not a measurement." % search_margin_m
+            if at_bound else
+            "nodes are collinear (linearity %.4f): position is UNOBSERVABLE -- the source and "
+            "its mirror reflected across the node line fit identically at zero residual." % lin
+            if not obs else
+            "nodes are coplanar (planarity rms %.3f m over %.1f m of vertical spread): HEIGHT is "
+            "unobservable -- up=%.1f m and up=%.1f m fit identically. East/north are unaffected. "
+            "Breaking the plane, not improving the timing, is what fixes this."
+            % (cop["planarity_rms_m"], cop["vertical_spread_m"], s[2], mirror[2])
+            if not up_obs else None),
+    }
+
+
 def solve(positions: Sequence, arrivals: Sequence[float], source_class: str,
           temp_c: float = 20.0, search_margin_m: float = 500.0,
-          grid_step_m: float = 10.0) -> Dict:
+          grid_step_m: float = 10.0, fixed_up_m: Optional[float] = None) -> Dict:
     """Fit a stationary source position to arrival times.
 
     `positions` are east/north/up metres in one local frame; 2-vectors are read as up=0.
@@ -145,15 +226,29 @@ def solve(positions: Sequence, arrivals: Sequence[float], source_class: str,
     an UNOBSERVABLE note when the nodes are collinear, because the fit has a mirror twin across
     the node line that matches it to the last digit.
     """
+    # fixed_up_m DECLARES the source height instead of solving for it: two unknowns, so three
+    # nodes suffice again. This exists because going 3D raised the minimum node count from three
+    # to four, and a lot of real arrays sit at three -- two PPS nodes plus a phone, say. Assuming
+    # the source is on the ground is often true and always a CHOICE; the point is that it is now
+    # written in the call and echoed in the result, rather than being smuggled in by a solver that
+    # silently ignores the third axis. That was the old behaviour and it is what this whole change
+    # set exists to remove.
+    n_unk = 2 if fixed_up_m is not None else 3
+    min_nodes = n_unk + 1
+
     # Two distinct faults, reported distinctly. Folding them into one message made a length
     # mismatch of 4 positions against 3 arrivals say "need >= 4 nodes ... got 4", which sends the
     # reader to count nodes they already have enough of.
     if len(positions) != len(arrivals):
         raise ValueError("positions and arrivals must be the same length: got %d and %d"
                          % (len(positions), len(arrivals)))
-    if len(positions) < 4:
-        raise ValueError("need >= 4 nodes for a 3D fit: t0 cancels, so N nodes give N-1 "
-                         "equations for 3 unknowns; got %d" % len(positions))
+    if len(positions) < min_nodes:
+        raise ValueError(
+            "need >= %d nodes for a %dD fit: t0 cancels, so N nodes give N-1 equations for %d "
+            "unknowns; got %d%s"
+            % (min_nodes, n_unk, n_unk, len(positions),
+               "" if fixed_up_m is not None else
+               ". Pass fixed_up_m to declare the source height and solve in 2D instead"))
     if source_class in CONE_CLASSES:
         raise ValueError("source class %r radiates off a Mach cone, not from a point: "
                          "use shockwave.solve" % (source_class,))
@@ -196,6 +291,27 @@ def solve(positions: Sequence, arrivals: Sequence[float], source_class: str,
     # best. On a coplanar array the two sides are mirror twins and score identically, which is the
     # ambiguity `up_observable` reports; on a broken plane they are not, and this is what finds
     # the real one.
+    # With the height declared there are genuinely two unknowns, so the optimiser is given two.
+    # Equal bounds were tried first and least_squares rejects them ("each lower bound must be
+    # strictly less than each upper"); an epsilon-wide window would have worked numerically and
+    # lied about the dimensionality. These wrappers reuse _residual and _jacobian unchanged, so
+    # the 2D and 3D paths cannot drift apart -- the Jacobian simply loses its third column.
+    if fixed_up_m is not None:
+        u0 = float(fixed_up_m)
+        _lift = lambda s2: np.array([s2[0], s2[1], u0])
+        fit = least_squares(lambda s2, *a: _residual(_lift(s2), *a),
+                            seed[:2], jac=lambda s2, *a: _jacobian(_lift(s2), *a)[:, :2],
+                            args=(P, t, c), bounds=(lo[:2], hi[:2]),
+                            xtol=1e-14, ftol=1e-14, gtol=1e-14)
+        s = _lift(fit.x)
+        _chk = slice(0, 2)
+        at_bound = bool(np.any(np.isclose(s[:2], lo[:2], atol=1e-6))
+                        or np.any(np.isclose(s[:2], hi[:2], atol=1e-6)))
+        res = _residual(s, P, t, c)
+        rms_ms = math.sqrt(float(res @ res) / n_eq) * 1000.0
+        t0 = t_ref + float(np.mean(t - np.linalg.norm(s[None, :] - P, axis=1) / c))
+        return _report(s, P, t, c, n_eq, n_unk, rms_ms, t0, at_bound, source_class,
+                       search_margin_m, fixed_up_m)
     nrm = np.asarray(PL.coplanarity(P)["plane_normal"], float)
     span = float(np.linalg.norm(P.max(axis=0) - P.min(axis=0)))
     nudge = max(0.05 * span, 1.0)
@@ -211,73 +327,11 @@ def solve(positions: Sequence, arrivals: Sequence[float], source_class: str,
     # Pinned means the best fit is outside the searched region: either the source really is, and
     # the caller should widen search_margin_m, or the model is wrong for this data. Either way it
     # is not a position, and saying so beats quoting the edge of a box as a measurement.
-    at_bound = bool(np.any(np.isclose(s, lo, atol=1e-6)) or np.any(np.isclose(s, hi, atol=1e-6)))
+    _chk = slice(0, 2) if fixed_up_m is not None else slice(0, 3)
+    at_bound = bool(np.any(np.isclose(s[_chk], lo[_chk], atol=1e-6))
+                    or np.any(np.isclose(s[_chk], hi[_chk], atol=1e-6)))
     res = _residual(s, P, t, c)
     rms_ms = math.sqrt(float(res @ res) / n_eq) * 1000.0
     t0 = t_ref + float(np.mean(t - np.linalg.norm(s[None, :] - P, axis=1) / c))
-    lin = PL.linearity(P)
-    obs = lin >= PL.COLLINEAR_LINEARITY
-
-    # Height observability is a SEPARATE question from horizontal observability, and for this
-    # project it is usually the one that bites: nodes sitting on the ground are coplanar, and a
-    # coplanar array cannot tell a source above the plane from its reflection below it. Both fit
-    # to the last digit, so this is not something a better optimiser or a longer capture fixes.
-    cop = PL.coplanarity(P)
-    d3 = (PL.dop3(P, s) if len(P) >= 4
-          else {"hdop": float("inf"), "vdop": float("inf"), "pdop": float("inf"),
-                "dof": 0, "singular": True})
-    up_obs = obs and not cop["coplanar"]
-    mirror = _mirror_through_plane(s, P, cop["plane_normal"]) if obs else None
-
-    # When the node plane is near-horizontal, "the other one is below the array" is a physical
-    # statement and not a coordinate accident, so it is worth naming. This is a PREFERENCE from
-    # outside the data, never a measurement: up_observable stays False either way.
-    up_pref = None
-    if obs and not up_obs and mirror is not None and cop["near_horizontal"]:
-        hi = s if s[2] >= mirror[2] else mirror
-        up_pref = ("the node plane is within 26 deg of horizontal, so the twin at up=%.1f m is "
-                   "below it -- preferring up=%.1f m is an assumption that the source is above "
-                   "the array, not a measurement" % (min(s[2], mirror[2]), hi[2]))
-
-    return {
-        "east_m": float(s[0]) if obs else None,
-        "north_m": float(s[1]) if obs else None,
-        "up_m": float(s[2]) if obs else None,
-        "position_observable": obs,
-        "up_observable": up_obs,
-        "up_mirror_m": float(mirror[2]) if (mirror is not None and not up_obs) else None,
-        "up_preferred_reason": up_pref,
-        "t0_utc_s": t0 if obs else None,
-        "range_m": float(np.linalg.norm(s - P.mean(axis=0))) if obs else None,
-        "ground_range_m": float(np.linalg.norm(s[:2] - P.mean(axis=0)[:2])) if obs else None,
-        "rms_residual_ms": rms_ms,
-        "at_search_bound": at_bound,
-        # Three unknowns now, so four nodes give an exact fit whose residual is ~0 by
-        # construction. Five is where it starts carrying information -- one more than before.
-        "residual_is_meaningful": n_eq > 3,
-        "n_nodes": len(P), "n_equations": n_eq, "n_unknowns": 3,
-        "sound_speed_mps": c,
-        "dop": PL.dop(P, s)["dop"],
-        # hdop/vdop reported separately because they are not interchangeable: the vertical is the
-        # weak axis of a ground-based array by construction, and a single combined figure hides
-        # exactly the component this project keeps getting wrong.
-        "hdop": d3["hdop"], "vdop": d3["vdop"], "pdop": d3["pdop"],
-        "dop_dof": d3["dof"], "dop_singular": d3["singular"],
-        "linearity": lin,
-        "planarity_rms_m": cop["planarity_rms_m"],
-        "vertical_spread_m": cop["vertical_spread_m"],
-        "source_class": source_class,
-        "note": (
-            "solution is pinned at the edge of the searched region (search_margin_m=%.0f): the "
-            "source is outside it, or a point-source model does not fit this data. The "
-            "coordinates are the box edge, not a measurement." % search_margin_m
-            if at_bound else
-            "nodes are collinear (linearity %.4f): position is UNOBSERVABLE -- the source and "
-            "its mirror reflected across the node line fit identically at zero residual." % lin
-            if not obs else
-            "nodes are coplanar (planarity rms %.3f m over %.1f m of vertical spread): HEIGHT is "
-            "unobservable -- up=%.1f m and up=%.1f m fit identically. East/north are unaffected. "
-            "Breaking the plane, not improving the timing, is what fixes this."
-            % (cop["planarity_rms_m"], cop["vertical_spread_m"], s[2], mirror[2])
-            if not up_obs else None),
-    }
+    return _report(s, P, t, c, n_eq, n_unk, rms_ms, t0, at_bound, source_class,
+                   search_margin_m, fixed_up_m)
