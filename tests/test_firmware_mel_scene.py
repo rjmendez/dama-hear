@@ -114,12 +114,45 @@ def test_the_declared_edges_describe_the_table():
     assert d("MELS_F_HI") == pytest.approx(freqs[top]) == pytest.approx(7812.5)
 
 
-def test_no_band_is_empty():
-    """The generator's own SystemExit condition, asserted against the shipped artefact. An empty
-    band emits a constant -120 dB column that reads as a measurement of silence."""
-    for b, (lo, n) in enumerate(_pairs(SCENE_H, "MELS")):
+def test_no_band_is_empty_and_none_of_them_sits_on_DC():
+    """The generator's own two refusals, asserted against the shipped artefact.
+
+    An empty band emits a constant -120 dB column that reads as a measurement of silence. A band
+    holding bin 0 emits the DC offset the node's 1.6 Hz block exists to remove, as if it were
+    signal -- which is why the generator sets F_LO = FS/NFFT, bin 1, rather than lower.
+
+    ⚠️THE DC HALF USED TO BE DEAD. It read `assert lo > 0 or b == 0`, and band 0 is the ONLY band
+    that can hold bin 0, so the clause exempted the single case it was written for and could not
+    fail. Scoped honestly: measured against today's generator it still cannot fail from a constant
+    edit, because mel_filterbank's triangle rises from zero AT its lower edge, so bin 0 gets weight
+    exactly 0.0 even at f_lo=0.0 -- checked at f_lo in (0, 10, 20, 31.25, 62.5), all of which put
+    band 0 at bin 1. What it does cover is the ARTEFACT: a hand-edited mel_scene.h, or a future
+    bank whose windows are not triangles-from-zero. `MELS_FB_LO[0] == 1` below is the falsifiable
+    half -- raising F_LO moves it (f_lo=300 would give bin 5).
+    """
+    pairs = _pairs(SCENE_H, "MELS")
+    for b, (lo, n) in enumerate(pairs):
         assert n > 0, "scene band %d has no FFT bins under it" % b
-        assert lo > 0 or b == 0, "band %d starts at DC" % b
+        assert lo > 0, "band %d holds bin 0 (DC)" % b
+    assert pairs[0][0] == 1, \
+        "band 0 starts at bin %d, not the first bin above DC -- F_LO has moved" % pairs[0][0]
+
+
+def test_the_generators_fixed_layout_count_is_this_banks_number_not_the_sketchs():
+    """⚠️A CONSTANT TRANSPLANTED BETWEEN TWO BANKS. gen_mel_scene.py justifies LAYOUT=nyquist by
+    what FIXED would cost, and said `5 of 20 bands above Nyquist and empty`. Measured with THIS
+    bank's own f_lo (62.5 Hz = FS/NFFT) the answer is 4, bands 16..19. The 5 is mel_filterbank's
+    docstring number, and that one is for SK.F_LO=300 -- a different lower edge gives different
+    mel edges all the way up. Both counts are asserted here so the comment cannot drift back.
+    """
+    def empties(f_lo, layout):
+        fb = SK.mel_filterbank(WANT_FS, WANT_NFFT, WANT_BANDS, f_lo=f_lo, f_hi=WANT_F_HI,
+                               layout=layout)
+        return [b for b in range(WANT_BANDS) if not len(np.nonzero(fb[b])[0])]
+
+    assert empties(WANT_FS / WANT_NFFT, "fixed") == [16, 17, 18, 19]      # this bank: 4
+    assert len(empties(300.0, "fixed")) == 5                              # the sketch's: 5
+    assert empties(WANT_FS / WANT_NFFT, WANT_LAYOUT) == []                # shipped: none
 
 
 def test_regenerating_the_header_reproduces_it_byte_for_byte(tmp_path):

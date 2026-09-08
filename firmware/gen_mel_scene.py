@@ -49,10 +49,14 @@ F_LO = FS / SK.NFFT
 F_HI = 20000.0
 # ⚠️LAYOUT IS A CHOICE, NOT A DEFAULT. NYQUIST is passed explicitly for the same reason F_HI is:
 # it must not be inherited from SK's editable default. At 16 kHz -- the only rate this bank is
-# ever compiled for -- NYQUIST spans the whole usable spectrum, where FIXED would put 5 of 20
-# bands above Nyquist and empty (the generator refuses an empty band below, so a FIXED bank could
-# not ship here at all). Changing this changes what band k MEANS in every scene row ever written,
-# and the corpus's f_lo_hz/f_hi_hz columns are what would record the change.
+# ever compiled for -- NYQUIST spans the whole usable spectrum, where FIXED leaves 4 of 20 bands
+# (16..19) with no FFT bin under them, so the empty-band refusal below means a FIXED bank could
+# not ship here at all. MEASURED with THIS bank's own f_lo=62.5, not inherited: mel_filterbank's
+# docstring says 5 of 20, but that is SK.F_LO=300, a different lower edge and therefore different
+# edges all the way up -- 5 is the detection bank's number and 4 is this one's.
+# tests/test_firmware_mel_scene.py pins both counts so neither can drift back into prose.
+# Changing this changes what band k MEANS in every scene row ever written, and the corpus's
+# f_lo_hz/f_hi_hz columns are what would record the change.
 LAYOUT = SK.LAYOUT_NYQUIST
 
 
