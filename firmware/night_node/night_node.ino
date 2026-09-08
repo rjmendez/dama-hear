@@ -2631,6 +2631,13 @@ void loop() {
       last_try_ms = millis();
       logf("gps   nothing decoded in %lus -- re-running bring-up (attempt %lu)\n",
            (unsigned long)(up_ms / 1000), (unsigned long)(++gps_retries));
+      // The sweep detaches the UART and re-sends CFG-VALSET, which drops the timepulse for
+      // ~11 s. Without this flag that gap is averaged in as a real PPS interval: mach came back
+      // reporting a 3.95 SECOND spread and two glitches, which is a health metric reading as
+      // catastrophic failure because of a diagnostic. Every probe route already declares its own
+      // disturbance this way; this path is a probe too.
+      pps_resync = true; pps_resyncs++; fs_clean_secs = 0;
+      pps_int_min = 0xFFFFFFFF; pps_int_max = 0;
       gps_bringup();
       logf("gps   bring-up retry done: %s, RX=GPIO%d, %lu baud\n",
            gps_pin_src, gps_rx_pin, (unsigned long)gps_baud);
