@@ -25,6 +25,7 @@ FILES = [
     ("hear_sketch.py", "hear/sketch.py"),
     ("hear_corpus.py", "hear/corpus.py"),
     ("hear_detsfile.py", "hear/detsfile.py"),
+    ("hear_scenefile.py", "hear/scenefile.py"),
     ("hear_pool.py", "hear/pool.py"),
     ("tools_hear_drain.py", "tools/hear_drain.py"),
 ]

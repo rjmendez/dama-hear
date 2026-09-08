@@ -6,7 +6,7 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: '68e7ac7-dirty'
+    dama-hear/commit: '07a2fda-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
 data:
   hear__init__.py: |
@@ -754,6 +754,230 @@ data:
         with open(path, "r", errors="replace") as fh:
             return read_text(fh.read(), default_node=default_node)
     
+  hear_scenefile.py: |
+    #!/usr/bin/env python3
+    """Read a node's `scene.csv` -- the CONTINUOUS descriptor, not the gated one.
+    
+    ⚠️THIS IS THE CORPUS, AND `dets.csv` IS THE EXCEPTION. A detection row exists only when the
+    impulse gate fired, so a pool built from `dets.csv` alone can hold nothing but impulsive events
+    and structurally cannot represent the acoustic world the gate is silent for -- which is nearly
+    all of it. `scene.csv` carries one row every ~1.024 s whether or not anything triggered. Cicadas,
+    traffic, aircraft, rain, machinery, the diurnal cycle and the room's own noise floor are all
+    HERE and nowhere else. dama-hear is not a gunshot project; the sketch is deliberately
+    uninterpreted so the central side can train new classifiers on the same bytes forever, and this
+    is the file that makes that true rather than aspirational.
+    
+    ⚠️A SCENE ROW IS NOT A WIRE FRAME. `mel_hex` is a BARE `bands x slices` int8 array, band-major
+    (index `b*slices + s`), each cell a 0.5 dB step below the row's OWN `ref_db4` reference in
+    quarter-dB. There is no v1/v2 header on it and `hear.wire.decode` would reject it. The geometry
+    comes from the row's `bands` and `slices` columns -- which is why they are columns -- and the
+    length is CHECKED against them, because a truncated line is otherwise indistinguishable from a
+    smaller descriptor.
+    
+    ⚠️THE SECOND AXIS IS `slices`, NOT `frames`. The row's `frames` column is how many FFT frames the
+    node summed into each slice; it says how much averaging is behind a cell and it is NOT the shape.
+    Conflating them silently changes what a feature vector means.
+    
+    The generations, all with headers that describe their own rows (unlike `dets.csv` G3):
+    
+        S0  10 cols   utc_us..mel_hex                      the shape hear_bridge.SCENE_COLUMNS pins
+        S1  12 cols   + f_lo_hz, f_hi_hz                   the band edges stated per row
+        S2  13 cols   node, ...                            node named by the file
+    """
+    from __future__ import annotations
+    
+    import csv
+    from dataclasses import dataclass, field
+    from typing import Any, Dict, List, Optional, Sequence, Tuple
+    
+    import numpy as np
+    
+    _BASE = ("utc_us", "uptime_s", "sample", "bands", "slices", "span_ms", "ref_db4", "frames",
+             "fft_us", "mel_hex")
+    
+    
+    @dataclass(frozen=True)
+    class Generation:
+        name: str
+        declared: Tuple[str, ...]
+        written: Tuple[str, ...]
+    
+        @property
+        def broken_header(self) -> bool:
+            return self.declared != self.written
+    
+    
+    S0 = Generation("S0", _BASE, _BASE)
+    S1 = Generation("S1", _BASE + ("f_lo_hz", "f_hi_hz"), _BASE + ("f_lo_hz", "f_hi_hz"))
+    S2 = Generation("S2", ("node",) + _BASE + ("f_lo_hz", "f_hi_hz"),
+                    ("node",) + _BASE + ("f_lo_hz", "f_hi_hz"))
+    
+    GENERATIONS: Tuple[Generation, ...] = (S0, S1, S2)
+    LATEST = S2
+    
+    
+    class UnknownSchema(ValueError):
+        """The header matches no generation. Carries the header so the caller can add one."""
+    
+    
+    @dataclass
+    class SceneRead:
+        generation: Generation
+        rows: List[Dict[str, Any]] = field(default_factory=list)
+        skips: List[Tuple[int, str]] = field(default_factory=list)
+        counts: Dict[str, int] = field(default_factory=dict)
+        header: Tuple[str, ...] = ()
+        partial_first_line: bool = False
+    
+        def _skip(self, line: int, reason: str) -> None:
+            self.skips.append((line, reason))
+            self.counts[reason] = self.counts.get(reason, 0) + 1
+    
+        def summary(self) -> Dict[str, Any]:
+            return {"generation": self.generation.name, "rows": len(self.rows),
+                    "skipped": len(self.skips), "reasons": dict(self.counts),
+                    "partial_first_line": self.partial_first_line}
+    
+    
+    def identify(header: Sequence[str]) -> Generation:
+        h = tuple(c.strip() for c in header)
+        for g in GENERATIONS:
+            if h == g.declared:
+                return g
+        for g in GENERATIONS:
+            if h[:len(g.declared)] == g.declared:
+                raise UnknownSchema(
+                    "scene.csv header extends %s with %r. S2 prepended a column and S1 appended two, "
+                    "so neither end is safe to assume: add the generation to hear/scenefile.py."
+                    % (g.name, list(h[len(g.declared):])))
+        raise UnknownSchema("scene.csv header %r matches no known generation (%s)"
+                            % (list(h), ", ".join(g.name for g in GENERATIONS)))
+    
+    
+    def decode_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        """One row's `mel_hex` -> {q, ref_db, bands, slices, span_ms, frames_summed}.
+    
+        Raises ValueError with the reason. Every geometry field is read from the ROW; nothing here
+        pins a shape, because `SCENE_SLICES` and `SCENE_FRAMES_PER_SLICE` are firmware's to change.
+        """
+        def _int(k):
+            v = row.get(k)
+            if v in (None, ""):
+                return None
+            try:
+                return int(float(v))
+            except (TypeError, ValueError):
+                return None
+    
+        bands, slices = _int("bands"), _int("slices")
+        if not bands or not slices or bands < 1 or slices < 1:
+            raise ValueError("bands=%r slices=%r; both required and positive"
+                             % (row.get("bands"), row.get("slices")))
+        s = str(row.get("mel_hex") or "").strip()
+        if not s:
+            raise ValueError("empty mel_hex")
+        if len(s) != 2 * bands * slices:
+            raise ValueError("mel_hex is %d hex chars, %dx%d needs %d"
+                             % (len(s), bands, slices, 2 * bands * slices))
+        try:
+            b = bytes.fromhex(s)
+        except ValueError as e:
+            raise ValueError("mel_hex is not hex: %s" % e)
+        ref4 = _int("ref_db4")
+        if ref4 is None:
+            raise ValueError("no ref_db4, so the cells have no reference level")
+        span = row.get("span_ms")
+        if span in (None, ""):
+            raise ValueError("no span_ms, so the window this row describes is unknown")
+        try:
+            span = float(span)
+        except (TypeError, ValueError):
+            raise ValueError("span_ms is %r, not a number" % (span,))
+        if span <= 0:
+            raise ValueError("span_ms is %r; a row covers a positive interval" % (span,))
+        return {"q": np.frombuffer(b, dtype=np.int8).reshape(bands, slices),
+                "ref_db": ref4 / 4.0, "bands": bands, "slices": slices,
+                "span_ms": span, "frames_summed": _int("frames")}
+    
+    
+    def read_text(text: str, default_node: Optional[str] = None,
+                  allow_partial_first_line: bool = False) -> SceneRead:
+        """Parse a scene.csv's text.
+    
+        `allow_partial_first_line` is for a BYTE-RANGE fetch. `GET /sd?file=scene.csv&tail=N` starts
+        mid-line and carries no header, so the caller states the generation is known and the first
+        fragment is dropped rather than parsed into a plausible wrong row -- the failure `dets.csv`
+        G3 already taught this project. It is off by default: a whole file that begins mid-row is a
+        corrupt file, not a partial fetch, and the two must not read the same.
+        """
+        lines = text.splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        if not lines:
+            raise ValueError(
+                "scene.csv is empty: %d byte(s), no header and no rows. A file the node created but "
+                "never wrote, and one whose content was lost, both read like this; neither is a "
+                "quiet interval, which still carries the header and its rows." % len(text))
+    
+        header = tuple(c.strip() for c in next(csv.reader([lines[0]])))
+        partial = False
+        if allow_partial_first_line:
+            try:
+                gen = identify(header)
+                body = lines[1:]
+            except UnknownSchema:
+                # No header: a tail fetch. Infer the generation from the row width, drop the leading
+                # fragment, and record that we did -- an unreported drop is the bug this file exists
+                # to not repeat.
+                rows = [r for r in csv.reader(lines[1:]) if r]
+                if not rows:
+                    raise ValueError("tail fetch carried no complete row")
+                widths = {}
+                for r in rows:
+                    widths[len(r)] = widths.get(len(r), 0) + 1
+                width = max(widths, key=widths.get)
+                match = [g for g in GENERATIONS if len(g.written) == width]
+                if not match:
+                    raise UnknownSchema(
+                        "tail fetch rows are %d wide, which matches no generation (%s)"
+                        % (width, ", ".join("%s=%d" % (g.name, len(g.written)) for g in GENERATIONS)))
+                gen = match[0]
+                body = lines[1:]
+                partial = True
+        else:
+            gen = identify(header)
+            body = lines[1:]
+    
+        out = SceneRead(generation=gen, header=header, partial_first_line=partial)
+        width = len(gen.written)
+        if partial:
+            # ⚠️COUNTED, not merely flagged. The fragment is a line this read threw away, and a drop
+            # that lives only in a boolean is a drop nobody totals. It lands in skip_reasons beside
+            # every other refusal, so `rows == added + duplicate + skipped` still closes upstream.
+            out._skip(1, "partial_first_line")
+        for n, row in enumerate(csv.reader(body), start=2):
+            if not row or not any(c.strip() for c in row):
+                continue
+            if len(row) != width:
+                out._skip(n, "row_width_%d_expected_%d" % (len(row), width))
+                continue
+            d = dict(zip(gen.written, (c.strip() for c in row)))
+            if d.get("node"):
+                d["node_from"] = "file"
+            else:
+                if not default_node:
+                    out._skip(n, "no_node")
+                    continue
+                d["node"], d["node_from"] = default_node, "argument"
+            d["schema"] = gen.name
+            out.rows.append(d)
+        return out
+    
+    
+    def read_file(path: str, default_node: Optional[str] = None) -> SceneRead:
+        with open(path, "r", errors="replace") as fh:
+            return read_text(fh.read(), default_node=default_node)
+    
   hear_pool.py: |
     #!/usr/bin/env python3
     """One append-only pool holding every sketch both kinds of sensor have ever produced.
@@ -792,13 +1016,17 @@ data:
     
     import base64
     import binascii
+    import gzip
     import hashlib
     import json
     import os
     from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
     
+    import numpy as np
+    
     from . import corpus as C
     from . import detsfile as DF
+    from . import scenefile as SF
     from . import sketch as SK
     
     SCHEMA_VERSION = 1
@@ -879,9 +1107,15 @@ data:
         def __init__(self, root: str):
             self.root = os.path.expanduser(root)
             self.records_dir = os.path.join(self.root, "records")
+            # ⚠️A SEPARATE STORE, ON PURPOSE. A scene row is one every ~1.024 s whether or not
+            # anything happened; a detection row exists only when the gate fired. Putting ~168k
+            # continuous rows a day beside 1045 event rows would make `records` a number that means
+            # two things at once, and every ratio computed from it wrong. Same discipline that keeps
+            # health.csv archived but not ingested.
+            self.scene_dir = os.path.join(self.root, "scene")
             self.ledger_path = os.path.join(self.root, "ledger.jsonl")
             self.state_dir = os.path.join(self.root, "state")
-            for d in (self.root, self.records_dir, self.state_dir):
+            for d in (self.root, self.records_dir, self.scene_dir, self.state_dir):
                 os.makedirs(d, exist_ok=True)
             self._keys: Optional[set] = None
     
@@ -1045,6 +1279,210 @@ data:
             self._ledger(entry)
             return entry
     
+        # ---------------------------------------------------------------- scene
+    
+        def _scene_path(self, day: str, node: str) -> str:
+            d = os.path.join(self.scene_dir, day)
+            os.makedirs(d, exist_ok=True)
+            return os.path.join(d, "%s.jsonl.gz" % node)
+    
+        def _scene_keys(self, day: str, node: str) -> set:
+            """Keys already stored for ONE day and node.
+    
+            ⚠️Deliberately NOT a whole-pool key set. Scene is ~84k rows per node per day, so a month
+            is millions of keys and holding them all to deduplicate one 15-minute fetch trades a
+            bounded problem for an unbounded one. A fetch only ever appends to the day(s) it covers,
+            so only those days need loading.
+            """
+            p = self._scene_path(day, node)
+            ks = set()
+            if not os.path.exists(p):
+                return ks
+            with gzip.open(p, "rt") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ks.add(json.loads(line)["key"])
+                    except Exception:
+                        continue
+            return ks
+    
+        def ingest_scene(self, path: str, default_node: Optional[str] = None,
+                         origin: Optional[str] = None, partial: bool = False) -> Dict[str, Any]:
+            """Ingest one `scene.csv` (or a byte-range tail of one). Idempotent.
+    
+            `partial=True` says this text came from `GET /sd?file=scene.csv&tail=N`, which starts
+            mid-line and carries no header. The leading fragment is DROPPED and the drop is reported
+            -- see `hear.scenefile.read_text`. Off by default so a whole file that begins mid-row
+            still reads as the corruption it is.
+            """
+            raw = open(path, "rb").read()
+            sha = hashlib.sha256(raw).hexdigest()
+            read = SF.read_text(raw.decode("utf-8", "replace"), default_node=default_node,
+                                allow_partial_first_line=partial)
+    
+            recs: List[Dict[str, Any]] = []
+            bad: Dict[str, int] = {}
+            for row in read.rows:
+                try:
+                    d = SF.decode_row(row)
+                except ValueError as e:
+                    r = "decode_" + str(e).split(":")[0].split(",")[0].strip().replace(" ", "_")[:40]
+                    bad[r] = bad.get(r, 0) + 1
+                    continue
+                except Exception as e:
+                    r = "decode_" + type(e).__name__
+                    bad[r] = bad.get(r, 0) + 1
+                    continue
+                utc_us = int(row.get("utc_us") or 0)
+                node = row["node"]
+                ts = (utc_us / 1e6) if utc_us > 0 else None
+                recs.append({
+                    "schema_version": SCHEMA_VERSION,
+                    # The mel bytes are in the key for the same reason the sketch frame is: utc_us is
+                    # 0 for every pre-PPS row, and a boot's worth of them would otherwise collapse
+                    # into one record.
+                    "key": key("scene", node, utc_us, row.get("sample"), d["q"].tobytes()),
+                    "source": "scene", "node": node, "node_from": row.get("node_from"),
+                    "utc_us": utc_us, "anchored": utc_us > 0, "ts_utc_s": ts,
+                    "mel_b64": base64.b64encode(d["q"].tobytes()).decode(),
+                    "ref_db": d["ref_db"], "bands": d["bands"],
+                    # `slices`, never `frames`. The row's `frames` column is how many FFT frames were
+                    # summed into each slice -- the averaging behind a cell, not the shape.
+                    "slices": d["slices"], "frames_summed": d["frames_summed"],
+                    "span_ms": d["span_ms"],
+                    "f_lo_hz": float(row["f_lo_hz"]) if row.get("f_lo_hz") else None,
+                    "f_hi_hz": float(row["f_hi_hz"]) if row.get("f_hi_hz") else None,
+                    "fft_us": row.get("fft_us"),
+                    "sample": row.get("sample"), "uptime_s": row.get("uptime_s"),
+                    "scene_schema": row.get("schema"),
+                })
+    
+            by_bucket: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+            for r in recs:
+                by_bucket.setdefault((_day(r.get("ts_utc_s")), r["node"]), []).append(r)
+            added = 0
+            for (day, node), rows in by_bucket.items():
+                seen = self._scene_keys(day, node)
+                fresh = []
+                for r in rows:
+                    if r["key"] in seen:
+                        continue
+                    seen.add(r["key"])
+                    fresh.append(json.dumps(r, sort_keys=True))
+                if not fresh:
+                    continue
+                with gzip.open(self._scene_path(day, node), "at") as fh:
+                    fh.write("\n".join(fresh) + "\n")
+                added += len(fresh)
+    
+            reasons = dict(read.counts)
+            for k, v in bad.items():
+                reasons[k] = reasons.get(k, 0) + v
+            skipped = len(read.skips) + sum(bad.values())
+            entry = {
+                "kind": "scene.csv", "path": os.path.abspath(path), "origin": origin or path,
+                "sha256": sha, "bytes": len(raw), "generation": read.generation.name,
+                "rows": len(read.rows) + len(read.skips), "decoded": len(recs), "added": added,
+                "duplicate": len(recs) - added, "skipped": skipped, "skip_reasons": reasons,
+                "decode_errors": bad, "partial_first_line": read.partial_first_line,
+                "schema_version": SCHEMA_VERSION,
+            }
+            assert entry["rows"] == added + entry["duplicate"] + skipped, entry
+            self._ledger(entry)
+            return entry
+    
+        def scene(self, node: Optional[str] = None, day: Optional[str] = None,
+                  anchored_only: bool = False) -> Iterator[Dict[str, Any]]:
+            """Every stored scene row, oldest partition first. A generator: a month of these is
+            millions of rows and materialising them as a list is not something a caller should do by
+            accident."""
+            if not os.path.isdir(self.scene_dir):
+                return
+            for d in sorted(os.listdir(self.scene_dir)):
+                if day and d != day:
+                    continue
+                p = os.path.join(self.scene_dir, d)
+                if not os.path.isdir(p):
+                    continue
+                for fn in sorted(os.listdir(p)):
+                    if not fn.endswith(".jsonl.gz"):
+                        continue
+                    if node and fn != "%s.jsonl.gz" % node:
+                        continue
+                    with gzip.open(os.path.join(p, fn), "rt") as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            r = json.loads(line)
+                            if anchored_only and not r.get("anchored"):
+                                continue
+                            yield r
+    
+        def scene_matrix(self, node: Optional[str] = None, day: Optional[str] = None,
+                         mode: str = "db", limit: Optional[int] = None
+                         ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+            """[n, bands*slices] over stored scene rows, and the rows behind it.
+    
+            Refuses to stack rows of differing geometry rather than reshaping to fit: `bands` and
+            `slices` are firmware's to change, and a matrix whose width silently depends on which
+            firmware happened to be running is not a dataset.
+            """
+            if mode not in ("db", "q"):
+                raise ValueError("mode must be 'db' or 'q'")
+            rows, out = [], []
+            geom = None
+            for r in self.scene(node=node, day=day):
+                g = (r["bands"], r["slices"])
+                if geom is None:
+                    geom = g
+                elif g != geom:
+                    raise ValueError("mixed scene geometry: %s then %s -- select a day or node "
+                                     "whose firmware did not change" % (geom, g))
+                q = np.frombuffer(base64.b64decode(r["mel_b64"]), dtype=np.int8) \
+                    .reshape(r["bands"], r["slices"]).astype(float)
+                rows.append((q / 2.0 + r["ref_db"] if mode == "db" else q).reshape(-1))
+                out.append(r)
+                if limit and len(rows) >= limit:
+                    break
+            if not rows:
+                return np.zeros((0, 0)), []
+            return np.vstack(rows), out
+    
+        def scene_stats(self) -> Dict[str, Any]:
+            """What the scene store holds. Counted by walking it, because a row count taken from the
+            ledger would credit rows a later gzip write could have lost."""
+            n = 0
+            by_node: Dict[str, int] = {}
+            by_day: Dict[str, int] = {}
+            geom: Dict[str, int] = {}
+            anchored = 0
+            first = last = None
+            for r in self.scene():
+                n += 1
+                by_node[r["node"]] = by_node.get(r["node"], 0) + 1
+                d = _day(r.get("ts_utc_s"))
+                by_day[d] = by_day.get(d, 0) + 1
+                g = "%dx%d" % (r["bands"], r["slices"])
+                geom[g] = geom.get(g, 0) + 1
+                anchored += bool(r.get("anchored"))
+                t = r.get("ts_utc_s")
+                if t:
+                    first = t if first is None else min(first, t)
+                    last = t if last is None else max(last, t)
+            bytes_on_disk = 0
+            for dirpath, _dirs, files in os.walk(self.scene_dir):
+                for f in files:
+                    bytes_on_disk += os.path.getsize(os.path.join(dirpath, f))
+            return {"rows": n, "by_node": by_node, "by_day": by_day, "geometry": geom,
+                    "anchored": anchored, "unanchored": n - anchored,
+                    "first_utc_s": first, "last_utc_s": last,
+                    "bytes_on_disk": bytes_on_disk,
+                    "bytes_per_row": round(bytes_on_disk / n, 1) if n else None}
+    
         # ---------------------------------------------------------------- read
     
         def raw(self, source: Optional[str] = None, day: Optional[str] = None
@@ -1132,7 +1570,11 @@ data:
                 anchored += bool(r.get("anchored"))
                 no_ctx += bool(r.get("no_context"))
                 unstated += r.get("fs_hz") is None
-            led = self.ledger()
+            # ⚠️ONLY THE SKETCH INGESTS. The ledger is one log for both stores, so an unfiltered read
+            # here credited this summary with scene.csv's S1/S2 generations and scene's skip tallies
+            # -- a count describing two different things again, which is the bug this pool exists to
+            # not commit.
+            led = [e for e in self.ledger() if e.get("kind") in ("dets.csv", "mqtt.jsonl")]
             skips: Dict[str, int] = {}
             for e in led:
                 for k, v in (e.get("skip_reasons") or {}).items():
@@ -1206,7 +1648,20 @@ data:
     # archived but NOT ingested -- the pool holds sketches, and mixing a second row shape into it
     # would make its counts mean two things.
     DETS_FILES = ("dets.csv", "dets-prev.csv")
+    # ⚠️THE SCENE IS THE CORPUS. dets.csv only exists where the impulse gate fired, so a pool built
+    # from it alone can hold nothing but impulsive events. scene.csv carries a row every ~1.024 s
+    # regardless -- the ambient world this project is also about. See hear/scenefile.py.
+    SCENE_FILES = ("scene.csv", "scene-prev.csv")
     CONTEXT_FILES = ("health.csv",)
+    
+    # ⚠️SCENE IS FETCHED BY TAIL, NOT WHOLE. It grows without bound (11 MB seen; 2-4 minutes to pull
+    # at the node's 40-135 KB/s) and re-fetching all of it every 15 minutes would spend the whole
+    # interval on rows already stored. At ~245 B/row and ~1.024 s/row this window covers about 2.3
+    # hours, so it is self-healing across a run that fails or a node that drops off briefly -- the
+    # ingest is content-addressed, so the overlap costs nothing. A gap LONGER than this is real loss,
+    # which is what hear-drain-check exists to make visible rather than to paper over.
+    SCENE_TAIL_BYTES = 2_000_000
+    SCENE_TAIL_HOURS = 2.3
     
     DEFAULT_TIMEOUT_S = 30.0
     # A node reporting detections at the measured night rate goes quiet for hours in daylight, so
@@ -1224,21 +1679,32 @@ data:
         return json.loads(_get("http://%s/status" % ip, timeout).decode("utf-8", "replace"))
     
     
-    def fetch_sd(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S) -> Optional[bytes]:
+    def fetch_sd(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S,
+                 tail: Optional[int] = None) -> Optional[bytes]:
         """One file off the card, or None if the node does not have it.
     
         A missing `dets-prev.csv` is NORMAL -- it exists only after a roll -- so it is not an error.
         The node answers a missing file with a short body rather than a 404, so the body is checked:
         anything that is not a CSV header is treated as absent and recorded as such.
         """
+        url = "http://%s/sd?file=%s" % (ip, name)
+        if tail:
+            url += "&tail=%d" % int(tail)
         try:
-            body = _get("http://%s/sd?file=%s" % (ip, name), timeout)
+            body = _get(url, timeout)
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return None
             raise
+        if not body.strip():
+            return None
+        # A whole-file fetch must start with a header. A TAIL fetch starts mid-row and legitimately
+        # does not, so it is only checked for having a complete row in it -- the reader drops the
+        # leading fragment and says that it did.
         head = body[:200].lstrip()
-        if not head or not (head.startswith(b"node") or head.startswith(b"utc_us")):
+        if tail:
+            return body if b"\n" in body else None
+        if not (head.startswith(b"node") or head.startswith(b"utc_us")):
             return None
         return body
     
@@ -1257,7 +1723,7 @@ data:
         """Fetch, archive and ingest one node. Never raises for a node-side problem; reports it."""
         stamp = int(stamp if stamp is not None else time.time())
         out: Dict[str, Any] = {"node": node, "ip": ip, "at": stamp, "ok": False,
-                               "files": [], "added": 0, "errors": []}
+                               "files": [], "added": 0, "scene_added": 0, "errors": []}
         try:
             st = fetch_status(ip, timeout)
         except Exception as e:
@@ -1280,6 +1746,32 @@ data:
                                          "archived": archive(pl.root, node, name, body, stamp)})
             except Exception as e:
                 out["errors"].append("%s: %r" % (name, e))
+    
+        for name in SCENE_FILES:
+            # scene-prev.csv is the rolled predecessor and does not grow, so it is fetched whole --
+            # once. The live file is tailed.
+            tail = SCENE_TAIL_BYTES if name == "scene.csv" else None
+            try:
+                body = fetch_sd(ip, name, timeout, tail=tail)
+            except Exception as e:
+                out["errors"].append("%s: %r" % (name, e))
+                continue
+            if body is None:
+                out["files"].append({"name": name, "absent": True})
+                continue
+            path = archive(pl.root, node, name, body, stamp)
+            try:
+                entry = pl.ingest_scene(path, default_node=node, origin="%s:/%s" % (node, name),
+                                       partial=bool(tail))
+            except Exception as e:
+                out["errors"].append("%s: ingest: %r" % (name, e))
+                continue
+            out["scene_added"] = out.get("scene_added", 0) + entry["added"]
+            out["files"].append({"name": name, "bytes": len(body), "ingested": True,
+                                 "scene": True, "archived": path,
+                                 **{k: entry[k] for k in
+                                    ("generation", "rows", "added", "duplicate", "skipped",
+                                     "skip_reasons", "partial_first_line")}})
     
         for name in DETS_FILES:
             try:
@@ -1352,6 +1844,7 @@ data:
             p = os.path.expanduser(p)
             if os.path.isdir(p):
                 todo += sorted(glob.glob(os.path.join(p, "**", "*dets*.csv"), recursive=True))
+                todo += sorted(glob.glob(os.path.join(p, "**", "*scene*.csv"), recursive=True))
                 todo += sorted(glob.glob(os.path.join(p, "**", "sketches-*.jsonl"), recursive=True))
             else:
                 todo.append(p)
@@ -1360,6 +1853,13 @@ data:
             try:
                 if base.startswith("sketches-") and base.endswith(".jsonl"):
                     out.append(pl.ingest_mqtt_jsonl(p))
+                elif "scene" in base:
+                    node = default_node
+                    for known in ("nyquist", "mach", "puc"):
+                        if known in p:
+                            node = known
+                            break
+                    out.append(pl.ingest_scene(p, default_node=node))
                 else:
                     node = default_node
                     for known in ("nyquist", "mach", "puc"):
@@ -1481,7 +1981,8 @@ data:
     
         pl = P.Pool(root)
         if a.stats:
-            print(json.dumps(pl.stats(), indent=2, sort_keys=True))
+            print(json.dumps({"sketches": pl.stats(), "scene": pl.scene_stats()},
+                             indent=2, sort_keys=True))
             return 0
     
         if a.ingest:
@@ -1506,21 +2007,23 @@ data:
             if a.phone_corpus else None
         write_heartbeat(root, results, phone)
     
-        report = {"results": results, "phone": phone, "stats": pl.stats()}
+        report = {"results": results, "phone": phone, "stats": pl.stats(),
+                  "scene_stats": pl.scene_stats()}
         if a.json:
             print(json.dumps(report, indent=2, sort_keys=True))
         else:
             for r in results:
-                print("%-9s %-4s +%d record(s)%s" % (
-                    r["node"], "ok" if r["ok"] else "FAIL", r["added"],
+                print("%-9s %-4s +%d sketch, +%d scene%s" % (
+                    r["node"], "ok" if r["ok"] else "FAIL", r["added"], r.get("scene_added", 0),
                     "" if r["ok"] else "  " + "; ".join(r["errors"])))
                 for f in r["files"]:
                     if f.get("absent"):
                         print("    %-14s absent" % f["name"])
                     elif f.get("ingested"):
-                        print("    %-14s %s  %d row(s) -> +%d new, %d dup, %d skipped %s"
+                        print("    %-15s %s %6d row(s) -> +%-6d new, %6d dup, %d skipped %s%s"
                               % (f["name"], f["generation"], f["rows"], f["added"], f["duplicate"],
-                                 f["skipped"], f["skip_reasons"] or ""))
+                                 f["skipped"], f["skip_reasons"] or "",
+                                 "  [tail]" if f.get("partial_first_line") else ""))
                     else:
                         print("    %-14s %d B archived" % (f["name"], f["bytes"]))
             if phone is not None:
@@ -1528,8 +2031,12 @@ data:
                       % ("ok" if phone.get("ok") else "FAIL", phone["added"],
                          "" if phone.get("ok") else "  " + "; ".join(phone["errors"])))
             s = report["stats"]
-            print("\npool %s: %d record(s), %s, %d anchored / %d not"
+            print("\npool %s\n  sketches %d  %s  (%d anchored / %d not)"
                   % (root, s["records"], s["by_source"], s["anchored"], s["unanchored"]))
+            sc = report["scene_stats"]
+            print("  scene    %d rows  %s  geom %s  %.1f MB on disk (%s B/row)"
+                  % (sc["rows"], sc["by_node"], sc["geometry"],
+                     sc["bytes_on_disk"] / 1e6, sc["bytes_per_row"]))
     
         # A run where every sensor failed is a failure. A run where one of several failed is not --
         # the pool still gained the others, and a timer that gives up on all of them because one node

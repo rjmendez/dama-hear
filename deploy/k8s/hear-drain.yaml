@@ -64,6 +64,7 @@ spec:
                 - { name: code, mountPath: /app/hear/sketch.py,    subPath: hear_sketch.py }
                 - { name: code, mountPath: /app/hear/corpus.py,    subPath: hear_corpus.py }
                 - { name: code, mountPath: /app/hear/detsfile.py,  subPath: hear_detsfile.py }
+                - { name: code, mountPath: /app/hear/scenefile.py, subPath: hear_scenefile.py }
                 - { name: code, mountPath: /app/hear/pool.py,      subPath: hear_pool.py }
                 - { name: code, mountPath: /app/tools/hear_drain.py, subPath: tools_hear_drain.py }
                 - { name: pool, mountPath: /pool }
@@ -118,6 +119,7 @@ spec:
                 - { name: code, mountPath: /app/hear/sketch.py,    subPath: hear_sketch.py }
                 - { name: code, mountPath: /app/hear/corpus.py,    subPath: hear_corpus.py }
                 - { name: code, mountPath: /app/hear/detsfile.py,  subPath: hear_detsfile.py }
+                - { name: code, mountPath: /app/hear/scenefile.py, subPath: hear_scenefile.py }
                 - { name: code, mountPath: /app/hear/pool.py,      subPath: hear_pool.py }
                 - { name: code, mountPath: /app/tools/hear_drain.py, subPath: tools_hear_drain.py }
                 - { name: pool, mountPath: /pool }
