@@ -340,6 +340,42 @@ class TestScenePool:
             pl.scene_matrix()
         assert "62.50000001" in str(e.value), "the refusal printed one key for two axes"
 
+    def test_a_zero_limit_returns_nothing_rather_than_everything(self, tmp_path):
+        # ⚠️`if limit and ...` treated 0 as unlimited, so scene_matrix(limit=0) built the WHOLE
+        # pool -- the opposite of what it says, and the docstring promises the limit bounds memory.
+        pl = P.Pool(str(tmp_path / "pool"))
+        pl.ingest_scene(self._write(tmp_path, "s.csv", SF.S2, 6))
+        X, rows = pl.scene_matrix(limit=0)
+        assert X.shape == (0, 0) and rows == []
+        assert pl.scene_matrix(limit=2)[0].shape[0] == 2
+
+    @pytest.mark.parametrize("stated,expect", [("62.5", 62.5), ("0", 0.0), ("", None)])
+    def test_what_the_csv_path_makes_of_an_edge_column(self, tmp_path, stated, expect):
+        """Pins the reachable behaviour: a stated 0 is 0.0, an empty column is undeclared.
+
+        ⚠️This does NOT prove the truthiness fix in `ingest_scene`. The value arrives from CSV as
+        a STRING, and "0" is truthy, so `if row.get(...)` and `if ... not in (None, "")` agree on
+        every input a CSV can produce -- checked for "62.5", "0", "" and absent. The fix only
+        changes a float 0.0, which no CSV path yields. It is kept as stated intent, not sold as a
+        repair, and the test that claimed to prove it passed without it.
+        """
+        pl = P.Pool(str(tmp_path / "pool"))
+        p = tmp_path / "z.csv"
+        row = _row(SF.S2, 1788813341984000).split(",")
+        row[SF.S2.written.index("f_lo_hz")] = stated
+        p.write_text(_csv(SF.S2, [",".join(row)]))
+        pl.ingest_scene(str(p))
+        assert next(iter(pl.scene()))["f_lo_hz"] == expect
+
+    def test_the_refusal_names_the_stated_difference_not_a_shared_absence(self):
+        # Both leave f_hi absent, so the absence is not the difference -- f_lo is.
+        why = P._why_geoms_differ((20, 4, 62.5, None), (20, 4, 300.0, None))
+        assert "EDGES" in why and "UNDECLARED" not in why
+
+    def test_the_refusal_still_says_undeclared_when_that_is_the_difference(self):
+        why = P._why_geoms_differ((20, 4, 62.5, 7812.5), (20, 4, None, None))
+        assert "UNDECLARED" in why
+
     def test_the_matrix_restores_the_reference_level(self, tmp_path):
         pl = P.Pool(str(tmp_path / "pool"))
         q, hexs = _mel()
