@@ -311,13 +311,43 @@ class TestUtcTrusted:
         p, _, _ = _phone_payload(clock_tier="gnss", utc_trusted=False)
         assert C.from_phone(p).utc_trusted is False
 
-    def test_it_cannot_be_set_to_something_that_disagrees_with_the_tier(self):
-        """A property, not a dataclass field: no Record can be constructed whose stored
-        `utc_trusted` contradicts the tier it was derived from."""
+    def test_it_is_read_only_on_the_record(self):
+        """A property, not a dataclass field, so it cannot be reassigned on an instance.
+
+        ⚠️That is ALL this proves. It does not prove the value can never disagree with the tier:
+        a producer stating `utc_trusted` outright still outranks the derivation, by design --
+        see test_a_producer_stating_it_outright_outranks_the_derivation. An earlier docstring
+        here claimed the stronger property and was simply wrong.
+        """
         p, _, _ = _phone_payload(clock_tier="wall")
         r = C.from_phone(p)
         with pytest.raises(AttributeError):
             r.utc_trusted = True
+
+    def test_a_statement_does_not_defeat_the_source_guard(self):
+        # A node's clock trust is a different measurement; a stated flag must not import this
+        # scale onto it. ⚠️Nodes DO publish clock_tier ("pps"/"free"), neither of which is in
+        # TRUSTED_CLOCK_TIERS, so the guard tests the SOURCE and not the field's presence.
+        assert C.utc_trusted_of({"source": "node", "clock_tier": "pps",
+                                 "utc_trusted": True}) is None
+
+    def test_a_statement_does_not_defeat_the_undated_guard(self):
+        # The same producer already said it could not date this onset. A flag contradicting its
+        # own refusal is not new information, and the conservative reading wins.
+        assert C.utc_trusted_of({"source": "phone", "clock_tier": "gnss",
+                                 "onset_dated": False, "utc_trusted": True}) is False
+
+    @pytest.mark.parametrize("stated", [0, 1, "false", "true", "", []])
+    def test_a_non_bool_statement_is_refused_not_discarded(self, stated):
+        """⚠️THE REGRESSION THAT POINTED THE WRONG WAY.
+
+        `isinstance(stated, bool)` alone let a non-bool fall through to the tier derivation, so a
+        producer publishing `utc_trusted: 0` -- saying do not trust me -- came back TRUE off its
+        own good tier. A statement this version cannot parse is a producer it does not
+        understand, which is the case the unknown-tier rule already refuses.
+        """
+        assert C.utc_trusted_of({"source": "phone", "clock_tier": "gnss",
+                                 "utc_trusted": stated}) is False
 
     def test_onset_found_reaches_the_record_at_all(self):
         """⚠️REGRESSION. from_phone dropped `onset_found` on the floor, and it is the OTHER key

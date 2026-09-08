@@ -626,7 +626,13 @@ class Pool:
             by_fs[str(r.get("fs_hz"))] = by_fs.get(str(r.get("fs_hz")), 0) + 1
             by_day[_day(r.get("ts_utc_s"))] = by_day.get(_day(r.get("ts_utc_s")), 0) + 1
             if r.get("source") == "phone":
-                by_tier[str(r.get("clock_tier"))] = by_tier.get(str(r.get("clock_tier")), 0) + 1
+                # ⚠️"(unstated)", not str(None). A `str()` here buckets a row with no tier under
+                # the literal key "None", which is indistinguishable in the drain output from a
+                # producer that emitted the string "None" as its tier. The parenthesised form
+                # cannot collide with any tier a producer could publish.
+                tier = r.get("clock_tier")
+                tk = "(unstated)" if tier is None else str(tier)
+                by_tier[tk] = by_tier.get(tk, 0) + 1
                 t = C.utc_trusted_of(r)
                 by_trust["not_stated" if t is None else ("true" if t else "false")] += 1
             anchored += bool(r.get("anchored"))
