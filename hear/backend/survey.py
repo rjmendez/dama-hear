@@ -87,8 +87,15 @@ class Survey:
         return node_id in self._pos
 
     def __repr__(self) -> str:
-        return "Survey(%d nodes, diameter %.1f m, linearity %.3f)" % (
-            len(self.ids), self.diameter_m(), self.linearity())
+        # Must not raise. linearity() needs >= 3 nodes, so a 2-node survey -- which is a legal
+        # object, just not a solvable array -- made its own repr throw, which is the worst moment
+        # for that to happen: you print it precisely when something is already wrong.
+        try:
+            lin = "%.3f" % self.linearity()
+        except (ValueError, SurveyError):
+            lin = "n/a (needs >= 3 nodes)"
+        return "Survey(%d nodes, diameter %.1f m, linearity %s)" % (
+            len(self.ids), self.diameter_m(), lin)
 
     def position(self, node_id: int) -> np.ndarray:
         """(3,) float64 (east, north, up) in metres. Raises for an id the survey does not have --

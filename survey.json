@@ -1,11 +1,11 @@
 {
-  "frame": "enu",
+  "frame": "enu_local",
   "units": "m",
   "origin": {
-    "lat_deg": 40.2925223,
-    "lon_deg": -76.1221602,
+    "lat_deg": 40.292522149999996,
+    "lon_deg": -76.1221604,
     "h_ell_m": 0.0,
-    "source": "median of nyquist; height datum is the --heights argument, NOT GNSS (storey = 3.0 m nominal US residential floor-to-floor, NOT measured)"
+    "source": "median of nyquist; height datum is the --heights argument, NOT GNSS (storey = 3.0 m nominal US residential floor-to-floor, NOT measured) (storey = 3.0 m nominal US residential floor-to-floor, NOT measured)"
   },
   "nodes": [
     {
@@ -14,17 +14,17 @@
       "e_m": -0.0,
       "n_m": 0.0,
       "u_m": 0.0,
-      "sigma_m": 0.719,
+      "sigma_m": 0.717,
       "u_source": "datum",
       "sigma_u_m": 0.0
     },
     {
       "node_id": 2,
       "name": "mach",
-      "e_m": -16.615,
-      "n_m": -0.289,
+      "e_m": -16.602,
+      "n_m": -0.272,
       "u_m": 3.0,
-      "sigma_m": 0.52,
+      "sigma_m": 0.521,
       "u_source": "nominal storey, +/-1.0 m assumed",
       "sigma_u_m": 1.0
     }
