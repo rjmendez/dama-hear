@@ -131,3 +131,45 @@ a burst remains unsolved, which is the same retrigger problem that broke the ons
 poisoned `gap`.
 
 Data at `~/hear-pull-2026-09-08/` (22 MB, not committed).
+
+## Timestamp recovery, and two asymmetries between the nodes
+
+`tools/fix_fs_at_bias.py` undoes the latch's stamp bias in captures taken before the firmware
+fix. The bias is deterministic, not estimated: the node back-dates each sample from the end of
+its block by `(BLOCK−1−i)·1e6/fs_at`, so a rate 41 % too high makes the back-date too small and
+every stamp too late by `(255 − sample mod 256) × 1e6 × (1/16000 − 1/fs_at)` — 18.3 µs per sample
+of block position, capping at **4.67 ms**.
+
+Applied to the captures:
+
+| file | corrected | fs_at sound | never stamped |
+|---|---|---|---|
+| `mach_dets_preflash` | **59** (median 2.38 ms, max 4.58) | 201 | 10 |
+| `drain0907_mach` | 0 | 2 | **346** |
+| `nyquist_dets_preflash` | 0 | 154 | 13 |
+| `drain0907_nyquist` | 0 | 375 | 7 |
+
+⚠️ **nyquist was never affected** — the latch was mach-only and boot-scoped, matching the WAV
+header evidence.
+
+⚠️ **mach was essentially unanchored for the whole 09-07 drain**: 346 of 348 rows carry
+`utc_us = 0` against 7 of 382 on nyquist. That is most of why mach contributes fewer usable
+events than its raw detection count suggests, and it is a separate fault from the rate latch.
+
+### The one-sided delay is real, and is not the rate latch
+
+Anchored on nyquist the 30 coincidences give a median τ of **+25.04 ms, 90 % positive**; anchored
+on mach, **−21.33 ms, 93 %** — near-negatives, as a genuine offset would be. The fs_at correction
+leaves both **unchanged**: a 2.4 ms fix cannot account for 25 ms.
+
+These coincidences are genuine, not accidents. With 526 and 262 events over a 15.0 h overlap and
+a ±49.1 ms bound, the chance-coincidence expectation is **0.25 pairs**; 200 draws of independent
+Poisson and clustered processes at the same rates produced too few matches to even form a null.
+A synthetic process with a real +25 ms offset reproduces the signature (median +23.2 ms, 78 %
+positive).
+
+⚠️ It still cannot be split into instrument offset versus a source field on nyquist's side from
+arrival times alone — but a *clock* offset is ruled out: both nodes are PPS-disciplined at
+24–32 ns, seven orders of magnitude below 25 ms. What remains is an acoustic or processing path
+difference, or geometry. The impulsive-source session from three surveyed positions is what
+separates them.
