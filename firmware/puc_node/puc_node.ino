@@ -163,11 +163,16 @@ static const int SAFE[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
 static const int NSAFE = sizeof(SAFE) / sizeof(SAFE[0]);
 #define SCAN_N 120000
 
-static String pin_scan(uint32_t window_ms, bool pulldown) {
+// mode: 0 = leave pins as they are, 1 = pulldown, 2 = pullup.
+// The pullup is the decisive one for a suspected open joint. An UNCONNECTED input follows whatever
+// pull is applied, so it reads HIGH. A pin wired to a push-pull driver that is currently low does
+// NOT follow it, and reads LOW. Reset-state and pulldown cannot tell those apart -- both read low
+// either way, which is exactly what GPIO18 does with a 1PPS testpoint soldered to it.
+static String pin_scan(uint32_t window_ms, int mode) {
   uint32_t *b0 = (uint32_t *)ps_malloc((size_t)SCAN_N * 4);
   uint32_t *b1 = (uint32_t *)ps_malloc((size_t)SCAN_N * 4);
   if (!b0 || !b1) { free(b0); free(b1); return "PSRAM alloc failed\n"; }
-  if (pulldown) for (int k = 0; k < NSAFE; k++) pinMode(SAFE[k], INPUT_PULLDOWN);
+  if (mode) for (int k = 0; k < NSAFE; k++) pinMode(SAFE[k], mode == 2 ? INPUT_PULLUP : INPUT_PULLDOWN);
   delay(20);
   // Paced, not free-running: unpaced this fills in 0.2 s, which cannot contain a 1 Hz pulse -- the
   // first version of this reported an empty table and read as "nothing is wired".
@@ -220,7 +225,7 @@ static void routes() {
       "uptime  %lus\nheap    %lu   psram %lu\n"
       "gps     fix %d, %d sats, %s   sentences %lu (%lu valid)\n"
       "pps     %lu edges on GPIO%d\n\n"
-      "/status /pins /scan /scanpd /gps /pmtk?cmd= /pps /ota /update /reboot\n</pre>",
+      "/status /pins /scan /scanpd /scanpu /gps /pmtk?cmd= /pps /ota /update /reboot\n</pre>",
       node_id, NODE_CLASS, (unsigned long)(millis() / 1000),
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getFreePsram(),
       gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences, (unsigned long)gps_valid,
@@ -269,8 +274,9 @@ static void routes() {
     http.send(200, "text/plain", b);
   });
 
-  http.on("/scan",   []() { http.send(200, "text/plain", pin_scan(4000, false)); });
-  http.on("/scanpd", []() { http.send(200, "text/plain", pin_scan(4000, true)); });
+  http.on("/scan",   []() { http.send(200, "text/plain", pin_scan(4000, 0)); });
+  http.on("/scanpd", []() { http.send(200, "text/plain", pin_scan(4000, 1)); });
+  http.on("/scanpu", []() { http.send(200, "text/plain", pin_scan(4000, 2)); });
 
   http.on("/gps", []() {
     // Raw NMEA for a few seconds, pumped here because the parser lives in loop() and a handler
@@ -295,6 +301,25 @@ static void routes() {
       return;
     }
     String c = http.arg("cmd");
+    // BOUND PMTK285. A 500 ms width in a 1000 ms period is a 50% duty timepulse, and the MT3333
+    // does not accept it -- sending one stopped this module transmitting entirely and it then
+    // ignored PMTK101, PMTK104 and even a bare PMTK605. Only a power cycle brought it back.
+    // night_node's /tplen has clamped to 10..900 ms since it was written, for exactly this reason;
+    // this endpoint was built as an unbounded passthrough and I used it to do the thing that guard
+    // exists to prevent. A passthrough that can hang the hardware is not a diagnostic.
+    if (c.startsWith("PMTK285")) {
+      int comma = c.indexOf(',', 8);
+      long w = comma > 0 ? c.substring(comma + 1).toInt() : -1;
+      if (w < 10 || w > 400) {
+        http.send(400, "text/plain",
+          "PMTK285 pulse width must be 10..400 ms.\n\n"
+          "500 ms hung this module: it stopped transmitting and ignored every command including a\n"
+          "cold start, and needed a power cycle. The period is 1000 ms and a width near it is not a\n"
+          "pulse. 100 ms is the module default and what /pps expects; 300 ms is about as wide as is\n"
+          "worth going to make it easier to catch on a meter (~1.0 V average against 3.3 V).\n");
+        return;
+      }
+    }
     pmtk(c.c_str());
     String o = "sent $" + c + "\n\nreply:\n";
     uint32_t t0 = millis();
