@@ -1,0 +1,15 @@
+# PUC: 32 MB flash, and none of the stock schemes use it. The OTA-capable ones (min_spiffs, no_fs)
+# are 4 MB layouts that would strand 28 MB; the 32 MB ones (app5M_fat24M_32MB) have a single app
+# slot and no OTA at all. OTA is the entire requirement here -- this board goes to the bench and
+# should never need the cable again -- so the table is written out rather than chosen.
+#
+# 3 MB per slot is generous against night_node's 1.1 MB, and leaves room for the scene/mel work
+# and anything a 48 kHz two-microphone node grows into. The rest is FAT, because the PUC records
+# to flash as well as to its SD slot and 26 MB is a lot of audio.
+#
+# Name,   Type, SubType,  Offset,    Size,      Flags
+nvs,      data, nvs,      0x9000,    0x5000,
+otadata,  data, ota,      0xe000,    0x2000,
+app0,     app,  ota_0,    0x10000,   0x300000,
+app1,     app,  ota_1,    0x310000,  0x300000,
+ffat,     data, fat,      0x610000,  0x19F0000,

@@ -191,7 +191,7 @@ static volatile int32_t  gps_qerr_ps = 0;
 static volatile uint8_t  timtp_flags = 0xFF;
 // Read-back of what the module says its timepulse config actually is. An ACK to VALSET means the
 // keys were accepted, not that the pin is driving anything -- so ask.
-static char tp_readback[160] = "(not read)";
+static char tp_readback[256] = "(not read)";   // 12 fields now, not 7
 static char nmea[100]; static int nmea_i = 0;
 static uint8_t rawbuf[512]; static volatile uint16_t raw_i = 0; static volatile uint32_t raw_tot = 0;
 static volatile uint32_t nmea_valid = 0;      // lines that actually start '$' and carry a talker id
@@ -478,6 +478,15 @@ static void i2c_scan() {
 #define K_PERIOD_LOCK    0x40050003UL   // U4 us, locked
 #define K_LEN_TP1        0x40050004UL   // U4 us, unlocked
 #define K_LEN_LOCK       0x40050005UL   // U4 us, locked
+// The module's SOLUTION rate, which this firmware never set -- so each one ran at whatever it
+// shipped with. Measured: nyquist's emits NAV-PVT at 4.98/s, mach's at 9.65/s, against a
+// labelling path that assumes roughly one report per PPS edge. That mismatch is why mach rejects
+// about two labellings a second and nyquist rejects none: at 10 Hz, far more reports land in the
+// window belonging to an edge that has not advanced yet, and the +1s-per-edge guard correctly
+// throws them out. Both nodes end up with valid time, but they are not behaving the same way, and
+// they are about to be asked to agree with each other to microseconds.
+#define K_RATE_MEAS      0x30210001UL   // U2 ms between measurements
+#define K_RATE_NAV       0x30210002UL   // U2 measurements per navigation solution
 #define K_MSG_NAV_PVT    0x20910007UL   // U1 rate on UART1
 #define K_MSG_TIM_TP     0x2091017eUL   // U1 rate on UART1
 
@@ -496,7 +505,10 @@ static uint16_t vs_i;
 static void vs_begin() { vs_i = 0; ubx_buf[vs_i++] = 0; ubx_buf[vs_i++] = 0x01;   // version 0, RAM layer
                          ubx_buf[vs_i++] = 0; ubx_buf[vs_i++] = 0; }
 static void vs_add(uint32_t key, uint32_t val) {
-  int w = ((key >> 28) & 0x7) == 4 ? 4 : 1;                 // 0x4... is U4, everything used here is 1 B
+  // Key size lives in bits 30-28: 1=bit, 2=U1, 3=U2, 4=U4. U2 was not needed until CFG-RATE, and
+  // sending a U2 key with one byte of payload gets the whole VALSET NAKed.
+  int st = (key >> 28) & 0x7;
+  int w = st == 4 ? 4 : st == 3 ? 2 : 1;
   for (int i = 0; i < 4; i++) ubx_buf[vs_i++] = (key >> (8 * i)) & 0xFF;
   for (int i = 0; i < w; i++) ubx_buf[vs_i++] = (val >> (8 * i)) & 0xFF;
 }
@@ -512,7 +524,8 @@ static void gps_valget() {           // ask the module what TP1 is actually set 
                            // POL decides which way round the pulse is, and /pps's "~10% high"
                            // verdict is only true for POL=1. Reading everything EXCEPT the field
                            // that could invalidate the reading was not a useful read-back.
-                           K_POL_TP1, K_ALIGN_TOW_TP1, K_SYNC_GNSS_TP1};
+                           K_POL_TP1, K_ALIGN_TOW_TP1, K_SYNC_GNSS_TP1,
+                           K_RATE_MEAS, K_RATE_NAV};
   for (unsigned k = 0; k < sizeof(keys) / sizeof(keys[0]); k++)
     for (int i = 0; i < 4; i++) ubx_buf[vs_i++] = (keys[k] >> (8 * i)) & 0xFF;
   ubx_send(0x06, 0x8B, ubx_buf, vs_i);
@@ -540,6 +553,7 @@ static void gps_configure() {
   vs_add(K_TP1_ENA, 1); vs_add(K_USE_LOCKED_TP1, 1);
   vs_add(K_ALIGN_TOW_TP1, 1); vs_add(K_POL_TP1, 1);
   vs_add(K_SYNC_GNSS_TP1, 1);
+  vs_add(K_RATE_MEAS, 1000); vs_add(K_RATE_NAV, 1);   // exactly one solution per PPS edge
   vs_add(K_MSG_NAV_PVT, 1); vs_add(K_MSG_TIM_TP, 1);
   vs_send();
 }
@@ -599,10 +613,15 @@ static void ubx_msg() {
     timtp_flags = ux[14];          // bit0 timeBase, bit1 utc, bit4 qErrInvalid
     ubx_timtp++;
   } else if (ux_cls == 0x06 && ux_id == 0x8B && ux_len > 4) {     // CFG-VALGET response
-    char o[160]; int n = 0; uint16_t i = 4;
+    char o[256]; int n = 0; uint16_t i = 4;
     while (i + 4 <= ux_len && n < (int)sizeof(o) - 24) {
       uint32_t key = (uint32_t)ux[i] | ((uint32_t)ux[i+1] << 8) | ((uint32_t)ux[i+2] << 16) | ((uint32_t)ux[i+3] << 24);
-      int w = (((key >> 28) & 0x7) == 4) ? 4 : 1;
+      // Same size table as vs_add. Reading a U2 key as one byte does not just print the low
+      // byte (1000 -> 232); it advances the cursor by one byte too few, so every field
+      // after it decodes from the wrong offset. The value was written correctly -- the
+      // module measurably runs at 1 Hz -- only the read-back lied about it.
+      int stz = (key >> 28) & 0x7;
+      int w = stz == 4 ? 4 : stz == 3 ? 2 : 1;
       uint32_t v = 0;
       for (int k = 0; k < w && i + 4 + k < ux_len; k++) v |= (uint32_t)ux[i + 4 + k] << (8 * k);
       const char *nm = key == K_TP1_ENA ? "TP1_ENA" : key == K_PERIOD_TP1 ? "PERIOD"
@@ -610,6 +629,7 @@ static void ubx_msg() {
                      : key == K_LEN_LOCK ? "LEN_LOCK" : key == K_PULSE_DEF ? "PULSE_DEF"
                      : key == K_USE_LOCKED_TP1 ? "USE_LOCKED" : key == K_POL_TP1 ? "POL"
                      : key == K_ALIGN_TOW_TP1 ? "ALIGN_TOW" : key == K_SYNC_GNSS_TP1 ? "SYNC_GNSS"
+                     : key == K_RATE_MEAS ? "RATE_MEAS" : key == K_RATE_NAV ? "RATE_NAV"
                      : "?";
       n += snprintf(o + n, sizeof(o) - n, "%s%s=%lu", n ? " " : "", nm, (unsigned long)v);
       i += 4 + w;
@@ -2158,7 +2178,7 @@ void setup() {
     // port here instead of delay()ing and wondering why nothing arrived.
     uint32_t t0 = millis();
     while (millis() - t0 < 900) { while (Serial1.available()) ubx_feed((uint8_t)Serial1.read()); }
-    http.send(200, "text/plain", tp_readback);
+    http.send(200, "text/plain", String(tp_readback) + "\n");
   });
   http.on("/pps", []() {              // live probe: wire the tap, hit this, no reboot needed
     detachInterrupt(digitalPinToInterrupt(PPS_PIN));

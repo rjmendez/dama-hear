@@ -18,14 +18,21 @@ import sys
 
 if len(sys.argv) < 2:
     print(__doc__.strip()); sys.exit(2)
-node_id = sys.argv[1].strip()
-node_class = sys.argv[2].strip() if len(sys.argv) > 2 else "xiao-s3-pps"
+args = [a for a in sys.argv[1:] if not a.startswith("--")]
+if "--dir" in sys.argv: args = [a for a in args if a != sys.argv[sys.argv.index("--dir") + 1]]
+node_id = args[0].strip()
+node_class = args[1].strip() if len(args) > 1 else "xiao-s3-pps"
 if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,22}", node_id):
     print("node id must be lowercase letters, digits and dashes, <=23 chars: %r" % node_id)
     sys.exit(2)
 
 src = os.path.expanduser("~/.wifi")
-out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "secrets.h")
+# --dir lets one generator serve more than one sketch. puc_node needs its own secrets.h and
+# copying the file by hand is how a node ends up flashed with another node's identity.
+sketch = os.path.dirname(os.path.abspath(__file__))
+if "--dir" in sys.argv:
+    sketch = os.path.abspath(sys.argv[sys.argv.index("--dir") + 1])
+out = os.path.join(sketch, "secrets.h")
 
 nets = {}
 for line in open(src):
