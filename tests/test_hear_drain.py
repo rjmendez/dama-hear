@@ -114,11 +114,40 @@ class FakeNode:
         return {"scene.csv": len(self.data)}
 
 
+class GrowingNode(FakeNode):
+    """A node whose scene.csv grows WHILE it is being served, which is what the real one does.
+
+    ⚠️`FakeNode` grows only between drains, and that is exactly the blind spot that let a
+    catch-up refetch look correct. A 2 MB tail at the node's measured 40-135 KB/s takes 15-50 s,
+    during which the file gains ~3.5-12 KB at ~235 B/s -- and `/sd` seeks against the size AT
+    REFETCH TIME (night_node.ino:1985-1986), not against the size the drain read from `/ls`.
+    """
+
+    def __init__(self, grow_rows_per_fetch=0, **kw):
+        super().__init__(**kw)
+        self.grow_rows_per_fetch = grow_rows_per_fetch
+
+    def sd(self, ip, name, timeout=None, tail=None):
+        body = super().sd(ip, name, timeout=timeout, tail=tail)
+        if name == "scene.csv" and self.grow_rows_per_fetch:
+            self.grow(self.grow_rows_per_fetch)
+        return body
+
+
+def _rows_in_pool(pl, n):
+    """Every `utc_us` the pool holds for this node -- the ground truth a byte count is a proxy for."""
+    return {int(r["utc_us"]) for r in pl.scene(node=n.node) if r.get("utc_us")}
+
+
+def _rows_on_card(n, uptime0=100):
+    return {n.boot_epoch_us + up * 1_000_000 for up in range(uptime0 + 1, n.uptime + 1)}
+
+
 @pytest.fixture
 def wired(monkeypatch):
     """Install a FakeNode over the drain's three network calls and hand back a builder."""
-    def build(**kw):
-        n = FakeNode(**kw)
+    def build(cls=FakeNode, **kw):
+        n = cls(**kw)
         monkeypatch.setattr(HD, "fetch_status", n.status)
         monkeypatch.setattr(HD, "fetch_sd", n.sd)
         monkeypatch.setattr(HD, "_ls_sizes", n.ls)
@@ -160,7 +189,9 @@ class TestNullControl:
             seen.append(r["unfetched_bytes"])
             n.grow(9)                                   # ~1/10th of the window, as measured
         assert seen == [0] * 20, seen
-        assert not any(f.get("gap", {}).get("catchup") for r in [r] for f in r["files"])
+        assert all(r["unfetched_unknown"] is False for _ in [0])
+        # and every one of those runs measured exactly one scene tail -- no second fetch
+        assert [c for c in n.sd_calls if c[0] == "scene.csv"] == [("scene.csv", tail)] * 20
 
     def test_the_steady_state_really_is_mostly_duplicate(self, tmp_path, wired):
         # If the fixture did NOT overlap heavily it would not be reproducing production, and the
@@ -269,8 +300,7 @@ class TestGapThroughTheDrain:
 
         n.grow(400)                                     # far more than the window covers
         size_now = len(n.data)
-        # --max-catchup-bytes 0 turns the catch-up off, so what is reported is the raw gap.
-        r = _drain(pl, n, tail, max_catchup_bytes=0)
+        r = _drain(pl, n, tail)
         withheld = size_now - tail - watermark
         assert withheld > 0
         g = [f for f in r["files"] if f["name"] == "scene.csv"][0]["gap"]
@@ -322,57 +352,79 @@ class TestGapThroughTheDrain:
         assert after == before, "a failed run must leave the next one still able to see the gap"
 
 
-class TestCatchUp:
-    def test_a_gap_the_tail_missed_is_refetched_and_closed(self, tmp_path, wired):
+class TestThereIsNoCatchUp:
+    """⚠️THE DRAIN MEASURES THE GAP AND DOES NOT TRY TO CLOSE IT, AND THAT IS DELIBERATE.
+
+    A refetch has to size a bigger `tail=` against a size read BEFORE the first body, but the node
+    seeks against the size at REFETCH time (night_node.ino:1985-1986) and the file grew for the
+    whole of the first fetch. The refetch therefore lands forward of the gap. Worse, the residual
+    was recomputed against the same stale size, so a refetch that missed reported success. These
+    tests are the guard on that decision: one scene fetch per run, and an honest number.
+    """
+
+    def test_only_one_scene_fetch_is_ever_issued(self, tmp_path, wired):
         pl = P.Pool(str(tmp_path / "pool"))
         n = wired()
         n.grow(200)
+        tail = 20_000
+        _drain(pl, n, tail)
+        n.grow(400)                                     # far more than the window covers
+        n.sd_calls.clear()
+        r = _drain(pl, n, tail)
+        scene = [c for c in n.sd_calls if c[0] == "scene.csv"]
+        assert scene == [("scene.csv", tail)], scene
+        assert r["unfetched_bytes"] > 0                 # named, not closed
+
+    def test_a_refetch_would_have_under_reached_and_then_reported_success(self, tmp_path, wired):
+        """The measurement that removed the catch-up, kept as the reason it stays removed.
+
+        `grow_rows_per_fetch` stands in for the 15-50 s a 2 MB tail takes on the real node. A
+        window sized against the pre-fetch `size_now` -- which is all a refetch could do -- does
+        not reach the gap, and re-running `scene_gap` against that same stale `size_now` scores
+        it as covered.
+        """
+        pl = P.Pool(str(tmp_path / "pool"))
+        n = wired(cls=GrowingNode, grow_rows_per_fetch=20)
+        n.grow(60)
         tail = 20_000
         _drain(pl, n, tail)
         n.grow(400)
-        n.sd_calls.clear()
-        r = _drain(pl, n, tail, max_catchup_bytes=10_000_000)
-        assert r["ok"], r["errors"]
-        g = [f for f in r["files"] if f["name"] == "scene.csv"][0]["gap"]
-        assert g["unfetched_bytes"] == 0, g
-        assert g["catchup"]["capped"] is False
-        assert g["catchup"]["gained_bytes"] > 0
-        # the refetch is a SECOND /sd with a bigger tail, which is the node's only reach-back
-        scene = [c for c in n.sd_calls if c[0] == "scene.csv"]
-        assert len(scene) == 2 and scene[1][1] > scene[0][1]
 
-    def test_the_cap_bounds_the_refetch_and_states_the_residual(self, tmp_path, wired):
-        pl = P.Pool(str(tmp_path / "pool"))
-        n = wired()
-        n.grow(200)
-        tail = 20_000
-        _drain(pl, n, tail)
+        size_now = len(n.data)                          # what /ls would report, read BEFORE the body
         prev = HD.read_watermarks(pl.root)["nyquist"]["scene.csv"]["size"]
-        n.grow(600)
-        size_now = len(n.data)
-        cap = 40_000                                    # bigger than the tail, smaller than needed
-        r = _drain(pl, n, tail, max_catchup_bytes=cap)
-        g = [f for f in r["files"] if f["name"] == "scene.csv"][0]["gap"]
-        assert g["catchup"]["capped"] is True
-        assert g["catchup"]["requested_tail"] == cap
-        assert g["fetched_bytes"] == cap
-        # exactly what the cap refused, and it is stated rather than absorbed
-        assert g["unfetched_bytes"] == size_now - cap - prev > 0
-        assert r["unfetched_bytes"] == g["unfetched_bytes"]
-        assert any("catch-up cap" in e for e in r["errors"])
-        # the rows the cap DID reach are still stored -- a bounded loss, not a refused run
-        f = [f for f in r["files"] if f["name"] == "scene.csv"][0]
-        assert f["added"] > 0
+        body = HD.fetch_sd("10.0.0.1", "scene.csv", tail=tail)
+        gap = HD.scene_gap(size_now, len(body), prev, HD.mean_row_bytes(body))
+        assert gap["unfetched_bytes"] > 0
 
-    def test_the_gap_shrinks_between_the_two_windows(self, tmp_path, wired):
+        # the refetch a catch-up would have made: fetched + gap + one row, as it was written
+        wanted = int(len(body) + gap["unfetched_bytes"] + gap["mean_row_bytes"] + 1)
+        bigger = HD.fetch_sd("10.0.0.1", "scene.csv", tail=wanted)
+        first_byte_actually_served = len(n.data) - len(bigger)
+        # ⚠️the node seeked against a file that had grown, so the second window starts FORWARD of
+        # where the gap is -- it never reached back past `prev`.
+        assert first_byte_actually_served > prev, (first_byte_actually_served, prev)
+        # ...and the arithmetic the catch-up used, against the stale size, calls that covered
+        stale = HD.scene_gap(size_now, len(bigger), prev, HD.mean_row_bytes(bigger))
+        assert stale["unfetched_bytes"] == 0, "this is the false clean the refetch reported"
+
+    def test_the_gap_stays_honest_when_the_file_grows_during_the_fetch(self, tmp_path, wired):
+        """The single fetch's number is a LOWER bound on the loss, never a false zero.
+
+        `size_now` is read before the body, so growth during the fetch understates `window_start`
+        and therefore the gap. The direction is the safe one and it is asserted here rather than
+        assumed: what the drain reports must not exceed what is genuinely missing.
+        """
         pl = P.Pool(str(tmp_path / "pool"))
-        n = wired()
-        n.grow(200)
+        n = wired(cls=GrowingNode, grow_rows_per_fetch=20)
+        n.grow(60)
         _drain(pl, n, 20_000)
-        n.grow(600)
-        r = _drain(pl, n, 20_000, max_catchup_bytes=40_000)
-        g = [f for f in r["files"] if f["name"] == "scene.csv"][0]["gap"]
-        assert g["first_window"]["unfetched_bytes"] > g["unfetched_bytes"]
+        n.grow(400)
+        r = _drain(pl, n, 20_000)
+        missing = _rows_on_card(n, uptime0=100) - _rows_in_pool(pl, n)
+        assert missing, "the fixture must actually withhold rows or this proves nothing"
+        reported_rows = [f for f in r["files"]
+                         if f["name"] == "scene.csv"][0]["gap"]["unfetched_rows_est"]
+        assert 0 < reported_rows <= len(missing), (reported_rows, len(missing))
 
 
 class TestLsFailure:
@@ -390,7 +442,10 @@ class TestLsFailure:
         assert g["size_unknown"] is True
         assert g["unfetched_bytes"] is None
         assert r["unfetched_unknown"] is True
-        assert r["unfetched_bytes"] == 0          # nothing MEASURED, and the flag says so
+        # ⚠️None, NOT 0. Nothing was measured, and this module's whole contract is that an
+        # unmeasured thing must not render as a clean one.
+        assert r["unfetched_bytes"] is None
+        assert "/ls gave no size" in r["unfetched_reason"]
         assert r["ls_ok"] is False and "connection refused" in r["ls_error"]
         # ⚠️and the run is still OK: the fetch and the ingest worked. Failing it here would mark
         # firmware without /ls permanently broken, and then STALE, while its data flowed fine.
@@ -421,6 +476,25 @@ class TestLsParsing:
         assert "health.csv" in sizes and "dets.csv" in sizes
         assert "clips" not in sizes            # `d ` is a directory, not a file
         assert all(isinstance(v, int) for v in sizes.values())
+
+    def test_the_file_sizes_the_module_quotes_are_the_ones_that_were_captured(self, monkeypatch):
+        """The reach-back arithmetic in the module docstring is quoted against these listings.
+
+        ⚠️A constant that is validated against nothing drifts silently, which is how the tail's
+        reach-back came to be described as 2.3 h long after it stopped being that.
+        """
+        sizes = {}
+        for name in ("nyquist", "mach"):
+            body = open(os.path.join(FIXTURES, "ls_%s.txt" % name), "rb").read()
+            monkeypatch.setattr(HD, "_get", lambda *a, **kw: body)
+            sizes[name] = HD._ls_sizes("10.0.0.1")["scene.csv"]
+        assert sizes == {"nyquist": 16_771_742, "mach": 16_435_916}
+        assert "16,771,742 B" in HD.__doc__ or "16,771,742 B" in open(HD.__file__).read()
+        # 2 MB / 235.0 B per row / (1 row per 1.024 s), the figure the docstring states
+        assert abs(HD.SCENE_TAIL_BYTES / 235.0 * 1.024 / 3600.0 - 2.42) < 0.01
+        assert abs(HD.SCENE_TAIL_BYTES / 232.1 * 1.024 / 3600.0 - 2.45) < 0.01
+        # and the window really is a small fraction of the file it is cut from
+        assert HD.SCENE_TAIL_BYTES < min(sizes.values()) / 5
 
     def test_a_leading_slash_on_the_name_is_normalised(self, monkeypatch):
         monkeypatch.setattr(HD, "_get",
@@ -481,7 +555,7 @@ class TestLedgerInvariants:
         n.grow(200)
         _drain(pl, n, 20_000)
         n.grow(400)
-        _drain(pl, n, 20_000, max_catchup_bytes=0)
+        _drain(pl, n, 20_000)
         entries = self._entries(pl)
         assert len(entries) == 2
         for e in entries:
@@ -562,9 +636,44 @@ class TestBootAudit:
         st = {"uptime_s": 129, "scene": {"rows": 40, "written": 40}}
         a = HD.boot_audit(pl, "nyquist", st, now=boot_a + 129)
         assert a["ingested_this_boot"] == 30
-        assert a["unattributed_unanchored"] == 10
+        assert a["unanchored_rows_stored"] == 10
+        assert a["unanchored_attributable_max"] == 10
         assert a["outstanding_max"] == 10
         assert a["outstanding_min"] == 0                # they may all belong to this boot
+
+    def test_unanchored_rows_from_OTHER_boots_do_not_widen_this_boots_range(self, tmp_path):
+        """⚠️THE LOWER BOUND USED TO COUNT EVERY UNANCHORED ROW THE NODE EVER PRODUCED.
+
+        On the exported corpus that is 2,896 rows for mach across only 786 distinct `uptime_s`
+        values (13-808 s, the cold-start window before PPS lock) -- roughly 3.7 boots' worth,
+        all subtracted from ONE boot's outstanding count. Within a boot `uptime_s` is strictly
+        increasing (rows are 1.024 s apart), so this boot can hold at most one unanchored row per
+        distinct value. Here four boots each contribute the same ten `uptime_s` values: 40 rows
+        stored, but at most 10 of them can be this boot's.
+        """
+        boot_a = 1_788_800_000
+        rows = [(int((boot_a + u) * 1e6), u) for u in range(100, 130)]
+        for _boot in range(4):
+            rows += [(0, u) for u in range(10, 20)]
+        pl = self._pool_with(tmp_path, rows)
+        st = {"uptime_s": 129, "scene": {"rows": 45, "written": 45}}
+        a = HD.boot_audit(pl, "nyquist", st, now=boot_a + 129)
+        assert a["ingested_this_boot"] == 30
+        assert a["unanchored_rows_stored"] == 40       # what the raw walk used to subtract
+        assert a["unanchored_attributable_max"] == 10  # what one boot can actually hold
+        assert a["outstanding_max"] == 15
+        assert a["outstanding_min"] == 5               # 15 - 10, not max(0, 15 - 40) == 0
+
+    def test_an_unanchored_row_above_the_current_uptime_cannot_be_this_boots(self, tmp_path):
+        boot_a = 1_788_800_000
+        rows = [(int((boot_a + u) * 1e6), u) for u in range(100, 130)] \
+            + [(0, u) for u in (10, 11, 12, 900, 901)]   # 900/901 postdate this boot's uptime
+        pl = self._pool_with(tmp_path, rows)
+        st = {"uptime_s": 129, "scene": {"rows": 40, "written": 40}}
+        a = HD.boot_audit(pl, "nyquist", st, now=boot_a + 129)
+        assert a["unanchored_rows_stored"] == 5
+        assert a["unanchored_attributable_max"] == 3
+        assert a["outstanding_min"] == 7                # 10 - 3, not 10 - 5
 
     def test_it_says_when_it_declined_rather_than_returning_a_clean_zero(self, tmp_path):
         pl = P.Pool(str(tmp_path / "pool"))
@@ -631,20 +740,57 @@ class TestCheck:
 
 
 class TestHeartbeatCarriesTheLoss:
-    def test_a_run_that_lost_rows_records_it_even_though_it_also_errored(self, tmp_path, wired):
-        # ⚠️The capped catch-up both loses rows and reports an error, so filing the loss under
-        # `if r["ok"]` would hide it in the one case it exists for.
+    def test_a_run_that_lost_rows_records_it_even_though_it_also_errored(self, tmp_path, wired,
+                                                                        monkeypatch):
+        # ⚠️The run that loses rows is often the same run that reports an error, so filing the
+        # loss under `if r["ok"]` would hide it in the one case it exists for.
         pl = P.Pool(str(tmp_path / "pool"))
         n = wired()
         n.grow(200)
         _drain(pl, n, 20_000)
         n.grow(600)
-        r = _drain(pl, n, 20_000, max_catchup_bytes=40_000)
+        real = n.sd
+
+        def flaky(ip, name, timeout=None, tail=None):
+            if name == "dets.csv":
+                raise OSError("connection reset")
+            return real(ip, name, timeout=timeout, tail=tail)
+        monkeypatch.setattr(HD, "fetch_sd", flaky)
+        r = _drain(pl, n, 20_000)
         assert not r["ok"]
         hb = HD.write_heartbeat(pl.root, [r], None, now=1000.0)
         assert hb["sensors"]["nyquist"]["last_unfetched_bytes"] == r["unfetched_bytes"] > 0
         code, lines = HD.check(pl.root, max_stale_s=7200.0, now=1010.0)
         assert code == 1 and "UNFETCHED" in lines[0]
+
+    def test_a_measured_gap_survives_an_ingest_that_raises(self, tmp_path, wired, monkeypatch):
+        """⚠️THE GAP IS A PROPERTY OF THE FETCH, NOT OF THE STORE.
+
+        The accounting used to be booked after `ingest_scene`, so the `except: continue` that
+        handles a failed store took the measurement with it: a run that measured a real gap and
+        then failed to write reported 0 unfetched bytes. That is a measured loss rendered as
+        clean, in the module whose contract is that it must not be.
+        """
+        pl = P.Pool(str(tmp_path / "pool"))
+        n = wired()
+        n.grow(200)
+        tail = 20_000
+        _drain(pl, n, tail)
+        watermark = HD.read_watermarks(pl.root)["nyquist"]["scene.csv"]["size"]
+        n.grow(400)
+        withheld = len(n.data) - tail - watermark
+        assert withheld > 0
+
+        def boom(*a, **kw):
+            raise RuntimeError("gzip write failed")
+        monkeypatch.setattr(pl, "ingest_scene", boom)
+        r = _drain(pl, n, tail)
+        assert any("ingest" in e for e in r["errors"])
+        assert r["unfetched_unknown"] is False
+        assert r["unfetched_bytes"] == withheld
+        hb = HD.write_heartbeat(pl.root, [r], None, now=1000.0)
+        assert hb["sensors"]["nyquist"]["last_unfetched_bytes"] == withheld
+        assert HD.check(pl.root, max_stale_s=7200.0, now=1010.0)[0] == 1
 
     def test_an_unknown_measurement_reaches_the_heartbeat_as_none(self, tmp_path, wired,
                                                                   monkeypatch):
@@ -655,6 +801,105 @@ class TestHeartbeatCarriesTheLoss:
         r = _drain(pl, n, 20_000)
         hb = HD.write_heartbeat(pl.root, [r], None, now=1000.0)
         assert hb["sensors"]["nyquist"]["last_unfetched_bytes"] is None
+
+
+class TestARunThatMeasuredNothingSaysSo:
+    """⚠️THE EARLY RETURNS USED TO REPORT A MEASURED ZERO FOR A RUN THAT MEASURED NOTHING."""
+
+    def test_an_unreachable_status_is_unknown_not_a_clean_zero(self, tmp_path, monkeypatch):
+        pl = P.Pool(str(tmp_path / "pool"))
+
+        def boom(*a, **kw):
+            raise OSError("no route to host")
+        monkeypatch.setattr(HD, "fetch_status", boom)
+        r = HD.drain_node(pl, "nyquist", "10.0.0.1")
+        assert r["unfetched_bytes"] is None
+        assert r["unfetched_unknown"] is True
+        assert "/status" in r["unfetched_reason"]
+        hb = HD.write_heartbeat(pl.root, [r], None, now=1000.0)
+        assert hb["sensors"]["nyquist"]["last_unfetched_bytes"] is None
+        code, lines = HD.check(pl.root, max_stale_s=7200.0, now=1010.0)
+        assert "UNKNOWN" in lines[0] and "UNFETCHED" not in lines[0]
+
+    def test_a_refused_identity_is_unknown_not_a_clean_zero(self, tmp_path, wired):
+        pl = P.Pool(str(tmp_path / "pool"))
+        n = wired(node="mach")                          # answers as mach, asked for nyquist
+        n.grow(50)
+        r = HD.drain_node(pl, "nyquist", "10.0.0.1")
+        assert any("identity" in e for e in r["errors"])
+        assert r["unfetched_bytes"] is None
+        assert r["unfetched_unknown"] is True
+        assert "mach" in r["unfetched_reason"]
+        hb = HD.write_heartbeat(pl.root, [r], None, now=1000.0)
+        assert hb["sensors"]["nyquist"]["last_unfetched_bytes"] is None
+
+    def test_a_node_that_serves_no_scene_is_unknown_not_a_clean_zero(self, tmp_path, wired,
+                                                                     monkeypatch):
+        pl = P.Pool(str(tmp_path / "pool"))
+        n = wired()
+        n.grow(50)
+        monkeypatch.setattr(HD, "fetch_sd", lambda *a, **kw: None)
+        r = HD.drain_node(pl, "nyquist", "10.0.0.1")
+        assert r["unfetched_bytes"] is None and r["unfetched_unknown"] is True
+
+
+class TestTheCheckSeesEveryDrain:
+    """⚠️THE DRAIN RUNS 4x AS OFTEN AS THE CHECK, so a field the drain overwrites is a field the
+    gate mostly never reads. deploy/k8s/hear-drain.yaml: drain `*/15 * * * *`, check `17 * * * *`.
+    """
+
+    def test_the_two_cronjobs_really_are_that_far_apart(self):
+        import re
+        y = open(os.path.join(os.path.dirname(FIXTURES), "..", "deploy", "k8s",
+                              "hear-drain.yaml")).read()
+        schedules = re.findall(r'^\s*schedule:\s*"([^"]+)"', y, re.M)
+        assert schedules == ["*/15 * * * *", "17 * * * *"], schedules
+        # 4 drains land between two checks, so the window the check sums must cover at least that
+        assert HD.DEFAULT_UNFETCHED_WINDOW_S >= 4 * 15 * 60
+
+    def test_a_loss_three_runs_ago_is_still_seen_by_the_hourly_check(self, tmp_path, wired):
+        """The failure this fixes: a gap at :02, and three clean drains before the check at :17."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        n = wired()
+        n.grow(200)
+        _drain(pl, n, 20_000)
+        n.grow(400)
+        lossy = _drain(pl, n, 20_000)                   # :02 -- the run that skipped bytes
+        assert lossy["unfetched_bytes"] > 0
+        HD.write_heartbeat(pl.root, [lossy], None, now=120.0)
+        for i, t in enumerate((900.0, 1800.0, 2700.0)):  # :15, :30, :45 -- all clean
+            n.grow(9)
+            clean = _drain(pl, n, 20_000)
+            assert clean["unfetched_bytes"] == 0
+            HD.write_heartbeat(pl.root, [clean], None, now=t)
+        hb = json.load(open(HD.heartbeat_path(pl.root)))
+        assert hb["sensors"]["nyquist"]["last_unfetched_bytes"] == 0   # the overwritten field
+        code, lines = HD.check(pl.root, max_stale_s=7200.0, now=3600.0)
+        assert code == 1, lines
+        assert "UNFETCHED" in lines[0] and str(lossy["unfetched_bytes"]) in lines[0]
+
+    def test_the_ring_is_bounded(self, tmp_path, wired):
+        pl = P.Pool(str(tmp_path / "pool"))
+        n = wired()
+        n.grow(50)
+        r = _drain(pl, n, 20_000)
+        for i in range(HD.UNFETCHED_RING + 10):
+            HD.write_heartbeat(pl.root, [r], None, now=float(i))
+        hb = json.load(open(HD.heartbeat_path(pl.root)))
+        assert len(hb["sensors"]["nyquist"]["unfetched_recent"]) == HD.UNFETCHED_RING
+
+    def test_a_loss_older_than_the_window_stops_failing_the_gate(self, tmp_path):
+        root = str(tmp_path)
+        os.makedirs(root, exist_ok=True)
+        json.dump({"sensors": {"nyquist": {
+            "kind": "node", "last_success_s": 100_000.0, "last_unfetched_bytes": 0,
+            "unfetched_recent": [{"at": 100.0, "bytes": 735_000, "reason": None},
+                                 {"at": 99_000.0, "bytes": 0, "reason": None}]}}},
+            open(HD.heartbeat_path(root), "w"))
+        assert HD.check(root, max_stale_s=7200.0, now=100_010.0,
+                        unfetched_window_s=7200.0)[0] == 0
+        assert HD.check(root, max_stale_s=7200.0, now=100_010.0,
+                        unfetched_window_s=200_000.0)[0] == 1
 
 
 class TestWatermarkFile:
