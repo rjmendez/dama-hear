@@ -744,9 +744,23 @@ static void fft256() {
 }
 
 // Build the 172 B frame from the ring, starting `back` samples before the write head.
-static int sketch_frame(uint8_t *out, uint32_t back, uint32_t node_us, uint16_t peak, uint16_t flags) {
+//: Samples the sketch spans: (FRAMES-1) hops plus one analysis window.
+#define SKETCH_SPAN ((uint32_t)(MEL16_NFFT + (MEL16_FRAMES - 1) * MEL16_HOP))
+//: How far BEFORE the trigger the window starts. One hop, matching hear/node/detect.py
+//: SKETCH_BACK_S = 0.004 s, which is exactly MEL16_HOP at 16 kHz.
+#define SKETCH_BACK ((uint32_t)MEL16_HOP)
+//: Two detections closer than this are one event's decay. hear/node/detect.py RETRIGGER_S.
+#define RETRIGGER_SAMPLES ((uint32_t)(0.060 * (double)FS_NOMINAL))
+
+// ⚠️TAKES AN ABSOLUTE SAMPLE INDEX AND RUNS FORWARD FROM IT. It used to take a look-BACK from
+// the write pointer, which put the window at [T-46.0 ms, T-2.0 ms] -- ending 2 ms before the
+// trigger, so not one shipped frame has ever contained the event that caused it. The comment at
+// the call site claimed the opposite. Measured over 1123 field frames: the loudest time frame is
+// the LAST of 8 in 33.9% of them (uniform would be 12.5%) and one of the last two in 47.3%,
+// which is the event arriving at the edge of a window that stops before it.
+static int sketch_frame(uint8_t *out, uint32_t start_abs, uint32_t node_us, uint16_t peak, uint16_t flags) {
   static float db[MEL16_BANDS * MEL16_FRAMES];
-  uint32_t start = (aring_w + ARING - back) % ARING;
+  uint32_t start = start_abs % ARING;
   for (int t = 0; t < MEL16_FRAMES; t++) {
     uint32_t s0 = start + (uint32_t)t * MEL16_HOP;
     for (int i = 0; i < MEL16_NFFT; i++) {
@@ -878,6 +892,7 @@ enum { CLIP_PENDING = 0, CLIP_OK, CLIP_BUDGET, CLIP_CARDFULL, CLIP_DEDUPE, CLIP_
 struct Det { uint32_t sample; uint32_t pps_n; int32_t us_since_pps; int64_t utc_us;
               int16_t trigger; uint16_t flags; uint32_t uptime_s; double fs_at;
               uint8_t clip_st;
+              uint8_t sk_st;          // 0 = the sketch is still waiting for post-onset audio
               uint8_t frame[MEL16_FRAME_BYTES]; };
 // A RING. dets[] used to be a hard cap -- past the 64th, a detection incremented the counter and
 // stored nothing, so a windy night reported hundreds of events and kept the first 64. det_n is
@@ -1099,11 +1114,17 @@ static bool utc_to_sample(int64_t utc, uint32_t *s) {
 //        1-2k -22.3 dB | 2-4k -27.8 dB | 4-8k -26.3 dB
 //      62-312 Hz carries +8.2 dB MORE than the whole 312-8000 Hz span the sketch can see.
 //
-// MEL16_FB_LO[0] is 5, so the detection bank's band 0 is FFT bins 5-8 = 312.5-500.0 Hz and
+// MEL16_FB_LO[0] is 5, so the detection bank's band 0 starts at FFT bin 5 = 312.5 Hz and
 // everything below is thrown away after the DC block has already paid for it. The scene bank
 // (mel_scene.h, from firmware/gen_mel_scene.py) starts at bin 1 instead: band 0 is bins 1-4 =
-// 62.5-250.0 Hz, band 2 lands exactly on the old band 0, and the top band still ends at bin 125
-// = 7812.5 Hz. No band is empty; the shipped bank has 227 nonzero weights, this one 233.
+// 62.5-250.0 Hz, and the top band still ends at bin 125 = 7812.5 Hz. No band is empty; the
+// scene bank has 233 nonzero weights against the shipped MEL16_FB_W[245].
+//
+// ⚠️THE TWO BANKS SHARE NO BAND. Scene band 2 is bins 5-8 and detection band 0 is bins 5-10 --
+// same first bin, different support -- so they overlap without being the same band, and no
+// (FB_LO, FB_N) pair of one bank equals any pair of the other. Band k on a scene row and band k
+// on a sketch frame are DIFFERENT FREQUENCIES and must never be stacked; tests/
+// test_firmware_mel_scene.py asserts both banks and their disjointness against the headers.
 //
 // The DETECTION bank is untouched, and must stay untouched: firmware/hear_poc checks it byte-
 // exact against golden vectors and hear/wire.py profile 0 IS the 20x8 f_lo=300 shape, so moving
@@ -2486,8 +2507,57 @@ void setup() {
 // happened, so an empty clip column is never ambiguous between "quiet", "budget spent" and "card
 // full". A row is not written until its clip has resolved, so the column never names a file that
 // does not exist -- see clip_pump() and the wait in det_flush.
+// ⚠️`node_id` AND NOT `node`, WHICH scene.csv USES, DELIBERATELY. The old header said `node`
+// and the row never wrote it -- 12 columns declared, 11 written, so every field a consumer read
+// by name was shifted one left and the missing one was the column saying WHICH NODE the row came
+// from, in the file that exists for multi-node TDoA. csv_open() rolls a file aside only when the
+// header STRING changes, so keeping the name would have appended 12-column rows under the same
+// header as the 11-column ones already on the card. Renaming forces the roll. Pulled from
+// nyquist and mach on 2026-09-08: 147 and 268 rows, every one 11 wide.
+// ⚠️`sketch_back` IS IN THE HEADER SO A ROW SAYS WHERE ITS OWN WINDOW STARTED. The frame's
+// meaning changed when the window went from [T-46 ms, T-2 ms] to running forward from one hop
+// before the trigger, and nothing in a row recorded which convention produced it -- so new-window
+// frames would have appended under the same header as old-window ones, indistinguishable. That is
+// the ambiguity csv_open's roll exists to prevent, and a changed header string is what triggers
+// it. Recording the value rather than bumping a version number also makes the NEXT window change
+// visible in the data instead of only in the firmware.
 static const char DETS_HDR[] =
-  "node,utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,frame_hex,clip,clip_why";
+  "node_id,utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,sketch_back,frame_hex,"
+  "clip,clip_why";
+
+// ⚠️THE SKETCH IS TAKEN HERE, NOT AT THE GATE EDGE, BECAUSE THE AUDIO DOES NOT EXIST YET.
+// The window runs forward from one hop before the trigger, so it needs SKETCH_SPAN - SKETCH_BACK
+// samples that have not been captured when the gate fires. Same deferral, and the same wait
+// idiom, as clip_pump.
+//
+// In order, and it RETURNS rather than continues on the first not-ready detection: dets are
+// flushed in order and det_flush refuses to write a row whose sketch is still pending, so
+// skipping ahead would stall the queue behind a row that can never complete.
+static void sketch_pump() {
+  // Slots recycle at MAXDET. Anything older than that is already gone; walking to it would
+  // sketch whatever occupies the slot now -- the same guard det_flush keeps.
+  uint32_t k0 = det_flushed;
+  if (det_n - det_flushed > MAXDET) k0 = det_n - MAXDET;
+  for (uint32_t k = k0; k < det_n; k++) {
+    Det &d = dets[k % MAXDET];
+    if (d.sk_st) continue;
+    if ((int32_t)(g_samples - (d.sample + (SKETCH_SPAN - SKETCH_BACK))) < 0) {
+      // not yet. If it never comes -- capture stalled -- the row must still be able to leave.
+      if ((millis() - boot_ms) / 1000 - d.uptime_s > CLIP_WAIT_MAX_S) {
+        d.flags |= 0x0002; d.sk_st = 1;
+        memset(d.frame, 0, sizeof d.frame);
+      }
+      return;
+    }
+    uint32_t start = d.sample - SKETCH_BACK;
+    // The ring holds ARING samples. If it lapped the window while we waited, the sketch would be
+    // of whatever is there now -- say so rather than ship it as a measurement.
+    if ((uint32_t)(aring_total - start) > (uint32_t)ARING) d.flags |= 0x0002;
+    sketch_frame(d.frame, start, (uint32_t)d.us_since_pps,
+                 (uint16_t)abs((int)d.trigger), d.flags);
+    d.sk_st = 1;
+  }
+}
 
 static void det_flush() {
   if (!sd_ok || det_flushed == det_n) return;
@@ -2496,7 +2566,7 @@ static void det_flush() {
   // open once a second for as long as that lasts.
   { uint32_t f0 = det_flushed;
     if (det_n > MAXDET && det_n - MAXDET > f0) f0 = det_n - MAXDET;
-    if (dets[f0 % MAXDET].clip_st == CLIP_PENDING) return; }
+    if (dets[f0 % MAXDET].clip_st == CLIP_PENDING || !dets[f0 % MAXDET].sk_st) return; }
   if (!detf) {
     // The old det_hdr_done latch is gone: it was set even when the header had NOT been written,
     // so a card swapped mid-run could never get one.
@@ -2516,12 +2586,13 @@ static void det_flush() {
     // so the delay a detection can suffer is ~10 s against the 1 s it used to be; the cost is
     // that a power cut inside that window loses the row, and det_n vs det_written in health.csv
     // is where that would show. Break, not continue: the file is append-only and in-order.
-    if (d.clip_st == CLIP_PENDING) break;
+    if (d.clip_st == CLIP_PENDING || !d.sk_st) break;
     char line[MEL16_FRAME_BYTES * 2 + 224];
-    int m = snprintf(line, sizeof line, "%lld,%lu,%lu,%lu,%ld,%d,%u,%.3f,",
+    int m = snprintf(line, sizeof line, "%s,%lld,%lu,%lu,%lu,%ld,%d,%u,%.3f,%lu,",
+                     node_id,
                      (long long)d.utc_us, (unsigned long)d.uptime_s, (unsigned long)d.sample,
                      (unsigned long)d.pps_n, (long)d.us_since_pps, d.trigger,
-                     (unsigned)d.flags, d.fs_at);
+                     (unsigned)d.flags, d.fs_at, (unsigned long)SKETCH_BACK);
     for (int j = 0; j < MEL16_FRAME_BYTES && m < (int)sizeof line - 64; j++) {
       line[m++] = hx[d.frame[j] >> 4]; line[m++] = hx[d.frame[j] & 0xF];
     }
@@ -2593,17 +2664,31 @@ static void audio_pump() {
           // detection used it 128 events ago -- a stale CLIP_OK would name a file for the wrong
           // event. Nothing is written from audio_pump(); clip_pump() picks it up from loop().
           dets[idx].clip_st = CLIP_PENDING;
-          // Sketch from a little BEFORE the trigger, so the rise the classifier needs is inside
-          // the window rather than clipped off its front.
-          uint32_t back = MEL16_NFFT + (MEL16_FRAMES - 1) * MEL16_HOP + 32;
+          // ⚠️THE SKETCH IS QUEUED, NOT TAKEN HERE. The window has to run FORWARD from the
+          // onset, and at this instant the post-onset audio does not exist yet -- the same
+          // reason clip_pump is a deferred queue. sketch_pump() takes it once the audio lands.
+          dets[idx].sk_st = 0;
           // ⚠️Before the ring has filled, the window behind the trigger is zeros, and a sketch of
           // silence is a legitimate-looking frame of all-equal bands. Flag it rather than ship a
           // number that means nothing. Bit 1 = insufficient context. (Bit 0 is retrigger.)
-          uint16_t fl = (aring_total < back) ? 0x0002 : 0x0000;
+          //
+          // MEL16_FLAG_BITS carries the rate code (bits 8-11) and the fixed-layout bit (12), both
+          // generated alongside the filterbank by gen_mel.py so they cannot disagree with it.
+          // Without them a frame does not say what band k MEANS: at 16 kHz band 12 is 3072 Hz
+          // under the old rescaled bank and 5826 Hz under the shared axis, and a consumer had no
+          // way to tell this node's frames from a 48 kHz phone's. Frames pulled from nyquist and
+          // mach on 2026-09-08 all decoded as fs=None/layout=nyquist, so the shipped classifier
+          // refused every one of them -- correctly, and uselessly.
+          // Bit 0 = retrigger: this detection landed inside the previous one's decay, so it is
+          // evidence about the site rather than a new event. It was DECLARED in the comment above
+          // and never once set -- the flags histogram over 1167 field rows is exactly {0, 2}.
+          // hear/node/detect.py has always packed it (RETRIGGER_S = 0.060 s).
+          uint16_t fl = MEL16_FLAG_BITS;
+          if (det_n >= 2) {
+            const Det &prev = dets[(det_n - 2) % MAXDET];
+            if ((uint32_t)(dets[idx].sample - prev.sample) < RETRIGGER_SAMPLES) fl |= 0x0001;
+          }
           dets[idx].flags = fl;
-          sketch_frame(dets[idx].frame, back,
-                       (uint32_t)(dets[idx].us_since_pps),
-                       (uint16_t)abs((int)sac), fl);
         }
       }
       float a = fabsf((float)sac);
@@ -2696,14 +2781,28 @@ void loop() {
             }
           }
         }
-        if (d < (uint32_t)(0.97 * fs_clean)) {
+        // ⚠️AGAINST FS_NOMINAL, NOT fs_clean. Testing a second against the very average it
+        // updates is a one-way latch: once fs_clean drifts high, every real second looks short,
+        // every second takes the drop branch, fs_clean_secs is reset before it can reach the 8
+        // it needs to recompute, and the value is stuck for the rest of the run. Measured on
+        // mach: fs_clean_hz = 22624.0000 in 1124 of 1126 health rows, fs_win_s pinned at 0,
+        // drop_samples 223,352,776 against ~223,209,000 predicted by the inflation itself, and
+        // every clip written in that boot carrying a 22624 Hz WAV header over 16 kHz audio.
+        if (d < (uint32_t)(0.97 * (double)FS_NOMINAL)) {
           drop_seconds++;
-          drop_samples += (uint32_t)(fs_clean - (double)d);
+          drop_samples += (uint32_t)((double)FS_NOMINAL - (double)d);
           fs_clean_secs = 0;                      // a broken second cannot be averaged over
         } else {
           if (!fs_clean_secs) { win_sm0 = prev_sm; win_e0 = e - 1; }
           fs_clean_secs = e - win_e0;
-          if (fs_clean_secs >= 8) fs_clean = (double)(sm - win_sm0) / (double)fs_clean_secs;
+          if (fs_clean_secs >= 8) {
+            double fsc = (double)(sm - win_sm0) / (double)fs_clean_secs;
+            // A crystal is tens of ppm from nominal, not percent. Anything outside 1% is a
+            // counting fault, not a measurement, and must not become the divisor that dates
+            // every sample, sizes every WAV header and scales every drop count.
+            if (fsc > 0.99 * (double)FS_NOMINAL && fsc < 1.01 * (double)FS_NOMINAL) fs_clean = fsc;
+            else fs_clean_secs = 0;
+          }
         }
       }
       prev_sm = sm; seen_edge = e;
@@ -2714,6 +2813,7 @@ void loop() {
     if (millis() - last_env > 5000) { last_env = millis(); bmp_read(); }   // variable this slow
   }
 
+  sketch_pump();                                  // before the flush: it gates what may be written
   { static uint32_t last_fl = 0;                  // batch, so the stall is once a second not once a hit
     if (det_n != det_flushed && millis() - last_fl > 1000) { last_fl = millis(); det_flush(); }
   }

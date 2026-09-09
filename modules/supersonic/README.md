@@ -33,3 +33,29 @@ Trajectory solving lives in `hear/solve/shockwave.py`, because the geometry is p
 
 Trained on one range, one rifle, one afternoon, all cracks and **zero blast-only** examples.
 A shot heard from behind, or a subsonic round, is not represented. Retrain.
+
+## Scoring the bytes the fleet transmits
+
+`model.json` reads six hand-engineered features. Nothing consumed a **sketch**, so the fleet was
+transmitting a representation no model could score. `train_sketch.py` fits ones that can, and
+`classify.score_sketch()` applies them:
+
+| model | bands | applies to | nested grouped-CV AUC |
+|---|---|---|---|
+| `model_sketch.json` | 20 | ≥32 kHz sensors (the phones) | 0.9634 |
+| `model_sketch_15.json` | 15 | ≥16 kHz — **the whole fleet** | 0.9588 |
+
+⚠️**The sketch is not more accurate than the six features.** Paired bootstrap over the 69 groups:
++0.0054 AUC, 95 % CI [−0.0098, +0.0232], P(better) 0.75. A tie. Earlier notes on this repo implied
+otherwise and have been corrected. The reasons to use it are that it fits a Meshtastic packet, that
+it can be retrained for a sound nobody has thought of yet, and that a node cannot reliably compute
+the envelope those six scalars come from.
+
+⚠️**`score_sketch` refuses rather than pads.** A 16 kHz node's top five bands are empty *by
+construction*; feeding those to the 20-band model is a spectrum claiming the node measured silence
+above 9.4 kHz when it measured nothing at all. Measured cost: AUC 0.9141 against 0.9473 on the same
+audio. Use `FLEET_SKETCH_MODEL` for a mixed-rate fleet.
+
+⚠️**Do not re-try burst structure.** Round-to-round interval, capped at 250 ms so it cannot encode
+an operator's pause: 0.9634 → 0.9630. *Alone* it scores AUC **0.32** — anti-predictive, because
+short intervals mark retriggers and retriggers are labelled not-shot.

@@ -26,23 +26,83 @@ actually buys.
 
 ## It is not a downgrade — it is better
 
-Measured on the same 228 operator-labelled events, grouped 5-fold CV:
+Measured on the same 228 operator-labelled events. ⚠️**NESTED** grouped CV — the regularisation
+strength is chosen *inside* each outer fold, so the number is not selected on its own test
+statistic. The earlier figures on this page were single-level CV with `C` tuned against the
+score they reported, and they are superseded:
 
-| | AUC | accuracy |
+| | nested AUC | superseded figure |
 |---|---|---|
-| **172 B sketch** | **0.9631** | **0.8816** |
+| **172 B sketch**, absolute dB, one-hop onset | **0.9728** | 0.9631 |
+| sketch, 15 bands (whole fleet) | 0.9665 | — |
+| sketch, peak-aligned | 0.9634 | — |
+| hand-crafted 6 features | 0.9584 | 0.9589 |
+| band/frame summaries (36 dims) | 0.9554 | — |
+| sketch, onset clamped to the 25 ms guard | 0.9443 | — |
+| sketch shape *without* `ref_db` | 0.9450 | 0.9519 |
 
-⚠️**These numbers predate the onset fix and have to be re-measured.** They were obtained on
-sketches whose first frame began at the envelope PEAK. `hear/node/pipeline.py` now starts the
-sketch at the constant-fraction ONSET, so frame 0 is the rise rather than the blast and the
-amplitude cue sits elsewhere in the window. The bytes are different, so the AUC is unknown until
-it is refitted on the same 228 hand-labelled events. Do not quote this table against current code.
-| hand-crafted 6 features | 0.9589 | 0.8684 |
-| `ref_db` alone (amplitude) | 0.9007 | — |
-| sketch shape *without* `ref_db` | 0.9519 | — |
+⚠️**WHERE THE SKETCH STARTS IS WORTH MORE THAN ANYTHING ELSE MEASURED HERE.** The gate's onset
+is walked back to the 25 ms re-trigger guard, which is right for the TIMESTAMP and wrong for a
+33 ms feature window — it slides the window off the event and scores **0.9443**, worse than not
+walking back at all. Clamped to one hop it is **0.9732**. That 2.9-point spread is larger than
+every representation difference on this page put together, and it is a constant doing two jobs
+with one number (`detect.SKETCH_BACK_S`).
 
-The sketch beats the features it replaces, and the shape carries strong signal independent of
-loudness — which is exactly what a six-scalar summary was throwing away.
+⚠️**The onset itself is now referred to the local floor, not to zero.** A round landing inside
+the previous round's decay tail never sees its envelope fall to 20 % of the *new* peak, so the
+walk ran to the clamp edge and returned it: **42 of 228 events (18.4 %)** timestamped exactly
+25 ms early, **8.6 m of range**. Against known synthetic truth at that condition the error goes
+from **−21.62 ms to +0.43 ms**. On the real corpus the never-timed count goes 42 → 0, and
+**27.6 % of all events move by more than 1 ms**. Cost to the sketch: 0.9732 → **0.9728** at 20 bands and
+0.9705 → **0.9665** at 15 — inside the noise band either way, and worth one definition of "onset"
+across node, phone and training script. (An earlier draft of this line quoted 0.9712/0.9690;
+those were measured before the interior-trough guard and are superseded by the refit.)
+
+### ⚠️ NFFT: the case for shortening it died with the window fix
+
+Re-measured on the same 228 events with the **current onset-aligned window**, nested grouped CV:
+
+| geometry | AUC | wire bytes |
+|---|---|---|
+| **NFFT 256, 20×8** (shipped) | **0.9728** | 172 |
+| NFFT 128, 20×12 | 0.9677 | 252 |
+| NFFT 128, 20×8 | 0.9667 | 172 |
+| NFFT 128, 15×8 | 0.9663 | 132 |
+| NFFT 64, 20×8 | 0.9444 | 172 |
+
+A 2026-09-08 research pass costed NFFT 128/64 at **+0.0104 to +0.0171** and ranked it worth
+doing. That gain was measured against the **pre-fix** window, which ended 2 ms *before* the
+trigger — with the event at the very edge, finer time resolution helps. Once the window is placed
+correctly the frequency resolution of NFFT 256 matters more, and every shorter NFFT is worse.
+
+⚠️ 256 vs 128 is 0.006, inside the ±0.017 noise band, so the honest claim is *not better*, not
+*worse*. NFFT 64 at 0.9444 is outside the band and genuinely worse. Either way there is no longer
+a measured case for changing NFFT, and it would have cost new profile ids, regenerated goldens,
+both ports and a model refit.
+
+⚠️**The sketch cannot resolve a crack's rise, and should stop being asked to.** One analysis
+frame is NFFT/fs = 5.33 ms; the measured peak-to-onset distance is a **median of 1.56 ms**. Frame
+0 contains the peak at every rise from 1 ms to 20 ms. If the rise must be resolved the lever is
+NFFT/HOP_S, not the onset clamp.
+
+⚠️**The sketch does NOT measurably beat the features it replaces.** Paired bootstrap over the 69
+groups: sketch − hand features = **+0.0054, 95 % CI [−0.0098, +0.0232]**, P(sketch better) 0.75.
+That is a tie, and the previous wording ("the sketch beats the features it replaces") was reading
+noise. At n = 228 with 69 independent groups this corpus cannot separate them; more data would
+settle it, more features will not.
+
+The case for the sketch was never accuracy:
+
+1. it is what fits in a Meshtastic packet;
+2. it commits to no interpretation — the same bytes retrain for cicadas next year;
+3. a node cannot reliably compute `rise`/`decay`/`crest`. The envelope work behind those six
+   scalars is precisely what does not fit on the node.
+
+**What does not help, measured, so nobody retries it:** round-to-round interval capped at 250 ms
+so it cannot encode an operator's pause — 0.9634 → 0.9630, and *alone* it scores AUC **0.32**,
+anti-predictive, because short intervals mark retriggers and retriggers are labelled not-shot.
+Burst structure carries nothing on this corpus. Uncapped (the leaky `gap`) it is 0.9627, so the
+leak was not buying anything either.
 
 ⚠️`ref_db` must travel. Amplitude alone reaches 0.90; a sketch normalised per-event and sent
 without its reference would discard the single strongest cue this project has measured.

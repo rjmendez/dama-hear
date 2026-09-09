@@ -1,0 +1,151 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hear-pool
+  namespace: dama
+  labels:
+    app: hear-drain
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-drain
+  namespace: dama
+  labels:
+    app: hear-drain
+  annotations:
+    dama-hear/what: >-
+      Drains the ESP32-S3 hear nodes into the pooled sketch corpus on the hear-pool PVC.
+      Content-addressed and idempotent, so overlapping runs and re-fetched files cost nothing.
+spec:
+  # Every 15 minutes. The nodes roll dets.csv to dets-prev.csv on reflash, so the window a
+  # missed run can lose is bounded well under one boot; the fetch is tens of KB.
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: hear-drain
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: drain
+              image: python:3.13-slim
+              command: ["/bin/sh", "-lc"]
+              args:
+                - |
+                  set -e
+                  # numpy is cached on the PVC rather than pulled every 15 minutes. The version is
+                  # pinned so a silent upgrade cannot change a decode; bump it deliberately.
+                  LIB=/pool/pylib
+                  if [ ! -d "$LIB/numpy" ]; then
+                    echo "installing numpy into $LIB"
+                    pip install --no-cache-dir --target "$LIB" 'numpy==2.2.6' >/dev/null 2>&1
+                  fi
+                  export PYTHONPATH="$LIB:/app"
+                  exec python /app/tools/hear_drain.py \
+                    --pool /pool/corpus \
+                    --node nyquist=172.16.100.105 \
+                    --node mach=172.16.100.116
+              volumeMounts:
+                - { name: code, mountPath: /app/hear/__init__.py,  subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/sketch.py,    subPath: hear_sketch.py }
+                - { name: code, mountPath: /app/hear/corpus.py,    subPath: hear_corpus.py }
+                - { name: code, mountPath: /app/hear/detsfile.py,  subPath: hear_detsfile.py }
+                - { name: code, mountPath: /app/hear/scenefile.py, subPath: hear_scenefile.py }
+                - { name: code, mountPath: /app/hear/pool.py,      subPath: hear_pool.py }
+                - { name: code, mountPath: /app/tools/hear_drain.py, subPath: tools_hear_drain.py }
+                - { name: pool, mountPath: /pool }
+              resources:
+                requests: { cpu: 100m, memory: 128Mi }
+                limits:   { cpu: "1",  memory: 512Mi }
+          volumes:
+            - name: code
+              configMap:
+                name: hear-drain-code
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool
+---
+# ⚠️STALENESS IS THE FAILURE THAT MATTERS AND IT IS SILENT. The drain above exits 0 whenever its
+# HTTP succeeds, so a node that fell off the wifi -- or one whose SD card stopped being written --
+# produces a green CronJob history forever. This second job asserts on the SENSOR's own last
+# success, which is what a monitor should alert on.
+#
+# ⚠️IT ALSO ASSERTS THAT THE SCENE TAIL REACHED BACK FAR ENOUGH. A drain whose HTTP succeeded and
+# whose window started hours after the previous one ended is fresh, adds rows and exits 0. The
+# 2 MB tail covers 2.42 h on nyquist and 2.45 h on mach (derived from the pool ledger's own
+# 235.0 / 232.1 B per row at 1.024 s per row), which is not comfortably longer than a boot. How
+# much has already been lost that way is NOT asserted here: it was never measured, which is the
+# reason the drain now measures it. `--check` fails on any whole row the fetch never asked for;
+# see the byte watermark in tools/hear_drain.py. Threshold: --max-unfetched-bytes, default 0.
+#
+# ⚠️THIS JOB RUNS ONE FIFTH AS OFTEN AS THE DRAIN ABOVE (`*/15 * * * *` vs `17 * * * *`), so four
+# drains land between two checks. A per-run heartbeat field would be overwritten three times
+# before the gate looked at it, so the heartbeat keeps a ring and `--unfetched-window-s` says how
+# much of it to sum. It is passed explicitly BECAUSE it is coupled to these two schedules: change
+# either cron and this number has to move with it. 7200 s is two check periods, so one missed
+# check run still reports the loss.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-drain-check
+  namespace: dama
+  labels:
+    app: hear-drain
+spec:
+  schedule: "17 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: hear-drain
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: check
+              image: python:3.13-slim
+              command: ["/bin/sh", "-lc"]
+              args:
+                - |
+                  export PYTHONPATH=/pool/pylib:/app
+                  python /app/tools/hear_drain.py --pool /pool/corpus --check \
+                    --unfetched-window-s 7200
+                  echo "--- pool ---"
+                  python /app/tools/hear_drain.py --pool /pool/corpus --stats
+              volumeMounts:
+                - { name: code, mountPath: /app/hear/__init__.py,  subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/sketch.py,    subPath: hear_sketch.py }
+                - { name: code, mountPath: /app/hear/corpus.py,    subPath: hear_corpus.py }
+                - { name: code, mountPath: /app/hear/detsfile.py,  subPath: hear_detsfile.py }
+                - { name: code, mountPath: /app/hear/scenefile.py, subPath: hear_scenefile.py }
+                - { name: code, mountPath: /app/hear/pool.py,      subPath: hear_pool.py }
+                - { name: code, mountPath: /app/tools/hear_drain.py, subPath: tools_hear_drain.py }
+                - { name: pool, mountPath: /pool }
+              resources:
+                requests: { cpu: 100m, memory: 128Mi }
+                limits:   { cpu: "1",  memory: 512Mi }
+          volumes:
+            - name: code
+              configMap:
+                name: hear-drain-code
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool

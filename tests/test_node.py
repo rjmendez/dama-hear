@@ -320,6 +320,56 @@ class TestOnset:
         assert max(abs(e) for e in errs) <= 2.0, "worst %+.2f samples" % \
             max(errs, key=abs)
 
+    def test_a_round_inside_the_previous_one_s_tail_is_timed_not_clamped(self):
+        """⚠️THE 18.4% CASE, WITH KNOWN TRUTH.
+
+        A round landing inside the previous round's decay tail never sees its envelope fall to
+        20% of the NEW peak, because the old one is still ringing. Referred to zero, the walk ran
+        to the clamp edge and returned it -- 25 ms early, 8.6 m of range. Referred to the local
+        trough it lands on the event.
+
+        Measured on the real corpus this takes the never-timed count from 42 of 228 to 0.
+        """
+        rng = np.random.default_rng(7)
+        n, truth = int(0.30 * FS), int(0.045 * FS)
+
+        def blip(count, amp, rise_s, decay_s):
+            t = np.arange(count) / FS
+            env = np.where(t < rise_s, t / max(rise_s, 1e-9), np.exp(-(t - rise_s) / decay_s))
+            return amp * env * rng.normal(0, 1, count)
+
+        # previous round at -3 dB still ringing, so the floor sits at ~0.23 of the new peak
+        x = blip(n, 20000.0 * 10 ** (-3 / 20.0), 0.001, 0.060)
+        x[truth:] += blip(n - truth, 20000.0, 0.0016, 0.030)
+        x += rng.normal(0, 20.0, n)
+
+        e = DT.envelope(x, FS)
+        peak = int(np.argmax(e))
+        idx, found = DT.onset_index_checked(e, peak, DT.ONSET_FRAC, back=int(DT.GUARD_S * FS))
+        assert found is True, "still cannot time a round inside a decay tail"
+        err_ms = (idx - truth) / FS * 1e3
+        assert abs(err_ms) < 3.0, "onset off by %.1f ms" % err_ms
+
+    def test_referring_to_the_floor_cannot_regress_a_quiet_event(self):
+        """Where the floor is zero the two references are identical -- a strict generalisation."""
+        e = np.concatenate([np.zeros(2000), np.linspace(0.0, 1.0, 500)])
+        peak = len(e) - 1
+        idx, found = DT.onset_index_checked(e, peak, 0.20, back=2400)
+        assert found is True
+        # the 20% crossing of a clean rise off a zero floor
+        assert abs(idx - (2000 + 0.20 * 500)) < 2.0
+
+    def test_a_trough_at_the_window_edge_is_not_a_baseline(self):
+        """⚠️A window that TRUNCATES a rise has its minimum at the left edge. Referring the
+        fraction to that turns an honest 'clamped, cannot see further back' into a confidently
+        LATE onset. Only an interior trough is a baseline. All 228 real events have one; a
+        truncated block does not, by construction."""
+        e = np.linspace(0.5, 1.0, 1200)          # descending out of the window: never a trough
+        peak = len(e) - 1
+        idx, found = DT.onset_index_checked(e, peak, 0.20, back=1000)
+        assert found is False, "a truncated rise must not be referred to its own edge"
+        assert idx == peak - 1000
+
     def test_a_rise_that_predates_the_block_is_clamped_to_the_edge(self):
         # The gate is block-local. Hand it a block that starts partway up the rise, so the 20%
         # crossing is already behind it: the answer must be the edge, not an extrapolation.
@@ -337,7 +387,7 @@ class TestOnsetInThePipeline:
     # estimator is pinned offset-independently by test_onset_is_offset_independent below.
     AT = 8400
 
-    def test_timestamp_and_sketch_both_start_at_the_onset(self):
+    def test_timestamp_starts_at_the_onset(self):
         rise = 0.020
         p = Pipeline(FS, node_us_of=lambda idx: int(round(idx / FS * 1e6)))
         d = p.run(_burst(rise, 20000.0, at=self.AT))[0]
@@ -347,10 +397,59 @@ class TestOnsetInThePipeline:
         peak_us = int(round(d["peak_index"] / FS * 1e6))
         assert peak_us - got > 0.7 * rise * 1e6
 
-    def test_the_sketch_contains_the_rise(self):
-        # sketched from the onset, the first frame must be quieter than the peak frame; sketched
-        # from the peak (the old behaviour) frame 0 IS the peak and the rise is gone
+    def test_the_sketch_cannot_resolve_a_real_crack_s_rise_and_does_not_pretend_to(self):
+        """⚠️THIS REPLACES `test_the_sketch_contains_the_rise`, WHICH ASSERTED SOMETHING THE
+        FORMAT CANNOT DO FOR ITS OWN TARGET SIGNAL.
+
+        One analysis frame is NFFT/fs = 256/48000 = **5.33 ms**. The measured peak-to-onset
+        distance over the 228 hand-labelled 2026-09-05 events is a **median of 1.56 ms**. The
+        rise of a rifle crack is therefore SHORTER THAN ONE FRAME and frame 0 contains the peak
+        no matter where the window starts -- swept here at 1/2/4/5.33/8/12/20 ms rises, frame 0
+        is within 1.5 dB of the peak at every one.
+
+        The old test passed only because a 20 ms synthetic rise is not a crack. Chasing that
+        property also costs accuracy: sketching from the 25 ms-clamped onset instead of one hop
+        measures 0.9443 against 0.9732 nested AUC on the real events.
+
+        If the rise must be resolved, the lever is NFFT/HOP_S -- not the onset clamp.
+        """
+        for rise_s in (0.001, 0.002, 0.004, 0.008, 0.020):
+            d = Pipeline(FS).run(_burst(rise_s, 20000.0, at=self.AT))[0]
+            db = SK.unpack(d["frame"])["db"]
+            band = int(np.argmax(db.max(axis=1)))
+            assert db[band].max() - db[band, 0] < 6.0, (
+                "a %.0f ms rise resolved into frame 0 -- if NFFT or HOP_S changed, this "
+                "test's premise changed with it" % (rise_s * 1e3))
+        assert SK.NFFT / FS > 0.00156, "one frame is no longer longer than a crack's rise"
+
+    def test_the_sketch_window_is_clamped_tighter_than_the_timestamp(self):
+        """⚠️THE TWO WANT DIFFERENT CLAMPS AND USED TO SHARE ONE NUMBER.
+
+        The timestamp walks back to the 25 ms re-trigger guard, which is right for it. Starting
+        the 33 ms sketch there slides it off the event: nested grouped CV on the same 228 events,
+        varying ONLY the sketch start, gives 0.9443 at the 25 ms guard against 0.9732 at one hop
+        -- the guard is worse than not walking back at all (0.9634).
+        """
         d = Pipeline(FS).run(_burst(0.020, 20000.0, at=self.AT))[0]
-        db = SK.unpack(d["frame"])["db"]
-        band = int(np.argmax(db.max(axis=1)))
-        assert db[band, 0] < db[band].max() - 6.0, "frame 0 is already the peak: no rise sketched"
+        back_s = (d["peak_index"] - d["sketch_index"]) / FS
+        assert 0 <= back_s <= DT.SKETCH_BACK_S + 1.0 / FS, \
+            "sketch started %.1f ms before the peak; the clamp is %.1f ms" % (
+                back_s * 1e3, DT.SKETCH_BACK_S * 1e3)
+        # the timestamp is NOT clamped that tightly -- it still walks the full rise
+        assert (d["peak_index"] - d["onset_index"]) / FS > 0.7 * 0.020
+
+    def test_an_onset_that_never_crossed_the_fraction_says_so(self):
+        """⚠️18.4% of the 2026-09-05 events never reach 20% of their own peak inside the guard --
+        retriggers sitting in the previous round's decay tail. onset_index returns the CLAMP EDGE
+        for those, 25 ms early, indistinguishable from a real slow rise. At 345 m/s that is 8.6 m
+        of range on a project whose output is localisation."""
+        fs = 48000.0
+        e = np.linspace(0.5, 1.0, int(0.05 * fs))          # never drops below 20% of its peak
+        peak = len(e) - 1
+        idx, found = DT.onset_index_checked(e, peak, 0.20, back=int(DT.GUARD_S * fs))
+        assert found is False
+        assert idx == peak - int(DT.GUARD_S * fs), "not an onset: it is the clamp edge"
+        # and a real rise is still found and still flagged
+        e2 = np.concatenate([np.zeros(1000), np.linspace(0.0, 1.0, 200)])
+        idx2, found2 = DT.onset_index_checked(e2, len(e2) - 1, 0.20, back=int(DT.GUARD_S * fs))
+        assert found2 is True and idx2 > 1000
