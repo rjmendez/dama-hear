@@ -53,7 +53,68 @@ __all__ = [
     "max_interval", "range_from_interval", "range_lower_bound", "theta_from_interval",
     "range_uncertainty", "band_power", "crack_onset", "second_arrival",
     "rise_reference", "interval_consistent", "IntervalCheck",
+    "CRLB_MB_SW_M_PER_S", "MAX_USEFUL_SLACK", "position_error_floor_m", "crlb_geometry_factor",
 ]
+
+
+# ---------------------------------------------------------------- the CRLB floor
+#
+# ⚠️THIS REPLACES THE PASS/FAIL GATE AS THE THING TO REPORT. `interval_consistent`'s |dt_i - dt_j|
+# <= 2d/c bound is a real physical inequality and is kept, but it is not a result: it scales with
+# separation, so past ~0.35 m of spacing at 2 ms of onset scatter it cannot fail, and the three
+# 2026-09-05 phones (10.1-20.0 m, bound 58.7-115.9 ms) passed every pair on every burst including
+# pairs whose implied ranges differed by a factor of two. A check that cannot fail is not
+# evidence.
+#
+# The field's answer is not a tighter bound, it is a CRLB. Lindgren et al. (2010, EURASIP JASP
+# 690732) publish, for their muzzle-blast/shock-wave difference model, the position-error floor
+#
+#     RMSE(x) >= 1430 * sigma_e   [m],    sigma_e = per-microphone detection-time error [s]
+#
+# which converts an onset sigma straight into metres of position error, with no threshold to tune
+# and no way to pass by construction.
+#
+# ⚠️1430 IS THEIR ARRAY'S NUMBER, NOT A UNIVERSAL CONSTANT, AND IT MUST BE RE-DIMENSIONED BEFORE
+# IT IS BELIEVED HERE. It carries units of m/s, and 1430 / 345.238 = 4.14: it is c multiplied by a
+# geometric dilution of ~4.1 for THEIR sensor layout and THEIR source geometry. Our own layouts
+# are far worse conditioned -- `placement.dop_grid` over a 120 m box gives a median DOP of 35-200
+# for three nodes around the nyquist-mach pair -- so 1430 is a floor we are nowhere near, not a
+# prediction of what we would achieve. `crlb_geometry_factor()` exposes the 4.14 so a caller can
+# substitute a DOP measured for its own geometry instead of importing Lindgren's.
+
+#: Lindgren et al. (2010) MB-SW position-error floor, metres per second of detection-time error.
+CRLB_MB_SW_M_PER_S: float = 1430.0
+
+#: (2d/c) / tol above which the cross-mic bound cannot realistically fail and so tests nothing.
+#: JUDGEMENT. Sized on the measured cases it must separate: the ESP intra-board 38.1 mm pair at a
+#: 1.06 ms tolerance scores 0.21, the 2026-09-05 phones at 10.1-20.0 m score 55-109.
+MAX_USEFUL_SLACK: float = 3.0
+
+
+def position_error_floor_m(sigma_e_s: float, k_m_per_s: float = CRLB_MB_SW_M_PER_S) -> float:
+    """RMSE(x) >= k * sigma_e. The CRLB position-error floor a given onset sigma cannot beat.
+
+    Read it as a floor and never as an estimate: it is what a perfectly-conditioned estimator on
+    Lindgren's geometry would achieve, so any real answer is worse. Pass `k_m_per_s` to substitute
+    a factor derived from the layout at hand -- see `crlb_geometry_factor`.
+    """
+    s = float(sigma_e_s)
+    if s < 0.0:
+        raise ValueError("sigma_e must be >= 0 s (got %r)" % sigma_e_s)
+    if k_m_per_s <= 0.0:
+        raise ValueError("k must be > 0 m/s (got %r)" % k_m_per_s)
+    return float(k_m_per_s) * s
+
+
+def crlb_geometry_factor(k_m_per_s: float = CRLB_MB_SW_M_PER_S, c: float = 345.238) -> float:
+    """k / c: the dilution the published floor bakes in, in metres of position per metre of range.
+
+    1430 / 345.238 = 4.14. Quoting it this way is the whole point -- it is the number that has to
+    be replaced by this array's own DOP before the floor means anything about this array.
+    """
+    if c <= 0.0:
+        raise ValueError("c must be > 0 m/s (got %r)" % c)
+    return float(k_m_per_s) / float(c)
 
 
 # ---------------------------------------------------------------- geometry
@@ -290,9 +351,20 @@ def rise_reference(x, fs: float, anchors_s: Iterable[float], **kw) -> np.ndarray
 
 
 class IntervalCheck(dict):
-    """dict with a truthy `valid`, so `if check_array_intervals(...):` reads correctly."""
+    """dict with a truthy `valid`, so `if check_array_intervals(...):` reads correctly.
+
+    ⚠️`valid` ALONE IS NOT A RESULT. Read `discriminating` beside it: False means the 2d/c bound
+    was too loose to fail on this geometry, so `valid` is True by construction and carries no
+    information. `usable_as_gate` is the conjunction, and `position_floor_m` is the quantity that
+    replaces the verdict when there is a sigma to compute it from.
+    """
     def __bool__(self) -> bool:
         return bool(self.get("valid"))
+
+    @property
+    def usable_as_gate(self) -> bool:
+        """True only when the check both passed AND could have failed."""
+        return bool(self.get("valid")) and bool(self.get("discriminating"))
 
 
 def interval_consistent(intervals_s: Dict[int, float], mic_positions, c: float = 345.238,
@@ -326,6 +398,10 @@ def interval_consistent(intervals_s: Dict[int, float], mic_positions, c: float =
     cannot fail is not evidence the picks are right. For the bound to discriminate you need 2d/c
     comparable to the scatter -- d <~ 0.35 m at 2 ms -- which is a CO-LOCATED pair, i.e. exactly
     what a node array is and exactly what surveyed flags tens of metres apart are not.
+
+    ⚠️SO DO NOT REPORT `valid`. `discriminating` says whether the bound could have failed at all,
+    `tightest_bound_slack` says by how far, and `position_floor_m` (given `sigma_s`) is the
+    CRLB-derived quantity that replaces the verdict -- see `position_error_floor_m`.
     """
     if (tol_s is None) == (sigma_s is None):
         raise ValueError("pass exactly one of tol_s or sigma_s: a bound with no tolerance is "
@@ -335,17 +411,36 @@ def interval_consistent(intervals_s: Dict[int, float], mic_positions, c: float =
     P = np.asarray(mic_positions, dtype=float)
     keys = sorted(intervals_s)
     pairs, bad = [], []
+    slacks = []
     for a in range(len(keys)):
         for b in range(a + 1, len(keys)):
             i, j = keys[a], keys[b]
             d = float(np.linalg.norm(P[i] - P[j]))
             ddt = float(intervals_s[i] - intervals_s[j])
             ok = physically_possible(ddt / 2.0, d, c, tol_s=tol_s / 2.0)
+            # How much room the bound has over the tolerance. > 1 means a wrong pick has to be
+            # bigger than the tolerance by this factor before the bound notices it at all.
+            slack = float("inf") if tol_s <= 0.0 else (2.0 * d / c) / float(tol_s)
+            slacks.append(slack)
             pairs.append(dict(pair=(i, j), spacing_m=d, ddt_s=ddt, max_ddt_s=2.0 * d / c,
-                              within_bound=bool(ok)))
+                              within_bound=bool(ok), bound_slack=slack))
             if not ok:
                 bad.append(f"|dt{i}-dt{j}| = {abs(ddt)*1e3:.2f} ms > 2d/c = {2*d/c*1e3:.2f} ms")
     v = np.array([intervals_s[k] for k in keys], dtype=float)
-    return IntervalCheck(valid=not bad, reasons=bad, pairs=pairs,
-                         interval_s=float(np.median(v)), spread_s=float(v.max() - v.min()),
-                         n_mics=len(keys))
+    tightest = min(slacks) if slacks else float("inf")
+    discriminating = bool(tightest <= MAX_USEFUL_SLACK)
+    floor_m = (position_error_floor_m(float(sigma_s)) if sigma_s is not None else None)
+    return IntervalCheck(
+        valid=not bad, reasons=bad, pairs=pairs,
+        interval_s=float(np.median(v)), spread_s=float(v.max() - v.min()),
+        n_mics=len(keys),
+        # ⚠️the three fields that stop `valid` from being read as a result on its own.
+        discriminating=discriminating,
+        tightest_bound_slack=tightest,
+        position_floor_m=floor_m,
+        note=(None if discriminating else
+              "the tightest pair's bound is %.0fx its tolerance (%.2f ms over %.2f ms), so no "
+              "onset error this detector produces can fail it: `valid` here is true by "
+              "construction. Report position_floor_m = %s instead -- pass sigma_s to get it."
+              % (tightest, tightest * tol_s * 1e3, tol_s * 1e3,
+                 "%.2f m" % floor_m if floor_m is not None else "(needs sigma_s)")))

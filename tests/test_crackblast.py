@@ -239,3 +239,51 @@ def test_measured_2026_09_05_board_intervals():
     broken = {0: 0.03216, 2: 0.05673, 4: 0.03928}            # 21:03:47.150
     chk = interval_consistent(broken, ESP_MICS, c=C, sigma_s=0.00025)
     assert not chk["valid"] and len(chk["reasons"]) >= 2
+
+
+# ── the CRLB floor that replaces the pass/fail gate ─────────────────────────────────────────────
+
+def test_the_floor_is_linear_in_the_onset_sigma_and_refuses_nonsense():
+    from hear.solve.crackblast import position_error_floor_m
+    assert position_error_floor_m(1e-3) == pytest.approx(1.43)
+    assert position_error_floor_m(0.0) == 0.0
+    assert position_error_floor_m(2e-4) == pytest.approx(2 * position_error_floor_m(1e-4))
+    with pytest.raises(ValueError):
+        position_error_floor_m(-1e-6)
+    with pytest.raises(ValueError):
+        position_error_floor_m(1e-6, k_m_per_s=0.0)
+
+
+def test_the_published_constant_decomposes_into_c_times_a_dilution():
+    """1430 m/s is Lindgren's array, not a universal. Exposing 1430/c = 4.14 is what lets a
+    caller swap in a DOP measured on ITS geometry -- ours is 35-200, not 4.1."""
+    from hear.solve.crackblast import CRLB_MB_SW_M_PER_S, crlb_geometry_factor
+    assert crlb_geometry_factor(c=C) == pytest.approx(4.142, abs=1e-3)
+    assert crlb_geometry_factor(CRLB_MB_SW_M_PER_S, C) * C == pytest.approx(CRLB_MB_SW_M_PER_S)
+
+
+def test_the_gate_says_when_its_bound_could_not_have_failed():
+    """The measured trap: at 10-20 m the 2d/c bound is 58.7-115.9 ms against ~2 ms of onset
+    scatter, so every pair passes on every burst. `valid` alone hides that; `discriminating`
+    is what stops it being read as evidence."""
+    phones = [(0.0, 0.0), (10.132, 0.0), (0.0, 20.005)]
+    loose = interval_consistent({0: 0.0412, 1: 0.0916, 2: 0.0538}, phones, c=C, sigma_s=0.0007)
+    assert loose["valid"] is True
+    assert loose["discriminating"] is False
+    assert loose.usable_as_gate is False
+    assert loose["tightest_bound_slack"] > 10.0
+    assert "true by construction" in loose["note"]
+
+    tight = interval_consistent({i: 0.0538 for i in range(6)}, ESP_MICS, c=C, sigma_s=0.00025)
+    assert tight["valid"] is True and tight["discriminating"] is True
+    assert tight.usable_as_gate is True
+    assert tight["tightest_bound_slack"] < 1.0
+    assert tight["note"] is None
+
+
+def test_the_floor_is_reported_whenever_a_sigma_was_given():
+    with_sigma = interval_consistent({i: 0.0538 for i in range(6)}, ESP_MICS, c=C,
+                                     sigma_s=0.00025)
+    assert with_sigma["position_floor_m"] == pytest.approx(1430.0 * 0.00025)
+    with_tol = interval_consistent({i: 0.0538 for i in range(6)}, ESP_MICS, c=C, tol_s=1e-3)
+    assert with_tol["position_floor_m"] is None, "no sigma, no floor -- do not invent one"

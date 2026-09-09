@@ -183,11 +183,21 @@ def _report(s, P, t, c, n_eq, n_unk, rms_ms, t0, at_bound, source_class,
         "n_nodes": len(P), "n_equations": n_eq, "n_unknowns": n_unk,
         "up_assumed_m": float(fixed_up_m) if fixed_up_m is not None else None,
         "sound_speed_mps": c,
-        "dop": PL.dop(P, s)["dop"],
+        # ⚠️`dop` AND `pdop` PRICE DIFFERENT QUESTIONS AND ARE NOT COMPARABLE. dop() is the 2D,
+        # TWO-unknown dilution on the horizontal projection; dop3() is the THREE-unknown one this
+        # fit actually solved. Measured on a 4-node ground layout with a source at (30, 30, 2):
+        # dop 31.59, hdop 35.83, pdop 45.09 -- so `dop` reads 12% below the horizontal figure and
+        # 30% below the whole one. Both are reported because the 2D number is the one
+        # placement.dop_grid plans against, but the dimension is now in the payload rather than
+        # only in this comment, so a consumer cannot quote the smaller one as "the DOP".
+        "dop": PL.dop(P, s)["dop"], "dop_unknowns": 2,
         # hdop/vdop reported separately because they are not interchangeable: the vertical is the
         # weak axis of a ground-based array by construction, and a single combined figure hides
         # exactly the component this project keeps getting wrong.
-        "hdop": d3["hdop"], "vdop": d3["vdop"], "pdop": d3["pdop"],
+        "hdop": d3["hdop"], "vdop": d3["vdop"], "pdop": d3["pdop"], "pdop_unknowns": 3,
+        # ⚠️these two describe dop3, NOT `dop` above: with three nodes dop3 refuses (dof 0,
+        # singular True) while `dop` is finite and can look excellent. Named for what they are.
+        "dop3_dof": d3["dof"], "dop3_singular": d3["singular"],
         "dop_dof": d3["dof"], "dop_singular": d3["singular"],
         "linearity": lin,
         "planarity_rms_m": cop["planarity_rms_m"],

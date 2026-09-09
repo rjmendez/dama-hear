@@ -177,6 +177,75 @@ class Budget:
                        % (self.available_sigma_s * 1e6, self.shortfall, self.achievable_dT_c()))
 
 
+def separation_for_temperature(target_dT_c: float, sigma_d_m: float,
+                               sigma_tau_s: float = 0.0, c: Optional[float] = None,
+                               temp_c: float = 20.0) -> Dict[str, float]:
+    """How much RANGE DIFFERENCE a known-source pair needs to recover T to `target_dT_c`.
+
+    This is the inversion the dama-gotchi phone chirp makes available, and it is the only one on
+    this fleet that needs no emission time and no per-handset audio offset: a phone at a SURVEYED
+    point emits, two clock-synced nodes at surveyed points hear it, and
+
+        c = (d_2 - d_1) / (t_2 - t_1)
+
+    -- the emission instant and every constant in the phone's playback path cancel in the
+    difference. With tau = Delta_d / c,
+
+        sigma_c / c = sqrt(sigma_Delta_d^2 + c^2 sigma_tau^2) / Delta_d
+
+    so the required separation is c * sqrt(...) / (0.606 * dT). `sigma_d_m` is the error in
+    Delta_d, i.e. the two NODE positions differenced -- a source far out on the baseline extension
+    contributes only second-order, which is where to stand.
+
+    ⚠️THE SURVEY TERM DOES NOT AVERAGE DOWN OVER CHIRPS and the timing term does. Measured on
+    survey.json, the existing pair is the binding case: sigma_m 0.717 and 0.521 m give
+    sigma_Delta_d = 0.89 m against a maximum Delta_d of 16.873 m -- 5.3%, worth 18 m/s, worth
+    30 degC. The pair cannot measure air temperature to any useful precision until it is
+    re-surveyed, whatever the clock does.
+    """
+    c = sound_speed(temp_c) if c is None else float(c)
+    if target_dT_c <= 0.0:
+        raise ValueError("target dT must be > 0 degC (got %r)" % target_dT_c)
+    if sigma_d_m < 0.0 or sigma_tau_s < 0.0:
+        raise ValueError("sigmas must be >= 0")
+    num = math.hypot(float(sigma_d_m), c * float(sigma_tau_s))
+    need = c * num / (DC_DT * float(target_dT_c))
+    return {
+        "required_separation_m": need,
+        "required_delay_s": need / c,
+        "survey_only_separation_m": c * float(sigma_d_m) / (DC_DT * float(target_dT_c)),
+        "target_dT_c": float(target_dT_c),
+        "sigma_c_mps": DC_DT * float(target_dT_c),
+        "c_mps": c,
+    }
+
+
+def temperature_from_separation(separation_m: float, sigma_d_m: float,
+                                sigma_tau_s: float = 0.0, c: Optional[float] = None,
+                                temp_c: float = 20.0) -> Dict[str, float]:
+    """The inverse of `separation_for_temperature`: what dT a given range difference buys.
+
+    Reported term by term because the two error sources behave differently over repeated chirps --
+    the timing term averages as 1/sqrt(N), the survey term does not move at all until someone
+    re-surveys the nodes.
+    """
+    c = sound_speed(temp_c) if c is None else float(c)
+    d = float(separation_m)
+    if d <= 0.0:
+        raise ValueError("separation must be > 0 m (got %r)" % separation_m)
+    f_survey = float(sigma_d_m) / d
+    f_timing = c * float(sigma_tau_s) / d
+    frac = math.hypot(f_survey, f_timing)
+    return {
+        "separation_m": d,
+        "sigma_c_mps": frac * c,
+        "dT_c": frac * c / DC_DT,
+        "dT_c_survey_term": f_survey * c / DC_DT,
+        "dT_c_timing_term": f_timing * c / DC_DT,
+        "c_mps": c,
+    }
+
+
 def absolute_budget(path_m: float, target_dT_c: float = 1.0, c: Optional[float] = None,
                     temp_c: float = 20.0, available_sigma_s: Optional[float] = None) -> Budget:
     """Timing precision a path must be measured to for a target temperature precision.

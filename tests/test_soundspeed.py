@@ -238,3 +238,43 @@ def test_budget_rejects_impossible_inputs():
         absolute_budget(0.0, 1.0)
     with pytest.raises(ValueError):
         absolute_budget(36.0, 0.0)
+
+
+# ── sizing the known-source (phone chirp) geometry ──────────────────────────────────────────────
+
+def test_the_required_separation_scales_the_way_the_algebra_says():
+    from hear.solve.soundspeed import separation_for_temperature, temperature_from_separation
+    r = separation_for_temperature(1.0, 0.028, 0.0, c=345.238)
+    assert r["required_separation_m"] == pytest.approx(345.238 * 0.028 / 0.606, rel=1e-12)
+    assert separation_for_temperature(0.5, 0.028, 0.0)["required_separation_m"] == \
+        pytest.approx(2 * separation_for_temperature(1.0, 0.028, 0.0)["required_separation_m"])
+    back = temperature_from_separation(r["required_separation_m"], 0.028, 0.0, c=345.238)
+    assert back["dT_c"] == pytest.approx(1.0, rel=1e-9)
+
+
+def test_the_existing_pair_cannot_measure_air_temperature_at_all():
+    """MEASURED from survey.json: sigma_m 0.717 and 0.521 m differenced is 0.89 m against a
+    maximum range difference of 16.873 m. The clock is irrelevant here -- the timing term is
+    0.3 degC and the survey term is 30."""
+    from hear.solve.soundspeed import temperature_from_separation
+    r = temperature_from_separation(16.873, 0.890, math.sqrt(2) * 19.3e-6, c=345.238)
+    assert r["dT_c"] > 25.0
+    assert r["dT_c_survey_term"] / r["dT_c_timing_term"] > 50.0
+
+
+def test_rtk_nodes_reach_one_degree_on_the_existing_baseline_and_need_more_for_half():
+    from hear.solve.soundspeed import separation_for_temperature, temperature_from_separation
+    rtk = temperature_from_separation(16.873, 0.028, math.sqrt(2) * 19.3e-6, c=345.238)
+    assert 0.8 < rtk["dT_c"] < 1.2
+    need = separation_for_temperature(0.5, 0.028, math.sqrt(2) * 19.3e-6, c=345.238)
+    assert 30.0 < need["required_separation_m"] < 40.0
+
+
+def test_it_refuses_impossible_targets():
+    from hear.solve.soundspeed import separation_for_temperature, temperature_from_separation
+    with pytest.raises(ValueError):
+        separation_for_temperature(0.0, 0.02)
+    with pytest.raises(ValueError):
+        separation_for_temperature(1.0, -0.02)
+    with pytest.raises(ValueError):
+        temperature_from_separation(0.0, 0.02)

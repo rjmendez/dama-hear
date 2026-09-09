@@ -49,6 +49,66 @@ class CalibrationError(ValueError):
     else in this package, rather than decorating an answer nobody can check."""
 
 
+def known_source_offset_budget(path_m: float, sigma_pos_m: float, sigma_node_t_s: float,
+                               sigma_pick_t_s: float, sigma_temp_c: float = 1.0,
+                               temp_c: float = 20.0, n_chirps: int = 1,
+                               source_moves: bool = False) -> Dict:
+    """What a KNOWN-SOURCE event buys for one node's constant audio-stamp offset.
+
+    ⚠️THIS IS WHY THE PHONE CHIRP IS INSTRUMENTATION AND NOT A SEVENTH LABEL. `solve_multi` above
+    separates bias from position only because the source MOVES between events, and it needs
+    K >= 2 events plus a trusted node to do it. A dama-gotchi chirp is different in kind: its
+    source POSITION and its emission INSTANT are both known, so one event gives the offset
+    directly,
+
+        beta = t_heard - t_emitted - d/c
+
+    with no solve, no rank argument and no second event. The unknowns collapse the way
+    `soundspeed.determines_speed(..., n_known_sources=n_events)` counts them.
+
+    The four terms and how each behaves over N chirps:
+
+      survey     sigma_pos / c        random only if the phone MOVES between chirps
+      picking    sigma_pick           random, averages as 1/sqrt(N)
+      node clock sigma_node_t         random, averages as 1/sqrt(N)
+      sound speed (path/c)*0.176%/degC  COMMON MODE at a fixed path: never averages
+
+    ⚠️SO STAND CLOSE. The sound-speed term is the only one proportional to path length, and it is
+    the only one repetition cannot remove. At 5 m an unknown 1 degC is worth 25 us; at 36 m it is
+    183 us. `soundspeed.separation_for_temperature` wants the OPPOSITE geometry -- a long
+    separation -- which is why measuring c and measuring beta are two different standoffs and not
+    one experiment.
+
+    `source_moves=True` says the phone was re-surveyed at a different spot for each chirp, which
+    is what turns the survey term from a bias into noise.
+    """
+    c = SW.sound_speed(temp_c)
+    if path_m <= 0.0:
+        raise CalibrationError("path must be > 0 m (got %r)" % path_m)
+    if n_chirps < 1:
+        raise CalibrationError("need >= 1 chirp (got %d)" % n_chirps)
+    rt = math.sqrt(float(n_chirps))
+    survey = float(sigma_pos_m) / c
+    pick = float(sigma_pick_t_s)
+    node = float(sigma_node_t_s)
+    speed = (float(path_m) / c) * abs(float(sigma_temp_c)) * 0.606 / c
+    single = math.sqrt(survey ** 2 + pick ** 2 + node ** 2 + speed ** 2)
+    averaged = math.sqrt((survey / rt if source_moves else survey) ** 2
+                         + (pick / rt) ** 2 + (node / rt) ** 2 + speed ** 2)
+    return {
+        "terms_s": {"survey": survey, "onset_pick": pick, "node_clock": node,
+                    "sound_speed": speed},
+        "sigma_single_s": single,
+        "sigma_after_n_s": averaged,
+        "n_chirps": int(n_chirps),
+        "irreducible_s": speed if not source_moves else math.hypot(speed, 0.0),
+        "path_m": float(path_m),
+        "sound_speed_mps": c,
+        "limiting_term": max({"survey": survey, "onset_pick": pick, "node_clock": node,
+                              "sound_speed": speed}.items(), key=lambda kv: kv[1])[0],
+    }
+
+
 def _seed_grid(P: np.ndarray, margin_m: float, step_m: float, up_m: float) -> np.ndarray:
     lo, hi = P.min(axis=0) - margin_m, P.max(axis=0) + margin_m
     xs = np.arange(lo[0], hi[0] + step_m * 0.5, step_m)

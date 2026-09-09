@@ -140,3 +140,40 @@ class TestReporting:
         r = CB.solve_multi(NODES, arr, PHONES, "blast", temp_c=T, fixed_up_m=2.5)
         assert r["up_assumed_m"] == 2.5
         assert all(p[2] == 2.5 for p in r["positions_m"])
+
+
+class TestKnownSourceOffsetBudget:
+    """The phone chirp as instrumentation. A known source position AND a known emission instant
+    turn the bias problem from a rank argument into arithmetic -- see solve_multi's docstring for
+    what it costs when the source is unknown."""
+
+    def test_the_sound_speed_term_is_the_one_repetition_cannot_remove(self):
+        near = CB.known_source_offset_budget(5.0, 0.02, 14.5e-6, 20e-6, n_chirps=100,
+                                             source_moves=True)
+        far = CB.known_source_offset_budget(36.0, 0.02, 14.5e-6, 20e-6, n_chirps=100,
+                                            source_moves=True)
+        assert far["terms_s"]["sound_speed"] / near["terms_s"]["sound_speed"] == \
+            pytest.approx(36.0 / 5.0, rel=1e-9)
+        assert far["sigma_after_n_s"] > 5 * near["sigma_after_n_s"]
+        assert far["limiting_term"] == "sound_speed"
+
+    def test_a_stationary_phone_keeps_its_survey_error_as_a_bias(self):
+        moving = CB.known_source_offset_budget(5.0, 0.02, 14.5e-6, 20e-6, n_chirps=100,
+                                               source_moves=True)
+        fixed = CB.known_source_offset_budget(5.0, 0.02, 14.5e-6, 20e-6, n_chirps=100,
+                                              source_moves=False)
+        assert fixed["sigma_after_n_s"] > moving["sigma_after_n_s"]
+        assert fixed["sigma_single_s"] == pytest.approx(moving["sigma_single_s"])
+
+    def test_the_16_7_ms_offset_is_measurable_today_at_the_survey_we_already_have(self):
+        """The one calibration this fleet can run without re-surveying anything: even at
+        survey.json's 0.717 m the budget lands ~80x inside the offset it has to detect."""
+        r = CB.known_source_offset_budget(5.0, 0.717, 14.5e-6, 20e-6, n_chirps=100,
+                                          source_moves=True)
+        assert r["sigma_after_n_s"] < 16.7e-3 / 50.0
+
+    def test_it_refuses_a_zero_path_and_a_zero_chirp_count(self):
+        with pytest.raises(CB.CalibrationError):
+            CB.known_source_offset_budget(0.0, 0.02, 1e-5, 1e-5)
+        with pytest.raises(CB.CalibrationError):
+            CB.known_source_offset_budget(5.0, 0.02, 1e-5, 1e-5, n_chirps=0)
