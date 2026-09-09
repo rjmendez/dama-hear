@@ -1206,6 +1206,74 @@ static File     scenef;
 // open CREATES that stat fails, _stat is left uninitialised, and size() returns heap garbage --
 // deterministic per build, which is how both CSVs ran a whole night with no header. So existence
 // is tested first, with exists(), and size() is consulted only on a file already known to be there.
+// ---- daily files, oldest rolled off ---------------------------------------------------------
+// scene.csv was ONE growing file. At the measured 335 B/row and one row per 1.024 s that is
+// 1.18 MB/h -- 10 GB a year in a single CSV, where one bad write costs the lot and nothing ever
+// bounds it. Fine for a night; not for a fleet that runs continuously.
+//
+// So each stream writes /scene-YYYYMMDD.csv, and when the card runs low the OLDEST day goes. The
+// data is on the card if it is wanted and it is not kept by default, which is the trade asked for.
+//
+// ⚠️THE DATE COMES FROM THE PPS-DISCIPLINED UTC, NOT FROM millis(). A node with no fix yet has no
+// date, and writing one anyway would put a day's rows under whatever the clock guessed at boot.
+// Until the anchor is valid, rows go to -00000000, which is a real file that gets rolled off like
+// any other rather than a gap nobody can account for.
+#define KEEP_FREE_MB 64u        // stop pruning here: a full card fails writes, and a node that
+                                // cannot write is worse than one missing last week.
+
+static void utc_yyyymmdd(int64_t utc_us, char *out, size_t n) {
+  if (utc_us <= 0) { snprintf(out, n, "00000000"); return; }
+  // days from civil, inverted. Same algorithm as the NAV-PVT path, run backwards -- no time.h.
+  long long z = utc_us / 1000000LL / 86400LL + 719468LL;
+  long long era = (z >= 0 ? z : z - 146096) / 146097;
+  unsigned long doe = (unsigned long)(z - era * 146097);
+  unsigned long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  long long y = (long long)yoe + era * 400;
+  unsigned long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  unsigned long mp = (5 * doy + 2) / 153;
+  unsigned long d = doy - (153 * mp + 2) / 5 + 1;
+  unsigned long m = mp + (mp < 10 ? 3 : -9);
+  y += (m <= 2);
+  snprintf(out, n, "%04lld%02lu%02lu", y, m, d);
+}
+
+// Delete the oldest <stem>-YYYYMMDD.csv until the card has KEEP_FREE_MB again. Returns how many
+// went. Oldest is by NAME, which sorts chronologically because the name is a date -- no stat call
+// per file, and no dependence on FAT timestamps, which a node with no RTC writes wrong anyway.
+static int prune_oldest(const char *stem, const char *keep_name) {
+  int gone = 0;
+  for (int guard = 0; guard < 8; guard++) {
+    if ((uint32_t)((SD.totalBytes() - SD.usedBytes()) / 1048576ULL) >= KEEP_FREE_MB) break;
+    char oldest[40]; oldest[0] = 0;
+    File d = SD.open("/");
+    for (File e = d.openNextFile(); e; e = d.openNextFile()) {
+      const char *nm = e.name();
+      if (!e.isDirectory() && strncmp(nm, stem, strlen(stem)) == 0 &&
+          strcmp(nm, keep_name) != 0 && (!oldest[0] || strcmp(nm, oldest) < 0))
+        snprintf(oldest, sizeof oldest, "%s", nm);
+      e.close();
+    }
+    d.close();
+    // The pre-rotation file is not named scene-YYYYMMDD.csv, so the loop above will never pick
+    // it -- 20.7 MB stranded on nyquist, uncollectable, for as long as the node lives. Take it
+    // once there is a dated file to take it in favour of.
+    if (!oldest[0]) {
+      char legacy[24]; snprintf(legacy, sizeof legacy, "/%.*s.csv", (int)(strlen(stem) - 1), stem);
+      if (SD.exists(legacy) && SD.remove(legacy)) {
+        logf("sd    pruned legacy %s (superseded by daily files)\n", legacy);
+        gone++;
+        continue;
+      }
+      break;                                   // nothing left to give
+    }
+    char path[48]; snprintf(path, sizeof path, "/%s", oldest);
+    if (!SD.remove(path)) { logf("sd    could NOT remove %s\n", path); break; }
+    logf("sd    pruned %s to free space\n", path);
+    gone++;
+  }
+  return gone;
+}
+
 static File csv_open(const char *path, const char *prev, const char *hdr) {
   bool fresh = !SD.exists(path);
   if (!fresh) {
@@ -1239,8 +1307,23 @@ static void scene_emit() {
   float ref = scene_db[0];
   for (int i = 1; i < MELS_BANDS * SCENE_SLICES; i++) if (scene_db[i] > ref) ref = scene_db[i];
   if (!sd_ok) return;
-  if (!scenef) {
-    scenef = csv_open("/scene.csv", "/scene-prev.csv", SCENE_HDR);
+  // One file per UTC day. Reopened when the date rolls, so a capture spanning midnight lands in
+  // two files rather than one that has to be split later by whoever reads it.
+  {
+    static char cur_day[12] = "";
+    char day[12]; utc_yyyymmdd(utc, day, sizeof day);
+    if (strcmp(day, cur_day) != 0) {
+      if (scenef) { scenef.close(); }
+      snprintf(cur_day, sizeof cur_day, "%s", day);
+      char path[36], prev[40];
+      snprintf(path, sizeof path, "/scene-%s.csv", day);
+      snprintf(prev, sizeof prev, "/scene-%s-prev.csv", day);
+      // Prune BEFORE opening the new day, so the space is there to write into. The file about to
+      // be written is named so it cannot prune itself.
+      prune_oldest("scene-", path + 1);
+      scenef = csv_open(path, prev, SCENE_HDR);
+      logf("sd    scene -> %s\n", path);
+    }
     if (!scenef) return;
   }
   char line[MELS_BANDS * SCENE_SLICES * 2 + 192];
@@ -1436,6 +1519,30 @@ static void clip_name(char *out, size_t n, uint32_t sample) {
   snprintf(out, n, CLIP_DIR "/%s-%s-%010lu.wav", node_id, clip_boot, (unsigned long)sample);
 }
 
+// Delete the oldest clip in CLIP_DIR and return its bytes to the budget. Oldest is by NAME:
+// clip_name() embeds the boot-unique prefix and a zero-padded sample index, so within a boot the
+// name sorts chronologically. Across boots the prefix is random rather than ordered, so this can
+// evict a newer clip from a previous boot -- accepted, because the alternative is a stat() per
+// file on every eviction and the set is at most 49.
+static bool clip_evict_oldest() {
+  if (!sd_ok) return false;
+  char oldest[64]; oldest[0] = 0;
+  File d = SD.open(CLIP_DIR);
+  if (!d) return false;
+  for (File e = d.openNextFile(); e; e = d.openNextFile()) {
+    if (!e.isDirectory() && (!oldest[0] || strcmp(e.name(), oldest) < 0))
+      snprintf(oldest, sizeof oldest, "%s", e.name());
+    e.close();
+  }
+  d.close();
+  if (!oldest[0]) return false;
+  char path[80]; snprintf(path, sizeof path, CLIP_DIR "/%s", oldest);
+  if (!SD.remove(path)) { logf("clip  could NOT evict %s\n", path); return false; }
+  clip_budget_left += CLIP_BYTES;
+  logf("clip  evicted %s to make room\n", path);
+  return true;
+}
+
 static const char *clip_why(uint8_t st) {
   switch (st) {
     case CLIP_OK:      return "ok";
@@ -1504,7 +1611,20 @@ static void clip_pump() {
   if (!praw || !praw_cap)            { d.clip_st = CLIP_RING;   clip_skip_ring++; return; }
   if (clip_have_last && d.sample - clip_last_sample < CLIP_DEDUPE_SAMPLES)
                                      { d.clip_st = CLIP_DEDUPE; clip_skip_dedupe++; return; }
-  if (clip_budget_left < CLIP_BYTES) { d.clip_st = CLIP_BUDGET; clip_skip_budget++; return; }
+  // THE BUDGET IS A WINDOW, NOT AN ALLOWANCE. It used to be a per-boot counter that only ever
+  // decremented, sized in its own comment as "1.4x the measured 12 h event count" -- correct for
+  // one night, and wrong the moment the fleet runs continuously. Every node went permanently deaf
+  // to audio after its first busy day and stayed that way until someone rebooted it. Measured:
+  // mach reached it and served 128 consecutive detections reading clip_why "budget", which is why
+  // there was no audio to cross-correlate against rankine when it was first asked for.
+  //
+  // Now the oldest clip is deleted to make room, so retention is bounded by the BUDGET rather than
+  // by uptime, and a node that has been up for a month still carries its last 49 events. Failing
+  // to free space still refuses the clip -- that path is a full card, and it is reported as
+  // "budget" exactly as before rather than pretending the write happened.
+  if (clip_budget_left < CLIP_BYTES && !clip_evict_oldest()) {
+    d.clip_st = CLIP_BUDGET; clip_skip_budget++; return;
+  }
   if (sd_free_mb_last < CLIP_FREE_RESERVE_MB)
                                      { d.clip_st = CLIP_CARDFULL; clip_skip_full++; return; }
   if (d.sample < CLIP_PRE_SAMPLES)   { d.clip_st = CLIP_RING;   clip_skip_ring++; return; }
@@ -1798,7 +1918,11 @@ static File detf;
 // The baud sweep on its own, so /gpspins can re-run it after FORCING a pin order. Extracted
 // rather than duplicated: a second copy would drift, and the candidate list is the part that
 // matters -- a module configured UBX-binary only shows nothing to a NMEA-only scan.
-static void gps_autobaud() {
+// Returns whether anything actually DECODED. The caller cannot use nmea_valid/ubx_pvt for
+// that: those are incremented by the runtime parser, never by this sweep, so they read 0 after a
+// SUCCESSFUL sweep just as they do after a failed one. Using them cost nyquist and rankine their
+// fix -- the fallback below fired even when the first sweep had found 230400.
+static bool gps_autobaud() {
   // Find the module's baud instead of assuming it. Assuming 9600 produced a stream that a lenient
   // parser happily counted as 22 "sentences" while zero of them were valid NMEA -- a wrong number
   // that looked like a working link. Count VALID lines and let the module tell us.
@@ -1834,14 +1958,59 @@ static void gps_autobaud() {
     logf("gps   using %lu baud (%s)%s\n", (unsigned long)gps_baud,
                   best_ubx ? "UBX binary" : "NMEA",
                   best_b ? "" : " -- nothing decoded at any rate");
+    return best_b != 0;
   }
 }
 
 
 static void gps_bringup() {
+  // DETACH THE UART FIRST. gps_pick_pins() reads both pins with digitalRead, and on a RETRY the
+  // UART peripheral still owns them -- so the probe measured a pin it did not control, saw nothing
+  // move, and reported "neither pin toggled" every single time. The sweep that follows then called
+  // Serial1.begin() on an already-open port, which does not reinitialise cleanly, so it found
+  // nothing at any baud either.
+  //
+  // The effect was a watchdog that looked like it was working and could never succeed: nyquist ran
+  // four attempts over 14 minutes and failed all four, while POST /gpspins -- identical code, but
+  // it calls end() first -- found 230400 on the first try. At boot the bug is invisible because no
+  // UART is open yet, which is exactly why it survived until the fleet started retrying.
+  Serial1.end();
   gps_pick_pins();
+  bool decoded = gps_autobaud();
 
-  gps_autobaud();
+  // IF NOTHING DECODED, TRY THE OTHER PIN ORDER BEFORE GIVING UP.
+  //
+  // gps_pick_pins() can only decide while the module is TALKING, and a module that is quiet at
+  // the moment the probe runs -- which is most of them, for the first few seconds after a reset --
+  // sends it to the DOCUMENTED order by default. On a node wired the other way that is a deadlock:
+  // the ESP's TX lands on the module's TX, so nothing can be sent to wake it, and the sweep finds
+  // nothing at any baud for ever.
+  //
+  // Measured on mach tonight: it entered that state on EVERY reflash, three times, and each time
+  // POST /gpspins?swap=1 found 115200 immediately -- the module had been transmitting the whole
+  // time on the pin the 250 ms probe was not watching. A fleet meant to run continuously cannot
+  // have a coin-flip at every reboot that costs a node its GPS until someone drives out to it.
+  //
+  // So: swap and sweep again. It costs ~11 s on a node that has already failed to decode anything,
+  // and nothing at all on a node that worked first time.
+  if (!decoded) {
+    int rx = gps_rx_pin, tx = gps_tx_pin;
+    gps_rx_pin = (rx == GPS_RX) ? GPS_TX : GPS_RX;
+    gps_tx_pin = (tx == GPS_TX) ? GPS_RX : GPS_TX;
+    logf("gps   nothing decoded on RX=GPIO%d -- trying the other order, RX=GPIO%d\n",
+         rx, gps_rx_pin);
+    if (gps_autobaud()) {
+      gps_pin_src = "measured: SWAPPED at the module (found by fallback)";
+    } else {
+      // Neither order works. Put the pins back AND SWEEP AGAIN, because the failed attempt left
+      // the UART open at whatever that sweep settled on -- 9600 -- and restoring only the pin
+      // VARIABLES leaves the port wrong. That is what cost nyquist and rankine their fix.
+      gps_rx_pin = rx; gps_tx_pin = tx;
+      logln("gps   neither pin order decoded -- module is silent or unpowered");
+      gps_autobaud();
+    }
+  }
+
   delay(300);
   gps_configure();
 }
