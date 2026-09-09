@@ -24,3 +24,12 @@ Two facts these captures happen to record, both load-bearing elsewhere:
 
 Do not regenerate them to make a test pass. If the firmware changes a name, that is the test
 telling the truth.
+
+⚠️These captures predate the 2026-09-08 acquisition-audit change, so they do NOT carry
+`acq.fs_win_s`, `acq.fs_step_ppm`, `acq.fs_used_hz`, `acq.over_s`, `i2s.clean_s` or `pps.gaps`,
+and their `i2s.measured_hz` (15651.2904 and 15483.2787) is the old cumulative-over-cumulative
+figure that any stall poisons. That is not a reason to regenerate them -- the rule above still
+holds. It is a note that the NEW names are pinned only by tests/test_firmware_csv_schema.py and
+tests/test_firmware_timebase.py against the source, and are not yet pinned against a live node.
+Re-capture both files the next time a node runs a build that has them, and the drain's audit
+block will be pinned against hardware again.
