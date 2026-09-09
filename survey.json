@@ -27,6 +27,16 @@
       "sigma_m": 0.521,
       "u_source": "nominal storey, +/-1.0 m assumed",
       "sigma_u_m": 1.0
+    },
+    {
+      "node_id": 3,
+      "name": "rankine",
+      "e_m": -4.58,
+      "n_m": 10.48,
+      "u_m": 3.0,
+      "sigma_m": 0.49,
+      "u_source": "same storey as mach, operator-stated; NOT measured",
+      "sigma_u_m": 1.0
     }
   ]
 }
