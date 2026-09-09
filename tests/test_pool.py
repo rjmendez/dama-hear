@@ -107,7 +107,7 @@ class TestOneDataset:
         pl.ingest_dets(_dets(tmp_path, "dets.csv", 3))
         recs = pl.records()
         assert all(isinstance(r, C.Record) for r in recs)
-        X, kept = C.feature_matrix(recs, 16000.0)
+        X, kept, _ = C.feature_matrix(recs, 16000.0)
         assert X.shape == (3, SK.MEL_BANDS * SK.FRAMES)
 
     def test_v2_173_byte_node_frame_ingest_and_records(self, tmp_path):
