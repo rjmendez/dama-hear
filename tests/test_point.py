@@ -315,3 +315,65 @@ def test_solves_at_a_real_utc_epoch_not_just_a_small_t0():
     assert errs[T0_UTC] < 0.1, "real-epoch error %.3f m" % errs[T0_UTC]
     assert errs[T0_UTC] == pytest.approx(errs[1000.0], abs=0.05), \
         "accuracy must not depend on the epoch the operator happens to run at"
+
+
+class TestDopSaysWhichEstimationProblemItPriced:
+    """⚠️`dop` and `pdop` are dilutions of DIFFERENT fits and sat unlabelled in one dict.
+
+    Each number is recomputed here from the geometry, never asserted from memory."""
+
+    NODES = [(0., 0., 0.), (40., 0., 0.), (0., 40., 0.), (40., 40., 0.)]
+    SRC = (30., 30., 2.)
+
+    def _solve(self, **kw):
+        c = SW.sound_speed(T)
+        arr = [T0_UTC + math.dist(self.SRC, n) / c for n in self.NODES]
+        return PT.solve(self.NODES, arr, "blast", temp_c=T, **kw)
+
+    def test_the_short_name_reads_far_better_than_the_fit_it_sits_beside(self):
+        """THE DEFECT, measured. On a ground array the vertical is the weak axis, so a figure
+        that never priced it is optimistic by two orders of magnitude -- and it is the figure
+        whose name a consumer reaches for first."""
+        r = self._solve()
+        assert r["dop"] < 2.0                      # ~1.04: looks excellent
+        assert r["pdop"] > 100.0                   # ~107.2: what this solve actually cost
+        assert r["pdop"] / r["dop"] > 50.0, "the gap is the whole reason for the labels"
+        # The labels are what make the two comparable at all.
+        assert r["dop_unknowns"] == 2
+        assert r["pdop_unknowns"] == 3
+        assert r["n_unknowns"] == r["pdop_unknowns"], "this fit solved three unknowns"
+
+    def test_dop_prices_this_fit_is_false_when_the_height_was_estimated(self):
+        r = self._solve()
+        assert r["dop_prices_this_fit"] is False
+        assert r["up_assumed_m"] is None
+
+    def test_dop_prices_this_fit_is_true_only_when_the_height_was_declared(self):
+        """A DECLARED height really does leave two unknowns, and that is the one case where the
+        2-unknown figure describes the estimate."""
+        r = self._solve(fixed_up_m=2.0)
+        assert r["dop_prices_this_fit"] is True
+        assert r["n_unknowns"] == r["dop_unknowns"] == 2
+
+    def test_the_singular_flag_names_its_own_quantity(self):
+        """⚠️At three nodes `dop` is finite while the old `dop_singular` was True -- it was
+        reporting the THREE-unknown fit's refusal under a name that said `dop`. A consumer
+        checking it before trusting `dop` was wrong in both directions."""
+        c = SW.sound_speed(T)
+        n3 = self.NODES[:3]
+        arr = [T0_UTC + math.dist(self.SRC, n) / c for n in n3]
+        r = PT.solve(n3, arr, "blast", temp_c=T, fixed_up_m=2.0)
+        assert math.isfinite(r["dop"]), "2 unknowns, 3 nodes: this is a real number"
+        assert r["dop3_singular"] is True, "3 unknowns is what refused"
+        # The correctly-named key and the legacy alias still agree, so nothing silently changed
+        # meaning; only the name became honest.
+        assert r["dop3_singular"] == r["dop_singular"]
+        assert r["dop3_dof"] == r["dop_dof"]
+
+    def test_every_dilution_key_carries_an_unknown_count(self):
+        """A dilution figure with no dimension is the thing this class exists to prevent, so a
+        future key added without one fails here."""
+        r = self._solve()
+        for k in ("dop", "pdop"):
+            assert "%s_unknowns" % k in r, "%s reports no unknown count" % k
+        assert {r["dop_unknowns"], r["pdop_unknowns"]} == {2, 3}

@@ -106,7 +106,7 @@ class TestOneDataset:
         pl.ingest_dets(_dets(tmp_path, "dets.csv", 3))
         recs = pl.records()
         assert all(isinstance(r, C.Record) for r in recs)
-        X, kept = C.feature_matrix(recs, 16000.0)
+        X, kept, _ = C.feature_matrix(recs, 16000.0)
         assert X.shape == (3, SK.MEL_BANDS * SK.FRAMES)
 
     def test_the_key_is_content_so_two_drains_of_one_detection_agree(self, tmp_path):

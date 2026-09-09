@@ -183,11 +183,39 @@ def _report(s, P, t, c, n_eq, n_unk, rms_ms, t0, at_bound, source_class,
         "n_nodes": len(P), "n_equations": n_eq, "n_unknowns": n_unk,
         "up_assumed_m": float(fixed_up_m) if fixed_up_m is not None else None,
         "sound_speed_mps": c,
+        # ⚠️TWO DILUTION FIGURES FOR TWO DIFFERENT ESTIMATION PROBLEMS, AND ONLY ONE OF THEM
+        # PRICES THE FIT THAT PRODUCED THE COORDINATES ABOVE.
+        #
+        # `dop` marginalises the emission time over TWO unknowns (east, north). `pdop`/`hdop`/
+        # `vdop` marginalise over THREE (east, north, up). They used to sit in this dict side by
+        # side, unlabelled, and the shorter name is the one a consumer quotes as "the DOP".
+        #
+        # Measured, 4 nodes at (0,0,0) (40,0,0) (0,40,0) (40,40,0), source (30,30,2):
+        #     dop  =   1.039     <- 2 unknowns: the height was not among them
+        #     hdop =   5.320
+        #     vdop = 107.090     <- the axis a ground array cannot see
+        #     pdop = 107.222     <- what this solve's dilution actually is
+        # `dop` reads 103x better than the fit, because it never priced the axis that is weak.
+        #
+        # So each figure now states how many unknowns it paid for, and `dop_prices_this_fit`
+        # says outright whether the short name matches the solve. It is True only when the
+        # height was DECLARED (fixed_up_m), which is the one case where the estimate really did
+        # have two unknowns.
         "dop": PL.dop(P, s)["dop"],
+        "dop_unknowns": 2,
+        "dop_prices_this_fit": fixed_up_m is not None,
         # hdop/vdop reported separately because they are not interchangeable: the vertical is the
         # weak axis of a ground-based array by construction, and a single combined figure hides
         # exactly the component this project keeps getting wrong.
         "hdop": d3["hdop"], "vdop": d3["vdop"], "pdop": d3["pdop"],
+        "pdop_unknowns": 3,
+        # ⚠️These two describe dop3, NOT `dop`, and their old names said otherwise. At three
+        # nodes `dop` is finite (2 unknowns, dof 0) while `dop_singular` was True -- it was
+        # reporting that the THREE-unknown fit had refused. A consumer checking `dop_singular`
+        # before trusting `dop` got the wrong answer in both directions. Correctly named now;
+        # the old keys are kept because removing them is a separate, breaking decision, and no
+        # caller in this repo reads either.
+        "dop3_dof": d3["dof"], "dop3_singular": d3["singular"],
         "dop_dof": d3["dof"], "dop_singular": d3["singular"],
         "linearity": lin,
         "planarity_rms_m": cop["planarity_rms_m"],

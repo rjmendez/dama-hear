@@ -236,8 +236,9 @@ def from_node(frame: bytes, node_id: str, second_utc_s: Optional[int] = None,
 
 
 def feature_matrix(records: Iterable[Record], fs_hz: float,
-                   mode: str = "db") -> Tuple[np.ndarray, List[Record]]:
-    """[n, bands*frames] for the records that belong on `fs_hz`'s frequency axis, and those records.
+                   mode: str = "db"
+                   ) -> Tuple[np.ndarray, List[Record], Dict[str, Any]]:
+    """[n, bands*frames] for the records on `fs_hz`'s axis, those records, and WHAT IT DROPPED.
 
     `fs_hz` is REQUIRED and is not inferred from the data. Inferring it makes the common mistake
     -- a corpus of mostly-48 kHz phones with a handful of 16 kHz nodes -- silent: the majority
@@ -246,26 +247,91 @@ def feature_matrix(records: Iterable[Record], fs_hz: float,
     Records with no stated rate are excluded. They may well be `fs_hz`; nothing in the frame says
     so, and a training matrix is the wrong place to guess.
 
+    ⚠️THE RATE MATCH IS EXACT AND THAT IS DELIBERATE, BUT IT MUST NOT BE SILENT.
+
+    A frame can only state one of the nine enumerated `SK.FS_CODES` rates, so a frame-stated rate
+    is NOMINAL. When the frame states nothing the pool falls back to the dets.csv `fs_hz` column,
+    which is the PPS-DISCIPLINED measured rate (`pool.fs_stated_by == "csv"`). Both land in this
+    field and `!=` cannot tell them apart.
+
+    Measured on ~/hear-pool 2026-09-08, 1038 records, all from the same two 16 kHz nodes:
+
+        83   frame-stated, exactly 16000.0
+        519  csv-stated, which happened to read exactly 16000.0
+        436  csv-stated, one of 30 neighbours spanning 15936.0-16034.909 (+/-0.400%)
+
+    `feature_matrix(recs, 16000.0)` kept 602 and dropped 436 -- 42.0% of the corpus -- returning
+    a clean (602, 160) matrix and no way to find out. Those 436 are not another sensor and not
+    another axis: the nearest is 15992.099 Hz, 0.05% away, whose band edges differ from the
+    nominal bank by 0.024 Hz at band 1 and 3.9 Hz at band 19, under 4% of a band width. What
+    decided whether a row survived was whether that window's clock discipline happened to round
+    to 16000.000. That is a coin flip, not a frequency-axis decision.
+
+    It matters most for exactly the corpus that has nowhere else to go: `aligned_matrix` refuses
+    all 955 legacy `nyquist`-layout records and tells the caller to "use feature_matrix() per
+    rate", and this is what happens when they do.
+
+    So the tally distinguishes the two cases the exact match cannot: `nearest_dropped_frac` near
+    0 means you just threw away YOUR OWN NODE over clock discipline, and near 2.0 means you
+    correctly refused a 48 kHz phone against a 16 kHz axis. Widening the match by default would
+    silently GROW a training set, which is the same bug pointing the other way -- so the KEPT set
+    is unchanged here and only what is said about it is new.
+
+    `aligned_matrix` -- whose ValueError tells the caller to "use feature_matrix() per rate" --
+    already returns an info dict. This one now does too, for the same reason and in the same
+    shape: the two are the only ways to build a training matrix here, and the loud one hands you
+    to this one.
+
     mode "db"  -- absolute dB, ref_db restored. Amplitude alone was worth AUC 0.90 on the 2026-09-05
                   corpus, so this is the default.
     mode "q"   -- the raw int8, shape only. Use when levels are not comparable across sites.
     """
     if mode not in ("db", "q"):
         raise ValueError("mode must be 'db' or 'q'")
+    target = float(fs_hz)
     kept: List[Record] = []
     rows: List[np.ndarray] = []
+    n_in = 0
+    no_rate = 0
+    dropped_rates: Dict[float, int] = {}
     for r in records:
-        if r.fs_hz is None or float(r.fs_hz) != float(fs_hz):
+        n_in += 1
+        if r.fs_hz is None:
+            no_rate += 1
+            continue
+        rate = float(r.fs_hz)
+        if rate != target:
+            dropped_rates[rate] = dropped_rates.get(rate, 0) + 1
             continue
         v = r.db if mode == "db" else r.q.astype(float)
         rows.append(v.reshape(-1))
         kept.append(r)
+
+    n_other = sum(dropped_rates.values())
+    nearest = min(dropped_rates, key=lambda x: abs(x - target)) if dropped_rates else None
+    info: Dict[str, Any] = {
+        "fs_hz": target,
+        "n_in": n_in,
+        "kept": len(kept),
+        "dropped_no_rate": no_rate,
+        "dropped_other_rate": n_other,
+        # Every rate that was refused, so "one stray phone" and "the whole corpus, disciplined"
+        # are not the same line in a log.
+        "dropped_rates_hz": sorted(dropped_rates.items()),
+        "nearest_dropped_rate_hz": nearest,
+        # |nearest - fs| / fs. ~0 is clock discipline on the sensor you asked for; ~2.0 is a
+        # 48 kHz phone against a 16 kHz axis. The number that says which mistake you just made.
+        "nearest_dropped_frac": (abs(nearest - target) / target) if nearest is not None else None,
+    }
+    # The invariant this function existed without: the parts total the whole.
+    assert info["kept"] + no_rate + n_other == n_in, info
+
     if not rows:
-        return np.zeros((0, 0)), []
+        return np.zeros((0, 0)), [], info
     w = {len(r) for r in rows}
     if len(w) != 1:
         raise ValueError("mixed sketch geometry in one matrix: %s" % sorted(w))
-    return np.vstack(rows), kept
+    return np.vstack(rows), kept, info
 
 
 def aligned_matrix(records: Iterable[Record], mode: str = "db",
@@ -404,9 +470,23 @@ def main(argv=None) -> int:
         if len(skips) > 20:
             print("  ... %d more" % (len(skips) - 20))
     if a.fs:
-        X, kept = feature_matrix(recs, a.fs, a.mode)
+        X, kept, fm = feature_matrix(recs, a.fs, a.mode)
         print("\nmatrix for %.0f Hz: %s (%d of %d records)"
               % (a.fs, X.shape, len(kept), len(recs)))
+        # The drop used to be the difference between two numbers nobody subtracted.
+        if fm["dropped_no_rate"] or fm["dropped_other_rate"]:
+            print("  dropped %d: %d with no stated rate, %d on another rate"
+                  % (fm["dropped_no_rate"] + fm["dropped_other_rate"],
+                     fm["dropped_no_rate"], fm["dropped_other_rate"]))
+            if fm["nearest_dropped_rate_hz"] is not None:
+                print("  nearest dropped rate %.3f Hz (%.3f%% away)%s"
+                      % (fm["nearest_dropped_rate_hz"], 100.0 * fm["nearest_dropped_frac"],
+                         "  <- clock discipline on this same axis, not another sensor"
+                         if fm["nearest_dropped_frac"] < 0.01 else ""))
+            for rate, n in fm["dropped_rates_hz"][:10]:
+                print("    %12.3f Hz  %5d" % (rate, n))
+            if len(fm["dropped_rates_hz"]) > 10:
+                print("    ... %d more rate(s)" % (len(fm["dropped_rates_hz"]) - 10))
         if a.npz:
             np.savez(a.npz, X=X, node_id=np.array([r.node_id for r in kept]),
                      ts_utc_s=np.array([-1.0 if r.ts_utc_s is None else r.ts_utc_s for r in kept]),

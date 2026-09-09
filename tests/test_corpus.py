@@ -97,17 +97,17 @@ class TestFeatureMatrix:
         300 Hz-7.84 kHz at 16 kHz; stacking them trains on an axis that moves between rows."""
         recs = [C.from_node(_frame(fs=48000.0, seed=i)[0], "p%d" % i) for i in range(3)]
         recs += [C.from_node(_frame(fs=16000.0, seed=i)[0], "n%d" % i) for i in range(2)]
-        X, kept = C.feature_matrix(recs, 48000.0)
+        X, kept, _ = C.feature_matrix(recs, 48000.0)
         assert X.shape == (3, SK.MEL_BANDS * SK.FRAMES)
         assert all(r.fs_hz == 48000.0 for r in kept)
-        X16, kept16 = C.feature_matrix(recs, 16000.0)
+        X16, kept16, _ = C.feature_matrix(recs, 16000.0)
         assert X16.shape == (2, SK.MEL_BANDS * SK.FRAMES)
 
     def test_an_unstated_rate_is_excluded_not_assumed(self):
         q, ref = SK.sketch(np.zeros(4096), 48000.0)
         legacy = SK.pack(1, ref, 0, q)                        # no fs -> code 0
         recs = [C.from_node(legacy, "old"), C.from_node(_frame(fs=48000.0)[0], "new")]
-        X, kept = C.feature_matrix(recs, 48000.0)
+        X, kept, _ = C.feature_matrix(recs, 48000.0)
         assert len(kept) == 1 and kept[0].node_id == "new"
 
     def test_the_rate_is_required_and_never_inferred(self):
@@ -115,15 +115,84 @@ class TestFeatureMatrix:
             C.feature_matrix([], mode="db")                   # fs_hz has no default
 
     def test_empty_is_empty_not_an_error(self):
-        X, kept = C.feature_matrix([], 48000.0)
+        X, kept, _ = C.feature_matrix([], 48000.0)
         assert X.shape == (0, 0) and kept == []
 
     def test_q_mode_drops_the_level(self):
         recs = [C.from_node(_frame(seed=5)[0], "a")]
-        Xdb, _ = C.feature_matrix(recs, 48000.0, mode="db")
-        Xq, _ = C.feature_matrix(recs, 48000.0, mode="q")
+        Xdb, _, _ = C.feature_matrix(recs, 48000.0, mode="db")
+        Xq, _, _ = C.feature_matrix(recs, 48000.0, mode="q")
         assert Xdb.max() == pytest.approx(recs[0].ref_db, abs=1e-9)
         assert Xq.max() == pytest.approx(0.0)                 # the reference is the zero point
+
+    # ── the loss tally ────────────────────────────────────────────────────────────────
+    # Added because feature_matrix dropped 42.0% of ~/hear-pool and returned a clean matrix.
+
+    @staticmethod
+    def _rated(fs, seed, node):
+        """A record whose rate is STATED BUT NOT ENUMERABLE -- the pool's csv-stated case.
+
+        FS_CODES holds nine nominal rates, so a PPS-disciplined 15992.099 cannot travel in the
+        frame; the pool takes it from the dets.csv column instead (pool.py fs_stated_by='csv').
+        from_node's fs_hz override is that same path.
+        """
+        frame = _frame(fs=48000.0, seed=seed)[0] if fs is None else _frame(fs=fs, seed=seed)[0]
+        return C.from_node(frame, node, fs_hz=fs)
+
+    def test_the_parts_total_the_whole(self):
+        """The invariant the function shipped without. Every record is kept, unrated, or
+        off-rate -- a fourth outcome cannot be invented without failing here."""
+        q, ref = SK.sketch(np.zeros(4096), 48000.0)
+        recs = [C.from_node(_frame(fs=48000.0, seed=1)[0], "a"),
+                C.from_node(_frame(fs=16000.0, seed=2)[0], "b"),
+                C.from_node(SK.pack(1, ref, 0, q), "c")]          # no fs code -> unrated
+        _X, kept, fm = C.feature_matrix(recs, 48000.0)
+        assert fm["n_in"] == len(recs)
+        assert fm["kept"] == len(kept)
+        assert fm["kept"] + fm["dropped_no_rate"] + fm["dropped_other_rate"] == fm["n_in"]
+
+    def test_a_disciplined_rate_is_reported_as_this_axis_not_another_sensor(self):
+        """⚠️THE MEASURED DEFECT, ~/hear-pool 2026-09-08. 955 of 1038 records take their rate
+        from the dets.csv PPS-DISCIPLINED column; 519 of those happened to read exactly
+        16000.000 and 436 read one of 30 neighbours spanning 15936.0-16034.909 (+/-0.4%).
+        feature_matrix(recs, 16000.0) kept 602 and dropped 436 -- 42.0% -- with no message.
+        Survival was decided by whether that window's clock discipline rounded to the nominal
+        value, not by which frequency axis the row was measured on. The tally has to say the
+        nearest miss was 0.05% away, i.e. this same microphone."""
+        recs = [self._rated(16000.0, i, "n%d" % i) for i in range(3)]
+        recs.append(self._rated(15992.099, 9, "disciplined"))
+        _X, kept, fm = C.feature_matrix(recs, 16000.0)
+        assert len(kept) == 3 and fm["dropped_other_rate"] == 1
+        assert fm["nearest_dropped_rate_hz"] == pytest.approx(15992.099)
+        assert fm["nearest_dropped_frac"] < 0.001        # 0.05%: under 4% of a band width
+        assert fm["dropped_rates_hz"] == [(15992.099, 1)]
+
+    def test_a_different_sensor_is_reported_as_a_different_sensor(self):
+        """The other side of the same field: 48 kHz against a 16 kHz axis is a 2.0 fraction, so
+        ONE number separates 'my own clock discipline' from 'the wrong microphone'."""
+        recs = [self._rated(16000.0, 1, "n"), self._rated(48000.0, 2, "phone")]
+        _X, _kept, fm = C.feature_matrix(recs, 16000.0)
+        assert fm["nearest_dropped_rate_hz"] == pytest.approx(48000.0)
+        assert fm["nearest_dropped_frac"] == pytest.approx(2.0)
+
+    def test_the_exact_match_is_not_widened_only_reported(self):
+        """⚠️Widening the match by default would silently GROW a training set -- the same bug
+        pointing the other way. What is KEPT must not change; only what is said about it."""
+        recs = [self._rated(16000.0, 1, "n"), self._rated(15992.099, 2, "d")]
+        X, kept, fm = C.feature_matrix(recs, 16000.0)
+        assert X.shape[0] == 1 and len(kept) == 1
+        assert fm["dropped_other_rate"] == 1
+
+    def test_an_unrated_record_is_counted_separately_from_a_wrong_rate(self):
+        """'nothing said what rate it was' and 'it was another sensor' are different losses and
+        must not share a counter."""
+        q, ref = SK.sketch(np.zeros(4096), 48000.0)
+        recs = [C.from_node(SK.pack(1, ref, 0, q), "old"),
+                self._rated(16000.0, 1, "wrong"),
+                self._rated(48000.0, 2, "right")]
+        _X, _kept, fm = C.feature_matrix(recs, 48000.0)
+        assert fm["dropped_no_rate"] == 1
+        assert fm["dropped_other_rate"] == 1
 
 
 class TestSummaryAndReader:
