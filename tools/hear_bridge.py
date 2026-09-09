@@ -111,6 +111,15 @@ CONSUMER_EMBED_DIM = 1024
 # is 21.1 us -- a third of one sample at 1e6/16000 = 62.5 us -- so the fallback does not move a
 # pointer. It is NOT the cumulative fs_cum_hz of 15991.4821 in that same row, which is poisoned by
 # boot loss.
+#
+# ⚠️`fs_cum_hz` IS A COLUMN OF THAT CAPTURE, NOT OF NEW ONES. The firmware renamed it `fs_ok_hz`
+# on 2026-09-08 when its meaning changed from "every sample over every second" to "the seconds the
+# node certified as neither short nor long" -- a header change, deliberately, because that is what
+# rolls the file aside and keeps rows written under the old meaning readable. A health.csv from a
+# card flashed after that date has fs_ok_hz, clean_s, fs_used_hz, fs_step_ppm, over_s and
+# pps_gaps; one from before has fs_cum_hz and none of the rest. Do not read the two as one column.
+# Also note fs_clean_hz's quantisation: its step is 16000/fs_win_s ppm, so the +10.5625 ppm above
+# is only meaningful because that row's window was 3030 s (a 5.3 ppm step). See docs/timing.md.
 NOMINAL_FS = 16000.0
 
 # The node's impulse geometry, COPIED from firmware/night_node/mel16.h (MEL16_BANDS,

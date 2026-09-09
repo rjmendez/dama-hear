@@ -69,11 +69,16 @@ while True:
             if s["uptime_s"] < prev["uptime_s"]:
                 say("NODE REBOOTED (uptime went %ss -> %ss)" % (prev["uptime_s"], s["uptime_s"]))
             # the deliverable: report it once it is real, then only when it moves
-            if s["pps"]["edges"] >= 3 and s["i2s"]["measured_hz"] > 0:
+            # ⚠️SUPPORT, NOT EDGE COUNT. This used to announce the figure "from N PPS edges",
+            # which is every edge the node ever saw -- including the ones on either side of a
+            # stall. The rate is now averaged only over seconds the node certified as neither
+            # short nor long, and `clean_s` is that population; announcing anything else here
+            # would put a window behind a number that was not measured over it.
+            if s["i2s"].get("clean_s", 0) >= 8 and s["i2s"]["measured_hz"] > 0:
                 a, b = prev["i2s"]["measured_hz"], s["i2s"]["measured_hz"]
                 if a == 0 or abs(b - a) > 0.02:
-                    say("I2S measured %.4f Hz (%+.1f ppm) from %d PPS edges"
-                        % (b, s["i2s"]["ppm"], s["pps"]["edges"]))
+                    say("I2S measured %.4f Hz (%+.1f ppm) over %d clean GPS seconds"
+                        % (b, s["i2s"]["ppm"], s["i2s"]["clean_s"]))
         prev = s
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         misses += 1
