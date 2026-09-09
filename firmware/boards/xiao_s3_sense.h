@@ -1,5 +1,12 @@
 // Seeed XIAO ESP32-S3 Sense + u-blox GPS + BMP280 + microSD.
-// Built as: nyquist, mach.  Class: xiao-s3-pps (hear/nodeclass.py).
+// Built as: nyquist, mach, rankine.  Class: xiao-s3-pps (hear/nodeclass.py).
+//
+// rankine is the THIRD node and it is the one that makes the array an array. Two nodes give one
+// equation for two unknowns and cannot place anything -- every result this project has produced
+// from nyquist+mach is a cone of possible bearings, not a position. Three nodes with the source
+// height declared (point.solve(fixed_up_m=...)) close it. Placement is what it is worth: across
+// the nyquist->mach axis, not along it. A third node ON that line adds an equation and no
+// geometry.
 #pragma once
 
 #define BOARD_NAME     "xiao-s3-pps"
@@ -41,10 +48,12 @@
 #define I2C_SDA_PIN    5         // D4
 #define I2C_SCL_PIN    6         // D5
 #define HAS_BARO       1         // 0x76/0x77. nyquist carries BMP280 silicon (chip id 0x58) on a
-                                 // board LABELLED BME280; mach carries a real BME280 (0x60) and so
-                                 // also reports humidity. Identified by chip id, never by label.
+                                 // board LABELLED BME280; mach and rankine carry a real BME280
+                                 // (0x60) and so also report humidity. Identified by CHIP ID,
+                                 // never by the silkscreen -- nyquist is why.
 #define HAS_HUMIDITY   0         // per-node in practice -- see above. Reported from the chip id.
 #define HAS_MAG        1         // nyquist IST8310 @0x0E, mach QMC5883L @0x0D. Detected, unread.
+                                 // rankine's part is unknown until it reports; /i2c says.
 #define HAS_RTC        0
 #define HAS_LIGHT      0
 #define HAS_AIR        0
