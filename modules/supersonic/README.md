@@ -42,8 +42,21 @@ transmitting a representation no model could score. `train_sketch.py` fits ones 
 
 | model | bands | applies to | nested grouped-CV AUC |
 |---|---|---|---|
-| `model_sketch.json` | 20 | ≥32 kHz sensors (the phones) | 0.9634 |
-| `model_sketch_15.json` | 15 | ≥16 kHz — **the whole fleet** | 0.9588 |
+| `model_sketch.json` | 20 | ≥32 kHz sensors (the phones) | 0.9728 |
+| `model_sketch_15.json` | 15 | ≥16 kHz — **the whole fleet** | 0.9665 |
+
+⚠️**Both figures were measured at 48 kHz, and the fleet runs at 16.** Every pooled node frame is
+16 kHz, and this repo has separately measured what a 48 kHz-fitted fixed-bank model does on 16 kHz
+audio over the common 15 bands: **0.9473** (`hear/corpus.py:283-285`, `hear/sketch.py:124-130`).
+That, not the column above, is the number that applies to a node score. ⚠️**And the column above is
+optimistic**: nested grouped CV grouped events by `int(utc // 3)` = 3 s, while
+`hear.validate.decorrelation_lag_s` measures these features not decorrelating until 22.4 s apart —
+91.7 % of events have a different-group neighbour inside the lag (`validate_sketch.py`).
+`tools/hear_score.py` ships all three numbers on every row for this reason.
+
+⚠️The earlier values in this table (0.9634 / 0.9588) were the **pre-onset-fix, peak-aligned**
+numbers from `train_sketch.py`'s notes; the shipped files' own `auc_nested_grouped_cv` keys are the
+ones above. Corrected 2026-09-09 when `hear-score` became the first consumer to read them.
 
 ⚠️**The sketch is not more accurate than the six features.** Paired bootstrap over the 69 groups:
 +0.0054 AUC, 95 % CI [−0.0098, +0.0232], P(better) 0.75. A tie. Earlier notes on this repo implied
