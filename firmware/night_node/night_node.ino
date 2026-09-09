@@ -1795,9 +1795,10 @@ static File detf;
 // The configure() is inside the retry deliberately: re-detecting the pins without re-sending
 // CFG-VALSET would leave the module at whatever rate it shipped with, which is the 5 Hz/10 Hz
 // asymmetry that cost mach two rejected UTC labellings a second.
-static void gps_bringup() {
-  gps_pick_pins();
-
+// The baud sweep on its own, so /gpspins can re-run it after FORCING a pin order. Extracted
+// rather than duplicated: a second copy would drift, and the candidate list is the part that
+// matters -- a module configured UBX-binary only shows nothing to a NMEA-only scan.
+static void gps_autobaud() {
   // Find the module's baud instead of assuming it. Assuming 9600 produced a stream that a lenient
   // parser happily counted as 22 "sentences" while zero of them were valid NMEA -- a wrong number
   // that looked like a working link. Count VALID lines and let the module tell us.
@@ -1834,6 +1835,13 @@ static void gps_bringup() {
                   best_ubx ? "UBX binary" : "NMEA",
                   best_b ? "" : " -- nothing decoded at any rate");
   }
+}
+
+
+static void gps_bringup() {
+  gps_pick_pins();
+
+  gps_autobaud();
   delay(300);
   gps_configure();
 }
@@ -2326,6 +2334,54 @@ void setup() {
     }
     http.send(200, "text/plain", o);
   });
+  // FORCE the pin order when the module cannot be measured.
+  //
+  // gps_pick_pins() decides by watching which pin carries a transmitter, so it can only decide
+  // while the module is TALKING. That is a deadlock for any node wired against the documented
+  // order: mach's pair is reversed, and when its module came up silent the probe fell back to the
+  // documented pinout, which put the ESP's TX into the module's TX. Nothing could then be sent to
+  // wake it, so the auto-detect could never succeed, and the watchdog retried the same wrong guess
+  // every two minutes -- 0 sentences, config_acked false, PPS still ticking, indefinitely.
+  //
+  // Autodetect is the right default and stays the default. This is the manual override for the
+  // case it cannot cover, and it is why a node whose GPS goes quiet is now recoverable over the
+  // network instead of needing someone outdoors.
+  //
+  //   curl -X POST 'http://<node>/gpspins?swap=1'   # module TX on D6, RX on D7 (mach's wiring)
+  //   curl -X POST 'http://<node>/gpspins?swap=0'   # documented order
+  //   curl -X POST 'http://<node>/gpspins?auto=1'   # hand it back to the probe
+  http.on("/gpspins", HTTP_POST, []() {
+    if (!http.hasArg("swap") && !http.hasArg("auto")) {
+      http.send(400, "text/plain", "POST /gpspins?swap=0|1 | ?auto=1\n");
+      return;
+    }
+    // Re-running bring-up drops the timepulse while it sweeps, and an interval spanning that gap
+    // is not a real one. Declare it, exactly as the watchdog path does, or a diagnostic shows up
+    // as a multi-second PPS interval that the high-water mark then keeps for the whole run.
+    pps_resync = true; pps_resyncs++; fs_clean_secs = 0;
+    pps_int_min = 0xFFFFFFFF; pps_int_max = 0;
+
+    if (http.hasArg("auto")) {
+      gps_bringup();
+    } else {
+      bool swap = http.arg("swap").toInt() != 0;
+      Serial1.end();
+      gps_rx_pin = swap ? GPS_TX : GPS_RX;
+      gps_tx_pin = swap ? GPS_RX : GPS_TX;
+      gps_pin_src = swap ? "FORCED: swapped at the module" : "FORCED: as documented";
+      // Sweep the baud on the pins we were just told to use, then configure. Forcing the pins
+      // without re-finding the baud would leave the UART open at whatever the failed autodetect
+      // settled on -- 9600, on mach -- and the override would look like it did nothing.
+      gps_autobaud();
+      gps_configure();
+    }
+    char b[220];
+    snprintf(b, sizeof b, "%s\nRX=GPIO%d TX=GPIO%d at %lu baud\n"
+             "watch /status: gps.sentences and gps.config_acked say whether it took.\n",
+             gps_pin_src, gps_rx_pin, gps_tx_pin, (unsigned long)gps_baud);
+    http.send(200, "text/plain", b);
+  });
+
   http.on("/gpsbaud", []() {
     // Detaching the UART for the measurement and putting it straight back: the pin is shared, and
     // a diagnostic that leaves the GPS silent afterwards would be worse than no diagnostic.
