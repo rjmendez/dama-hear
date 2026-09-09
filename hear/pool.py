@@ -29,7 +29,17 @@ answered from what was actually written, never from a file count.
 
 TIME. `utc_us == 0` means the node had no PPS lock yet; the row is KEPT and marked
 `anchored: false`. Dropping it at ingest would make the pool's own count depend on GPS state, and
-the frame is still a valid training example. Solvers filter on `anchored`.
+the frame is still a valid training example.
+
+⚠️`anchored` MEANS "A STAMP EXISTS", NOT "THE STAMP IS TRUSTWORTHY". It is the weaker of two
+questions and it is easy to read as the stronger one. For a node it is `utc_us > 0`, i.e. PPS
+lock. For a PHONE it is `bool(ts)` -- true whenever the payload carried a `ts_utc_ms` at all,
+INCLUDING the `clock_tier: "wall"` fallback, which GPSTimingSync declares at sigma 50 ms: about
+17 m at 343 m/s, which is not a TDoA arrival. The stored field is deliberately left as it is --
+it is content-addressed into every row already written and redefining it would change what those
+rows assert -- so the trust question is asked somewhere else. Ask
+`hear.corpus.Record.utc_trusted`; `stats()["by_clock_tier"]` says how many phone rows are in
+which tier, so the wall population is a counted number rather than a silent exclusion.
 """
 from __future__ import annotations
 
@@ -295,6 +305,14 @@ class Pool:
                 "sync_sigma_ns": payload.get("sync_sigma_ns"),
                 "onset_found": payload.get("onset_found"),
                 "onset_offset_us": payload.get("onset_offset_us"),
+                # ⚠️`corpus.Record.utc_trusted` reads this as its guard against an older phone
+                # build that publishes a `clock_tier` without the `stamp != null` coupling the
+                # property relies on. Stored here so the pool path can answer the same question
+                # `corpus.from_phone` can -- two readers of one message must not disagree.
+                "onset_dated": payload.get("onset_dated"),
+                # If a producer ever states it outright, it outranks the derivation. Absent is
+                # the normal case and stays absent, NOT False: see Record.utc_trusted.
+                "utc_trusted": payload.get("utc_trusted"),
             })
         added = self._append(recs)
         entry = {"kind": "mqtt.jsonl", "path": os.path.abspath(path), "origin": origin or path,
@@ -590,6 +608,15 @@ class Pool:
         by_node: Dict[str, int] = {}
         by_fs: Dict[str, int] = {}
         by_day: Dict[str, int] = {}
+        # ⚠️PHONE ONLY, AND COUNTED RATHER THAN EXCLUDABLE. `anchored` is true for a phone row
+        # stamped on the wall clock (see the module docstring), so the population a solver must
+        # hold out is invisible in the anchored/unanchored split. A selector that quietly drops
+        # rows without saying how many is the failure this pool has already had twice -- the G3
+        # 730 and the `flags & 2` 88 -- so the tiers are reported, not filtered. Nodes are absent
+        # from this breakdown because they do not have a clock_tier: their time comes from PPS,
+        # and folding a `None` bucket in here would read as a phone that failed to state one.
+        by_tier: Dict[str, int] = {}
+        by_trust: Dict[str, int] = {"true": 0, "false": 0, "not_stated": 0}
         anchored = no_ctx = unstated = 0
         n = 0
         for r in self.raw():
@@ -598,6 +625,16 @@ class Pool:
             by_node[r["node"]] = by_node.get(r["node"], 0) + 1
             by_fs[str(r.get("fs_hz"))] = by_fs.get(str(r.get("fs_hz")), 0) + 1
             by_day[_day(r.get("ts_utc_s"))] = by_day.get(_day(r.get("ts_utc_s")), 0) + 1
+            if r.get("source") == "phone":
+                # ⚠️"(unstated)", not str(None). A `str()` here buckets a row with no tier under
+                # the literal key "None", which is indistinguishable in the drain output from a
+                # producer that emitted the string "None" as its tier. The parenthesised form
+                # cannot collide with any tier a producer could publish.
+                tier = r.get("clock_tier")
+                tk = "(unstated)" if tier is None else str(tier)
+                by_tier[tk] = by_tier.get(tk, 0) + 1
+                t = C.utc_trusted_of(r)
+                by_trust["not_stated" if t is None else ("true" if t else "false")] += 1
             anchored += bool(r.get("anchored"))
             no_ctx += bool(r.get("no_context"))
             unstated += r.get("fs_hz") is None
@@ -614,6 +651,12 @@ class Pool:
                 skips[k] = skips.get(k, 0) + v
         return {"records": n, "by_source": by_source, "by_node": by_node, "by_fs_hz": by_fs,
                 "by_day": by_day, "anchored": anchored, "unanchored": n - anchored,
+                "by_clock_tier": by_tier,
+                "trusted_clock_tiers": sorted(C.TRUSTED_CLOCK_TIERS),
+                # Off `corpus.utc_trusted_of`, the SAME function `Record.utc_trusted` uses -- not
+                # re-derived from `by_clock_tier`, which would miss the `onset_dated` rung and
+                # give the pool's summary and its own records two different answers.
+                "phone_utc_trusted": by_trust,
                 "no_context": no_ctx, "fs_unstated": unstated,
                 "ingests": len(led),
                 "files_seen": len({e["sha256"] for e in led}),
