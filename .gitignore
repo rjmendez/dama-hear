@@ -8,3 +8,4 @@ __pycache__/
 *.log
 firmware/**/secrets.h
 .otabuild/
+firmware/**/build/
