@@ -19,7 +19,6 @@ Both defects were live on 2026-09-09 and both were silent:
 import os
 import re
 import subprocess
-import sys
 import textwrap
 
 import pytest
