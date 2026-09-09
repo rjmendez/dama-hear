@@ -57,6 +57,24 @@ with open(out, "w") as f:
     f.write("static const char *WIFI_PASSES[] = {%s};\n" % ", ".join('"%s"' % esc(p) for _, p in pairs))
     f.write('#define NODE_ID "%s"\n' % esc(node_id))
     f.write('#define NODE_CLASS "%s"\n' % esc(node_class))
+    # FIRMWARE BUILD ID. Every node reported an identical /status shape while running binaries
+    # built from different commits, and there was no field that could tell them apart -- so
+    # "are all the nodes on the same version?" was not answerable from the fleet, only from
+    # memory of who was flashed when. A capture whose nodes silently differ is not one capture.
+    #
+    # Recorded from git at GENERATION time, not build time, because secrets.h is what flash.py
+    # regenerates per node and it is the only file guaranteed to be rewritten on every flash.
+    # `-dirty` is not cosmetic here: it means the binary does not correspond to any commit, and
+    # a node running one cannot be matched to a source tree afterwards.
+    build = "unknown"
+    try:
+        import subprocess
+        build = subprocess.run(["git", "describe", "--always", "--dirty", "--tags"],
+                               cwd=os.path.dirname(os.path.abspath(__file__)),
+                               capture_output=True, text=True, timeout=10).stdout.strip() or "unknown"
+    except Exception:
+        pass
+    f.write('#define FW_BUILD "%s"\n' % esc(build))
 os.chmod(out, 0o600)
 
 def mask(s):

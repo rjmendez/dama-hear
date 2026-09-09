@@ -53,6 +53,12 @@ static const char *WIFI_PASSES[] = {""};
 #ifndef NODE_CLASS
 #define NODE_CLASS "xiao-s3-pps"        // 1 PDM mic @16k, GPS PPS, BMP280, microSD. See docs/node-classes.md
 #endif
+// Set by gen_secrets.py from `git describe --always --dirty --tags` at flash time. The fallback
+// matters: a sketch built by hand, without flash.py, is NOT a released build and must not be able
+// to claim a commit it was not built from.
+#ifndef FW_BUILD
+#define FW_BUILD "unset"
+#endif
 static char node_id[24];
 static void node_identity() {
 #ifdef NODE_ID
@@ -1616,7 +1622,9 @@ static String status_json() {
   if (g_floor_saved == g_floor_saved) snprintf(floor_saved, sizeof floor_saved, "%.1f", g_floor_saved);
   else                                snprintf(floor_saved, sizeof floor_saved, "null");
   snprintf(b, sizeof b,
-    "{\"node\":\"%s\",\"class\":\"%s\",\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
+    // fw is FIRST after the identity, because the question it answers -- is this node running
+    // the same binary as its neighbours -- is asked of the whole fleet at once.
+    "{\"node\":\"%s\",\"class\":\"%s\",\"fw\":\"%s\",\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
     // hell_m is height above the WGS84 ELLIPSOID and is the field a geodetic transform wants;
@@ -1657,7 +1665,7 @@ static String status_json() {
     "\"budget_left_clips\":%lu,\"pre_s\":%.1f,\"post_s\":%.1f,\"dir\":\"%s\",\"boot\":\"%s\"},"
     "\"env\":{\"temp_c\":%s,\"press_hpa\":%s,\"c_mps\":%s,\"reads\":%lu,\"fail\":%lu},"
     "\"sd\":%s,\"sd_free_mb\":%lu,\"sd_total_mb\":%lu,\"i2c\":\"%s\"}",
-    node_id, NODE_CLASS,
+    node_id, NODE_CLASS, FW_BUILD,
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
     gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences,
@@ -1838,7 +1846,7 @@ void setup() {
   logf("boot  attempt %lu on partition %s\n", (unsigned long)boot_try,
                 esp_ota_get_running_partition()->label);
   node_identity();          // before anything logs or joins: the id names the log and the AP
-  logf("\n=== dama-hear night node %s (%s) ===\n", node_id, NODE_CLASS);
+  logf("\n=== dama-hear night node %s (%s) fw %s ===\n", node_id, NODE_CLASS, FW_BUILD);
 
   // Try each configured network in turn. An outdoor node may only reach one of them, and which
   // one is not knowable from indoors.
