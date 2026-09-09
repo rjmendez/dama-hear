@@ -29,7 +29,17 @@ answered from what was actually written, never from a file count.
 
 TIME. `utc_us == 0` means the node had no PPS lock yet; the row is KEPT and marked
 `anchored: false`. Dropping it at ingest would make the pool's own count depend on GPS state, and
-the frame is still a valid training example. Solvers filter on `anchored`.
+the frame is still a valid training example.
+
+⚠️`anchored` MEANS "A STAMP EXISTS", NOT "THE STAMP IS TRUSTWORTHY". It is the weaker of two
+questions and it is easy to read as the stronger one. For a node it is `utc_us > 0`, i.e. PPS
+lock. For a PHONE it is `bool(ts)` -- true whenever the payload carried a `ts_utc_ms` at all,
+INCLUDING the `clock_tier: "wall"` fallback, which GPSTimingSync declares at sigma 50 ms: about
+17 m at 343 m/s, which is not a TDoA arrival. The stored field is deliberately left as it is --
+it is content-addressed into every row already written and redefining it would change what those
+rows assert -- so the trust question is asked somewhere else. Ask
+`hear.corpus.Record.utc_trusted`; `stats()["by_clock_tier"]` says how many phone rows are in
+which tier, so the wall population is a counted number rather than a silent exclusion.
 """
 from __future__ import annotations
 
@@ -80,6 +90,63 @@ def _day(ts_utc_s: Optional[float]) -> str:
         return "unanchored"
     import datetime as _dt
     return _dt.datetime.fromtimestamp(ts_utc_s, _dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+def _geom_str(g: Tuple[Any, Any, Any, Any]) -> str:
+    """A scene row's geometry as one printable key: `20x4@62.5-7812.5`.
+
+    The band EDGES are part of it. Two banks can share 20x4 and disagree about what band k is --
+    the scene bank spans 62.5-7812.5 Hz where the detection bank spans 312.5-8000 -- so a key that
+    named only the shape would report one geometry for two axes. `?` marks an edge the row never
+    declared (an S0 row has no f_lo_hz/f_hi_hz columns); it is not the same as any stated edge.
+
+    ⚠️THE KEY MUST NOT ROUND TWO AXES TOGETHER. `%g` is 6 significant digits, so a bare `%g` would
+    print 62.5 for both 62.5 and 62.50000001 -- and this string is `scene_stats`' dict key, the one
+    place a mix is counted WITHOUT raising, so a collapsed key undercounts distinct geometries
+    exactly where nothing else would notice. `scene_matrix` compares the exact tuple, so a bare
+    `%g` also lets it refuse two rows while printing one key for both. Every edge is therefore
+    round-tripped: `%g` is kept only when it reads back as the same float, else `repr`. Today's
+    firmware writes MELS_F_LO/MELS_F_HI at one decimal, so this never fires on shipped rows.
+    """
+    bands, slices, lo, hi = g
+
+    def fmt(v):
+        if v is None:
+            return "?"
+        v = float(v)
+        s = "%g" % v
+        return s if float(s) == v else repr(v)
+
+    return "%sx%s@%s-%s" % (bands, slices, fmt(lo), fmt(hi))
+
+
+def _why_geoms_differ(a: Tuple[Any, Any, Any, Any], b: Tuple[Any, Any, Any, Any]) -> str:
+    """Name what actually differs between two scene geometries, not what might have.
+
+    ⚠️Keyed on the DIFFERENCE, not on the presence of a None. A message that decided by asking
+    "is any edge undeclared?" reported band EDGES for a pure shape change whose edges were
+    byte-identical (20x4@300-7840 against 16x4@300-7840), and reported an undeclared axis for two
+    S0 rows whose edges were equally undeclared and therefore not different at all. A refusal that
+    misnames its own cause sends the reader to the wrong firmware constant.
+    """
+    why = []
+    if (a[0], a[1]) != (b[0], b[1]):
+        why.append("the SHAPE differs -- %sx%s against %sx%s, which is not one matrix width"
+                   % (a[0], a[1], b[0], b[1]))
+    if (a[2], a[3]) != (b[2], b[3]):
+        # ⚠️"Undeclared" only when the DIFFERENCE is itself a declared-vs-absent one. Asking
+        # "is any edge None?" put an UNDECLARED message on a pair whose f_lo genuinely differed
+        # (62.5 against 300) merely because both left f_hi absent -- the same misnaming one level
+        # down from the bug this function replaced.
+        differing = [i for i in (2, 3) if a[i] != b[i]]
+        if any((a[i] is None) != (b[i] is None) for i in differing):
+            why.append("one of them leaves its band axis UNDECLARED (an S0 row carries no "
+                       "f_lo_hz/f_hi_hz, shown as ?). An axis that is not stated cannot be "
+                       "shown to be the axis that is, so it is refused rather than assumed")
+        else:
+            why.append("the shape can match while the band EDGES do not, and then band k is "
+                       "a different frequency in the two")
+    return "; and ".join(why) if why else "they compare unequal on no named field"
 
 
 def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -295,6 +362,14 @@ class Pool:
                 "sync_sigma_ns": payload.get("sync_sigma_ns"),
                 "onset_found": payload.get("onset_found"),
                 "onset_offset_us": payload.get("onset_offset_us"),
+                # ⚠️`corpus.Record.utc_trusted` reads this as its guard against an older phone
+                # build that publishes a `clock_tier` without the `stamp != null` coupling the
+                # property relies on. Stored here so the pool path can answer the same question
+                # `corpus.from_phone` can -- two readers of one message must not disagree.
+                "onset_dated": payload.get("onset_dated"),
+                # If a producer ever states it outright, it outranks the derivation. Absent is
+                # the normal case and stays absent, NOT False: see Record.utc_trusted.
+                "utc_trusted": payload.get("utc_trusted"),
             })
         added = self._append(recs)
         entry = {"kind": "mqtt.jsonl", "path": os.path.abspath(path), "origin": origin or path,
@@ -386,8 +461,15 @@ class Pool:
                 # count -- use scenefile.frames_per_slice() for that. Neither is the shape.
                 "slices": d["slices"], "frames_summed": d["frames_summed"],
                 "span_ms": d["span_ms"],
-                "f_lo_hz": float(row["f_lo_hz"]) if row.get("f_lo_hz") else None,
-                "f_hi_hz": float(row["f_hi_hz"]) if row.get("f_hi_hz") else None,
+                # `not in (None, "")` rather than truthiness, as stated intent. ⚠️It changes
+                # NOTHING on the CSV path: the value arrives as a string and "0" is truthy, so
+                # both forms agree on "62.5", "0", "" and absent -- measured. Only a float 0.0
+                # differs, which no CSV yields. Written this way so the rule ("empty means
+                # undeclared, zero means zero") is legible if a non-CSV caller ever appears.
+                "f_lo_hz": (float(row["f_lo_hz"]) if row.get("f_lo_hz") not in (None, "")
+                            else None),
+                "f_hi_hz": (float(row["f_hi_hz"]) if row.get("f_hi_hz") not in (None, "")
+                            else None),
                 "fft_us": row.get("fft_us"),
                 "sample": row.get("sample"), "uptime_s": row.get("uptime_s"),
                 "scene_schema": row.get("schema"),
@@ -471,34 +553,55 @@ class Pool:
                      ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
         """[n, bands*slices] over stored scene rows, and the rows behind it.
 
-        Refuses to stack rows of differing geometry rather than reshaping to fit: `bands` and
-        `slices` are firmware's to change, and a matrix whose width silently depends on which
-        firmware happened to be running is not a dataset.
+        Refuses to stack rows of differing geometry rather than reshaping to fit. The geometry is
+        `bands`, `slices` AND the band edges `f_lo_hz`/`f_hi_hz`: all four are firmware's to
+        change, and two banks at one 20x4 shape stack into a matrix whose column k is a different
+        frequency in different rows -- which reads as a dataset and is not one. The edges are what
+        separate them; `bands`/`slices` alone cannot.
+
+        ⚠️An S0 row declares no edges at all (the columns arrive as None). A row whose axis is
+        unknown cannot be shown to share an axis with one whose axis is known, so an S0 row and an
+        S1/S2 row refuse to stack even if the same firmware wrote both. That is the intended
+        reading of an undeclared axis, not a bug; select a day or node to get one generation.
+
+        ⚠️`limit` BOUNDS WHAT IS BUILT, NOT WHAT IS CHECKED. The selection is walked to the end
+        whatever the limit, and a differing row past it still raises. Stopping the walk at the
+        limit would have made the keyword silently disable the guard the paragraph above promises,
+        and it would have handed back a sample drawn only from whichever geometry sorted first --
+        biased in a way the caller has no way to see. Measured on a 41,507-row pool: the full walk
+        costs 0.240 s against 0.009 s for the old early break, while the full build is 0.818 s. The
+        limit still bounds MEMORY, which is what it is for; only `limit` rows are ever decoded.
         """
         if mode not in ("db", "q"):
             raise ValueError("mode must be 'db' or 'q'")
         rows, out = [], []
         geom = None
         for r in self.scene(node=node, day=day):
-            g = (r["bands"], r["slices"])
+            g = (r["bands"], r["slices"], r.get("f_lo_hz"), r.get("f_hi_hz"))
             if geom is None:
                 geom = g
             elif g != geom:
-                raise ValueError("mixed scene geometry: %s then %s -- select a day or node "
-                                 "whose firmware did not change" % (geom, g))
+                raise ValueError("mixed scene geometry: %s then %s -- %s. Select a day or node "
+                                 "whose firmware did not change."
+                                 % (_geom_str(geom), _geom_str(g), _why_geoms_differ(geom, g)))
+            if limit is not None and len(rows) >= limit:
+                continue                    # keep CHECKING; stop collecting
             q = np.frombuffer(base64.b64decode(r["mel_b64"]), dtype=np.int8) \
                 .reshape(r["bands"], r["slices"]).astype(float)
             rows.append((q / 2.0 + r["ref_db"] if mode == "db" else q).reshape(-1))
             out.append(r)
-            if limit and len(rows) >= limit:
-                break
         if not rows:
             return np.zeros((0, 0)), []
         return np.vstack(rows), out
 
     def scene_stats(self) -> Dict[str, Any]:
         """What the scene store holds. Counted by walking it, because a row count taken from the
-        ledger would credit rows a later gzip write could have lost."""
+        ledger would credit rows a later gzip write could have lost.
+
+        `geometry` keys on `_geom_str` -- shape AND band edges, e.g. `20x4@62.5-7812.5`. This is
+        the only place a mix of banks is visible WITHOUT raising, so the key has to carry enough
+        to tell two 20x4 banks apart; a bare `20x4` would total two axes into one number.
+        """
         n = 0
         by_node: Dict[str, int] = {}
         by_day: Dict[str, int] = {}
@@ -510,7 +613,7 @@ class Pool:
             by_node[r["node"]] = by_node.get(r["node"], 0) + 1
             d = _day(r.get("ts_utc_s"))
             by_day[d] = by_day.get(d, 0) + 1
-            g = "%dx%d" % (r["bands"], r["slices"])
+            g = _geom_str((r["bands"], r["slices"], r.get("f_lo_hz"), r.get("f_hi_hz")))
             geom[g] = geom.get(g, 0) + 1
             anchored += bool(r.get("anchored"))
             t = r.get("ts_utc_s")
@@ -607,6 +710,15 @@ class Pool:
         by_node: Dict[str, int] = {}
         by_fs: Dict[str, int] = {}
         by_day: Dict[str, int] = {}
+        # ⚠️PHONE ONLY, AND COUNTED RATHER THAN EXCLUDABLE. `anchored` is true for a phone row
+        # stamped on the wall clock (see the module docstring), so the population a solver must
+        # hold out is invisible in the anchored/unanchored split. A selector that quietly drops
+        # rows without saying how many is the failure this pool has already had twice -- the G3
+        # 730 and the `flags & 2` 88 -- so the tiers are reported, not filtered. Nodes are absent
+        # from this breakdown because they do not have a clock_tier: their time comes from PPS,
+        # and folding a `None` bucket in here would read as a phone that failed to state one.
+        by_tier: Dict[str, int] = {}
+        by_trust: Dict[str, int] = {"true": 0, "false": 0, "not_stated": 0}
         anchored = no_ctx = unstated = 0
         n = 0
         for r in self.raw():
@@ -615,6 +727,16 @@ class Pool:
             by_node[r["node"]] = by_node.get(r["node"], 0) + 1
             by_fs[str(r.get("fs_hz"))] = by_fs.get(str(r.get("fs_hz")), 0) + 1
             by_day[_day(r.get("ts_utc_s"))] = by_day.get(_day(r.get("ts_utc_s")), 0) + 1
+            if r.get("source") == "phone":
+                # ⚠️"(unstated)", not str(None). A `str()` here buckets a row with no tier under
+                # the literal key "None", which is indistinguishable in the drain output from a
+                # producer that emitted the string "None" as its tier. The parenthesised form
+                # cannot collide with any tier a producer could publish.
+                tier = r.get("clock_tier")
+                tk = "(unstated)" if tier is None else str(tier)
+                by_tier[tk] = by_tier.get(tk, 0) + 1
+                t = C.utc_trusted_of(r)
+                by_trust["not_stated" if t is None else ("true" if t else "false")] += 1
             anchored += bool(r.get("anchored"))
             no_ctx += bool(r.get("no_context"))
             unstated += r.get("fs_hz") is None
@@ -631,6 +753,12 @@ class Pool:
                 skips[k] = skips.get(k, 0) + v
         return {"records": n, "by_source": by_source, "by_node": by_node, "by_fs_hz": by_fs,
                 "by_day": by_day, "anchored": anchored, "unanchored": n - anchored,
+                "by_clock_tier": by_tier,
+                "trusted_clock_tiers": sorted(C.TRUSTED_CLOCK_TIERS),
+                # Off `corpus.utc_trusted_of`, the SAME function `Record.utc_trusted` uses -- not
+                # re-derived from `by_clock_tier`, which would miss the `onset_dated` rung and
+                # give the pool's summary and its own records two different answers.
+                "phone_utc_trusted": by_trust,
                 "no_context": no_ctx, "fs_unstated": unstated,
                 "ingests": len(led),
                 "files_seen": len({e["sha256"] for e in led}),
