@@ -81,15 +81,37 @@
 #define MIC_BAND_LO_HZ 50
 #define MIC_BAND_HI_HZ 20000     // unverified part; at 48 kHz Nyquist is 24 kHz so the mic binds
 
+// ---- what the VENDOR FIRMWARE says is on this board ------------------------------------------
+// From its self-test CSV header, in ~/puc-backup (2x 4 MiB at 0x0 and 0x400000, mrpink). This is
+// the vendor's own inventory, so it settles the parts whose I2C address alone could not:
+//
+//   MAC_ADDR, FW_VER, BUTTON, WIFI, DS3231, BME688, LIS2DH12, LIS3MDL, AS7341,
+//   RGB_LED, SD_DET, USB_DET, USB_VOLTS, BATT_VOLTS, GPS, MIC_LEFT, MIC_RIGHT, BUZZER
+//
+// ⚠️TWO CORRECTIONS to what the ID registers alone suggested. 0x76 is a BME688, not a BME680 --
+// they share chip id 0x61. 0x18 is a LIS2DH12, not a LIS3DH -- they share WHO_AM_I 0x33. The
+// AS7341 guess at 0x39 (id 0x24) is confirmed. An ID register narrows a part; it does not always
+// name one.
+//
+// STILL UNMAPPED, and all findable the same way: BUTTON, RGB_LED, SD_DET, USB_DET, BUZZER and the
+// USB_VOLTS / BATT_VOLTS ADC inputs. GPIO45 is the one pulled-up pin not yet accounted for and
+// SD_DET is the obvious suspect, un-checked.
+
 // ---- storage -----------------------------------------------------------------------------
-// A microSD slot exists (the vendor writes /sdcard/YYYYMMDD/*.flac). The dump links sdmmc_host_*,
-// diskio_sdmmc and logs "Using SDMMC peripheral" -- so the card is on the NATIVE SDMMC peripheral,
-// not SPI. I had declared SCK/MISO/MOSI/CS here, which is the wrong bus entirely and would have
-// sent whoever wires this to the wrong pads. The roles are CLK, CMD and D0..D3.
+// A microSD slot exists (the vendor writes /sdcard/YYYYMMDD/*.flac). The card is on the NATIVE
+// SDMMC peripheral, not SPI. I had declared SCK/MISO/MOSI/CS here, which is the wrong bus entirely
+// and would have sent whoever wires this to the wrong pads. The roles are CLK, CMD and D0..D3.
+//
+// ⚠️PINS RECOVERED 2026-09-08 from the vendor dump, statically -- no probing, nothing driven.
+// The app memcpy's SDMMC_SLOT_CONFIG_DEFAULT() (the ORIGINAL-ESP32 defaults: clk 14, cmd 15, d0 2,
+// d1 4, d2 12, d3 13 -- a red herring, and the reason a naive read of the rodata is wrong) into a
+// stack struct at a1+16, then overrides every field for the S3 immediately after. Those overrides
+// are what is below, read off the store offsets at 0x4200ce4f-0x4200ce79:
+//     s32i a1,16 -> clk 12   s32i a1,20 -> cmd 13   s32i a1,24 -> d0 14
+//     s32i a1,28 -> d1  9    s32i a1,32 -> d2  11   s32i a1,36 -> d3 10   s8i a1,64 -> width 4
+// All six sit in the pulled-up set /scan vs /scanpd left over after the mic and I2C were assigned,
+// which is the independent check on this.
 #define SD_BUS         SD_SDMMC
-#define SD_CLK_PIN     -1
-#define SD_CMD_PIN     -1
-#define SD_D0_PIN      -1        // bus width not yet established (1-bit or 4-bit)
 
 // ---- I2C ---------------------------------------------------------------------------------
 // DS3231 RTC plus temperature, humidity, pressure, VOC, eCO2, IAQ, a 3-axis magnetometer, a 3-axis
@@ -122,3 +144,22 @@
 #define I2C_ADDR_EEPROM   0x50   // AT24C-series, reads 0xFF throughout (blank)
 #define I2C_ADDR_DS3231   0x68   // CONFIRMED by temp + status decode; OSF=0, has never lost time
 #define I2C_ADDR_BME680   0x76   // CONFIRMED chip id 0x61
+
+#define SD_CLK_PIN     12        // from the vendor dump: override after SLOT_CONFIG_DEFAULT
+#define SD_CMD_PIN     13
+#define SD_D0_PIN      14
+#define SD_D1_PIN      9
+#define SD_D2_PIN      11
+#define SD_D3_PIN      10
+#define SD_BUS_WIDTH   4
+
+// ---- GPS: the command set the VENDOR uses, lifted from the dump -------------------------------
+// Useful when the L86 is diagnosed: these are the exact strings the stock firmware sends, so a
+// module that answers these and not ours is telling us something about our port, not the module.
+//   $PMTK605     query firmware version   (answered PMTK705 ... Quectel-L86)
+//   $PMTK104     full cold start          $PMTK161,0  standby
+//   $PMTK220,1000  fix interval 1 Hz      $PMTK225,0  continuous   $PMTK225,8  AlwaysLocate
+//   $PMTK286,1   active interference cancellation on
+//   $PMTK306,15  /  $PMTK311,10           $PMTK353,1,1,1,0,0  constellation search mode
+// ⚠️There is NO PMTK285 anywhere in the vendor image -- it never enabled 1PPS, consistent with the
+// pin never having been routed.
