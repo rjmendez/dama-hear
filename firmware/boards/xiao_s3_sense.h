@@ -13,7 +13,7 @@
 
 // ---- GPS ---------------------------------------------------------------------------------
 // u-blox, UBX protocol. Baud is AUTO-DETECTED at boot and differs between the two built nodes --
-// nyquist's module runs at 230400 and mach's at 115200 -- so it is not stated here. The solution
+// nyquist's and rankine's modules run at 230400 and mach's at 115200 -- so it is not stated here. The solution
 // rate is NOT a board fact either: the firmware pins it to 1 Hz with CFG-RATE, because the two
 // modules shipped at 5 Hz and 10 Hz and that asymmetry cost mach two rejected UTC labellings a
 // second until it was found.
@@ -47,13 +47,14 @@
 // ---- I2C ---------------------------------------------------------------------------------
 #define I2C_SDA_PIN    5         // D4
 #define I2C_SCL_PIN    6         // D5
-#define HAS_BARO       1         // 0x76/0x77. nyquist carries BMP280 silicon (chip id 0x58) on a
-                                 // board LABELLED BME280; mach and rankine carry a real BME280
-                                 // (0x60) and so also report humidity. Identified by CHIP ID,
-                                 // never by the silkscreen -- nyquist is why.
+#define HAS_BARO       1         // 0x76/0x77. Only MACH carries a real BME280 (chip id 0x60) and
+                                 // so reports humidity. nyquist AND rankine are BMP280 silicon
+                                 // (0x58) on boards sold as BME280 -- two out of three, so the
+                                 // mislabelling is the norm here rather than one bad board.
+                                 // Identified by CHIP ID, never by the silkscreen or the invoice.
 #define HAS_HUMIDITY   0         // per-node in practice -- see above. Reported from the chip id.
-#define HAS_MAG        1         // nyquist IST8310 @0x0E, mach QMC5883L @0x0D. Detected, unread.
-                                 // rankine's part is unknown until it reports; /i2c says.
+#define HAS_MAG        1         // nyquist IST8310 @0x0E, mach QMC5883L @0x0D, rankine IST8310
+                                 // @0x0E. Detected, unread.
 #define HAS_RTC        0
 #define HAS_LIGHT      0
 #define HAS_AIR        0
