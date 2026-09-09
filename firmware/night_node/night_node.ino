@@ -34,6 +34,7 @@
 
 #if __has_include("secrets.h")
 #include "secrets.h"
+#endif
 
 // ---- shared platform -------------------------------------------------------------------------
 // firmware/lib/hear_platform. Built with: arduino-cli compile --libraries firmware/lib
@@ -43,11 +44,16 @@
 // float logf(float), and with the macro further down the file every call ABOVE it resolved to the
 // math one -- "cannot convert const char* to float" at three sites that had never been touched.
 // The original static logf worked everywhere only because Arduino hoists a prototype for it.
+//
+// ⚠️AND IT MUST NOT BE NESTED IN THE SECRETS GUARD, WHICH IS WHERE IT LANDED. secrets.h is
+// gitignored, so a clean checkout has none, and the whole block above was skipped -- taking logf
+// and logln with it and failing the build at four sites that have nothing to do with wifi. It
+// built only on a machine that already had secrets.h. That is a compile that depends on an
+// untracked file, which is the one thing CI cannot have.
 #include <hear_log.h>
 #define logf    hear_logf
 #define logln   hear_logln
 #define log_put hear_log_put
-#endif
 #ifndef WIFI_N                        // no secrets.h -- fall back to the node's own AP
 #define WIFI_N 0
 static const char *WIFI_SSIDS[] = {""};
@@ -1647,10 +1653,50 @@ static bool     clip_have_last = false;
 // needs no GPS fix, which a boot-time name must not wait for.
 static char clip_boot[9] = "00000000";
 
+// ---- which clip is worth keeping ---------------------------------------------------------
+// ⚠️THE BUDGET USED TO BE FIRST-COME AND THAT IS WORSE THAN IT SOUNDS. Measured over 19.9 h on
+// three nodes: 437 primary detections, 96 of them heard by a SECOND node within 250 ms -- the ones
+// that are events in the world rather than something local to one microphone. First-come spent the
+// budget on whatever happened earliest, and refused 191 clips on nyquist and 201 on mach. The
+// 33-event sequence at 23:50 UTC, the most structured thing all night and coincident on two nodes,
+// was refused every time with clip_why "budget". There is no audio of it.
+//
+// ⚠️DO NOT RANK BY LOUDNESS. It is the obvious idea and it is measurably WRONG here: ranking by
+// `peak` selects coincident events at 8% against a 22% base rate, i.e. worse than random, because
+// the loudest things on this property are close-by and local. ref_db is barely better (24%).
+//
+// What does predict it is LOW-FREQUENCY DOMINANCE -- how much the bottom two mel bands stand above
+// the frame's own mean. Coincident events average 20.4 dB of it, single-node events 12.7 dB
+// (Cohen d = +1.08). Ranking by it selects coincident events at 3.1x the base rate, and the effect
+// SURVIVES dropping the 23:50 sequence entirely (1.85x) and dropping every strongly-LF event
+// (2.78x), so it is not an artifact of one loud class.
+//
+// It is a PROXY and nothing more. A node cannot see coincidence -- only the central side can, and
+// that is where a real decision belongs. This buys the node a better guess until then.
+static uint8_t clip_priority(const uint8_t *frame) {
+  const int bands = frame[8], frames = frame[9];
+  if (bands < 3 || frames < 1) return 50;          // unreadable geometry: middle, not best or worst
+  long lo = 0, all = 0;
+  for (int b = 0; b < bands; b++)
+    for (int t = 0; t < frames; t++) {
+      int v = (int8_t)frame[12 + b * frames + t];
+      all += v;
+      if (b < 2) lo += v;
+    }
+  // q is in half-dB steps and the reference cancels in the difference, so no ref_db is needed.
+  float lf_db = ((float)lo / (2 * frames) - (float)all / (bands * frames)) * 0.5f;
+  long p = lrintf(lf_db * 3.0f);                   // ~0-33 dB spans the 0-99 range
+  return (uint8_t)(p < 0 ? 0 : (p > 99 ? 99 : p));
+}
+
+// The priority LEADS the name, so the lexicographic scan in clip_evict_worse_than() is a scan by
+// VALUE across every boot on the card, with the oldest evicted first inside one priority band.
+static uint8_t clip_prio_pending = 50;   // set immediately before each clip_name() call
 static void clip_name(char *out, size_t n, uint32_t sample) {
   // node first: a clip is the one artefact that gets copied off the card and mailed around,
   // so it has to carry its own provenance rather than depend on the directory it sits in.
-  snprintf(out, n, CLIP_DIR "/%s-%s-%010lu.wav", node_id, clip_boot, (unsigned long)sample);
+  snprintf(out, n, CLIP_DIR "/%02u-%s-%s-%010lu.wav", (unsigned)clip_prio_pending,
+           node_id, clip_boot, (unsigned long)sample);
 }
 
 // Delete the oldest clip in CLIP_DIR and return its bytes to the budget. Oldest is by NAME:
@@ -1658,7 +1704,12 @@ static void clip_name(char *out, size_t n, uint32_t sample) {
 // name sorts chronologically. Across boots the prefix is random rather than ordered, so this can
 // evict a newer clip from a previous boot -- accepted, because the alternative is a stat() per
 // file on every eviction and the set is at most 49.
-static bool clip_evict_oldest() {
+// ⚠️EVICT ONLY FOR SOMETHING BETTER. Evicting unconditionally was still first-come wearing a
+// different hat: a run of low-value events would walk the whole card, deleting good clips one at a
+// time to store worse ones. A busy evening did exactly that. So the weakest clip on the card is
+// found, its priority read back off its own name, and the incoming clip is refused unless it beats
+// it. Refusal is reported as "budget" as before -- the budget really is what stopped it.
+static bool clip_evict_worse_than(uint8_t prio) {
   if (!sd_ok) return false;
   char oldest[64]; oldest[0] = 0;
   File d = SD.open(CLIP_DIR);
@@ -1670,6 +1721,15 @@ static bool clip_evict_oldest() {
   }
   d.close();
   if (!oldest[0]) return false;
+  // Names written before this change carry no priority prefix. Treat them as the weakest thing on
+  // the card so one pass clears them, rather than letting an unparseable name block eviction.
+  unsigned weakest = 0;
+  if (oldest[0] >= '0' && oldest[0] <= '9' && oldest[1] >= '0' && oldest[1] <= '9')
+    weakest = (unsigned)((oldest[0] - '0') * 10 + (oldest[1] - '0'));
+  if (weakest >= prio) {
+    logf("clip  keeping %s (prio %u) over an incoming prio %u\n", oldest, weakest, (unsigned)prio);
+    return false;
+  }
   char path[80]; snprintf(path, sizeof path, CLIP_DIR "/%s", oldest);
   if (!SD.remove(path)) { logf("clip  could NOT evict %s\n", path); return false; }
   clip_budget_left += CLIP_BYTES;
@@ -1756,7 +1816,12 @@ static void clip_pump() {
   // by uptime, and a node that has been up for a month still carries its last 49 events. Failing
   // to free space still refuses the clip -- that path is a full card, and it is reported as
   // "budget" exactly as before rather than pretending the write happened.
-  if (clip_budget_left < CLIP_BYTES && !clip_evict_oldest()) {
+  // The sketch is what the priority is read from, so a clip whose sketch has not been built yet
+  // cannot be ranked. Wait rather than rank it wrong -- the post-roll wait below would hold it
+  // anyway, and guessing a priority here would put an unranked clip ahead of a measured one.
+  if (d.sk_st == 0) return;
+  const uint8_t prio = clip_priority(d.frame);
+  if (clip_budget_left < CLIP_BYTES && !clip_evict_worse_than(prio)) {
     d.clip_st = CLIP_BUDGET; clip_skip_budget++; return;
   }
   if (sd_free_mb_last < CLIP_FREE_RESERVE_MB)
@@ -1773,6 +1838,7 @@ static void clip_pump() {
   uint32_t start = d.sample - CLIP_PRE_SAMPLES;
   if ((int32_t)(start - praw_oldest()) < 0)   { d.clip_st = CLIP_RING; clip_skip_ring++; return; }
 
+  clip_prio_pending = prio;
   char path[48]; clip_name(path, sizeof path, d.sample);
   File f = SD.open(path, FILE_WRITE);
   if (!f) { d.clip_st = CLIP_FAIL; clip_fail++; return; }
