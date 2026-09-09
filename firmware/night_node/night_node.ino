@@ -1666,10 +1666,16 @@ static char clip_boot[9] = "00000000";
 // the loudest things on this property are close-by and local. ref_db is barely better (24%).
 //
 // What does predict it is LOW-FREQUENCY DOMINANCE -- how much the bottom two mel bands stand above
-// the frame's own mean. Coincident events average 20.4 dB of it, single-node events 12.7 dB
-// (Cohen d = +1.08). Ranking by it selects coincident events at 3.1x the base rate, and the effect
-// SURVIVES dropping the 23:50 sequence entirely (1.85x) and dropping every strongly-LF event
-// (2.78x), so it is not an artifact of one loud class.
+// the frame's own mean. Ranking by it selects coincident events well above the base rate, and the
+// effect SURVIVES dropping the strongest class entirely, so it is not an artifact of one event.
+//
+// ⚠️AND THE LABEL MATTERS MORE THAN THE FEATURE. "Coincident" was first scored on a flat +/-250 ms
+// window, which is 3-6x the sound travel time across these baselines: most pairs it accepted are
+// physically impossible for ONE source (median |dt| 163 ms between nodes 17 m apart, where the
+// ceiling is 50 ms). Re-scored against the real constraint -- |dt| <= separation/c plus 5 ms of
+// onset-pick jitter -- 871 primaries give 70 genuinely coincident, and the feature gets STRONGER,
+// not weaker: Cohen d +1.46 -> +1.70, lift at the top 25 5.6x -> 8.0x. A window wider than physics
+// admits every busy minute and would have made this look better than it is for the wrong reason.
 //
 // It is a PROXY and nothing more. A node cannot see coincidence -- only the central side can, and
 // that is where a real decision belongs. This buys the node a better guess until then.
