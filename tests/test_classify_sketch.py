@@ -81,6 +81,16 @@ class TestRefusals:
         with pytest.raises(CL.SketchMismatch, match="layout"):
             CL.score_sketch(_frame(48000.0, 3, layout=SK.LAYOUT_NYQUIST), m20)
 
+    def test_a_frame_that_does_not_state_its_layout_is_refused(self, m20):
+        """⚠️THE SHORT-CIRCUIT. The guard used to read `if layout is not None and ...`, so a frame
+        with no layout SKIPPED the axis check and got a score. An unstated axis is not a shared
+        axis: band k on such a frame has no stated frequency, so no model's weight for band k
+        applies to it. hear.sketch.unpack always sets `layout`, so nothing shipped is affected."""
+        f = dict(_frame(48000.0, 1))
+        del f["layout"]
+        with pytest.raises(CL.SketchMismatch, match="layout"):
+            CL.score_sketch(f, m20)
+
     def test_wrong_time_frame_count_is_refused(self, m20):
         f = _frame(48000.0, 4)
         f["q"] = f["q"][:, :4]

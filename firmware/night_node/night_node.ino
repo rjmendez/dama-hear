@@ -1114,11 +1114,17 @@ static bool utc_to_sample(int64_t utc, uint32_t *s) {
 //        1-2k -22.3 dB | 2-4k -27.8 dB | 4-8k -26.3 dB
 //      62-312 Hz carries +8.2 dB MORE than the whole 312-8000 Hz span the sketch can see.
 //
-// MEL16_FB_LO[0] is 5, so the detection bank's band 0 is FFT bins 5-8 = 312.5-500.0 Hz and
+// MEL16_FB_LO[0] is 5, so the detection bank's band 0 starts at FFT bin 5 = 312.5 Hz and
 // everything below is thrown away after the DC block has already paid for it. The scene bank
 // (mel_scene.h, from firmware/gen_mel_scene.py) starts at bin 1 instead: band 0 is bins 1-4 =
-// 62.5-250.0 Hz, band 2 lands exactly on the old band 0, and the top band still ends at bin 125
-// = 7812.5 Hz. No band is empty; the shipped bank has 227 nonzero weights, this one 233.
+// 62.5-250.0 Hz, and the top band still ends at bin 125 = 7812.5 Hz. No band is empty; the
+// scene bank has 233 nonzero weights against the shipped MEL16_FB_W[245].
+//
+// ⚠️THE TWO BANKS SHARE NO BAND. Scene band 2 is bins 5-8 and detection band 0 is bins 5-10 --
+// same first bin, different support -- so they overlap without being the same band, and no
+// (FB_LO, FB_N) pair of one bank equals any pair of the other. Band k on a scene row and band k
+// on a sketch frame are DIFFERENT FREQUENCIES and must never be stacked; tests/
+// test_firmware_mel_scene.py asserts both banks and their disjointness against the headers.
 //
 // The DETECTION bank is untouched, and must stay untouched: firmware/hear_poc checks it byte-
 // exact against golden vectors and hear/wire.py profile 0 IS the 20x8 f_lo=300 shape, so moving
