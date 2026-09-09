@@ -395,6 +395,8 @@ static bool    bme_has_rh = false;
 static uint8_t bme_H1 = 0, bme_H3 = 0;
 static int16_t bme_H2 = 0, bme_H4 = 0, bme_H5 = 0;
 static int8_t  bme_H6 = 0;
+
+static int16_t bme_s12(uint16_t v) { return (int16_t)((v & 0x800) ? (int32_t)v - 4096 : (int32_t)v); }
 static float   bmp_rh_pct = NAN;
 
 static bool bmp_block(uint8_t reg, uint8_t *buf, uint8_t n) {
@@ -433,8 +435,10 @@ static bool bmp_begin() {
         bme_H1 = h1;
         bme_H2 = (int16_t)(h[1] << 8 | h[0]);
         bme_H3 = h[2];
-        bme_H4 = (int16_t)(((int8_t)h[3] << 4) | (h[4] & 0x0F));
-        bme_H5 = (int16_t)(((int8_t)h[5] << 4) | (h[4] >> 4));
+        // dig_H4/H5 are 12-bit signed fields split across E4/E5/E6. Assembled unsigned and
+        // sign-extended from bit 11: shifting the signed register left is undefined.
+        bme_H4 = bme_s12(((uint16_t)h[3] << 4) | (h[4] & 0x0F));
+        bme_H5 = bme_s12(((uint16_t)h[5] << 4) | (h[4] >> 4));
         bme_H6 = (int8_t)h[6];
         bme_has_rh = true;
       }
