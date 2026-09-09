@@ -110,6 +110,39 @@ DETS_FILES = ("dets.csv", "dets-prev.csv")
 # from it alone can hold nothing but impulsive events. scene.csv carries a row every ~1.024 s
 # regardless -- the ambient world this project is also about. See hear/scenefile.py.
 SCENE_FILES = ("scene.csv", "scene-prev.csv")
+
+# ⚠️THE SCENE FILE NAMES ARE FIRMWARE'S TO CHANGE AND IT CHANGED THEM. Since fw 7f84d29 (commit
+# 4dbfe26, "daily files with the oldest rolled off") the nodes write scene-YYYYMMDD.csv and leave
+# the legacy scene.csv frozen. A drain that asks for two hardcoded names then fetches a file that
+# never grows again and ingests nothing -- while reporting `ok`, because zero new rows out of a
+# successful fetch is indistinguishable from a quiet node. Measured 2026-09-09 05:20 UTC: the lane
+# had been dead 3.27 h, nyquist's scene.csv frozen at 20,751,993 B while scene-20260909.csv grew,
+# and rankine served no scene.csv at all.
+#
+# So the names are DISCOVERED from /ls rather than declared. SCENE_FILES stays as the fallback for
+# firmware too old to have the endpoint, and as the answer when /ls fails -- a blind run must still
+# fetch something rather than nothing.
+SCENE_GLOB = "scene"
+
+
+def scene_names(sizes: Optional[Dict[str, int]]) -> Tuple[Tuple[str, ...], str]:
+    """(names to fetch, which one is live). Live is tailed; the rest are rolled and fetched whole.
+
+    Lexicographic order is chronological for scene-YYYYMMDD.csv, so the greatest dated name is
+    today's. ⚠️scene-00000000.csv is the PRE-LOCK file -- rows the node wrote before it knew the
+    date -- and it is a real file with real rows, not a placeholder, so it is fetched like any
+    other rolled file. hear/pool.py keeps its rows and marks them unanchored.
+    """
+    if not sizes:
+        return SCENE_FILES, "scene.csv"
+    found = sorted(n for n in sizes
+                   if n.startswith(SCENE_GLOB) and n.endswith(".csv") and not n.endswith("-prev.csv"))
+    if not found:
+        return SCENE_FILES, "scene.csv"
+    dated = [n for n in found if n != "scene.csv"]
+    live = dated[-1] if dated else "scene.csv"
+    names = tuple(found) + (("scene-prev.csv",) if "scene-prev.csv" in sizes else ())
+    return names, live
 CONTEXT_FILES = ("health.csv",)
 
 # ⚠️SCENE IS FETCHED BY TAIL, NOT WHOLE. It grows without bound (16,771,742 B on nyquist and
@@ -526,10 +559,13 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
     wm_dirty = False
     status_block = status_audit(st)
 
-    for name in SCENE_FILES:
-        # scene-prev.csv is the rolled predecessor and does not grow, so it is fetched whole --
-        # once. The live file is tailed.
-        tail = SCENE_TAIL_BYTES if name == "scene.csv" else None
+    scene_fetch, scene_live = scene_names(sizes)
+    out["scene_files"] = list(scene_fetch)
+    out["scene_live"] = scene_live
+    for name in scene_fetch:
+        # A rolled file does not grow, so it is fetched whole -- once, and the content-addressed
+        # ingest makes the repeat free. Only the live file is tailed.
+        tail = SCENE_TAIL_BYTES if name == scene_live else None
         try:
             body = fetch_sd(ip, name, timeout, tail=tail)
         except Exception as e:
