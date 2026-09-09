@@ -563,9 +563,29 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
     out["scene_files"] = list(scene_fetch)
     out["scene_live"] = scene_live
     for name in scene_fetch:
-        # A rolled file does not grow, so it is fetched whole -- once, and the content-addressed
-        # ingest makes the repeat free. Only the live file is tailed.
+        # A rolled file does not grow, so it is fetched whole. Only the live file is tailed.
         tail = SCENE_TAIL_BYTES if name == scene_live else None
+        # ⚠️WHOLE MEANS WHOLE, AND THE REPEAT IS NOT FREE. The content-addressed ingest makes a
+        # refetch free in STORAGE; it costs the full transfer every run. Once the nodes started
+        # writing scene-YYYYMMDD.csv the legacy scene.csv became a ROLLED file -- 16.7 MB on
+        # nyquist, 2-7 min at the measured 40-135 KB/s -- so discovery alone would have pulled it
+        # whole every 15 minutes and spent most of the interval making the node deaf. It is
+        # fetched once and then skipped while /ls reports the size it had when it last INGESTED.
+        # No size (/ls failed, or first sighting) means fetch: a blind run must fetch, not guess.
+        #
+        # ⚠️ONLY A WHOLE-FILE MARK LICENSES A SKIP. Yesterday's dated file was the LIVE file and
+        # was TAILED, so its mark is a size whose earlier bytes this drain never pulled. Skipping
+        # on that mark would strand everything before the last SCENE_TAIL_BYTES permanently, the
+        # moment the date rolled. A mark only permits a skip if it was written by a fetch that
+        # reached byte 0.
+        if not tail:
+            mark = node_wm.get(name) or {}
+            seen = mark.get("size") if mark.get("whole_file") else None
+            size_now = sizes.get(name) if sizes is not None else None
+            if seen is not None and size_now is not None and int(seen) == int(size_now):
+                out["files"].append({"name": name, "bytes": 0, "skipped_unchanged": True,
+                                     "size": int(size_now), "scene": True})
+                continue
         try:
             body = fetch_sd(ip, name, timeout, tail=tail)
         except Exception as e:
@@ -620,6 +640,15 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
                 node_wm[name] = {"size": int(gap["size_now"]), "at": stamp,
                                  "mean_row_bytes": gap.get("mean_row_bytes")}
                 wm_dirty = True
+        else:
+            # ⚠️BOOKED AFTER THE INGEST, for the same reason the tailed mark is: rows fetched but
+            # not stored must be fetched again. A whole-file mark is the size the file had when
+            # its rows landed, so a file that grows again is refetched rather than skipped.
+            whole_size = sizes.get(name) if sizes is not None else None
+            if whole_size is None:
+                whole_size = len(body)
+            node_wm[name] = {"size": int(whole_size), "at": stamp, "whole_file": True}
+            wm_dirty = True
         out["scene_added"] = out.get("scene_added", 0) + entry["added"]
         out["files"].append({"name": name, "bytes": len(body), "ingested": True,
                              "scene": True, "archived": path, "gap": gap,
