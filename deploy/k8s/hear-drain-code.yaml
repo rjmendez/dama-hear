@@ -6,7 +6,7 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: '43b439d-dirty'
+    dama-hear/commit: '5de215b'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
 data:
   hear__init__.py: |
