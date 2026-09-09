@@ -1,0 +1,190 @@
+---
+# ⚠️NO PersistentVolumeClaim HERE. `hear-pool` is declared once, in deploy/k8s/hear-drain.yaml,
+# and re-declaring it in a second file is how two manifests come to disagree about a storage
+# request. This bundle MOUNTS it and owns nothing but its own two CronJobs and its own ConfigMap.
+#
+# ⚠️APPLY ONLY THESE TWO FILES:
+#     python3 deploy/k8s/gen_configmap.py hear-score-code > deploy/k8s/hear-score-code.yaml
+#     kubectl apply -f deploy/k8s/hear-score-code.yaml -f deploy/k8s/hear-score.yaml
+# NEVER `kubectl apply -f deploy/k8s/`. A ConfigMap and a CronJob are both written WHOLE, so a
+# directory apply would also push whatever state deploy/k8s/hear-drain.yaml is in on this branch
+# over the live drain -- which has already been caught carrying an argument the checked-in file
+# lacks. Naming the two files is the whole protection.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-score
+  namespace: dama
+  labels:
+    app: hear-score
+  annotations:
+    dama-hear/what: >-
+      Scores the pooled sketches on the hear-pool PVC with the shipped 15-band fleet model and
+      counts, by reason and by node and by day partition, everything the model refused. Writes
+      /pool/corpus/scores/<day>/<source>.jsonl and a heartbeat for hear-score-check.
+    dama-hear/what-p-is-not: >-
+      P is NOT a probability that a gunshot occurred, is NOT calibrated to any field base rate,
+      is NOT comparable between two nodes (28.4 dB of measured inter-node level offset = 16.9
+      logits against a 7.37 dB p0.1-p0.9 range), and a low P is NOT evidence of absence. Every
+      emitted row carries those as booleans; scores/model_card.json carries the reasoning.
+spec:
+  # ⚠️A CronJob, NOT A DEPLOYMENT, AND NOT AN MQTT CONSUMER. Three measurements, not a preference:
+  # (a) nothing publishes dama/+/acoustic_sketch today -- dama-sketch-corpus is connected and
+  # subscribed and its corpus is empty, because the phone port is not in a release and the hugbot
+  # emitter is an unmerged PR -- so a live-topic consumer starves on day one while the pool has
+  # 1690 records and grows at 62.8/h; (b) the work is 177 us/frame, about 11 ms of CPU per hour,
+  # which does not justify a resident pod; (c) the node has been observed at 124 pods against an
+  # allocatable 110, admitting hear-drain only after a `Too many pods` FailedScheduling -- an
+  # always-on replica would hold a slot permanently and compete with the drain that feeds it.
+  #
+  # ⚠️THE :07 OFFSET IS FOR LOG READABILITY, NOT FOR ORDERING. Live hear-drain job durations have
+  # been measured from 3m58s to 67m against a 15-minute schedule, so no fixed offset can be
+  # "after the drain's write". Overlapping a drain is safe for a different reason: the record
+  # store is append-only and content-addressed, so a scorer that overlaps one can only MISS rows
+  # it picks up on the next pass, and the resume is a key set rather than a watermark.
+  schedule: "7,22,37,52 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: hear-score
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: score
+              image: python:3.13-slim
+              command: ["/bin/sh", "-lc"]
+              args:
+                - |
+                  set -e
+                  # ⚠️THE GUARD ASSERTS THE VERSION, NOT THE DIRECTORY. /pool/pylib is shared
+                  # with hear-drain, which pins the same numpy; a guard that only tests whether
+                  # the package DIRECTORY exists means whichever workload reaches an empty PVC
+                  # first decides the version and the other silently uses whatever it finds, so
+                  # both pins read as discipline while enforcing nothing. This one reinstalls on
+                  # a mismatch, and the resolved version is printed into the run log either way.
+                  # (The test asserting this is in tests/test_hear_score.py and scans these args,
+                  # so this comment deliberately does not spell the rejected form out.)
+                  LIB=/pool/pylib
+                  export PYTHONPATH="$LIB:/app"
+                  if ! python -c 'import numpy,sys; sys.exit(0 if numpy.__version__=="2.2.6" else 1)' 2>/dev/null; then
+                    echo "installing numpy==2.2.6 into $LIB"
+                    pip install --no-cache-dir --upgrade --target "$LIB" 'numpy==2.2.6' >/dev/null 2>&1
+                  fi
+                  python -c 'import numpy; print("numpy", numpy.__version__)'
+                  exec python /app/tools/hear_score.py \
+                    --pool /pool/corpus \
+                    --model /app/modules/supersonic/model_sketch_15.json
+              volumeMounts:
+                # ⚠️THE MODEL IS A SIBLING OF classify.py AND HAS TO BE. classify.py resolves
+                # FLEET_SKETCH_MODEL against its own __file__, so a model mounted anywhere else
+                # leaves that default pointing at nothing. --model above passes the same path
+                # explicitly so the dependency is visible in the args, not only in the layout.
+                - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/sketch.py,   subPath: hear_sketch.py }
+                - { name: code, mountPath: /app/modules/supersonic/classify.py, subPath: modules_supersonic_classify.py }
+                - { name: code, mountPath: /app/modules/supersonic/model.json, subPath: modules_supersonic_model.json }
+                - { name: code, mountPath: /app/modules/supersonic/model_sketch.json, subPath: modules_supersonic_model_sketch.json }
+                - { name: code, mountPath: /app/modules/supersonic/model_sketch_15.json, subPath: modules_supersonic_model_sketch_15.json }
+                - { name: code, mountPath: /app/tools/hear_score.py, subPath: tools_hear_score.py }
+                - { name: pool, mountPath: /pool }
+              resources:
+                # At the namespace LimitRange's per-Container minimum (cpu 100m, memory 128Mi).
+                # Anything lower is refused at POD creation, which a server dry-run does not show.
+                requests: { cpu: 100m, memory: 128Mi }
+                limits:   { cpu: "1",  memory: 512Mi }
+          volumes:
+            - name: code
+              configMap:
+                name: hear-score-code
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool
+---
+# ⚠️THE SCORER'S OWN EXIT STATUS IS NOT A HEALTH SIGNAL, FOR THE SAME REASON THE DRAIN'S IS NOT.
+# It exits 0 on a run that refused every frame it read -- correctly, because a refused frame is
+# data it read and honestly declined to score, and a legacy-firmware corpus must not look like a
+# broken scorer forever. It also exits 0 on a run that read an EMPTY directory. This job is what
+# a monitor keys on.
+#
+# ⚠️IT MUST NOT KEY ON THE SCORES. A normal night is P at the floor everywhere: one measured
+# population scored 437 of 437 non-zero with exactly 1 above 0.5, another had a maximum of 1.2e-5
+# across 83 rows. A gate asking "did anything score high" fires on a correct result and stays
+# silent on a broken one. The gates are throughput, refusals, torn lines, the accounting
+# invariant, and staleness. The class distribution is printed under `OBSERVATION, not a gate`.
+#
+# ⚠️AN EMPTY READ IS A FAILURE, NOT A PASS. Point --pool at /pool instead of /pool/corpus and
+# every growth-conditioned gate passes vacuously: 0 records, 0 refusals, 0 == 0 accounting. The
+# check therefore fails outright on records_seen == 0 and on a stale heartbeat, independently of
+# what the pool looks like -- the same shape as hear_drain.check()'s `if not sensors: return 1`.
+#
+# ⚠️THIS JOB RUNS ONE QUARTER AS OFTEN AS THE SCORER ABOVE (`7,22,37,52 * * * *` vs `27 * * * *`),
+# so four scoring runs land between two checks and a per-run heartbeat field would be three runs
+# stale before the gate read it. The heartbeat keeps a ring and --window-s says how much of it to
+# sum. 7200 s is two check periods, so one missed check still reports what happened. It is passed
+# explicitly BECAUSE it is coupled to these two schedules: change either cron and move this.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-score-check
+  namespace: dama
+  labels:
+    app: hear-score
+spec:
+  schedule: "27 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: hear-score
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: check
+              image: python:3.13-slim
+              command: ["/bin/sh", "-lc"]
+              args:
+                # ⚠️`set +e`, NOT `set -e`. GitHub-Actions-style runners have been seen delivering
+                # -e on the command line where the script cannot clear it; capturing rc explicitly
+                # is what makes the gate's exit status the job's exit status. The census after it
+                # is `|| true` so a summary failure can never mask, or manufacture, a gate result.
+                - |
+                  set +e
+                  export PYTHONPATH=/pool/pylib:/app
+                  python /app/tools/hear_score.py --pool /pool/corpus --check \
+                    --window-s 7200 --max-stale-s 7200
+                  rc=$?
+                  echo "--- census (read-only, writes nothing) ---"
+                  python /app/tools/hear_score.py --pool /pool/corpus --census \
+                    --model /app/modules/supersonic/model_sketch_15.json || true
+                  exit "$rc"
+              volumeMounts:
+                - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/sketch.py,   subPath: hear_sketch.py }
+                - { name: code, mountPath: /app/modules/supersonic/classify.py, subPath: modules_supersonic_classify.py }
+                - { name: code, mountPath: /app/modules/supersonic/model.json, subPath: modules_supersonic_model.json }
+                - { name: code, mountPath: /app/modules/supersonic/model_sketch.json, subPath: modules_supersonic_model_sketch.json }
+                - { name: code, mountPath: /app/modules/supersonic/model_sketch_15.json, subPath: modules_supersonic_model_sketch_15.json }
+                - { name: code, mountPath: /app/tools/hear_score.py, subPath: tools_hear_score.py }
+                - { name: pool, mountPath: /pool }
+              resources:
+                requests: { cpu: 100m, memory: 128Mi }
+                limits:   { cpu: "1",  memory: 512Mi }
+          volumes:
+            - name: code
+              configMap:
+                name: hear-score-code
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool
