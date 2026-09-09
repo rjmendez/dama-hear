@@ -606,6 +606,8 @@ static double  g_sync_bound_s = -1;   // rtt/2 of the exchange the clock was las
 static uint32_t g_sync_at_ms  = 0;
 static double  g_sync_off_s   = 0;
 static int     g_sync_count   = 0;
+static double  g_rtc_set_epoch = 0;    // the second the RTC was set TO
+static int32_t g_rtc_set_resid_us = 0; // how late the write landed past that second boundary
 
 static String i2c_sweep() {
   String o = "I2C sweep over the 11 externally-pulled-up pins (both orders; SDA/SCL is not symmetric)\n"
@@ -791,7 +793,25 @@ static void routes() {
     double now = tv.tv_sec + tv.tv_usec / 1e6 + r.offset_s;
     tv.tv_sec = (time_t)now; tv.tv_usec = (suseconds_t)((now - tv.tv_sec) * 1e6);
     settimeofday(&tv, nullptr);
-    bool rtc_ok = ds3231_write_time(47, 48, (time_t)now);
+    // ⚠️SET THE RTC ON THE SECOND BOUNDARY, NOT WHENEVER THE SYNC FINISHED. Writing
+    // (time_t)now truncates, so the RTC's own second boundary landed wherever the I2C write
+    // happened to fall -- up to 500 ms off -- and nothing recorded WHERE. Measured 2026-09-09
+    // after a 3.98 h holdover: the RTC read 406 ms slow, which decomposes into set-error plus
+    // drift in unknown proportion, so it bounds the rate error at +28 +/- 35 ppm and measures
+    // nothing. A bound that wide is not a calibration.
+    //
+    // The DS3231 restarts its divider chain when the seconds register is written, so the write
+    // instant IS the new second boundary. Busy-wait to just before the next true second, write
+    // there, and the phase error collapses to the I2C write latency. rtc_set_resid_us records
+    // what was left, so the next holdover measurement can subtract it instead of guessing.
+    double frac = now - floor(now);
+    uint32_t wait_us = (uint32_t)((1.0 - frac) * 1e6);
+    if (wait_us > 1000000) wait_us = 0;
+    uint64_t w0 = (uint64_t)esp_timer_get_time();
+    while ((uint64_t)esp_timer_get_time() - w0 < wait_us) { }
+    bool rtc_ok = ds3231_write_time(47, 48, (time_t)ceil(now));
+    g_rtc_set_epoch = ceil(now);
+    g_rtc_set_resid_us = (int32_t)(((uint64_t)esp_timer_get_time() - w0) - wait_us);
     g_sync_bound_s = r.rtt_best / 2.0; g_sync_at_ms = millis();
     g_sync_off_s = r.offset_s; g_sync_count++;
     char b[520];
@@ -801,12 +821,13 @@ static void routes() {
       "  samples  %d of %d answered, rtt best %.3f ms, min %.3f, max %.3f (spread %.3f)\n"
       "  applied  offset %+.3f ms\n"
       "  BOUND    +/- %.3f ms  = +/- %.3f m of sound  <- rtt/2, the asymmetry bound\n"
-      "  rtc      %s\n",
+      "  rtc      %s, set on the second boundary %+d us late\n",
       host.c_str(), r.stratum, r.refid, r.root_dist_s * 1000,
       r.n, NTP_SAMPLES, r.rtt_best * 1000, r.rtt_min * 1000, r.rtt_max * 1000,
       (r.rtt_max - r.rtt_min) * 1000, r.offset_s * 1000,
       r.rtt_best / 2 * 1000, r.rtt_best / 2 * 343.0,
-      rtc_ok ? "set from this sync, OSF cleared" : "WRITE FAILED -- holdover is not armed");
+      rtc_ok ? "set from this sync, OSF cleared" : "WRITE FAILED -- holdover is not armed",
+      (int)g_rtc_set_resid_us);
     http.send(200, "text/plain", b);
   });
 
@@ -835,6 +856,15 @@ static void routes() {
       g_sync_at_ms ? "" : "Until then this node cannot state a timestamp uncertainty and must not\n",
       g_sync_at_ms ? "" : "be admitted as a TDoA arrival at any tier.\n");
     String o = b;
+    if (have_rtc && g_rtc_set_epoch > 0) {
+      char e[300];
+      double held = rtcu - g_rtc_set_epoch;
+      snprintf(e, sizeof e,
+        "holdover it set the rtc to %.0f, %+d us late; %.0f s of rtc time since\n"
+        "         (rate error needs a SECOND sync to compute: this only says where it started)\n",
+        g_rtc_set_epoch, (int)g_rtc_set_resid_us, held);
+      o += e;
+    }
     if (g_sync_at_ms) {
       char c[420];
       snprintf(c, sizeof c,
