@@ -75,7 +75,11 @@ def main(argv):
 
     # 3. build
     print("flash: building %s for %s" % (node, target))
+    # --libraries: the shared platform code lives in firmware/lib/hear_platform and arduino-cli
+    # will not find it otherwise. Without this the build fails on the first symbol that moved,
+    # which is a confusing way to learn that a library exists.
     r = subprocess.run(["arduino-cli", "compile", "--fqbn", FQBN,
+                        "--libraries", os.path.join(REPO, "firmware", "lib"),
                         "--output-dir", outdir, SKETCH], cwd=REPO)
     if r.returncode:
         die("compile failed")
