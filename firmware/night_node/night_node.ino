@@ -1312,7 +1312,13 @@ static void scene_emit() {
   {
     static char cur_day[12] = "";
     char day[12]; utc_yyyymmdd(utc, day, sizeof day);
-    if (strcmp(day, cur_day) != 0) {
+    // REOPEN ON A DEAD HANDLE, not only on a date change. Keying solely on the date meant that
+    // anything which destroyed the file underneath us -- /format, a prune, a card swap -- left
+    // cur_day still matching, so the rotation said "same day, nothing to do" and the early return
+    // below dropped every row. Measured on rankine right after a format: 614 rows computed, 0
+    // written, scene_write_fail 0. Silent, permanent, and invisible in the counters, which is the
+    // worst combination for the file this project exists to produce.
+    if (strcmp(day, cur_day) != 0 || !scenef) {
       if (scenef) { scenef.close(); }
       snprintf(cur_day, sizeof cur_day, "%s", day);
       char path[36], prev[40];
@@ -1324,7 +1330,10 @@ static void scene_emit() {
       scenef = csv_open(path, prev, SCENE_HDR);
       logf("sd    scene -> %s\n", path);
     }
-    if (!scenef) return;
+    // Still nothing after trying to open: count it. An unwritable card is a real condition and it
+    // must show up in scene_write_fail like every other one, rather than as rows that quietly
+    // never existed.
+    if (!scenef) { scene_write_fail++; return; }
   }
   char line[MELS_BANDS * SCENE_SLICES * 2 + 192];
   int m = snprintf(line, sizeof line, "%s,%lld,%lu,%lu,%d,%d,%d,%d,%d,%lu,",

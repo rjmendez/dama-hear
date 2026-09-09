@@ -58,7 +58,8 @@ spec:
                   exec python /app/tools/hear_drain.py \
                     --pool /pool/corpus \
                     --node nyquist=172.16.100.105 \
-                    --node mach=172.16.100.116
+                    --node mach=172.16.100.116 \
+                    --node rankine=172.16.100.50
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py,  subPath: hear__init__.py }
                 - { name: code, mountPath: /app/hear/sketch.py,    subPath: hear_sketch.py }
