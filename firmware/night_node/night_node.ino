@@ -134,10 +134,16 @@ static volatile uint32_t g_samples = 0;      // updated by the audio loop, read 
 // which is the number that says whether the audio record has holes in it.
 // Touched only from loop() (the web handlers run there too), so no volatile and no races.
 static const char HEALTH_HDR[] =
-  "node,utc_us,time_valid,uptime_s,fix,sats,tacc_ns,pps,pps_bad,spread_us,esp_ppm,samples,fs_cum_hz,"
+  // fs_ok_hz, not fs_cum_hz: the column used to be every sample over every second, which one
+  // stall poisons for the rest of a run, and it is now the rate over the seconds the node
+  // certified as neither short nor long (clean_s is its support). RENAMED deliberately -- a
+  // header change is what rolls the file aside, and a column that silently changes meaning makes
+  // every earlier row in it ambiguous. esp_ppm changed the same way: it now averages only
+  // intervals that were really one second instead of dividing the whole span by the edge count.
+  "node,utc_us,time_valid,uptime_s,fix,sats,tacc_ns,pps,pps_bad,spread_us,esp_ppm,samples,fs_ok_hz,"
   "fs_clean_hz,fs_win_s,drop_s,drop_samples,samp_last_s,det_n,det_written,det_lost,ambient,"
   "env_peak_win,heap,gate_armed,gate_thr,gate_e_max,gate_forced,sig_dc,sd_free_mb,write_fail,"
-  "temp_c,press_hpa,c_mps,"
+  "temp_c,press_hpa,c_mps,rh_pct,"
   // gate_floor, because gate_thr only pins the floor down where the floor is the binding limb.
   // The clip counters, because a card that filled and a night that went quiet must not look the
   // same in the record -- clip_written advances only on a clip that landed, clip_skip_budget only
@@ -148,13 +154,72 @@ static const char HEALTH_HDR[] =
   // 3D fixes, which is the number to use as a TDoA focus. hacc_m is the receiver's own estimate
   // for the last epoch -- it does NOT shrink as the mean improves, so do not read it as the
   // accuracy of the mean; pos_n is what says how good the mean is.
-  "lat,lon,hell_m,hmsl_m,hacc_m,vacc_m,pos_n,mean_lat,mean_lon,mean_hell_m,mean_hmsl_m";
+  "lat,lon,hell_m,hmsl_m,hacc_m,vacc_m,pos_n,mean_lat,mean_lon,mean_hell_m,mean_hmsl_m,"
+  // APPENDED, never inserted: a reader that keys on names keeps working and one that counts
+  // columns fails loudly at the end rather than silently in the middle.
+  // clean_s     the seconds fs_ok_hz averaged over -- a rate without its support is not a figure
+  // fs_used_hz  what this row's timestamps were actually converted with (see fs_timebase)
+  // fs_step_ppm the quantisation step of fs_clean_hz, 16000/fs_win_s ppm. A row whose step is
+  //             coarser than the tolerance you need must not have its fs_clean_hz used at all.
+  // over_s      seconds that delivered too MANY samples: catch-up after a stall, or a missed edge
+  // pps_gaps    intervals that were not one second, i.e. edges the node never saw
+  "clean_s,fs_used_hz,fs_step_ppm,over_s,pps_gaps";
 static double   fs_clean      = (double)FS_NOMINAL;
 static uint32_t fs_clean_secs = 0;    // length of the current unbroken window, in GPS seconds
-static uint32_t drop_seconds  = 0;    // seconds that came up short by a block or more
+// The window behind the value fs_clean currently HOLDS, which is not fs_clean_secs: that one is
+// the live window and goes to 0 the moment a second is refused, while the value it last produced
+// stays in use. Every consumer that needs to know how well fs_clean is supported needs THIS one.
+static uint32_t fs_clean_win_s = 0;
+static uint32_t drop_seconds  = 0;    // seconds not delivered, charged for the WHOLE straddle
 static uint32_t drop_samples  = 0;    // estimated samples lost, cumulative
+static uint32_t over_seconds  = 0;    // seconds that delivered too MUCH: a catch-up burst after a
+                                      // stall, or an edge that went missing so one interval is
+                                      // really two. Excluded from every rate, counted here.
+static uint32_t clean_seconds = 0;    // GPS seconds certified neither short nor long
+static uint64_t clean_samples = 0;    // samples delivered during exactly those seconds
+static uint32_t esp_iv_n      = 0;    // one-second PPS intervals that were really one second
+static uint64_t esp_iv_sum_us = 0;    // their total, for the crystal figure
+static uint32_t pps_gaps      = 0;    // intervals that were NOT one second: an edge went missing
 static uint32_t samp_sec_last = 0;    // samples acquired during the most recent GPS second
 static float    env_peak_win  = 0.0f; // peak since the last health row, not since boot
+
+// ---- the slope that converts samples to time, and when it may be used -------
+// ⚠️fs_clean IS A THROUGHPUT ESTIMATE, NOT A CLOCK MEASUREMENT. Its numerator advances only in
+// whole BLOCK-sample I2S reads, so every value it can take is exactly (k * BLOCK) / win_s -- 12
+// readings from three independent sources were checked and all 12 are exact, among them
+// 16006.0952 = 336128/21 and 16000.8223 = 29189*256/467. Its resolution is BLOCK/win_s Hz, which
+// is 16000/win_s ppm: 2000 ppm at the 8 s minimum window, 1143 ppm at 14 s. A 1118 ppm gap
+// measured BETWEEN the two nodes is therefore smaller than one quantisation step of the coarser
+// of the two readings, and over one hour both nodes' values moved about 1000 ppm at constant
+// temperature. Crystals do not do that; estimators with a coarse step do.
+//
+// This value is the slope the raw ring interpolates on (sample_to_utc / utc_to_sample), the WAV
+// header rate for clips, and X-Audio-Fs-Hz. Marks sit ~1 s apart, so a slope wrong by X ppm is
+// X us of error by the far end of a mark gap, against the t_sigma_s = 100 us this node class
+// claims in hear/nodeclass.py. That is what sets the minimum window below:
+//
+//     BLOCK / win_s <= 100 ppm of FS_NOMINAL   ->   win_s >= BLOCK * 1e6 / (100 * FS_NOMINAL)
+//                                              ->   win_s >= 160 s
+//
+// Under that, the nominal rate is used instead. Nominal is WRONG BY THE SAME AMOUNT ON EVERY
+// NODE, so it cancels in a TDoA; an under-supported fs_clean does not, because two nodes land on
+// different wrong values. Measured cost of getting this wrong: a full 30 s /audio window pulled
+// from both nodes at their live fs_clean readings differs between them by 33-41 ms = 11-14 m.
+#define FS_TIMEBASE_MIN_WIN_S 160
+
+// The estimator's own resolution, in ppm, for the value fs_clean currently holds. 0 = no value
+// has been accepted yet. A reader must refuse a figure whose step is coarser than the tolerance
+// it needs -- printing 4 decimal places does not make 14 s of window state a rate to 0.1 Hz.
+static double fs_step_ppm() {
+  if (!fs_clean_win_s) return 0.0;
+  return (double)BLOCK / (double)fs_clean_win_s / (double)FS_NOMINAL * 1e6;
+}
+
+// The one slope any sample<->time conversion may use.
+static double fs_timebase() {
+  if (fs_clean_win_s >= FS_TIMEBASE_MIN_WIN_S && fs_clean > 1000.0) return fs_clean;
+  return (double)FS_NOMINAL;
+}
 
 // ---- the anchor: local microseconds <-> UTC ---------------------------------
 // A PPS edge IS a top-of-second. Latch the local clock at the edge, then learn which second it was
@@ -317,6 +382,21 @@ static uint16_t bmp_P1; static int16_t bmp_P2, bmp_P3, bmp_P4, bmp_P5, bmp_P6, b
 static float bmp_temp_c = NAN, bmp_press_hpa = NAN;
 static uint32_t bmp_reads = 0, bmp_fail = 0;
 
+// ⚠️HUMIDITY EXISTS ON ONE OF THESE BOARDS AND WAS NEVER READ. The note above says the fitted part
+// reports chip id 0x58 -- BMP280 silicon, no humidity -- which is true of nyquist and rankine.
+// mach reports 0x60, REAL BME280, and its humidity registers were ignored while /status published
+// only temperature and pressure. That is the measurement that separates a wet-weather source from
+// an instrument noise floor, and mach is the node carrying an unexplained flat +15.5 dB floor, so
+// it is the node that most needed it.
+//
+// 0x61 (BME680) is deliberately EXCLUDED. It has humidity too, on a different register map with a
+// different compensation, and assuming they match is how a plausible wrong number ships.
+static bool    bme_has_rh = false;
+static uint8_t bme_H1 = 0, bme_H3 = 0;
+static int16_t bme_H2 = 0, bme_H4 = 0, bme_H5 = 0;
+static int8_t  bme_H6 = 0;
+static float   bmp_rh_pct = NAN;
+
 static bool bmp_block(uint8_t reg, uint8_t *buf, uint8_t n) {
   Wire.beginTransmission(bmp_addr); Wire.write(reg);
   if (Wire.endTransmission(false) != 0) return false;
@@ -346,7 +426,24 @@ static bool bmp_begin() {
     // A dig_T1 of 0 or 0xFFFF means the calibration block did not really read: the compensation
     // would then return a confident wrong temperature rather than failing, which is worse.
     if (bmp_T1 == 0 || bmp_T1 == 0xFFFF) continue;
+    bme_has_rh = false; bmp_rh_pct = NAN;
+    if (id == 0x60) {                        // BME280 only -- see the note by bme_has_rh
+      uint8_t h1, h[7];
+      if (i2c_reg(a, 0xA1, &h1) && bmp_block(0xE1, h, 7)) {
+        bme_H1 = h1;
+        bme_H2 = (int16_t)(h[1] << 8 | h[0]);
+        bme_H3 = h[2];
+        bme_H4 = (int16_t)(((int8_t)h[3] << 4) | (h[4] & 0x0F));
+        bme_H5 = (int16_t)(((int8_t)h[5] << 4) | (h[4] >> 4));
+        bme_H6 = (int8_t)h[6];
+        bme_has_rh = true;
+      }
+    }
     bmp_w8(0xF5, 0xA0);                  // t_sb 1000 ms, filter off -- this is a slow variable
+    // ⚠️ctrl_hum (0xF2) IS LATCHED BY THE NEXT WRITE TO ctrl_meas (0xF4), NOT ON ITS OWN. Written
+    // after 0xF4 it is silently ignored and every humidity reading comes back skipped. This
+    // ordering is the whole trap in the BME280 datasheet, so the two writes stay adjacent.
+    if (bme_has_rh) bmp_w8(0xF2, 2);     // osrs_h x2
     bmp_w8(0xF4, (2 << 5) | (2 << 2) | 3);   // osrs_t x2, osrs_p x2, NORMAL mode (free-running)
     logf("bmp   0x%02X chip 0x%02X, dig_T1=%u -- temperature live\n", a, id, bmp_T1);
     return true;
@@ -381,6 +478,30 @@ static void bmp_read() {
   p2 = (((int64_t)bmp_P8) * p) >> 19;
   p = ((p + p1 + p2) >> 8) + (((int64_t)bmp_P7) << 4);
   bmp_press_hpa = (float)p / 25600.0f;                                // Q24.8 Pa -> hPa
+
+  // Humidity, datasheet integer path. It needs t_fine, which is why it lives here rather than in
+  // its own function. 0x8000 is the skipped-measurement value: report NAN, because a confident
+  // 0 %RH reads as desert air rather than as a sensor that did not answer.
+  if (bme_has_rh) {
+    uint8_t hb[2];
+    if (!bmp_block(0xFD, hb, 2)) bmp_rh_pct = NAN;
+    else {
+      int32_t adc_H = ((int32_t)hb[0] << 8) | hb[1];
+      if (adc_H == 0x8000) bmp_rh_pct = NAN;
+      else {
+        int32_t v = t_fine - (int32_t)76800;
+        v = (((((adc_H << 14) - (((int32_t)bme_H4) << 20) - (((int32_t)bme_H5) * v)) +
+              ((int32_t)16384)) >> 15) *
+             (((((((v * ((int32_t)bme_H6)) >> 10) *
+                  (((v * ((int32_t)bme_H3)) >> 11) + ((int32_t)32768))) >> 10) +
+                ((int32_t)2097152)) * ((int32_t)bme_H2) + 8192) >> 14));
+        v = v - (((((v >> 15) * (v >> 15)) >> 7) * ((int32_t)bme_H1)) >> 4);
+        if (v < 0) v = 0;
+        if (v > 419430400) v = 419430400;
+        bmp_rh_pct = (float)(v >> 12) / 1024.0f;                      // Q22.10 -> %RH
+      }
+    }
+  }
   bmp_reads++;
 }
 
@@ -1019,12 +1140,20 @@ static bool local_to_utc(uint64_t local_us, int64_t *utc_us) {
   return true;
 }
 
+// ⚠️THIS USED TO DIVIDE THE WHOLE FIRST-TO-LAST SPAN BY pps_count-1, which counts EDGES SEEN and
+// not seconds ELAPSED. A missed edge or a probe resync leaves the span intact and the divisor
+// short, so the quotient is not a crystal error at all: mach read a median 3206 ppm and a maximum
+// 37,988 ppm that way, while nyquist -- which had never resynced -- read a sane 9.5-12.2 ppm. A
+// node that reports a fictional crystal is worse than one that reports nothing, because the
+// figure is the only check the node has on its own timebase.
+//
+// Now it averages only intervals that were really one second, accumulated in loop() where the
+// (edge, timestamp) pair can be validated. Anything else is counted as pps_gaps and dropped.
 static double esp_clock_ppm(uint32_t *secs_out) {
-  if (pps_count < 3) return 0.0;
-  uint32_t n = pps_count - 1;                       // intervals between first and last edge
-  double us = (double)(pps_us_last - pps_us_first);
+  uint32_t n = esp_iv_n;
   if (secs_out) *secs_out = n;
-  return (us / (double)n / 1e6 - 1.0) * 1e6;
+  if (n < 2) return 0.0;
+  return ((double)esp_iv_sum_us / (double)n / 1e6 - 1.0) * 1e6;
 }
 
 // ---------------------------------------------------------------- raw ring (PSRAM)
@@ -1080,7 +1209,7 @@ static bool sample_to_utc(uint32_t s, int64_t *utc) {
     if ((int32_t)(m->sample - s) > 0) break;
     best = m;
   }
-  double fsu = fs_clean > 1000.0 ? fs_clean : (double)FS_NOMINAL;
+  double fsu = fs_timebase();
   *utc = best->utc_us + (int64_t)llrint((double)(int32_t)(s - best->sample) * 1e6 / fsu);
   return true;
 }
@@ -1093,7 +1222,7 @@ static bool utc_to_sample(int64_t utc, uint32_t *s) {
     if (m->utc_us > utc) break;
     best = m;
   }
-  double fsu = fs_clean > 1000.0 ? fs_clean : (double)FS_NOMINAL;
+  double fsu = fs_timebase();
   int64_t v = (int64_t)best->sample + (int64_t)llrint((double)(utc - best->utc_us) * fsu / 1e6);
   if (v < 0) return false;
   *s = (uint32_t)v;
@@ -1526,7 +1655,7 @@ static void clip_pump() {
   // The rate field is an integer and cannot carry the measured 16000.169 Hz, exactly as
   // wav_header says. There are no HTTP headers on a file, so the exact rate travels in dets.csv's
   // fs_hz column instead -- per detection, which is where it belongs anyway.
-  double fsu = fs_clean > 1000.0 ? fs_clean : (double)FS_NOMINAL;
+  double fsu = fs_timebase();
   wav_header(hdr, CLIP_SAMPLES * 2, (uint32_t)lrint(fsu));
   if (f.write(hdr, sizeof hdr) != sizeof hdr) {
     f.close(); SD.remove(path); d.clip_st = CLIP_FAIL; clip_fail++; return;
@@ -1590,15 +1719,24 @@ static bool gate_floor_persist() {
   return true;
 }
 
+// The acquisition rate over the seconds this node CERTIFIED as neither short nor long. It used
+// to be cumulative samples over cumulative seconds, which one stall poisons for the rest of the
+// run: the two live nodes served 7984.6726 Hz (-500,958 ppm) and 15332.5601 Hz (-41,715 ppm)
+// through this field while acquiring ~16 kHz, and that number is the one their own web UI
+// headlines as "I2S measured" and watch.py announces on every 0.02 Hz move. A figure like that
+// cannot convert a sample offset into a time, and it was never a diagnostic nobody reads.
+//
+// The support is reported beside it (clean_s) because a rate without its window is not a
+// measurement. Still block-quantised, like everything else derived from an I2S read counter --
+// its step here is BLOCK/clean_seconds Hz, which is why it only appears after 8 clean seconds.
 static double measured_fs() {
-  if (pps_count < 3) return 0.0;
-  double secs = (double)(pps_us_last - pps_us_first) / 1e6;
-  if (secs < 1.0) return 0.0;
-  return (double)(pps_samp_last - pps_samp_first) / secs;
+  if (clean_seconds < 8) return 0.0;
+  return (double)clean_samples / (double)clean_seconds;
 }
 
 static String status_json() {
   double fs = measured_fs();
+  uint32_t esp_n = 0; double esp_ppm = esp_clock_ppm(&esp_n);
   int64_t utc_now = 0; uint64_t nowl = (uint64_t)esp_timer_get_time();
   bool tv = local_to_utc(nowl, &utc_now);
   uint64_t since_edge = pps_count ? (nowl - edge_local_us) : 0;
@@ -1610,14 +1748,21 @@ static String status_json() {
   // static, not a stack frame: this grew from 2048 with the gate-floor and clips objects, and the
   // Arduino loop task has 8 kB of stack that the WebServer is already using. Only ever called
   // from the loop task (h_status), so there is no second caller to race it.
-  static char b[3072];
+  // SIZED FROM THE FORMAT, not from a sample. snprintf truncates silently, and a truncated
+  // /status is not a short answer -- it is invalid JSON, which every consumer reads as an
+  // unreachable node. tests/test_firmware_csv_schema.py bounds it: the literal text plus every
+  // conversion at the widest value it can carry (a %s at i2c_found's 256, a %.Nf at 24) is 5463
+  // bytes, so 5632 cannot truncate. Live output measured 2113 chars, which is exactly the sample
+  // a buffer must not be sized from -- the old 3072 was already inside the bound.
+  static char b[5632];
   // JSON has no NaN. A node that does not know its temperature emits null, which every parser
   // reads as absent -- printing nan would be invalid JSON, and a downstream coercion of it to 0.0
   // would look like a freezing night rather than a missing sensor.
-  char envs_t[16], envs_p[16], envs_c[16];
+  char envs_t[16], envs_p[16], envs_c[16], envs_h[16];
   #define ENVF(dst, v) do { if ((v) == (v)) snprintf(dst, sizeof dst, "%.2f", (double)(v)); \
                             else snprintf(dst, sizeof dst, "null"); } while (0)
   ENVF(envs_t, bmp_temp_c); ENVF(envs_p, bmp_press_hpa); ENVF(envs_c, sound_speed_mps());
+  ENVF(envs_h, bmp_rh_pct);   // null on a BMP280 node: absent, not zero
   char floor_saved[16];
   if (g_floor_saved == g_floor_saved) snprintf(floor_saved, sizeof floor_saved, "%.1f", g_floor_saved);
   else                                snprintf(floor_saved, sizeof floor_saved, "null");
@@ -1632,10 +1777,22 @@ static String status_json() {
     "\"pos\":{\"lat\":%.7f,\"lon\":%.7f,\"hell_m\":%.3f,\"hmsl_m\":%.3f,"
       "\"hacc_m\":%.2f,\"vacc_m\":%.2f,\"n\":%lu,"
       "\"mean_lat\":%.7f,\"mean_lon\":%.7f,\"mean_hell_m\":%.3f,\"mean_hmsl_m\":%.3f},"
-    "\"pps\":{\"edges\":%lu,\"glitches\":%lu,\"probe_resyncs\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,\"spread_us\":%ld},"
-    "\"i2s\":{\"nominal_hz\":%d,\"measured_hz\":%.4f,\"ppm\":%.1f,\"samples\":%lu},"
-    // measured_hz above is cumulative and stays poisoned by any stall. acq is the one to trust.
-    "\"acq\":{\"fs_clean_hz\":%.4f,\"win_s\":%lu,\"drop_s\":%lu,\"drop_samples\":%lu,\"last_s\":%lu},"
+    // gaps: intervals that were not one second, i.e. an edge that went missing. Reported beside
+    // the edge count because every "per second" figure derived from edges is short by each one.
+    "\"pps\":{\"edges\":%lu,\"glitches\":%lu,\"probe_resyncs\":%lu,\"gaps\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,\"spread_us\":%ld},"
+    // measured_hz is now the DROP-FREE cumulative rate and clean_s is its support; it used to be
+    // every sample over every second, which one stall poisons for the rest of the run.
+    "\"i2s\":{\"nominal_hz\":%d,\"measured_hz\":%.4f,\"ppm\":%.1f,\"clean_s\":%lu,\"samples\":%lu},"
+    // fs_clean_hz is BLOCK-QUANTISED: its step is fs_step_ppm, which is 16000/win_s ppm, so a
+    // 14 s window cannot state a rate to better than 1143 ppm no matter how it is printed. Refuse
+    // any value whose step is coarser than the tolerance you need. fs_used_hz is what this node
+    // actually converts samples to time with -- it falls back to the nominal rate until the
+    // window supports FS_TIMEBASE_MIN_WIN_S, because nominal is wrong identically on every node
+    // and cancels in a TDoA while an under-supported estimate does not.
+    "\"acq\":{\"fs_clean_hz\":%.4f,\"win_s\":%lu,\"fs_win_s\":%lu,\"fs_step_ppm\":%.1f,\"fs_used_hz\":%.4f,"
+      "\"drop_s\":%lu,\"drop_samples\":%lu,\"over_s\":%lu,\"last_s\":%lu},"
+    // ppm_vs_gps averages only intervals that were really one second. It used to divide the whole
+    // first-to-last span by the EDGE count, which reported 37,988 ppm on a node that had resynced.
     "\"esp_clock\":{\"ppm_vs_gps\":%.3f,\"pps_intervals\":%lu},"
     "\"time\":{\"valid\":%s,\"utc_us\":%lld,\"since_edge_us\":%llu,\"navpvt_nano\":%ld,\"label_rejects\":%lu},"
     "\"audio\":{\"enabled\":true,\"detections\":%lu,\"written\":%lu,\"lost\":%lu,"
@@ -1663,7 +1820,7 @@ static String status_json() {
     "\"skip_dedupe\":%lu,\"skip_ring\":%lu,"
     "\"nocard\":%lu,\"fail\":%lu,\"bytes_each\":%lu,\"budget_b\":%lu,\"budget_left_b\":%lu,"
     "\"budget_left_clips\":%lu,\"pre_s\":%.1f,\"post_s\":%.1f,\"dir\":\"%s\",\"boot\":\"%s\"},"
-    "\"env\":{\"temp_c\":%s,\"press_hpa\":%s,\"c_mps\":%s,\"reads\":%lu,\"fail\":%lu},"
+    "\"env\":{\"temp_c\":%s,\"press_hpa\":%s,\"c_mps\":%s,\"rh_pct\":%s,\"reads\":%lu,\"fail\":%lu},"
     "\"sd\":%s,\"sd_free_mb\":%lu,\"sd_total_mb\":%lu,\"i2c\":\"%s\"}",
     node_id, NODE_CLASS, FW_BUILD,
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
@@ -1680,12 +1837,15 @@ static String status_json() {
     pos_n ? pos_sum_lat  / pos_n * 1e-7   : 0.0, pos_n ? pos_sum_lon  / pos_n * 1e-7   : 0.0,
     pos_n ? pos_sum_hell / pos_n / 1000.0 : 0.0, pos_n ? pos_sum_hmsl / pos_n / 1000.0 : 0.0,
     (unsigned long)pps_count, (unsigned long)pps_glitch, (unsigned long)pps_resyncs,
+    (unsigned long)pps_gaps,
     (unsigned long)(pps_count > 1 ? pps_int_min : 0), (unsigned long)(pps_count > 1 ? pps_int_max : 0),
     (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0),
-    FS_NOMINAL, fs, fs > 0 ? (fs / FS_NOMINAL - 1.0) * 1e6 : 0.0, (unsigned long)g_samples,
-    fs_clean, (unsigned long)fs_clean_secs, (unsigned long)drop_seconds,
-    (unsigned long)drop_samples, (unsigned long)samp_sec_last,
-    esp_clock_ppm(NULL), (unsigned long)(pps_count > 1 ? pps_count - 1 : 0),
+    FS_NOMINAL, fs, fs > 0 ? (fs / FS_NOMINAL - 1.0) * 1e6 : 0.0, (unsigned long)clean_seconds,
+    (unsigned long)g_samples,
+    fs_clean, (unsigned long)fs_clean_secs, (unsigned long)fs_clean_win_s, fs_step_ppm(),
+    fs_timebase(), (unsigned long)drop_seconds,
+    (unsigned long)drop_samples, (unsigned long)over_seconds, (unsigned long)samp_sec_last,
+    esp_ppm, (unsigned long)esp_n,
     time_valid ? "true" : "false", (long long)utc_now, (unsigned long long)since_edge,
     (long)last_nano, (unsigned long)time_glitch,
     (unsigned long)det_n, (unsigned long)det_flushed, (unsigned long)det_lost,
@@ -1694,7 +1854,7 @@ static String status_json() {
     (unsigned long)gate_forced, sig_dc,
     g_floor, FLOOR_DEFAULT, FLOOR_MIN, FLOOR_MAX, g_floor_src, floor_saved,
     (unsigned long)det_write_fail,
-    praw_cap ? (double)praw_cap / (fs_clean > 1000.0 ? fs_clean : (double)FS_NOMINAL) : 0.0,
+    praw_cap ? (double)praw_cap / fs_timebase() : 0.0,
     (unsigned long)praw_cap, (unsigned long)r_held,
     praw_cap ? 100.0 * (double)r_held / (double)praw_cap : 0.0,
     (long long)r_from, (long long)r_to, (unsigned long)praw_mark_n,
@@ -1711,7 +1871,7 @@ static String status_json() {
     (unsigned long)(clip_budget_left / CLIP_BYTES),
     (double)CLIP_PRE_SAMPLES / FS_NOMINAL, (double)CLIP_POST_SAMPLES / FS_NOMINAL,
     CLIP_DIR, clip_boot,
-    envs_t, envs_p, envs_c, (unsigned long)bmp_reads, (unsigned long)bmp_fail,
+    envs_t, envs_p, envs_c, envs_h, (unsigned long)bmp_reads, (unsigned long)bmp_fail,
     sd_ok ? "true" : "false",
     (unsigned long)(sd_ok ? (SD.totalBytes() - SD.usedBytes()) / 1048576UL : 0UL),
     (unsigned long)(sd_ok ? SD.totalBytes() / 1048576UL : 0UL), i2c_found);
@@ -1727,12 +1887,20 @@ static void h_root() {
              "<h2>dama-hear night node</h2><table id=t></table>"
              "<p><a href='/detections'>detections</a> &middot; <a href='/status'>json</a></p>"
              "<script>async function u(){const s=await(await fetch('/status')).json();"
-             "const f=s.i2s.measured_hz?s.i2s.measured_hz.toFixed(4)+' Hz ('+s.i2s.ppm.toFixed(1)+' ppm)':'waiting for 3 PPS edges';"
+             // The rate and the window that supports it, together. A rate printed to four decimals with no
+             // window behind it is what let 7984.6726 Hz sit at the top of this page.
+             "const f=s.i2s.measured_hz?s.i2s.measured_hz.toFixed(4)+' Hz ('+s.i2s.ppm.toFixed(1)+' ppm) over '+s.i2s.clean_s+' clean s':'waiting for 8 clean GPS seconds';"
+             "const q=s.acq.fs_win_s?s.acq.fs_clean_hz.toFixed(4)+' Hz &plusmn;'+s.acq.fs_step_ppm.toFixed(0)+' ppm step over '+s.acq.fs_win_s+' s':'no window yet';"
+             // valid_nmea 0 is not a fault when the module is UBX-binary-only, which is the
+             // normal state of a receiver that came off a flight controller. Say so here rather
+             // than leave a zero that reads as a dead parser: nyquist serves fix 3 and a climbing
+             // ubx_pvt with 0 NMEA lines at every one of the 8 baud rates its boot sweep tried.
+             "const nm=s.gps.valid_nmea?s.gps.valid_nmea+' valid NMEA lines':(s.gps.ubx_pvt?'UBX-binary only (no NMEA, and none needed)':'no NMEA and no UBX');"
              "document.getElementById('t').innerHTML="
              "`<tr><td>uptime<td><b>${s.uptime_s} s</b>`+"
-             "`<tr><td>GPS<td><b>fix ${s.gps.fix}, ${s.gps.sats} sats, ${s.gps.utc} UTC</b> @ ${s.gps.baud} baud, ${s.gps.valid_nmea} valid lines`+`<tr><td>time accuracy<td><b>${s.gps.tacc_ns} ns</b> &middot; pulse qErr ${s.gps.qerr_ps} ps`+`<tr><td>UBX<td>pvt ${s.gps.ubx_pvt}, tim-tp ${s.gps.ubx_timtp}, ack ${s.gps.ubx_ack}, nak ${s.gps.ubx_nak}`+`<tr><td>config<td><b>${s.gps.config_acked?'accepted':'NOT acked - node TX to module RX unwired?'}</b>`+"
+             "`<tr><td>GPS<td><b>fix ${s.gps.fix}, ${s.gps.sats} sats, ${s.gps.utc} UTC</b> @ ${s.gps.baud} baud, ${nm}`+`<tr><td>time accuracy<td><b>${s.gps.tacc_ns} ns</b> &middot; pulse qErr ${s.gps.qerr_ps} ps`+`<tr><td>UBX<td>pvt ${s.gps.ubx_pvt}, tim-tp ${s.gps.ubx_timtp}, ack ${s.gps.ubx_ack}, nak ${s.gps.ubx_nak}`+`<tr><td>config<td><b>${s.gps.config_acked?'accepted':'NOT acked - node TX to module RX unwired?'}</b>`+"
              "`<tr><td>PPS edges<td><b>${s.pps.edges}</b> spread ${s.pps.spread_us} us, ${s.pps.glitches} rejected`+"
-             "`<tr><td>I2S measured<td><b>${f}</b>`+`<tr><td>UTC now<td><b>${s.time.valid?new Date(s.time.utc_us/1000).toISOString():'anchor not valid'}</b> &middot; ${(s.time.since_edge_us/1000).toFixed(0)} ms since edge, ${s.time.label_rejects} rejected`+`<tr><td>ESP clock vs GPS<td><b>${s.esp_clock.pps_intervals>2?s.esp_clock.ppm_vs_gps.toFixed(3)+' ppm':'need 3 PPS edges'}</b> over ${s.esp_clock.pps_intervals} s`+"
+             "`<tr><td>I2S measured<td><b>${f}</b>`+`<tr><td>timebase<td><b>${s.acq.fs_used_hz.toFixed(4)} Hz</b> in use &middot; estimate ${q} &middot; dropped ${s.acq.drop_s} s / over ${s.acq.over_s} s`+`<tr><td>UTC now<td><b>${s.time.valid?new Date(s.time.utc_us/1000).toISOString():'anchor not valid'}</b> &middot; ${(s.time.since_edge_us/1000).toFixed(0)} ms since edge, ${s.time.label_rejects} rejected`+`<tr><td>ESP clock vs GPS<td><b>${s.esp_clock.pps_intervals>2?s.esp_clock.ppm_vs_gps.toFixed(3)+' ppm':'need 3 PPS edges'}</b> over ${s.esp_clock.pps_intervals} s`+"
              "`<tr><td>samples<td>${s.i2s.samples}`+"
              "`<tr><td>detections<td><b>${s.audio.detections}</b> (env peak ${s.audio.env_peak})`+"
              "`<tr><td>raw ring<td>${s.raw.span_s?s.raw.span_s.toFixed(0)+' s, '+s.raw.fill_pct.toFixed(0)+'% written, '+(s.raw.bytes/1048576).toFixed(2)+' MB PSRAM':'<b>not allocated</b>'}`+"
@@ -2460,7 +2628,7 @@ void setup() {
   http.on("/audio", []() {
     // Bare /audio answers "what is retrievable?" so a caller never has to guess a window; with
     // ?from=<utc_us>&dur=<s> it returns that window as a playable WAV.
-    double   fsu = fs_clean > 1000.0 ? fs_clean : (double)FS_NOMINAL;
+    double   fsu = fs_timebase();
     uint32_t newest = g_samples;
     uint32_t lo = praw_oldest();
     // A flat 16 s guard would swallow half of a 30 s fallback ring, so cap it at a third.
@@ -2709,7 +2877,7 @@ static void audio_pump() {
           // the 183 us budget, and it throws away the 21 ns the GPS is handing us. Back-date by
           // the samples still to come, at the PPS-disciplined rate rather than the 16 kHz
           // nominal (which is out by ~5600 ppm).
-          double   fsu     = fs_clean > 1000.0 ? fs_clean : (double)FS_NOMINAL;
+          double   fsu     = fs_timebase();
           uint32_t back_us = (uint32_t)((double)(n - 1 - i) * 1e6 / fsu + 0.5);
           uint64_t cap_us  = (uint64_t)esp_timer_get_time() - back_us;
           int64_t  off     = (int64_t)cap_us - (int64_t)pps_us_last;
@@ -2817,26 +2985,50 @@ void loop() {
   // Each PPS edge is exactly one true second apart, so the samples between two edges ARE the
   // acquisition rate -- no reliance on the ESP crystal, whose +9 ppm would otherwise creep in.
   // A second that comes up short lost a block; it is counted and excluded, never averaged in.
-  { static uint32_t seen_edge = 0, prev_sm = 0, win_sm0 = 0, win_e0 = 0;
+  { static uint32_t seen_edge = 0, prev_sm = 0, win_sm0 = 0, win_e0 = 0, seen_resyncs = 0;
     uint32_t e = pps_count;
     if (e != seen_edge) {
       uint32_t sm = pps_samp_last;
+      uint32_t rs = pps_resyncs;
+      bool probed = (rs != seen_resyncs);   // a probe moved the clock inside this interval
+      seen_resyncs = rs;
       if (seen_edge) {
+        // ⚠️SPAN, NOT ONE SECOND. A blocking handler can straddle several edges, and this pass
+        // then has to account for all of them. Charging one second's worth was a counter that
+        // under-reported its own loss by (span - 1) seconds: the drain's own fetch stalled mach
+        // for 32 s, delivering 78,336 samples where 512,000 were due, and the old arithmetic
+        // charged 2 seconds of it. That single interval was 433,664 of the run's 437,504 total
+        // deficit, which is why the node looked like it was clocking 683,451 samples slow.
+        uint32_t span = e - seen_edge;
         uint32_t d = sm - prev_sm;
-        samp_sec_last = d;
+        uint64_t expect = (uint64_t)FS_NOMINAL * span;
+        // Only when this pass covers exactly one second does the field mean what it says. A
+        // straddle leaves the previous value rather than dividing a multi-second count by a span
+        // and calling the quotient "the most recent GPS second".
+        if (span == 1) samp_sec_last = d;
         // Anchor the raw ring: a (UTC, sample) pair for the PREVIOUS edge, which local_to_utc
         // will only name once its NAV-PVT has landed -- and if it has not, the pair is skipped
         // rather than guessed. (I had a figure here for how late that report arrives; it was not
         // measured and is gone. The code never depended on it: local_to_utc either names the edge
         // or refuses.) Only when exactly one edge has passed, because a blocking handler can
         // straddle two, and then the timestamp and the sample count describe different seconds.
-        if (e - seen_edge == 1) {
+        if (span == 1) {
           // The ISR writes the timestamp and the sample index as a set. Read them, then re-read
           // the edge counter: if an edge landed between the two reads, the pair is mismatched by
           // a whole second -- 343 m -- so throw it away rather than record it.
           uint64_t mus = pps_us_prev;
           uint32_t msamp = pps_samp_prev_exact;
+          uint64_t lus = pps_us_last;
           if (pps_count == e) {
+            // The crystal figure, accumulated where the pair can be validated rather than in the
+            // ISR. An interval that is not about a second means an EDGE WENT MISSING -- pps_count
+            // did not advance for it, so anything computed per counted edge is short by one. Both
+            // it and the interval that spans a timepulse probe are counted and excluded, never
+            // averaged: that exclusion IS the fix to esp_clock_ppm.
+            uint32_t iv = (uint32_t)(lus - mus);
+            if (probed)                     { /* the probe moved the clock: measures nothing */ }
+            else if (iv > 1500000u)         { pps_gaps++; }
+            else                            { esp_iv_sum_us += iv; esp_iv_n++; }
             int64_t mu;
             if (local_to_utc(mus, &mu)) {
               praw_mark[praw_mark_n % PRAW_MARKS].utc_us = mu;
@@ -2852,22 +3044,58 @@ void loop() {
         // mach: fs_clean_hz = 22624.0000 in 1124 of 1126 health rows, fs_win_s pinned at 0,
         // drop_samples 223,352,776 against ~223,209,000 predicted by the inflation itself, and
         // every clip written in that boot carrying a 22624 Hz WAV header over 16 kHz audio.
-        if (d < (uint32_t)(0.97 * (double)FS_NOMINAL)) {
-          drop_seconds++;
-          drop_samples += (uint32_t)((double)FS_NOMINAL - (double)d);
+        //
+        // ⚠️THE HIGH SIDE IS A DEFECT TOO, AND ONLY THE LOW SIDE WAS EVER TESTED. A second that
+        // delivers too MANY samples is a catch-up burst after a stall, or an interval that is
+        // really two because an edge went missing. Both were being averaged in: one drop-free
+        // interval on mach delivered 36.5 blocks too many (16346 Hz, +21,630 ppm) and the
+        // firmware certified it, which moved that node's best-available rate by 240 ppm --
+        // 35x the resolution the same estimate was being quoted to. It is also what keeps the
+        // edge count equal to the second count below: a missed edge makes d about twice expect
+        // for span 1, so it lands here and breaks the window instead of inflating it by
+        // 1/win_s (6250 ppm at a 160 s window, which the 1% band would have passed).
+        if (probed) {
+          fs_clean_secs = 0;                      // the probe moved the clock; measures nothing
+        } else if ((double)d < 0.97 * (double)expect) {
+          drop_seconds += span;
+          drop_samples += (uint32_t)(expect - (uint64_t)d);
           fs_clean_secs = 0;                      // a broken second cannot be averaged over
+        } else if ((double)d > 1.03 * (double)expect) {
+          over_seconds += span;
+          fs_clean_secs = 0;
         } else {
-          if (!fs_clean_secs) { win_sm0 = prev_sm; win_e0 = e - 1; }
+          // Certified: neither short nor long, no probe. This is the population the drop-free
+          // cumulative rate averages over, and the only one.
+          clean_seconds += span;
+          clean_samples += (uint64_t)d;
+          if (!fs_clean_secs) { win_sm0 = prev_sm; win_e0 = seen_edge; }
           fs_clean_secs = e - win_e0;
           if (fs_clean_secs >= 8) {
             double fsc = (double)(sm - win_sm0) / (double)fs_clean_secs;
             // A crystal is tens of ppm from nominal, not percent. Anything outside 1% is a
             // counting fault, not a measurement, and must not become the divisor that dates
             // every sample, sizes every WAV header and scales every drop count.
-            if (fsc > 0.99 * (double)FS_NOMINAL && fsc < 1.01 * (double)FS_NOMINAL) fs_clean = fsc;
-            else fs_clean_secs = 0;
+            if (fsc > 0.99 * (double)FS_NOMINAL && fsc < 1.01 * (double)FS_NOMINAL) {
+              fs_clean = fsc;
+              fs_clean_win_s = fs_clean_secs;     // the support of the value now in use
+            } else {
+              fs_clean_secs = 0;
+            }
           }
         }
+        // ⚠️WHAT NONE OF THIS CATCHES, MEASURED AND LEFT OPEN. A single lost 256-sample block is
+        // invisible to any per-second sample-count threshold. A PPS second carries 62 or 63
+        // blocks (15,872 or 16,128 samples) depending on where the phase falls -- at 16006.6 Hz
+        // it is 62.53 blocks, so about half of all seconds carry 63. A 63-block second that
+        // loses one block delivers exactly 62 * 256 = 15,872, which is bit-identical to a legal
+        // 62-block second. No fixed fraction separates them: 0.97 * FS_NOMINAL = 15,520 and even
+        // 0.985 * FS_NOMINAL = 15,760 sits below 15,872. Restricted to intervals where nothing
+        // was charged, nyquist's 30 s health intervals run about 0.49 blocks low (261 ppm), so
+        // the loss is real but small -- and it is NOT enough to explain that node's 470-980 ppm
+        // gap against mach, which is why "nyquist drops ~2 blocks per 30 s" was withdrawn.
+        // Separating "this node's PDM clock is slower" from "this node loses blocks nothing
+        // counts" needs a counter that knows the expected block PHASE, or an external frequency
+        // reference on the PDM clock pin. Neither exists here; see docs/timing.md.
       }
       prev_sm = sm; seen_edge = e;
     }
@@ -2937,10 +3165,11 @@ void loop() {
         // An EMPTY field for a sensor that is not there, never a number. "nan" parses as a float
         // in some readers and as a string in others; 0.0 would read as a freezing night. Empty is
         // the one value every CSV reader already agrees means absent.
-        char ct[16], cp[16], cc[16];
+        char ct[16], cp[16], cc[16], ch[16];
         #define CSVF(dst, v) do { if ((v) == (v)) snprintf(dst, sizeof dst, "%.2f", (double)(v)); \
                                   else dst[0] = 0; } while (0)
         CSVF(ct, bmp_temp_c); CSVF(cp, bmp_press_hpa); CSVF(cc, sound_speed_mps());
+        CSVF(ch, bmp_rh_pct);
         // Before the first 3D fix there is no mean. Writing 0.0000000 there would put the node
         // in the Gulf of Guinea, and a reader averaging the column would never notice.
         char mlat[20] = "", mlon[20] = "", mhe[16] = "", mhm[16] = "";
@@ -2952,9 +3181,10 @@ void loop() {
         }
         f.printf("%s,%lld,%d,%lu,%d,%d,%lu,%lu,%lu,%ld,%.4f,%lu,%.4f,"
                  "%.4f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.1f,%.0f,%lu,%d,%.0f,%.1f,%lu,%.1f,%lu,%lu,"
-                 "%s,%s,%s,"
+                 "%s,%s,%s,%s,"
                  "%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
-                 "%.7f,%.7f,%.3f,%.3f,%.2f,%.2f,%lu,%s,%s,%s,%s\n",
+                 "%.7f,%.7f,%.3f,%.3f,%.2f,%.2f,%lu,%s,%s,%s,%s,"
+                 "%lu,%.4f,%.1f,%lu,%lu\n",
                  node_id, (long long)tnow, tok ? 1 : 0,
                  (unsigned long)up, gps_fix, gps_sats, (unsigned long)gps_tacc_ns,
                  (unsigned long)pps_count, (unsigned long)pps_glitch,
@@ -2967,7 +3197,7 @@ void loop() {
                  armed, gate_thr(), env_e_max_win, (unsigned long)gate_forced, sig_dc,
                  (unsigned long)sd_free_mb_last,
                  (unsigned long)det_write_fail,
-                 ct, cp, cc,
+                 ct, cp, cc, ch,
                  g_floor, (unsigned long)clip_written, (unsigned long)clip_skip_budget,
                  (unsigned long)clip_skip_full,
                  (unsigned long)clip_skip_dedupe, (unsigned long)clip_skip_ring,
@@ -2975,7 +3205,9 @@ void loop() {
                  pos_lat_e7 * 1e-7, pos_lon_e7 * 1e-7,
                  pos_hell_mm / 1000.0, pos_hmsl_mm / 1000.0,
                  pos_hacc_mm / 1000.0, pos_vacc_mm / 1000.0,
-                 (unsigned long)pos_n, mlat, mlon, mhe, mhm);
+                 (unsigned long)pos_n, mlat, mlon, mhe, mhm,
+                 (unsigned long)clean_seconds, fs_timebase(), fs_step_ppm(),
+                 (unsigned long)over_seconds, (unsigned long)pps_gaps);
         f.close();
       }
       // scene.csv is held open and written every 1.024 s; committing it costs the same 20-50 ms

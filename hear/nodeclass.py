@@ -147,6 +147,24 @@ register(NodeClass(
     # 256-sample I2S block, which the firmware back-dates but only to about one sample. 100 us is
     # a deliberately conservative round number above the parts that have been measured; it has
     # never been checked against an external reference because the node has no second clock.
+    #
+    # ⚠️THE BUDGET HOLDS ON THE DETECTION PATH AND USED TO FAIL BY 11x ON THE RAW-RING PATH.
+    # Termwise RSS for a dets.csv arrival, 2026-09-08: GPS tAcc 0.02 us, PPS spread/2 5.00 us,
+    # esp_timer between anchors 12.20 us (9.5-12.2 ppm vs GPS, re-zeroed every PPS second),
+    # I2S block-quantisation residual ~1 sample 62.47 us, fs_clean back-date differential
+    # 8.90 us -> 64.47 us = 22.1 mm. It fits, and the term that dominates it is the one this
+    # comment already named.
+    #
+    # The RING is a different path and was NOT inside this number. sample_to_utc interpolates
+    # from the nearest PPS mark with fs_clean as the slope, and fs_clean is block-quantised to
+    # 16000/win_s ppm, so two nodes 1118 ppm apart carried 1118 us = 0.384 m of differential
+    # error at the far end of a one-second mark gap, and a full 30 s /audio window pulled from
+    # both differed by 33-41 ms = 11-14 m. Round-tripping through X-Audio-From-Utc-Us does not
+    # help: the node computes it with the same wrong slope. The firmware now refuses to use
+    # fs_clean as a timebase until its window supports 100 ppm (FS_TIMEBASE_MIN_WIN_S = 160 s,
+    # derived from THIS constant -- tests/test_firmware_timebase.py holds the two together), and
+    # falls back to the nominal rate below that, which is wrong identically on every node and
+    # cancels in a TDoA. See docs/timing.md for the full budget and what is still open.
     t_sigma_s=100e-6,
     mic_count=1,
     fs_hz=16000.0,
