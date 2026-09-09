@@ -93,9 +93,42 @@
 // AS7341 guess at 0x39 (id 0x24) is confirmed. An ID register narrows a part; it does not always
 // name one.
 //
-// STILL UNMAPPED, and all findable the same way: BUTTON, RGB_LED, SD_DET, USB_DET, BUZZER and the
-// USB_VOLTS / BATT_VOLTS ADC inputs. GPIO45 is the one pulled-up pin not yet accounted for and
-// SD_DET is the obvious suspect, un-checked.
+// ---- pins the vendor firmware CONFIGURES, recovered from its gpio_config() call sites ----------
+// Method: locate gpio_config() by its unique assert "GPIO_PIN mask error", find every caller, then
+// decode the gpio_config_t each one builds -- pin_bit_mask at +0/+4 (64-bit), mode +8, pull_up +12,
+// pull_down +16, intr_type +20. The ELECTRICAL CONFIG below is hard evidence read out of those
+// stores. The NAMES are inference and are marked as such: the log strings in that function are
+// function-level, so they say which routine configures a pin, never which pin is which.
+//
+//   GPIO  5   INPUT + PULLDOWN     a detect that reads HIGH when its thing is present
+//   GPIO  8   INPUT + PULLUP       a detect/switch that reads LOW when active
+//   GPIO 18   INPUT
+//   GPIO 38   INPUT                <- the DS3231 SQW input. Independently found on hardware first.
+//   GPIO 39   INPUT                configured beside 40, in the "Vesper Detected" routine
+//   GPIO 40   OUTPUT, PULSED       set high, short delay, set low -- a strobe
+//   GPIO 21   OUTPUT, driven high
+//   GPIO 41   OUTPUT, driven high
+//   GPIO 1,4,5,6  OUTPUT           one further site, mask 0x72
+//
+// ⚠️THE CROSS-CHECK THAT MAKES THIS WORTH TRUSTING. /scanpu on the live board found exactly three
+// pins held LOW against an internal pullup -- 8, 18 and 39 -- meaning something external drives
+// them. All three are INPUTS here. Two independent methods, same three pins.
+//
+// GPIO 40 pulsed with 39 read beside it, inside the routine that logs "Vesper Detected", is a
+// strobe-and-sample mic-presence probe. INFERRED, not proven. Likewise GPIO 8 (INPUT+PULLUP
+// reading LOW on the live board) is the shape of a card-detect with a card inserted, which is
+// testable in one move: eject the card and re-read /scanpu.
+//
+// STILL UNMAPPED: which of these is BUTTON vs SD_DET vs USB_DET, the BUZZER (GPIO1 is the LEDC
+// channel's gpio_num, from ledc_channel_config_t +0 at DRAM 0x3fcae0e8), and the two ADC inputs.
+// ⚠️THE RGB LED PIN IS NOT IN THE FIRMWARE AT ALL: rmt_new_tx_channel's gpio_num comes from a
+// FUNCTION RETURN (mov.n a2, a10 at 0x4201be4c), i.e. a runtime config lookup. The NVS partition
+// was parsed and holds no pin config -- only restart_counter, last_lat/lon, puc_mode,
+// station_mode and the wifi stack's own keys -- so that pin lives in PUC_Config.json on the card.
+// GPIO45 remains the one pulled-up pin no API touches; likely a passive strap.
+//
+// ⚠️THE DUMP CONTAINS THE WIFI PSK IN PLAINTEXT (nvs.net80211/sta.pswd). Treat ~/puc-backup as a
+// secret.
 
 // ---- storage -----------------------------------------------------------------------------
 // A microSD slot exists (the vendor writes /sdcard/YYYYMMDD/*.flac). The card is on the NATIVE
@@ -163,3 +196,11 @@
 //   $PMTK306,15  /  $PMTK311,10           $PMTK353,1,1,1,0,0  constellation search mode
 // ⚠️There is NO PMTK285 anywhere in the vendor image -- it never enabled 1PPS, consistent with the
 // pin never having been routed.
+
+// Electrical config only -- names still inferred, see the block above.
+#define SQW_IN_PIN     38        // DS3231 SQW, INPUT (firmware) + measured on hardware
+#define VESPER_STROBE  40        // OUTPUT, pulsed, in the "Vesper Detected" routine
+#define VESPER_SENSE   39        // INPUT, configured beside it
+#define DETECT_PU_PIN  8         // INPUT+PULLUP, reads LOW live -- card-detect shaped
+#define DETECT_PD_PIN  5         // INPUT+PULLDOWN
+#define BUZZER_PWM_PIN 1         // ledc_channel_config_t.gpio_num @0x3fcae0e8
