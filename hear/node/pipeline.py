@@ -35,7 +35,10 @@ class Pipeline:
         out: List[Dict] = []
         for s in range(0, len(x), block):
             for d in self.gate.process(x[s:s + block], s):
-                i = d["index"]
+                # ⚠️`sketch_index`, NOT `index`. `index` is the TIMESTAMP onset, walked back up
+                # to the 25 ms guard; starting a 33 ms sketch there slides it off the event --
+                # 0.9443 against 0.9732 nested AUC. See detect.SKETCH_BACK_S.
+                i = d["sketch_index"]
                 seg = x[i:min(len(x), i + int(POST_S * self.fs))]
                 if len(seg) < int(0.01 * self.fs):
                     continue
@@ -43,7 +46,7 @@ class Pipeline:
                 # sub-sample onset, not the floored slice bound: the timestamp is the product
                 frame = SK.pack(self.node_us_of(d["onset_index"]), ref,
                                 int(min(d["peak"], 65535)), q,
-                                flags=(1 if d["retrigger"] else 0))
+                                flags=(1 if d["retrigger"] else 0), fs=self.fs)
                 out.append({**d, "ref_db": ref, "frame": frame, "frame_len": len(frame)})
         return out
 

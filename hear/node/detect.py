@@ -14,7 +14,7 @@ reflection existed, which the echo analysis needs.
 """
 from __future__ import annotations
 
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -22,6 +22,15 @@ RETRIGGER_S = 0.060          # inside one muzzle blast's decay (median 12.7 ms, 
 GUARD_S = 0.025
 REARM_FRAC = 0.35            # envelope must fall to this fraction of threshold before re-firing
 ONSET_FRAC = 0.20            # constant fraction of the envelope peak that defines the onset
+
+#: How far before the peak the SKETCH window may start. One hop, NOT the re-trigger guard.
+#: The timestamp wants the true onset however slow the rise; the sketch is 8 x 4 ms and an onset
+#: 25 ms before the peak slides it off the event. Measured on 228 labelled events, nested grouped
+#: CV, varying only the sketch start: peak 0.9634, back<=2 ms 0.9746, back<=4 ms 0.9732,
+#: back<=8 ms 0.9685, back<=25 ms (the guard) 0.9443 -- worse than not walking back at all.
+#: 2/4/8/12 ms are within noise of each other; one hop is chosen on the mechanism, because past
+#: one hop the onset lands in a different sketch frame.
+SKETCH_BACK_S = 0.004
 # Seconds, and deliberately not rounded: this exact value is what the 2026-09-05 run used, and
 # docs/validation-full-captures.md's numbers were measured with it.
 # ⚠️The 48000 below is the CAPTURE RIG's rate, not the node's. docs/faketec-pin-budget.md records
@@ -59,14 +68,67 @@ def onset_index(e: np.ndarray, peak: int, frac: float = ONSET_FRAC, back: int = 
     predates the window is reported AT the window edge, not extrapolated: a detection whose rise
     began in the previous block is late, and saying so beats inventing a number.
     """
+    idx, _ = onset_index_checked(e, peak, frac, back)
+    return idx
+
+
+def onset_index_checked(e: np.ndarray, peak: int, frac: float = ONSET_FRAC,
+                        back: int = 0) -> Tuple[float, bool]:
+    """As [onset_index], plus whether the fraction was actually CROSSED.
+
+    ⚠️THE FRACTION IS REFERRED TO THE LOCAL FLOOR, NOT TO ZERO. `target = floor + frac*(peak -
+    floor)`, where `floor` is the minimum envelope in the search window.
+
+    Referred to zero it asks the envelope to fall to 20% of the NEW peak, which a round landing
+    inside the previous round's decay tail never does -- the old one is still ringing. The walk
+    then ran to the clamp edge and returned it, an arbitrary `peak - back` numerically
+    indistinguishable from a genuine slow rise. On the 228 hand-labelled 2026-09-05 events that
+    was **42 of them (18.4%)**, every one timestamped exactly 25 ms early.
+
+    Measured against known truth (a synthetic previous round still ringing 45 ms later, onset
+    truth 45.0 ms, swept by tail level):
+
+        floor/peak   referred to zero        referred to the floor
+        0.17         -0.55 ms   11/12 found  +0.45 ms   12/12
+        0.23        -21.62 ms    0/12 found  +0.43 ms   12/12
+
+    On the real corpus it takes the never-found count from **42 to 0**, moves those 42 by a
+    median of **+22.5 ms** toward the event, and leaves 63% of the rest within 0.05 ms. 27.6% of
+    all events shift by more than 1 ms and 19.3% by more than 10 ms; the largest is 24.27 ms,
+    which is **8.4 m of range** at 345 m/s.
+
+    ⚠️It is a STRICT GENERALISATION: where the floor is zero the two are identical, so a quiet
+    event cannot regress. Nor can a truncated one -- see the interior-trough guard below. Cost on the sketch, whose one-hop window barely sees the floor: nested
+    AUC 0.9732 -> 0.9712, inside the noise band, and worth it for one definition of "onset"
+    across the node, the phone and the training script.
+
+    ⚠️WHAT IT STILL CANNOT FIX: when the previous round is as loud as or louder than this one,
+    `peak` is the WRONG PEAK -- argmax finds the old event -- and no onset rule helps. Measured
+    at tail 0 dB and +3 dB the error is -22 ms and -45 ms for both methods. That is a
+    peak-picking failure, not an onset failure, and `found` does not catch it.
+
+    `found` is False only when no crossing exists even against the floor (an empty window, or a
+    peak at its very edge). Callers must not treat the index as measured when it is False.
+    """
     lo = max(0, peak - back) if back > 0 else 0
-    target = frac * float(e[peak])
+    if peak <= lo:
+        return float(lo), False
+    # ⚠️ONLY AN *INTERIOR* TROUGH IS A BASELINE. If the minimum sits at the window's left edge the
+    # envelope is still descending out of the window -- the rise predates it -- and referring the
+    # fraction to that edge value turns an honest "clamped, cannot see further back" into a
+    # confidently LATE onset. So that case keeps the zero reference, which clamps to the edge and
+    # reports found=False, exactly as before. The two are cleanly separable in practice: all 228
+    # of the 2026-09-05 events have an interior trough (including all 42 that could not be timed),
+    # and a block that truncates a rise has its trough at the edge by construction.
+    am = int(np.argmin(e[lo:peak]))
+    floor = float(e[lo + am]) if am > 0 else 0.0
+    target = floor + frac * (float(e[peak]) - floor)
     below = np.nonzero(e[lo:peak] < target)[0]
     if below.size == 0:
-        return float(lo)
+        return float(lo), False
     j = lo + int(below[-1])          # last sample below the fraction; crossing is in [j, j+1]
     rise = float(e[j + 1]) - float(e[j])
-    return float(j) if rise <= 0 else j + (target - float(e[j])) / rise
+    return (float(j) if rise <= 0 else j + (target - float(e[j])) / rise), True
 
 
 class Gate:
@@ -78,7 +140,8 @@ class Gate:
 
     def __init__(self, fs: float, ratio: float = 8.0, floor: float = 800.0,
                  guard_s: float = GUARD_S, ambient_tau_s: float = AMBIENT_TAU_S,
-                 rearm_frac: float = REARM_FRAC, onset_frac: float = ONSET_FRAC):
+                 rearm_frac: float = REARM_FRAC, onset_frac: float = ONSET_FRAC,
+                 sketch_back_s: float = SKETCH_BACK_S):
         """⚠️`ambient_tau_s` DEFAULTS TO 0.21 s AND USED TO SAY 10 s. It never was 10 s: the old
         alpha was derived per 1 ms hop and then applied once per SAMPLE, so the realised constant
         was 10 000 samples -- 0.208 s at 48 kHz, 48x faster than the parameter claimed.
@@ -100,6 +163,7 @@ class Gate:
         self.guard = max(1, int(guard_s * fs))
         self.rearm_frac = float(rearm_frac)
         self.onset_frac = float(onset_frac)
+        self.sketch_back_s = float(sketch_back_s)
         # per SAMPLE, because that is where it is applied
         self.alpha = 1.0 / max(1.0, ambient_tau_s * fs)
         self.ambient = 0.0
@@ -141,11 +205,21 @@ class Gate:
                 j = min(len(e), i + self.guard)
                 k = i + int(np.argmax(e[i:j]))
                 # bounded by the guard, which is also the window the peak was found in
-                on = block_start + onset_index(e, k, self.onset_frac, back=self.guard)
+                on_rel, on_found = onset_index_checked(e, k, self.onset_frac, back=self.guard)
+                on = block_start + on_rel
+                # A SECOND, tighter walk for the sketch window only. The timestamp and the
+                # feature window want different clamps and used to share one number.
+                on_sk = block_start + onset_index(
+                    e, k, self.onset_frac, back=max(1, int(self.sketch_back_s * self.fs)))
                 since = None if self.last_onset is None else (on - self.last_onset) / self.fs
                 out.append({
-                    "index": int(on),           # floored onset -- the sketch's first sample
+                    "index": int(on),           # floored onset -- what t_s is anchored on
                     "onset_index": float(on),   # sub-sample; what t_s is made of
+                    # ⚠️False => the fraction was never crossed and `onset_index` is the CLAMP
+                    # EDGE, not a measurement. 18.4% of the 2026-09-05 events. See
+                    # onset_index_checked.
+                    "onset_found": bool(on_found),
+                    "sketch_index": int(on_sk), # where the SKETCH starts; at most one hop back
                     "t_s": on / self.fs,
                     "peak_index": int(block_start + k),
                     "peak": float(np.abs(block[max(0, k - self.guard):k + self.guard]).max()),
