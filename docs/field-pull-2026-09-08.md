@@ -98,9 +98,16 @@ node with credentials for a network it cannot reach makes it unreachable and nee
 nodes'  `/status` does not report the SSID they are on, so there is nothing here to reconstruct it
 from.
 
-⚠️**When.** These are night nodes. Detections run 20:00–08:00 local and peak at 22:00–00:00
-(191 of 392 in those two hours); the last on either node was **08:46 local**. The safe window is
-**09:00–19:00 local**, and it is 10:20 now. Flash `nyquist` first, confirm it comes back and is
+⚠️**When.** ⚠️CORRECTED 2026-09-08 — the earlier text here called these "night nodes" and put
+detections at 20:00–08:00 local, peaking 22:00–00:00 (191 of 392). **Neither reproduces.** There
+is no node class by that name (the two are `xiao-s3-pps`; `puc` is `puc-ntp`), and over the 638
+anchored sketches in the pooled corpus **0 fall in 20:00–08:00 local** while **515 (81%) fall in
+the 18:00 hour alone**. The old figure came from a different, earlier capture that is not in the
+pool, and it cannot be checked.
+⚠️It also inverted the advice: 18:00 sits inside the window the old text called safe to flash.
+What the corpus can honestly say is that within its covered hours (10:00–20:00 local — it has no
+night coverage at all, so night activity is untestable rather than absent) the busiest hour by a
+wide margin is 18:00. Flash `nyquist` first, confirm it comes back and is
 recording, then `mach` — never both at once, so a bad image never takes out both ears.
 mach has **19 clips of budget left** and a reboot resets it, so it benefits either way.
 

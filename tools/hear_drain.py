@@ -441,6 +441,12 @@ def main(argv=None) -> int:
         s = report["stats"]
         print("\npool %s\n  sketches %d  %s  (%d anchored / %d not)"
               % (root, s["records"], s["by_source"], s["anchored"], s["unanchored"]))
+        # ⚠️`anchored` above answers "is there a stamp", not "is the stamp a measurement". For a
+        # phone those differ: a wall-tier row is anchored and is ~50 ms out. Printed only when
+        # phone rows exist, so the node-only drain this runs as today is unchanged.
+        if s.get("by_clock_tier"):
+            print("  phone clock %s  utc_trusted %s"
+                  % (s["by_clock_tier"], s["phone_utc_trusted"]))
         sc = report["scene_stats"]
         print("  scene    %d rows  %s  geom %s  %.1f MB on disk (%s B/row)"
               % (sc["rows"], sc["by_node"], sc["geometry"],

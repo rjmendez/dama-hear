@@ -26,6 +26,54 @@ import numpy as np
 
 from . import sketch as SK
 
+#: Phone `clock_tier` values whose stamp is a UTC MEASUREMENT rather than a wall-clock reading.
+#: Copied deliberately, not invented: this is dama-gotchi's own
+#: `sensors/tdoa_triangulation.py:449 GOOD_CLOCK_TIERS`, and `EskfFusion.kt:318`
+#: `BAD_PEER_CLOCK_TIERS = setOf("wall", "network", "unknown")` is the same split from the other
+#: side. ⚠️"network" IS EXCLUDED. It is a NETWORK_PROVIDER fallback anchor, not a GPS one --
+#: GPSTimingSync.java:612-616 says in as many words that it is "deliberately NOT treated as
+#: clock-trustworthy ... same as 'wall'", and its declared sigma is 25 ms (vs 5 ms for "location")
+#: which is 8.6 m at 343 m/s. A tier not listed here is not trusted, including one this version
+#: has never heard of: an unrecognised label is a producer we do not understand, and the
+#: conservative reading is the one that does not admit it to a solve.
+TRUSTED_CLOCK_TIERS = frozenset({"gnss", "location"})
+
+
+def utc_trusted_of(fields: Dict[str, Any]) -> Optional[bool]:
+    """The rungs behind `Record.utc_trusted`, over a plain mapping.
+
+    Read that property's docstring for what each rung is and why. This exists as a function so
+    that `Record` and `hear.pool.Pool.stats` -- which asks the same question of a STORED row dict,
+    before any Record is built -- cannot answer it two different ways. Two readers of one message
+    disagreeing about it is the defect, not the duplication.
+
+    `fields` is anything with `source`, `clock_tier`, `onset_dated` and `utc_trusted` keys, absent
+    meaning not stated: a stored pool row, or a Record's own attributes plus its `extra`.
+    """
+    # ⚠️THE GUARDS RUN FIRST, AND A PRODUCER'S STATEMENT DOES NOT DEFEAT THEM. An earlier version
+    # honoured a stated bool before either, so `{"source": "node", "utc_trusted": True}` returned
+    # True for a sensor whose clock trust is a different measurement entirely, and
+    # `{"onset_dated": False, "utc_trusted": True}` returned True for an onset the producer had
+    # just said it could not date. A statement that contradicts a refusal the same producer made
+    # is not extra information; the conservative reading is the one that does not admit it.
+    if fields.get("source") != "phone":
+        return None
+    if fields.get("onset_dated") is False:
+        return False
+    stated = fields.get("utc_trusted")
+    if stated is not None:
+        # ⚠️A NON-BOOL STATEMENT IS REFUSED, NOT DISCARDED. `isinstance(stated, bool)` alone let
+        # `utc_trusted: 0` and `utc_trusted: "false"` fall through to the derivation and come back
+        # TRUE -- a producer saying "do not trust me" read as trustworthy, which is this project's
+        # recurring failure pointing the worst possible way. An unparseable statement is a
+        # producer this version does not understand, and that is exactly the case the unknown-tier
+        # rule already refuses.
+        return stated if isinstance(stated, bool) else False
+    tier = fields.get("clock_tier")
+    if tier is None:
+        return None
+    return tier in TRUSTED_CLOCK_TIERS
+
 
 @dataclass
 class Record:
@@ -53,6 +101,52 @@ class Record:
 
     def band_edges_hz(self) -> Optional[np.ndarray]:
         return None if self.fs_hz is None else SK.band_edges_hz(self.fs_hz, self.bands)
+
+    @property
+    def utc_trusted(self) -> Optional[bool]:
+        """Is `ts_utc_s` a UTC measurement, or a wall-clock reading wearing one's clothes?
+
+        ⚠️DERIVED, NOT A FIELD. `hear/backend/associate.py` refuses arrivals on a `utc_trusted`
+        key, and nothing has ever published one. The temptation is to add the boolean to the
+        phone's payload; the phone has been publishing the same fact all along under the name
+        `clock_tier`, and a NEW key would be absent on every row recorded before its rollout --
+        which `arrival_is_usable` reads as usable (ABSENT MEANS USABLE, associate.py:90-98). The
+        wall-clock stamps this flag exists to refuse would sail through it. Deriving from a field
+        that is already on the wire answers correctly for history too, and costs no APK.
+
+        THE INVARIANT THIS RESTS ON, in the CURRENT producer: `AcousticRangingCollector.kt:3479`
+        computes `stamp` only when `onsetBootNs != null` (a HAL AudioTimestamp existed), and
+        `clock_tier`/`sync_sigma_ns`/`ts_utc_ms` are put only inside `if (stamp != null)`
+        (:3498-3500). `GPSTimingSync.java:272` sets tier "wall" on exactly the no-fresh-anchor
+        branch. So a stated non-wall tier means BOTH halves of the operator's definition. An older
+        build that published a tier without that coupling would over-trust here, which is what
+        rung (b) is for, and why `onset_dated` must be carried through the pool alongside it.
+
+        Rungs, in order -- and the GUARDS COME FIRST, deliberately:
+          (a) `source != "phone"` -> None. A node's timestamp trust is a DIFFERENT measurement
+              (PPS lock, tAcc, `pps_bad` in health.csv). ⚠️A node DOES set `clock_tier` --
+              `hear/node/telemetry.py:110` emits "pps" or "free" -- which is precisely why this
+              rung tests the SOURCE and not the presence of the field: neither of those labels
+              is in TRUSTED_CLOCK_TIERS, so reading a node off this scale would silently call
+              every PPS-locked node untrusted.
+          (b) `onset_dated is False` -> False. The phone says outright it could not date it.
+          (c) `utc_trusted` stated -> that value if it is a bool, else False. A producer stating
+              it outright outranks the DERIVATION, but not the two refusals above: a statement
+              contradicting the same producer's own "could not date" is not new information.
+          (d) `clock_tier is None` -> None. The producer did not say.
+          (e) else `clock_tier in TRUSTED_CLOCK_TIERS`.
+
+        None means NOT STATED, and `associate.arrival_is_usable` treats that as usable by design.
+        That is deliberate, not an oversight -- see tests/test_associate.py.
+
+        ⚠️THE TIER IS A LABEL; `sync_sigma_ns` IS THE MEASUREMENT OF THE SAME THING, and on this
+        fleet they disagree: `tdoa_triangulation._clock_ok` had to add a sigma bar after 3,536
+        arrivals claimed a gnss/location tier while stating a sigma worse than the 50 ms wall
+        value. No sigma bar is applied here on purpose -- that threshold is dimensioned for
+        precision multilateration, not for corpus admission -- so a caller doing geometry must
+        read `sync_sigma_ns` as well as this flag.
+        """
+        return utc_trusted_of(dict(self.extra, source=self.source, clock_tier=self.clock_tier))
 
 
 class SkipReason(Exception):
@@ -107,8 +201,14 @@ def from_phone(payload: Dict[str, Any], node_id: Optional[str] = None) -> Record
         clipped=payload.get("clipped"),
         clock_tier=payload.get("clock_tier"),
         sync_sigma_ns=payload.get("sync_sigma_ns"),
+        # ⚠️`onset_found` AND `onset_dated` ARE BOTH LOAD-BEARING, not colour. They are the two
+        # keys hear/backend/associate.py refuses arrivals on -- one directly, one through
+        # `Record.utc_trusted` -- so a Record that drops them cannot answer the gate's question
+        # about itself. `onset_found` was being dropped here entirely
+        # (AcousticRangingCollector.kt:3513 publishes it).
         extra=dict({k: payload[k] for k in
-                    ("trigger_ts_utc_ms", "onset_offset_us", "onset_dated", "since_prev_s")
+                    ("trigger_ts_utc_ms", "onset_offset_us", "onset_dated", "onset_found",
+                     "since_prev_s", "utc_trusted")
                     if k in payload},
                    # from the FRAME, not the JSON: it decides whether this row can be aligned
                    # with a row from a sensor running at another rate.
