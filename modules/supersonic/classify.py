@@ -56,8 +56,11 @@ def score(feat: Dict[str, float], model: Dict[str, Any]) -> Optional[float]:
 
 DEFAULT_SKETCH_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                     "model_sketch.json")
-#: For a fleet with anything slower than 32 kHz in it. 15 bands, AUC 0.9588 against 0.9634 --
-#: within noise, and it is the only one a 16 kHz node's frame can be scored with at all.
+#: For a fleet with anything slower than 32 kHz in it. 15 bands, AUC 0.9665 against the 20-band
+#: model's 0.9728 -- within noise, and it is the only one a 16 kHz node's frame can be scored with
+#: at all. ⚠️Both of those were measured at 48 kHz; applied to 16 kHz audio over the common 15
+#: bands this model measures 0.9473 (hear/corpus.py:283-285). The figures previously quoted here
+#: (0.9588 / 0.9634) matched neither shipped file and were the pre-onset-fix, peak-aligned ones.
 FLEET_SKETCH_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "model_sketch_15.json")
 
