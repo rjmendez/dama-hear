@@ -73,8 +73,9 @@ class TestDecode:
         assert d["bands"] == 20 and d["slices"] == 4
 
     def test_the_second_axis_is_slices_and_frames_is_the_averaging(self):
-        # ⚠️`frames` is how many FFT frames were summed into each slice. Reading it as the shape
-        # silently changes what every feature vector means.
+        # ⚠️`frames` is the ROW's total FFT frame count (firmware SCENE_FRAMES = 4 slices x 16
+        # frames = 64); per-slice averaging is frames/slices. Reading it as the shape silently
+        # changes what every feature vector means.
         r = SF.read_text(_csv(SF.S2, [_row(SF.S2, 1788813341984000)]))
         d = SF.decode_row(r.rows[0])
         assert d["q"].shape == (d["bands"], d["slices"])
