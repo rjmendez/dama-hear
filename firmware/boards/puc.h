@@ -26,10 +26,17 @@
 // whole-bank scans. The vendor firmware has no PPS string, no PMTK285 and no interrupt configured
 // on any pin, which is consistent: there was never a trace to write code for.
 //
-// GPIO18 is where the wire should land -- held low, not a strapping pin, clear of the flash
-// (26-32), PSRAM (33-37) and USB (19-20) ranges. Set to -1 until the joint exists; a node with
-// PPS_PIN -1 must be refused as a TDoA arrival source rather than quietly trusted.
-#define PPS_PIN        18
+// ⚠️⚠️DO NOT SOLDER TO GPIO18. This said GPIO18 was where the wire should land, chosen because it
+// reads low and is not a strapping pin. That was wrong and would have been found with an iron in
+// hand: the VENDOR FIRMWARE CONFIGURES GPIO18 AS AN INPUT (gpio_config, pin_bit_mask 0x40000), and
+// on the live board it reads LOW against an internal pullup -- so something external already
+// drives that net. A PPS wire there is a second driver on someone else's signal.
+//
+// The only SAFE pins no firmware API touches at all are 0, 2, 3, 15, 16, 17 and 46; of those 0, 3,
+// 45 and 46 are ESP32-S3 strapping pins and are out. ⚠️LAND A PPS WIRE ON 2, 15, 16 OR 17.
+// PPS_PIN below stays -1-in-spirit until a joint exists; a node with no PPS must be refused as a
+// TDoA arrival source rather than quietly trusted.
+#define PPS_PIN        -1        // was 18 -- GPIO18 IS ALREADY IN USE, see above. Pick 2/15/16/17.
 #define PPS_WIRED      0         // flip to 1 only when /pps has actually reported edges
 
 // ---- the tick that DOES exist ---------------------------------------------------------------
