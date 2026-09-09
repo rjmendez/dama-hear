@@ -29,6 +29,15 @@ spec:
   # on this same hear-pool PVC. It was added to the LIVE object by hand and was in neither this
   # file nor last-applied-configuration, so the next `kubectl apply -f` of this manifest would have
   # deleted it and the phone leg would have gone quiet with nothing reporting the loss.
+  #
+  # ⚠️THIS FILE IS APPLIED WHOLE, SO IT MUST BE A SUPERSET OF THE LIVE OBJECT. That is the general
+  # rule the above is one instance of, and two sessions edited the live args within one hour, so:
+  # `kubectl get cronjob hear-drain -n dama -o jsonpath='{...args}'` BEFORE every apply.
+  #
+  # The scene lane that was dead here -- nodes writing scene-YYYYMMDD.csv while the drain asked
+  # only for scene.csv, every run reporting `ok` over a 3.27 h hole -- is fixed in the drain, not
+  # in this file: tools/hear_drain.py now DISCOVERS the names from /ls. See
+  # docs/acoustic-stack.md section 0.1.
   # Every 15 minutes. The nodes roll dets.csv to dets-prev.csv on reflash, so the window a
   # missed run can lose is bounded well under one boot; the fetch is tens of KB.
   schedule: "*/15 * * * *"
