@@ -149,6 +149,46 @@ def _why_geoms_differ(a: Tuple[Any, Any, Any, Any], b: Tuple[Any, Any, Any, Any]
     return "; and ".join(why) if why else "they compare unequal on no named field"
 
 
+def _node_mismatch(row: Dict[str, Any], expect: Optional[str]) -> Optional[str]:
+    """The name the ROW carries against the name the FETCH says it came from. Returns the row's
+    name when they disagree, None when they agree or when there is nothing to compare.
+
+    ⚠️MEASURED, 2026-09-07 drain. `mach/scene.csv` is one file off one card written across 15
+    boot sessions, and rows 2610-2885 of it -- one complete boot, uptime 14->298 s, sample 0 to
+    275*16384, every row utc_us == 0 -- carry `node` = "nyquist". The floor of that block is
+    38.50 dB and its quiet-time band spread 0.75 dB, inside mach's other fourteen sessions
+    (36.75-39.00 dB, 0.50-1.00 dB) and nowhere near nyquist's four (23.75-26.25 dB, 1.50-16.50
+    dB): whatever hardware stood at mach's position recorded them. The `node` column is NODE_ID,
+    a compile-time #define from tools/gen_secrets.py, so a mid-file identity change means the
+    BINARY changed -- gen_secrets.py:30-31 names the failure verbatim ("copying the file by hand
+    is how a node ends up flashed with another node's identity").
+
+    Without this check `ingest_scene` buckets on the row's own label, so those 276 rows landed in
+    scene/unanchored/nyquist.jsonl.gz. The whole drain holds exactly ONE legitimately unanchored
+    nyquist row, so that partition was 276/277 = 99.6% another node's microphone, and `scene()`
+    walks `unanchored` by default while `scene_matrix()` cannot even switch it off.
+
+    ⚠️FOUR THINGS THAT LOOKED LIKE THIS GUARD AND ARE NOT. (a) `origin` reaches the ledger entry
+    and was never compared to anything. (b) `default_node` does NOT do this job on its own:
+    `scenefile.read_text` consults it only when the node cell is EMPTY, and an S2 row always
+    carries one, so the argument is structurally unreachable for exactly this file. (c)
+    `node_from` is stored on every record and read by nothing outside a test. (d) the ledger
+    assertion `rows == added + duplicate + skipped` still closed -- the rows were MIS-ROUTED, not
+    dropped, which is the loss a conservation check cannot see. That is why the refusal below is
+    counted into `skip_reasons`: the assertion has to keep closing for a reason, not by luck.
+
+    Refusing rather than relabelling is deliberate. The label is evidence that a node was flashed
+    with the wrong identity; rewriting it to the fetch's name would file the rows correctly and
+    destroy the only trace of the flashing error.
+    """
+    if not expect:
+        return None
+    node = row.get("node")
+    if not node or row.get("node_from") != "file":
+        return None            # the name came from `expect` itself: nothing disagrees
+    return None if node == expect else str(node)
+
+
 def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
     frame = binascii.unhexlify(row["frame_hex"])
@@ -274,8 +314,12 @@ class Pool:
         raw = open(path, "rb").read()
         sha = hashlib.sha256(raw).hexdigest()
         read = DF.read_text(raw.decode("utf-8", "replace"), default_node=default_node)
-        recs, bad = [], {}
+        recs, bad, mism = [], {}, {}
         for row in read.rows:
+            wrong = _node_mismatch(row, default_node)
+            if wrong:
+                mism[wrong] = mism.get(wrong, 0) + 1
+                continue
             try:
                 recs.append(_record_from_node_row(row))
             except Exception as e:                       # short frame, bad hex, bad header
@@ -290,13 +334,17 @@ class Pool:
         reasons = dict(read.counts)
         for k, v in bad.items():
             reasons["decode_" + k] = reasons.get("decode_" + k, 0) + v
-        skipped = len(read.skips) + sum(bad.values())
+        if mism:
+            # ONE reason key, not one per name: a garbage file must not be able to grow the
+            # breakdown without bound. The names live in their own field, like decode_errors.
+            reasons["node_mismatch"] = reasons.get("node_mismatch", 0) + sum(mism.values())
+        skipped = len(read.skips) + sum(bad.values()) + sum(mism.values())
         entry = {
             "kind": "dets.csv", "path": os.path.abspath(path), "origin": origin or path,
             "sha256": sha, "bytes": len(raw), "generation": read.generation.name,
             "rows": len(read.rows) + len(read.skips), "decoded": len(recs), "added": added,
             "duplicate": len(recs) - added,
-            "skipped": skipped, "skip_reasons": reasons,
+            "skipped": skipped, "skip_reasons": reasons, "node_mismatch": mism,
             "decode_errors": bad, "schema_version": SCHEMA_VERSION,
         }
         assert entry["rows"] == added + entry["duplicate"] + skipped, entry
@@ -432,7 +480,14 @@ class Pool:
 
         recs: List[Dict[str, Any]] = []
         bad: Dict[str, int] = {}
+        mism: Dict[str, int] = {}
         for row in read.rows:
+            # BEFORE the decode, because a row whose identity is wrong is not a row this file may
+            # contribute no matter how well it decodes. See `_node_mismatch`.
+            wrong = _node_mismatch(row, default_node)
+            if wrong:
+                mism[wrong] = mism.get(wrong, 0) + 1
+                continue
             try:
                 d = SF.decode_row(row)
             except ValueError as e:
@@ -496,12 +551,17 @@ class Pool:
         reasons = dict(read.counts)
         for k, v in bad.items():
             reasons[k] = reasons.get(k, 0) + v
-        skipped = len(read.skips) + sum(bad.values())
+        if mism:
+            reasons["node_mismatch"] = reasons.get("node_mismatch", 0) + sum(mism.values())
+        skipped = len(read.skips) + sum(bad.values()) + sum(mism.values())
         entry = {
             "kind": "scene.csv", "path": os.path.abspath(path), "origin": origin or path,
             "sha256": sha, "bytes": len(raw), "generation": read.generation.name,
             "rows": len(read.rows) + len(read.skips), "decoded": len(recs), "added": added,
             "duplicate": len(recs) - added, "skipped": skipped, "skip_reasons": reasons,
+            # Which OTHER node's name the refused rows carried, and how many. A count in
+            # skip_reasons says the drain refused something; this says a node is flashed wrong.
+            "node_mismatch": mism,
             "decode_errors": bad, "partial_first_line": read.partial_first_line,
             "schema_version": SCHEMA_VERSION,
         }

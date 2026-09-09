@@ -349,7 +349,12 @@ def status_audit(st: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "uptime_s": st.get("uptime_s"),
         "scene": {k: sc.get(k) for k in ("rows", "written", "short_blocks", "write_fail")},
-        "acq": {k: acq.get(k) for k in ("fs_clean_hz", "win_s", "drop_s", "drop_samples")},
+        # fs_used_hz and fs_step_ppm travel with fs_clean_hz on purpose: the estimate alone does
+        # not say whether it was fit to be used. Its step is 16000/fs_win_s ppm, and until the
+        # window reaches FS_TIMEBASE_MIN_WIN_S the node dates its samples with the nominal rate
+        # instead -- fs_used_hz is which of the two actually converted this drain's timestamps.
+        "acq": {k: acq.get(k) for k in ("fs_clean_hz", "win_s", "fs_win_s", "fs_step_ppm",
+                                        "fs_used_hz", "drop_s", "drop_samples", "over_s")},
     }
 
 

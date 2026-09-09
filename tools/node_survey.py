@@ -34,6 +34,47 @@ Two things follow, and neither is fixed by averaging longer.
 The horizontal IS usable, at roughly +/-2 m, which is +/-6 ms of TDoA. Good enough to place nodes
 on a site plan, not good enough to be the last word -- if you can measure the horizontal by hand
 too, do that instead and use this only to check it.
+
+RE-MEASURED 2026-09-08 over 22.3 h (health.csv off both cards, 2661 and 2647 rows, 8 reboots
+apiece). It confirms everything above and settles three questions that were being asked of the
+wrong number:
+
+  * The firmware's RUNNING MEAN is not broken. Recomputed independently against the firmware's
+    own mean_lat/mean_lon it agrees to 0.03 m (nyquist, 10.40 h, n=37,362) and 0.01 m (mach,
+    10.50 h, n=37,496). A "9.96 m anomaly" between a node's mean and its instantaneous fix is the
+    INSTANT wandering, not the mean: over 22.3 h nyquist's 2D scatter is sd 6.08 m (east 4.46,
+    north 4.12, east peak-to-peak 33.96 m) against mach's 3.40 m, and P(instant >= 9.98 m from
+    its own 22.3 h median) is 8.7% on nyquist, 0.2% on mach. Live 15 s polling reproduced a
+    0.45-9.06 m gap on nyquist inside four minutes.
+  * hAcc is optimistic by 3.1x (nyquist) and 3.0x (mach) on this longer run -- same finding as
+    the 7.2 h one, so use observed scatter as sigma, as this tool already does.
+  * THE BASELINE, from hourly block medians over 23 blocks: dE -17.42 m, dN +1.04 m, d = 17.45 m,
+    sd of block medians 2.92 m. 2d/c = 101.6 ms at c = 343.49 m/s (nyquist's own BMP280, 20.11 C).
+    ⚠️sigma_d is between 0.61 m and about 2.1 m and this dataset cannot narrow it further: 0.61 m
+    is 2.92/sqrt(23) if hourly blocks are independent (lag-1 block autocorrelation E -0.031,
+    N +0.367 supports that), 2.1 m is 2.92/sqrt(1.86) if the dominant error is multipath keyed to
+    the 11 h 58 m GPS ground-track repeat, of which 22.3 h contains only 1.86. An earlier write-up
+    of this run quoted 0.76 m, which corresponds to N_eff = 14.8 and is not derivable from either
+    stated input; it is not used here.
+  * ⚠️AND THE CURRENT survey.json DISAGREES WITH THIS RUN. It says mach is at E -16.602, N -0.272
+    (d = 16.60 m) from a 7.2 h run; 22.3 h says dE -17.42, dN +1.04. That is 1.55 m apart with the
+    NORTH COMPONENT FLIPPING SIGN. Both sit inside 2 sigma, so it is not a contradiction -- it is
+    the argument for measuring the horizontal by hand, which is what the paragraph above already
+    says and what nobody has done yet.
+  * The two nodes' errors DO NOT CANCEL. Correlation of 2508 time-matched simultaneous errors
+    (nearest fix within 15 s -- an exact-second join yields only 226 pairs and a different r, so
+    the tolerance has to be stated): r = -0.038 east, -0.022 north, +0.031 up. Observed per-epoch
+    baseline scatter 7.09 m against 7.00 m predicted from fully independent errors, i.e. a
+    cancellation factor of 0.99. There is no differential-GNSS shortcut available between these
+    two receivers over a 17 m baseline; the only ways to shrink sigma_d are a hand measurement or
+    a much longer run.
+
+⚠️pos_n IS NOT A DURATION AND CANNOT BE READ AS ONE. The firmware comments say the count is
+reported "so nobody uses a 12-sample mean as if it were an 8-hour one", but the NAV-PVT rate has
+ranged 1.00 to 9.54 Hz across builds and differed between the two nodes ON THE SAME DAY (nyquist
+4.94 Hz, mach 9.54 Hz at the 2026-09-07 drain; both 1.00 Hz now). n = 18,051 is therefore
+anywhere from 30 minutes to 5 hours, and the two nodes' counts were not comparable to each other
+at all. Read the averaging window from health.csv's uptime span, not from pos_n.
 """
 from __future__ import annotations
 
