@@ -24,6 +24,11 @@ metadata:
       Drains the ESP32-S3 hear nodes into the pooled sketch corpus on the hear-pool PVC.
       Content-addressed and idempotent, so overlapping runs and re-fetched files cost nothing.
 spec:
+  # ⚠️`--phone-corpus /pool/sketch_corpus` IS HALF OF A CROSS-REPO CONTRACT. The other half is
+  # dama-gotchi's dama-sketch-corpus Deployment, whose SKETCH_CORPUS_OUT_DIR writes that same path
+  # on this same hear-pool PVC. It was added to the LIVE object by hand and was in neither this
+  # file nor last-applied-configuration, so the next `kubectl apply -f` of this manifest would have
+  # deleted it and the phone leg would have gone quiet with nothing reporting the loss.
   # Every 15 minutes. The nodes roll dets.csv to dets-prev.csv on reflash, so the window a
   # missed run can lose is bounded well under one boot; the fetch is tens of KB.
   schedule: "*/15 * * * *"
@@ -59,6 +64,7 @@ spec:
                     --pool /pool/corpus \
                     --node nyquist=172.16.100.105 \
                     --node mach=172.16.100.116 \
+                    --phone-corpus /pool/sketch_corpus \
                     --node rankine=172.16.100.50
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py,  subPath: hear__init__.py }
@@ -126,11 +132,23 @@ spec:
               command: ["/bin/sh", "-lc"]
               args:
                 - |
+                  # ⚠️THE EXIT CODE MUST BE --check's, NOT --stats'. This script used to end on
+                  # --stats, which always succeeds, so the shell returned 0 and the CronJob was
+                  # green no matter what --check found. Reproduced: `sh -lc 'false; echo x; true'`
+                  # exits 0. A staleness gate that cannot fail is worse than none -- it is a green
+                  # light nobody checks.
+                  # `set +e` is explicit rather than assumed: if -e is ever added to the command
+                  # line above, `rc=$?` would never run and this silently reverts.
+                  set +e
                   export PYTHONPATH=/pool/pylib:/app
                   python /app/tools/hear_drain.py --pool /pool/corpus --check \
                     --unfetched-window-s 7200
+                  rc=$?
+                  # --stats runs EVEN WHEN THE CHECK FAILED: a failure is exactly when the pool
+                  # summary is wanted. Its own status is discarded so it cannot mask rc.
                   echo "--- pool ---"
-                  python /app/tools/hear_drain.py --pool /pool/corpus --stats
+                  python /app/tools/hear_drain.py --pool /pool/corpus --stats || true
+                  exit "$rc"
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py,  subPath: hear__init__.py }
                 - { name: code, mountPath: /app/hear/sketch.py,    subPath: hear_sketch.py }
