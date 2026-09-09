@@ -17,7 +17,8 @@ def _mel(bands=20, slices=4, seed=1):
     return q, binascii.hexlify(q.tobytes()).decode()
 
 
-def _row(gen, utc, node="nyquist", bands=20, slices=4, seed=1, mel=None):
+def _row(gen, utc, node="nyquist", bands=20, slices=4, seed=1, mel=None,
+         f_lo="300", f_hi="7840"):
     _q, hexs = _mel(bands, slices, seed)
     if mel is not None:
         hexs = mel
@@ -25,7 +26,7 @@ def _row(gen, utc, node="nyquist", bands=20, slices=4, seed=1, mel=None):
         "node": node, "utc_us": str(utc), "uptime_s": "5158", "sample": "81854464",
         "bands": str(bands), "slices": str(slices), "span_ms": "1024", "ref_db4": "251",
         "frames": "64", "fft_us": "18987", "mel_hex": hexs,
-        "f_lo_hz": "300", "f_hi_hz": "7840",
+        "f_lo_hz": f_lo, "f_hi_hz": f_hi,
     }
     return ",".join(vals[c] for c in gen.written)
 
@@ -232,6 +233,149 @@ class TestScenePool:
         pl.ingest_scene(str(b))
         with pytest.raises(ValueError, match="mixed scene geometry"):
             pl.scene_matrix()
+
+    def test_the_matrix_refuses_two_band_axes_at_one_geometry(self, tmp_path):
+        """⚠️THE CASE THAT USED TO RETURN A NUMBER. Both rows are 20x4, so a (bands, slices) key
+        calls them one geometry -- but one was filtered at f_lo 62.5 Hz and the other at 300, so
+        column k is a different frequency in the two and the stacked matrix is a lie about a
+        spectrum. The band edges are what separate them; the shape cannot."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        a = tmp_path / "a.csv"
+        a.write_text(_csv(SF.S2, [_row(SF.S2, 1788813341984000, f_lo="62.5")]))
+        b = tmp_path / "b.csv"
+        b.write_text(_csv(SF.S2, [_row(SF.S2, 1788813343984000, seed=9, f_lo="300")]))
+        pl.ingest_scene(str(a))
+        pl.ingest_scene(str(b))
+        assert pl.scene_stats()["geometry"] == {"20x4@62.5-7840": 1, "20x4@300-7840": 1}
+        with pytest.raises(ValueError, match="band EDGES") as e:
+            pl.scene_matrix()
+        assert "20x4@62.5-7840" in str(e.value) and "20x4@300-7840" in str(e.value)
+
+    def test_the_matrix_refuses_an_undeclared_band_axis(self, tmp_path):
+        """An S0 row carries no f_lo_hz/f_hi_hz at all. It cannot be SHOWN to share an axis with
+        a row that states one, so it is refused rather than assumed to match -- and the message
+        has to say that, not print a bare None."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        a = tmp_path / "a.csv"
+        a.write_text(_csv(SF.S0, [_row(SF.S0, 1788813341984000)]))
+        b = tmp_path / "b.csv"
+        b.write_text(_csv(SF.S2, [_row(SF.S2, 1788813343984000, seed=9)]))
+        pl.ingest_scene(str(a), default_node="nyquist")
+        pl.ingest_scene(str(b))
+        assert pl.scene_stats()["geometry"] == {"20x4@?-?": 1, "20x4@300-7840": 1}
+        with pytest.raises(ValueError, match="UNDECLARED") as e:
+            pl.scene_matrix()
+        assert "20x4@?-?" in str(e.value) and "None" not in str(e.value)
+
+    def test_the_refusal_names_the_SHAPE_when_only_the_shape_differs(self, tmp_path):
+        """⚠️Both rows declare 300-7840, byte-identical. The old message decided by asking whether
+        any edge slot was None rather than what actually differed, so a pure shape change came
+        back blaming the band EDGES -- pointing the reader at the wrong firmware constant."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        for i, (bands, seed) in enumerate(((20, 1), (16, 9))):
+            p = tmp_path / ("s%d.csv" % i)
+            p.write_text(_csv(SF.S2, [_row(SF.S2, 1788813341984000 + i * 2000000,
+                                           bands=bands, seed=seed)]))
+            pl.ingest_scene(str(p))
+        with pytest.raises(ValueError, match="SHAPE") as e:
+            pl.scene_matrix()
+        assert "20x4" in str(e.value) and "16x4" in str(e.value)
+        assert "EDGES" not in str(e.value), "the edges are identical; it must not blame them"
+
+    def test_two_undeclared_axes_differing_only_in_shape_are_named_as_shape(self, tmp_path):
+        """Two S0 rows: neither declares an edge, so the edges are not DIFFERENT, they are equally
+        absent. The difference is the shape, and that is what the message has to say."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        for i, (bands, seed) in enumerate(((20, 1), (16, 9))):
+            p = tmp_path / ("z%d.csv" % i)
+            p.write_text(_csv(SF.S0, [_row(SF.S0, 1788813341984000 + i * 2000000,
+                                           bands=bands, seed=seed)]))
+            pl.ingest_scene(str(p), default_node="nyquist")
+        with pytest.raises(ValueError, match="SHAPE") as e:
+            pl.scene_matrix()
+        assert "UNDECLARED" not in str(e.value), \
+            "both are undeclared, so the undeclared axis is not what differs"
+
+    def test_limit_does_not_disable_the_geometry_guard(self, tmp_path):
+        """⚠️THE GUARD A KEYWORD USED TO SWITCH OFF. `limit` broke out of the loop as soon as it
+        had enough rows, so a limited call over a mixed pool returned a matrix and said nothing
+        about the rows it never looked at -- and the sample it returned was drawn wholly from
+        whichever geometry came first, which the caller has no way to see. The selection is now
+        walked to the end whatever the limit."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        a = tmp_path / "a.csv"
+        a.write_text(_csv(SF.S2, [_row(SF.S2, 1788813341984000 + i * 1000000, seed=i + 1,
+                                       f_lo="62.5") for i in range(3)]))
+        b = tmp_path / "b.csv"
+        b.write_text(_csv(SF.S2, [_row(SF.S2, 1788813351984000, seed=9, f_lo="300")]))
+        pl.ingest_scene(str(a))
+        pl.ingest_scene(str(b))
+        assert pl.scene_stats()["rows"] == 4
+        # limit=2 is satisfied by the first three rows alone; the 4th is the differing one.
+        with pytest.raises(ValueError, match="mixed scene geometry"):
+            pl.scene_matrix(limit=2)
+
+    def test_limit_still_bounds_what_is_built(self, tmp_path):
+        """It bounds the BUILD, not the check: a homogeneous pool still returns `limit` rows."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        p = tmp_path / "h.csv"
+        p.write_text(_csv(SF.S2, [_row(SF.S2, 1788813341984000 + i * 1000000, seed=i + 1)
+                                  for i in range(5)]))
+        pl.ingest_scene(str(p))
+        X, rows = pl.scene_matrix(limit=2)
+        assert X.shape == (2, 80) and len(rows) == 2
+
+    def test_the_geometry_key_does_not_round_two_band_axes_together(self, tmp_path):
+        """⚠️`%g` is 6 significant digits. scene_stats' key is the ONE place a mix of banks is
+        countable without raising, so a key that rounds two edges into one string undercounts
+        distinct geometries exactly where nothing else would notice -- and it would make
+        scene_matrix print the same key twice in a refusal it raised on the exact tuple."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        for i, lo in enumerate(("62.5", "62.50000001")):
+            p = tmp_path / ("g%d.csv" % i)
+            p.write_text(_csv(SF.S2, [_row(SF.S2, 1788813341984000 + i * 2000000,
+                                           seed=i + 1, f_lo=lo)]))
+            pl.ingest_scene(str(p))
+        assert pl.scene_stats()["geometry"] == {"20x4@62.5-7840": 1, "20x4@62.50000001-7840": 1}
+        with pytest.raises(ValueError, match="EDGES") as e:
+            pl.scene_matrix()
+        assert "62.50000001" in str(e.value), "the refusal printed one key for two axes"
+
+    def test_a_zero_limit_returns_nothing_rather_than_everything(self, tmp_path):
+        # ⚠️`if limit and ...` treated 0 as unlimited, so scene_matrix(limit=0) built the WHOLE
+        # pool -- the opposite of what it says, and the docstring promises the limit bounds memory.
+        pl = P.Pool(str(tmp_path / "pool"))
+        pl.ingest_scene(self._write(tmp_path, "s.csv", SF.S2, 6))
+        X, rows = pl.scene_matrix(limit=0)
+        assert X.shape == (0, 0) and rows == []
+        assert pl.scene_matrix(limit=2)[0].shape[0] == 2
+
+    @pytest.mark.parametrize("stated,expect", [("62.5", 62.5), ("0", 0.0), ("", None)])
+    def test_what_the_csv_path_makes_of_an_edge_column(self, tmp_path, stated, expect):
+        """Pins the reachable behaviour: a stated 0 is 0.0, an empty column is undeclared.
+
+        ⚠️This does NOT prove the truthiness fix in `ingest_scene`. The value arrives from CSV as
+        a STRING, and "0" is truthy, so `if row.get(...)` and `if ... not in (None, "")` agree on
+        every input a CSV can produce -- checked for "62.5", "0", "" and absent. The fix only
+        changes a float 0.0, which no CSV path yields. It is kept as stated intent, not sold as a
+        repair, and the test that claimed to prove it passed without it.
+        """
+        pl = P.Pool(str(tmp_path / "pool"))
+        p = tmp_path / "z.csv"
+        row = _row(SF.S2, 1788813341984000).split(",")
+        row[SF.S2.written.index("f_lo_hz")] = stated
+        p.write_text(_csv(SF.S2, [",".join(row)]))
+        pl.ingest_scene(str(p))
+        assert next(iter(pl.scene()))["f_lo_hz"] == expect
+
+    def test_the_refusal_names_the_stated_difference_not_a_shared_absence(self):
+        # Both leave f_hi absent, so the absence is not the difference -- f_lo is.
+        why = P._why_geoms_differ((20, 4, 62.5, None), (20, 4, 300.0, None))
+        assert "EDGES" in why and "UNDECLARED" not in why
+
+    def test_the_refusal_still_says_undeclared_when_that_is_the_difference(self):
+        why = P._why_geoms_differ((20, 4, 62.5, 7812.5), (20, 4, None, None))
+        assert "UNDECLARED" in why
 
     def test_the_matrix_restores_the_reference_level(self, tmp_path):
         pl = P.Pool(str(tmp_path / "pool"))
