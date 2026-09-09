@@ -34,6 +34,19 @@
 
 #if __has_include("secrets.h")
 #include "secrets.h"
+
+// ---- shared platform -------------------------------------------------------------------------
+// firmware/lib/hear_platform. Built with: arduino-cli compile --libraries firmware/lib
+//
+// Thin aliases rather than renaming ~90 call sites, so the extraction reads as "the code moved,
+// nothing else changed". ⚠️THIS BLOCK MUST STAY WITH THE INCLUDES: logf is also math.h's
+// float logf(float), and with the macro further down the file every call ABOVE it resolved to the
+// math one -- "cannot convert const char* to float" at three sites that had never been touched.
+// The original static logf worked everywhere only because Arduino hoists a prototype for it.
+#include <hear_log.h>
+#define logf    hear_logf
+#define logln   hear_logln
+#define log_put hear_log_put
 #endif
 #ifndef WIFI_N                        // no secrets.h -- fall back to the node's own AP
 #define WIFI_N 0
@@ -951,27 +964,6 @@ static char ota_msg[96] = "idle";
 // Every diagnosis tonight -- the 230400/UBX baud scan, the driven-vs-floating pin probes, the I2C
 // scan -- came out of the boot log, which only existed on the USB cable. Once the node is carried
 // somewhere there is no cable, so the log has to be readable over the link that remains.
-#define LOGBUF 6144
-static char logbuf[LOGBUF];
-static volatile size_t log_w = 0;
-static volatile bool log_wrapped = false;
-
-static void log_put(const char *s, size_t n) {
-  for (size_t i = 0; i < n; i++) {
-    logbuf[log_w] = s[i];
-    log_w = (log_w + 1) % LOGBUF;
-    if (log_w == 0) log_wrapped = true;
-  }
-}
-static void logf(const char *fmt, ...) {
-  char b[256]; va_list ap; va_start(ap, fmt);
-  int n = vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
-  if (n < 0) return;
-  if (n > (int)sizeof b - 1) n = sizeof b - 1;
-  Serial.write((const uint8_t *)b, n); log_put(b, n);
-}
-static void logln(const char *s) { logf("%s\n", s); }
-static void logln(const String &s) { logf("%s\n", s.c_str()); }
 
 static void boot_guard() {
   if (boot_magic != BOOT_MAGIC) { boot_magic = BOOT_MAGIC; boot_try = 0; proven_ok = 0; }
@@ -2179,8 +2171,7 @@ void setup() {
   });
   http.on("/log", []() {
     String o;
-    if (log_wrapped) { o.reserve(LOGBUF + 1); for (size_t i = log_w; i < LOGBUF; i++) o += logbuf[i]; }
-    for (size_t i = 0; i < log_w; i++) o += logbuf[i];
+    o = hear_log_text();
     http.send(200, "text/plain", o);
   });
   http.on("/reboot", HTTP_POST, []() {      // POST, so a link prefetcher cannot reboot the node
