@@ -24,13 +24,35 @@ import sys
 import urllib.request
 from typing import Dict, List, Optional, Sequence
 
-TIMEOUT_S = 8.0
+# A node flushing its SD card blocks its HTTP loop for tens of milliseconds, and a mDNS lookup
+# can take a second on its own. 8 s was enough to report mach as UNREACHABLE while it was serving
+# 200s to a plain curl a moment later -- a false negative from the tool meant to decide whether
+# tonight's capture can run.
+TIMEOUT_S = 15.0
+RETRIES = 2
+
+# MEASURED, not assumed: nyquist wrote 2,689,167 B of scene.csv across 8,018 rows = 335 B/row, at
+# one row per 1.024 s. Everything else on the card is bounded or negligible -- the clip budget is a
+# hard 6 MB cap, health.csv runs ~7 KB/h, dets.csv less.
+#
+# ⚠️The first version of this check flagged anything under 200 MB as unable to contribute, on my
+# guess that rankine's 72 MB was "about two hours". It is about sixty. 200 MB is a week of
+# continuous capture, so that threshold condemned a card with days of headroom -- and a tool that
+# cries wolf about tonight's run is worse than no tool.
+SCENE_MB_PER_H = 335 * (3600 / 1.024) / 1e6      # 1.18 MB/h
+NIGHT_H = 14.0                                    # dusk to well past dawn
 
 
 def fetch(node: str) -> Dict:
     url = node if node.startswith("http") else "http://%s.local/status" % node
-    with urllib.request.urlopen(url, timeout=TIMEOUT_S) as r:
-        return json.load(r)
+    last: Optional[Exception] = None
+    for _ in range(RETRIES):
+        try:
+            with urllib.request.urlopen(url, timeout=TIMEOUT_S) as r:
+                return json.load(r)
+        except Exception as e:      # noqa: BLE001 -- one retry, then report the last reason
+            last = e
+    raise last if last else RuntimeError("unreachable")
 
 
 def row(name: str, d: Dict) -> str:
@@ -90,10 +112,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 why.append("fix %d" % d["gps"]["fix"])
             if not d["sd"]:
                 why.append("no SD card")
-            elif isinstance(d.get("sd_free_mb"), int) and d["sd_free_mb"] < 200:
-                why.append("%d MB free" % d["sd_free_mb"])
+            elif isinstance(d.get("sd_free_mb"), int):
+                hours = d["sd_free_mb"] / SCENE_MB_PER_H
+                if hours < NIGHT_H:
+                    why.append("%d MB free = %.1f h of scene rows, short of a night"
+                               % (d["sd_free_mb"], hours))
             if why:
-                print("  %-9s cannot contribute arrivals tonight: %s" % (n, "; ".join(why)))
+                print("  %-9s %s" % (n, "; ".join(why)))
     return 0 if not dead else 1
 
 
