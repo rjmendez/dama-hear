@@ -171,6 +171,15 @@ def worst_bearing(nodes: Sequence, step_deg: float = 5.0, **kw) -> Dict:
     tracks through the coordinate origin and make the verdict depend on where the survey put
     (0,0); sweeping through the centroid only ever tests tracks that pass THROUGH the array, which
     always straddle. Neither is the field case: the round goes past, not through.
+
+    ⚠️`observable` HERE IS TRUE BY CONSTRUCTION AND IS NOT A VERDICT ON THE ARRAY. The probe track
+    sits at the MIDDLE of the band, where the extreme nodes straddle whatever the layout is, so the
+    swing is set by the cone and the shift and not by the geometry: measured over 200 random 3-6
+    node layouts it never fell below 4.27 ms against a 0.05 ms floor, and its maximum is exactly
+    the closed form 2*delta*cos(theta_Mach)/c = 32.2988 ms at delta 6 m, 900 m/s, 20 degC. A gate
+    that cannot fail is not evidence -- the same defect the crack-blast interval bound had.
+    `span_m` is the number that carries the geometry. `swing_outside_band_ms` re-probes one band
+    width outside the band and IS discriminating; `discriminating` reports the contrast.
     """
     worst = None
     for b in np.arange(0.0, 180.0, step_deg):
@@ -179,7 +188,11 @@ def worst_bearing(nodes: Sequence, step_deg: float = 5.0, **kw) -> Dict:
             worst = sp
     mid = 0.5 * (worst["offset_lo"] + worst["offset_hi"])
     r = offset_sensitivity(nodes, worst["bearing_deg"], offset_m=mid, **kw)
-    return dict(worst, max_tdoa_swing_ms=r["max_tdoa_swing_ms"], observable=r["observable"])
+    out_of_band = worst["offset_hi"] + max(10.0, worst["span_m"])
+    r_out = offset_sensitivity(nodes, worst["bearing_deg"], offset_m=out_of_band, **kw)
+    return dict(worst, max_tdoa_swing_ms=r["max_tdoa_swing_ms"], observable=r["observable"],
+                swing_outside_band_ms=r_out["max_tdoa_swing_ms"],
+                discriminating=bool(r["observable"] and not r_out["observable"]))
 
 
 def best_addition(nodes: Sequence, candidates: Sequence,
@@ -189,24 +202,41 @@ def best_addition(nodes: Sequence, candidates: Sequence,
     Reports the median DOP with each candidate added, and whether it lifts the blindest bearing
     above the resolvable floor -- which is usually the one that matters and is not the same as
     improving DOP.
+
+    ACCEPTS A TWO-NODE BASE. That is the question this fleet actually has -- nyquist and mach and
+    a handful of phones -- and dop_grid/worst_bearing both refuse two nodes, so the tool used to
+    raise on its own primary use case. With no base to compare against, `dop_gain` and
+    `worst_span_gain_m` are None rather than a number computed from nothing.
+
+    ⚠️RANKING ON median_dop ALONE PICKS AN UNSOLVABLE ARRAY. dop() is a LOCAL measure: it never
+    sees the discrete mirror twin a collinear array has, so a candidate on the baseline EXTENSION
+    scores a finite and often BEST median DOP while `point.solve` refuses to quote a coordinate at
+    all. Measured on nyquist/mach with candidates 34 m from the centroid: the extension site
+    reports median DOP 34.06 against 58.98 for the perpendicular one, linearity 0.0000 either way
+    a fix consumer would not notice. `collinear` is therefore reported and sorted on FIRST.
     """
-    base_med = dop_grid(nodes, bounds, step)["median"]
-    base_worst = worst_bearing(nodes)["span_m"]
+    have_base = len(nodes) >= 3
+    base_med = dop_grid(nodes, bounds, step)["median"] if have_base else None
+    base_worst = worst_bearing(nodes)["span_m"] if have_base else None
     out = []
     for cand in candidates:
         trial = list(nodes) + [cand]
         g = dop_grid(trial, bounds, step)
         w = worst_bearing(trial)
+        lin = linearity(trial)
         out.append({
             "position": tuple(float(v) for v in np.asarray(cand, float)[:2]),
             "median_dop": g["median"],
-            "dop_gain": base_med - g["median"],
+            "dop_gain": (base_med - g["median"]) if have_base else None,
             "usable_frac": g["usable_frac"],
             "worst_span_m": w["span_m"],
-            "worst_span_gain_m": w["span_m"] - base_worst,
+            "worst_span_gain_m": (w["span_m"] - base_worst) if have_base else None,
             "dof": (len(trial) - 1) - 2,
+            "linearity": lin,
+            # point.solve returns position_observable False below this; the DOP above stays finite.
+            "collinear": bool(lin < COLLINEAR_LINEARITY),
         })
-    out.sort(key=lambda r: r["median_dop"])
+    out.sort(key=lambda r: (r["collinear"], r["median_dop"]))
     return out
 
 
@@ -468,11 +498,32 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     nodes = _parse_points(a.nodes)
-    if len(nodes) < 3:
-        print("need >= 3 nodes"); return 2
+    if len(nodes) < 2:
+        print("need >= 2 nodes"); return 2
     P = np.asarray(nodes, float)
     b = (float(P[:, 0].min() - a.margin), float(P[:, 1].min() - a.margin),
          float(P[:, 0].max() + a.margin), float(P[:, 1].max() + a.margin))
+
+    # A pair has no DOP, no band and no fix -- rank1. The only question it can be asked is where
+    # the next receiver goes, so answer that one and refuse the rest rather than exiting.
+    if len(nodes) == 2:
+        sep = float(np.linalg.norm(P[1, :2] - P[0, :2]))
+        print("nodes      2    baseline %.3f m" % sep)
+        print("           TWO NODES GIVE ONE TDoA: the position Fisher matrix is rank 1, so there")
+        print("           is no DOP, no band, no CEP and no fix at any baseline, SNR or clock.")
+        if not a.candidates:
+            print("           pass --candidates to ask where the THIRD receiver should go")
+            return 2
+        print("\ncandidates for the next node, best first "
+              "(collinear sites sorted last -- point.solve refuses them):")
+        for r in best_addition(nodes, _parse_points(a.candidates), b, max(a.step, 20.0)):
+            print("  (%7.1f,%7.1f)  median DOP %6.2f  thinnest band %6.1f m  linearity %.4f%s"
+                  % (r["position"][0], r["position"][1], r["median_dop"], r["worst_span_m"],
+                     r["linearity"],
+                     "  COLLINEAR: unsolvable, the DOP is a local number that cannot see the "
+                     "mirror twin" if r["collinear"] else ""))
+        return 0
+
     g = dop_grid(nodes, b, a.step)
     dof = (len(nodes) - 1) - 2
 
@@ -489,6 +540,9 @@ def main(argv=None) -> int:
     w = worst_bearing(nodes, v_mps=a.speed, temp_c=a.temp)
     print("thinnest bearing %.0f deg: offset observable only for tracks in a %.1f m band"
           % (w["bearing_deg"], w["span_m"]))
+    print("           in-band swing %.2f ms vs %.3f ms one band width outside it -- the band, not"
+          % (w["max_tdoa_swing_ms"], w["swing_outside_band_ms"]))
+    print("           the swing, is what this layout is worth")
     print()
     print(render(g, nodes))
     print("\n' '=good  '@'=degenerate  'N'=node   north up")
@@ -496,9 +550,10 @@ def main(argv=None) -> int:
     if a.candidates:
         print("\ncandidates for the next node, best first:")
         for r in best_addition(nodes, _parse_points(a.candidates), b, max(a.step, 20.0)):
-            print("  (%7.1f,%7.1f)  median DOP %6.2f (%+.2f)  thinnest band %6.1f m (%+.1f)"
+            print("  (%7.1f,%7.1f)  median DOP %6.2f (%+.2f)  thinnest band %6.1f m (%+.1f)%s"
                   % (r["position"][0], r["position"][1], r["median_dop"], -r["dop_gain"],
-                     r["worst_span_m"], r["worst_span_gain_m"]))
+                     r["worst_span_m"], r["worst_span_gain_m"],
+                     "  COLLINEAR: point.solve refuses this array" if r["collinear"] else ""))
 
     if len(nodes[0]) == 3:
         src = _parse_points(a.source)[0] if a.source else None
