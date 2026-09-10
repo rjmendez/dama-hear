@@ -23,6 +23,7 @@ file was generated and legitimately says `-dirty` in a working tree (the committ
 """
 import os
 import pathlib
+import re
 import sys
 
 import pytest
@@ -94,3 +95,94 @@ def test_the_import_closure_check_still_runs(bundle):
     ns = _gen()
     _app, code, data = ns["BUNDLES"][bundle]
     ns["check"](code, data)      # raises SystemExit if the closure is incomplete
+
+
+# ---------------------------------------------------------------- the pod, not just the map
+
+def _manifest_for(bundle):
+    """`hear-drain-code` -> deploy/k8s/hear-drain.yaml. The workload is the bundle without the
+    `-code` suffix, which is the naming every bundle here already follows."""
+    return ROOT / "deploy" / "k8s" / (bundle[:-len("-code")] + ".yaml")
+
+
+def _code_mounts(text):
+    """{container name: set of subPaths mounted from the `code` volume}.
+
+    ⚠️IT LOCATES `containers:` FIRST RATHER THAN MATCHING `- name:` ANYWHERE. The volume list
+    also spells `- name: code` and `- name: pool`, so a bare `- name:` scan invents two extra
+    "containers" that mount nothing -- and a guard that then required every container to mount
+    every key would fail on them, while one that skipped empty ones would stop noticing a
+    container whose mounts were dropped wholesale. Both failures are avoided by only ever
+    treating something under a `containers:` key as a container.
+    """
+    out, name = {}, None
+    depth = None
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if depth is not None and indent <= depth and not line.lstrip().startswith("-"):
+            depth, name = None, None
+        if re.match(r"\s*containers:\s*$", line):
+            depth, name = indent, None
+            continue
+        if depth is None:
+            continue
+        m = re.match(r"\s*- name: (\S+)\s*$", line)
+        if m and indent > depth:
+            name = m.group(1)
+            out.setdefault(name, set())
+            continue
+        m = re.search(r"name: code,.*subPath: (\S+?)\s*\}", line)
+        if m and name:
+            out[name].add(m.group(1))
+    return out
+
+
+@pytest.mark.parametrize("bundle", sorted(_gen()["BUNDLES"]))
+def test_every_bundle_key_is_mounted_by_every_container_that_uses_it(bundle):
+    """⚠️THE SEAM THAT BREAKS ONLY IN THE CLUSTER, CHECKED FOR EVERY BUNDLE.
+
+    The tests above prove the ConfigMap CONTENT matches the checkout and `gen_configmap.check()`
+    proves the import closure is complete. Neither looks at the pod. The `code` volume mounts
+    file-by-file by `subPath`, so a file added to a bundle without a matching `volumeMount` gives
+    a ConfigMap that HAS the module and a container that raises ModuleNotFoundError on a timer --
+    green generation, green sync test, dead workload.
+
+    ⚠️THIS WALKS `BUNDLES` FOR THE SAME REASON THE CONTENT GUARD ABOVE DOES. The per-manifest
+    copies of this check in tests/test_hear_drain_manifest.py and tests/test_hear_tag.py each
+    name ONE bundle, so hear-score-code had no mount guard at all -- exactly the hardcoding this
+    module's docstring warns about, reintroduced one manifest at a time.
+    """
+    _app, code, data = _gen()["BUNDLES"][bundle]
+    keys = {k for k, _rel in list(code) + list(data)}
+    manifest = _manifest_for(bundle)
+    assert manifest.exists(), "bundle %r has no workload manifest at %s" % (bundle, manifest)
+    mounts = _code_mounts(manifest.read_text())
+    assert mounts, "no containers parsed out of %s" % manifest.name
+    for container, got in sorted(mounts.items()):
+        assert got == keys, (
+            "%s container %r mounts %r but bundle %s ships %r -- the difference is %r, which is "
+            "either a module the pod cannot import or a mount of a key that does not exist"
+            % (manifest.name, container, sorted(got), bundle, sorted(keys),
+               sorted(keys ^ got)))
+
+
+@pytest.mark.parametrize("bundle", sorted(_gen()["BUNDLES"]))
+def test_every_mount_path_matches_the_bundle_path(bundle):
+    """A key mounted at the wrong path imports as a different module, or as none."""
+    by_key = {k: rel for k, rel in list(_gen()["BUNDLES"][bundle][1])
+              + list(_gen()["BUNDLES"][bundle][2])}
+    manifest = _manifest_for(bundle)
+    seen = 0
+    for line in manifest.read_text().splitlines():
+        m = re.search(r"mountPath: (\S+?),\s*subPath: (\S+?)\s*\}", line)
+        if not m:
+            continue
+        path, key = m.groups()
+        assert key in by_key, "%s mounts %r, which is in no bundle" % (manifest.name, key)
+        assert path == "/app/" + by_key[key], (
+            "%s is mounted at %s but bundle %s says %s" % (key, path, bundle, by_key[key]))
+        seen += 1
+    assert seen >= 2 * len(by_key), (
+        "only %d mounts parsed out of %s; the parser missed some" % (seen, manifest.name))

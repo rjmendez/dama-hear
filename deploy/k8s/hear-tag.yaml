@@ -1,0 +1,211 @@
+---
+# ⚠️CREATED SUSPENDED, AND IT STAYS SUSPENDED UNTIL A HUMAN HAS LISTENED. All three of these must
+# hold before `kubectl patch cronjob hear-tag -n dama -p '{"spec":{"suspend":false}}'`:
+#
+#   1. clips/index.jsonl holds >= 300 rows with outcome "stored", across all three nodes, over at
+#      least 3 consecutive days. Below that the corpus cannot show what a normal night looks like.
+#   2. A human has LISTENED to >= 30 of them, including at least one from mach, and written what
+#      they heard into docs/clip-calibration-<date>.md, per node. Three models agreeing on "Dog"
+#      is corroboration, not ground truth, and nobody has yet heard a single clip this fleet
+#      recorded.
+#   3. --max-silence-frac on the check job below is set from the MEASURED distribution in that
+#      calibration set. Until then it stays negative and the gate prints REPORT and does not fire.
+#      A threshold from a guess is the failure this repo names as its own.
+#
+# ⚠️IT TOUCHES THE PVC AND NEVER A NODE. The ESP32 serves one client at a time and REFUSES the
+# rest rather than queueing, so a second workload reaching a node would convert hear-drain's slow
+# run into a refused one. Nothing in this file opens a socket to 172.16.100.x.
+#
+# ⚠️APPLY ONLY THESE TWO FILES:
+#     python3 deploy/k8s/gen_configmap.py hear-tag-code > deploy/k8s/hear-tag-code.yaml
+#     kubectl apply -f deploy/k8s/hear-tag-code.yaml -f deploy/k8s/hear-tag.yaml
+# NEVER `kubectl apply -f deploy/k8s/`. A ConfigMap and a CronJob are both written WHOLE, so a
+# directory apply would also push this branch's hear-drain.yaml over the live drain -- which has
+# already been caught carrying an argument the checked-in file lacked.
+#
+# ⚠️NO PersistentVolumeClaim HERE. `hear-pool` is declared once, in deploy/k8s/hear-drain.yaml.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-tag
+  namespace: dama
+  labels:
+    app: hear-tag
+  annotations:
+    dama-hear/what: >-
+      Runs YAMNet (TFLite, ai-edge-litert) over the clips hear-drain pulled off the cards and
+      appends /pool/corpus/clips/tags.jsonl. Reads clips/index.jsonl, touches no node.
+    dama-hear/what-a-tag-is-not: >-
+      A tag is a MODEL's opinion. It is NOT a species identification (YAMNet has Bird, Owl, Hoot,
+      Chirp and stops), NOT calibrated to this site, NOT confirmed by any human, and NOT usable
+      as a training label -- fitting a scene- or sketch-based model on these targets would
+      reproduce the circular self-labelling that all 35 dama ant models were trained on. Every
+      row carries those as booleans; clips/tag_model_card.json carries the reasoning.
+    dama-hear/unsuspend-gate: >-
+      >=300 stored clips over >=3 days, >=30 of them listened to by a human and written up in
+      docs/clip-calibration-<date>.md including at least one from mach, and --max-silence-frac
+      set from that measured distribution.
+spec:
+  suspend: true
+  # Twice an hour against a drain that runs every 15 minutes. Inference is ~12 ms per clip, so
+  # the cost is pod startup, not the model; --limit and --deadline-s bound the catch-up pass.
+  schedule: "12,42 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 1500
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: hear-tag
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: tag
+              image: python:3.13-slim
+              command: ["/bin/sh", "-lc"]
+              args:
+                - |
+                  set -e
+                  # ⚠️A SEPARATE TARGET DIR FROM THE DRAIN'S /pool/pylib, ON PURPOSE. The tag lane
+                  # pulls ai-edge-litert and its transitive pins; resolving those into the dir the
+                  # drain imports from would let a tagger dependency break the collector that
+                  # feeds it. 146 MB once is cheap insurance.
+                  LIB=/pool/pylib-tag
+                  MODELS=/pool/models/yamnet
+                  export PYTHONPATH="$LIB:/app"
+                  if ! python -c 'import ai_edge_litert,sys; sys.exit(0 if ai_edge_litert.__version__=="2.2.0" else 1)' 2>/dev/null; then
+                    echo "installing ai-edge-litert==2.2.0 into $LIB"
+                    pip install --no-cache-dir --upgrade --target "$LIB" 'ai-edge-litert==2.2.0' 'numpy==2.2.6' >/dev/null 2>&1
+                  fi
+                  python -c 'import ai_edge_litert,numpy; print("litert",ai_edge_litert.__version__,"numpy",numpy.__version__)'
+                  mkdir -p "$MODELS"
+                  # ⚠️FETCHED ONCE, WITH PYTHON, NOT wget OR curl -- neither exists in python:*-slim,
+                  # and a loader that shells out to one of them is a documented reason PANNs was
+                  # refused. The fetch runs only when the pinned digests do not already verify.
+                  if ! python /app/tools/hear_tag.py --model-dir "$MODELS" --verify-weights; then
+                    echo "fetching YAMNet into $MODELS"
+                    python - "$MODELS" <<'PY'
+                  import io, sys, tarfile, urllib.request
+                  d = sys.argv[1]
+                  kaggle = "https://www.kaggle.com/api/v1/models/google/yamnet/tfLite/tflite/1/download"
+                  cmap = ("https://raw.githubusercontent.com/tensorflow/models/"
+                          "dfffd623b6be8d1d9744b8e261fbac370d17c46d/research/audioset/yamnet/"
+                          "yamnet_class_map.csv")
+                  blob = urllib.request.urlopen(kaggle, timeout=300).read()
+                  with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
+                      m = [x for x in tf.getmembers() if x.name.endswith(".tflite")]
+                      if len(m) != 1:
+                          raise SystemExit("archive holds %d .tflite members, expected 1" % len(m))
+                      open(d + "/yamnet.tflite", "wb").write(tf.extractfile(m[0]).read())
+                  open(d + "/yamnet_class_map.csv", "wb").write(
+                      urllib.request.urlopen(cmap, timeout=120).read())
+                  PY
+                  fi
+                  # ⚠️UNCONDITIONAL AND FATAL. The digests are pinned in tools/hear_tag.py, which
+                  # is shipped in this ConfigMap, so the check travels with the code that enforces
+                  # it. A mismatch stops the job; it does not degrade to tagging with whatever is
+                  # on the PVC. Hashing the FILE is the point -- the existing numpy guard in
+                  # hear-drain.yaml tested only that a directory existed, which enforces nothing.
+                  python /app/tools/hear_tag.py --model-dir "$MODELS" --verify-weights
+                  exec python /app/tools/hear_tag.py \
+                    --pool /pool/corpus \
+                    --model-dir "$MODELS" \
+                    --limit 400 \
+                    --deadline-s 600
+              volumeMounts:
+                - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/clips.py,    subPath: hear_clips.py }
+                - { name: code, mountPath: /app/hear/tags.py,     subPath: hear_tags.py }
+                - { name: code, mountPath: /app/tools/hear_tag.py, subPath: tools_hear_tag.py }
+                - { name: pool, mountPath: /pool }
+              resources:
+                # At the namespace LimitRange's per-Container minimum for cpu. Measured RSS is
+                # 82 MB for the interpreter plus the model; the limit covers the pip install too.
+                requests: { cpu: 100m, memory: 256Mi }
+                limits:   { cpu: "1",  memory: 1Gi }
+          volumes:
+            - name: code
+              configMap:
+                name: hear-tag-code
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool
+---
+# ⚠️THE TAGGER'S OWN EXIT STATUS IS NOT A HEALTH SIGNAL. It exits 0 on a run that refused every
+# clip it read -- correctly, because a pruned or evicted clip is a row it read and honestly
+# declined to tag. It also exits 0 on a run that read an EMPTY directory. This job is what a
+# monitor keys on.
+#
+# ⚠️IT MUST NOT KEY ON THE CLASSES. A quiet night is the expected result, and a gate asking "did
+# anything score high" fires on a correct run and stays silent on a broken one. The gates are
+# throughput, refusal buckets, torn lines, the accounting invariant, weight verification and
+# staleness. The class distribution prints under `OBSERVATION, not a gate`.
+#
+# ⚠️--max-silence-frac IS NEGATIVE ON PURPOSE AND THE OUTPUT SAYS "REPORT". Silence-dominated
+# output is the exact signature of normalisation not running -- measured, two real clips at -56.9
+# and -62.1 dBFS return Silence 0.406 and 0.723 raw, and Animal/Cricket and Animal/Wild animals
+# once RMS-normalised to -20 dBFS. So the fraction is worth watching. But the threshold has to
+# come from a measured calibration set, not from a number chosen today, and nobody has yet
+# listened to one clip. Set it in the SAME change that writes docs/clip-calibration-<date>.md.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-tag-check
+  namespace: dama
+  labels:
+    app: hear-tag
+spec:
+  suspend: true
+  schedule: "52 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: hear-tag
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: check
+              image: python:3.13-slim
+              command: ["/bin/sh", "-lc"]
+              args:
+                # ⚠️`set +e`, NOT `set -e`, and the gate's rc is captured before anything else
+                # runs. Runners have been seen delivering -e on the command line where the script
+                # cannot clear it, and a check job whose last command always succeeds is a green
+                # light nobody reads -- hear-drain shipped exactly that bug. The census after it
+                # is `|| true` so a summary failure can neither mask nor manufacture a result.
+                - |
+                  set +e
+                  export PYTHONPATH=/pool/pylib-tag:/app
+                  python /app/tools/hear_tag.py --pool /pool/corpus --check \
+                    --window-s 7200 --max-stale-s 14400 --max-silence-frac -1
+                  rc=$?
+                  echo "--- weights ---"
+                  python /app/tools/hear_tag.py --model-dir /pool/models/yamnet --verify-weights || true
+                  exit "$rc"
+              volumeMounts:
+                - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/clips.py,    subPath: hear_clips.py }
+                - { name: code, mountPath: /app/hear/tags.py,     subPath: hear_tags.py }
+                - { name: code, mountPath: /app/tools/hear_tag.py, subPath: tools_hear_tag.py }
+                - { name: pool, mountPath: /pool }
+              resources:
+                requests: { cpu: 100m, memory: 128Mi }
+                limits:   { cpu: "1",  memory: 512Mi }
+          volumes:
+            - name: code
+              configMap:
+                name: hear-tag-code
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool
