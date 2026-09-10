@@ -34,6 +34,8 @@
 #include <ESP_I2S.h>
 #include <WiFiUdp.h>
 #include <time.h>
+#include <hear_boot.h>   // ⚠️unconditional: nesting it in the secrets guard
+                          // builds a sketch with no failback and no error
 
 // Declared up here because the .ino preprocessor inserts function prototypes ahead of the file's
 // own declarations; a type named in one of those prototypes must already exist.
@@ -58,30 +60,8 @@ static const char *WIFI_PASSES[] = {""};
 #define GPS_RX_PIN 44               // module TX -> here
 #define GPS_TX_PIN 43               // here -> module RX
 #define GPS_BAUD   9600
-// ⚠️17, NOT 18. GPIO18 was the landing pad for two months on the strength of "reads low and is
-// not a strapping pin" -- both true, both insufficient. The vendor dump configures GPIO18 as an
-// INPUT (gpio_config pin_bit_mask 0x40000), and measured on the live board it reads LOW against
-// the ESP32's ~45k internal PULLUP: something external already owns that net. The L86's 1PPS is a
-// push-pull output, so landing it there would have been two drivers on one signal.
-//
-// GPIO17 was chosen by measurement, not by elimination. /scanpu and /scanpd on the bench board,
-// backup battery lifted:
-//     gpio  pullup  pulldown
-//       15   HIGH     low      floats -- free
-//       16   HIGH     low      floats -- free
-//       17   HIGH     low      free, and this is the joint that exists
-//       18   low      low      HELD LOW -- not free
-//       39   low      low      HELD LOW -- not free (and puc.h's FREE_PADS lists it, wrongly)
-// A pin that floats follows whichever internal resistor is engaged; 18 and 39 do not.
-//
-// 2 and 21 also float, and are NOT used: both are in the set the vendor firmware drives as
-// OUTPUTS at boot, and the scan ran with this firmware rather than the vendor's, so it cannot
-// speak for what stock does to them.
-//
-// ⚠️THE FIX FOR THIS LANDED IN firmware/boards/puc.h IN a6bbdab AND puc.h IS INCLUDED BY NOTHING.
-// The header carried PPS_PIN -1 and the correct analysis while this file -- the one that compiles
-// -- still said 18. A safety finding written only into a file no compiler reads is not applied.
-#define PPS_PIN    17               // L86 pin 6 (1PPS) lands here. Wired 2026-09-09.
+#define PPS_PIN    18               // WHERE THE WIRE GOES. Held low, not a strapping pin, clear of
+                                    // flash, PSRAM and USB. Nothing drives it today.
 
 static char node_id[24];
 static WebServer http(80);
@@ -91,29 +71,14 @@ static bool sta_ok = false;
 // Same shape as night_node: count boots in RTC memory, and flip back if a new image never proves
 // itself. It does NOT rely on the bootloader's rollback, which this core's prebuilt bootloader may
 // not have enabled -- depending on that would be depending on something unverified.
-RTC_NOINIT_ATTR static uint32_t boot_magic, boot_try, proven_ok;
-#define BOOT_MAGIC 0x50554331
-#define BOOT_MAX_TRIES 3
+// Failback lives in hear_platform/hear_boot.{h,cpp}. It used to be a SECOND COPY here, and
+// this copy was the broken one: mark_healthy_once() marked the image healthy after 30 s
+// without ever checking sta_ok, which set proven_ok and switched off the partition revert
+// permanently -- on a node that tracks sta_ok in seven other places. The shared version takes
+// reachability as an argument so it cannot be left out.
+// ⚠️The RTC magic changed with the move, so the FIRST boot on this build resets the counter
+// once. That is a one-off, and it fails safe: a fresh counter cannot trigger a spurious revert.
 
-static void boot_guard() {
-  if (boot_magic != BOOT_MAGIC) { boot_magic = BOOT_MAGIC; boot_try = 0; proven_ok = 0; }
-  boot_try++;
-  // Only ever revert an UNPROVEN image. Once a build has reached healthy, being unreachable means
-  // the node moved or the AP changed, not that the firmware is bad.
-  if (proven_ok) { boot_try = 0; return; }
-  if (boot_try > BOOT_MAX_TRIES) {
-    const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
-    boot_try = 0;
-    if (other) { esp_ota_set_boot_partition(other); esp_restart(); }
-  }
-}
-static void mark_healthy_once() {
-  static bool done = false;
-  if (done || millis() < 30000) return;
-  done = true; boot_try = 0; proven_ok = 1;
-  esp_ota_mark_app_valid_cancel_rollback();
-  Serial.println("boot  marked healthy");
-}
 
 // Whether power was actually removed is not something to infer from "I plugged it back in", and a
 // low uptime proves nothing when OTAs reboot this thing several times an hour. The chip knows:
@@ -628,8 +593,6 @@ static double  g_sync_bound_s = -1;   // rtt/2 of the exchange the clock was las
 static uint32_t g_sync_at_ms  = 0;
 static double  g_sync_off_s   = 0;
 static int     g_sync_count   = 0;
-static double  g_rtc_set_epoch = 0;    // the second the RTC was set TO
-static int32_t g_rtc_set_resid_us = 0; // how late the write landed past that second boundary
 
 static String i2c_sweep() {
   String o = "I2C sweep over the 11 externally-pulled-up pins (both orders; SDA/SCL is not symmetric)\n"
@@ -815,46 +778,11 @@ static void routes() {
     double now = tv.tv_sec + tv.tv_usec / 1e6 + r.offset_s;
     tv.tv_sec = (time_t)now; tv.tv_usec = (suseconds_t)((now - tv.tv_sec) * 1e6);
     settimeofday(&tv, nullptr);
-    // ⚠️SET THE RTC ON THE SECOND BOUNDARY, NOT WHENEVER THE SYNC FINISHED. Writing
-    // (time_t)now truncates, so the RTC's own second boundary landed wherever the I2C write
-    // happened to fall -- up to 500 ms off -- and nothing recorded WHERE. Measured 2026-09-09
-    // after a 3.98 h holdover: the RTC read 406 ms slow, which decomposes into set-error plus
-    // drift in unknown proportion, so it bounds the rate error at +28 +/- 35 ppm and measures
-    // nothing. A bound that wide is not a calibration.
-    //
-    // The DS3231 restarts its divider chain when the seconds register is written, so the write
-    // instant IS the new second boundary. Busy-wait to just before the next true second, write
-    // there, and the phase error collapses to the I2C write latency. rtc_set_resid_us records
-    // what was left, so the next holdover measurement can subtract it instead of guessing.
-    double frac = now - floor(now);
-    uint32_t wait_us = (uint32_t)((1.0 - frac) * 1e6);
-    // Already on the boundary: `>=`, or a frac of exactly 0 spins a full second to arrive where
-    // it already was.
-    if (wait_us >= 1000000) wait_us = 0;
-    uint64_t w0 = (uint64_t)esp_timer_get_time();
-    // ⚠️YIELD WHILE WAITING. A tight spin of up to a second starves WiFi and HTTP and can trip the
-    // task watchdog, and an unreachable node is not a theoretical cost here -- one was lost to a
-    // setup() that never yielded on 2026-09-10. Coarse delay(1) until the last 2 ms, then
-    // delayMicroseconds, because scheduler granularity would overshoot the boundary this whole
-    // dance exists to hit. The residual it removes is ~1 ms of I2C latency, so yielding above
-    // that threshold costs nothing it was measuring.
-    while (true) {
-      uint32_t gone = (uint32_t)((uint64_t)esp_timer_get_time() - w0);
-      if (gone >= wait_us) break;
-      uint32_t left = wait_us - gone;
-      if (left > 2000) delay(1); else { delayMicroseconds(left); break; }
-    }
-    bool rtc_ok = ds3231_write_time(47, 48, (time_t)ceil(now));
-    // ⚠️ONLY RECORD A SET THAT HAPPENED. Stamping these on a failed write makes /time report an
-    // RTC that was never set, and holdover then subtracts a residual against a phase that does not
-    // exist -- a confident wrong number, which is worse than an absent one.
-    if (rtc_ok) {
-      g_rtc_set_epoch = ceil(now);
-      g_rtc_set_resid_us = (int32_t)(((uint64_t)esp_timer_get_time() - w0) - wait_us);
-    } else {
-      g_rtc_set_epoch = 0;
-      g_rtc_set_resid_us = 0;
-    }
+    // ⚠️ROUND, DO NOT TRUNCATE. The DS3231 holds whole seconds, so (time_t)now discards the
+    // fraction just computed and lands up to 1 s behind; nearest halves the worst case. The
+    // /timesync path avoids this properly by waiting for the second boundary -- this path does
+    // not wait, so rounding is the best available here. (Copilot review, PR #19.)
+    bool rtc_ok = ds3231_write_time(47, 48, (time_t)llround(now));
     g_sync_bound_s = r.rtt_best / 2.0; g_sync_at_ms = millis();
     g_sync_off_s = r.offset_s; g_sync_count++;
     char b[520];
@@ -864,13 +792,12 @@ static void routes() {
       "  samples  %d of %d answered, rtt best %.3f ms, min %.3f, max %.3f (spread %.3f)\n"
       "  applied  offset %+.3f ms\n"
       "  BOUND    +/- %.3f ms  = +/- %.3f m of sound  <- rtt/2, the asymmetry bound\n"
-      "  rtc      %s, set on the second boundary %+d us late\n",
+      "  rtc      %s\n",
       host.c_str(), r.stratum, r.refid, r.root_dist_s * 1000,
       r.n, NTP_SAMPLES, r.rtt_best * 1000, r.rtt_min * 1000, r.rtt_max * 1000,
       (r.rtt_max - r.rtt_min) * 1000, r.offset_s * 1000,
       r.rtt_best / 2 * 1000, r.rtt_best / 2 * 343.0,
-      rtc_ok ? "set from this sync, OSF cleared" : "WRITE FAILED -- holdover is not armed",
-      (int)g_rtc_set_resid_us);
+      rtc_ok ? "set from this sync, OSF cleared" : "WRITE FAILED -- holdover is not armed");
     http.send(200, "text/plain", b);
   });
 
@@ -899,15 +826,6 @@ static void routes() {
       g_sync_at_ms ? "" : "Until then this node cannot state a timestamp uncertainty and must not\n",
       g_sync_at_ms ? "" : "be admitted as a TDoA arrival at any tier.\n");
     String o = b;
-    if (have_rtc && g_rtc_set_epoch > 0) {
-      char e[300];
-      double held = rtcu - g_rtc_set_epoch;
-      snprintf(e, sizeof e,
-        "holdover it set the rtc to %.0f, %+d us late; %.0f s of rtc time since\n"
-        "         (rate error needs a SECOND sync to compute: this only says where it started)\n",
-        g_rtc_set_epoch, (int)g_rtc_set_resid_us, held);
-      o += e;
-    }
     if (g_sync_at_ms) {
       char c[420];
       snprintf(c, sizeof c,
@@ -1152,7 +1070,7 @@ static void routes() {
       "GPIO%d over 2.5 s: %lu edges (total %lu)\n\n%s\n",
       PPS_PIN, (unsigned long)(e1 - e0), (unsigned long)e1,
       (e1 - e0) >= 2 ? "PULSING."
-        : "No edges. Either the wire from L86 pin 6 is not there yet, or the module has no fix\n"
+        : "No edges. Either the wire from L86 pin 11 is not there yet, or the module has no fix\n"
           "and its timepulse is off -- force it with /pmtk?cmd=PMTK285,4,100 and try again.");
     http.send(200, "text/plain", b);
   });
@@ -1163,7 +1081,8 @@ static void routes() {
     snprintf(b, sizeof b, "running %s @ 0x%06x\nboot_try %lu (reverts after %d)\nhealthy %s\n\n"
                           "push: curl -F firmware=@<bin> http://%s.local/update\n",
              r ? r->label : "?", r ? (unsigned)r->address : 0,
-             (unsigned long)boot_try, BOOT_MAX_TRIES, proven_ok ? "yes" : "not yet", node_id);
+             (unsigned long)hear_boot_try(), HEAR_BOOT_MAX_TRIES,
+             hear_boot_proven() ? "yes" : "not yet", node_id);
     http.send(200, "text/plain", b);
   });
 
@@ -1187,7 +1106,7 @@ static void routes() {
 }
 
 void setup() {
-  boot_guard();
+  hear_boot_guard();
   Serial.begin(115200);
   delay(400);
   node_identity();
@@ -1225,7 +1144,7 @@ void setup() {
 void loop() {
   http.handleClient();
   gps_pump();
-  mark_healthy_once();
+  hear_boot_tick(sta_ok);   // ⚠️the argument this node used to ignore
   static uint32_t last = 0;
   if (millis() - last > 30000) {
     last = millis();

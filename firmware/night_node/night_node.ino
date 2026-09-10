@@ -27,6 +27,7 @@
 #include <Update.h>
 #include "esp_ota_ops.h"
 #include "esp_task_wdt.h"
+#include <hear_boot.h>
 #include "mel16.h"
 #include "mel_scene.h"
 #include "esp_heap_caps.h"
@@ -1091,27 +1092,13 @@ static int sd_cs = 0;
 static uint32_t boot_ms = 0;
 
 // ---------------------------------------------------------------- OTA + failback
-// Failback does NOT rely on the bootloader's rollback feature: this core ships a prebuilt
-// bootloader and I could not confirm CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE is set, so depending on
-// it would be depending on something unverified. Instead the app counts its own boots in RTC
-// memory, which survives a reset. Three boots without reaching healthy and it flips the boot
-// partition back itself.
-//
-// ⚠️What this CANNOT save you from: a build that faults before setup() runs -- a bad global
-// constructor, say -- because nothing then increments the counter. That case still needs USB.
-// The counter is incremented as the first statement of setup() to shrink that window to almost
-// nothing.
-#define BOOT_MAGIC 0xB0074A11UL
-#define BOOT_MAX_TRIES 3
-#define HEALTHY_AFTER_MS 30000
-#define UNHEALTHY_REBOOT_MS 90000     // boots fine but never becomes reachable -> force a reboot
+// Moved to hear_platform/hear_boot.{h,cpp}. It lived here AND in puc_node.ino, and the copies had
+// drifted: puc_node's mark_healthy_once() marked an image healthy after 30 s without checking
+// whether the node was reachable, which sets proven_ok and disables its own partition revert for
+// good. hear_boot_tick() takes reachability as a PARAMETER so that omission is not expressible.
 #ifndef BUILD_TAG
 #define BUILD_TAG "A"
 #endif
-RTC_NOINIT_ATTR static uint32_t boot_magic;
-RTC_NOINIT_ATTR static uint32_t boot_try;
-RTC_NOINIT_ATTR static uint32_t proven_ok;   // this image reached healthy at least once
-static bool marked_healthy = false;
 static char ota_msg[96] = "idle";
 
 // ---------------------------------------------------------------- log ring
@@ -1119,24 +1106,6 @@ static char ota_msg[96] = "idle";
 // scan -- came out of the boot log, which only existed on the USB cable. Once the node is carried
 // somewhere there is no cable, so the log has to be readable over the link that remains.
 
-static void boot_guard() {
-  if (boot_magic != BOOT_MAGIC) { boot_magic = BOOT_MAGIC; boot_try = 0; proven_ok = 0; }
-  boot_try++;
-  // ⚠️Only ever revert an UNPROVEN image. Once this build has reached healthy, being unreachable
-  // means the node moved, the AP changed, or the weather did -- not that the firmware is bad.
-  // Without this, carrying the node out of WiFi range for three boots would roll back a working
-  // image, which is the failback doing real harm in the name of safety.
-  if (proven_ok) { boot_try = 0; return; }
-  if (boot_try > BOOT_MAX_TRIES) {
-    const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
-    boot_try = 0;
-    if (other && esp_ota_set_boot_partition(other) == ESP_OK) {
-      logf("\nBOOT GUARD: %d boots without reaching healthy -- reverting to %s\n",
-                    BOOT_MAX_TRIES, other->label);
-      Serial.flush(); delay(200); esp_restart();
-    }
-  }
-}
 
 // ⚠️A HANG IN setup() DEFEATS THE FAILBACK ABOVE COMPLETELY, and that is not theoretical: rankine
 // was lost to it on 2026-09-10 after a 48 kHz PDM flash. boot_guard() counts RESETS and
@@ -1155,21 +1124,6 @@ static void boot_wdt_arm(uint32_t ms) {
 }
 static void boot_wdt_disarm() { esp_task_wdt_delete(NULL); }
 
-static void mark_healthy_once() {
-  // An image that runs happily but never joins WiFi cannot be recovered over the air and will
-  // never reboot on its own, so the boot counter never advances. Force it: unreachable for long
-  // enough is a failed boot, and three of those revert the partition.
-  if (!marked_healthy && !proven_ok && millis() - boot_ms > UNHEALTHY_REBOOT_MS) {
-    logln("boot  never became reachable -- rebooting so the failback counter advances");
-    Serial.flush(); delay(200); esp_restart();
-  }
-  if (marked_healthy || millis() - boot_ms < HEALTHY_AFTER_MS) return;
-  if (!sta_ok) return;                       // healthy MUST include "reachable", or a node that
-  marked_healthy = true;                     // boots into a corner cannot be recovered over the air
-  boot_try = 0; proven_ok = 1;               // this image has earned the benefit of the doubt
-  esp_ota_mark_app_valid_cancel_rollback();  // harmless if the bootloader ignores it
-  logln("boot  marked healthy; failback counter cleared");
-}
 static float env_peak_seen = 0;
 
 // ppm error of the ESP32's own oscillator against GPS. esp_timer should advance exactly 1e6 us
@@ -2305,11 +2259,11 @@ static void gps_bringup() {
 }
 
 void setup() {
-  boot_guard();                    // first statement: a later fault still counts as a failed boot
+  hear_boot_guard();                    // first statement: a later fault still counts as a failed boot
   Serial.begin(115200);
   delay(1500);
   boot_ms = millis();
-  logf("boot  attempt %lu on partition %s\n", (unsigned long)boot_try,
+  logf("boot  attempt %lu on partition %s\n", (unsigned long)hear_boot_try(),
                 esp_ota_get_running_partition()->label);
   node_identity();          // before anything logs or joins: the id names the log and the AP
   logf("\n=== dama-hear night node %s (%s) fw %s ===\n", node_id, NODE_CLASS, FW_BUILD);
@@ -2427,8 +2381,8 @@ void setup() {
     snprintf(b, sizeof b,
       "build     " BUILD_TAG "\nrunning   %s @ 0x%06lx\nboot_try  %lu (reverts after %d)\nhealthy   %s\n"
       "img_state %d\nlast ota  %s\n\npush:  curl -F firmware=@<bin> http://<ip>/update\n",
-      run->label, (unsigned long)run->address, (unsigned long)boot_try, BOOT_MAX_TRIES,
-      marked_healthy ? "yes" : "not yet", (int)st, ota_msg);
+      run->label, (unsigned long)run->address, (unsigned long)hear_boot_try(), HEAR_BOOT_MAX_TRIES,
+      hear_boot_marked() ? "yes" : "not yet", (int)st, ota_msg);
     http.send(200, "text/plain", b);
   });
   http.on("/log", []() {
@@ -3461,7 +3415,7 @@ void loop() {
     if (millis() - retry > 15000) { retry = millis(); WiFi.reconnect(); }
   }
 
-  mark_healthy_once();
+  hear_boot_tick(sta_ok);          // reachability is the sketch's to answer, not the library's
 
   static uint32_t last = 0;
   if (millis() - last > 30000) {
