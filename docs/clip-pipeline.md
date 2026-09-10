@@ -372,13 +372,17 @@ The microphone runs at `FS_ACQ` (48 kHz) and everything downstream of the decima
 | consumer | rate | why |
 |---|---|---|
 | clips (`praw`, WAV) | 48 kHz | the most band this mic can legally be clocked for; Perch v2 resamples from it |
-| scene, sketch, gate, dets, timebase | 16 kHz | the mel banks are generated tables with 16000.0f baked in |
+| **sketch** (`mel_impulse.h`, `aring`) | **48 kHz** | every phone in the fleet emits 48 kHz; the node was the last 16 kHz emitter |
+| scene, gate, dets, timebase | 16 kHz | `mel_scene.h` is the axis of the stored scene corpus and does not move |
 
-⚠️**A bare `FS_NOMINAL` bump would have compiled clean and corrupted the corpus.** `mel16.h` and
-`mel_scene.h` hardcode `16000.0f`; running the FFT on audio at any other rate attributes every band
-to the wrong frequency while the CSV keeps declaring `f_lo_hz=62.5, f_hi_hz=7812.5`. `hear/pool.py`
-refuses to pool across band axes, but it keys on the *declared* axis — which would not have changed.
-Two `static_assert`s now tie the banks to `FS_NOMINAL`, and they were verified to fire.
+⚠️**A bare `FS_NOMINAL` bump would have compiled clean and corrupted the corpus.** `mel_impulse.h`
+and `mel_scene.h` each hardcode a rate; running the FFT on audio at any other rate attributes every
+band to the wrong frequency while the CSV keeps declaring `f_lo_hz=62.5, f_hi_hz=7812.5`.
+`hear/pool.py` refuses to pool across band axes, but it keys on the *declared* axis — which would
+not have changed. Two `static_assert`s tie the banks to their rates — `MELIMP_FS == FS_ACQ` and
+`MELS_FS == FS_NOMINAL` — and they were verified to fire. They name **different** symbols on
+purpose: one assert covering both banks would have to pick a rate, and picking either one makes
+the other bank's guard a lie that still compiles.
 
 **The filter is measured, not assumed.** `firmware/gen_decim.py` emits `decim.h`; the numbers are
 taken from the **quantised** taps, because the float design and the int16 filter that runs on the

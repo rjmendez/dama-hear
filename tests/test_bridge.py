@@ -798,14 +798,24 @@ class TestEmptyIsNotSuccess:
 
 
 class TestFirmwareConstantsDoNotDrift:
-    """NODE_BANDS/FRAMES/HOP/NFFT and NODE_MAX_DUR_S are COPIES of firmware constants, and a copy
-    drifts. Bands and frames are on the wire, so a frame of another shape decodes to another shape
-    and span_ms goes honestly null. HOP and NFFT are NOT on the wire: edit MEL16_HOP alone and
-    to_record still calls the geometry `known`, and feature_span_ms goes quietly wrong by exactly
-    the edit. Nothing inside the module can see that, so this is the detector."""
+    """NODE_BANDS/FRAMES and NODE_MAX_DUR_S are COPIES of firmware constants, and a copy drifts.
+    Bands and frames are on the wire, so a frame of another shape decodes to another shape and
+    span_ms goes honestly null. Hop and nfft are NOT copied here any more (D8): feature_span_ms
+    reads SK.HOP_S/SK.NFFT straight from hear.sketch, so there is nothing left in this module for
+    a firmware edit to leave stale -- the risk that remains is passing feature_span_ms the WRONG
+    fs, and that is what test_the_span_... below proves against, for both rates the fleet has.
+
+    ⚠️THIS CLASS USED TO POINT AT firmware/night_node/mel16.h, WHICH IS GONE (D1: the night_node
+    bank was renamed mel_impulse.h / MELIMP_ when it moved to 48 kHz, precisely so a stale
+    reference to the old name fails loudly -- FileNotFoundError -- instead of reading a real,
+    valid, WRONG-RATE header and passing green. That FileNotFoundError firing here, once, on this
+    change, was this guard doing its job; the fix is to point it at the new file and check the
+    new rate, not to make it tolerant of either."""
 
     ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    MEL16 = os.path.join(ROOT, "firmware", "night_node", "mel16.h")
+    IMPULSE = os.path.join(ROOT, "firmware", "night_node", "mel_impulse.h")
+    PATH_TEST = os.path.join(ROOT, "firmware", "path_test", "mel16.h")
+    BOARD = os.path.join(ROOT, "firmware", "boards", "xiao_s3_sense.h")
     INO = os.path.join(ROOT, "firmware", "night_node", "night_node.ino")
 
     @staticmethod
@@ -816,24 +826,78 @@ class TestFirmwareConstantsDoNotDrift:
         assert m, "%s is not #defined in %s any more; this copy is now unanchored" % (name, path)
         return m.group(1).rstrip("f")
 
-    def test_the_impulse_geometry_still_matches_mel16_h(self):
-        d = lambda n: int(self._define(self.MEL16, n))            # noqa: E731
-        assert (BR.NODE_BANDS, BR.NODE_FRAMES) == (d("MEL16_BANDS"), d("MEL16_FRAMES"))
-        assert (BR.NODE_HOP, BR.NODE_NFFT) == (d("MEL16_HOP"), d("MEL16_NFFT"))
-        assert BR.NOMINAL_FS == float(self._define(self.MEL16, "MEL16_FS"))
+    def test_the_impulse_geometry_still_matches_the_compiled_bank(self):
+        d = lambda n: int(self._define(self.IMPULSE, n))          # noqa: E731
+        assert (BR.NODE_BANDS, BR.NODE_FRAMES) == (d("MELIMP_BANDS"), d("MELIMP_FRAMES"))
+        # NOMINAL_FS converts a DECIMATED `sample` index; LEGACY_NODE_FS guesses a rate-unstated
+        # sketch's rate. Both are the board's FS_NOMINAL -- two names, one number, on purpose (D8).
+        fs_nominal = float(self._define(self.BOARD, "FS_NOMINAL"))
+        assert BR.NOMINAL_FS == fs_nominal
+        assert BR.LEGACY_NODE_FS == fs_nominal
+        # And the impulse bank itself must NOT be at that rate any more -- it is the one thing
+        # this whole change moves.
+        assert float(self._define(self.IMPULSE, "MELIMP_FS")) == fs_nominal * int(
+            self._define(self.INO, "DECIM"))
 
     def test_the_span_this_module_reports_is_the_span_the_firmware_fetches(self):
-        # night_node.ino: `uint32_t back = MEL16_NFFT + (MEL16_FRAMES - 1) * MEL16_HOP + 32;`
-        # -- 736 samples, of which 32 is guard and 704 is span. 704 / 16000 * 1000 = 44.0 ms.
-        nfft = int(self._define(self.MEL16, "MEL16_NFFT"))
-        hop = int(self._define(self.MEL16, "MEL16_HOP"))
-        frames = int(self._define(self.MEL16, "MEL16_FRAMES"))
-        fs = float(self._define(self.MEL16, "MEL16_FS"))
+        # night_node.ino: `#define SKETCH_SPAN (MELIMP_NFFT + (MELIMP_FRAMES - 1) * MELIMP_HOP)`.
+        # No +32 guard term any more -- the ring fetch IS the span (D2/D4 replaced the old
+        # over-fetch with an exact readiness test) -- so this is the rate-agnostic property with
+        # nothing subtracted off either side, checked against the header that is actually built
+        # into a night_node: mel_impulse.h, at its own (48 kHz) rate.
+        nfft = int(self._define(self.IMPULSE, "MELIMP_NFFT"))
+        hop = int(self._define(self.IMPULSE, "MELIMP_HOP"))
+        frames = int(self._define(self.IMPULSE, "MELIMP_FRAMES"))
+        fs = float(self._define(self.IMPULSE, "MELIMP_FS"))
         span_samples = nfft + (frames - 1) * hop
-        assert (span_samples, span_samples + 32) == (704, 736)
-        assert BR.feature_span_ms(frames) == pytest.approx(span_samples / fs * 1000.0, abs=1e-9)
-        assert BR.feature_span_ms(BR.NODE_FRAMES) == 44.0
+        assert BR.feature_span_ms(frames, fs) == pytest.approx(
+            span_samples / fs * 1000.0, abs=1e-9)
+
+        # THE SAME CALL, both rates the fleet actually writes: a legacy/16 kHz frame (path_test's
+        # bank, and every node before this move) and a current 48 kHz one. Fails against a version
+        # of feature_span_ms that re-pins its formula to one configuration -- e.g. hardcoding the
+        # 48 kHz numbers this test's first assertion just checked -- because that would still pass
+        # the first assertion and fail one of these two.
+        assert BR.feature_span_ms(BR.NODE_FRAMES, 16000.0) == 44.0
+        assert BR.feature_span_ms(BR.NODE_FRAMES, 48000.0) == pytest.approx(33.333, abs=0.001)
+        # path_test's own compiled bank names the legacy rate explicitly, rather than trusting the
+        # literal 16000.0 above to still be what that file says.
+        assert BR.feature_span_ms(BR.NODE_FRAMES, float(
+            self._define(self.PATH_TEST, "MEL16_FS"))) == 44.0
+
+        # A row whose frame does not state a rate (predates the fs code, or SK.fs_code() cannot
+        # name it) falls back to LEGACY_NODE_FS -- still 44.0 ms, which is the whole fleet's
+        # history before this move.
         assert BR.to_record(_row(), NODE)["feature"]["span_ms"] == 44.0
+
+    def test_the_column_and_the_frame_agree_on_four_milliseconds(self):
+        """D6: dets.csv's `sketch_back` column is NOT renamed when its unit changes (64 decimated
+        samples on a legacy row, 192 acquisition samples on a current one) -- tools/hear_bridge.py
+        does not even read that column (see DETS_COLUMNS), so the unit has to be recoverable from
+        the rest of the SAME row instead: the row's own frame_hex states its rate (flags bits
+        8-11), and sketch_back / that rate is SKETCH_BACK_S regardless of which row it is.
+
+        Proved against the firmware's own SKETCH_BACK_S and the value night_node.ino currently
+        writes to the column (SKETCH_BACK, derived per sketch_domain.h's sk_back_acq_len -- see
+        tests/test_firmware_sketch_domain.py::test_the_back_off_is_derived_from_time_not_from_the_hop
+        for that derivation itself), plus the legacy pairing every stored row before this move
+        used. Fails against a firmware that writes an acquisition-domain sketch_back but a frame
+        whose flags still claim the decimated rate, or vice versa -- exactly the mismatch a G6
+        column rename would have been catching, without paying for a G6 column rename."""
+        back_s = float(self._define(self.INO, "SKETCH_BACK_S"))
+        fs_nominal = float(self._define(self.BOARD, "FS_NOMINAL"))
+        fs_acq = fs_nominal * int(self._define(self.INO, "DECIM"))
+        # SKETCH_BACK == MELIMP_HOP at this rate is a coincidence (D5), not asserted equal in C
+        # on purpose -- so this is derived from SKETCH_BACK_S x fs_acq, the way the firmware does.
+        sketch_back_acq = round(back_s * fs_acq)
+
+        for sketch_back, fs in ((sketch_back_acq, fs_acq),   # what a row writes today
+                                (64, fs_nominal)):            # what every row wrote before
+            q = _q()
+            raw = SK.pack(0, 0.0, 0, q, fs=fs, layout=SK.LAYOUT_FIXED)
+            u = SK.unpack(raw)
+            assert u["fs_hz"] == fs, "SK.pack/unpack did not round-trip this rate"
+            assert sketch_back / u["fs_hz"] == pytest.approx(back_s, abs=1e-12)
 
     def test_the_pointer_clamp_is_the_limit_the_node_actually_serves(self):
         # A pointer promising more than AUDIO_MAX_S comes back short with no error.

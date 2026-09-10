@@ -100,7 +100,19 @@ class Record:
         return self.q.astype(float) / 2.0 + self.ref_db
 
     def band_edges_hz(self) -> Optional[np.ndarray]:
-        return None if self.fs_hz is None else SK.band_edges_hz(self.fs_hz, self.bands)
+        """⚠️THE LAYOUT IS PART OF THE ANSWER. This accessor's whole job is "do two frames mean
+        the same frequencies", and it used to answer from the NYQUIST axis whatever the record's
+        own layout said: for a fixed-layout 16 kHz node frame -- every node sketch in the stored
+        history -- it returned a 7840.0 Hz top edge where the frame itself states 20000.0, so two
+        frames that ARE on one axis compared as different. It read correct at 48 kHz only because
+        the two layouts coincide above LAYOUT_EQUIVALENT_ABOVE_HZ.
+
+        Defaults to NYQUIST, not FIXED: a record that states no axis must not be assumed onto the
+        shared one."""
+        if self.fs_hz is None:
+            return None
+        return SK.band_edges_hz(self.fs_hz, self.bands,
+                                layout=self.extra.get("layout", SK.LAYOUT_NYQUIST))
 
     @property
     def utc_trusted(self) -> Optional[bool]:
@@ -294,7 +306,10 @@ def aligned_matrix(records: Iterable[Record], mode: str = "db",
     if mode not in ("db", "q"):
         raise ValueError("mode must be 'db' or 'q'")
     recs = [r for r in records if r.fs_hz is not None]
-    bad = [r for r in recs if r.extra.get("layout", SK.LAYOUT_FIXED) != SK.LAYOUT_FIXED]
+    # ⚠️ABSENT DEFAULTS TO NYQUIST, i.e. to REFUSED -- the same rule Record.band_edges_hz() and
+    # classify.score_sketch() apply. Defaulting a missing key to FIXED walked an axis-less record
+    # straight through the refusal below, which is the one thing this function exists to do.
+    bad = [r for r in recs if r.extra.get("layout", SK.LAYOUT_NYQUIST) != SK.LAYOUT_FIXED]
     if bad:
         raise ValueError(
             "%d record(s) use the %r layout, whose band edges are rescaled per rate; they cannot "

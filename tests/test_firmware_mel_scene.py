@@ -1,5 +1,6 @@
-"""The SCENE bank's identity. mel16.h has had a regeneration test since it shipped; mel_scene.h
-has had nothing, and it is the bank every one of the 41,507 corpus scene rows was filtered with.
+"""The SCENE bank's identity. The IMPULSE sketch banks have had a regeneration test since they
+shipped; mel_scene.h has had nothing, and it is the bank every one of the 41,507 corpus scene
+rows was filtered with.
 
 ⚠️WHY A TEST RATHER THAN A COMMENT. The scene bank's axis was pinned by nothing: gen_mel_scene.py
 took `layout` and `f_hi` from hear.sketch's module-level defaults by omission, so flipping
@@ -19,7 +20,7 @@ two banks can share all four edges and differ in the WEIGHTS between them. That 
 the byte-exact regeneration test below covers. Neither is complete alone.
 
 There is no ESP32 toolchain in CI, so this reads the generated header, exactly as
-tests/test_firmware_mel16.py does.
+tests/test_firmware_mel_banks.py does.
 """
 import pathlib
 import re
@@ -33,7 +34,7 @@ from hear import sketch as SK
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCENE_H = ROOT / "firmware" / "night_node" / "mel_scene.h"
-MEL16_H = ROOT / "firmware" / "night_node" / "mel16.h"
+IMPULSE_H = ROOT / "firmware" / "night_node" / "mel_impulse.h"
 GEN = ROOT / "firmware" / "gen_mel_scene.py"
 
 # ⚠️LITERAL ON PURPOSE. Importing these from SK would make the test agree with whatever SK says
@@ -166,11 +167,38 @@ def test_regenerating_the_header_reproduces_it_byte_for_byte(tmp_path):
 
 
 def test_the_scene_bank_is_not_the_detection_bank():
-    """Band k on a scene row and band k on a sketch frame are different frequencies. They overlap
-    (scene band 2 is bins 5-8, detection band 0 is bins 5-10, sharing four bins) but no band of
-    one IS a band of the other, so nothing may stack a scene row with a sketch frame."""
-    scene = _pairs(SCENE_H, "MELS")
-    det = _pairs(MEL16_H, "MEL16")
-    shared = set(scene) & set(p for p in det if p != (0, 0))
-    assert not shared, "these (first bin, bin count) pairs occur in BOTH banks: %s" % sorted(shared)
-    assert scene[2][0] == det[0][0], "the overlap this test is bounding has moved; re-read both banks"
+    """Band k on a scene row and band k on a sketch frame are not the same measurement, so nothing
+    may stack a scene row with a sketch frame.
+
+    ⚠️THIS CAN NO LONGER BE DECIDED IN BINS. The banks used to share a rate, so an equal
+    (first bin, bin count) pair meant an equal band and the test was a set intersection. The sketch
+    bank moved to FS_ACQ and the scene bank did not, so a bin index now means 187.5 Hz on one and
+    62.5 Hz on the other: bins (9, 5) occur in BOTH banks and are 562.5-843.75 Hz on the scene row
+    against 1687.5-2531.25 Hz on the sketch frame. Comparing bins would now pass for the wrong
+    reason. The comparison is in Hz, and where a span DOES coincide -- scene bins (24, 9) and sketch
+    bins (8, 3) are both 1500.0-2062.5 Hz -- the resolutions still differ 3:1, which is what makes
+    them different measurements of the same span rather than the same band."""
+    d_s, _ = _load(SCENE_H)
+    d_i, _ = _load(IMPULSE_H)
+    fs_s, fs_i = d_s("MELS_FS"), d_i("MELIMP_FS")
+    nfft = d_s("MELS_NFFT")
+    assert fs_s != fs_i, "the two banks are at one rate again; this test's whole premise is gone"
+    assert d_i("MELIMP_NFFT") == nfft
+
+    def spans(path, pre, fs):
+        return [(lo * fs / nfft, (lo + n) * fs / nfft, n)
+                for lo, n in _pairs(path, pre) if n]
+
+    scene = spans(SCENE_H, "MELS", fs_s)
+    det = spans(IMPULSE_H, "MELIMP", fs_i)
+    for a in scene:
+        for b in det:
+            assert not (a[0] == b[0] and a[1] == b[1] and a[2] == b[2]), \
+                "a scene band and a sketch band are the same band: %.1f-%.1f Hz over %d bins" % a
+
+    # The two coincidences named in the docstring, asserted so a rate change cannot quietly move
+    # them and leave the prose describing a bank that is gone.
+    bins_shared = set(_pairs(SCENE_H, "MELS")) & set(p for p in _pairs(IMPULSE_H, "MELIMP") if p[1])
+    assert bins_shared == {(9, 5)}, "the bin coincidence moved: %s" % sorted(bins_shared)
+    hz_shared = sorted(set((a[0], a[1]) for a in scene) & set((b[0], b[1]) for b in det))
+    assert hz_shared == [(1500.0, 2062.5)], "the frequency coincidence moved: %s" % hz_shared

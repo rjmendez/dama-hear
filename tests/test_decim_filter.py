@@ -32,6 +32,12 @@ FS_ACQ = 48000.0
 FS_DEC = 16000.0
 
 
+def _strip_c_comments(src):
+    """A source-scanning guard that does not strip comments matches its own prose: night_node.ino's
+    prose names both banks and both rates in the paragraphs that explain the asserts."""
+    return re.sub(r"//.*", "", re.sub(r"/\*.*?\*/", " ", src, flags=re.S))
+
+
 def _defines():
     txt = HDR.read_text()
     d = {k: int(v) for k, v in re.findall(r"#define\s+(DECIM_\w+)\s+(\d+)", txt)}
@@ -107,12 +113,46 @@ def test_the_passband_is_flat_enough_not_to_tilt_the_corpus():
 
 def test_the_firmware_derives_the_acquisition_rate_and_never_hardcodes_it():
     """FS_ACQ must stay FS_NOMINAL * DECIM. Two independent constants would be free to disagree,
-    which is the exact failure the mel-bank static_asserts exist to catch one layer down."""
-    ino = (ROOT / "firmware" / "night_node" / "night_node.ino").read_text()
+    which is the exact failure the mel-bank static_asserts exist to catch one layer down.
+
+    ⚠️AIMED AT THE PROPERTY, NOT AT ONE CONFIGURATION. This used to match the literal string
+    `static_assert((int)MEL16_FS == FS_NOMINAL` for both banks. That went blind the moment the
+    banks stopped sharing a rate: the sketch bank moved to FS_ACQ, and a guard pinned to the old
+    text can only say the old text is gone -- it cannot say the new binding is right, and it would
+    have passed just as happily if the SCENE assert had been the one repointed. So: every mel bank
+    the sketch includes is pinned by a static_assert to a rate SYMBOL, and that symbol's value must
+    equal the rate baked into that bank's own generated header."""
+    ino = _strip_c_comments((ROOT / "firmware" / "night_node" / "night_node.ino").read_text())
     assert "#define FS_ACQ     (FS_NOMINAL * DECIM)" in ino
-    for guard in ("static_assert((int)MEL16_FS == FS_NOMINAL",
-                  "static_assert((int)MELS_FS  == FS_NOMINAL"):
-        assert guard in ino, "the mel-bank rate guard is gone: %s" % guard
+    nominal = float(re.search(r"#define\s+FS_NOMINAL\s+(\d+)",
+                             (ROOT / "firmware" / "boards" / "xiao_s3_sense.h").read_text()).group(1))
+    decim = int(re.search(r"#define\s+DECIM\s+(\d+)", ino).group(1))
+    rates = {"FS_NOMINAL": nominal, "FS_ACQ": nominal * decim}
+
+    banks = {}
+    for inc in re.findall(r'#include\s+"([a-z_0-9]+\.h)"', ino):
+        h = ROOT / "firmware" / "night_node" / inc
+        if not h.exists():
+            continue
+        m = re.search(r"#define\s+(MEL[A-Z0-9]*)_FS\s+([0-9.]+)f", h.read_text())
+        if m:
+            banks[m.group(1)] = float(m.group(2))
+    assert len(banks) >= 2, "expected the sketch bank and the scene bank, found %s" % sorted(banks)
+
+    for pre, fs in sorted(banks.items()):
+        m = re.search(r"static_assert\(\(int\)%s_FS\s*==\s*(\w+)" % pre, ino)
+        assert m, "%s_FS is not pinned to a rate by a static_assert" % pre
+        sym = m.group(1)
+        assert sym in rates, "%s_FS is pinned to %s, which is not a rate this sketch defines" % (pre, sym)
+        assert rates[sym] == fs, \
+            "%s_FS is %.1f Hz but the guard pins it to %s = %.1f Hz" % (pre, fs, sym, rates[sym])
+
+    # The two banks read two different streams; a build where both name the same rate is the
+    # pre-change one, and the decimator has nothing left to do.
+    pinned = {pre: re.search(r"static_assert\(\(int\)%s_FS\s*==\s*(\w+)" % pre, ino).group(1)
+              for pre in banks}
+    assert len(set(pinned.values())) == 2, \
+        "both mel banks are pinned to the same rate: %s" % pinned
 
 
 # ---------------------------------------------------------------- the folded implementation
