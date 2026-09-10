@@ -6,7 +6,7 @@ metadata:
   labels:
     app: hear-tag
   annotations:
-    dama-hear/commit: '951a6f7-dirty'
+    dama-hear/commit: '70511e2-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
 data:
   hear__init__.py: |
@@ -290,9 +290,10 @@ data:
     import shutil
     from typing import Any, Dict, Iterable, List, Optional
     
-    #: 2 adds `dur_s` and `header_rate_suspect`. A v1 row carries neither; readers fall back to
-    #: bytes/wav_header_fs_hz, which is right for every v1 row because the mis-header only ever
-    #: reached 48 kHz clips and none were stored under v1.
+    #: 2 adds `dur_s` and `header_rate_suspect`. ⚠️A v1 row carries neither, and v1 rows DO include
+    #: mis-headed 48 kHz clips -- they were stored before this field existed. A reader must not take
+    #: bytes / wav_header_fs_hz at face value for a v1 row; hear/tags.py `_post_s` re-derives the
+    #: length by the same uniqueness rule header_rate_suspect() uses.
     CLIP_SCHEMA_VERSION = 2
     #: 44-byte canonical header + 64000 samples * 2 bytes, at the 16 kHz / 4.0 s geometry.
     #: ⚠️KEPT ONLY AS THE HISTORICAL SIZE. It is NOT a validity test any more -- see wav_probe.
@@ -1018,12 +1019,36 @@ data:
         """
         total = row.get("dur_s")
         if total is None:
-            n, fs = row.get("bytes"), row.get("wav_header_fs_hz")
-            if n and fs:
-                total = (int(n) - 44) / float(int(fs) * 2)
+            total = _v1_total_s(row.get("bytes"), row.get("wav_header_fs_hz"))
         if total is None or not (CLIP_PRE_S < total <= 8.0):
             return CLIP_POST_S
         return total - CLIP_PRE_S
+    
+    
+    #: The clip lengths this fleet writes and the rates it clocks. Repeated from hear/clips.py rather
+    #: than imported, because clips.py imports THIS module; test_hear_tag asserts the copies agree.
+    _GEOMETRIES_S = (4.0, 5.0)
+    _GEOMETRY_TOL = 0.02
+    _FLEET_RATES_HZ = (16000.0, 32000.0, 48000.0)
+    
+    
+    def _v1_total_s(n_bytes, header_fs) -> Optional[float]:
+        """A v1 row's length, for rows written before `dur_s` existed. None when unknowable.
+    
+        ⚠️NOT bytes / header rate. v1 rows include 48 kHz clips headed 16000 Hz, which that division
+        reads as 15.0 s. The header is believed only when it yields a length the fleet writes;
+        otherwise exactly one fleet rate must, or nothing is claimed.
+        """
+        if not n_bytes or not header_fs:
+            return None
+        n = (int(n_bytes) - 44) / 2.0
+        def is_geom(d):
+            return any(abs(d - g) <= g * _GEOMETRY_TOL for g in _GEOMETRIES_S)
+        at_header = n / float(header_fs)
+        if is_geom(at_header):
+            return at_header
+        hits = [n / r for r in _FLEET_RATES_HZ if is_geom(n / r)]
+        return hits[0] if len(hits) == 1 else None
     
     
     def sample_window(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:

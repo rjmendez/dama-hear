@@ -169,3 +169,32 @@ class TestTheWindowComesFromTheClipNotAConstant:
         assert row["t_end_utc_s"] - row["ts_utc_s"] == pytest.approx(4.0)
         assert row["header_rate_suspect"]["true_fs_hz"] == 48000.0
         assert row["wav_header_fs_hz"] == 16000, "the lying header is KEPT, not overwritten"
+
+
+class TestAV1RowIsNotReadAtFaceValue:
+    """v1 index rows predate `dur_s` and include mis-headed 48 kHz clips, so tags.py re-derives
+    the length. clips.py imports tags.py, so the logic is repeated there, not imported."""
+
+    def test_the_repeated_constants_agree(self):
+        import hear.tags as TAGS
+        assert TAGS._GEOMETRIES_S == CLIPS.CLIP_GEOMETRIES_S
+        assert TAGS._GEOMETRY_TOL == CLIPS.CLIP_GEOMETRY_TOL
+
+    @pytest.mark.parametrize("n_bytes,header_fs", [
+        (128044, 16000), (128044, 15988), (480044, 48000), (480044, 47973),
+        (480044, 16000), (480044, 16005)])
+    def test_the_v1_fallback_agrees_with_clips(self, n_bytes, header_fs):
+        import hear.tags as TAGS
+        want = CLIPS.clip_total_s({"bytes": n_bytes, "wav_header_fs_hz": header_fs})
+        assert TAGS._v1_total_s(n_bytes, header_fs) == pytest.approx(want, rel=1e-3)
+
+    def test_a_misheaded_v1_row_gets_the_48k_post_roll_not_14_seconds(self):
+        import hear.tags as TAGS
+        w = TAGS.sample_window({"sample": 1000000, "bytes": 480044, "wav_header_fs_hz": 16000})
+        assert w["post_s"] == pytest.approx(4.0)
+
+    def test_a_length_that_names_no_geometry_falls_back_rather_than_guessing(self):
+        import hear.tags as TAGS
+        assert TAGS._v1_total_s(12345 * 2 + 44, 48000) is None
+        assert TAGS.sample_window({"sample": 1, "bytes": 12345 * 2 + 44,
+                                   "wav_header_fs_hz": 48000})["post_s"] == TAGS.CLIP_POST_S

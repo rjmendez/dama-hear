@@ -257,7 +257,8 @@ def sheet(picked, staged, out, day_tag):
     lines.append("")
     lines.append("## What the corpus cannot tell you")
     lines.append("")
-    lines.append("- A clip is 4.0 s: 1.0 s before the trigger and 3.0 s after. If the event is at "
+    lines.append("- A clip is 1.0 s before the trigger and 3.0 s after (16 kHz) or 4.0 s after "
+                 "(48 kHz); the `rate` column says which. If the event is at "
                  "the very start you are hearing its tail only.")
     lines.append("- The tagger has never run on these. Nothing here is a model's opinion; that is "
                  "the point.")
