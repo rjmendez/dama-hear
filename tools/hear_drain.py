@@ -1280,6 +1280,25 @@ def drain_phone_corpus(pl: "P.Pool", corpus_dir: str, days: int = 3) -> Dict[str
     return out
 
 
+#: Every node whose files a backfill may name from their own path. ⚠️It is the drain's `--node`
+#: roster written down: a name missing here is not a mis-named ingest, it is an UNCHECKED one.
+KNOWN_NODES = ("nyquist", "mach", "rankine", "puc")
+
+
+def node_from_path(path: str, default_node: Optional[str] = None) -> Optional[str]:
+    """The node a historical file belongs to, from its path COMPONENTS, else `default_node`.
+
+    Component-wise on purpose: `known in path` made `/home/machine/drains/x_dets.csv` mach's.
+    The archive layout this reads is `<pool>/raw/<node>/<stamp>-dets.csv`, plus the hand-made
+    drains' `<dir>/<node>/dets.csv` and `<dir>/<node>_dets.csv`.
+    """
+    parts = [q for p in os.path.abspath(path).split(os.sep) for q in (p, p.split("_")[0])]
+    for known in KNOWN_NODES:
+        if known in parts:
+            return known
+    return default_node
+
+
 def backfill(pl: "P.Pool", paths: List[str], default_node: Optional[str] = None
              ) -> List[Dict[str, Any]]:
     """Ingest historical files: a dets.csv, a sketches-*.jsonl, or a directory of either.
@@ -1294,6 +1313,14 @@ def backfill(pl: "P.Pool", paths: List[str], default_node: Optional[str] = None
     column -- so it comes from `default_node` and is recorded as asserted. When a directory is
     given, a file whose NAME begins `<something>_` is allowed to name its own node from that
     prefix, which is how the existing hand-made drains are laid out.
+
+    ⚠️THE PATH IS READ BY COMPONENT, AND THE ROSTER HAS TO BE COMPLETE. Both halves were wrong:
+    the roster was ("nyquist", "mach", "puc") -- no `rankine`, though the pool has archived 23 of
+    its dets files -- and the test was `known in p`, a SUBSTRING match on the whole path, which
+    files everything under a directory called `machine/` as mach. A missing name is the worse of
+    the two here: with `--ingest-node` unset it leaves `default_node` None, `_node_mismatch` then
+    has nothing to compare, and the file's own labels are believed unconditionally -- which is
+    how a re-ingest could file rankine's card under whatever its rows happened to say.
     """
     out: List[Dict[str, Any]] = []
     todo: List[str] = []
@@ -1311,19 +1338,9 @@ def backfill(pl: "P.Pool", paths: List[str], default_node: Optional[str] = None
             if base.startswith("sketches-") and base.endswith(".jsonl"):
                 out.append(pl.ingest_mqtt_jsonl(p))
             elif "scene" in base:
-                node = default_node
-                for known in ("nyquist", "mach", "puc"):
-                    if known in p:
-                        node = known
-                        break
-                out.append(pl.ingest_scene(p, default_node=node))
+                out.append(pl.ingest_scene(p, default_node=node_from_path(p, default_node)))
             else:
-                node = default_node
-                for known in ("nyquist", "mach", "puc"):
-                    if known in p:
-                        node = known
-                        break
-                out.append(pl.ingest_dets(p, default_node=node))
+                out.append(pl.ingest_dets(p, default_node=node_from_path(p, default_node)))
         except Exception as e:
             out.append({"path": os.path.abspath(p), "error": "%s: %s" % (type(e).__name__, e)})
     return out

@@ -186,3 +186,31 @@ def test_every_mount_path_matches_the_bundle_path(bundle):
         seen += 1
     assert seen >= 2 * len(by_key), (
         "only %d mounts parsed out of %s; the parser missed some" % (seen, manifest.name))
+
+
+#: `kubectl apply` writes the whole object into the `kubectl.kubernetes.io/last-applied-
+#: configuration` ANNOTATION, and an annotation may not exceed 256 KiB. It is not the 1 MiB
+#: ConfigMap limit and it bites at a quarter of it.
+ANNOTATION_CAP = 256 * 1024
+
+
+@pytest.mark.parametrize("bundle", sorted(_gen()["BUNDLES"]))
+def test_a_bundle_still_fits_what_kubectl_apply_can_annotate(bundle):
+    """⚠️MEASURED ON A SIBLING BUNDLE, NOT IMAGINED. deploy/k8s/hear-tdoa-code.yaml is 444,270 B
+    and `kubectl apply` refuses it -- "metadata.annotations: Too long" -- while `kubectl create`
+    and a plain `get` are perfectly happy, so the object looks fine right up to the redeploy.
+
+    hear-drain-code.yaml is 256,430 B today, 5,714 B under the cap: about one more module. The
+    number is asserted rather than described because the next person to add a file to a bundle
+    finds out here, in a test that names the fix, instead of at an apply during an incident.
+    THE FIX IS NOT `--validate=false`: it is `kubectl apply --server-side` (which stores no such
+    annotation) or splitting the bundle.
+    """
+    path = ROOT / "deploy" / "k8s" / (bundle + ".yaml")
+    if not path.exists():
+        pytest.skip("no ConfigMap at %s" % path)
+    size = path.stat().st_size
+    assert size < ANNOTATION_CAP, (
+        "%s is %d B, over the %d B annotation cap -- `kubectl apply` will refuse it with "
+        "metadata.annotations: Too long. Apply it --server-side, or split the bundle."
+        % (path.name, size, ANNOTATION_CAP))
