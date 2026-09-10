@@ -363,3 +363,48 @@ resolution; ~146 MB once is cheap insurance.
 Two known-open items, both now *visible* rather than fixed: rankine's 25 `clip_why: "fail"` rows —
 clips that never reached the card at all, countable from the index once this ships — and the
 anchored/unanchored split of the 228,251 scene rows, which nothing here is sized from.
+
+## Acquisition at 32 kHz, decimated to 16 kHz
+
+The microphone runs at `FS_ACQ` (32 kHz) and everything downstream of the decimator runs at
+`FS_NOMINAL` (16 kHz). Two rates, on purpose, because the two consumers want different things:
+
+| consumer | rate | why |
+|---|---|---|
+| clips (`praw`, WAV) | 32 kHz | Perch v2 reads 32 kHz natively, in 5.0 s windows |
+| scene, sketch, gate, dets, timebase | 16 kHz | the mel banks are generated tables with 16000.0f baked in |
+
+⚠️**A bare `FS_NOMINAL` bump would have compiled clean and corrupted the corpus.** `mel16.h` and
+`mel_scene.h` hardcode `16000.0f`; running the FFT on audio at any other rate attributes every band
+to the wrong frequency while the CSV keeps declaring `f_lo_hz=62.5, f_hi_hz=7812.5`. `hear/pool.py`
+refuses to pool across band axes, but it keys on the *declared* axis — which would not have changed.
+Two `static_assert`s now tie the banks to `FS_NOMINAL`, and they were verified to fire.
+
+**The filter is measured, not assumed.** `firmware/gen_decim.py` emits `decim.h`; the numbers are
+taken from the **quantised** taps, because the float design and the int16 filter that runs on the
+node are not the same filter:
+
+| | |
+|---|---|
+| passband ripple, 62.5–7812.5 Hz | ≤ 0.19 dB |
+| worst fold into that band | −64.0 dB |
+| group delay | 128 acquisition samples = 4.00 ms exactly |
+| cost | 4.1 M MAC/s, ~2% of one core |
+
+A 33-tap halfband was measured at only −7.7 dB and rejected. An earlier generator normalised
+*after* quantising, pushing a 347 LSB residual onto the centre tap — a broadband impulse that
+flattened the stopband to −39.0 dB. `tests/test_decim_filter.py` fails on both.
+
+**The group delay is compensated, not ignored.** `acq_of()` converts a decimated sample index to an
+acquisition index, subtracting the FIR delay, so a clip starts where the sound was and detections
+are not stamped 4 ms late — which would have discarded far more than the 21 ns the GPS provides.
+It saturates at 0: the first 4 ms after boot would otherwise underflow.
+
+**Costs.** The PSRAM raw ring halves from 240 s to 120 s (same bytes, twice the rate). A clip is
+320,044 B instead of 128,044 — 2.5× — so the on-node budget holds fewer, which matters much less
+now that clips are drained every 15 minutes rather than living on the card until evicted.
+
+⚠️**The 32 kHz PDM rate is UNVERIFIED ON THIS HARDWARE.** It compiles and `firmware/boards/puc.h`
+already runs PDM at 48 kHz through the same driver, but no node has been flashed. Confirm the boot
+line reports `PDM 32000 Hz ... -> /2 -> 16000 Hz` and that `fs_clean_hz` still settles near 16000
+before trusting a night of data.
