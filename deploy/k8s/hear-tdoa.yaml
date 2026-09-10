@@ -112,6 +112,7 @@ spec:
                 - { name: code, mountPath: /app/hear/corpus.py, subPath: hear_corpus.py }
                 - { name: code, mountPath: /app/hear/detsfile.py, subPath: hear_detsfile.py }
                 - { name: code, mountPath: /app/hear/scenefile.py, subPath: hear_scenefile.py }
+                - { name: code, mountPath: /app/hear/identity.py, subPath: hear_identity.py }
                 - { name: code, mountPath: /app/hear/pool.py, subPath: hear_pool.py }
                 - { name: code, mountPath: /app/hear/geodesy.py, subPath: hear_geodesy.py }
                 - { name: code, mountPath: /app/hear/nodeclass.py, subPath: hear_nodeclass.py }
@@ -221,6 +222,7 @@ spec:
                 - { name: code, mountPath: /app/hear/corpus.py, subPath: hear_corpus.py }
                 - { name: code, mountPath: /app/hear/detsfile.py, subPath: hear_detsfile.py }
                 - { name: code, mountPath: /app/hear/scenefile.py, subPath: hear_scenefile.py }
+                - { name: code, mountPath: /app/hear/identity.py, subPath: hear_identity.py }
                 - { name: code, mountPath: /app/hear/pool.py, subPath: hear_pool.py }
                 - { name: code, mountPath: /app/hear/geodesy.py, subPath: hear_geodesy.py }
                 - { name: code, mountPath: /app/hear/nodeclass.py, subPath: hear_nodeclass.py }
