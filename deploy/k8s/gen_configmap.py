@@ -120,6 +120,10 @@ TDOA_CODE = [
     ("hear_corpus.py", "hear/corpus.py"),
     ("hear_detsfile.py", "hear/detsfile.py"),
     ("hear_scenefile.py", "hear/scenefile.py"),
+    # ⚠️pool.py imports it -- same reason it is in DRAIN_CODE. This is the third bundle to carry
+    # hear/pool.py and the closure is per-bundle, so adding an import to pool.py is an edit in as
+    # many places as there are bundles shipping it. check() is what says so out loud.
+    ("hear_identity.py", "hear/identity.py"),
     ("hear_pool.py", "hear/pool.py"),
     ("hear_geodesy.py", "hear/geodesy.py"),
     ("hear_nodeclass.py", "hear/nodeclass.py"),
