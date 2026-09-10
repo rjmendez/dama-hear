@@ -100,12 +100,62 @@ TAG_CODE = [
     ("tools_hear_tag.py", "tools/hear_tag.py"),
 ]
 
+# ⚠️THE BIGGEST BUNDLE, AND EVERY FILE IN IT IS AN IMPORT CLOSURE MEMBER RATHER THAN A CHOICE.
+# tools/hear_tdoa.py composes the whole solve stack, so it drags hear/backend/pipeline.py (for
+# to_dama_event -- reimplementing that payload shape is how a consumer comes to read a MISSING
+# model as a FAILED solve), which drags hear/wire.py and the hear/node package, whose __init__
+# imports detect, telemetry and pipeline together.
+#
+# ⚠️check() BELOW CANNOT VERIFY MOST OF THIS LIST, so it is not evidence that the list is right.
+# _imported_paths resolves `from hear import x` and `from hear.<mod> import y`; it does NOT
+# resolve a RELATIVE import (`from ..solve import shockwave`), and `from hear.backend import
+# associate` resolves to the non-existent `hear/backend.py` and is silently dropped. Almost every
+# import inside the hear package is one of those two shapes. The list was therefore derived by
+# importing the entry point and reading sys.modules, and tests/test_hear_tdoa.py's
+# TestTheDeployBundle is what keeps it honest -- not this audit.
+TDOA_CODE = [
+    ("hear__init__.py", "hear/__init__.py"),
+    ("hear_sketch.py", "hear/sketch.py"),
+    ("hear_corpus.py", "hear/corpus.py"),
+    ("hear_detsfile.py", "hear/detsfile.py"),
+    ("hear_scenefile.py", "hear/scenefile.py"),
+    ("hear_pool.py", "hear/pool.py"),
+    ("hear_geodesy.py", "hear/geodesy.py"),
+    ("hear_nodeclass.py", "hear/nodeclass.py"),
+    ("hear_wire.py", "hear/wire.py"),
+    ("hear_node__init__.py", "hear/node/__init__.py"),
+    ("hear_node_detect.py", "hear/node/detect.py"),
+    ("hear_node_pipeline.py", "hear/node/pipeline.py"),
+    ("hear_node_telemetry.py", "hear/node/telemetry.py"),
+    ("hear_backend__init__.py", "hear/backend/__init__.py"),
+    ("hear_backend_survey.py", "hear/backend/survey.py"),
+    ("hear_backend_associate.py", "hear/backend/associate.py"),
+    ("hear_backend_pipeline.py", "hear/backend/pipeline.py"),
+    ("hear_solve__init__.py", "hear/solve/__init__.py"),
+    ("hear_solve_placement.py", "hear/solve/placement.py"),
+    ("hear_solve_shockwave.py", "hear/solve/shockwave.py"),
+    ("hear_solve_point.py", "hear/solve/point.py"),
+    ("hear_solve_consistency.py", "hear/solve/consistency.py"),
+    ("hear_solve_soundspeed.py", "hear/solve/soundspeed.py"),
+    ("hear_solve_calibrate.py", "hear/solve/calibrate.py"),
+    ("tools_hear_tdoa.py", "tools/hear_tdoa.py"),
+]
+# ⚠️THE SURVEY IS DATA THIS WORKLOAD OPENS AT RUNTIME, and it is the ONE input that decides where
+# every answer lands. It is listed by hand because _data_paths resolves a .json against the
+# MODULE's own directory -- for tools/hear_tdoa.py that is `tools/survey.json`, which does not
+# exist, so the audit sees nothing to require. hear-tdoa.yaml passes --survey /app/survey.json
+# explicitly so the dependency is visible in the args and not only in the mount layout.
+TDOA_DATA = [
+    ("survey.json", "survey.json"),
+]
+
 #: name -> (app label, code files, data files). The first entry is the default, so the command
 #: documented in deploy/k8s/README.md keeps working with no argument.
 BUNDLES = {
     "hear-drain-code": ("hear-drain", DRAIN_CODE, []),
     "hear-score-code": ("hear-score", SCORE_CODE, SCORE_DATA),
     "hear-tag-code": ("hear-tag", TAG_CODE, []),
+    "hear-tdoa-code": ("hear-tdoa", TDOA_CODE, TDOA_DATA),
 }
 DEFAULT_BUNDLE = "hear-drain-code"
 

@@ -1,0 +1,255 @@
+---
+# ⚠️NO PersistentVolumeClaim HERE. `hear-pool` is declared once, in deploy/k8s/hear-drain.yaml.
+# This bundle MOUNTS it and owns nothing but its own two CronJobs and its own ConfigMap.
+#
+# ⚠️APPLY ONLY THESE TWO FILES:
+#     python3 deploy/k8s/gen_configmap.py hear-tdoa-code > deploy/k8s/hear-tdoa-code.yaml
+#     kubectl apply -f deploy/k8s/hear-tdoa-code.yaml -f deploy/k8s/hear-tdoa.yaml
+# NEVER `kubectl apply -f deploy/k8s/`. A ConfigMap and a CronJob are both written WHOLE, so a
+# directory apply would also push whatever state the other manifests are in on this branch.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-tdoa
+  namespace: dama
+  labels:
+    app: hear-tdoa
+  annotations:
+    dama-hear/what: >-
+      Drives the shipped TDoA solvers (hear/solve/point.py, shockwave.py) over the pooled
+      arrivals on the hear-pool PVC and accounts for every record that did not solve. Writes
+      /pool/corpus/tdoa/runs/<run_id>/{manifest,coactivity,candidates,attempts,events,null,plan}
+      and /pool/corpus/tdoa/arrivals/<day>/<source>.jsonl, plus a heartbeat for hear-tdoa-check.
+    dama-hear/what-a-solution-is-not: >-
+      2 receivers is rank-1 and singular for ANY geometry. 3 receivers with the height DECLARED
+      is exactly determined, so its residual is ~0 BY CONSTRUCTION -- including for a badly wrong
+      --fixed-up-m -- and is NOT evidence the fit is right. `up` is declared, not solved. `c` is
+      ASSUMED from --temp-c and determines_speed says it can never be recovered from 3 ground
+      receivers and an unknown source at ANY number of events. Position error is ~20x the timing
+      error here, so the next accuracy gain is a re-survey, not a clock. And a run with ZERO
+      events is NOT evidence of no gunshots -- the referent is the co-activity number in
+      coactivity.json. /pool/corpus/tdoa/model_card.json carries the reasoning and every figure
+      in it is computed at runtime from the survey that was actually loaded.
+    dama-hear/source-class-is-an-operator-assertion: >-
+      --source-class below is asserted by the operator and is never inferred. Nothing in this
+      repo classifies cone-vs-point, and asserting the wrong one is a measured 67.4 degree error
+      that no residual reveals. Change it here, deliberately, or not at all.
+spec:
+  # ⚠️A CronJob, NOT A DEPLOYMENT. Measured on the live pool 2026-09-10: the whole run is 4.9 s
+  # over 6,137 records, of which 3.4 s is the 50-trial shuffle null (so 200 trials is ~13 s and
+  # fits this schedule with room to spare). That does not justify a resident pod, and the node
+  # has been observed at 124 pods against an allocatable 110.
+  #
+  # ⚠️THE OFFSET IS FOR LOG READABILITY, NOT FOR ORDERING. Live hear-drain job durations have
+  # been measured from 3m58s to 67m against a 15-minute schedule, so no fixed offset is "after
+  # the drain's write". Overlapping a drain is safe for a different reason: the record store is
+  # append-only and content-addressed, and this job's own resume is a key set rather than a
+  # watermark, so an overlapping run can only MISS rows the next pass picks up.
+  schedule: "11,26,41,56 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: hear-tdoa
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: tdoa
+              image: python:3.13-slim
+              command: ["/bin/sh", "-lc"]
+              args:
+                - |
+                  set -e
+                  # ⚠️--lookback-h 168 MUST COVER THE WHOLE EXISTING STORE ON FIRST DEPLOY,
+                  # and it is 168 rather than the tool's 72 h default for a measured reason.
+                  # Association is not a per-record function, so a record that falls out of the
+                  # lookback before any run associated it can NEVER be associated -- the tool
+                  # counts those as outside_lookback_unassociated and --check fails on them,
+                  # permanently. Measured on the live pool 2026-09-10 at the 72 h default: 1
+                  # record. A gate that fails for ever is a gate operators learn to ignore, so
+                  # either this covers the store or somebody runs a one-off wide-lookback
+                  # backfill BEFORE this CronJob first fires. Widen it when the corpus outgrows
+                  # a week; the cost is only re-association CPU, measured at 1.3 s per run
+                  # excluding the null.
+                  #
+                  # ⚠️THE GUARD ASSERTS BOTH VERSIONS, NOT THE DIRECTORY. /pool/pylib is SHARED
+                  # with hear-drain and hear-score, which pin numpy 2.2.6. A guard that only
+                  # tests whether a package directory exists means whichever workload reaches an
+                  # empty PVC first decides the version and the others silently use what they
+                  # find, so every pin reads as discipline while enforcing nothing.
+                  #
+                  # ⚠️BOTH PACKAGES IN ONE pip INVOCATION. scipy is a HARD dependency here --
+                  # hear/solve/point.py:48 is a module-level `from scipy.optimize import
+                  # least_squares` -- and installing it separately lets the resolver bump numpy
+                  # underneath the two workloads that share this directory. Resolved and verified
+                  # on the cluster's own python 3.13.15, not copied from a document: numpy 2.2.6
+                  # + scipy 1.15.3 install together and import together; scipy adds 116 MB to a
+                  # 71 MB /pool/pylib on a volume with 217 GB free.
+                  LIB=/pool/pylib
+                  export PYTHONPATH="$LIB:/app"
+                  if ! python -c 'import numpy,scipy,sys; sys.exit(0 if numpy.__version__=="2.2.6" and scipy.__version__=="1.15.3" else 1)' 2>/dev/null; then
+                    echo "installing numpy==2.2.6 scipy==1.15.3 into $LIB"
+                    pip install --no-cache-dir --upgrade --target "$LIB" 'numpy==2.2.6' 'scipy==1.15.3' >/dev/null 2>&1
+                  fi
+                  python -c 'import numpy,scipy; print("numpy", numpy.__version__, "scipy", scipy.__version__)'
+                  exec python /app/tools/hear_tdoa.py \
+                    --pool /pool/corpus \
+                    --survey /app/survey.json \
+                    --out /pool/corpus/tdoa \
+                    --source-class blast \
+                    --fixed-up-m 0.0 \
+                    --lookback-h 168 \
+                    --null-trials 200
+              volumeMounts:
+                - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/sketch.py, subPath: hear_sketch.py }
+                - { name: code, mountPath: /app/hear/corpus.py, subPath: hear_corpus.py }
+                - { name: code, mountPath: /app/hear/detsfile.py, subPath: hear_detsfile.py }
+                - { name: code, mountPath: /app/hear/scenefile.py, subPath: hear_scenefile.py }
+                - { name: code, mountPath: /app/hear/pool.py, subPath: hear_pool.py }
+                - { name: code, mountPath: /app/hear/geodesy.py, subPath: hear_geodesy.py }
+                - { name: code, mountPath: /app/hear/nodeclass.py, subPath: hear_nodeclass.py }
+                - { name: code, mountPath: /app/hear/wire.py, subPath: hear_wire.py }
+                - { name: code, mountPath: /app/hear/node/__init__.py, subPath: hear_node__init__.py }
+                - { name: code, mountPath: /app/hear/node/detect.py, subPath: hear_node_detect.py }
+                - { name: code, mountPath: /app/hear/node/pipeline.py, subPath: hear_node_pipeline.py }
+                - { name: code, mountPath: /app/hear/node/telemetry.py, subPath: hear_node_telemetry.py }
+                - { name: code, mountPath: /app/hear/backend/__init__.py, subPath: hear_backend__init__.py }
+                - { name: code, mountPath: /app/hear/backend/survey.py, subPath: hear_backend_survey.py }
+                - { name: code, mountPath: /app/hear/backend/associate.py, subPath: hear_backend_associate.py }
+                - { name: code, mountPath: /app/hear/backend/pipeline.py, subPath: hear_backend_pipeline.py }
+                - { name: code, mountPath: /app/hear/solve/__init__.py, subPath: hear_solve__init__.py }
+                - { name: code, mountPath: /app/hear/solve/placement.py, subPath: hear_solve_placement.py }
+                - { name: code, mountPath: /app/hear/solve/shockwave.py, subPath: hear_solve_shockwave.py }
+                - { name: code, mountPath: /app/hear/solve/point.py, subPath: hear_solve_point.py }
+                - { name: code, mountPath: /app/hear/solve/consistency.py, subPath: hear_solve_consistency.py }
+                - { name: code, mountPath: /app/hear/solve/soundspeed.py, subPath: hear_solve_soundspeed.py }
+                - { name: code, mountPath: /app/hear/solve/calibrate.py, subPath: hear_solve_calibrate.py }
+                - { name: code, mountPath: /app/tools/hear_tdoa.py, subPath: tools_hear_tdoa.py }
+                - { name: code, mountPath: /app/survey.json, subPath: survey.json }
+                - { name: pool, mountPath: /pool }
+              resources:
+                # At the namespace LimitRange's per-Container minimum (cpu 100m, memory 128Mi).
+                # Anything lower is refused at POD creation, which a server dry-run does not show.
+                requests: { cpu: 100m, memory: 128Mi }
+                limits:   { cpu: "1",  memory: 512Mi }
+          volumes:
+            - name: code
+              configMap:
+                name: hear-tdoa-code
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool
+---
+# ⚠️THE SOLVER'S OWN EXIT STATUS IS NOT A HEALTH SIGNAL. It exits 0 on a run that solved NOTHING
+# -- correctly, because the product is the funnel and on this corpus the honest answer has been
+# zero-to-two events across three days. It also exits 0 on an EMPTY read. This job is what a
+# monitor keys on.
+#
+# ⚠️NOT ONE GATE IN IT IS ABOUT EVENTS. A gate keyed on the event count would fire on a correct
+# result for as long as three-way uptime stays at 30 minutes in three days, and would go quiet
+# the day the driver broke. The gates are throughput, refusal-bucket novelty, torn lines, the
+# three accounting invariants, the survey, the scan window, the lookback, and staleness. The
+# event count, the coincidence counts and their null are printed under `OBSERVATION, not a gate`.
+#
+# ⚠️AN EMPTY READ IS A FAILURE, NOT A PASS. Point --pool at /pool instead of /pool/corpus and
+# every growth-conditioned gate passes vacuously. The check fails outright on records_seen == 0.
+#
+# ⚠️THE WINDOW GATE EXISTS FOR ONE SPECIFIC REGRESSION. associate.max_window_s sizes off
+# survey.diameter_m(), which includes the node arrival_ids() refuses; on this survey that is
+# 99.6 ms instead of 79.1 ms and it COSTS a real event. The driver routes around it by building
+# an arrival sub-survey, and this gate is what says if that stops working.
+#
+# ⚠️THIS JOB RUNS ONE QUARTER AS OFTEN AS THE SOLVER ABOVE, so four runs land between two checks
+# and a per-run heartbeat field would be three runs stale before the gate read it. The heartbeat
+# keeps a ring and --window-s says how much of it to sum. 7200 s is two check periods, so one
+# missed check still reports what happened. It is passed explicitly BECAUSE it is coupled to
+# these two schedules: change either cron and move this.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-tdoa-check
+  namespace: dama
+  labels:
+    app: hear-tdoa
+spec:
+  schedule: "47 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: hear-tdoa
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: check
+              image: python:3.13-slim
+              command: ["/bin/sh", "-lc"]
+              args:
+                # ⚠️`set +e`, NOT `set -e`. Runners have been seen delivering -e on the command
+                # line where the script cannot clear it; capturing rc explicitly is what makes
+                # the gate's exit status the job's exit status. The census after it is `|| true`
+                # so a summary failure can never mask, or manufacture, a gate result. --census
+                # runs stages 1-2 only and writes NOTHING, which is why a read-only gate job may
+                # run it at all.
+                - |
+                  set +e
+                  export PYTHONPATH=/pool/pylib:/app
+                  python /app/tools/hear_tdoa.py --pool /pool/corpus \
+                    --survey /app/survey.json --out /pool/corpus/tdoa --check \
+                    --window-s 7200 --max-stale-s 7200
+                  rc=$?
+                  echo "--- census (stages 1-2, writes nothing) ---"
+                  python /app/tools/hear_tdoa.py --pool /pool/corpus \
+                    --survey /app/survey.json --out /pool/corpus/tdoa --census \
+                    --source-class blast || true
+                  exit "$rc"
+              volumeMounts:
+                - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/sketch.py, subPath: hear_sketch.py }
+                - { name: code, mountPath: /app/hear/corpus.py, subPath: hear_corpus.py }
+                - { name: code, mountPath: /app/hear/detsfile.py, subPath: hear_detsfile.py }
+                - { name: code, mountPath: /app/hear/scenefile.py, subPath: hear_scenefile.py }
+                - { name: code, mountPath: /app/hear/pool.py, subPath: hear_pool.py }
+                - { name: code, mountPath: /app/hear/geodesy.py, subPath: hear_geodesy.py }
+                - { name: code, mountPath: /app/hear/nodeclass.py, subPath: hear_nodeclass.py }
+                - { name: code, mountPath: /app/hear/wire.py, subPath: hear_wire.py }
+                - { name: code, mountPath: /app/hear/node/__init__.py, subPath: hear_node__init__.py }
+                - { name: code, mountPath: /app/hear/node/detect.py, subPath: hear_node_detect.py }
+                - { name: code, mountPath: /app/hear/node/pipeline.py, subPath: hear_node_pipeline.py }
+                - { name: code, mountPath: /app/hear/node/telemetry.py, subPath: hear_node_telemetry.py }
+                - { name: code, mountPath: /app/hear/backend/__init__.py, subPath: hear_backend__init__.py }
+                - { name: code, mountPath: /app/hear/backend/survey.py, subPath: hear_backend_survey.py }
+                - { name: code, mountPath: /app/hear/backend/associate.py, subPath: hear_backend_associate.py }
+                - { name: code, mountPath: /app/hear/backend/pipeline.py, subPath: hear_backend_pipeline.py }
+                - { name: code, mountPath: /app/hear/solve/__init__.py, subPath: hear_solve__init__.py }
+                - { name: code, mountPath: /app/hear/solve/placement.py, subPath: hear_solve_placement.py }
+                - { name: code, mountPath: /app/hear/solve/shockwave.py, subPath: hear_solve_shockwave.py }
+                - { name: code, mountPath: /app/hear/solve/point.py, subPath: hear_solve_point.py }
+                - { name: code, mountPath: /app/hear/solve/consistency.py, subPath: hear_solve_consistency.py }
+                - { name: code, mountPath: /app/hear/solve/soundspeed.py, subPath: hear_solve_soundspeed.py }
+                - { name: code, mountPath: /app/hear/solve/calibrate.py, subPath: hear_solve_calibrate.py }
+                - { name: code, mountPath: /app/tools/hear_tdoa.py, subPath: tools_hear_tdoa.py }
+                - { name: code, mountPath: /app/survey.json, subPath: survey.json }
+                - { name: pool, mountPath: /pool }
+              resources:
+                requests: { cpu: 100m, memory: 128Mi }
+                limits:   { cpu: "1",  memory: 512Mi }
+          volumes:
+            - name: code
+              configMap:
+                name: hear-tdoa-code
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool
