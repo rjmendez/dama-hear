@@ -364,14 +364,14 @@ Two known-open items, both now *visible* rather than fixed: rankine's 25 `clip_w
 clips that never reached the card at all, countable from the index once this ships — and the
 anchored/unanchored split of the 228,251 scene rows, which nothing here is sized from.
 
-## Acquisition at 32 kHz, decimated to 16 kHz
+## Acquisition at 48 kHz, decimated to 16 kHz
 
-The microphone runs at `FS_ACQ` (32 kHz) and everything downstream of the decimator runs at
+The microphone runs at `FS_ACQ` (48 kHz) and everything downstream of the decimator runs at
 `FS_NOMINAL` (16 kHz). Two rates, on purpose, because the two consumers want different things:
 
 | consumer | rate | why |
 |---|---|---|
-| clips (`praw`, WAV) | 32 kHz | Perch v2 reads 32 kHz natively, in 5.0 s windows |
+| clips (`praw`, WAV) | 48 kHz | the most band this mic can legally be clocked for; Perch v2 resamples from it |
 | scene, sketch, gate, dets, timebase | 16 kHz | the mel banks are generated tables with 16000.0f baked in |
 
 ⚠️**A bare `FS_NOMINAL` bump would have compiled clean and corrupted the corpus.** `mel16.h` and
@@ -386,10 +386,15 @@ node are not the same filter:
 
 | | |
 |---|---|
-| passband ripple, 62.5–7812.5 Hz | ≤ 0.19 dB |
-| worst fold into that band | −64.0 dB |
-| group delay | 128 acquisition samples = 4.00 ms exactly |
-| cost | 4.1 M MAC/s, ~2% of one core |
+| passband ripple, 62.5–7812.5 Hz | ≤ 0.08 dB |
+| worst fold into that band | −63.4 dB |
+| group delay | 224 acquisition samples = 4.67 ms |
+| cost | 7.2 M MAC/s, ~3% of one core |
+
+⚠️**÷3 folds more images than ÷2.** Both the k=1 and k=2 images of 16 kHz land in the used band,
+so the stopband runs from 8187.5 Hz to Nyquist and every image is measured — not just the first.
+The test originally checked only `fs_d − f`, which was correct for ÷2 and would have missed half
+the aliasing here.
 
 A 33-tap halfband was measured at only −7.7 dB and rejected. An earlier generator normalised
 *after* quantising, pushing a 347 LSB residual onto the centre tap — a broadband impulse that
@@ -400,11 +405,26 @@ acquisition index, subtracting the FIR delay, so a clip starts where the sound w
 are not stamped 4 ms late — which would have discarded far more than the 21 ns the GPS provides.
 It saturates at 0: the first 4 ms after boot would otherwise underflow.
 
-**Costs.** The PSRAM raw ring halves from 240 s to 120 s (same bytes, twice the rate). A clip is
-320,044 B instead of 128,044 — 2.5× — so the on-node budget holds fewer, which matters much less
-now that clips are drained every 15 minutes rather than living on the card until evicted.
+**Why 48 and not more.** The mic's Standard Performance Mode tops out at a 4.0 MHz clock and the
+ESP32 drives PDM at fs × 64, so fs ≤ 62.5 kHz. Only ÷2 and ÷3 reach 16 kHz by an integer; 64 kHz
+would be a clean ÷4 and needs 4.096 MHz, which the mic does not support. Worth noting the fleet's
+current 16 kHz clocks the mic at 1.024 MHz — *below* Standard Performance's 1.1 MHz floor and above
+Low-Power's 900 kHz ceiling, an unspecified gap it happens to work in. 48 kHz is the first rate
+squarely inside a documented mode.
 
-⚠️**The 32 kHz PDM rate is UNVERIFIED ON THIS HARDWARE.** It compiles and `firmware/boards/puc.h`
-already runs PDM at 48 kHz through the same driver, but no node has been flashed. Confirm the boot
-line reports `PDM 32000 Hz ... -> /2 -> 16000 Hz` and that `fs_clean_hz` still settles near 16000
-before trusting a night of data.
+**Costs, and they are real.** The PSRAM raw ring drops from **240 s to 60 s** — a quarter of the
+retrospective window. A clip is **480,044 B instead of 128,044** (3.75×), so the on-node budget
+holds 13 instead of 49. That second cost only became affordable because clips are now drained every
+15 minutes instead of living on the card until evicted.
+
+**Nyquist is 24 kHz, and nothing above 10 kHz is characterised.** The datasheet's frequency
+response plot ends at 10 kHz; SNR is quoted over a 20 kHz bandwidth. Response above that is
+unspecified, so treat any content between 10 and 24 kHz as measured-but-uncalibrated. If it turns
+out to be structured rather than noise, that is a finding, not a guarantee.
+
+⚠️**UNVERIFIED ON HARDWARE.** The mic and SoC specs say 48 kHz is in range; no node has been
+flashed. (An earlier note here cited `boards/puc.h` running PDM at 48 kHz as evidence — that was
+wrong: its `FS_NOMINAL 48000` is a vendor string from a flash dump, and the only measured PDM run
+on that board was at 16 kHz.) Confirm the boot line reports `PDM 48000 Hz ... -> /3 -> 16000 Hz`,
+that the ring log shows the expected 60 s fallback, and that `fs_clean_hz` still settles near
+16000, before trusting a night of data.
