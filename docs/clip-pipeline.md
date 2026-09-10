@@ -432,7 +432,7 @@ node are not the same filter:
 | passband ripple, 62.5–7812.5 Hz | ≤ 0.08 dB |
 | worst fold into that band | −63.4 dB |
 | group delay | 224 acquisition samples = 4.67 ms |
-| cost | 7.2 M MAC/s, ~3% of one core |
+| cost | 24.2 cycles per multiply, 225 folded multiplies per output, measured on rankine via `/dsp` — **36% of one core** for one microphone |
 
 ⚠️**÷3 folds more images than ÷2.** Both the k=1 and k=2 images of 16 kHz land in the used band,
 so the stopband runs from 8187.5 Hz to Nyquist and every image is measured — not just the first.
