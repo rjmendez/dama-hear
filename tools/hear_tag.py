@@ -727,7 +727,11 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
     # writes -- the same magic number, in the same shape, that hear/clips.py had already been
     # fixed for. A constant copied out of one module keeps its number and loses its meaning.
     probe = {"fs_hz": int(header_fs), "dur_s": len(pcm) / float(header_fs or 1)}
-    fix = CLIPS.header_rate_suspect(probe)
+    # Two distinct rate defects are on the cards: the FS_NOMINAL-stamped 48 kHz clip (an integer
+    # decimation apart) and mach's latched 22624/22848 Hz boot (not an integer anything, only
+    # recoverable from the length). Neither can fire on the other's clips.
+    fix = (CLIPS.header_rate_suspect(probe)
+           or CLIPS.length_implies_rate(len(pcm), header_fs, row.get("fs_hz")))
     true_fs = fix["true_fs_hz"] if fix else float(header_fs)
     # ⚠️THE RATE IS SETTLED BEFORE THE LENGTH, BECAUSE THE LENGTH IS MEASURED IN IT. Checked the
     # other way round, mach's 22624 Hz boot came back as `wav_sample_count` -- 64000 samples read

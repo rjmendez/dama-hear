@@ -169,3 +169,64 @@ class TestTheWindowComesFromTheClipNotAConstant:
         assert row["t_end_utc_s"] - row["ts_utc_s"] == pytest.approx(4.0)
         assert row["header_rate_suspect"]["true_fs_hz"] == 48000.0
         assert row["wav_header_fs_hz"] == 16000, "the lying header is KEPT, not overwritten"
+
+
+class TestALatchedWrongRateIsRecoveredFromTheLengthAlone:
+    """⚠️mach shipped a whole boot headed 22624/22848 Hz over 16 kHz audio. That is a DIFFERENT
+    defect from the FS_NOMINAL-stamped 48 kHz clip: 22848/16000 is not an integer anything, so
+    the decimation-factor search cannot see it. The only handle is the length.
+
+    ⚠️IT MATTERS TO A PERSON, NOT ONLY TO A MODEL. Played at 22848 Hz a 4.0 s clip is 2.80 s and
+    every frequency is 1.43x high -- a dog becomes a smaller dog. One of the 29 clips a human
+    listened to on 2026-09-10 was this one, and they heard it at the wrong pitch.
+    """
+
+    def test_the_22848_boot_is_recovered_to_16k(self):
+        fix = CLIPS.length_implies_rate(64000, 22848, 16000.0)
+        assert fix and fix["true_fs_hz"] == 16000.0
+        assert fix["true_dur_s"] == pytest.approx(4.0)
+        assert fix["header_dur_s"] == pytest.approx(2.80, abs=0.01)
+
+    def test_the_other_reported_bad_rate_too(self):
+        assert CLIPS.length_implies_rate(64000, 22624, None)["true_fs_hz"] == 16000.0
+
+    def test_a_rate_the_fleet_really_clocks_is_never_second_guessed(self):
+        """⚠️If the header names a real rate, the LENGTH is the anomaly. Rewriting the rate to
+        explain away an odd length is exactly backwards -- it would turn a truncated clip into a
+        confident claim about a sample rate."""
+        for fs in (16000, 15968, 32000, 48000, 47973):
+            assert CLIPS.length_implies_rate(64000, fs, None) is None
+            assert CLIPS.length_implies_rate(999, fs, None) is None
+
+    def test_a_csv_that_merely_echoes_the_broken_header_does_not_veto(self):
+        """⚠️MEASURED REGRESSION, AND IT COST A REAL CLIP. This first required the CSV to agree
+        with the recovered rate. mach-a75b9e4c has BOTH the header and dets.csv at 22848, because
+        night_node writes both from fs_timebase() -- :1958 and :3498 -- so a bad fs_clean latch
+        lands in both. The veto fired and the clip stayed broken. Two copies of one measurement
+        are not two measurements."""
+        fix = CLIPS.length_implies_rate(64000, 22848, 22848.0)
+        assert fix and fix["true_fs_hz"] == 16000.0
+        assert fix["csv_was_independent"] is False
+
+    def test_a_csv_naming_a_REAL_rate_that_disagrees_still_vetoes(self):
+        """A three-way disagreement is a different thing from an echo, and is not recoverable."""
+        assert CLIPS.length_implies_rate(64000, 22848, 48000.0) is None
+        assert CLIPS.length_implies_rate(64000, 22848, 32000.0) is None
+
+    def test_a_csv_naming_a_real_rate_that_agrees_is_corroboration(self):
+        fix = CLIPS.length_implies_rate(64000, 22848, 16004.7)
+        assert fix["true_fs_hz"] == 16000.0 and fix["csv_was_independent"] is True
+
+    def test_a_length_that_names_no_rate_recovers_nothing(self):
+        for n in (12345, 1, 999999):
+            assert CLIPS.length_implies_rate(n, 22848, None) is None
+
+    def test_it_does_not_fire_on_the_decimation_mismatch(self):
+        """The two corrections must not both claim the same clip. A 48 kHz body headed 16000 has
+        a header rate the fleet DOES clock, so only header_rate_suspect sees it."""
+        assert CLIPS.length_implies_rate(240000, 16000, 16000.0) is None
+        assert CLIPS.header_rate_suspect({"fs_hz": 16000, "dur_s": 15.0})["decim"] == 3
+
+    def test_zero_and_absent_inputs_do_not_divide_by_zero(self):
+        for args in ((0, 22848, None), (64000, 0, None), (64000, None, None), (None, 22848, None)):
+            assert CLIPS.length_implies_rate(*args) is None

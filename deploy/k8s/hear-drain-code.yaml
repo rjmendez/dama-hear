@@ -6,7 +6,7 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: '951a6f7-dirty'
+    dama-hear/commit: 'c85eb33-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
 data:
   hear__init__.py: |
@@ -2185,6 +2185,10 @@ data:
     CLIP_GEOMETRIES_S = (4.0, 5.0)
     #: Clock drift on the header's integer rate. 2% is ~30x the 14 Hz observed header spread.
     CLIP_GEOMETRY_TOL = 0.02
+    #: Rates a node is ever configured to clock the microphone at. Mirrors hear/resample.py, repeated
+    #: rather than imported: clips.py ships in bundles that resample.py is not in.
+    FLEET_ACQ_RATES_HZ = (16000.0, 32000.0, 48000.0)
+    FLEET_RATE_TOL = 0.005
     
     
     def header_rate_suspect(probe: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2225,6 +2229,63 @@ data:
                 "why": ("body is %.1f s at the header's %g Hz, which is not a length this fleet "
                         "writes; at %g Hz it is %.2f s -- the FS_NOMINAL-stamped 48 kHz clip bug"
                         % (dur, fs, true_fs, true_dur))}
+    
+    
+    def length_implies_rate(n_samples: int, header_fs: float,
+                            csv_fs: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """A header rate nobody clocks -> the fleet rate its LENGTH says it must be. Or None.
+    
+        ⚠️A DIFFERENT DEFECT FROM header_rate_suspect, WITH A DIFFERENT SHAPE. That one is a
+        decimation mismatch: the body is at FS_ACQ, the header at FS_NOMINAL, and the two are an
+        integer factor apart. This one is a rate that was simply LATCHED WRONG -- mach shipped a whole
+        boot headed 22624/22848 Hz over 16 kHz audio, and 22848/16000 is not an integer anything. The
+        only handle on it is that 64000 samples is 2.80 s at the header's rate, which is not a length
+        this fleet writes, and 4.00 s at 16 kHz, which is.
+    
+        ⚠️IT ONLY LOOKS AT A HEADER THAT IS ALREADY IMPOSSIBLE. A rate the fleet clocks is left alone
+        even if the length is odd -- then the LENGTH is the anomaly and rewriting the rate to explain
+        it away would be exactly backwards.
+    
+        ⚠️UNIQUENESS IS THE PROOF. Exactly one fleet rate must turn the sample count into a length
+        this fleet writes; two candidates or none means the header is not recoverable.
+    
+        ⚠️THE CSV IS NOT INDEPENDENT EVIDENCE, AND ASSUMING IT WAS COST A CLIP. This function first
+        required `csv_fs` to agree with the recovered rate. It does not, on the very boot this exists
+        for: mach-a75b9e4c has BOTH the header and dets.csv at 22848 Hz, so the veto fired and the
+        clip stayed broken. night_node.ino writes both from `fs_timebase()` -- the clip header at
+        :1958 and the detection row at :3498 -- so when `fs_clean` latches wrong, both inherit it.
+        Their DISAGREEMENT is informative and is why they travel side by side; their AGREEMENT is one
+        measurement written twice.
+    
+        So `csv_fs` may only veto when it names a rate the fleet ACTUALLY CLOCKS and that rate is not
+        the recovered one -- a real three-way disagreement. A `csv_fs` that merely echoes an
+        impossible header carries no information and is ignored.
+        """
+        if not n_samples or not header_fs or header_fs <= 0:
+            return None
+        for r in FLEET_ACQ_RATES_HZ:
+            if abs(float(header_fs) - r) <= r * FLEET_RATE_TOL:
+                return None                     # the header names a rate we really do clock
+        hits = []
+        for r in FLEET_ACQ_RATES_HZ:
+            d = n_samples / r
+            if any(abs(d - g) <= g * CLIP_GEOMETRY_TOL for g in CLIP_GEOMETRIES_S):
+                hits.append((r, d))
+        if len(hits) != 1:
+            return None
+        r, d = hits[0]
+        csv_names_a_fleet_rate = bool(csv_fs) and any(
+            abs(float(csv_fs) - q) <= q * FLEET_RATE_TOL for q in FLEET_ACQ_RATES_HZ)
+        if csv_names_a_fleet_rate and abs(float(csv_fs) - r) > r * FLEET_RATE_TOL:
+            return None                         # a real three-way disagreement: recover nothing
+        return {"header_fs_hz": float(header_fs), "true_fs_hz": r, "true_dur_s": d,
+                "header_dur_s": n_samples / float(header_fs),
+                "csv_fs_hz": None if csv_fs is None else float(csv_fs),
+                "csv_was_independent": csv_names_a_fleet_rate,
+                "why": ("header states %g Hz, which this fleet never clocks; %d samples is %.2f s "
+                        "there and %.2f s at %g Hz, the one rate that makes it a clip -- the latched "
+                        "fs_clean bug, not a decimation mismatch"
+                        % (header_fs, n_samples, n_samples / float(header_fs), d, r))}
     
     
     def clip_total_s(row: Dict[str, Any]) -> Optional[float]:
