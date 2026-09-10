@@ -26,6 +26,15 @@ thing is the circularity this repo names elsewhere.
 RMS 40 dB under their peak; taking RMS to -20 dBFS would clip the transient, which is exactly the
 part worth hearing. Gain is min(rms_target, peak_target) and the manifest says which bound bit.
 
+⚠️A LYING HEADER IS CORRECTED FOR PLAYBACK AND SAID OUT LOUD. Two different rate defects are on the cards.
+night_node stamped every 48 kHz clip with the FS_NOMINAL timebase for the whole of the 48 kHz
+rollout, so a 5.0 s clip claims 15.0 s at 16 kHz and plays an octave and a half LOW. Separately,
+mach latched 22624/22848 Hz for a whole boot over 16 kHz audio, so those clips claim 2.80 s and
+play 1.43x too HIGH -- a dog becomes a smaller dog, and a person listening has no way to know. Firmware is fixed; the clips already on the
+PVC are not rewritable. `hear/clips.header_rate_suspect` recovers the rate only when exactly one
+integer factor closes onto a length this fleet actually writes, and the sheet marks every clip it
+touched -- a corrected clip is evidence about a firmware bug as well as about the site.
+
 ⚠️IT READS THE POOL AND WRITES ONLY --out. No node is contacted, index.jsonl is not rewritten,
 and nothing is pruned.
 """
@@ -41,6 +50,9 @@ import shutil
 import struct
 import sys
 import wave
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hear.clips import header_rate_suspect, length_implies_rate  # noqa: E402
 
 #: Target for the listening copy. -20 dBFS RMS matches what hear_tag.py normalises to, so the ear
 #: and the model are hearing the same level.
@@ -213,6 +225,73 @@ def stratify(rows, n, rng, require_nodes):
     return picked
 
 
+#: How many clips to actually OPEN when stratifying. Measuring silence_frac means reading the
+#: audio, and the index does not carry it. 150 bounds the work to a few seconds while still being
+#: a random draw before it is a stratified one.
+STRATIFY_CANDIDATES = 150
+
+
+def stratify_silence(rows, n, rng, require_nodes, pool):
+    """Even coverage of the silence_frac axis, still round-robin over nodes inside each band.
+
+    ⚠️THIS IS A DELIBERATELY UNREPRESENTATIVE SAMPLE AND THAT IS THE POINT. Gate condition 3 needs
+    the ENVELOPE of the silence_frac distribution among clips a person calls empty, and a random
+    draw from this corpus lands mostly in one place: the first 30 clips produced 3 empties, which
+    the tool itself then refused to set a threshold from. Flattening the axis fills the tails.
+
+    ⚠️NOTHING DOWNSTREAM MAY READ A COUNT FROM A BATCH DRAWN THIS WAY. "40 % of clips were empty"
+    would be a statement about this function, not about the site. The manifest records which
+    sampler ran, and the sheet says so at the top.
+
+    ⚠️IT IS RANDOM BEFORE IT IS STRATIFIED. silence_frac is not in the index, so it is measured by
+    opening the audio; opening all of them would be minutes of pure-Python framing. A random
+    STRATIFY_CANDIDATES-sized draw is measured and the bands are filled from that, so the only
+    bias introduced is the intended one.
+    """
+    cand = list(rows)
+    rng.shuffle(cand)
+    cand = cand[:STRATIFY_CANDIDATES]
+    scored = []
+    for r in cand:
+        src = os.path.join(pool, "corpus", r["path"])
+        if not os.path.exists(src):
+            continue
+        try:
+            samples, fs, _ = read_pcm(src)
+        except (wave.Error, ValueError):
+            continue
+        fix = (header_rate_suspect({"fs_hz": fs, "dur_s": len(samples) / float(fs)})
+               or length_implies_rate(len(samples), fs, r.get("fs_hz")))
+        m = measure(samples, fix["true_fs_hz"] if fix else fs)
+        if m.get("silence_frac") is None:
+            continue
+        scored.append((m["silence_frac"], r))
+    B = 8
+    bands = [[] for _ in range(B)]
+    for f, r in scored:
+        bands[min(B - 1, int(max(0.0, min(0.999, f)) * B))].append(r)
+    for b in bands:
+        rng.shuffle(b)
+    picked, seen = [], set()
+    for node in require_nodes:
+        for b in bands:
+            hit = next((x for x in b if x.get("node") == node and x["clip_key"] not in seen), None)
+            if hit is not None:
+                b.remove(hit); picked.append(hit); seen.add(hit["clip_key"]); break
+    live = [i for i, b in enumerate(bands) if b]
+    i = 0
+    while len(picked) < n and live:
+        idx = live[i % len(live)]
+        if not bands[idx]:
+            live.remove(idx)
+            continue
+        r = bands[idx].pop()
+        if r["clip_key"] not in seen:
+            picked.append(r); seen.add(r["clip_key"])
+        i += 1
+    return picked
+
+
 def sheet(picked, staged, out, day_tag):
     lines = []
     lines.append("# Clip calibration — %s" % day_tag)
@@ -228,27 +307,32 @@ def sheet(picked, staged, out, day_tag):
     lines.append("`gain_db` is how much this clip had to be lifted to be audible. It is a "
                  "property of the recording, not of the event.")
     lines.append("")
-    lines.append("| # | node | UTC | rms dBFS | crest dB | silence frac | gain dB | heard | "
-                 "confident? | notes |")
-    lines.append("|---|------|-----|----------|----------|--------------|---------|-------|"
-                 "------------|-------|")
+    lines.append("| # | node | UTC | rate | rms dBFS | crest dB | silence frac | gain dB | "
+                 "heard | confident? | notes |")
+    lines.append("|---|------|-----|------|----------|----------|--------------|---------|"
+                 "-------|------------|-------|")
     import datetime
     for i, (r, m) in enumerate(zip(picked, staged), 1):
         ts = r.get("ts_utc_s")
         when = (datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
                 .strftime("%m-%d %H:%M:%S") if isinstance(ts, (int, float)) else "unanchored")
-        lines.append("| %d | %s | %s | %.1f | %s | %s | %+.1f |  |  |  |" % (
-            i, r.get("node"), when, m["rms_dbfs_orig"],
+        rate = ("%g Hz ⚠️was %g" % (m["wav_fs_hz"], m["header_fs_hz"])
+                if m.get("header_rate_suspect") else "%g Hz" % m["wav_fs_hz"])
+        lines.append("| %d | %s | %s | %s | %.1f | %s | %s | %+.1f |  |  |  |" % (
+            i, r.get("node"), when, rate, m["rms_dbfs_orig"],
             "%.1f" % m["crest_db"] if m.get("crest_db") is not None else "—",
             "%.3f" % m["silence_frac"] if m.get("silence_frac") is not None else "—",
             20.0 * math.log10(m["gain"]) if m["gain"] > 0 else 0.0))
     lines.append("")
     lines.append("## What the corpus cannot tell you")
     lines.append("")
-    lines.append("- A clip is 4.0 s: 1.0 s before the trigger and 3.0 s after. If the event is at "
+    lines.append("- A clip is 1.0 s before the trigger and 3.0 s after (16 kHz) or 4.0 s after "
+                 "(48 kHz); the `rate` column says which. If the event is at "
                  "the very start you are hearing its tail only.")
     lines.append("- The tagger has never run on these. Nothing here is a model's opinion; that is "
                  "the point.")
+    lines.append("- A ⚠️ in the rate column means the clip's WAV header said the wrong rate and "
+                 "was corrected for playback. The audio is real; only the header was wrong.")
     lines.append("")
     open(os.path.join(out, "sheet.md"), "w", encoding="utf-8").write("\n".join(lines) + "\n")
 
@@ -266,11 +350,25 @@ def main():
     ap.add_argument("--require-node", action="append", default=["mach"],
                     help="guarantee at least one clip from this node; repeatable "
                          "(gate names mach)")
+    ap.add_argument("--exclude", default=None,
+                    help="file of clip_keys, one per line, to leave out. A second batch must not "
+                         "re-serve what has already been listened to")
+    ap.add_argument("--stratify-silence", action="store_true",
+                    help="spread the sample evenly over silence_frac instead of drawing at "
+                         "random. ⚠️THE RESULT IS NOT A BASE RATE -- it exists to populate the "
+                         "distribution gate condition 3 is derived from, and a threshold read "
+                         "off a deliberately flattened sample would be wrong")
     ap.add_argument("--seed", type=int, default=None,
                     help="fix the sample. Omit for a fresh draw; record it for a repeatable one")
     args = ap.parse_args()
 
     rows = load_index(args.pool)
+    if args.exclude and os.path.exists(args.exclude):
+        with open(args.exclude, encoding="utf-8") as fh:
+            skip = {ln.strip() for ln in fh if ln.strip()}
+        before = len(rows)
+        rows = [r for r in rows if r.get("clip_key") not in skip]
+        print("excluded %d already-heard clip(s)" % (before - len(rows)))
     if args.node:
         rows = [r for r in rows if r.get("node") in set(args.node)]
     if not rows:
@@ -281,7 +379,10 @@ def main():
     require = [nd for nd in (args.require_node or [])
                if any(r.get("node") == nd for r in rows)]
     missing = [nd for nd in (args.require_node or []) if nd not in require]
-    picked = stratify(rows, args.n, rng, require)
+    if args.stratify_silence:
+        picked = stratify_silence(rows, args.n, rng, require, args.pool)
+    else:
+        picked = stratify(rows, args.n, rng, require)
 
     if os.path.isdir(args.out) and os.listdir(args.out) and not args.force:
         raise SystemExit("%s already holds files; staging into it would mix this run's clips "
@@ -301,15 +402,20 @@ def main():
         except (wave.Error, ValueError) as e:
             skipped.append({"path": r["path"], "why": str(e)})
             continue
-        m = measure(samples, fs)
+        fix = (header_rate_suspect({"fs_hz": fs, "dur_s": len(samples) / float(fs)})
+               or length_implies_rate(len(samples), fs, r.get("fs_hz")))
+        play_fs = fix["true_fs_hz"] if fix else fs
+        m = measure(samples, play_fs)
+        m["header_fs_hz"] = fs
+        m["header_rate_suspect"] = fix
         g, bound = gain_for(m)
         base = os.path.basename(r["path"])
         shutil.copy2(src, os.path.join(args.out, base))
         loud = base[:-4] + ".loud.wav" if base.endswith(".wav") else base + ".loud.wav"
-        clipped = write_loud(samples, fs, g, os.path.join(args.out, loud))
+        clipped = write_loud(samples, play_fs, g, os.path.join(args.out, loud))
         m.update({"gain": g, "gain_db": round(20.0 * math.log10(g), 2) if g > 0 else 0.0,
                   "gain_bound_by": bound, "clipped_samples": clipped,
-                  "wav_fs_hz": fs, "loud": loud, "orig": base})
+                  "wav_fs_hz": play_fs, "loud": loud, "orig": base})
         staged.append(m)
         kept.append(r)
 
@@ -321,6 +427,13 @@ def main():
             "staged": len(kept),
             "skipped": skipped,
             "require_node_unavailable": missing,
+            "sampler": "silence-stratified" if args.stratify_silence else "node-balanced",
+            "sampler_warning": (
+                "⚠️silence-stratified: this batch is SPREAD EVENLY over silence_frac on purpose, "
+                "so counts from it are a property of the sampler and not of the site. It exists "
+                "to populate the distribution --max-silence-frac is derived from."
+                if args.stratify_silence else None),
+            "excluded_file": args.exclude,
             "rms_target_dbfs": RMS_TARGET_DBFS,
             "peak_target_dbfs": PEAK_TARGET_DBFS,
             "silence_frame_dbfs": SILENCE_FRAME_DBFS,
@@ -353,6 +466,10 @@ def main():
         print("  ⚠️asked for %d, staged %d (%d skipped)" % (args.n, len(kept), len(skipped)))
     for s in skipped:
         print("    skipped %s: %s" % (s["path"], s["why"]))
+    fixed = [m for m in staged if m.get("header_rate_suspect")]
+    if fixed:
+        print("  ⚠️%d clip(s) had a wrong WAV header rate and were corrected for playback: %s"
+              % (len(fixed), fixed[0]["header_rate_suspect"]["why"]))
     lv = [m["rms_dbfs_orig"] for m in staged if m["rms_dbfs_orig"] != -math.inf]
     if lv:
         print("  original level: %.1f to %.1f dBFS -- raw playback of these is silence, use "
