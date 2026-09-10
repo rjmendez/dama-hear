@@ -156,12 +156,36 @@ def _post_s(row: Dict[str, Any]) -> float:
     """
     total = row.get("dur_s")
     if total is None:
-        n, fs = row.get("bytes"), row.get("wav_header_fs_hz")
-        if n and fs:
-            total = (int(n) - 44) / float(int(fs) * 2)
+        total = _v1_total_s(row.get("bytes"), row.get("wav_header_fs_hz"))
     if total is None or not (CLIP_PRE_S < total <= 8.0):
         return CLIP_POST_S
     return total - CLIP_PRE_S
+
+
+#: The clip lengths this fleet writes and the rates it clocks. Repeated from hear/clips.py rather
+#: than imported, because clips.py imports THIS module; test_hear_tag asserts the copies agree.
+_GEOMETRIES_S = (4.0, 5.0)
+_GEOMETRY_TOL = 0.02
+_FLEET_RATES_HZ = (16000.0, 32000.0, 48000.0)
+
+
+def _v1_total_s(n_bytes, header_fs) -> Optional[float]:
+    """A v1 row's length, for rows written before `dur_s` existed. None when unknowable.
+
+    ⚠️NOT bytes / header rate. v1 rows include 48 kHz clips headed 16000 Hz, which that division
+    reads as 15.0 s. The header is believed only when it yields a length the fleet writes;
+    otherwise exactly one fleet rate must, or nothing is claimed.
+    """
+    if not n_bytes or not header_fs:
+        return None
+    n = (int(n_bytes) - 44) / 2.0
+    def is_geom(d):
+        return any(abs(d - g) <= g * _GEOMETRY_TOL for g in _GEOMETRIES_S)
+    at_header = n / float(header_fs)
+    if is_geom(at_header):
+        return at_header
+    hits = [n / r for r in _FLEET_RATES_HZ if is_geom(n / r)]
+    return hits[0] if len(hits) == 1 else None
 
 
 def sample_window(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:

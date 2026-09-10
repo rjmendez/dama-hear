@@ -1701,7 +1701,8 @@ static void wav_header(uint8_t *h, uint32_t data_bytes, uint32_t fs) {
 // 35 x 128044 = 4481540 B = 4.27 MiB, a 2.26x margin. The budget is set above that rather than at
 // it, because the events are not spread evenly: 34 of the 48 triggers fall in the two hours
 // 09:00-10:59, so a per-night average protects nothing. A byte budget does.
-#define CLIP_BUDGET_B  6291456u   // 6 MiB = 49 clips = 1.4x the measured 12 h event count, and
+#define CLIP_BUDGET_B  6291456u   // 6 MiB. 49 clips at 16 kHz (1.4x the measured 12 h event
+                                  // count) but only 13 at 48 kHz (~0.37x); CLIP_BYTES moved, this did not. And
                                   // leaves 3.64 MiB of the remainder for the CSVs to overrun into
 // And a live floor under that, because the budget assumes the card started at 19 MiB free and
 // nothing here can know that it did. 2 MiB is ~2.6 h of scene rows (227 B per 1.024 s = 221.7
