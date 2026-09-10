@@ -148,7 +148,7 @@ class TestTheListingParsesThroughTheDrainsOwnParser:
 
     def test_every_golden_name_is_the_measured_clip_size(self):
         got = D._ls_parse(GOLDEN.read_text())
-        assert set(got.values()) == {D.CL.CLIP_BYTES}
+        assert set(got.values()) == {D.CL.CLIP_BYTES_16K_4S}
 
     def test_a_truncation_marker_is_carried_not_dropped(self):
         # ⚠️THE REGRESSION THIS EXISTS FOR. `! truncated ...` starts with `!`, so the `- ` parse

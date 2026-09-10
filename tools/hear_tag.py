@@ -614,10 +614,10 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
     except Exception as exc:
         return {"ok": False, "reason": R_WAV_UNREADABLE,
                 "detail": "%s: %s" % (type(exc).__name__, exc)}
-    if len(pcm) * 2 + 44 != CLIPS.CLIP_BYTES:
+    if len(pcm) * 2 + 44 != CLIPS.CLIP_BYTES_16K_4S:
         return {"ok": False, "reason": R_WAV_SAMPLES,
                 "detail": "%d samples; a clip is %d (%.1f s pre + %.1f s post at %d Hz)"
-                          % (len(pcm), (CLIPS.CLIP_BYTES - 44) // 2, CLIPS.CLIP_PRE_S,
+                          % (len(pcm), (CLIPS.CLIP_BYTES_16K_4S - 44) // 2, CLIPS.CLIP_PRE_S,
                              CLIPS.CLIP_POST_S, int(CLIPS.FS_NOMINAL_HZ))}
     try:
         assert_rate(header_fs, row.get("fs_hz"))
