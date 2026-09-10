@@ -183,6 +183,24 @@ DEFAULT_DEADLINE_S = 600.0
 #: a single clip would be a number from a guess dressed as a measurement; this repo's own rule is
 #: to derive a threshold from the measured envelope.
 SILENCE_FRAC_REPORT_ONLY = -1.0
+
+#: ⚠️THE NORMALISATION CANARY, AND THE ONE IT REPLACED COULD NOT FIRE. `--max-silence-frac` gated
+#: the fraction of clips whose top class is `Silence`, which worked under YAMNet because an
+#: un-normalised clip came back Silence every time. Measured on the 69-clip human calibration set
+#: (docs/clip-calibration-2026-09-10.md), mn10_as gives silence_top_frac 0.0000 normalised and
+#: 0.0435 un-normalised -- a threshold resting on THREE clips, whose 95 % interval reaches from
+#: 0.9 % to 12 %, so a 2 % gate could pass a completely broken run.
+#:
+#: The run's MEAN TOP SCORE uses all 69 instead of 3: 0.254 healthy against 0.162 un-normalised,
+#: higher on 58 of 69 clips, and at the job's 400-clip --limit the two run-level means are 13.6
+#: sigma apart. The floor sits between them, nearer the broken end because a false HIGH is a
+#: woken operator and a false ok is a quiet lane.
+MEAN_TOP_SCORE_FLOOR = 0.20
+#: Negative disables the gate and prints the number instead, the same convention as above.
+MEAN_TOP_SCORE_REPORT_ONLY = -1.0
+#: ⚠️IT IS CALIBRATED AGAINST EXACTLY ONE FAILURE. The `broken` arm above is normalisation
+#: disabled and nothing else. Wrong weights, a corrupt resample or silence on the wire may not
+#: move this number at all, so a run that passes is not a run that is known good.
 SILENCE_CLASS = "Silence"
 
 # ----------------------------------------------------------------- refusal vocabulary
@@ -651,7 +669,7 @@ def empty_tally() -> Dict[str, Any]:
             "superseded": 0,
             "tagged": 0, "refused": 0, "already_tagged": 0, "deferred": 0,
             "by_reason": {}, "by_node": {}, "by_node_day_reason": {},
-            "silence_top": 0, "scored_any": 0, "dbfs": [], "unstored": []}
+            "silence_top": 0, "scored_any": 0, "dbfs": [], "unstored": [], "top_scores": []}
 
 
 def tally(t: Dict[str, Any], node: str, day: str, outcome: str,
@@ -669,6 +687,8 @@ def tally(t: Dict[str, Any], node: str, day: str, outcome: str,
             if top == SILENCE_CLASS:
                 t["silence_top"] += 1
                 n["silence_top"] += 1
+            if top is not None:
+                t["top_scores"].append(float(scores[top]))
             if row.get("pre_norm_dbfs") is not None:
                 t["dbfs"].append(float(row["pre_norm_dbfs"]))
             if row.get("max_unstored_score") is not None:
@@ -727,7 +747,11 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
     # writes -- the same magic number, in the same shape, that hear/clips.py had already been
     # fixed for. A constant copied out of one module keeps its number and loses its meaning.
     probe = {"fs_hz": int(header_fs), "dur_s": len(pcm) / float(header_fs or 1)}
-    fix = CLIPS.header_rate_suspect(probe)
+    # Two distinct rate defects are on the cards: the FS_NOMINAL-stamped 48 kHz clip (an integer
+    # decimation apart) and mach's latched 22624/22848 Hz boot (not an integer anything, only
+    # recoverable from the length). Neither can fire on the other's clips.
+    fix = (CLIPS.header_rate_suspect(probe)
+           or CLIPS.length_implies_rate(len(pcm), header_fs, row.get("fs_hz")))
     true_fs = fix["true_fs_hz"] if fix else float(header_fs)
     # ⚠️THE RATE IS SETTLED BEFORE THE LENGTH, BECAUSE THE LENGTH IS MEASURED IN IT. Checked the
     # other way round, mach's 22624 Hz boot came back as `wav_sample_count` -- 64000 samples read
@@ -893,12 +917,16 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
     t["weights_ok"] = bool(verified["ok"])
     t["at"] = now
     t["silence_frac"] = (t["silence_top"] / float(t["tagged"])) if t["tagged"] else None
+    _tops = t.pop("top_scores")
+    t["mean_top_score"] = (sum(_tops) / len(_tops)) if _tops else None
+    t["n_top_scores"] = len(_tops)
     t["observation_not_health"] = {
         "level_dbfs": _distribution(t.pop("dbfs")),
         # ⚠️AGGREGATED, NOT ONLY PER ROW. `max_unstored_score` made the discarded tail a number on
         # each row; nothing summed it, so a floor set too high looked exactly like a quiet night.
         "max_unstored_score": _distribution(t.pop("unstored")),
         "silence_top_frac": t["silence_frac"],
+        "mean_top_score": t["mean_top_score"],
         "note": ("the class distribution is NOT an input to any gate. A quiet night is the "
                  "expected result; a gate keyed on 'did anything score high' fires on a correct "
                  "run. silence_top_frac is gated only once a human calibration set has been "
@@ -979,6 +1007,8 @@ def write_heartbeat(root: str, report: Dict[str, Any], now: Optional[float] = No
         "conservation_ok": bool(report.get("conservation_ok")),
         "weights_ok": bool(report.get("weights_ok")),
         "silence_top": report.get("silence_top"),
+        "mean_top_score": report.get("mean_top_score"),
+        "n_top_scores": report.get("n_top_scores"),
         "silence_frac": report.get("silence_frac"),
         # ⚠️`scored_any` IS AN ABSOLUTE SIGNAL AND `silence_frac` IS NOT. A model that returns
         # nothing above the floor for every clip reports silence_frac 0.000 -- the best possible
@@ -998,6 +1028,7 @@ def write_heartbeat(root: str, report: Dict[str, Any], now: Optional[float] = No
 
 
 def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
+               min_mean_top_score: float = MEAN_TOP_SCORE_REPORT_ONLY,
                window_s: float = DEFAULT_RUN_WINDOW_S,
                max_stale_s: float = DEFAULT_MAX_STALE_S,
                now: Optional[float] = None) -> Tuple[int, List[str]]:
@@ -1010,7 +1041,10 @@ def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
     that saw zero index rows fails, unverified weights fail, and a stale heartbeat fails whatever
     the store looks like. hear_drain.check()'s `if not sensors: return 1` is the same shape.
 
-    ⚠️THE SILENCE FRACTION IS REPORT-ONLY UNTIL A HUMAN HAS CALIBRATED IT. At max_silence_frac < 0
+    ⚠️THE SILENCE FRACTION IS REPORT-ONLY FOREVER NOW, AND CALIBRATION IS WHAT RETIRED IT. It was
+    "report-only until a human calibrates it"; 69 clips were heard and the answer was that
+    mn10_as returns Silence top-1 on 0 of them healthy and 3 un-normalised, so any gate rests on
+    three clips. `min_mean_top_score` is the canary that replaced it. At max_silence_frac < 0
     it prints the measured value and says on its own line that it is not gating. Setting it from
     a guess rather than from the measured envelope is the failure this repo names as its own.
     """
@@ -1119,18 +1153,36 @@ def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
 
     sil = sum(int(r.get("silence_top") or 0) for r in window)
     frac = (sil / float(tagged)) if tagged else None
-    if max_silence_frac < 0:
-        lines.append("silence  REPORT    %s of tagged clips top-class Silence -- NOT GATED. The "
-                     "threshold is set from a measured human calibration set, not from a guess; "
-                     "see the Phase-3 gate in docs/acoustic-stack.md"
-                     % ("%.3f" % frac if frac is not None else "n/a"))
-    elif frac is not None and frac > max_silence_frac:
-        lines.append("silence  HIGH      %.3f of tagged clips top-class Silence, over %.3f -- the "
-                     "usual cause is normalisation not running" % (frac, max_silence_frac))
+    # ⚠️REPORTED, NEVER GATED, AND NOT BECAUSE IT IS UNCALIBRATED. It IS calibrated now, and the
+    # calibration is what retired it: mn10_as returns Silence top-1 on 0 of 69 human-heard clips
+    # normalised and 3 of 69 un-normalised. A gate between those rests on three clips. Kept as an
+    # observation because a sudden non-zero IS informative; it is just not a threshold.
+    lines.append("silence  REPORT    %s of tagged clips top-class Silence -- NOT GATED, and it "
+                 "cannot be: 0/69 healthy vs 3/69 un-normalised on the human calibration set "
+                 "(docs/clip-calibration-2026-09-10.md S1.2). The normalisation canary is the "
+                 "score floor below."
+                 % ("%.3f" % frac if frac is not None else "n/a"))
+
+    tops = [(float(r["mean_top_score"]), int(r.get("n_top_scores") or 0)) for r in window
+            if r.get("mean_top_score") is not None]
+    n_scored = sum(n for _, n in tops)
+    mean_top = (sum(m * n for m, n in tops) / n_scored) if n_scored else None
+    if min_mean_top_score < 0:
+        lines.append("score    REPORT    mean top score %s over %d clip(s) -- NOT GATED"
+                     % ("%.3f" % mean_top if mean_top is not None else "n/a", n_scored))
+    elif mean_top is None:
+        lines.append("score    ok        no scored clips in the window (min %.3f)"
+                     % min_mean_top_score)
+    elif mean_top < min_mean_top_score:
+        lines.append("score    LOW       mean top score %.3f over %d clip(s), under %.3f -- the "
+                     "measured cause is normalisation not running (0.254 healthy against 0.162 "
+                     "un-normalised, 13.6 sigma apart at a 400-clip run). ⚠️It is calibrated "
+                     "against that ONE failure; passing is not proof of health."
+                     % (mean_top, n_scored, min_mean_top_score))
         bad += 1
     else:
-        lines.append("silence  ok        %s (max %.3f)"
-                     % ("%.3f" % frac if frac is not None else "n/a", max_silence_frac))
+        lines.append("score    ok        mean top score %.3f over %d clip(s) (min %.3f)"
+                     % (mean_top, n_scored, min_mean_top_score))
 
     reasons: Dict[str, int] = {}
     for r in window:
@@ -1191,6 +1243,10 @@ def main(argv=None) -> int:
                     help="tag everything and report, writing nothing")
     ap.add_argument("--check", action="store_true",
                     help="read the heartbeat and exit non-zero if tagging is not flowing")
+    ap.add_argument("--min-mean-top-score", type=float, default=MEAN_TOP_SCORE_REPORT_ONLY,
+                    help="fail --check when the window's mean top score falls below this. "
+                         "%.2f is the calibrated floor; negative reports without gating"
+                         % MEAN_TOP_SCORE_FLOOR)
     ap.add_argument("--max-silence-frac", type=float, default=SILENCE_FRAC_REPORT_ONLY,
                     help="--check fails above this fraction of tagged clips whose top class is "
                          "Silence. Negative (the default) means REPORT ONLY -- set it from a "
@@ -1215,6 +1271,7 @@ def main(argv=None) -> int:
 
     if a.check:
         code, lines = check_tags(root, max_silence_frac=a.max_silence_frac,
+                                 min_mean_top_score=a.min_mean_top_score,
                                  window_s=a.window_s, max_stale_s=a.max_stale_s)
         print("\n".join(lines))
         return code
