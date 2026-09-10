@@ -944,7 +944,7 @@ static int sketch_frame(uint8_t *out, uint32_t start_abs, uint32_t node_us, uint
 
 // ---------------------------------------------------------------- gate (as hear/node/detect.py)
 static float g_amb = 0, env_sum = 0, env_buf[16]; static int env_i = 0, armed = 1;
-static const float ENV_INV = 1.0f / 16.0f, ALPHA = 1.0f / 10000.0f;
+static const float ENV_INV = 1.0f / 16.0f;
 static const float RATIO = 8.0f, FLOOR_DEFAULT = 800.0f, REARM = 0.35f;
 // THE FLOOR IS RUNTIME-SETTABLE (POST /gate?floor=N). It used to be a compile-time 800, and over
 // the 2026-09-07 capture it -- not the adaptive 8 x ambient limb -- was what the gate actually
@@ -993,7 +993,31 @@ static float env_e_max_win = 0.0f;
 // disarmed, envelope 1400-1600 against thr 800, ambient frozen at 73.2, two detections all night
 // -- both from before it locked. A rising floor must move the floor estimate even when it is loud,
 // just slowly enough that a millisecond-long shockwave does not desensitise the node to itself.
-static const float ALPHA_UP = 1.0f / 200000.0f;    // ~12.5 s at 16 kHz, vs 0.625 s for ALPHA
+// ⚠️THE ASYMMETRY IS ON DIRECTION, NOT ON THE THRESHOLD. It used to be
+// `(e <= thr ? ALPHA : ALPHA_UP)`, which put the SLOW limb only where the envelope was already
+// above thr -- a state the Schmitt gate leaves within milliseconds. Everything else, including
+// the reverberant tail of the very event that just fired and the noise of whatever is making
+// the events, took the FAST limb at tau 0.625 s and raced the floor estimate upward inside the
+// burst. Measured on mach 2026-09-09 while clapping beside it: ambient 22 -> 143 in five
+// seconds, thr 200 -> 1146, and not one of the claps fired. The node in the loudest room
+// (env_peak 16938, 2.7x its siblings) had the FEWEST detections of the three.
+//
+// Keyed on direction instead, a burst can only lift the floor at tau_rise, so it cannot
+// desensitise the node to itself; a genuinely louder room is still learned, just over half a
+// minute rather than half a second. Falling stays quick so the node recovers when the room does.
+//
+// This keeps both invariants the old form was protecting:
+//   - ambient is still learned while DISARMED (rising is never frozen), so the deadlock that
+//     cost 156 s of solid disarm outdoors cannot come back; REARM_MAX_SAMPLES still backs it.
+//   - one loud event still cannot raise the floor -- more strongly than before, not less.
+//
+// Expressed as TIMES and divided by the rate, because tau is a time. The old literals were
+// sample counts commented "at 16 kHz", so the same source gave a 3x different time constant on
+// a 48 kHz node -- an fs-dependence nobody chose.
+static const float AMB_TAU_RISE_S = 30.0f;
+static const float AMB_TAU_FALL_S = 5.0f;
+static const float ALPHA_RISE = 1.0f / (AMB_TAU_RISE_S * (float)FS_NOMINAL);
+static const float ALPHA_FALL = 1.0f / (AMB_TAU_FALL_S * (float)FS_NOMINAL);
 // And a watchdog under that, because a gate that has gone deaf looks exactly like a quiet night.
 // 30 s is far longer than any real event and far shorter than a night.
 static const uint32_t REARM_MAX_SAMPLES = 30u * FS_NOMINAL;
@@ -1020,10 +1044,8 @@ static int gate(int16_t s) {
   // left /status and health.csv reporting a threshold the gate was not using -- a record that
   // looks correct and is not. Both sites read the same variable now.
   float thr = g_amb * RATIO; if (thr < g_floor) thr = g_floor;
-  // Track the floor unconditionally: fast while below threshold, slow while above it. The slow
-  // limb is what breaks the deadlock, and it is slow enough that a real transient is over long
-  // before it shifts the estimate.
-  g_amb += (e <= thr ? ALPHA : ALPHA_UP) * (e - g_amb);
+  // Track the floor unconditionally, slow UP and quick DOWN. See AMB_TAU_RISE_S.
+  g_amb += (e > g_amb ? ALPHA_RISE : ALPHA_FALL) * (e - g_amb);
   if (!armed) {
     if (e < thr * REARM) { armed = 1; disarm_samples = 0; }
     else if (++disarm_samples > REARM_MAX_SAMPLES) { armed = 1; disarm_samples = 0; gate_forced++; }

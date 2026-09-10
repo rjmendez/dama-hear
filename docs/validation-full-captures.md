@@ -19,12 +19,29 @@ artefacts.
 **46% of detections land inside known firing windows covering 3.3% of the audio** — 14x
 enrichment over chance.
 
-⚠️**Which ambient constant produced these numbers.** The gate's floor ran at
-`AMBIENT_TAU_S = 0.2083 s`. The code used to *document* 10 s while realising 0.21 s, because its
-alpha was derived per 1 ms hop and applied per sample; the parameter now says 0.21 s and the
-arithmetic is bit-identical, so nothing in this table moved. If anyone ever changes that constant,
-this table has to be re-measured -- it is not a property of the algorithm, it is a property of that
-number.
+⚠️**THIS TABLE IS SUPERSEDED AND HAS NOT BEEN RE-MEASURED (2026-09-09).** It was produced by a
+gate whose ambient floor ran at a single symmetric `AMBIENT_TAU_S = 0.2083 s`, updated only while
+the envelope was below threshold. That is no longer the default. The floor is now asymmetric in
+direction -- `AMBIENT_TAU_RISE_S = 30 s`, `AMBIENT_TAU_FALL_S = 5 s`, tracked unconditionally --
+because the old form let a burst raise its own threshold.
+
+The evidence, measured on the node `mach` while clapping in the same room: ambient 22 -> 143 in
+five seconds, threshold 200 -> 1146, and **not one clap detected**, while a phone beside it
+recorded every one. Across the three nodes the one in the occupied room had the highest peak
+envelope (16938, 2.7x its siblings) and the **fewest** detections (294, against 689 and 470).
+The premise this table's constant rested on -- "the floor only ever sees material already below
+threshold, so nothing it tracks is an event" -- is false: a transient's reverberant tail is below
+threshold and *is* the event.
+
+**What that means for the numbers above.** As this document already warned, they are a property
+of that constant and not of the algorithm, so they do not describe the shipping gate. Expect the
+raw detection count to RISE under the new default, most in occupied or bursty conditions; the
+false-alarm figure (0 in 68.5 min of quiet) is the one most at risk, because a slower-rising
+floor sits lower. **Re-measurement against the 2026-09-05 captures is outstanding.**
+
+The old behaviour stays reproducible -- `Gate(fs, ambient_tau_s=AMBIENT_TAU_S)` sets both limbs
+equal -- and `tests/test_node.py::TestAmbientTau::test_the_legacy_symmetric_constant_is_still_reachable`
+pins that, so this table can be regenerated rather than merely believed.
 
 ⚠️**The 0.9631 sketch AUC quoted below predates the onset fix** and needs refitting; see
 `docs/uplink.md`.
