@@ -121,8 +121,25 @@ def _sat(y):
     return 32767 if y > 32767 else (-32768 if y < -32768 else y)
 
 
-def _run(H, x, hist, decim, shift, fold):
-    """Both forms of the same filter, in the same arithmetic the firmware uses."""
+def _run(H, x, hist, decim, shift, fold, flat=False):
+    """The forms of the same filter, in the same arithmetic the firmware uses.
+
+    `flat` models the SHIPPED loop: history and input copied into one contiguous span so there is no
+    per-tap conditional. Measured on rankine at 24.2 cycles per multiply against 36.0 for the
+    conditional form -- 36% of a core for one microphone rather than 54%.
+    """
+    if flat:
+        buf = list(hist) + list(x)
+        n, half, out = len(H), len(H) // 2, []
+        base = len(H) - 1
+        for k in range(0, len(x) - decim + 1, decim):
+            w = base + k + decim - 1
+            acc = 0
+            for t in range(half):
+                acc += H[t] * (buf[w - t] + buf[w - (n - 1 - t)])
+            acc += H[half] * buf[w - half]
+            out.append(_sat(acc >> shift))
+        return out
     n, half, out = len(H), len(H) // 2, []
     for k in range(0, len(x) - decim + 1, decim):
         acc = 0
@@ -175,3 +192,32 @@ def test_the_accumulator_really_does_need_64_bits():
     assert worst > 2**31 - 1, (
         "worst-case accumulator is %d, which now FITS int32 -- decimate() can drop to 32-bit "
         "arithmetic and should" % worst)
+
+
+def test_the_contiguous_loop_is_the_same_filter_to_the_bit():
+    """⚠️THE RISK OF REMOVING THE BRANCH. A faster loop computing something else is not faster, and
+    a decimator bug is inaudible in a spectrum plot and wrong in every clip and every sketch. The
+    node itself reported 0 differing outputs before this replaced the conditional form; this is the
+    same check on the host, where it can run on every commit."""
+    import random
+    d, taps = _defines()
+    H = [int(t) for t in taps]
+    rng = random.Random(11)
+    for _ in range(4):
+        hist = [rng.randint(-32768, 32767) for _ in range(len(H) - 1)]
+        x = [rng.randint(-32768, 32767) for _ in range(768)]
+        ref = _run(H, x, hist, 3, d["DECIM_SHIFT"], fold=False)
+        flat = _run(H, x, hist, 3, d["DECIM_SHIFT"], fold=True, flat=True)
+        assert ref == flat, "contiguous loop differs on %d of %d outputs" % (
+            sum(1 for p, q in zip(ref, flat) if p != q), len(ref))
+
+
+def test_the_shipped_decimator_has_no_per_tap_conditional():
+    """It cost 12 cycles per multiply, which is a third of the filter. Comments stripped first."""
+    import re as _re
+    src = _re.sub(r"//[^\n]*", "", (ROOT / "firmware" / "night_node" / "night_node.ino").read_text())
+    i = src.index("static int decimate(const int16_t *in")
+    body = src[i:src.index("\n}", i)]
+    assert "dscratch" in body, "decimate() no longer uses the contiguous scratch span"
+    assert "? in[" not in body and ">= 0 ?" not in body, (
+        "a per-tap conditional is back in decimate(); that measured 36.0 cycles/MAC against 24.2")
