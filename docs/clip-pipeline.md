@@ -240,9 +240,11 @@ copies each clip out unchanged **and** writes an audible `.loud.wav` beside it, 
 worksheet and an `.m3u`:
 
 ```
-kubectl -n dama exec <pod-with-/pool> -- python3 tools/hear_listen.py --pool /pool --out /tmp/listen --n 30
-kubectl -n dama cp dama/<pod>:/tmp/listen ~/hear-listen-<date>
+kubectl -n dama exec <pool-pod> -- python3 tools/hear_listen.py --pool /pool --out /tmp/listen --n 30
+kubectl -n dama cp dama/<pool-pod>:/tmp/listen ~/hear-listen-<date>
 ```
+
+`<pool-pod>` is any pod in `dama` that mounts the `hear-pool` PVC at `/pool`.
 
 ⚠️**The gain is not cosmetic and the raw files are not quiet, they are inaudible.** Measured
 2026-09-10 across the pool: −65.7 to −43.3 dBFS, needing +24 to +41 dB to reach a normal listening
