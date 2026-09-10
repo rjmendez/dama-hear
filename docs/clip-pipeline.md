@@ -56,10 +56,19 @@ Measured on the live fleet 2026-09-09:
 | rankine | 249 | ~200 |
 | **fleet** | **625** | **~478** |
 
-**Not one clip had ever left a node.** Each node writes 4.0 s WAVs (1.0 s pre-trigger + 3.0 s post,
-16 kHz 16-bit mono, 128,044 B) into `/clips` under a 6,291,456 B budget — exactly 49 clips
-(`6291456 / 128044 = 49`, confirmed live: all three nodes report `budget_left_clips 0` and
-`6291456 - 17300 = 6274156 = 49 × 128044`). The 50th evicts the oldest.
+**Not one clip had ever left a node.** Each node writes a fixed-length 16-bit mono WAV into
+`/clips` under a 6,291,456 B budget (`CLIP_BUDGET_B`), and the oldest is evicted when it is full.
+How many that holds depends on which clip geometry the firmware writes (§6.1):
+
+| era | clip | bytes | clips in budget |
+|---|---|---|---|
+| 16 kHz | 1.0 + 3.0 s | 128,044 | **49** — confirmed live when measured: all three nodes reported `budget_left_clips 0` and `6291456 − 17300 = 49 × 128044` |
+| 48 kHz | 1.0 + 4.0 s | 480,044 | **13** (`6291456 // 480044`, 50,884 B left over) |
+
+⚠️**The 48 kHz switch cut the on-card buffer from 49 clips to 13** and nothing re-derived it. The
+firmware's own comment still calls the budget "1.4x the measured 12 h event count"; at 13 clips it
+is about 0.37×, so a busy night now depends on the drain's 15-minute cadence rather than on the
+card.
 
 Two things kept them there. The `/ls` handler hardcoded `SD.open("/")` and ignored every argument,
 so it listed root only and clip names — which embed a boot id and a millis counter — were
@@ -231,8 +240,22 @@ operator to ignore it). The unsuspend condition is written onto the object as
    consecutive days.
 2. A human has **listened to ≥ 30 of them**, including at least one from mach, and written what they
    heard into `docs/clip-calibration-<date>.md`.
-3. `max_silence_frac` is set from the **measured** distribution in that calibration set. Threshold
-   from the envelope, never a single sample.
+3. ~~`max_silence_frac` is set from the **measured** distribution in that calibration set.~~
+   ✅**Met by retirement, 2026-09-10.** The distribution was measured and it killed the knob:
+   `mn10_as` returns `Silence` top-1 on **0 of 69** clips healthy and **3 of 69** un-normalised, so
+   any threshold between those rests on three clips. The normalisation canary is now
+   `--min-mean-top-score` (0.254 healthy against 0.162 un-normalised, **13.6 σ** apart at a
+   400-clip run). See `docs/clip-calibration-2026-09-10.md`.
+
+⚠️**All three conditions are met.** 473 stored clips across three nodes over 2026-09-08…10; 69
+heard by a person including 25 from mach, written up and with the labels checked in at
+`testdata/clip-labels-2026-09-10.jsonl`. Unsuspending is a human decision now, not a blocked one —
+the `.onnx` still has to reach the PVC first.
+
+⚠️**The listening tool's own `silence_frac` is not a gate either, and the same set is why.**
+Against what the listener called empty it scores **AUC 0.401** — below chance, in the wrong
+direction. A quiet insect chorus sits under −60 dBFS most of the time and an empty windy clip does
+not; frame-level level is not occupancy.
 
 `tools/hear_listen.py` stages condition 2. It draws a node-balanced sample from `index.jsonl`,
 copies each clip out unchanged **and** writes an audible `.loud.wav` beside it, and emits the
@@ -256,20 +279,68 @@ failure `hear_tag.py` documents from the model's side, where an un-normalised cl
 measured on the ORIGINAL.** Deriving a silence threshold from the normalised copy would measure
 the tool's own gain.
 
+### 6.1 Two clip geometries, and one build that headed them wrong
+
+The clip is the one artefact written at `FS_ACQ` rather than `FS_NOMINAL`, and its length changed
+with the rate:
+
+| era | geometry | samples | bytes |
+|-----|----------|---------|-------|
+| 16 kHz | 1.0 + 3.0 s | 64,000 | 128,044 |
+| 48 kHz | 1.0 + 4.0 s | 240,000 | 480,044 |
+
+5.0 s is deliberate: Perch reads **non-overlapping 5 s windows**, so a 4.0 s clip would be padded
+20% with fabricated silence. Both eras are in the corpus right now, so a consumer that assumes one
+is 1.0 s wrong at the **end** for every clip of the other. `clips.clip_total_s()` reads the length
+off the clip; `CLIP_PRE_S`/`CLIP_POST_S` are the fallback for a row with no body, nothing more.
+
+⚠️**The 48 kHz clip writer stamped the FS_NOMINAL rate into the WAV header.** The body is
+`CLIP_SAMPLES` at `FS_ACQ`; `fs_timebase()` returns the decimated rate, and it went in unscaled.
+A 5.0 s 48 kHz clip therefore reads back as **15.0 s of 16 kHz**, an octave and a half low.
+`/praw` got its `* DECIM` when the rate moved and the clip writer did not — nobody owned the seam.
+
+It could not be caught downstream: `hear_tag.py`'s `assert_rate` refuses any clip whose header is
+not 16 kHz, so a header lying by saying *exactly* 16000 is the one wrong rate that guard is blind
+to. The audio would have entered YAMNet 3× too slow and degraded silently towards `Silence` with
+every counter green.
+
+Firmware is fixed. Clips already on the PVC are not rewritable, so `clips.header_rate_suspect()`
+recovers the rate — **only** when exactly one integer factor closes onto a length this fleet
+actually writes and a rate the mic can legally be clocked at. Written first against a plausible
+*range*, a 15.0 s body matched ÷2 (7.5 s at 32 kHz) before it matched the correct ÷3 and returned
+the first hit; two readings that both close means the header is not recoverable, not that the
+first one wins. The lying header is **kept** on the row beside the correction.
+
 Until 3 is set, `check_tags` runs report-only and says so on its own output line.
 
-**Model: YAMNet as TFLite under `ai-edge-litert`, not under TensorFlow.** Bit-identical scores at
-12.1 ms/clip in 82 MB RSS from a 146 MB venv, against 14.3 ms in 903 MB from a 1.4 GB venv — and the
-PVC is the binding constraint. All 64 of YAMNet's mel bins sit below 8 kHz, so the 16 kHz ceiling
-costs it nothing.
+**Model: EfficientAT `mn10_as` as ONNX under `onnxruntime`.** MIT, 4.88M params, AudioSet
+**mAP 0.471** against YAMNet's 0.306 — `docs/acoustic-stack.md` §6.2b has why this and not
+AST/PaSST/BEATs/BirdNET. 527 classes, **960**-d embeddings (not 1024: `hear_bridge.py`'s consumers
+hard-code that width and drop mismatches silently, and YAMNet's 1024 and BirdNET's 1024 are
+mutually confusable there). 48 ms/clip against YAMNet's 12 — irrelevant at ~20 events/hour, which
+is 0.03 % duty on one core.
 
-Weights live on the PVC at `/pool/models/yamnet/`, never in a ConfigMap (16,096,668 B against a
+The model is **32 kHz native** and the fleet writes 16 and 48, so `hear/resample.py` crosses:
+48 kHz → 32 kHz is a decimation and every band is measurement; 16 kHz → 32 kHz is an interpolation
+and everything above 8 kHz is the filter. `band_limit_hz`, `fs_source_hz` and `upsampled` ride on
+every tag row so the second can never be read as the first. A rate **nobody configured** — mach's
+22624 Hz boot — is still refused into a counted bucket rather than stretched into a confident
+answer.
+
+Weights live on the PVC at `/pool/models/mn10_as/`, never in a ConfigMap (24,016,402 B against a
 1 MiB cap). They are **verified against a pinned sha256**, not checked for existence:
 
 ```
-yamnet.tflite         16,096,668 B  141fba1cdaae842c…
-yamnet_class_map.csv      14,096 B  cdf24d193e196d9e…
+mn10_as.onnx                        24,016,402 B  1b718a05a68ba8ee…
+audioset_class_labels_indices.csv       14,675 B  cdd1049833c4b861…
 ```
+
+⚠️**The `.onnx` is not fetchable, and the job says so instead of guessing.** Upstream publishes
+PyTorch checkpoints; converting one needs torch, torchaudio and torchvision (EfficientAT's model code imports it) — roughly 3 GB into a 5 Gi PVC to
+produce a 24 MB graph once. `tools/export_mn10_onnx.py` builds it on a workstation, from a
+sha-pinned upstream `.pt`, byte-reproducibly, and it is staged onto the PVC. The CronJob verifies
+and **exits 1 with the two commands to run**; it never builds, and never loads a graph it has not
+hashed.
 
 A digest mismatch exits **2**, not 1, so a monitor can tell "the model is not what it says" from
 "tagging is behind".

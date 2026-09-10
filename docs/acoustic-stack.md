@@ -742,6 +742,78 @@ Therefore:
   distribution on that node's own quiet capture**, never from a median, and never validated
   against the same samples it came from.
 
+### 6.2b Stage 0.5 — the coarse tagger is now EfficientAT mn10_as ✅SHIPPED
+
+`tools/hear_tag.py` ran YAMNet. It runs **EfficientAT `mn10_as`** (MIT, 4.88M params,
+0.54 GMACs, **AudioSet mAP 0.471** against YAMNet's 0.306). §8 already refused YAMNet as a
+backbone on this corpus and said `mn10_as` was "strictly better on every axis"; that is now done
+rather than noted.
+
+| | YAMNet | mn10_as |
+|---|---|---|
+| AudioSet mAP | 0.306 | **0.471** |
+| params | 3.7M | 4.88M |
+| classes | 521 | **527** (full AudioSet ontology) |
+| embedding | 1024 | **960** |
+| native rate | 16 kHz | 32 kHz |
+| licence | Apache-2.0 | MIT |
+| runtime | ai-edge-litert | onnxruntime |
+| per clip | 12 ms | **48 ms** incl. resample |
+
+⚠️**960, and it matters.** `tools/hear_bridge.py` has four consumers hard-coding `len(e) == 1024`;
+three drop a mismatch silently and `audio_anomaly_score.py` returns `0.0` / "not anomalous".
+YAMNet's 1024 and BirdNET's 1024 are mutually confusable there. 960 is neither, and every row
+carries `embedding_dim`.
+
+⚠️**48 ms against 12 ms is not a regression that matters.** At ~20 events/hour a 48 ms model is
+0.03 % duty on one core. The shortlist's own rule was *pick on accuracy and licence, ignore
+latency*.
+
+**Supply chain.** Upstream ships PyTorch, so the graph is built by `tools/export_mn10_onnx.py`
+and the chain is pinned at both ends:
+
+```
+mn10_as_mAP_471.pt  0bd7dc24…  19,708,753 B   upstream release v0.0.1, MIT
+  → tools/export_mn10_onnx.py                 in this repo, byte-reproducible
+    → mn10_as.onnx  1b718a05…  24,016,402 B   verified before every load
+```
+
+The mel frontend is baked into the graph (reproducing `AugmentMelSTFT` to **8.4e-05** max abs
+error) and `torch.stft` is replaced by a DFT `conv1d`, so the pod needs onnxruntime and numpy —
+no torch, no torchaudio, no librosa. The exported graph reproduces PyTorch to **7.6e-06** on
+logits and **1.0e-06** on embeddings. The job **verifies and refuses**; it never builds, and it
+never downloads a model it cannot hash.
+
+**Normalisation is still mandatory and the reason shrank.** Over the 29 scorable clips of the
+2026-09-10 staging set, top-1 is `Silence` on **1 raw and 0 normalised** — where YAMNet returned
+`Silence` for every un-normalised clip. What it now buys is confidence, not an answer.
+
+### 6.2c Gate 2, partially answered — and my first reading of it was wrong
+
+§5 called the 48 kHz-versus-16 kHz experiment **unrunnable** for want of a 48 kHz source with
+retention. The nodes now write 48 kHz clips and the pool holds them, so it ran.
+
+**Within-clip A/B, 7 real 48 kHz clips**, native (48→32, every band measurement) against
+band-crippled (48→16→32, everything above 8 kHz is the interpolation filter):
+
+| | |
+|---|---|
+| score-vector cosine | **0.90 – 0.99** |
+| top-1 changed | **1 of 7** |
+| Insect score, native − crippled | **+0.021** mean (min −0.093, max +0.157) |
+
+⚠️**The band is not doing the work, and I nearly reported that it was.** Scoring all 30 staged
+clips, every 48 kHz clip came back `Insect`/`Animal` while the 16 kHz clips were dominated by
+`Speech` — which reads as a decisive argument for the extra octave. It is not: all seven 48 kHz
+clips are from rankine and mach on one night, so the split is confounded with node and time. The
+within-clip control above removes that confound and the effect nearly vanishes. A between-group
+difference is not a treatment effect.
+
+⚠️**This is a measurement of mn10_as, not of Perch.** Different model, different native rate,
+different training distribution. **Gate 2 remains open for Perch**; what has closed is the
+question for the coarse tier, and the method — a within-clip A/B on real 48 kHz audio — is now
+available for Perch the moment it is worth running.
+
 ### 6.3 Stage 1 — Perch 2.0, chosen on licence
 
 32 kHz, 5 s window, EfficientNet-B3, ~12M params, **1536-d** embeddings, Apache-2.0. BirdNET
@@ -796,7 +868,8 @@ retargeted or retired deliberately.)
 
 ## 8. Rejected, with the measurement
 
-- **YAMNet as an embedding backbone for anything new.** 361 of 1024 dimensions hold **exactly
+- **YAMNet, for anything, now.** It was the coarse tagger until 2026-09-10 and is now replaced
+  by `mn10_as` (§6.2b). As an EMBEDDING BACKBONE it was already refused: 361 of 1024 dimensions hold **exactly
   zero variance** and 43.2 % of directions are pinned by the covariance floor
   (`hear/validate.py`), against the scene corpus's rank 80/80 and 0 % floored. The hugbot
   detector built on it measured mean AUC **0.624** and caught **0 %** of gaussian noise matched
@@ -804,8 +877,8 @@ retargeted or retired deliberately.)
   **Jaccard 0.155**; on a drift-free interleaved control it detected **0.31 %** — *below* its own
   0.5 % false-alarm rate. Its own author calls it a corpus reader, not an alarm. It has published
   ~691k messages to **zero subscribers**. **Port the validation machinery; never the model.**
-  If a small AudioSet tagger is genuinely wanted, EfficientAT `mn10_as` is strictly better on
-  every axis (MIT, 4.88M params, mAP 47.1).
+  ~~If a small AudioSet tagger is genuinely wanted, EfficientAT `mn10_as` is strictly better on
+  every axis (MIT, 4.88M params, mAP 47.1).~~ **Done — see §6.2b.**
 - **AST / PaSST / BEATs.** 87–90M params for ~1 mAP over `mn10_as` at 4.88M. Decisive: the
   measured few-shot result is that AudioSet-trained embeddings **lose** to bird-trained
   embeddings on all six bioacoustic datasets tested, including bats and marine mammals
@@ -834,7 +907,7 @@ retargeted or retired deliberately.)
 | per-node `ref_db` offset across the fleet | whether any Stage 0 verdict means anything (§6.1) | one co-heard event, or accept 0.9450 shape-only |
 | mach's +15.5 dB floor: electrical or environmental | whether mach is a classification node | **10 minutes** — cover the mic and log |
 | BirdWeather 4066 detection count / span / confidence | whether a site bird probe is trainable this month | one API pull |
-| Perch/BirdNET accuracy on 16 kHz-sourced audio | all of S1 (§5, Gate 2) | one puc-clip A/B |
+| Perch/BirdNET accuracy on 16 kHz-sourced audio | all of S1 (§5, Gate 2) | one puc-clip A/B — the METHOD is now proven on mn10_as (§6.2c); only Perch is untested |
 | per-node RSSI on nyquist/mach/rankine | the transport curve — `night_node.ino` never calls `WiFi.RSSI()` and `/status` has no wifi block; the only RSSI on the property is puc's −77 dBm | a firmware field |
 | whether the 24 %→57.5 % `/audio` loss curve is linear in link speed | whether the token bucket's charge model is right | two more nodes' worth of points |
 | the 3.27 h scene stall's historical extent | how much corpus has already been lost this way | a row-rate gap analysis over 82,225 pooled rows |
