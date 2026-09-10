@@ -1,3 +1,5 @@
+# kubectl apply --server-side -f deploy/k8s/hear-tdoa-code.yaml
+# apply-mode server: 480088 B serialised against a 262144 B last-applied-configuration cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -6,8 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '87eb4d3-dirty'
+    dama-hear/commit: '06cb69e-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
+    dama-hear/apply-mode: server
+    dama-hear/serialised-bytes: '480088'
 data:
   hear__init__.py: |
     
@@ -6416,8 +6420,8 @@ data:
     
     WHAT IT WRITES, all under `--out` (default `<pool>/tdoa`) and NEVER inside the checkout:
     
-        <out>/runs/<run_id>/manifest.json     policy, survey, window, funnel, conservation,
-                                              not_composed, could_not_do, timings
+        <out>/runs/<run_id>/manifest.json     policy, survey, window, funnel, onset_quality,
+                                              conservation, not_composed, could_not_do, timings
         <out>/runs/<run_id>/coactivity.json
         <out>/runs/<run_id>/candidates.jsonl  ungated scan + bound_check + reached_associate
         <out>/runs/<run_id>/attempts.jsonl    one row per candidate, ALWAYS a verdict
@@ -6434,15 +6438,29 @@ data:
     
         event_key = sha256("\\x1f".join(sorted(member pool_keys)))[:32]
     
-    a content address of the member SET. Consequences, published rather than hidden: a backfill that
-    adds a member produces a NEW event_key and the superseded row stays (counted
-    `event_membership_changed`); a backfill older than the lookback can never be associated (counted
+    a content address of the member SET, and the keys it is deduped AGAINST are read from
+    `runs/*/events.jsonl` -- the emission log -- and from nowhere else. ⚠️NOT from the arrival
+    ledger, which carries an event_key for every arrival of every CANDIDATE whatever its verdict:
+    reading it as an emission log let a run that REFUSED a group burn that member set's key
+    permanently, so the next run solved it, filtered it against its own refusal, and wrote a 0-byte
+    events.jsonl under a manifest claiming an emission. See `read_emitted_events`.
+    
+    Consequences, published rather than hidden: a backfill that adds a member produces a NEW
+    event_key and the superseded row stays -- counted `event_membership_changed` and NAMED in
+    `superseded_event_keys`, which is a count of new events reusing an arrival already published
+    under a different key, not a count of new events; a backfill older than the lookback can never be associated (counted
     `outside_lookback_unassociated`, which is a hard `--check` failure -- the one thing a lookback
     costs, made loud). The per-record ledger resumes on sha256(pool_key|verdict|reason|event_key), so a
     record is written once per DISTINCT verdict and a verdict that later changes appends a transition
     row rather than rewriting history. A file/offset/timestamp watermark would be wrong for the same
     measured reason hear_score.py:64 gives: a later drain was observed appending 513 rows INTO an
     already-scanned partition.
+    
+    ⚠️EVERY ARRIVAL IN THIS POOL CARRIES AN UNKNOWN ONSET QUALITY, and the run says so in a number
+    rather than passing them in silence. `onset_quality` in the manifest is the distribution over the
+    three states -- crossed, not crossed, and never measured -- per source. Today the third bucket is
+    100% of the admitted stream, because no producer in the chain measures the quantity at all: see
+    _ONSET_UNSTATED_WHY for the four places that was checked. `--onset-unstated refuse` prices it.
     
     ⚠️--census WRITES NOTHING AT ALL, which is a deliberate deviation from "writes only the run
     summary". The check CronJob runs `--census || true` after the gate, and a read-only gate job that
@@ -6528,14 +6546,53 @@ data:
     D_CLOCK_UNTRUSTED = "clock_untrusted"
     D_SYNC_SIGMA = "sync_sigma_exceeds"
     D_ONSET = "onset_not_found"
+    D_ONSET_UNSTATED = "onset_unstated"
     D_LATENCY = "latency_uncorrected"
     D_UNPARSEABLE = "line_unparseable"
     D_ADMITTED = "admitted"
     
     DROP_REASONS = (D_UNANCHORED, D_OUTSIDE_WINDOW, D_OUTSIDE_LOOKBACK_EMITTED,
                     D_OUTSIDE_LOOKBACK_UNASSOC, D_PENDING_SETTLE, D_UNSURVEYED, D_NOT_ARRIVAL,
-                    D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_SYNC_SIGMA, D_ONSET, D_LATENCY,
-                    D_UNPARSEABLE)
+                    D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_SYNC_SIGMA, D_ONSET, D_ONSET_UNSTATED,
+                    D_LATENCY, D_UNPARSEABLE)
+    
+    #: Why an admitted arrival's onset quality is UNSTATED, stated once so the ledger detail, the
+    #: manifest and the CLI help cannot drift apart. Every clause was checked on 2026-09-10 against
+    #: the running system, not read off a comment:
+    #:
+    #:   * hear/pool.py `_record_from_node_row` builds a source=node record from the dets.csv row
+    #:     plus the decoded sketch frame and writes no onset field at all. `row.get("onset_found")`
+    #:     is therefore None on every node row ever ingested -- not sometimes, always. The gate this
+    #:     replaces read that None as "not False" and passed 100% of the node corpus in silence.
+    #:   * The three deployed nodes (nyquist .105, mach .116, rankine .50) each answer
+    #:     GET /sd?file=/dets.csv with the G5 header
+    #:     node_id,utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,sketch_back,
+    #:     frame_hex,clip,clip_why -- no onset column, and hear/detsfile.py declares none in any
+    #:     generation G1..G5.
+    #:   * The sketch frame cannot carry it either. hear/sketch.py spends flags bits 0-7 on event
+    #:     flags (bit 0 retrigger, bit 1 no-context), 8-11 on the sample-rate code and 12 on layout;
+    #:     hear/node/pipeline.py packs `flags=(1 if d["retrigger"] else 0)` and nothing else. The
+    #:     Python detector DOES compute the crossing verdict -- hear/node/detect.py's
+    #:     `onset_index_checked` returns it and the gate puts it in the detection dict -- and it
+    #:     dies at the wire boundary, a 172-byte format shared byte-for-byte with the Android
+    #:     producer.
+    #:   * The node firmware never computes it at all: firmware/night_node/night_node.ino derives
+    #:     the stamp with `sk_onset_acq_at(acq_base, i, DECIM, DECIM_DELAY)`, index arithmetic on
+    #:     the gate-crossing sample back-dated by the decimator group delay. There is no
+    #:     constant-fraction search on the node, so there is no verdict to carry.
+    #:
+    #: SO "MAKE THE PRODUCER STATE IT" IS NOT A PLUMBING FIX. It is a new dets.csv generation or a
+    #: wire-format bit, a firmware change on three field nodes, a matching change in the Android
+    #: producer and a pool schema bump -- and even done perfectly it would state nothing about the
+    #: records already in the pool, which is the entire corpus every result here rests on. What the
+    #: driver can do is refuse to call an unmeasured quantity a passing measurement, and publish the
+    #: count.
+    _ONSET_UNSTATED_WHY = (
+        "onset quality is UNSTATED: nothing in this chain measures it. dets.csv (G5) has no onset "
+        "column, the 172-byte sketch frame has no bit for one, and the node firmware picks the "
+        "stamp from the gate crossing with no constant-fraction test. Admitted under "
+        "--onset-unstated admit and counted in the run's onset_quality block; that is NOT evidence "
+        "the stamp is good")
     
     # ---------------------------------------------------------------- verdicts (attempts.jsonl)
     V_SOLVED = "solved"
@@ -6885,6 +6942,8 @@ data:
         ledger: List[Dict[str, Any]] = []
         by_reason: Dict[str, int] = {}
         by_node_day_reason: Dict[str, int] = {}
+        onset_unstated: Dict[str, int] = {}       # admitted with an unknown onset, by source
+        onset_stated: Dict[str, int] = {}         # admitted and the producer said it crossed
         n_rows = 0
     
         def _drop(day: str, row: Optional[Dict[str, Any]], reason: str, detail: str) -> None:
@@ -6981,11 +7040,22 @@ data:
                       _detail(row, "stated sync_sigma %.0f ns exceeds --max-sync-sigma-ns %.0f"
                               % (float(ssig), float(max_sync_ns))))
                 continue
-            if row.get("onset_found") is False:
+            # ⚠️THREE-STATE, AND THE THIRD STATE IS THE ONE THAT ACTUALLY OCCURS. See the
+            # `onset_quality` block returned below for what this pool is made of.
+            onset = row.get("onset_found")
+            if onset is False:
                 _drop(day, row, D_ONSET,
                       _detail(row, "the producer states the constant-fraction onset was never "
-                                   "crossed, so the stamp is the clamp edge (~25 ms, ~8.6 m)"))
+                                   "crossed, so the stamp is the clamp edge, not a measurement"))
                 continue
+            if onset is None:
+                # NOT "the producer measured it and the field went missing". For source=node the
+                # quantity is NEVER MEASURED ANYWHERE IN THE CHAIN -- see _ONSET_UNSTATED_WHY.
+                if policy["onset_unstated"] == "refuse":
+                    _drop(day, row, D_ONSET_UNSTATED, _detail(row, _ONSET_UNSTATED_WHY))
+                    continue
+                onset_unstated[row.get("source") or "unknown"] = (
+                    onset_unstated.get(row.get("source") or "unknown", 0) + 1)
             lat_ms = None
             if row.get("source") == "phone":
                 # ⚠️REACHABLE ONLY ONCE A PHONE IS SURVEYED. Today no phone has a survey entry, so
@@ -7020,12 +7090,48 @@ data:
                 "onset_found": row.get("onset_found"),
             }
             dets.append(d)
+            if onset is True:
+                src = d["source"] or "unknown"
+                onset_stated[src] = onset_stated.get(src, 0) + 1
             by_reason[D_ADMITTED] = by_reason.get(D_ADMITTED, 0) + 1
     
         _assign_seq(dets)
         return {"dets": dets, "ledger": ledger, "by_reason": by_reason,
                 "by_node_day_reason": by_node_day_reason, "rows_seen": n_rows,
-                "n_admitted": len(dets), "n_dropped": len(ledger)}
+                "n_admitted": len(dets), "n_dropped": len(ledger),
+                "onset_quality": _onset_quality(policy, onset_stated, onset_unstated, by_reason)}
+    
+    
+    def _onset_quality(policy: Dict[str, Any], stated: Dict[str, int],
+                       unstated: Dict[str, int], by_reason: Dict[str, int]) -> Dict[str, Any]:
+        """A DISTRIBUTION over the three onset states of the admitted stream, per source.
+    
+        Reported rather than summarised to one number because the three states are not degrees of
+        the same thing: `stated_crossed` is a measurement that passed, `stated_not_crossed` is a
+        measurement that failed (and those rows are already gone, counted under the drop reason),
+        and `unstated` is NO MEASUREMENT -- see _ONSET_UNSTATED_WHY. Averaging the last into a
+        "quality score" with the first two is exactly the move this block exists to prevent.
+    
+        `unstated_frac` is over the ADMITTED stream, which is the population every downstream count
+        in this run is computed from. It is None when nothing was admitted, not 0.0: a fraction of
+        an empty set has no referent.
+        """
+        n_stated = sum(stated.values())
+        n_unstated = sum(unstated.values())
+        n_admitted = n_stated + n_unstated
+        return {
+            "policy": policy["onset_unstated"],
+            "stated_crossed": dict(sorted(stated.items())),
+            "unstated_admitted": dict(sorted(unstated.items())),
+            "n_stated_crossed": n_stated,
+            "n_unstated_admitted": n_unstated,
+            "n_stated_not_crossed_refused": by_reason.get(D_ONSET, 0),
+            "n_unstated_refused": by_reason.get(D_ONSET_UNSTATED, 0),
+            "unstated_frac_of_admitted": (None if not n_admitted else n_unstated / float(n_admitted)),
+            # The load-bearing sentence, carried in the artefact so a reader of manifest.json alone
+            # cannot mistake a passed row for a timed one.
+            "why_unstated": _ONSET_UNSTATED_WHY,
+        }
     
     
     def _assign_seq(dets: List[Dict[str, Any]]) -> None:
@@ -7686,21 +7792,46 @@ data:
         return keys, hashes
     
     
-    def read_event_keys(out: str) -> set:
-        ks = set()
-        for _day, path in _partitions(arrivals_dir(out)):
+    def read_emitted_events(out: str) -> Tuple[set, Dict[str, str]]:
+        """What has actually been EMITTED before: (event_keys, pool_key -> the key that carried it).
+    
+        Read from `runs/*/events.jsonl` -- the emission log -- and from nothing else.
+    
+        ⚠️THIS USED TO READ THE ARRIVAL LEDGER, WHICH IS A DIFFERENT SET AND A STRICTLY LARGER ONE.
+        The ledger gets an `event_key` for every arrival in every CANDIDATE group, written from
+        `ev_key_of_det`, which is populated before the verdict is known -- so a candidate that was
+        REFUSED (inadmissible, margin-dependent, solver-refused, lost to the associator) still put
+        its key in the ledger. The next run would solve that same group, compute the same key, find
+        it "already emitted", and filter it out: events.jsonl came out 0 bytes while manifest.json
+        said an event had been emitted. One refusal burned that member set forever, and the only
+        way back was to delete the ledger partition -- i.e. the append-only store's own history.
+        Reproduced by execution; TestEmissionDedupeReadsEmissions is the regression.
+    
+        A missing or empty `runs/` is an empty set: nothing has been emitted, so nothing is deduped.
+        A torn line costs one re-emission, which is the same trade `read_ledger` makes and the safe
+        direction -- a duplicate row is visible, a silently dropped event is not.
+        """
+        ks: set = set()
+        member_of: Dict[str, str] = {}
+        for _run_id, path in _partitions(runs_dir(out)):
+            if os.path.basename(path) != "events.jsonl":
+                continue
             with open(path) as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:
                         continue
                     try:
-                        k = json.loads(line).get("event_key")
+                        r = json.loads(line)
                     except Exception:
                         continue
-                    if k:
-                        ks.add(k)
-        return ks
+                    k = r.get("event_key")
+                    if not k:
+                        continue
+                    ks.add(k)
+                    for pk in (r.get("pool_keys") or ()):
+                        member_of[str(pk)] = k
+        return ks, member_of
     
     
     def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[str] = None,
@@ -7802,7 +7933,7 @@ data:
     
         # ---------------------------------------------------------- read
         ledger_keys, ledger_hashes = read_ledger(out)
-        prior_event_keys = read_event_keys(out)
+        prior_event_keys, prior_member_event = read_emitted_events(out)
         lines_read = count_lines(pool_root, policy["sources"])        # INDEPENDENT byte pass
         a = admit(pool_root, sv, arr_sv, policy, ledger_keys=ledger_keys, now=now)
         dets, ledger = a["dets"], a["ledger"]
@@ -7814,6 +7945,7 @@ data:
             "admitted": a["n_admitted"], "dropped": a["n_dropped"],
             "by_reason": a["by_reason"], "by_node_day_reason": a["by_node_day_reason"],
         }
+        report["onset_quality"] = a["onset_quality"]
     
         if census:
             report["mode"] = "census"
@@ -8031,7 +8163,12 @@ data:
             "by_verdict": {v: sum(1 for r in attempts if r["verdict"] == v) for v in VERDICTS},
             "events_admissible": n_admissible,
             "events_solved": n_solved,
-            "events_emitted": len(events_out),
+            # ⚠️SOLVED AND ADMISSIBLE THIS RUN -- NOT what was written. `events_emitted` below is
+            # the number of rows that actually reached events.jsonl, and the two differ by exactly
+            # the events a previous run already published. Reporting the first under the second's
+            # name is how a manifest came to claim an emission against a 0-byte file.
+            "events_solved_admissible": len(events_out),
+            "events_emitted": 0,
             "singleton_unpaired": n_singleton,
             "associate": {
                 "n_events": len(grouped["events"]), "n_rejected": len(grouped["rejected"]),
@@ -8081,8 +8218,25 @@ data:
             new_events = [e for e in events_out if e["event_key"] not in prior_event_keys]
             _append_jsonl(os.path.join(rd, "events.jsonl"), new_events)
             report["events_new"] = len(new_events)
-            report["event_membership_changed"] = sum(
-                1 for e in events_out if e["event_key"] not in prior_event_keys and prior_event_keys)
+            report["events_emitted"] = len(new_events)     # what reached the file, not what solved
+            # ⚠️MEMBERSHIP CHANGED = A MEMBER SET THAT SUPERSEDES A PUBLISHED ONE, which is what
+            # event_key()'s docstring promises this number is. It used to be
+            # `sum(1 for e in events_out if e[key] not in prior and prior)` -- algebraically
+            # len(new_events) whenever anything had ever been emitted, so a first-ever backfill of
+            # ten unrelated events reported ten "membership changes" and a genuine supersession on
+            # an empty store reported none. The real question is whether a new key reuses an
+            # arrival that was ALREADY PUBLISHED under a DIFFERENT key, which is exactly the
+            # backfill-adds-a-member case, and it needs the prior member map to answer.
+            superseded = set()
+            n_changed = 0
+            for e in new_events:
+                prior = {prior_member_event[k] for k in (e.get("pool_keys") or ())
+                         if k in prior_member_event and prior_member_event[k] != e["event_key"]}
+                if prior:
+                    n_changed += 1
+                    superseded |= prior
+            report["event_membership_changed"] = n_changed
+            report["superseded_event_keys"] = sorted(superseded)
             # the per-record ledger: append-only, one row per DISTINCT verdict, deduped by hash
             fresh = [r for r in ledger if r["ledger_hash"] not in ledger_hashes]
             report["ledger_rows_written"] = len(fresh)
@@ -8582,6 +8736,16 @@ data:
                         help="also read the phone source. They are unsurveyed, so today every row "
                              "still lands in unsurveyed_node -- this makes that a counted number")
         ap.add_argument("--clock-unstated", choices=("admit", "refuse"), default="refuse")
+        # ⚠️DEFAULT admit, WHERE --clock-unstated DEFAULTS refuse, AND THE ASYMMETRY IS THE POINT.
+        # An unstated CLOCK is a producer that measures trust and did not say; refusing it costs a
+        # phone row. An unstated ONSET is a quantity no producer in this chain measures at all
+        # (_ONSET_UNSTATED_WHY), so refusing it by default would empty the corpus and report a
+        # missing FIELD as an absence of EVENTS. `refuse` is offered so the cost is measurable:
+        # run it and the admitted count is what a stated-onset chain would have left.
+        ap.add_argument("--onset-unstated", choices=("admit", "refuse"), default="admit",
+                        help="what to do with an arrival whose producer never measured onset "
+                             "quality. Today that is every source=node row: see the run's "
+                             "onset_quality block")
         ap.add_argument("--latency-cal", default=None,
                         help="acoustic_latency_calibration.json from tools/hear_latency_cal.py")
         ap.add_argument("--null-trials", type=int, default=DEFAULT_NULL_TRIALS)
@@ -8654,7 +8818,8 @@ data:
             "v_mps": a.v_mps, "min_nodes": a.min_nodes, "margin_frac": a.margin_frac,
             "margin_s_override": a.margin_s, "force_margin": bool(a.force_margin),
             "bin_s": a.bin_s, "max_sync_sigma_ns": a.max_sync_sigma_ns,
-            "clock_unstated": a.clock_unstated, "latency_cal": cal,
+            "clock_unstated": a.clock_unstated, "onset_unstated": a.onset_unstated,
+            "latency_cal": cal,
             "null_trials": a.null_trials, "null_seed": a.null_seed,
             "calibrate": bool(a.calibrate),
             "known_source": _parse_point(a.known_source) if a.known_source else None,

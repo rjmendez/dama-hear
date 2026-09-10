@@ -145,7 +145,7 @@ def pol(**over):
         "source_class": "blast", "fixed_up_m": 0.0, "temp_c": TEMP_C, "v_mps": 900.0,
         "min_nodes": 3, "margin_frac": HT.DEFAULT_MARGIN_FRAC, "margin_s_override": None,
         "force_margin": False, "bin_s": 60.0, "max_sync_sigma_ns": None,
-        "clock_unstated": "refuse", "latency_cal": None,
+        "clock_unstated": "refuse", "onset_unstated": "admit", "latency_cal": None,
         "null_trials": 0, "null_seed": 1, "calibrate": False, "known_source": None,
         "candidates": [], "site_box": None, "target_events": 20, "array_id": "hear",
         "allow_phones": False,
@@ -327,6 +327,13 @@ class TestStartupRefusalsArePreIO:
 
 # ================================================================= the funnel
 
+def planted_rows_for_admit(n=3):
+    """Three anchored node rows, one per live arrival node, far enough apart in time that they
+    never group. Enough to exercise the admit funnel without asserting anything about solving."""
+    return [node_row(nm, T0 + 600.0 * i, seed=40 + i)
+            for i, nm in enumerate(["nyquist", "mach", "rankine"][:n])]
+
+
 class TestAdmit:
     """One parametrised case per drop reason, each asserting the reason AND that the row never
     reaches associate() -- because several of these are rows associate() would crash on."""
@@ -402,6 +409,47 @@ class TestAdmit:
         rec = dict(P._record_from_node_row(node_row("nyquist", T0, seed=7)), onset_found=False)
         r, _ = self._reasons(tmp_path, [], extra=[rec])
         assert r.get(HT.D_ONSET) == 1
+
+    def test_a_node_row_carries_NO_onset_field_at_all(self, tmp_path):
+        """⚠️THE PRECONDITION THE WHOLE GATE RESTED ON, ASSERTED INSTEAD OF ASSUMED.
+
+        `hear.pool._record_from_node_row` is the only way a source=node record is built, and it
+        writes no onset key. The gate that read `row.get("onset_found") is False` therefore
+        could not fire on a node row for any input whatsoever -- it was not rarely-taken, it was
+        unreachable. If a future producer change adds the field this test fails, which is the
+        signal to revisit --onset-unstated's default, not to delete the assertion.
+        """
+        rec = P._record_from_node_row(node_row("nyquist", T0, seed=71))
+        assert "onset_found" not in rec
+
+    def test_an_unstated_onset_is_admitted_but_COUNTED_not_silent(self, tmp_path):
+        r, t = self._reasons(tmp_path, planted_rows_for_admit())
+        q = t["onset_quality"]
+        assert q["policy"] == "admit"
+        assert r.get(HT.D_ONSET_UNSTATED) is None            # nothing refused under admit
+        assert q["n_stated_crossed"] == 0
+        assert q["n_unstated_admitted"] == t["funnel"]["admitted"] > 0
+        assert q["unstated_frac_of_admitted"] == 1.0
+        assert q["unstated_admitted"] == {"node": t["funnel"]["admitted"]}
+        assert "no producer" in q["why_unstated"] or "nothing in this chain" in q["why_unstated"]
+
+    def test_refuse_makes_the_cost_of_an_unmeasured_onset_a_number(self, tmp_path):
+        """The policy is offered so the price is measurable, not because it should be run."""
+        rows = planted_rows_for_admit()
+        _r, admit_t = self._reasons(tmp_path / "a", rows)
+        r, refuse_t = self._reasons(tmp_path / "b", rows, onset_unstated="refuse")
+        assert r.get(HT.D_ONSET_UNSTATED) == admit_t["funnel"]["admitted"]
+        assert refuse_t["funnel"]["admitted"] == 0
+        assert refuse_t["onset_quality"]["unstated_frac_of_admitted"] is None, (
+            "a fraction of an empty admitted set has no referent and must not be reported as 0")
+
+    def test_an_unstated_onset_is_not_reported_as_a_passing_measurement(self, tmp_path):
+        _r, t = self._reasons(tmp_path, planted_rows_for_admit())
+        q = t["onset_quality"]
+        assert q["n_stated_crossed"] + q["n_unstated_admitted"] == t["funnel"]["admitted"]
+        assert q["n_stated_crossed"] == 0, (
+            "no node row states a crossing, so any nonzero count here means the driver has "
+            "started reading an absent field as a measurement")
 
     def test_a_stated_sync_sigma_above_the_bound_is_refused(self, tmp_path):
         rec = dict(P._record_from_node_row(node_row("nyquist", T0, seed=8)),
@@ -827,10 +875,18 @@ class TestResumeIsIdempotent:
                    now=T0 + 3600.0)
         b = HT.run(str(tmp_path / "pool"), write_survey(tmp_path), pol(), out=out,
                    now=T0 + 7200.0)
-        assert a["events_emitted"] == b["events_emitted"] == 1
+        # ⚠️TWO NUMBERS, AND CONFLATING THEM WAS THE BUG. Both runs SOLVE the same one event;
+        # only the first WRITES it. This assertion used to read
+        # `a["events_emitted"] == b["events_emitted"] == 1` against a second run whose
+        # events.jsonl is 0 bytes -- the manifest asserting an emission that never happened.
+        assert a["events_solved_admissible"] == b["events_solved_admissible"] == 1
+        assert a["events_emitted"] == 1 and b["events_emitted"] == 0
         assert a["ledger_rows_written"] == 3 and b["ledger_rows_written"] == 0
         # the second run's event is a repeat of the same member set, so nothing new is emitted
         assert b["events_new"] == 0
+        assert b["event_membership_changed"] == 0, (
+            "the same member set is not a membership change; the old expression made this "
+            "count len(new_events) whenever anything had ever been emitted")
         led = [json.loads(l) for p in (pathlib.Path(out) / "arrivals").rglob("*.jsonl")
                for l in p.read_text().splitlines()]
         assert len({r["ledger_hash"] for r in led}) == len(led)
@@ -854,6 +910,91 @@ class TestResumeIsIdempotent:
               (pathlib.Path(out) / "runs" / b["run_id"] / "events.jsonl"
                ).read_text().splitlines()]
         assert ka and kb and ka != kb, "adding a member must change the content address"
+
+    # geometry wide enough that a 30 degC error crosses a pair bound -- see
+    # TestSoundSpeedIsAssumed for the mechanism and the metres.
+    WIDE = [{"node_id": i + 1, "name": "n%d" % i, "e_m": float(e), "n_m": float(n), "u_m": 0.0,
+             "sigma_m": 0.1}
+            for i, (e, n) in enumerate([(0, 0), (120, 0), (0, 140), (150, 130)])]
+
+    def test_a_REFUSED_run_does_not_burn_the_event_key_for_the_run_that_solves_it(self,
+                                                                                  tmp_path):
+        """⚠️THE DEFECT, REPRODUCED BY EXECUTION AND THEN PINNED.
+
+        Run 1 assumes 30 degC, which shrinks every pair bound past a genuine event and refuses
+        it as inadmissible. Run 2 assumes the right temperature and solves the SAME member set,
+        so `event_key` -- a content address of that set -- is identical.
+
+        The emission dedupe used to read its "already emitted" set out of the ARRIVAL LEDGER,
+        which gets an event_key for every arrival of every CANDIDATE regardless of verdict. So
+        run 1's refusal put the key there, run 2 filtered its own solved event out against it,
+        and events.jsonl was written 0 bytes while manifest.json reported an emission. One
+        refusal burned that member set permanently, and the only way to recover it was to delete
+        an append-only partition.
+        """
+        sv = SV.from_dict(survey_dict(self.WIDE))
+        svp = write_survey(tmp_path, self.WIDE)
+        out = str(tmp_path / "out")
+        build_pool(tmp_path / "pool", planted(sv, (300.0, 260.0, 0.0), T0))
+
+        hot = HT.run(str(tmp_path / "pool"), svp, pol(temp_c=30.0), out=out, now=T0 + 3600.0)
+        assert hot["events_admissible"] == 0 and hot["events_emitted"] == 0
+
+        # the refused candidate's key IS in the arrival ledger -- that is the trap, not a bug
+        led = [json.loads(l) for pp in (pathlib.Path(out) / "arrivals").rglob("*.jsonl")
+               for l in pp.read_text().splitlines()]
+        refused_keys = {r["event_key"] for r in led if r.get("event_key")}
+        assert refused_keys, "the ledger must still record which candidate an arrival was in"
+
+        cool = HT.run(str(tmp_path / "pool"), svp, pol(temp_c=0.0), out=out, now=T0 + 7200.0)
+        assert cool["events_admissible"] == 1
+        assert cool["events_solved_admissible"] == 1
+
+        ev = pathlib.Path(out) / "runs" / cool["run_id"] / "events.jsonl"
+        lines = [l for l in ev.read_text().splitlines() if l.strip()]
+        assert len(lines) == 1, "the solved event must reach the file, not just the manifest"
+        assert json.loads(lines[0])["event_key"] in refused_keys, (
+            "same member set, so the same content address -- which is exactly why reading the "
+            "candidate ledger as an emission log lost it")
+        assert cool["events_emitted"] == len(lines), (
+            "manifest and file must agree; claiming an emission against a 0-byte append is "
+            "the failure this assertion exists for")
+
+    def test_a_member_added_to_a_PUBLISHED_event_is_the_only_membership_change(self, tmp_path):
+        """`event_membership_changed` must count SUPERSESSION, not "new since something".
+
+        The old expression was `sum(1 for e in events_out if e[key] not in prior and prior)`,
+        which is len(new_events) whenever anything had ever been emitted. So a first-ever
+        backfill of unrelated events reported every one of them as a membership change, and a
+        genuine supersession against an empty store reported none. Both directions are checked
+        here, because a count that is right only when it happens to equal another count is not
+        measuring what its name says.
+        """
+        nodes = LIVE_NODES + [{"node_id": 5, "name": "extra", "e_m": 8.0, "n_m": -9.0,
+                               "u_m": 0.0, "sigma_m": 0.5}]
+        sv = SV.from_dict(survey_dict(nodes))
+        svp = write_survey(tmp_path, nodes)
+        out = str(tmp_path / "out")
+        build_pool(tmp_path / "pool", planted(sv, (40.0, 30.0, 0.0), T0, nodes=[1, 2, 3]))
+
+        a = HT.run(str(tmp_path / "pool"), svp, pol(), out=out, now=T0 + 3600.0)
+        assert a["events_emitted"] == 1
+        assert a["event_membership_changed"] == 0, (
+            "the FIRST emission supersedes nothing; the old expression got this right only "
+            "because it happened to short-circuit on an empty prior set")
+
+        P.Pool(str(tmp_path / "pool"))._append(
+            [P._record_from_node_row(r) for r in
+             planted(sv, (40.0, 30.0, 0.0), T0, nodes=[5], seed0=90)])
+        b = HT.run(str(tmp_path / "pool"), svp, pol(), out=out, now=T0 + 7200.0)
+        assert b["events_emitted"] == 1
+        assert b["event_membership_changed"] == 1
+        assert b["superseded_event_keys"] == sorted(
+            {json.loads(l)["event_key"] for l in
+             (pathlib.Path(out) / "runs" / a["run_id"] / "events.jsonl"
+              ).read_text().splitlines() if l.strip()}), (
+            "the superseded key must name the row that stays in the append-only store, so a "
+            "reader can see WHICH published event this one replaces")
 
     def test_a_backfill_older_than_the_lookback_fails_the_check(self, tmp_path):
         build_pool(tmp_path / "pool", [node_row("nyquist", T0 - 86400.0, seed=1)])
@@ -1101,6 +1242,50 @@ class TestTheDeployBundle:
         assert len(thinned_c) + len(thinned_d) < len(code) + len(data)
         GC.check(thinned_c, thinned_d)          # passes -- that is the finding, not a pass mark
 
+    def test_this_bundle_cannot_be_applied_CLIENT_side_and_says_so_in_a_FIELD(self):
+        """⚠️A PLAIN `kubectl apply` ON THIS FILE IS REJECTED, and the rejection is the API
+        server's, not a warning:
+
+            The ConfigMap "hear-tdoa-code" is invalid: metadata.annotations:
+            Too long: may not be more than 262144 bytes
+
+        Client-side apply stores the entire submitted object in
+        `kubectl.kubernetes.io/last-applied-configuration`. This bundle carries the whole solve
+        stack, so the object clears that cap by 1.8x. `--server-side` writes managed fields
+        instead and applies the same file (verified against the live cluster).
+
+        ⚠️THE ASSERTION READS THE ANNOTATION, NOT THE DOCUMENT TEXT. Grepping the .yaml for the
+        string "--server-side" would also hit the copy of tools/hear_tdoa.py inside the bundle's
+        own `data`, so the guard would pass on any bundle that merely *mentions* it -- a check
+        matching its own explanation. The annotation is a field with one value.
+        """
+        _app, code, data = GC.BUNDLES[BUNDLE]
+        mode, n_bytes = GC.apply_mode(code, data)
+        assert mode == "server"
+        assert n_bytes > GC.CLIENT_APPLY_ANNOTATION_CAP
+        assert n_bytes < GC.OBJECT_CAP, (
+            "server-side apply does NOT lift the 1 MiB object cap; past it the bundle has to "
+            "be split and no flag saves it")
+        if not CODEMAP.exists():
+            pytest.skip("no ConfigMap at %s" % CODEMAP)
+        ann = _annotations_from_text(CODEMAP.read_text())
+        assert ann.get("dama-hear/apply-mode") == "server"
+
+    @pytest.mark.parametrize("bundle", sorted(GC.BUNDLES))
+    def test_every_bundle_declares_the_mode_its_own_SIZE_implies(self, bundle):
+        """Not just this one. hear-drain-code is at 90% of the cap, so the bundle that has
+        always applied cleanly is one import-closure member away from crossing -- and the
+        failure mode is an apply that starts being rejected with no source change to blame."""
+        _app, code, data = GC.BUNDLES[bundle]
+        mode, n_bytes = GC.apply_mode(code, data)
+        assert mode == ("server" if n_bytes > GC.CLIENT_APPLY_ANNOTATION_CAP else "client")
+        f = REPO / "deploy" / "k8s" / ("%s.yaml" % bundle)
+        if not f.exists():
+            pytest.skip("no ConfigMap at %s" % f)
+        assert _annotations_from_text(f.read_text()).get("dama-hear/apply-mode") == mode, (
+            "regenerate: python3 deploy/k8s/gen_configmap.py %s > deploy/k8s/%s.yaml"
+            % (bundle, bundle))
+
     def test_the_manifest_declares_no_pvc(self):
         text = MANIFEST.read_text()
         assert "kind: PersistentVolumeClaim" not in text, (
@@ -1151,6 +1336,29 @@ class TestTheGeneratorAudit:
         r = subprocess.run([sys.executable, str(REPO / "deploy" / "k8s" / "gen_configmap.py"),
                             "nope"], capture_output=True, text=True, cwd=str(REPO))
         assert r.returncode != 0 and "unknown bundle" in r.stderr
+
+
+def _annotations_from_text(text):
+    """metadata.annotations as a dict, read from the header BEFORE `data:`.
+
+    Stopping at `data:` is the whole point: every embedded module is indented under it and one
+    of them is this generator's own source, so a scan of the full document would find the
+    annotation keys written as string literals in the code that emits them.
+    """
+    out, in_ann = {}, False
+    for line in text.split("\n"):
+        if line.startswith("data:"):
+            break
+        if line.strip() == "annotations:":
+            in_ann = True
+            continue
+        if in_ann:
+            if not line.startswith("    "):
+                in_ann = False
+                continue
+            k, _sep, v = line.strip().partition(":")
+            out[k] = v.strip().strip("'\"")
+    return out
 
 
 def _embedded_from_text(text):
