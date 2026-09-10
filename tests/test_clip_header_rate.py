@@ -230,3 +230,54 @@ class TestALatchedWrongRateIsRecoveredFromTheLengthAlone:
     def test_zero_and_absent_inputs_do_not_divide_by_zero(self):
         for args in ((0, 22848, None), (64000, 0, None), (64000, None, None), (None, 22848, None)):
             assert CLIPS.length_implies_rate(*args) is None
+
+
+class TestAV1RowIsNotReadAtFaceValue:
+    """v1 index rows predate `dur_s` and include mis-headed 48 kHz clips, so tags.py re-derives
+    the length. clips.py imports tags.py, so the logic is repeated there, not imported."""
+
+    def test_the_repeated_constants_agree(self):
+        import hear.tags as TAGS
+        assert TAGS._GEOMETRIES_S == CLIPS.CLIP_GEOMETRIES_S
+        assert TAGS._GEOMETRY_TOL == CLIPS.CLIP_GEOMETRY_TOL
+
+    @pytest.mark.parametrize("n_bytes,header_fs", [
+        (128044, 16000), (128044, 15988), (480044, 48000), (480044, 47973),
+        (480044, 16000), (480044, 16005)])
+    def test_the_v1_fallback_agrees_with_clips(self, n_bytes, header_fs):
+        import hear.tags as TAGS
+        want = CLIPS.clip_total_s({"bytes": n_bytes, "wav_header_fs_hz": header_fs})
+        assert TAGS._v1_total_s(n_bytes, header_fs) == pytest.approx(want, rel=1e-3)
+
+    def test_a_misheaded_v1_row_gets_the_48k_post_roll_not_14_seconds(self):
+        import hear.tags as TAGS
+        w = TAGS.sample_window({"sample": 1000000, "bytes": 480044, "wav_header_fs_hz": 16000})
+        assert w["post_s"] == pytest.approx(4.0)
+
+    def test_a_length_that_names_no_geometry_falls_back_rather_than_guessing(self):
+        import hear.tags as TAGS
+        assert TAGS._v1_total_s(12345 * 2 + 44, 48000) is None
+        assert TAGS.sample_window({"sample": 1, "bytes": 12345 * 2 + 44,
+                                   "wav_header_fs_hz": 48000})["post_s"] == TAGS.CLIP_POST_S
+
+
+class TestTheIndexRowCarriesTheLatchedRateCorrection:
+
+    def test_a_22848_clip_is_indexed_at_its_real_length(self):
+        import struct
+        d = b"\0\0" * 64000
+        body = (b"RIFF" + struct.pack("<I", 36 + len(d)) + b"WAVEfmt " + struct.pack("<I", 16)
+                + struct.pack("<HHIIHH", 1, 1, 22848, 45696, 2, 16)
+                + b"data" + struct.pack("<I", len(d)) + d)
+        row = CLIPS.index_row(
+            clip="/clips/mach-a75b9e4c-0026897593.wav",
+            parts=CLIPS.parse_clip_name("/clips/mach-a75b9e4c-0026897593.wav"),
+            node="mach", body=body, probe=CLIPS.wav_probe(body),
+            dets={"utc_us": 1788881847478265, "ts_utc_s": 1788881847.478265, "anchored": True,
+                  "uptime_s": 1, "fs_hz": 22848.0, "trigger": "lf", "clip_why": "ok",
+                  "dets_origin": "mach:/dets.csv", "record_key": "aa" * 16},
+            path="clips/2026-09-08/mach/x.wav", outcome="stored", fetched_at=1.0)
+        assert row["dur_s"] == pytest.approx(4.0)
+        assert row["t_end_utc_s"] - row["ts_utc_s"] == pytest.approx(3.0)
+        assert row["header_rate_suspect"]["true_fs_hz"] == 16000.0
+        assert CLIPS.clip_total_s(row) == pytest.approx(4.0)

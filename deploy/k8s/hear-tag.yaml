@@ -94,8 +94,8 @@ spec:
                   python -c 'import onnxruntime,numpy; print("onnxruntime",onnxruntime.__version__,"numpy",numpy.__version__)'
                   mkdir -p "$MODELS"
                   # ⚠️THE CLASS MAP IS FETCHABLE; THE MODEL IS NOT, AND THAT IS DELIBERATE.
-                  # Upstream publishes PyTorch checkpoints. Converting one needs torch and
-                  # torchvision -- roughly 3 GB into a 5 Gi PVC to run a 24 MB graph once. So the
+                  # Upstream publishes PyTorch checkpoints. Converting one needs torch, torchaudio and
+                  # torchvision (EfficientAT's model code imports it) -- roughly 3 GB into a 5 Gi PVC to run a 24 MB graph once. So the
                   # .onnx is built OUT OF BAND by tools/export_mn10_onnx.py, whose own input is
                   # the sha256-pinned upstream .pt, and staged onto the PVC. This job VERIFIES it
                   # and refuses; it never builds and never downloads a model it cannot check.

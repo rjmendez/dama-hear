@@ -56,11 +56,19 @@ Measured on the live fleet 2026-09-09:
 | rankine | 249 | ~200 |
 | **fleet** | **625** | **~478** |
 
-**Not one clip had ever left a node.** Each node writes a fixed-length WAV (1.0 s pre-trigger plus
-3.0 s post at 16 kHz, 4.0 s post at 48 kHz — see §6.1,
-16 kHz 16-bit mono, 128,044 B) into `/clips` under a 6,291,456 B budget — exactly 49 clips
-(`6291456 / 128044 = 49`, confirmed live: all three nodes report `budget_left_clips 0` and
-`6291456 - 17300 = 6274156 = 49 × 128044`). The 50th evicts the oldest.
+**Not one clip had ever left a node.** Each node writes a fixed-length 16-bit mono WAV into
+`/clips` under a 6,291,456 B budget (`CLIP_BUDGET_B`), and the oldest is evicted when it is full.
+How many that holds depends on which clip geometry the firmware writes (§6.1):
+
+| era | clip | bytes | clips in budget |
+|---|---|---|---|
+| 16 kHz | 1.0 + 3.0 s | 128,044 | **49** — confirmed live when measured: all three nodes reported `budget_left_clips 0` and `6291456 − 17300 = 49 × 128044` |
+| 48 kHz | 1.0 + 4.0 s | 480,044 | **13** (`6291456 // 480044`, 50,884 B left over) |
+
+⚠️**The 48 kHz switch cut the on-card buffer from 49 clips to 13** and nothing re-derived it. The
+firmware's own comment still calls the budget "1.4x the measured 12 h event count"; at 13 clips it
+is about 0.37×, so a busy night now depends on the drain's 15-minute cadence rather than on the
+card.
 
 Two things kept them there. The `/ls` handler hardcoded `SD.open("/")` and ignored every argument,
 so it listed root only and clip names — which embed a boot id and a millis counter — were
@@ -254,9 +262,11 @@ copies each clip out unchanged **and** writes an audible `.loud.wav` beside it, 
 worksheet and an `.m3u`:
 
 ```
-kubectl -n dama exec <pod-with-/pool> -- python3 tools/hear_listen.py --pool /pool --out /tmp/listen --n 30
-kubectl -n dama cp dama/<pod>:/tmp/listen ~/hear-listen-<date>
+kubectl -n dama exec <pool-pod> -- python3 tools/hear_listen.py --pool /pool --out /tmp/listen --n 30
+kubectl -n dama cp dama/<pool-pod>:/tmp/listen ~/hear-listen-<date>
 ```
+
+`<pool-pod>` is any pod in `dama` that mounts the `hear-pool` PVC at `/pool`.
 
 ⚠️**The gain is not cosmetic and the raw files are not quiet, they are inaudible.** Measured
 2026-09-10 across the pool: −65.7 to −43.3 dBFS, needing +24 to +41 dB to reach a normal listening
@@ -326,7 +336,7 @@ audioset_class_labels_indices.csv       14,675 B  cdd1049833c4b861…
 ```
 
 ⚠️**The `.onnx` is not fetchable, and the job says so instead of guessing.** Upstream publishes
-PyTorch checkpoints; converting one needs torch and torchvision — roughly 3 GB into a 5 Gi PVC to
+PyTorch checkpoints; converting one needs torch, torchaudio and torchvision (EfficientAT's model code imports it) — roughly 3 GB into a 5 Gi PVC to
 produce a 24 MB graph once. `tools/export_mn10_onnx.py` builds it on a workstation, from a
 sha-pinned upstream `.pt`, byte-reproducibly, and it is staged onto the PVC. The CronJob verifies
 and **exits 1 with the two commands to run**; it never builds, and never loads a graph it has not

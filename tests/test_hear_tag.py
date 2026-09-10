@@ -288,21 +288,14 @@ class TestTheRateIsSnappedOrRefused:
         assert not got["ok"]
         assert "22624" in got["detail"] and "16000.169" in got["detail"]
 
-    def test_resampling_is_deliberate_and_labelled_not_incidental(self):
-        """⚠️THIS TEST USED TO ASSERT NO RESAMPLER EXISTED AT ALL. It does now -- the model is
-        32 kHz and the fleet is not -- so the invariant moved to what the resampler must SAY.
-        A resampler that did not report its source rate and band limit would be the thing the
-        old test was really guarding against."""
-        row = HT.tag_one(StubTagger(),
-                         {"clip_key": "k", "outcome": "stored", "path": None},
-                         "/nonexistent", HT.model_block(VERIFIED))
-        assert not row["ok"]
+    def test_resampling_is_deliberate_and_labelled_not_incidental(self, tmp_path):
+        """This test used to assert no resampler existed at all. One does now -- the model is
+        32 kHz and the fleet is not -- so the invariant moved to what every row must SAY."""
+        row = store_clip(tmp_path)
+        got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
+        assert got["ok"], got
         for field in ("band_limit_hz", "fs_source_hz", "upsampled"):
-            assert field in HT.tag_one.__doc__ or True
-        import inspect
-        src = inspect.getsource(HT.tag_one)
-        for field in ("band_limit_hz", "fs_source_hz", "upsampled"):
-            assert field in src, "%s must ride on every row" % field
+            assert field in got["row"], "%s must ride on every tag row" % field
 
 
 # ----------------------------------------------------------------- the score picture
