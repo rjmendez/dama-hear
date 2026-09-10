@@ -37,7 +37,13 @@ SKETCH_BACK_S = 0.004
 # that the nRF52840 cannot produce 48000 Hz at all, and the PDM mic runs at 16 kHz. tau is a TIME,
 # so it carries across sample rates unchanged -- the equivalent SAMPLE count does not, and writing
 # this as "10 000 samples" in library code would assert a rate the hardware cannot reach.
-AMBIENT_TAU_S = 10000.0 / 48000.0   # 0.2083 s
+AMBIENT_TAU_S = 10000.0 / 48000.0   # 0.2083 s -- the LEGACY symmetric constant; see Gate
+#: Slow up, quick down. The rise must outlast an event string (a clap burst, a magazine, a
+#: firework finale) so the floor cannot be lifted by the very events it is there to catch; the
+#: fall only has to outlast one event, so the node recovers when a site genuinely quietens.
+#: Mirrored in firmware/night_node/night_node.ino as AMB_TAU_RISE_S / AMB_TAU_FALL_S.
+AMBIENT_TAU_RISE_S = 30.0
+AMBIENT_TAU_FALL_S = 5.0
 
 
 def envelope(x: np.ndarray, fs: float, ms: float = 1.0) -> np.ndarray:
@@ -139,23 +145,41 @@ class Gate:
     """
 
     def __init__(self, fs: float, ratio: float = 8.0, floor: float = 800.0,
-                 guard_s: float = GUARD_S, ambient_tau_s: float = AMBIENT_TAU_S,
+                 guard_s: float = GUARD_S, ambient_tau_s: Optional[float] = None,
                  rearm_frac: float = REARM_FRAC, onset_frac: float = ONSET_FRAC,
-                 sketch_back_s: float = SKETCH_BACK_S):
-        """⚠️`ambient_tau_s` DEFAULTS TO 0.21 s AND USED TO SAY 10 s. It never was 10 s: the old
-        alpha was derived per 1 ms hop and then applied once per SAMPLE, so the realised constant
-        was 10 000 samples -- 0.208 s at 48 kHz, 48x faster than the parameter claimed.
+                 sketch_back_s: float = SKETCH_BACK_S,
+                 ambient_tau_rise_s: float = AMBIENT_TAU_RISE_S,
+                 ambient_tau_fall_s: float = AMBIENT_TAU_FALL_S):
+        """⚠️THE AMBIENT ESTIMATE IS ASYMMETRIC IN DIRECTION: slow up, quick down.
 
-        The measured behaviour is kept and the parameter renamed to what it does, not the other
-        way round, for two reasons. Every number in docs/validation-full-captures.md (338 raw
-        detections -> 168, 32 impossible clusters -> 1, zero false alarms in 68.5 min of quiet)
-        was produced by the 0.21 s floor; correcting the arithmetic upward would have invalidated
-        a published result without touching the document. And 0.21 s is the constant a gunshot
-        gate wants anyway: the floor only ever sees material already below threshold, so nothing
-        it tracks is an event, and a range's floor moves with wind and traffic inside a single
-        string faster than a 10 s average can follow.
+        This replaces a single `ambient_tau_s` of 0.21 s that updated only while the envelope sat
+        BELOW threshold. That form rested on one claim, stated in this docstring and now known to
+        be false: "the floor only ever sees material already below threshold, so nothing it tracks
+        is an event". A transient's reverberant tail is below threshold and IS the event, as is
+        the noise of whatever is producing a string of them -- so a burst raised its own bar.
 
-        The realised constant is pinned by step response in tests/test_node.py, not asserted here.
+        Measured on the node `mach` 2026-09-09, clapping in the same room: ambient 22 -> 143 in
+        five seconds, threshold 200 -> 1146, zero of the claps detected, while the co-located
+        phone recorded every one. Across the three nodes the one in the occupied room had the
+        highest peak envelope (16938, 2.7x its siblings) and the FEWEST detections (294 vs 689
+        and 470). The gate turned itself down exactly where there was most to hear.
+
+        Keyed on direction, a burst lifts the floor only at `ambient_tau_rise_s`, so it cannot
+        desensitise the detector to itself, while a genuinely louder site is still learned -- over
+        half a minute instead of half a second. Falling stays quick so a site that quietens
+        recovers its sensitivity. Rising is never frozen, so the disarm deadlock the firmware hit
+        outdoors (156 s solid, ambient stuck at 73.2) cannot occur here either.
+
+        ⚠️`ambient_tau_s` IS RETAINED AND SETS BOTH LIMBS EQUAL, because every number in
+        docs/validation-full-captures.md (338 raw detections -> 168, 32 impossible clusters -> 1,
+        zero false alarms in 68.5 min of quiet) was produced by the symmetric 0.21 s floor. Those
+        numbers are reproducible by passing `ambient_tau_s=AMBIENT_TAU_S` -- near enough, since
+        the old form also FROZE the estimate above threshold, which mattered only in the disarmed
+        state. They do NOT describe the default any more, and this change is expected to raise the
+        detection count in bursty or occupied conditions, which is its point.
+
+        The realised constants are pinned by step response in tests/test_node.py, not asserted
+        here.
         """
         self.fs = float(fs)
         self.ratio = float(ratio)
@@ -164,8 +188,11 @@ class Gate:
         self.rearm_frac = float(rearm_frac)
         self.onset_frac = float(onset_frac)
         self.sketch_back_s = float(sketch_back_s)
-        # per SAMPLE, because that is where it is applied
-        self.alpha = 1.0 / max(1.0, ambient_tau_s * fs)
+        # per SAMPLE, because that is where they are applied
+        if ambient_tau_s is not None:          # legacy symmetric form; see the docstring
+            ambient_tau_rise_s = ambient_tau_fall_s = float(ambient_tau_s)
+        self.alpha_rise = 1.0 / max(1.0, ambient_tau_rise_s * fs)
+        self.alpha_fall = 1.0 / max(1.0, ambient_tau_fall_s * fs)
         self.ambient = 0.0
         self.n_seen = 0
         self.last_onset: Optional[float] = None
@@ -198,10 +225,10 @@ class Gate:
                     self.armed = True
                 i += 1
                 continue
-            # ambient tracks the quiet material only, so one loud event cannot raise the floor
-            if e[i] <= thr:
-                self.ambient = (1 - self.alpha) * self.ambient + self.alpha * e[i]
-            else:
+            # Slow up, quick down -- tracked unconditionally. See __init__.
+            self.ambient += (self.alpha_rise if e[i] > self.ambient
+                             else self.alpha_fall) * (e[i] - self.ambient)
+            if e[i] > thr:
                 j = min(len(e), i + self.guard)
                 k = i + int(np.argmax(e[i:j]))
                 # bounded by the guard, which is also the window the peak was found in
