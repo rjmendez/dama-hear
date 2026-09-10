@@ -23,6 +23,8 @@ real timestamped event. hear/pool.py:71 solved the same problem the same way.
 """
 from __future__ import annotations
 
+from . import sketch as SK
+
 import hashlib
 import json
 import os
@@ -31,8 +33,16 @@ import shutil
 from typing import Any, Dict, Iterable, List, Optional
 
 CLIP_SCHEMA_VERSION = 1
-#: 44-byte canonical header + 64000 samples * 2 bytes. night_node.ino CLIP_BYTES.
-CLIP_BYTES = 128044
+#: 44-byte canonical header + 64000 samples * 2 bytes, at the 16 kHz / 4.0 s geometry.
+#: ⚠️KEPT ONLY AS THE HISTORICAL SIZE. It is NOT a validity test any more -- see wav_probe.
+CLIP_BYTES_16K_4S = 128044
+
+#: What a clip may be, as a DURATION rather than a byte count. The node's geometry has already
+#: changed once -- 4.0 s at 16 kHz became 5.0 s at 48 kHz, 128044 B to 480044 B -- and the fixed
+#: total here did not move with it, so the drain refused every clip the fleet wrote
+#: ("total_480044_expected_128044") while reporting itself healthy. A magic number layered on a
+#: SELF-DESCRIBING format is what made a firmware change into silent data loss.
+CLIP_MIN_S, CLIP_MAX_S = 0.5, 30.0
 CLIP_PRE_S = 1.0
 CLIP_POST_S = 3.0
 CLIP_DIR = "/clips"
@@ -150,7 +160,7 @@ def wav_probe(body: bytes) -> Dict[str, Any]:
     REPORTED; whether it is usable is the tagger's decision, not the store's.
     """
     out: Dict[str, Any] = {"ok": False, "reason": None, "fs_hz": None, "channels": None,
-                           "bits": None, "data_bytes": None, "total_bytes": len(body)}
+                           "bits": None, "data_bytes": None, "total_bytes": len(body), "dur_s": None, "fs_nameable": None}
     if len(body) < 44:
         out["reason"] = "header_short_%d" % len(body)
         return out
@@ -183,8 +193,21 @@ def wav_probe(body: bytes) -> Dict[str, Any]:
     if 44 + out["data_bytes"] != len(body):
         out["reason"] = "data_len_%d_body_%d" % (out["data_bytes"], len(body))
         return out
-    if len(body) != CLIP_BYTES:
-        out["reason"] = "total_%d_expected_%d" % (len(body), CLIP_BYTES)
+    # ⚠️THE HEADER ALREADY PROVED THE BODY. `44 + data_bytes == len(body)` above catches a
+    # truncated or padded fetch, so what is left to check is whether this is a PLAUSIBLE CLIP --
+    # a question about duration and rate, not about one firmware's byte count.
+    # ⚠️A RATE THIS FORMAT CANNOT NAME IS REPORTED, NOT REFUSED. mach once wrote a whole boot
+    # headed 22624 Hz while its CSV said 16000; refusing on the header would have discarded every
+    # clip of it. `fs_nameable` travels with the row so the disagreement stays visible and the
+    # tagger decides -- which is the same rule the index already follows by carrying BOTH the
+    # header rate and the dets rate side by side.
+    if not out["fs_hz"]:
+        out["reason"] = "fs_zero"
+        return out
+    out["fs_nameable"] = SK.fs_code(float(out["fs_hz"])) != 0
+    out["dur_s"] = out["data_bytes"] / float(out["fs_hz"] * 2)
+    if not (CLIP_MIN_S <= out["dur_s"] <= CLIP_MAX_S):
+        out["reason"] = "duration_%.3f_s_outside_%.1f_%.1f" % (out["dur_s"], CLIP_MIN_S, CLIP_MAX_S)
         return out
     out["ok"] = True
     return out

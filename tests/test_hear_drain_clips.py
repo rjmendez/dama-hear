@@ -159,7 +159,7 @@ class TestAClipIsNotACsv:
             "sniff changed and the CSV lane's absent-file detection changed with it")
         body, reason = HD.fetch_clip("10.0.0.1", CLIP_A)
         assert reason is None and body is not None
-        assert len(body) == CL.CLIP_BYTES == 128044
+        assert len(body) == CL.CLIP_BYTES_16K_4S == 128044
         assert body[:4] == b"RIFF"
 
     def test_a_zero_byte_200_is_a_refusal_not_a_clip(self, wired):
@@ -319,8 +319,8 @@ class TestTheIndexIsTheDedupKey:
         assert row["path"] == "clips/2025-09-09/nyquist/nyquist-db21acd5-900.wav", row["path"]
         assert not os.path.isabs(row["path"]), "the index must not pin an absolute pod path"
         on_disk = os.path.join(pl.root, row["path"])
-        assert os.path.getsize(on_disk) == CL.CLIP_BYTES
-        assert row["bytes"] == CL.CLIP_BYTES and len(row["sha256"]) == 64
+        assert os.path.getsize(on_disk) == CL.CLIP_BYTES_16K_4S
+        assert row["bytes"] == CL.CLIP_BYTES_16K_4S and len(row["sha256"]) == 64
 
     def test_both_rate_readings_travel_side_by_side(self, tmp_path, wired):
         # ⚠️A SHIPPED CONDITION ON MACH: a whole boot headed 22624 Hz while the CSV said 16000.
@@ -603,7 +603,7 @@ class TestItReachesTheGate:
 
     def test_the_defaults_are_the_measured_card_ceiling(self):
         # 6291456 / 128044 = 49 exactly, and all three nodes report budget_left_clips 0.
-        assert HD.CLIP_MAX_PER_NODE_DEFAULT == 6291456 // CL.CLIP_BYTES == 49
+        assert HD.CLIP_MAX_PER_NODE_DEFAULT == 6291456 // CL.CLIP_BYTES_16K_4S == 49
         assert HD.DEFAULT_MAX_CLIPS_DEFERRED == 0, "deferral is a design invariant, not a range"
         assert HD.DEFAULT_MAX_CLIPS_LOST == -1, (
             "666 clips are already destroyed and still named in current dets.csv files; a gate "
@@ -619,7 +619,7 @@ class TestPruneRunsBeforeTheFetch:
         pl = _pool(tmp_path)
         old = CL.store_path(pl.root, "2026-09-01", "nyquist", "nyquist-aa-1.wav")
         os.makedirs(os.path.dirname(old), exist_ok=True)
-        open(old, "wb").write(b"\0" * CL.CLIP_BYTES)
+        open(old, "wb").write(b"\0" * CL.CLIP_BYTES_16K_4S)
         state = {}
         n = wired(dets_rows=[_dets_row(_name(1), sample=1)], clips={_name(1): _wav()})
         n.watch = lambda: state.update(old_still_there=os.path.exists(old))
@@ -676,7 +676,7 @@ class TestTheIndexIsNeverBehindTheBytes:
         assert len(idx) == 2, "the ledger must not lag the bytes; got %d row(s)" % len(idx)
         assert {r["outcome"] for r in idx.values()} == {"stored"}
         for r in idx.values():
-            assert os.path.getsize(os.path.join(pl.root, r["path"])) == CL.CLIP_BYTES
+            assert os.path.getsize(os.path.join(pl.root, r["path"])) == CL.CLIP_BYTES_16K_4S
 
     def test_the_next_run_does_not_call_the_node_destroyed_a_clip_it_holds(self, tmp_path, wired,
                                                                           monkeypatch):
@@ -806,7 +806,7 @@ class TestPruneOrder:
     def _clip(self, pl, day, node, base, mtime):
         p = CL.store_path(pl.root, day, node, base)
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        open(p, "wb").write(b"\0" * CL.CLIP_BYTES)
+        open(p, "wb").write(b"\0" * CL.CLIP_BYTES_16K_4S)
         os.utime(p, (mtime, mtime))
         return p
 
@@ -816,7 +816,7 @@ class TestPruneOrder:
         pl = _pool(tmp_path)
         dated = self._clip(pl, "2025-09-09", "nyquist", "nyquist-aa-1.wav", 1_700_000_000)
         loose = self._clip(pl, "unanchored", "nyquist", "nyquist-bb-2.wav", 1_800_000_000)
-        out = CL.prune(pl.root, CL.CLIP_BYTES, 1_900_000_000.0)
+        out = CL.prune(pl.root, CL.CLIP_BYTES_16K_4S, 1_900_000_000.0)
         assert out["files_deleted"] == 1
         assert os.path.exists(dated) and not os.path.exists(loose)
 
@@ -870,3 +870,70 @@ class TestATruncatedListingIsNotAShortCard:
         monkeypatch.setattr(HD, "drain_node", lambda *a, **kw: r)
         HD.main(["--pool", str(pl.root), "--node", "nyquist=10.0.0.1"])
         assert "/ls stopped at 256 entries" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- the geometry contract
+
+class TestClipSizeIsNotAMagicNumber:
+    """⚠️A FIRMWARE CHANGE BECAME SILENT DATA LOSS THROUGH THIS.
+
+    `hear/clips.py` hardcoded `CLIP_BYTES_16K_4S = 128044` -- the 16 kHz / 4.0 s size -- and validated with
+    `len(body) != CLIP_BYTES_16K_4S`. When the node moved to 48 kHz / 5.0 s (480044 B) the constant did not
+    move with it, so the drain refused EVERY clip the fleet wrote, reported
+    `total_480044_expected_128044`, and went on calling itself healthy while 288 clips on one node
+    and 312 on another were evicted uncollected.
+
+    The WAV is self-describing and `44 + data_bytes == len(body)` already catches truncation, so a
+    fixed total added nothing except a second place for the geometry to live.
+    """
+
+    def _wav(self, rate, secs):
+        import struct
+        n = int(rate * secs)
+        d = n * 2
+        return (b"RIFF" + struct.pack("<I", 36 + d) + b"WAVEfmt "
+                + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
+                + b"data" + struct.pack("<I", d) + b"\0" * d)
+
+    def test_both_shipped_geometries_are_accepted(self):
+        from hear import clips as CL
+        for rate, secs in ((16000, 4.0), (48000, 5.0)):
+            p = CL.wav_probe(self._wav(rate, secs))
+            assert p["ok"], "%d Hz / %.1f s refused: %s" % (rate, secs, p["reason"])
+            assert abs(p["dur_s"] - secs) < 1e-6
+
+    def test_no_module_pins_validity_to_one_byte_count(self):
+        """The constant may survive as history; using it as a TEST may not."""
+        import pathlib
+        import re
+        root = pathlib.Path(__file__).resolve().parents[1]
+        for rel in ("hear/clips.py", "tools/hear_drain.py"):
+            src = re.sub(r"#[^\n]*", "", (root / rel).read_text())
+            assert not re.search(r"len\(body\)\s*!=\s*\w*CLIP_BYTES_16K_4S", src), (
+                "%s validates a clip against a fixed total again" % rel)
+            # ⚠️NO LITERAL SEARCH HERE. A guard that greps for one number is the same brittle
+            # shape as the constant it is policing -- it would go blind the moment the geometry
+            # moved again. What must never come back is the PATTERN: validity decided by equality
+            # against a fixed total.
+            assert not re.search(r"len\(body\)\s*!=\s*\d+", src), (
+                "%s validates a clip against a literal total" % rel)
+
+    def test_a_truncated_clip_is_still_refused(self):
+        """Dropping the total must not drop the protection it was standing in for."""
+        from hear import clips as CL
+        body = self._wav(48000, 5.0)[:-1000]
+        p = CL.wav_probe(body)
+        assert not p["ok"] and p["reason"].startswith("data_len_")
+
+    def test_an_implausible_duration_is_refused(self):
+        from hear import clips as CL
+        assert not CL.wav_probe(self._wav(48000, 0.1))["ok"]
+        assert not CL.wav_probe(self._wav(48000, 60.0))["ok"]
+
+    def test_a_rate_the_wire_format_cannot_name_is_KEPT_and_flagged(self):
+        """⚠️NOT REFUSED. mach once headed a whole boot 22624 Hz while its CSV said 16000; a rate
+        gate here would have discarded every clip of it. Report the disagreement, keep the audio."""
+        from hear import clips as CL
+        p = CL.wav_probe(self._wav(37000, 4.0))
+        assert p["ok"], "an odd header rate must not lose the clip: %s" % p["reason"]
+        assert p["fs_nameable"] is False

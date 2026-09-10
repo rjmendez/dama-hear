@@ -38,7 +38,7 @@ import gen_configmap as GC                                      # noqa: E402
 
 MANIFEST = os.path.join(ROOT, "deploy", "k8s", "hear-tag.yaml")
 
-CLIP_SAMPLES = (CLIPS.CLIP_BYTES - 44) // 2
+CLIP_SAMPLES = (CLIPS.CLIP_BYTES_16K_4S - 44) // 2
 
 
 # ----------------------------------------------------------------- fixtures
@@ -371,7 +371,7 @@ class TestTheTaggerReadsOnlyWhatClipsDeclares:
         row = store_clip(tmp_path)
         pcm, fs = HT.read_wav(os.path.join(str(tmp_path), row["path"]))
         assert fs == row["wav_header_fs_hz"]
-        assert len(pcm) * 2 + 44 == row["bytes"] == CLIPS.CLIP_BYTES
+        assert len(pcm) * 2 + 44 == row["bytes"] == CLIPS.CLIP_BYTES_16K_4S
 
 
 # ----------------------------------------------------------------- the refusal census
