@@ -299,6 +299,27 @@ class TestAnchoredIsNotTrusted:
         pl.ingest_dets(_dets(tmp_path, "dets.csv", 1))
         assert pl.records()[0].utc_trusted is None
 
+    def test_the_ingest_keeps_the_edge_index_an_unanchored_row_is_placed_by(self, tmp_path):
+        """⚠️pps_n AND us_since_pps USED TO BE DROPPED AT INGEST, so an unanchored row became
+        unplaceable the moment it reached the pool. Measured 2026-09-10: 517 of mach's 2557 node
+        records were stored with `anchored: false` and neither field, i.e. with no way even in
+        principle to say WHICH second they happened in. `utc_us == 0` means the node could not
+        NAME the edge; pps_n still says which edge it was and us_since_pps how far into it, and
+        every generation of dets.csv has carried both (they are in `hear.detsfile._BASE`).
+        What may and may not be reconstructed from them is `hear/unanchored.py`'s business --
+        keeping them is this one's."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        fh = binascii.hexlify(_frame()).decode()
+        p = tmp_path / "unanchored.csv"
+        p.write_text(",".join(DF.G5.declared) + "\n"
+                     + "mach,0,34,5000000,31,-1140,200,4608,16000.000,64,%s,,ring\n" % fh)
+        assert pl.ingest_dets(str(p))["added"] == 1
+        rec = json.loads((tmp_path / "pool" / "records" / "unanchored" / "node.jsonl")
+                         .read_text().splitlines()[0])
+        assert rec["anchored"] is False and rec["utc_us"] == 0
+        assert rec["pps_n"] == "31"
+        assert rec["us_since_pps"] == "-1140"
+
     def test_the_mqtt_arithmetic_still_closes_with_the_new_columns(self, tmp_path):
         pl = P.Pool(str(tmp_path / "pool"))
         f = _mqtt_payloads(tmp_path, "c.jsonl", [{"clock_tier": "wall"}, {"clock_tier": "gnss"}])
