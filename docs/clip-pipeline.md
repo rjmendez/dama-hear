@@ -234,6 +234,26 @@ operator to ignore it). The unsuspend condition is written onto the object as
 3. `max_silence_frac` is set from the **measured** distribution in that calibration set. Threshold
    from the envelope, never a single sample.
 
+`tools/hear_listen.py` stages condition 2. It draws a node-balanced sample from `index.jsonl`,
+copies each clip out unchanged **and** writes an audible `.loud.wav` beside it, and emits the
+worksheet and an `.m3u`:
+
+```
+kubectl -n dama exec <pod-with-/pool> -- python3 tools/hear_listen.py --pool /pool --out /tmp/listen --n 30
+kubectl -n dama cp dama/<pod>:/tmp/listen ~/hear-listen-<date>
+```
+
+⚠️**The gain is not cosmetic and the raw files are not quiet, they are inaudible.** Measured
+2026-09-10 across the pool: −65.7 to −43.3 dBFS, needing +24 to +41 dB to reach a normal listening
+level. At −57 dBFS an int16 sample peaks near 45 counts of 32767. Anyone who opened the pool WAVs
+directly would have heard nothing and would have been hearing the level, not the site — the same
+failure `hear_tag.py` documents from the model's side, where an un-normalised clip returns
+`Silence` and exits 0.
+
+⚠️**Condition 3 is derived from `rms_dbfs_orig`/`silence_frac` in `manifest.json`, which are
+measured on the ORIGINAL.** Deriving a silence threshold from the normalised copy would measure
+the tool's own gain.
+
 Until 3 is set, `check_tags` runs report-only and says so on its own output line.
 
 **Model: YAMNet as TFLite under `ai-edge-litert`, not under TensorFlow.** Bit-identical scores at

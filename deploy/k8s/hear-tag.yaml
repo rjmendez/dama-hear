@@ -7,7 +7,10 @@
 #   2. A human has LISTENED to >= 30 of them, including at least one from mach, and written what
 #      they heard into docs/clip-calibration-<date>.md, per node. Three models agreeing on "Dog"
 #      is corroboration, not ground truth, and nobody has yet heard a single clip this fleet
-#      recorded.
+#      recorded. `tools/hear_listen.py` stages this: the pool WAVs sit at -65.7 to -43.3 dBFS and
+#      are INAUDIBLE played directly, so the tool writes a gain-corrected copy beside each one
+#      plus the worksheet. Condition 3 comes from the ORIGINAL levels it records, never the
+#      audible copy.
 #   3. --max-silence-frac on the check job below is set from the MEASURED distribution in that
 #      calibration set. Until then it stays negative and the gate prints REPORT and does not fire.
 #      A threshold from a guess is the failure this repo names as its own.
