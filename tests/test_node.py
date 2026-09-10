@@ -234,12 +234,97 @@ class TestAmbientTau:
         assert abs(got / tau - 1.0) < 0.05, \
             "asked for %.4f s, measured %.4f s (%.0fx)" % (tau, got, got / tau)
 
-    def test_default_is_the_constant_the_published_run_was_measured_with(self):
+    def test_the_legacy_symmetric_constant_is_still_reachable(self):
         # ⚠️docs/validation-full-captures.md (338 raw -> 168, 32 impossible clusters -> 1, zero
-        # false alarms in 68.5 min) was produced with alpha = 1e-4 per sample. Changing this
-        # number invalidates that table. If this fails, the document has to move too.
-        assert DT.Gate(FS).alpha == pytest.approx(1.0 / 10000.0, rel=1e-12)
-        assert self._realised_tau(DT.AMBIENT_TAU_S) < 0.25, "the floor is no longer sub-second"
+        # false alarms in 68.5 min) was produced with alpha = 1e-4 per sample. That is no longer
+        # the DEFAULT -- see TestBurstDoesNotDesensitise -- but it must stay reproducible, or the
+        # published table becomes unrepeatable rather than merely superseded.
+        g = DT.Gate(FS, ambient_tau_s=DT.AMBIENT_TAU_S)
+        assert g.alpha_rise == pytest.approx(1.0 / 10000.0, rel=1e-12)
+        assert g.alpha_fall == pytest.approx(1.0 / 10000.0, rel=1e-12)
+        assert self._realised_tau(DT.AMBIENT_TAU_S) < 0.25, "the legacy floor is not sub-second"
+
+    def test_the_default_is_slow_up_and_quick_down(self):
+        g = DT.Gate(FS)
+        rise = 1.0 / g.alpha_rise / FS
+        fall = 1.0 / g.alpha_fall / FS
+        assert rise == pytest.approx(DT.AMBIENT_TAU_RISE_S, rel=1e-9)
+        assert fall == pytest.approx(DT.AMBIENT_TAU_FALL_S, rel=1e-9)
+        # The ordering is the whole design, not the specific seconds: the floor must not be able
+        # to climb inside an event string, and must still fall back when the site quietens.
+        assert rise > 5.0 * fall, "rise %.1f s is not slow relative to fall %.1f s" % (rise, fall)
+        assert rise >= 20.0, "a %.1f s rise is short enough for a clap burst to lift" % rise
+
+    def test_the_rising_step_really_takes_the_slow_limb(self):
+        # Measured, not read off the parameter -- the same discipline as _realised_tau, but the
+        # default is asymmetric so the legacy helper cannot express it.
+        g = DT.Gate(FS)
+        g.ambient = 20.0
+        g.process(np.full(int(2.0 * FS), 200.0), 0)      # 2 s of a louder, still sub-threshold room
+        # 2 s against a 30 s rise is 6.4% of the way, NOT the 6x the old 0.21 s limb would give
+        assert g.ambient < 40.0, "ambient reached %.1f in 2 s -- the fast limb is still on" % g.ambient
+        assert g.ambient > 20.0, "ambient did not rise at all; the deadlock guard is gone"
+
+    def test_a_fallen_room_is_recovered_quickly(self):
+        g = DT.Gate(FS)
+        g.ambient = 200.0
+        g.process(np.full(int(15.0 * FS), 20.0), 0)      # 3 fall-taus of quiet
+        assert g.ambient < 40.0, "ambient stuck at %.1f after 15 s of quiet" % g.ambient
+
+
+class TestBurstDoesNotDesensitise:
+    """⚠️THE REGRESSION THIS FILE EXISTS FOR, measured in the field before it was written.
+
+    On the node `mach`, 2026-09-09, clapping in the same room: ambient 22 -> 143 in five seconds,
+    threshold 200 -> 1146, and not one clap fired -- while the phone beside it recorded every one.
+    Across the three nodes the one in the occupied room had the highest peak envelope (16938,
+    2.7x its siblings) and the FEWEST detections (294, against 689 and 470).
+
+    The gate turned itself down exactly where there was most to hear, because the ambient
+    estimator took its fast limb on everything below threshold -- which includes a transient's
+    own reverberant tail and the noise of whoever is producing the transients.
+    """
+
+    @staticmethod
+    def _clapping_room(n=6, gap=1.5, quiet=22.0, occupied=143.0, clap=683.0, seed=3):
+        """The measured levels as a signal: a quiet floor, then a burst whose SUB-THRESHOLD
+        material sits where mach's ambient actually went, with claps on top of it."""
+        rng = np.random.default_rng(seed)
+        x = list(rng.normal(0.0, quiet, int(8.0 * FS)))
+        for _ in range(n):
+            seg = rng.normal(0.0, occupied, int(gap * FS))
+            c = int(0.02 * FS)
+            seg[:c] += np.linspace(clap * 2.2, 0.0, c)
+            x += list(seg)
+        return np.array(x, dtype=np.float32)
+
+    @staticmethod
+    def _run(g, x):
+        out = []
+        for s in range(0, len(x), 4096):
+            out += g.process(x[s:s + 4096], s)
+        return out
+
+    def test_the_burst_cannot_lift_the_threshold_out_of_its_own_reach(self):
+        x = self._clapping_room()
+        g = DT.Gate(FS, floor=200.0)
+        self._run(g, x)
+        # mach reached 143; the fix must keep it far below that inside a ~9 s burst
+        assert g.ambient < 60.0, "ambient reached %.1f -- the burst lifted its own floor" % g.ambient
+        assert g.threshold() < 500.0, \
+            "threshold reached %.1f; mach's claps peaked at 683" % g.threshold()
+
+    def test_the_legacy_gate_is_the_one_that_went_deaf(self):
+        # The counter-case, so this file records WHY the default moved rather than asserting it.
+        x = self._clapping_room()
+        old = DT.Gate(FS, floor=200.0, ambient_tau_s=DT.AMBIENT_TAU_S)
+        new = DT.Gate(FS, floor=200.0)
+        self._run(old, x)
+        self._run(new, x)
+        assert old.ambient > 3.0 * new.ambient, \
+            "legacy ambient %.1f vs fixed %.1f -- the limbs are not behaving differently" % (
+                old.ambient, new.ambient)
+        assert old.threshold() > 1.8 * new.threshold()
 
 
 class TestOnset:
