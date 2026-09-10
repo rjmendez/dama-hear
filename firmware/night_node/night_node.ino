@@ -1625,6 +1625,10 @@ static void wav_header(uint8_t *h, uint32_t data_bytes, uint32_t fs) {
 // cost is not hidden: it shows up in drop_s, which is the instrument for exactly this.
 #define CLIP_CHUNK_B 4096
 #define CLIP_DIR "/clips"
+// /ls?dir= entry cap. Not sized to CLIP_BUDGET_B/CLIP_BYTES=49: clip_budget_left is a RAM
+// counter that resets full every boot with no startup rescan of CLIP_DIR, so eviction only
+// binds once THIS boot's counter is spent -- the real ceiling is free SD space, not 49.
+#define LS_MAX_ENTRIES 256
 // Hard deadline on the PENDING state. det_flush will not write a detection's row until its clip
 // resolves, so a clip that can never resolve would stall dets.csv -- the record mattering more
 // than the audio, that must not be possible. 10 s is well past the 3 s post-roll and well short
@@ -2450,13 +2454,37 @@ void setup() {
     f.close();
   });
   http.on("/ls", []() {
+    // dir defaults to root, so an old caller with no argument gets exactly the old listing.
+    // ⚠️/sd?file= already opens any absolute path with no authentication of any kind -- /reboot,
+    // /update and /log are unauthenticated too -- so restricting dir here would buy nothing real
+    // and would break its use as a whole-card census. Not an oversight; a decision.
     if (!sd_ok) { http.send(503, "text/plain", "no card mounted\n"); return; }
-    String o; File d = SD.open("/");
+    String dir = http.hasArg("dir") ? http.arg("dir") : String("/");
+    if (!dir.startsWith("/")) dir = "/" + dir;
+    if (dir.indexOf("..") >= 0) { http.send(400, "text/plain", "no\n"); return; }
+    File d = SD.open(dir.c_str());
+    if (!d || !d.isDirectory()) { http.send(404, "text/plain", "not a directory: " + dir + "\n"); return; }
+    // Name is dir-qualified (e.g. "clips/07-nyquist-...wav") so it is usable straight into
+    // /sd?file=/<name> with no client-side reconstruction. Root keeps the bare name -- e.name()
+    // already comes back without a leading slash there -- so the line format for a root listing,
+    // which _ls_sizes() depends on, is byte-for-byte what it was before this change.
+    String pre = (dir == "/") ? String("") : dir.substring(1) + "/";
+    http.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    http.send(200, "text/plain", "");
+    unsigned n = 0;
     for (File e = d.openNextFile(); e; e = d.openNextFile()) {
-      o += String(e.isDirectory() ? "d " : "- ") + e.name() + "  " + String((long)e.size()) + " B\n";
+      if (n++ >= LS_MAX_ENTRIES) {
+        http.sendContent("! truncated at " + String(n - 1) + " entries\n");
+        e.close();
+        break;
+      }
+      String nm = e.name();
+      if (nm.startsWith("/")) nm = nm.substring(1);
+      http.sendContent(String(e.isDirectory() ? "d " : "- ") + pre + nm + "  " + String((long)e.size()) + " B\n");
       e.close();
     }
-    http.send(200, "text/plain", o.length() ? o : "(empty)\n");
+    d.close();
+    http.sendContent("");
   });
   http.on("/perf", []() {            // measured throughput, not a datasheet number
     int mb = http.hasArg("mb") ? http.arg("mb").toInt() : 4;

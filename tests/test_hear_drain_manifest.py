@@ -132,3 +132,103 @@ class TestThePhoneLegIsDeclared:
         assert text.count("mountPath: /pool") >= 2, (
             "both the drain and the check must mount the pool PVC; %r lives on it"
             % PHONE_CORPUS_PATH)
+
+
+# ---------------------------------------------------------------- seam S9: bundle <-> mounts
+
+def _gen():
+    """gen_configmap.py's namespace, the same way tests/test_configmap_sync.py loads it."""
+    p = os.path.join(ROOT, "deploy", "k8s", "gen_configmap.py")
+    ns = {"__file__": p, "__name__": "gen_configmap"}
+    with open(p) as fh:
+        exec(compile(fh.read(), p, "exec"), ns)            # noqa: S102 -- our own file
+    return ns
+
+
+def _mounts(text):
+    """{container name: set of subPaths it mounts from the `code` volume}.
+
+    Same small parser as `_containers` above and for the same reason: the suite has no yaml
+    dependency, and `- { name: code, ... }` is an inline mapping that the `- name: <container>`
+    line format cannot collide with.
+    """
+    out, name = {}, None
+    for line in text.splitlines():
+        m = re.match(r"\s*- name: (\S+)\s*$", line)
+        if m:
+            name = m.group(1)
+            out.setdefault(name, set())
+            continue
+        m = re.search(r"name: code,.*subPath: (\S+?)\s*\}", line)
+        if m and name:
+            out[name].add(m.group(1))
+    return out
+
+
+class TestEveryBundleKeyIsMounted:
+    """⚠️THIS SEAM WAS UNGUARDED, AND IT IS THE ONE THAT BREAKS ONLY IN THE CLUSTER.
+
+    `tests/test_configmap_sync.py` proves the ConfigMap CONTENT matches the checkout, and
+    `gen_configmap.check()` proves the import closure is complete. Neither looks at the pod. A
+    file added to `DRAIN_CODE` without a matching `volumeMount` gives a ConfigMap that has the
+    module and a container that gets `ModuleNotFoundError` at 15-minute intervals -- green
+    generation, green sync test, dead drain. The `code` volume mounts file-by-file by `subPath`,
+    so there is no directory mount to cover for a missing line.
+    """
+
+    def test_every_bundle_key_is_mounted_by_every_container(self):
+        with open(MANIFEST) as fh:
+            text = fh.read()
+        keys = {k for k, _rel in _gen()["BUNDLES"]["hear-drain-code"][1]}
+        mounts = _mounts(text)
+        for container in ("drain", "check"):
+            assert mounts.get(container) == keys, (
+                "container %r mounts %r but bundle hear-drain-code ships %r -- the difference is "
+                "%r, which is either a module the pod cannot import or a mount of a key that does "
+                "not exist" % (container, sorted(mounts.get(container) or []), sorted(keys),
+                               sorted(keys ^ (mounts.get(container) or set()))))
+
+    def test_the_mount_path_matches_the_bundle_path(self):
+        """A key mounted at the wrong path imports as a different module, or as none."""
+        with open(MANIFEST) as fh:
+            lines = fh.read().splitlines()
+        by_key = {k: rel for k, rel in _gen()["BUNDLES"]["hear-drain-code"][1]}
+        seen = 0
+        for line in lines:
+            m = re.search(r"mountPath: (\S+?),\s*subPath: (\S+?)\s*\}", line)
+            if not m:
+                continue
+            path, key = m.groups()
+            assert key in by_key, "%r is mounted but is in no bundle" % key
+            assert path == "/app/" + by_key[key], (
+                "%s is mounted at %s but the bundle says %s" % (key, path, by_key[key]))
+            seen += 1
+        assert seen >= 2 * len(by_key), "only %d mounts parsed; the parser missed some" % seen
+
+
+class TestTheClipLaneIsBounded:
+    """⚠️THE CLIP MARGIN IS THE SCHEDULE MARGIN. Runs already take 218-307 s of the 900 s
+    interval, and `concurrencyPolicy: Forbid` with no deadline means one overrun silently SKIPS
+    the next tick -- a 15-minute schedule quietly becomes a 30-minute one. The clip lane is what
+    spends that margin, so the bound goes in WITH it and not after."""
+
+    def test_the_drain_job_cannot_overrun_its_own_schedule(self):
+        with open(MANIFEST) as fh:
+            text = fh.read()
+        m = re.search(r"activeDeadlineSeconds:\s*(\d+)", text)
+        assert m, ("hear-drain has no activeDeadlineSeconds. With Forbid and no deadline, one "
+                   "overrunning run skips the next tick and nothing reports it")
+        assert int(m.group(1)) < 900, (
+            "activeDeadlineSeconds %s is not shorter than the 900 s schedule, so it cannot stop "
+            "a run from eating the next tick" % m.group(1))
+
+    def test_the_clip_cap_is_declared_rather_than_defaulted(self, blocks):
+        # The cap and the node's CLIP_BUDGET_B are one number in two places; a manifest that
+        # leaves it implicit lets them drift without any diff to see.
+        assert "--clip-max-per-node" in blocks["drain"], blocks["drain"]
+        assert "--clip-deadline-s" in blocks["drain"], blocks["drain"]
+
+    def test_the_gate_fails_on_a_binding_cap(self, blocks):
+        assert "--max-clips-deferred" in blocks["check"], (
+            "deferral by cap is a design invariant, so the gate has to see it; without this flag "
+            "the cap can bind every run while the check stays green")

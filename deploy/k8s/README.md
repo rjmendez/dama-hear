@@ -1,4 +1,4 @@
-# hear-drain / hear-score — pooled sketch ingestion and scoring
+# hear-drain / hear-score / hear-tag — pooled sketch ingestion, scoring and clip tagging
 
 Runs in k3s (`namespace: dama`), **not** on a workstation: the pool has to keep being fed while
 nobody is logged in, and a laptop is not that.
@@ -18,6 +18,13 @@ python3 deploy/k8s/gen_configmap.py hear-score-code > deploy/k8s/hear-score-code
 kubectl -n dama get configmap hear-score-code -o yaml     # NotFound on a first apply
 kubectl apply -f deploy/k8s/hear-score-code.yaml -f deploy/k8s/hear-score.yaml
 kubectl -n dama create job --from=cronjob/hear-score hear-score-manual-1   # then watch it
+
+# hear-tag  ⚠️SHIPS SUSPENDED. Do NOT unsuspend before the Phase-3 gate in
+#           docs/acoustic-stack.md §0.4 -- >=300 stored clips over >=3 days, >=30 of them
+#           LISTENED TO by a human and written up in docs/clip-calibration-<date>.md, and
+#           --max-silence-frac set from that measured distribution.
+python3 deploy/k8s/gen_configmap.py hear-tag-code > deploy/k8s/hear-tag-code.yaml
+kubectl apply -f deploy/k8s/hear-tag-code.yaml -f deploy/k8s/hear-tag.yaml
 ```
 
 | object | what |
@@ -27,9 +34,15 @@ kubectl -n dama create job --from=cronjob/hear-score hear-score-manual-1   # the
 | `hear-drain-check` CronJob | hourly: fails if a sensor's last SUCCESS is stale |
 | `hear-score` CronJob | 4x/hour: score every unscored pooled sketch, count every refusal |
 | `hear-score-check` CronJob | hourly: fails if scoring is not flowing |
+| `hear-tag` CronJob | **suspended.** 2x/hour: YAMNet over the collected clips, counting every refusal by reason. Touches the PVC and never a node — the ESP32 serves one client at a time |
+| `hear-tag-check` CronJob | **suspended.** hourly: fails if tagging is not flowing, or if the pinned model sha256 stopped verifying |
 
-The PVC is declared **once**, in `hear-drain.yaml`. `hear-score.yaml` mounts it and declares no
-storage of its own — two manifests claiming one PVC is how they come to disagree about its size.
+The PVC is declared **once**, in `hear-drain.yaml`. `hear-score.yaml` and `hear-tag.yaml` mount
+it and declare no storage of their own — two manifests claiming one PVC is how they come to
+disagree about its size. The tag lane installs into `/pool/pylib-tag`, a **separate** target dir
+from the drain's `/pool/pylib`, so a tagger dependency cannot break the collector that feeds it;
+the 16 MB YAMNet weights live at `/pool/models/yamnet` and are verified against a sha256 pinned
+in `tools/hear_tag.py` before anything is tagged.
 
 ## hear-score — the consumer that was missing
 
