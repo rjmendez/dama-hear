@@ -343,6 +343,69 @@ def _ls_sizes(ip: str, timeout: float = DEFAULT_TIMEOUT_S,
     return _ls_parse(_get(url, timeout).decode("utf-8", "replace"))
 
 
+# ⚠️A RESET IS NOT A MISSING ENDPOINT. `/ls` failing sends `scene_names()` to its blind fallback,
+# which asks for the LEGACY names -- and on current firmware that means re-tailing a frozen
+# scene.csv and ingesting nothing while the dated file the node is actually writing goes
+# uncollected for that run. The fallback is right for firmware too old to have the endpoint and
+# wrong for a node that simply dropped one connection, and before this the drain could not tell
+# the two apart.
+#
+# MEASURED 2026-09-09 on nyquist: `/ls` answers in 35-118 ms when the node is idle, degrades to
+# 7.3 s while a large `/sd` transfer is in flight, and is REFUSED outright when a second client
+# is mid-request -- the ESP32 core serves one client at a time and resets the rest rather than
+# queueing them. nyquist was the only node with a second poller (a watch.py on the workstation,
+# every 30 s) and the only node whose `/ls` failed: 2 of 4 runs, each costing it its scene lane.
+#
+# So a transport failure is RETRIED. An HTTP status is not: a 404 is the node answering, and
+# answering "no such endpoint" is exactly the old firmware this fallback exists for.
+LS_RETRIES = 3
+LS_RETRY_BACKOFF_S = 1.5
+
+
+def ls_sizes_retrying(ip: str, timeout: float = DEFAULT_TIMEOUT_S, retries: int = LS_RETRIES,
+                      backoff: float = LS_RETRY_BACKOFF_S,
+                      sleep=None, dir: Optional[str] = None
+                      ) -> Tuple[Optional[LsListing], Optional[str], int]:
+    """(sizes, error repr, attempts). None sizes means every attempt failed.
+
+    ⚠️`sleep` RESOLVES AT CALL TIME, NOT AT DEF TIME. A `sleep=time.sleep` default binds the
+    function object when the module is imported, so patching `time.sleep` afterwards does nothing
+    -- which made two of this module's own tests sleep for real while appearing to be patched.
+
+    ⚠️THE LsListing IS RETURNED WHOLE, NOT REBUILT AS A PLAIN DICT. `truncated_at` rides on the
+    object; a retry that copied it into a dict would drop the node's own admission that its
+    census was capped, turning a partial listing back into one indistinguishable from a
+    complete one -- the exact distinction _ls_sizes exists to preserve.
+
+    ⚠️THE ATTEMPT COUNT IS RETURNED SO THE RUN RECORD CAN SAY A RETRY HAPPENED. A retry that
+    silently succeeds turns a node with a real contention problem into a node that looks healthy,
+    and the contention is worth seeing before it becomes a failure.
+    """
+    if sleep is None:
+        sleep = time.sleep
+    last = None
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            # `dir` is only passed when asked for, so a caller or a stub with the original
+            # two-argument signature keeps working unchanged.
+            got = _ls_sizes(ip, timeout) if dir is None else _ls_sizes(ip, timeout, dir=dir)
+            return got, None, attempt
+        except urllib.error.HTTPError as e:
+            # The node answered. 404 is old firmware without the endpoint; do not hammer it.
+            return None, repr(e), attempt
+        except (TypeError, AttributeError, NameError):
+            # ⚠️A PROGRAMMING ERROR IS NOT A TRANSPORT FAULT AND MUST NOT BE RETRIED. A bare
+            # `except Exception` here swallowed a signature mismatch as a dropped connection,
+            # retried it three times with real backoff, and then reported the node unreachable --
+            # so a bug in this process read exactly like a node refusing to answer. Raise it.
+            raise
+        except Exception as e:
+            last = repr(e)
+            if attempt < retries:
+                sleep(backoff * attempt)
+    return None, last, max(1, retries)
+
+
 # ---------------------------------------------------------------- byte watermark
 
 def watermark_path(root: str) -> str:
@@ -1000,12 +1063,13 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
     # enough to lack the endpoint would otherwise be marked permanently failed -- and then STALE
     # -- while its data flowed normally. It is recorded in its own field so `ok` keeps meaning
     # "the data moved" and the blind spot is still visible.
-    sizes: Optional[Dict[str, int]] = None
-    try:
-        sizes = _ls_sizes(ip, timeout)
-    except Exception as e:
-        out["ls_error"] = repr(e)
+    sizes, ls_err, ls_attempts = ls_sizes_retrying(ip, timeout)
+    if ls_err:
+        out["ls_error"] = ls_err
     out["ls_ok"] = sizes is not None
+    out["ls_attempts"] = ls_attempts
+    if sizes is not None and ls_attempts > 1:
+        out["ls_retried"] = ls_attempts
     # ⚠️A CAPPED LISTING IS A PARTIAL CENSUS, NOT A SHORT CARD. The handler stops at
     # LS_MAX_ENTRIES and says so; carrying the number here is what keeps "the card holds this"
     # apart from "this is as far as /ls counted".
@@ -1632,8 +1696,15 @@ def main(argv=None) -> int:
                       "card; scene files and clip names past that point were not seen"
                       % r["ls_truncated_at"])
             if r.get("ls_error"):
-                print("    /ls failed (%s) -- reach-back UNMEASURED this run, not clean"
-                      % r["ls_error"])
+                print("    /ls failed after %d attempt(s) (%s) -- reach-back UNMEASURED this "
+                      "run, not clean" % (r.get("ls_attempts", 1), r["ls_error"]))
+            elif r.get("ls_retried"):
+                # Succeeded, but not first time. Contention worth seeing before it becomes loss.
+                # ⚠️STATES THE MEASUREMENT, NOT THE CAUSE. Concurrent-client refusal is the
+                # mechanism seen on nyquist, but any transport fault retries the same way and a
+                # log line must not name a cause it did not establish.
+                print("    /ls needed %d attempts -- the node did not answer first time"
+                      % r["ls_retried"])
             elif r.get("unfetched_unknown"):
                 print("    reach-back UNMEASURED this run, not clean: %s"
                       % r.get("unfetched_reason"))
