@@ -130,7 +130,14 @@ static void node_identity() {
 // 32 kHz natively. Acquiring at FS_ACQ and decimating by DECIM gives the classifiers full band
 // while the scene corpus, the sketch wire format and its fs code keep the exact axis 228k stored
 // rows were measured on -- which a bare rate change would have silently split in two.
-#define DECIM      2
+// ⚠️48 kHz IS THE CEILING THIS MICROPHONE ALLOWS, not a preference. Standard Performance Mode
+// tops out at a 4.0 MHz clock (MSM261D3526H1CPM datasheet V1.2) and the ESP32 drives PDM at
+// fs * 64 in I2S_PDM_DSR_8S, so fs <= 62.5 kHz. Of the rates below that, only /2 and /3 reach the
+// mel banks' 16 kHz by an INTEGER -- 64 kHz would be a clean /4 and needs 4.096 MHz, which the
+// mic does not support. Note the fleet's CURRENT 16 kHz clocks the mic at 1.024 MHz, which is
+// BELOW that mode's 1.1 MHz floor and above Low-Power's 900 kHz ceiling: an unspecified gap it
+// happens to work in. 48 kHz is the first rate that is squarely inside a documented mode.
+#define DECIM      3
 #define FS_ACQ     (FS_NOMINAL * DECIM)   // microphone / praw / clips
 #define ABLOCK     (BLOCK * DECIM)        // one I2S read -> exactly one decimated frame
 

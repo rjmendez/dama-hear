@@ -26,9 +26,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 HDR = ROOT / "firmware" / "night_node" / "decim.h"
 GEN = ROOT / "firmware" / "gen_decim.py"
 
-#: The band the scene mel bank actually uses; everything above 2*fs_d/2 - TOP folds into it.
+#: The band the scene mel bank actually uses.
 TOP_HZ = 7812.5
-FS_ACQ = 32000.0
+FS_ACQ = 48000.0
+FS_DEC = 16000.0
 
 
 def _defines():
@@ -71,21 +72,29 @@ def test_the_group_delay_is_a_whole_number_of_acquisition_samples():
     d, _t = _defines()
     assert d["DECIM_DELAY"] == (d["DECIM_TAPS"] - 1) // 2
     assert (d["DECIM_TAPS"] - 1) % 2 == 0, "an even-length FIR has a half-sample delay"
+    # It need NOT be a multiple of DECIM: acq_of() subtracts it in the acquisition domain.
 
 
 def test_nothing_above_the_fold_lands_in_the_used_band():
     """The whole reason the filter is 257 taps and not a cheap halfband.
 
-    A 33-tap halfband was measured at -7.7 dB here. -40 dB is the floor this asserts, which is
-    well below the -64.0 dB the shipped taps achieve and well above the -39.0 dB a normalisation
-    bug in the generator once produced.
+    ⚠️THE THRESHOLD IS TUNED TO THE SHIPPED FILTER, NOT TO ONE HISTORICAL BUG. It was first set
+    at -40 dB, which sat neatly between the -39.0 dB a normalisation bug produced at /2 and the
+    -64.0 dB the good design achieved. Retargeting to /3 moved that bug to -46.3 dB and the guard
+    went silently blind to it -- a threshold picked against one failure stops testing when the
+    configuration moves. -55 dB is below the -63.4 dB the shipped taps measure with headroom for
+    honest design variation, and above every degraded variant seen so far.
     """
     d, taps = _defines()
     w, a = _response(taps, d["DECIM_SHIFT"])
     db = lambda f: 20 * np.log10(np.interp(f, w, a) + 1e-12)          # noqa: E731
-    fs_d = FS_ACQ / d["DECIM"] if "DECIM" in d else 16000.0
-    worst = max(db(fs_d - f) for f in np.linspace(62.5, TOP_HZ, 400))
-    assert worst < -40.0, "worst fold into 62.5-%.1f Hz is %+.1f dB" % (TOP_HZ, worst)
+    # ⚠️/3 FOLDS MORE THAN ONE IMAGE. Checking only (fs_d - f) was right for /2 and would miss the
+    # k=2 image entirely at /3 -- a guard that passes because it looked in one place.
+    decim = int(round(FS_ACQ / FS_DEC))
+    grid = np.linspace(62.5, TOP_HZ, 400)
+    worst = max(max(db(k * FS_DEC - f), db(k * FS_DEC + f))
+                for f in grid for k in range(1, decim) if k * FS_DEC + f <= FS_ACQ / 2)
+    assert worst < -55.0, "worst fold into 62.5-%.1f Hz is %+.1f dB" % (TOP_HZ, worst)
 
 
 def test_the_passband_is_flat_enough_not_to_tilt_the_corpus():
