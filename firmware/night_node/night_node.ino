@@ -26,6 +26,7 @@
 #include <Wire.h>
 #include <Update.h>
 #include "esp_ota_ops.h"
+#include "esp_task_wdt.h"
 #include "mel16.h"
 #include "mel_scene.h"
 #include "esp_heap_caps.h"
@@ -1136,6 +1137,23 @@ static void boot_guard() {
     }
   }
 }
+
+// ⚠️A HANG IN setup() DEFEATS THE FAILBACK ABOVE COMPLETELY, and that is not theoretical: rankine
+// was lost to it on 2026-09-10 after a 48 kHz PDM flash. boot_guard() counts RESETS and
+// mark_healthy_once() runs in loop(), so a setup() that never returns produces neither -- no reset,
+// no counter, no revert, and http.handleClient() never runs either, so the web server is begun but
+// deaf. The node sits powered, awake and unreachable until someone walks to it.
+//
+// The watchdog turns a hang into a reset, which the failback already knows how to handle. It is
+// armed only around the calls that touch hardware and can block, because the WiFi join above
+// deliberately spends up to 12 s and must not be killed for it.
+static void boot_wdt_arm(uint32_t ms) {
+  esp_task_wdt_config_t c = { .timeout_ms = ms, .idle_core_mask = 0, .trigger_panic = true };
+  // Arduino may already have initialised the TWDT; reconfigure then, init if not.
+  if (esp_task_wdt_reconfigure(&c) != ESP_OK) esp_task_wdt_init(&c);
+  esp_task_wdt_add(NULL);
+}
+static void boot_wdt_disarm() { esp_task_wdt_delete(NULL); }
 
 static void mark_healthy_once() {
   // An image that runs happily but never joins WiFi cannot be recovered over the air and will
@@ -2381,32 +2399,6 @@ void setup() {
   }
   logf("gate  floor %.0f (%s), min %.0f max %.0f\n", g_floor, g_floor_src, FLOOR_MIN, FLOOR_MAX);
 
-  i2s.setPinsPdmRx(PDM_CLK, PDM_DIN);
-  if (!i2s.begin(I2S_MODE_PDM_RX, FS_NOMINAL, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO))
-    logln("i2s   FAILED");
-  else logf("i2s   PDM %d Hz on CLK=%d DIN=%d\n", FS_NOMINAL, PDM_CLK, PDM_DIN);
-
-  // Raw ring. Ask for 240 s (7.68 MB of the 8.34 MB free) and step down rather than fail: what
-  // matters is largest CONTIGUOUS free block, which total-free does not report. Log the span that
-  // was actually obtained -- a silent failure here would look identical to a quiet night, which is
-  // the failure class env_e_max_win already exists to rule out.
-  {
-    static const uint32_t want_s[] = {240, 180, 120, 60, 30};
-    for (unsigned k = 0; k < sizeof(want_s) / sizeof(want_s[0]) && !praw; k++) {
-      size_t want = (size_t)want_s[k] * FS_NOMINAL * sizeof(int16_t);
-      // Leave 256 kB of PSRAM behind: WiFi buffers and the web server allocate from it too, and a
-      // ring that takes the last byte would trade audio for a node that cannot be reached.
-      if (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) < want + 262144) continue;
-      praw = (int16_t *)ps_malloc(want);
-      if (praw) { praw_cap = want_s[k] * FS_NOMINAL; praw_want_s = want_s[k]; }
-    }
-    if (praw)
-      logf("praw  raw ring %lu s = %lu kB PSRAM, %lu kB PSRAM still free\n",
-           (unsigned long)praw_want_s, (unsigned long)(praw_cap * 2UL / 1024UL),
-           (unsigned long)(ESP.getFreePsram() / 1024UL));
-    else
-      logln("praw  NO PSRAM ring -- /audio is disabled; capture, gate and logging are unaffected");
-  }
 
   http.on("/", h_root); http.on("/status", h_status); http.on("/detections", h_dets);
   http.on("/update", HTTP_POST,
@@ -3020,6 +3012,44 @@ void setup() {
   fft_init();
   http.begin();
   logln("http  up\n");
+
+  // ⚠️AUDIO COMES UP LAST, AFTER THE RECOVERY CHANNEL. i2s.begin() and the PSRAM ring are the two
+  // calls in setup() that touch hardware and can block, and until this point nothing that can
+  // hang has run. Bringing them up before the server meant a node that failed here was never
+  // reachable at all -- rankine, 2026-09-10.
+  //
+  // ⚠️AND THEY RUN UNDER A WATCHDOG, because ordering alone does not save a HANG: handleClient()
+  // is called from loop(), so a setup() that never returns leaves the server begun but deaf, and
+  // boot_guard() counts resets that never happen. 15 s is far longer than either call has ever
+  // taken and far shorter than a night.
+  boot_wdt_arm(15000);
+  i2s.setPinsPdmRx(PDM_CLK, PDM_DIN);
+  if (!i2s.begin(I2S_MODE_PDM_RX, FS_NOMINAL, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO))
+    logln("i2s   FAILED");
+  else logf("i2s   PDM %d Hz on CLK=%d DIN=%d\n", FS_NOMINAL, PDM_CLK, PDM_DIN);
+
+  // Raw ring. Ask for 240 s (7.68 MB of the 8.34 MB free) and step down rather than fail: what
+  // matters is largest CONTIGUOUS free block, which total-free does not report. Log the span that
+  // was actually obtained -- a silent failure here would look identical to a quiet night, which is
+  // the failure class env_e_max_win already exists to rule out.
+  {
+    static const uint32_t want_s[] = {240, 180, 120, 60, 30};
+    for (unsigned k = 0; k < sizeof(want_s) / sizeof(want_s[0]) && !praw; k++) {
+      size_t want = (size_t)want_s[k] * FS_NOMINAL * sizeof(int16_t);
+      // Leave 256 kB of PSRAM behind: WiFi buffers and the web server allocate from it too, and a
+      // ring that takes the last byte would trade audio for a node that cannot be reached.
+      if (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) < want + 262144) continue;
+      praw = (int16_t *)ps_malloc(want);
+      if (praw) { praw_cap = want_s[k] * FS_NOMINAL; praw_want_s = want_s[k]; }
+    }
+    if (praw)
+      logf("praw  raw ring %lu s = %lu kB PSRAM, %lu kB PSRAM still free\n",
+           (unsigned long)praw_want_s, (unsigned long)(praw_cap * 2UL / 1024UL),
+           (unsigned long)(ESP.getFreePsram() / 1024UL));
+    else
+      logln("praw  NO PSRAM ring -- /audio is disabled; capture, gate and logging are unaffected");
+  }
+  boot_wdt_disarm();
 }
 
 // ---------------------------------------------------------------- detections -> card
