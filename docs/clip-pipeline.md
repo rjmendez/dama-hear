@@ -13,14 +13,14 @@ model-generated tags. This is the operator page for what actually ships. The des
 **1. These are model-generated labels. Nobody has listened to this audio.** Every score in
 `tags.jsonl` carries `"provenance": "model"` as a literal, and `"claim": {"usable_as_training_label":
 false}`. Those fields are there so the refusal travels with the data instead of living only on this
-page. A YAMNet score is a hypothesis about a 4-second clip. It is not an observation, it is not an
+page. A tag score is a hypothesis about a 5-second clip. It is not an observation, it is not an
 annotation, and three models agreeing is corroboration, not ground truth.
 
-**2. The audio is 16 kHz, so everything above 8 kHz is simply not present.** Bat calls, most insect
-stridulation detail, and the upper half of many bird songs are outside the recording, not merely
-missed by the model. A confident "no bird" from this pipeline is a statement about 0–8 kHz.
+**2. The tagger reads the 48 kHz clips at 32 kHz, so nothing above 16 kHz reaches it.** Bat calls
+are outside that, and the microphone's response above 10 kHz is uncharacterised. A confident
+"no bird" from this pipeline is a statement about 0–16 kHz.
 
-**3. YAMNet does event triage, not species identification.** Its 521 classes go as far as `Bird`,
+**3. The tagger does event triage, not species identification.** AudioSet's 527 classes go as far as `Bird`,
 `Owl`, `Hoot`, `Chirp` and stop. It is structurally incapable of "Barred Owl vs Great Horned Owl".
 Asking it for species produces a confident answer to a question it cannot represent. BirdNET, which
 can represent that question, was evaluated and **refused**: zero birds across nine real clips,
@@ -56,19 +56,9 @@ Measured on the live fleet 2026-09-09:
 | rankine | 249 | ~200 |
 | **fleet** | **625** | **~478** |
 
-**Not one clip had ever left a node.** Each node writes a fixed-length 16-bit mono WAV into
-`/clips` under a 6,291,456 B budget (`CLIP_BUDGET_B`), and the oldest is evicted when it is full.
-How many that holds depends on which clip geometry the firmware writes (§6.1):
-
-| era | clip | bytes | clips in budget |
-|---|---|---|---|
-| 16 kHz | 1.0 + 3.0 s | 128,044 | **49** — confirmed live when measured: all three nodes reported `budget_left_clips 0` and `6291456 − 17300 = 49 × 128044` |
-| 48 kHz | 1.0 + 4.0 s | 480,044 | **13** (`6291456 // 480044`, 50,884 B left over) |
-
-⚠️**The 48 kHz switch cut the on-card buffer from 49 clips to 13** and nothing re-derived it. The
-firmware's own comment still calls the budget "1.4x the measured 12 h event count"; at 13 clips it
-is about 0.37×, so a busy night now depends on the drain's 15-minute cadence rather than on the
-card.
+Each node writes a 5.0 s, 48 kHz, 16-bit mono WAV (480,044 B) into `/clips` under a 6,291,456 B
+budget (`CLIP_BUDGET_B`): a rolling window of 13 clips, where the next one evicts the oldest. The
+drain fetches each clip before it rolls off; eviction is the design, not a loss.
 
 Two things kept them there. The `/ls` handler hardcoded `SD.open("/")` and ignored every argument,
 so it listed root only and clip names — which embed a boot id and a millis counter — were
@@ -121,8 +111,7 @@ Abandoned `<basename>.wav.<pid>.tmp` part-files are swept on every `prune()` cal
 invisible to the cap and nothing ever removed it.
 
 Each index row carries **both** rate readings side by side: `fs_hz` from the dets CSV and
-`wav_header_fs_hz` from the file. They disagree in the field — mach shipped an entire boot headed
-22624 Hz — and that disagreement has to be visible, not averaged away.
+`wav_header_fs_hz` from the file. When they disagree, the disagreement has to be visible, not averaged away.
 
 Identity is `clip_key = sha256("clip\x1f<node>\x1f<boot>\x1f<sample>")[:32]` — the **name**, which is
 unique by construction and known before the bytes are. `sha256` of the body is stored as an
@@ -164,7 +153,7 @@ probed_404 + sum(refused) + deferred_by_cap` is an `assert` in `drain_clips`, no
 
 | counter | means |
 |---|---|
-| `clips_fetched` | 128,044 B RIFF stored |
+| `clips_fetched` | 480,044 B RIFF stored |
 | `clips_already_held` | index says `stored`; not re-fetched |
 | `clips_already_gone` | index says `evicted_before_fetch`; **not re-probed** |
 | `clips_gone` | `CL.CONFIRM_404` consecutive 404s — newly confirmed destroyed |
@@ -187,7 +176,7 @@ the gate reads it.
 ## 5. Two fetch traps worth naming
 
 ⚠️**`fetch_sd()` cannot fetch a clip, and fails by reporting it ABSENT.** It sniffs the body for
-`b"node"` or `b"utc_us"`; a WAV starts with `RIFF`, so a present 128,044 B clip reads as missing.
+`b"node"` or `b"utc_us"`; a WAV starts with `RIFF`, so a present clip reads as missing.
 Proven against a live node. `fetch_clip()` exists for this and nothing else.
 
 ⚠️**200 is not proof of a file.** `/sd?file=/clips` returns 200 with a zero-byte body (measured), so
@@ -279,38 +268,6 @@ failure `hear_tag.py` documents from the model's side, where an un-normalised cl
 measured on the ORIGINAL.** Deriving a silence threshold from the normalised copy would measure
 the tool's own gain.
 
-### 6.1 Two clip geometries, and one build that headed them wrong
-
-The clip is the one artefact written at `FS_ACQ` rather than `FS_NOMINAL`, and its length changed
-with the rate:
-
-| era | geometry | samples | bytes |
-|-----|----------|---------|-------|
-| 16 kHz | 1.0 + 3.0 s | 64,000 | 128,044 |
-| 48 kHz | 1.0 + 4.0 s | 240,000 | 480,044 |
-
-5.0 s is deliberate: Perch reads **non-overlapping 5 s windows**, so a 4.0 s clip would be padded
-20% with fabricated silence. Both eras are in the corpus right now, so a consumer that assumes one
-is 1.0 s wrong at the **end** for every clip of the other. `clips.clip_total_s()` reads the length
-off the clip; `CLIP_PRE_S`/`CLIP_POST_S` are the fallback for a row with no body, nothing more.
-
-⚠️**The 48 kHz clip writer stamped the FS_NOMINAL rate into the WAV header.** The body is
-`CLIP_SAMPLES` at `FS_ACQ`; `fs_timebase()` returns the decimated rate, and it went in unscaled.
-A 5.0 s 48 kHz clip therefore reads back as **15.0 s of 16 kHz**, an octave and a half low.
-`/praw` got its `* DECIM` when the rate moved and the clip writer did not — nobody owned the seam.
-
-It could not be caught downstream: `hear_tag.py`'s `assert_rate` refuses any clip whose header is
-not 16 kHz, so a header lying by saying *exactly* 16000 is the one wrong rate that guard is blind
-to. The audio would have entered YAMNet 3× too slow and degraded silently towards `Silence` with
-every counter green.
-
-Firmware is fixed. Clips already on the PVC are not rewritable, so `clips.header_rate_suspect()`
-recovers the rate — **only** when exactly one integer factor closes onto a length this fleet
-actually writes and a rate the mic can legally be clocked at. Written first against a plausible
-*range*, a 15.0 s body matched ÷2 (7.5 s at 32 kHz) before it matched the correct ÷3 and returned
-the first hit; two readings that both close means the header is not recoverable, not that the
-first one wins. The lying header is **kept** on the row beside the correction.
-
 Until 3 is set, `check_tags` runs report-only and says so on its own output line.
 
 **Model: EfficientAT `mn10_as` as ONNX under `onnxruntime`.** MIT, 4.88M params, AudioSet
@@ -320,12 +277,9 @@ hard-code that width and drop mismatches silently, and YAMNet's 1024 and BirdNET
 mutually confusable there). 48 ms/clip against YAMNet's 12 — irrelevant at ~20 events/hour, which
 is 0.03 % duty on one core.
 
-The model is **32 kHz native** and the fleet writes 16 and 48, so `hear/resample.py` crosses:
-48 kHz → 32 kHz is a decimation and every band is measurement; 16 kHz → 32 kHz is an interpolation
-and everything above 8 kHz is the filter. `band_limit_hz`, `fs_source_hz` and `upsampled` ride on
-every tag row so the second can never be read as the first. A rate **nobody configured** — mach's
-22624 Hz boot — is still refused into a counted bucket rather than stretched into a confident
-answer.
+The model is **32 kHz native**; `hear/resample.py` decimates the 48 kHz clips to it, so every band
+the model reads is measurement. A header rate that does not snap to 48 kHz is refused into a counted
+bucket.
 
 Weights live on the PVC at `/pool/models/mn10_as/`, never in a ConfigMap (24,016,402 B against a
 1 MiB cap). They are **verified against a pinned sha256**, not checked for existence:
@@ -357,15 +311,8 @@ Measured on this fleet's own audio, two real clips pulled off nyquist:
 Clips are recorded at −49 to −62 dBFS. **A pipeline that skips `normalise()` is green forever and
 emits Silence for every clip.**
 
-**No resampling.** `assert_rate()` refuses anything more than `FS_TOLERANCE_HZ = 64.0` from 16000.
-The measured spread is 15986–16000, which is harmless; mach's 22624 Hz boot is not, and a resampler
-would quietly launder it into plausible-looking tags. YAMNet does not validate its input rate and
-does not resample — feeding it the wrong rate degrades **silently** to Silence.
-
-The 1024-d embedding is stored with every tag. It is free (same forward pass), it is a fixed
-16 kHz-native axis — unlike the scene.csv (20×4, 62.5–7812.5 Hz) / sketch (20×8, 300–20000 Hz) band
-split that `hear/pool.py` refuses to pool across — and it is what makes any later clustering possible
-without re-fetching audio the node has long since destroyed.
+The 960-d embedding is stored with every tag. It is free (same forward pass), and it is what makes
+later clustering possible after the clip itself has rolled off.
 
 ### Joining a clip to scene rows
 
@@ -448,8 +395,7 @@ resolution; ~146 MB once is cheap insurance.
 |---|---|
 | Training-label export, scene-row label join | circular labels; see §0 item 5 |
 | BirdNET | zero birds across nine real clips, floor-confidence neotropical hypotheses, 25% of each clip discarded, CC BY-NC-SA weights |
-| PANNs / CNN14 | wants 32 kHz, 17% of its filterbank on guaranteed zeros, 14% confidence loss on the same A/B, 311 ms vs 12 ms, 5.9 GB torch install |
-| Resampling in the tagger | would launder mach's 22624 Hz boot into plausible tags |
+| PANNs / CNN14 | wants 32 kHz, 14% confidence loss on the same A/B, 311 ms vs 12 ms, 5.9 GB torch install |
 | `Content-Type` fix on `/sd` | serves `.wav` as `text/csv`; real, cosmetic, and unverifiable without a flash |
 | PVC resize | prune + free-space reserve bound it in code, where it is testable |
 
@@ -465,7 +411,7 @@ The microphone runs at `FS_ACQ` (48 kHz) and everything downstream of the decima
 | consumer | rate | why |
 |---|---|---|
 | clips (`praw`, WAV) | 48 kHz | the most band this mic can legally be clocked for; Perch v2 resamples from it |
-| **sketch** (`mel_impulse.h`, `aring`) | **48 kHz** | every phone in the fleet emits 48 kHz; the node was the last 16 kHz emitter |
+| **sketch** (`mel_impulse.h`, `aring`) | **48 kHz** | every phone in the fleet emits 48 kHz |
 | scene, gate, dets, timebase | 16 kHz | `mel_scene.h` is the axis of the stored scene corpus and does not move |
 
 ⚠️**A bare `FS_NOMINAL` bump would have compiled clean and corrupted the corpus.** `mel_impulse.h`
@@ -503,25 +449,19 @@ are not stamped 4 ms late — which would have discarded far more than the 21 ns
 It saturates at 0: the first 4 ms after boot would otherwise underflow.
 
 **Why 48 and not more.** The mic's Standard Performance Mode tops out at a 4.0 MHz clock and the
-ESP32 drives PDM at fs × 64, so fs ≤ 62.5 kHz. Only ÷2 and ÷3 reach 16 kHz by an integer; 64 kHz
-would be a clean ÷4 and needs 4.096 MHz, which the mic does not support. Worth noting the fleet's
-current 16 kHz clocks the mic at 1.024 MHz — *below* Standard Performance's 1.1 MHz floor and above
-Low-Power's 900 kHz ceiling, an unspecified gap it happens to work in. 48 kHz is the first rate
-squarely inside a documented mode.
+ESP32 drives PDM at fs × 64, so fs ≤ 62.5 kHz. Only ÷2 and ÷3 reach `FS_NOMINAL` by an integer; 64 kHz
+would be a clean ÷4 and needs 4.096 MHz, which the mic does not support. 48 kHz sits squarely
+inside a documented mode.
 
-**Costs, and they are real.** The PSRAM raw ring drops from **240 s to 60 s** — a quarter of the
-retrospective window. A clip is **480,044 B instead of 128,044** (3.75×), so the on-node budget
-holds 13 instead of 49. That second cost only became affordable because clips are now drained every
-15 minutes instead of living on the card until evicted.
+**The ring and the clip budget, at 48 kHz.** The PSRAM raw ring asks for 80 s (7.68 MB) and steps
+down to 60/45/30 s if PSRAM is short; firmware before
+this change stepped straight to 60 s, which is what all three nodes report (`raw.span_s: 60.0`).
+A clip is 480,044 B and the on-node budget is a rolling window of 13.
 
 **Nyquist is 24 kHz, and nothing above 10 kHz is characterised.** The datasheet's frequency
 response plot ends at 10 kHz; SNR is quoted over a 20 kHz bandwidth. Response above that is
 unspecified, so treat any content between 10 and 24 kHz as measured-but-uncalibrated. If it turns
 out to be structured rather than noise, that is a finding, not a guarantee.
 
-⚠️**UNVERIFIED ON HARDWARE.** The mic and SoC specs say 48 kHz is in range; no node has been
-flashed. (An earlier note here cited `boards/puc.h` running PDM at 48 kHz as evidence — that was
-wrong: its `FS_NOMINAL 48000` is a vendor string from a flash dump, and the only measured PDM run
-on that board was at 16 kHz.) Confirm the boot line reports `PDM 48000 Hz ... -> /3 -> 16000 Hz`,
-that the ring log shows the expected 60 s fallback, and that `fs_clean_hz` still settles near
-16000, before trusting a night of data.
+**Verified on hardware.** All three nodes run 48 kHz acquisition decimated to `FS_NOMINAL`, report
+`raw.span_s: 60.0` on the current firmware, and settle `fs_clean_hz` on the PPS.

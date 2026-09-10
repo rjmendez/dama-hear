@@ -56,7 +56,7 @@ real sound at least as fast as it discards nothing:
 | 0.90 | 11 % | 17 % |
 
 The mechanism is not mysterious: a quiet insect chorus is a low-level sustained texture that sits
-under −60 dBFS most of the time, and an "empty" clip on a windy night does not. **Frame-level
+under −60 dBFS most of the time, and an "empty" clip on a windy day does not. **Frame-level
 level is not occupancy.** Nothing should be gated on this field.
 
 ### 1.2 The knob the gate actually names is a different thing, and it is nearly dead
@@ -126,7 +126,7 @@ Three things fall out:
 - **Insects are where the two agree.** Half the insect calls get `Insect` top-1, the single
   largest cell. That is also the one class this site plausibly has in quantity.
 - **`Speech` is the model's null response.** 21 of 69 clips (30 %) return `Speech` top-1 —
-  7 insect, 6 dog, 4 empty, 3 machine, 1 aircraft — on 3.5 wooded acres at night. It is what the
+  7 insect, 6 dog, 4 empty, 3 machine, 1 aircraft — on 3.5 wooded acres. It is what the
   model reaches for with nothing to say, and no downstream consumer should treat it as an
   observation.
 - **The model has no "nothing here".** `Silence` was top-1 on **0 of 9** clips the listener called

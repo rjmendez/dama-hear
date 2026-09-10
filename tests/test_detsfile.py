@@ -103,7 +103,7 @@ class TestG5:
 
 
 class TestRefusals:
-    def test_an_empty_file_is_an_error_not_a_quiet_night(self):
+    def test_an_empty_file_is_an_error_not_a_quiet_period(self):
         with pytest.raises(ValueError, match="empty"):
             DF.read_text("")
 

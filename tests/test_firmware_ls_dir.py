@@ -138,17 +138,17 @@ class TestTheListingParsesThroughTheDrainsOwnParser:
     def test_the_listing_parses_through_the_drains_own_parser(self):
         got = D._ls_parse(GOLDEN.read_text())
         assert got == {
-            "clips/nyquist-db21acd5-1016781646.wav": 128044,
-            "clips/nyquist-db21acd5-1016849331.wav": 128044,
-            "clips/nyquist-db21acd5-1082421378.wav": 128044,
-            "clips/nyquist-db21acd5-1082530195.wav": 128044,
-            "clips/07-nyquist-4f0c9b12-0000149504.wav": 128044,
-            "clips/23-nyquist-4f0c9b12-0000216064.wav": 128044,
+            "clips/nyquist-db21acd5-1016781646.wav": 480044,
+            "clips/nyquist-db21acd5-1016849331.wav": 480044,
+            "clips/nyquist-db21acd5-1082421378.wav": 480044,
+            "clips/nyquist-db21acd5-1082530195.wav": 480044,
+            "clips/07-nyquist-4f0c9b12-0000149504.wav": 480044,
+            "clips/23-nyquist-4f0c9b12-0000216064.wav": 480044,
         }
 
     def test_every_golden_name_is_the_measured_clip_size(self):
         got = D._ls_parse(GOLDEN.read_text())
-        assert set(got.values()) == {D.CL.CLIP_BYTES_16K_4S}
+        assert set(got.values()) == {44 + int(D.CL.CLIP_TOTAL_S * 48000) * 2}
 
     def test_a_truncation_marker_is_carried_not_dropped(self):
         # ⚠️THE REGRESSION THIS EXISTS FOR. `! truncated ...` starts with `!`, so the `- ` parse
@@ -225,7 +225,7 @@ class TestTheListingBecomesAWorkList:
         "clips/.wav", "dets.csv", "scene.csv",
     ])
     def test_a_name_that_is_not_a_clip_never_becomes_a_candidate(self, name):
-        assert D.ls_candidates({name: 128044}, self.NODE) == []
+        assert D.ls_candidates({name: 480044}, self.NODE) == []
 
     def test_a_listing_records_the_size_the_node_reported(self):
         got = D.ls_candidates({"clips/nyquist-db21acd5-1016781646.wav": 40960}, self.NODE)
@@ -239,7 +239,7 @@ class TestTheTwoDiscoverySourcesUnion:
         k = D.CL.clip_key("nyquist", "db21acd5", 1016781646)
         dets = [{"clip_key": k, "clip": "/clips/nyquist-db21acd5-1016781646.wav",
                  "anchored": True, "utc_us": 1757459321000000}]
-        ls = D.ls_candidates({"clips/nyquist-db21acd5-1016781646.wav": 128044}, "nyquist")
+        ls = D.ls_candidates({"clips/nyquist-db21acd5-1016781646.wav": 480044}, "nyquist")
         got = D.merge_candidates(dets, ls)
         assert len(got) == 1, "the same clip from both sources is one fetch, not two"
         assert got[0]["anchored"] is True, (
@@ -257,7 +257,7 @@ class TestTheTwoDiscoverySourcesUnion:
         a = D.CL.clip_key("nyquist", "aaaaaaaa", 1)
         b = D.CL.clip_key("nyquist", "aaaaaaaa", 2)
         dets = [{"clip_key": a}, {"clip_key": b}]
-        ls = D.ls_candidates({"clips/nyquist-bbbbbbbb-0000000003.wav": 128044}, "nyquist")
+        ls = D.ls_candidates({"clips/nyquist-bbbbbbbb-0000000003.wav": 480044}, "nyquist")
         got = D.merge_candidates(dets, ls)
         assert [c["clip_key"] for c in got[:2]] == [a, b]
         assert len(got) == 3

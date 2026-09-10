@@ -4,7 +4,7 @@
 WHY THIS IS NOT `csv.DictReader`. Five generations of `dets.csv` exist on the cards and in the
 drains, and one of them writes a header that does not describe its own rows:
 
-    G1   9 cols   utc_us..frame_hex                          the 2026-09-07 night
+    G1   9 cols   utc_us..frame_hex                          the 2026-09-07 capture
     G2  11 cols   + clip, clip_why
     G3  12 cols DECLARED, 11 WRITTEN  ⚠️ header says `node,` and the writer never emits it
     G4  12 cols   node_id, ...                               fs/layout build, node_id populated
@@ -134,7 +134,7 @@ def read_text(text: str, default_node: Optional[str] = None) -> DetsRead:
         raise ValueError(
             "dets.csv is empty: %d byte(s), no header and no rows. A file the node created but "
             "never wrote, and a file whose content was lost, both read like this; neither is a "
-            "quiet night. An empty night still carries its header." % len(text))
+            "quiet period. An empty capture still carries its header." % len(text))
     header = tuple(c.strip() for c in next(csv.reader([lines[0]])))
     gen = identify(header)
     out = DetsRead(generation=gen, header=header)

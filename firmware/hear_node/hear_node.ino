@@ -1,10 +1,10 @@
-// Overnode: PDM mic + real GPS PPS + WiFi, on a XIAO ESP32-S3 Sense.
+// Acoustic node: PDM mic + real GPS PPS + WiFi, on a XIAO ESP32-S3 Sense.
 //
 // The point of leaving this outside is ONE measurement the project has never been able to make.
 // firmware/path_test could only ever check the capture path, because its pulse and esp_timer came
 // off the same crystal. A GPS PPS is an INDEPENDENT reference, so counting I2S samples between
 // edges gives the true sample rate in Hz to GPS accuracy -- the 48000-vs-47619 class of trap that
-// no datasheet answers. Over a night the block-granularity averages out to well under a ppm.
+// no datasheet answers. Over a long run the block-granularity averages out to well under a ppm.
 //
 // Wiring (leaves the onboard PDM mic in place, since the good mic has not arrived):
 //     GPS TX  -> D7 (GPIO44)      GPS RX  <- D6 (GPIO43)
@@ -71,7 +71,7 @@
 // is at least unique even when nobody set one. NODE_ID and NODE_CLASS live in secrets.h because
 // that is the per-device file, not because they are secret.
 #ifndef NODE_CLASS
-#define NODE_CLASS "xiao-s3-pps"        // 1 PDM mic @16k, GPS PPS, BMP280, microSD. See docs/node-classes.md
+#define NODE_CLASS "xiao-s3-pps"        // 1 PDM mic @48k, GPS PPS, BMP280, microSD. See docs/node-classes.md
 #endif
 // Set by gen_secrets.py from `git describe --always --dirty --tags` at flash time. The fallback
 // matters: a sketch built by hand, without flash.py, is NOT a released build and must not be able
@@ -126,18 +126,13 @@ static void node_identity() {
 // mel_scene.h is 16000.0f and reads dcblk. Which stream a bank is applied to is the whole
 // question, and each has its own static_assert naming its own rate symbol.
 //
-// WHY ACQUIRE HIGHER AT ALL: the clips are the only artefact that can say WHAT a sound was, and
-// every open classifier worth pointing at them wants more band than 16 kHz carries. Perch v2 is
-// 32 kHz natively. Acquiring at FS_ACQ and decimating by DECIM gives the classifiers full band
-// while the scene corpus, the sketch wire format and its fs code keep the exact axis 228k stored
-// rows were measured on -- which a bare rate change would have silently split in two.
+// The clips are the only artefact that can say WHAT a sound was, so they keep the full band the
+// microphone gives at FS_ACQ; the scene lane runs at FS_NOMINAL after decimation by DECIM.
 // ⚠️48 kHz IS THE CEILING THIS MICROPHONE ALLOWS, not a preference. Standard Performance Mode
 // tops out at a 4.0 MHz clock (MSM261D3526H1CPM datasheet V1.2) and the ESP32 drives PDM at
 // fs * 64 in I2S_PDM_DSR_8S, so fs <= 62.5 kHz. Of the rates below that, only /2 and /3 reach the
-// mel banks' 16 kHz by an INTEGER -- 64 kHz would be a clean /4 and needs 4.096 MHz, which the
-// mic does not support. Note the fleet's CURRENT 16 kHz clocks the mic at 1.024 MHz, which is
-// BELOW that mode's 1.1 MHz floor and above Low-Power's 900 kHz ceiling: an unspecified gap it
-// happens to work in. 48 kHz is the first rate that is squarely inside a documented mode.
+// scene bank's FS_NOMINAL by an INTEGER -- 64 kHz would be a clean /4 and needs 4.096 MHz, which the
+// mic does not support. 48 kHz sits squarely inside a documented mode.
 #define DECIM      3
 #define FS_ACQ     (FS_NOMINAL * DECIM)   // microphone / praw / clips
 #define ABLOCK     (BLOCK * DECIM)        // one I2S read -> exactly one decimated frame
@@ -193,7 +188,7 @@ static const char HEALTH_HDR[] =
   "env_peak_win,heap,gate_armed,gate_thr,gate_e_max,gate_forced,sig_dc,sd_free_mb,write_fail,"
   "temp_c,press_hpa,c_mps,rh_pct,"
   // gate_floor, because gate_thr only pins the floor down where the floor is the binding limb.
-  // The clip counters, because a card that filled and a night that went quiet must not look the
+  // The clip counters, because a card that filled and a gate that went quiet must not look the
   // same in the record -- clip_written advances only on a clip that landed, clip_skip_budget only
   // on one that was wanted and refused.
   "gate_floor,clip_written,clip_skip_budget,clip_skip_cardfull,clip_skip_dedupe,"
@@ -363,7 +358,7 @@ static volatile int gps_fix = 0, gps_sats = 0;
 //
 // A single epoch is good to a few metres, which is the same order as the path differences we are
 // trying to resolve (28 ms of dog is 9.8 m). These nodes do not move, so the fix averages down:
-// the mean of N independent epochs improves as sqrt(N), and an overnight run is ~30k epochs. Both
+// the mean of N independent epochs improves as sqrt(N), and an 8 h run is ~30k epochs. Both
 // are kept -- last for liveness, mean for geometry -- and the count is reported so nobody uses a
 // 12-sample mean as if it were an 8-hour one.
 static volatile int32_t  pos_lat_e7 = 0, pos_lon_e7 = 0;   // 1e-7 deg, as the wire carries them
@@ -445,7 +440,7 @@ static const char *i2c_name(uint8_t a) {
 // ---------------------------------------------------------------- BMP280 (temperature, pressure)
 // Sound speed is the one environmental term that does NOT cancel in TDoA: it biases every node in
 // the same direction, so a shared error in c moves every range together and the residual never
-// sees it. c = 331.3 + 0.606*T, so 0.6 m/s per degree -- a 10 C overnight swing is 1.8% on every
+// sees it. c = 331.3 + 0.606*T, so 0.6 m/s per degree -- a 10 C daily swing is 1.8% on every
 // range. Without this the node assumes a temperature, and the assumption is invisible downstream.
 //
 // The part is identified by CHIP ID, not by the address it answers on. The board fitted here is
@@ -988,8 +983,7 @@ static void fft256() {
 #define SKETCH_SPAN ((uint32_t)(MELIMP_NFFT + (MELIMP_FRAMES - 1) * MELIMP_HOP))
 //: How far BEFORE the onset the window starts. hear/node/detect.py SKETCH_BACK_S.
 #define SKETCH_BACK_S 0.004
-//: Derived from TIME at the ACQUISITION rate. It used to be MELIMP_HOP, which was 64 == 0.004 s
-//: only because the bank was at 16 kHz; the same line at 48 kHz is 1.333 ms. HOP_S and
+//: Derived from TIME at the ACQUISITION rate, not from a hop count. HOP_S and
 //: SKETCH_BACK_S are two independent reference constants that both happen to be 0.004 -- so this
 //: is deliberately NOT asserted equal to the hop, which would re-create the coupling.
 #define SKETCH_BACK (sk_back_acq_len(SKETCH_BACK_S, (double)FS_ACQ))
@@ -1043,8 +1037,8 @@ static const float RATIO = 8.0f, FLOOR_DEFAULT = 800.0f, REARM = 0.35f;
 // THE FLOOR IS RUNTIME-SETTABLE (POST /gate?floor=N). It used to be a compile-time 800, and over
 // the 2026-09-07 capture it -- not the adaptive 8 x ambient limb -- was what the gate actually
 // ran on: gate_thr was exactly 800.0 in 1418 of 1450 health.csv rows (97.8%), max 1715. Median
-// ambient over those rows is 28.9, so 8 x ambient is ~231 and the floor was ~3.5x above it all
-// night. 800 was chosen for gunshots; retuning it for anything quieter meant a reflash and a walk
+// ambient over those rows is 28.9, so 8 x ambient is ~231 and the floor was ~3.5x above it
+// throughout. 800 was chosen for gunshots; retuning it for anything quieter meant a reflash and a walk
 // outside, which is why it never got retuned.
 //
 // GUARD, AND WHY THESE TWO BOUNDS.
@@ -1059,10 +1053,10 @@ static const float RATIO = 8.0f, FLOOR_DEFAULT = 800.0f, REARM = 0.35f;
 //   tinguishable from a dead microphone -- the exact failure env_e_max_win exists to rule out.
 //
 // ⚠️NEITHER BOUND PROTECTS THE CARD, and it would be a lie to imply one does. Floor 100 gives 27x
-// the crossing rate of floor 800 on the measured night. What bounds the card is downstream:
+// the crossing rate of floor 800 on the measured capture. What bounds the card is downstream:
 // det_flush writes at most 16 rows per second (16 x 437 B = 6992 B/s, so 19 MiB in 47 min at
-// the absolute cap), and the clip writer -- which at 128044 B a clip would fill the card in about
-// three minutes at that rate -- is held by its own byte budget (CLIP_BUDGET_B). Lower this floor
+// the absolute cap), and the clip writer -- which would fill the card in minutes at that rate --
+// is held by its own byte budget (CLIP_BUDGET_B). Lower this floor
 // on an unattended node only with that budget in place.
 static const float FLOOR_MIN = 100.0f, FLOOR_MAX = 32768.0f;
 static float g_floor = FLOOR_DEFAULT;
@@ -1075,16 +1069,16 @@ static const char *g_floor_src = "default";
 // 300 while the file still said 800 would be true and useless -- what the operator needs to know
 // is what the node will come back as after the plug timer cuts it.
 static float g_floor_saved = NAN;
-// A night that records nothing is ambiguous: was it quiet, or was the threshold set above
+// A run that records nothing is ambiguous: was it quiet, or was the threshold set above
 // everything that happened? Track the highest envelope actually reached between health rows.
-// e_max well under thr all night says the gate was too high; e_max grazing thr says it was tuned
-// about right and the night was genuinely still. Without this the run cannot be told apart from
+// e_max well under thr throughout says the gate was too high; e_max grazing thr says it was tuned
+// about right and the period was genuinely still. Without this the run cannot be told apart from
 // a dead microphone.
 static float env_e_max_win = 0.0f;
 // Ambient must keep being learned while DISARMED, or the gate deadlocks. Confining the update to
 // the armed branch means a noise floor that rises above thr can never be learned, so e can never
 // fall below thr*REARM, so the gate never re-arms. Measured outdoors on this node: 156 s solid
-// disarmed, envelope 1400-1600 against thr 800, ambient frozen at 73.2, two detections all night
+// disarmed, envelope 1400-1600 against thr 800, ambient frozen at 73.2, two detections in the whole run
 // -- both from before it locked. A rising floor must move the floor estimate even when it is loud,
 // just slowly enough that a millisecond-long shockwave does not desensitise the node to itself.
 // ⚠️THE ASYMMETRY IS ON DIRECTION, NOT ON THE THRESHOLD. It used to be
@@ -1105,15 +1099,13 @@ static float env_e_max_win = 0.0f;
 //     cost 156 s of solid disarm outdoors cannot come back; REARM_MAX_SAMPLES still backs it.
 //   - one loud event still cannot raise the floor -- more strongly than before, not less.
 //
-// Expressed as TIMES and divided by the rate, because tau is a time. The old literals were
-// sample counts commented "at 16 kHz", so the same source gave a 3x different time constant on
-// a 48 kHz node -- an fs-dependence nobody chose.
+// Expressed as TIMES and divided by the rate, because tau is a time.
 static const float AMB_TAU_RISE_S = 30.0f;
 static const float AMB_TAU_FALL_S = 5.0f;
 static const float ALPHA_RISE = 1.0f / (AMB_TAU_RISE_S * (float)FS_NOMINAL);
 static const float ALPHA_FALL = 1.0f / (AMB_TAU_FALL_S * (float)FS_NOMINAL);
-// And a watchdog under that, because a gate that has gone deaf looks exactly like a quiet night.
-// 30 s is far longer than any real event and far shorter than a night.
+// And a watchdog under that, because a gate that has gone deaf looks exactly like a quiet period.
+// 30 s is far longer than any real event.
 static const uint32_t REARM_MAX_SAMPLES = 30u * FS_NOMINAL;
 static uint32_t disarm_samples = 0, gate_forced = 0;
 // The PDM mic sits on a large positive DC pedestal. Measured on this node: mean(s) = 1285.8
@@ -1123,12 +1115,9 @@ static uint32_t disarm_samples = 0, gate_forced = 0;
 // scale) before it could register. Every sample is DC-blocked before anything looks at it.
 // One pole at ~1.6 Hz -- two decades below the acoustic band, so no transient is reshaped, and
 // it still settles within a fraction of a second at boot.
-static const float ALPHA_DC = 1.0f / 1600.0f;      // tau ~0.1 s at 16 kHz
-// ⚠️THE PEDESTAL FILTER RUNS AT FS_ACQ NOW, SO ITS COEFFICIENT MUST BE RE-DIMENSIONED. ALPHA_DC is
-// a per-sample rate; reusing it on a stream running DECIM times faster would keep the number and
-// silently change the time constant to 0.1/DECIM s, tightening the high-pass into the bottom scene
-// band. Divided by DECIM, tau stays 0.1 s in SECONDS, which is what the constant actually means.
-static const float ALPHA_DC_ACQ = ALPHA_DC / (float)DECIM;
+static const float DC_TAU_S = 0.1f;                // pedestal filter time constant, seconds
+// Per-sample coefficient at FS_ACQ, the rate the pedestal filter runs at.
+static const float ALPHA_DC_ACQ = 1.0f / (DC_TAU_S * (float)FS_ACQ);
 static float    sig_dc = 0.0f;                     // the pedestal being subtracted
 static bool     dc_ready = false;
 static float gate_thr() { float t = g_amb * RATIO; return t < g_floor ? g_floor : t; }
@@ -1172,16 +1161,16 @@ struct Det { uint32_t sample; uint32_t pps_n; int32_t us_since_pps; int64_t utc_
               uint32_t acq_at;
               uint8_t frame[MELIMP_FRAME_BYTES]; };
 // A RING. dets[] used to be a hard cap -- past the 64th, a detection incremented the counter and
-// stored nothing, so a windy night reported hundreds of events and kept the first 64. det_n is
+// stored nothing, so a windy spell reported hundreds of events and kept the first 64. det_n is
 // the monotonic total; the slot is det_n % MAXDET.
 static Det dets[MAXDET];
 static uint32_t det_n = 0;        // total ever detected
 static uint32_t det_flushed = 0;  // total written to the card
 static uint32_t det_lost = 0;     // overwritten in the ring before they could be written
 // The card the node is on exposes a 40 MB FAT partition, ~20 MB of it free. That is ~50k
-// detections -- ample for a night, but not infinite, and a full card fails by returning a short
+// detections -- ample for a long run, but not infinite, and a full card fails by returning a short
 // write, not by raising anything. Counting failures is what stops a card that filled at 03:00
-// from looking exactly like a night that went quiet at 03:00.
+// from looking exactly like a gate that went quiet at 03:00.
 static uint32_t det_write_fail = 0;
 // us_since_pps is SIGNED: a sample captured a few hundred us before an edge is back-dated across
 // it, and belongs to the previous second. Reporting that as a huge unsigned number would put the
@@ -1204,7 +1193,7 @@ static int sd_cs = 0;
 static char ota_msg[96] = "idle";
 
 // ---------------------------------------------------------------- log ring
-// Every diagnosis tonight -- the 230400/UBX baud scan, the driven-vs-floating pin probes, the I2C
+// Every diagnosis during bring-up -- the 230400/UBX baud scan, the driven-vs-floating pin probes, the I2C
 // scan -- came out of the boot log, which only existed on the USB cable. Once the node is carried
 // somewhere there is no cable, so the log has to be readable over the link that remains.
 
@@ -1265,10 +1254,10 @@ static double esp_clock_ppm(uint32_t *secs_out) {
 // dets.csv survives a reboot and det_n does not: 48 in-run plus that boot's own 2 startup
 // triggers is exactly 50, and the other 12 are two apiece from six earlier boots. g_samples
 // resets too, which is why two sample values repeat across boots with different triggers.)
-// This ring keeps the last few minutes of actual PCM so a detection can be heard, or re-analysed
+// This ring keeps the last minute or so of actual PCM so a detection can be heard, or re-analysed
 // off-box with a feature the node has never been taught.
 //
-// 240 s x 16000 Hz x 2 B = 7 680 000 B = 7.68 MB, against the 8.34 MB of PSRAM this board
+// 80 s x FS_ACQ x 2 B = 7 680 000 B = 7.68 MB, against the 8.34 MB of PSRAM this board
 // reported free at runtime. It fits -- but ps_malloc needs one CONTIGUOUS block and total-free is
 // not largest-free, so ask for progressively less rather than fail outright, and treat failure as
 // a missing feature rather than an error: praw == NULL disables /audio and changes nothing else.
@@ -1277,7 +1266,7 @@ static uint32_t  praw_cap = 0;              // samples the ring holds; 0 = not a
 static uint32_t  praw_want_s = 0;           // the span that actually got allocated, for the log
 
 // The ring is contiguous in WRITE order, not in time. A lost block leaves no hole in it, and the
-// night lost 18 seconds of 40791 (42749 samples), so reading it back at a flat rate would be
+// capture lost 18 seconds of 40791 (42749 samples), so reading it back at a flat rate would be
 // wrong by up to that much. Anchor it the way everything else here is anchored instead: one
 // (UTC, sample) pair per GPS second, which stays exact across a drop.
 #define PRAW_MARKS 300                      // >= the longest ring ever allocated, in seconds
@@ -1295,7 +1284,7 @@ static uint32_t praw_cap_d() { return praw_cap / DECIM; }
 // Acquisition-sample offset of a decimated sample index. The FIR is linear phase, so the sound in
 // decimated output J was centred DECIM_DELAY acquisition samples before that output's newest
 // input -- which is why a clip cut at J*DECIM alone would start 4.667 ms late (DECIM_DELAY 224
-// at FS_ACQ; the 4.00 ms this line used to claim was the 257-tap 32 kHz decimator's).
+// at FS_ACQ).
 // ⚠️SATURATES AT 0 RATHER THAN WRAPPING. For the first DECIM_DELAY/DECIM decimated samples after
 // boot the unsigned arithmetic would underflow to ~4e9, and every caller compares the result
 // against a window bound -- so a detection in the first 4 ms would have passed a "is the pre-roll
@@ -1365,9 +1354,8 @@ static bool utc_to_sample(int64_t utc, uint32_t *s) {
 //   2. A 10 s pull off this node's own ring, energy relative to the total:
 //        2-62 Hz -6.2 dB | 62-312 Hz -1.9 dB | 312-500 Hz -11.9 dB | 500-1k -16.2 dB
 //        1-2k -22.3 dB | 2-4k -27.8 dB | 4-8k -26.3 dB
-//      62-312 Hz carries +8.2 dB MORE than the whole 312-8000 Hz span the sketch could then see.
-//      Both measurements were taken while the sketch bank was at 16 kHz; the move to 48 kHz
-//      raised its ceiling, not its floor, so the argument for a separate scene bank is unchanged.
+//      62-312 Hz carries +8.2 dB MORE than the whole 312-8000 Hz span.
+//      The sketch bank's floor does not move with its rate, so the separate scene bank stays.
 //
 // MELIMP_FB_LO[0] is 2 at 187.5 Hz/bin, so the detection bank's band 0 is bins 2-3 = 375.0-562.5
 // Hz and everything below is thrown away after the DC block has already paid for it. The scene
@@ -1466,12 +1454,12 @@ static File     scenef;
 // Why size() is not used to decide (2) before opening: FS::size() returns VFSFileImpl::_stat
 // .st_size, filled by a stat() run BEFORE the open (core 3.0.5, vfs_api.cpp:274). On a file the
 // open CREATES that stat fails, _stat is left uninitialised, and size() returns heap garbage --
-// deterministic per build, which is how both CSVs ran a whole night with no header. So existence
+// deterministic per build, which is how both CSVs ran a whole run with no header. So existence
 // is tested first, with exists(), and size() is consulted only on a file already known to be there.
 // ---- daily files, oldest rolled off ---------------------------------------------------------
 // scene.csv was ONE growing file. At the measured 335 B/row and one row per 1.024 s that is
 // 1.18 MB/h -- 10 GB a year in a single CSV, where one bad write costs the lot and nothing ever
-// bounds it. Fine for a night; not for a fleet that runs continuously.
+// bounds it.
 //
 // So each stream writes /scene-YYYYMMDD.csv, and when the card runs low the OLDEST day goes. The
 // data is on the card if it is wanted and it is not kept by default, which is the trade asked for.
@@ -1657,7 +1645,7 @@ static void scene_frame(const int16_t *s) {
 // ---------------------------------------------------------------- /audio limits and WAV
 // Serving the whole ring is 7.68 MB, and WiFi on this node measured 335 kB/s, so that is ~23 s
 // inside one handler. The I2S DMA holds 6 x 240 frames = 90 ms, so a handler that does not drain
-// it would throw away more audio than the entire night lost (18 s of 40791). Hence: bounded
+// it would throw away more audio than the entire capture lost (18 s of 40791). Hence: bounded
 // requests, and the loop's own audio path pumped between chunks -- the same reason /tp pumps
 // Serial1 rather than delay()ing.
 #define AUDIO_MAX_S   30
@@ -1695,10 +1683,9 @@ static void wav_header(uint8_t *h, uint32_t data_bytes, uint32_t fs) {
 }
 
 // ---------------------------------------------------------------- clips: a WAV per detection
-// The PSRAM ring already holds 240 s of PCM and /audio can already serve any window of it. What
-// it cannot do is outlive those 240 s: an event heard at 03:00 is gone by 03:04 unless somebody
-// was awake and fetching. This writes a fixed-length WAV around each detection to the card, so
-// the audio survives the night the same way dets.csv does.
+// The PSRAM ring holds the last praw_want_s seconds of PCM (80 s when PSRAM allows) and /audio can
+// serve any window of it, but it rolls over within that span. This writes a fixed-length WAV around each detection to the card, so
+// the audio is still there when the drain comes to identify it.
 //
 // It addresses the ring BY SAMPLE, not by UTC. dets[].sample is a direct praw index (both are
 // counted in g_samples), so unlike /audio -- which refuses outright with "the ring cannot be
@@ -1711,9 +1698,8 @@ static void wav_header(uint8_t *h, uint32_t data_bytes, uint32_t fs) {
 // not an impulse that has finished inside the 44 ms window.
 // ⚠️CLIPS ARE IN ACQUISITION SAMPLES, EVERYTHING ELSE IS IN DECIMATED ONES. The clip is the one
 // artefact that exists to be handed to a classifier, so it keeps the full band the microphone
-// gives; every other consumer runs at FS_NOMINAL. 5.0 s is not a round number chosen for taste:
-// Perch v2 reads NON-OVERLAPPING 5 s windows at 32 kHz, so a 4.0 s clip would be padded by 20%
-// with fabricated silence, and BirdNET's 3.0 s window against 4.0 s discarded 1 s in 4.
+// gives; every other consumer runs at FS_NOMINAL. 5.0 s matches
+// Perch v2's non-overlapping 5 s window at 32 kHz.
 #define CLIP_PRE_SAMPLES  ((uint32_t)FS_ACQ)              // 1.0 s
 #define CLIP_POST_SAMPLES ((uint32_t)(4 * FS_ACQ))        // 4.0 s
 #define CLIP_SAMPLES      (CLIP_PRE_SAMPLES + CLIP_POST_SAMPLES)   // 240000 @ 48 kHz
@@ -1731,7 +1717,7 @@ static void wav_header(uint8_t *h, uint32_t data_bytes, uint32_t fs) {
                                                           // compared against d.sample. The clustering that gave 33
 //
 // BUDGET. Measured free space on this card is 19 MiB (sd_free_mb is a floor: (total-used)/1048576,
-// and it read 19 for most of the run). Over a 12 h night the CSVs take, from row sizes measured
+// and it read 19 for most of the run). Over 12 h the CSVs take, from row sizes measured
 // on the capture's own files:
 //     scene.csv  42188 rows x 227 B  = 9576676 B     (rows = 12 h / 1.024 s)
 //     health.csv  1440 rows x 151.2 B =  217728 B    (219244 B / 1450 rows, measured)
@@ -1743,18 +1729,16 @@ static void wav_header(uint8_t *h, uint32_t data_bytes, uint32_t fs) {
 //                                                     with no clip is 411 B.)
 //                                      ---------
 //                                       9816691 B = 9.36 MiB, leaving 9.64 MiB
-// At the measured event rate -- 33 events in 11.33 h = 2.91/h = 35 over 12 h -- clips cost
-// 35 x 128044 = 4481540 B = 4.27 MiB, a 2.26x margin. The budget is set above that rather than at
-// it, because the events are not spread evenly: 34 of the 48 triggers fall in the two hours
-// 09:00-10:59, so a per-night average protects nothing. A byte budget does.
-#define CLIP_BUDGET_B  6291456u   // 6 MiB. 49 clips at 16 kHz (1.4x the measured 12 h event
-                                  // count) but only 13 at 48 kHz (~0.37x); CLIP_BYTES moved, this did not. And
-                                  // leaves 3.64 MiB of the remainder for the CSVs to overrun into
+// CLIPS ARE A ROLLING WINDOW. At CLIP_BYTES = 480044 B the budget holds 13 clips and the next one
+// evicts the oldest. A clip exists only until the drain has fetched it for identification;
+// eviction is the design, not a loss.
+#define CLIP_BUDGET_B  6291456u   // 6 MiB = 13 clips, leaving 3.64 MiB of the remainder for the
+                                  // CSVs to overrun into
 // And a live floor under that, because the budget assumes the card started at 19 MiB free and
 // nothing here can know that it did. 2 MiB is ~2.6 h of scene rows (227 B per 1.024 s = 221.7
 // B/s), so the record keeps running for hours after clips stop.
 #define CLIP_FREE_RESERVE_MB 2
-// Chunk size, and the reason there is one: a 128044 B write inside loop() would stall the I2S
+// Chunk size, and the reason there is one: a 480044 B write inside loop() would stall the I2S
 // reader far past the DMA's 6 x 240 frames = 90 ms and drop the audio this exists to keep. One
 // 4096 B chunk per loop iteration instead -- loop() calls audio_pump() every pass, so the DMA is
 // drained between chunks by the code that already does it, with no nested pump inside a card
@@ -1791,7 +1775,7 @@ static uint32_t clip_last_sample = 0;
 static bool     clip_have_last = false;
 // Boot-unique filename prefix. NOT derived from utc_us (three of 62 capture rows have utc_us == 0
 // and zeros collide) and not from det_n or sample alone (both restart at 0 every boot, so a
-// second night would overwrite the first's clips). esp_random() is seeded by hardware entropy and
+// second boot would overwrite the first's clips). esp_random() is seeded by hardware entropy and
 // needs no GPS fix, which a boot-time name must not wait for.
 static char clip_boot[9] = "00000000";
 
@@ -1800,7 +1784,7 @@ static char clip_boot[9] = "00000000";
 // three nodes: 437 primary detections, 96 of them heard by a SECOND node within 250 ms -- the ones
 // that are events in the world rather than something local to one microphone. First-come spent the
 // budget on whatever happened earliest, and refused 191 clips on nyquist and 201 on mach. The
-// 33-event sequence at 23:50 UTC, the most structured thing all night and coincident on two nodes,
+// 33-event sequence at 23:50 UTC, the most structured thing in the capture and coincident on two nodes,
 // was refused every time with clip_why "budget". There is no audio of it.
 //
 // ⚠️DO NOT RANK BY LOUDNESS. It is the obvious idea and it is measurably WRONG here: ranking by
@@ -1954,8 +1938,8 @@ static void clip_pump() {
   if (clip_have_last && d.sample - clip_last_sample < CLIP_DEDUPE_SAMPLES)
                                      { d.clip_st = CLIP_DEDUPE; clip_skip_dedupe++; return; }
   // THE BUDGET IS A WINDOW, NOT AN ALLOWANCE. It used to be a per-boot counter that only ever
-  // decremented, sized in its own comment as "1.4x the measured 12 h event count" -- correct for
-  // one night, and wrong the moment the fleet runs continuously. Every node went permanently deaf
+  // decremented, sized for one 12 h capture's event count -- wrong the moment the fleet runs
+  // continuously. Every node went permanently deaf
   // to audio after its first busy day and stayed that way until someone rebooted it. Measured:
   // mach reached it and served 128 consecutive detections reading clip_why "budget", which is why
   // there was no audio to cross-correlate against rankine when it was first asked for.
@@ -1999,17 +1983,12 @@ static void clip_pump() {
   File f = SD.open(path, FILE_WRITE);
   if (!f) { d.clip_st = CLIP_FAIL; clip_fail++; return; }
   uint8_t hdr[44];
-  // The rate field is an integer and cannot carry the measured 16000.169 Hz, exactly as
+  // The rate field is an integer and cannot carry the measured fractional rate, exactly as
   // wav_header says. There are no HTTP headers on a file, so the exact rate travels in dets.csv's
   // fs_hz column instead -- per detection, which is where it belongs anyway.
   double fsu = fs_timebase();
-  // ⚠️CLIP_SAMPLES IS COUNTED AT FS_ACQ, SO THE HEADER RATE IS fsu * DECIM. fs_timebase() is the
-  // FS_NOMINAL-domain rate -- correct for everything else on this node and wrong for exactly this
-  // file. Stamping it unscaled headed a 5.0 s 48 kHz clip as 15.0 s of 16 kHz: every player and
-  // every model reads it three times too slow, an octave and a half down. It cannot be caught
-  // downstream either, because 16000 is precisely the rate hear_tag.py's assert_rate wants, so a
-  // lying header sails past the guard that exists to stop wrong-rate audio reaching the model.
-  // /praw already scales by DECIM at line 3142; this writer did not get the same edit.
+  // CLIP_SAMPLES is counted at FS_ACQ, so the header rate is fsu * DECIM: fs_timebase() is the
+  // FS_NOMINAL-domain rate. /praw scales the same way.
   wav_header(hdr, CLIP_SAMPLES * 2, (uint32_t)lrint(fsu * DECIM));
   if (f.write(hdr, sizeof hdr) != sizeof hdr) {
     f.close(); SD.remove(path); d.clip_st = CLIP_FAIL; clip_fail++; return;
@@ -2076,7 +2055,7 @@ static bool gate_floor_persist() {
 // The acquisition rate over the seconds this node CERTIFIED as neither short nor long. It used
 // to be cumulative samples over cumulative seconds, which one stall poisons for the rest of the
 // run: the two live nodes served 7984.6726 Hz (-500,958 ppm) and 15332.5601 Hz (-41,715 ppm)
-// through this field while acquiring ~16 kHz, and that number is the one their own web UI
+// through this field, and that number is the one their own web UI
 // headlines as "I2S measured" and watch.py announces on every 0.02 Hz move. A figure like that
 // cannot convert a sample offset into a time, and it was never a diagnostic nobody reads.
 //
@@ -2111,7 +2090,7 @@ static String status_json() {
   static char b[5632];
   // JSON has no NaN. A node that does not know its temperature emits null, which every parser
   // reads as absent -- printing nan would be invalid JSON, and a downstream coercion of it to 0.0
-  // would look like a freezing night rather than a missing sensor.
+  // would look like a freezing reading rather than a missing sensor.
   char envs_t[16], envs_p[16], envs_c[16], envs_h[16];
   #define ENVF(dst, v) do { if ((v) == (v)) snprintf(dst, sizeof dst, "%.2f", (double)(v)); \
                             else snprintf(dst, sizeof dst, "null"); } while (0)
@@ -2177,11 +2156,11 @@ static String status_json() {
     // scene: fft_us_per_row is MEASURED on this part, summed over the 64 frames of one row.
     // bands/f_lo_hz/f_hi_hz: the scene bank is NOT the detection bank any more, and a reader
       // that assumes MELIMP's band 0 would misread every row -- at 48 kHz that is bins 2-3,
-      // i.e. 375.0-750.0 Hz at 187.5 Hz per bin, not the 312 Hz it was at 16 kHz.
+      // i.e. 375.0-750.0 Hz at 187.5 Hz per bin.
     "\"scene\":{\"rows\":%lu,\"written\":%lu,\"row_span_ms\":%d,\"fft_us_per_row\":%lu,\"fft_us_max\":%lu,"
     "\"short_blocks\":%lu,\"write_fail\":%lu,\"bands\":%d,\"slices\":%d,\"f_lo_hz\":%.1f,\"f_hi_hz\":%.1f},"
     // clips: written advances only on a full CLIP_BYTES landing, skip_budget only when one was
-    // wanted and refused. A card that filled at 03:00 and a night that went quiet at 03:00 differ
+    // wanted and refused. A card that filled at 03:00 and a gate that went quiet at 03:00 differ
     // here and nowhere else.
     "\"clips\":{\"written\":%lu,\"skip_budget\":%lu,\"skip_cardfull\":%lu,"
     "\"skip_dedupe\":%lu,\"skip_ring\":%lu,"
@@ -2502,7 +2481,7 @@ static void gps_bringup() {
   // the ESP's TX lands on the module's TX, so nothing can be sent to wake it, and the sweep finds
   // nothing at any baud for ever.
   //
-  // Measured on mach tonight: it entered that state on EVERY reflash, three times, and each time
+  // Measured on mach: it entered that state on EVERY reflash, three times, and each time
   // POST /gpspins?swap=1 found 115200 immediately -- the module had been transmitting the whole
   // time on the pin the 250 ms probe was not watching. A fleet meant to run continuously cannot
   // have a coin-flip at every reboot that costs a node its GPS until someone drives out to it.
@@ -2672,9 +2651,8 @@ void setup() {
     delay(300); ESP.restart();
   });
   http.on("/sd", []() {
-    // night.csv was described as the durable record. A record that can only be read by walking
-    // outside and pulling the card is not one -- this makes it retrievable over the same link.
-    String name = http.hasArg("file") ? http.arg("file") : String("/night.csv");
+    // Any file on the card, over the same link the node reports on.
+    String name = http.hasArg("file") ? http.arg("file") : String("/health.csv");
     if (!name.startsWith("/")) name = "/" + name;
     if (name.indexOf("..") >= 0) { http.send(400, "text/plain", "no\n"); return; }
     if (!sd_ok) { http.send(503, "text/plain", "no card mounted\n"); return; }
@@ -2918,7 +2896,7 @@ void setup() {
     // ext4 root both go and the card comes back at its real capacity.
     //
     // Guarded by the node's OWN NAME rather than confirm=yes, because there are two of these on
-    // similar addresses. A typo should cost you an error, not a night.
+    // similar addresses. A typo should cost you an error, not a trip out to the node.
     if (http.arg("confirm") != String(node_id)) {
       char b[440];
       snprintf(b, sizeof b,
@@ -3318,7 +3296,7 @@ void setup() {
       // The mic does not stop for a download. Drain by ELAPSED TIME rather than one block per
       // chunk: a block is 16 ms of audio, so a fixed one-per-chunk only keeps up above roughly
       // 256 kB/s, and below that the DMA's 90 ms overruns after a few chunks and stays overrun
-      // for the rest of the download -- losing more audio than the whole night did. Capped at
+      // for the rest of the download -- losing more audio than the whole capture did. Capped at
       // the DMA depth, because past that the samples are already gone and blocking here to ask
       // for them would only widen the hole.
       uint64_t t_now = (uint64_t)esp_timer_get_time();
@@ -3341,7 +3319,7 @@ void setup() {
   // ⚠️AND THEY RUN UNDER A WATCHDOG, because ordering alone does not save a HANG: handleClient()
   // is called from loop(), so a setup() that never returns leaves the server begun but deaf, and
   // boot_guard() counts resets that never happen. 15 s is far longer than either call has ever
-  // taken and far shorter than a night.
+  // taken.
   boot_wdt_arm(15000);
   i2s.setPinsPdmRx(PDM_CLK, PDM_DIN);
   if (!i2s.begin(I2S_MODE_PDM_RX, FS_ACQ, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO))
@@ -3349,12 +3327,12 @@ void setup() {
   else logf("i2s   PDM %d Hz on CLK=%d DIN=%d -> /%d -> %d Hz\n",
             FS_ACQ, PDM_CLK, PDM_DIN, DECIM, FS_NOMINAL);
 
-  // Raw ring. Ask for 240 s (7.68 MB of the 8.34 MB free) and step down rather than fail: what
+  // Raw ring. Ask for 80 s (7.68 MB of the 8.34 MB free) and step down rather than fail: what
   // matters is largest CONTIGUOUS free block, which total-free does not report. Log the span that
-  // was actually obtained -- a silent failure here would look identical to a quiet night, which is
+  // was actually obtained -- a silent failure here would look identical to a quiet period, which is
   // the failure class env_e_max_win already exists to rule out.
   {
-    static const uint32_t want_s[] = {240, 180, 120, 60, 30};
+    static const uint32_t want_s[] = {80, 60, 45, 30};
     for (unsigned k = 0; k < sizeof(want_s) / sizeof(want_s[0]) && !praw; k++) {
       size_t want = (size_t)want_s[k] * FS_ACQ * sizeof(int16_t);
       // Leave 256 kB of PSRAM behind: WiFi buffers and the web server allocate from it too, and a
@@ -3503,7 +3481,7 @@ static void det_flush() {
     if (detf.write((const uint8_t *)line, m) != (size_t)m) {
       // Close, so the next flush reopens. A short write that leaves the handle open turns a
       // transient card error into a permanent, silent stop -- the failure would be counted but
-      // never recovered from, and the rest of the night would still be lost.
+      // never recovered from, and the rest of the run would still be lost.
       det_write_fail++; detf.close(); break;
     }
     det_flushed = k + 1;      // only advance on a write that actually landed
@@ -3643,14 +3621,13 @@ static void audio_pump() {
           // The block arrives as a unit, so reading the clock here stamps every sample in it
           // with the moment the block FINISHED. At BLOCK=256 that is up to 15.9 ms late -- 87x
           // the 183 us budget, and it throws away the 21 ns the GPS is handing us. Back-date by
-          // the samples still to come, at the PPS-disciplined rate rather than the 16 kHz
-          // nominal (which is out by ~5600 ppm).
+          // the samples still to come, at the PPS-disciplined rate rather than
+          // FS_NOMINAL (which is out by ~5600 ppm).
           // ⚠️TWO TERMS NOW. (nd-1-i) is the decimated samples still to come, as before. DECIM_DELAY is
           // the FIR group delay: the sound reached the microphone DECIM_DELAY = 224 acquisition
           // samples -- 4.667 ms at FS_ACQ -- before it reached this output sample. Omitting it
           // would stamp every detection 4.667 ms late and throw away far more than the 21 ns the
-          // GPS is handing us. (The number below it used to read 128 / 4.00 ms, which was the
-          // 257-tap 32 kHz decimator; the taps and the rate both moved and the prose did not.)
+          // GPS is handing us.
           double   fsu     = fs_timebase();
           uint32_t back_us = (uint32_t)(((double)(nd - 1 - i) / fsu
                               + (double)DECIM_DELAY / (fsu * (double)DECIM)) * 1e6 + 0.5);
@@ -3684,9 +3661,8 @@ static void audio_pump() {
           //
           // MELIMP_FLAG_BITS carries the rate code (bits 8-11) and the fixed-layout bit (12), both
           // generated alongside the filterbank by gen_mel.py so they cannot disagree with it.
-          // Without them a frame does not say what band k MEANS: at 16 kHz band 12 is 3072 Hz
-          // under the old rescaled bank and 5826 Hz under the shared axis, and a consumer had no
-          // way to tell this node's frames from a 48 kHz phone's. Frames pulled from nyquist and
+          // Without them a frame does not say what band k MEANS, and a consumer has no way to
+          // tell one rate's frames from another's. Frames pulled from nyquist and
           // mach on 2026-09-08 all decoded as fs=None/layout=nyquist, so the shipped classifier
           // refused every one of them -- correctly, and uselessly.
           // Bit 0 = retrigger: this detection landed inside the previous one's decay, so it is
@@ -3706,7 +3682,7 @@ static void audio_pump() {
       if (a > env_peak_win) env_peak_win = a;
     }
     // The DC-BLOCKED samples go into the raw ring, not the raw ones: the pedestal drifted
-    // 1093.9 -> 1439.6 over the night, so raw audio carries a moving offset a consumer would only
+    // 1093.9 -> 1439.6 over the capture, so raw audio carries a moving offset a consumer would only
     // have to remove again, and the ring would not match what the gate and the sketch saw.
     // sig_dc is in health.csv if the pedestal is ever wanted back.
     if (praw && n > 0) {
@@ -3735,7 +3711,7 @@ void loop() {
   // transmitting yet, and it was never revisited. On mach -- the node whose TX/RX pair is
   // reversed -- an OTA reboot beat the module to the punch, the probe saw neither pin toggle,
   // fell back to the documented pinout mach does not have, and the node ran for 8 minutes with
-  // fix 0 and ubx_pvt 0. It would have run all night.
+  // fix 0 and ubx_pvt 0. It would have run indefinitely.
   //
   // ⚠️THE CADENCE IS PART OF THE LOSS. A flat 120 s retry means each failed attempt costs two
   // minutes of detections with no timestamp; mach's 1016 s NAV-PVT-silent window in the
@@ -3870,8 +3846,7 @@ void loop() {
         // every second takes the drop branch, fs_clean_secs is reset before it can reach the 8
         // it needs to recompute, and the value is stuck for the rest of the run. Measured on
         // mach: fs_clean_hz = 22624.0000 in 1124 of 1126 health rows, fs_win_s pinned at 0,
-        // drop_samples 223,352,776 against ~223,209,000 predicted by the inflation itself, and
-        // every clip written in that boot carrying a 22624 Hz WAV header over 16 kHz audio.
+        // drop_samples 223,352,776 against ~223,209,000 predicted by the inflation itself.
         //
         // ⚠️THE HIGH SIDE IS A DEFECT TOO, AND ONLY THE LOW SIDE WAS EVER TESTED. A second that
         // delivers too MANY samples is a catch-up burst after a stall, or an interval that is
@@ -3959,7 +3934,7 @@ void loop() {
                      "connected. Running the module's stock config; PPS will appear only on fix.");
   }
 
-  if (sta_ok && WiFi.status() != WL_CONNECTED) {     // AP blipped; an overnode reconnects
+  if (sta_ok && WiFi.status() != WL_CONNECTED) {     // AP blipped; a node reconnects
     static uint32_t retry = 0;
     if (millis() - retry > 15000) { retry = millis(); WiFi.reconnect(); }
   }
@@ -3980,9 +3955,8 @@ void loop() {
                   (unsigned long)pps_count, (unsigned long)pps_glitch,
                   (long)(pps_count > 1 ? (long)pps_int_max - (long)pps_int_min : 0));
     if (sd_ok) {   // the radio is a convenience; the card is the record
-      // health.csv, not night.csv: the schema gained the acquisition audit and the detection
-      // counters, and silently changing the column count of an existing file makes every row in
-      // it ambiguous. night.csv keeps the earlier bench rows under its own header.
+      // Silently changing the column count of an existing file makes every row in it ambiguous,
+      // so a schema change rolls the file rather than appending wider rows.
       // The roll's rename is what made the header bug bite: before it, /health.csv always existed
       // at open time so stat() succeeded and size() was real; the rename made the very next open a
       // CREATE, the one path that reaches the uninitialised _stat. csv_open handles all of it, and
@@ -3991,7 +3965,7 @@ void loop() {
       if (f) {
         int64_t tnow = 0; bool tok = local_to_utc((uint64_t)esp_timer_get_time(), &tnow);
         // An EMPTY field for a sensor that is not there, never a number. "nan" parses as a float
-        // in some readers and as a string in others; 0.0 would read as a freezing night. Empty is
+        // in some readers and as a string in others; 0.0 would read as a freezing reading. Empty is
         // the one value every CSV reader already agrees means absent.
         char ct[16], cp[16], cc[16], ch[16];
         #define CSVF(dst, v) do { if ((v) == (v)) snprintf(dst, sizeof dst, "%.2f", (double)(v)); \
@@ -4045,7 +4019,7 @@ void loop() {
       // as any other card flush, so it happens on the 30 s health interval rather than per row.
       // The exposure is up to 30 rows (~7 kB) if the plug timer cuts power mid-interval.
       if (scenef) scenef.flush();
-      env_peak_win = 0.0f;      // per-row peak, so a single loud event does not flatten the night
+      env_peak_win = 0.0f;      // per-row peak, so a single loud event does not flatten the run
       env_e_max_win = 0.0f;
       det_flush();              // never let the card lag the ring by more than a health interval
     }

@@ -40,7 +40,7 @@ block will be pinned against hardware again.
 node; this one could not, because the `/ls?dir=` handler it exercises exists only in this
 checkout and **the fleet has not been flashed**. It is built from two things that ARE measured:
 the line format the handler in `firmware/hear_node/hear_node.ino` emits (dir-qualified name,
-two spaces, size, ` B`), and real clip names and the real 128044 B clip size observed on nyquist
+two spaces, size, ` B`), and real clip names and the real 480044 B clip size
 on 2026-09-09.
 
 It mixes both shipped name shapes on purpose. `nyquist-<boot>-<sample>.wav` is what the FLASHED

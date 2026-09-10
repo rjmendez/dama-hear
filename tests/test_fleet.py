@@ -86,7 +86,7 @@ class TestTheSplitGate(TestDriftReport):
     """`--require-one-build` — opt-in, and ONLY for the split.
 
     The default stays report-only on purpose: a node with no sky yet is not a failure, and a tool
-    that cries wolf about tonight teaches its operator to ignore it. A split fleet is different in
+    that cries wolf teaches its operator to ignore it. A split fleet is different in
     kind -- never transient, never self-healing, and it silently invalidates the capture.
     """
 

@@ -3,7 +3,7 @@
 # hold before `kubectl patch cronjob hear-tag -n dama -p '{"spec":{"suspend":false}}'`:
 #
 #   1. clips/index.jsonl holds >= 300 rows with outcome "stored", across all three nodes, over at
-#      least 3 consecutive days. Below that the corpus cannot show what a normal night looks like.
+#      least 3 consecutive days. Below that the corpus cannot show what a normal day looks like.
 #   2. A human has LISTENED to >= 30 of them, including at least one from mach, and written what
 #      they heard into docs/clip-calibration-<date>.md, per node. Three models agreeing on "Dog"
 #      is corroboration, not ground truth, and nobody has yet heard a single clip this fleet
@@ -157,7 +157,7 @@ spec:
 # declined to tag. It also exits 0 on a run that read an EMPTY directory. This job is what a
 # monitor keys on.
 #
-# ⚠️IT MUST NOT KEY ON THE CLASSES. A quiet night is the expected result, and a gate asking "did
+# ⚠️IT MUST NOT KEY ON THE CLASSES. A quiet period is the expected result, and a gate asking "did
 # anything score high" fires on a correct run and stays silent on a broken one. The gates are
 # throughput, refusal buckets, torn lines, the accounting invariant, weight verification and
 # staleness. The class distribution prints under `OBSERVATION, not a gate`.

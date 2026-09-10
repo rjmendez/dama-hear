@@ -177,8 +177,8 @@ class NodeClass:
 
         `limit` is "microphone" or "nyquist", and they need different remedies: a Nyquist ceiling
         is fixed by sampling faster, a microphone ceiling is fixed only by a different part. The
-        distinction is not pedantic -- the XIAO nodes are Nyquist-bound at 8 kHz today and would
-        still be microphone-bound at 15 kHz with the planned ICS-43434.
+        distinction is not pedantic -- the XIAO PDM nodes are microphone-bound at 10 kHz, and the
+        planned ICS-43434 would be microphone-bound at 15 kHz.
         """
         hi, limit = self.band_hz[1], "microphone"
         if self.nyquist_hz < hi:
@@ -345,12 +345,12 @@ register(NodeClass(
     # measured on BOTH sides, not just on its own.
     path_bias_s=1.0 / 16000.0,
     mic_count=1,
-    fs_hz=16000.0,
-    # The XIAO's onboard PDM MEMS part. The low edge is where the firmware's DC block sits (1.6 Hz)
-    # and the high edge is well above Nyquist, so Nyquist is what binds -- usable_band_hz() says so.
+    fs_hz=48000.0,
+    # The XIAO's onboard PDM MEMS part. The low edge is where the firmware's DC block sits (1.6 Hz);
+    # the datasheet's response ends at 10 kHz, so at 48 kHz the microphone binds, not Nyquist.
     band_hz=(50.0, 10000.0),
     env=("temp", "press"),
-    raw_retain_s=240.0,
+    raw_retain_s=80.0,   # 7.68 MB of PSRAM at 48 kHz; firmware before hear_node stepped to 60 s
     notes="XIAO ESP32-S3 Sense + u-blox GPS on D0 PPS + BMP280 + microSD. nyquist, mach, rankine "
           "-- all three answered GET /status with this class 2026-09-10.",
 ))

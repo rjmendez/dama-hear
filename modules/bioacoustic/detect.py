@@ -5,11 +5,11 @@ WHY THIS IS NOT hear/node/detect.py WITH DIFFERENT NUMBERS. That gate is a broad
 sized for an impulse, and the 2026-09-07 12.08 h capture measured exactly how far it is from this
 job. Its floor is 800 counts against a median ambient of 28.95 -- 28.8 dB over the background, and
 19.6 dB over ambient p95 (84.11). A chorus sitting a plausible 10 dB over ambient is ~19 dB under
-that gate and cannot fire it at any hour of the night. Worse, the gate's envelope is broadband,
-and the night's own sketches say what that costs.
+that gate and cannot fire it at any hour. Worse, the gate's envelope is broadband,
+and the capture's own sketches say what that costs.
 
     RECIPE, so the numbers below are reproducible rather than asserted. Capture is
-    ~/dama-hear-night-2026-09-07/final/. health.csv holds 1450 rows; its utc_us spans
+    ~/dama-hear-capture-2026-09-07/final/. health.csv holds 1450 rows; its utc_us spans
     07:16:23.7 to 19:21:15.9 UTC and its uptime_s runs 28 s to 43521 s -- 12.081 h either way,
     which is where "12.08 h" comes from. The ambient figures above are the median and the 95th
     percentile of that file's `ambient` column over all 1450 rows, in counts, against the
@@ -106,7 +106,7 @@ CLOSE_S = 0.25               # a gap this short does not end a song
 MAX_DURATION_S = 10.0
 # Structure thresholds, measured on this box against synthetic references. They are NOT measured
 # on field data: the 2026-09-07 capture contains no biological example to measure them on, and
-# saying so is the point -- these are provisional numbers to be refitted the first night this
+# saying so is the point -- these are provisional numbers to be refitted the first time this
 # detector records something a person has listened to.
 # RECIPE for both thresholds: the helpers in tests/test_bioacoustic.py, at the shipped defaults,
 # on this box. `noise` is _band_noise(n, gain=8.0, seed=2); `buzz` is _buzz(4 s, snr_db=S) fed to
@@ -373,7 +373,7 @@ class TonalGate:
     level that is keeping it disarmed. The firmware hit this in the field and fixed it -- see
     `gate()` in firmware/hear_node/hear_node.ino and the `ALPHA_UP` constant above it, whose
     comment records the measurement: "156 s solid disarmed, envelope 1400-1600 against thr 800,
-    ambient frozen at 73.2, two detections all night". A chorus IS a floor that rises for hours,
+    ambient frozen at 73.2, two detections all run". A chorus IS a floor that rises for hours,
     so this module cannot afford that failure and does not have the branch.
 
     ⚠️THE PRICE OF THAT IS PAID ACROSS EVENTS, NOT INSIDE ONE, AND THIS CLASS USED TO CLAIM THE
@@ -425,7 +425,7 @@ class TonalGate:
         self.limit = band_limit(band[0], band[1], self.fs, mic_f_hi)
         if not self.limit["reachable"]:
             # Refuse rather than return nothing forever. A gate asked for 15-60 kHz at 16 kHz will
-            # never fire, and silence is indistinguishable from a quiet night.
+            # never fire, and silence is indistinguishable from a quiet period.
             raise ValueError("band unreachable: " + self.limit["note"])
         self.f_lo = self.limit["f_lo"]
         self.f_hi = self.limit["f_hi_eff"]

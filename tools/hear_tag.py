@@ -28,7 +28,7 @@ were not.
   * BirdNET V2.4: the only thing that answers WHICH bird, 48 kHz native -- and CC BY-NC-SA, which
     plausibly follows every probe onto the APK. Take BirdNET's answers via puc's BirdWeather
     feed; do not take its weights.
-  * PANNs/CNN14: wants 32 kHz, 17 % of its filterbank lands on guaranteed zeros at 16 kHz, and it
+  * PANNs/CNN14: wants 32 kHz, and it
     measured 14 % lower confidence than YAMNet on the same A/B for 311 ms and 1.5 GB RSS.
   * Perch 2.0 is NOT a competitor to this file. It is the bioacoustic embedding tier, 1536-d,
     Apache-2.0, and it is still gated (docs/acoustic-stack.md S5). This is the coarse tier.
@@ -45,19 +45,9 @@ is confidence (Speech 0.15 -> 0.29, Insect 0.13 -> 0.27 on individual clips), be
 log-power with a fixed (log + 4.5) / 5 offset so absolute level moves every band. Still
 mandatory, no longer load-bearing on its own.
 
-⚠️THE RATE IS RESAMPLED NOW, AND THE REFUSAL MOVED RATHER THAN VANISHED. mn10_as is 32 kHz
-native; the fleet writes 48 kHz and used to write 16 kHz, so "refuse anything but 16 kHz" would
-now refuse the entire corpus. hear/resample.py snaps the header rate to a rate this fleet
-actually clocks and RAISES otherwise -- mach's 22624 Hz boot is still thrown out into a counted
-bucket rather than stretched into plausible-looking tags. What crosses:
-
-    48000 -> 32000  L=2 M=3  decimation.    Every band the model reads is measurement.
-    16000 -> 32000  L=2 M=1  interpolation. Above 8 kHz is the filter, not the night.
-
-`band_limit_hz`, `fs_source_hz` and `upsampled` ride on every row so the second case can never be
-read as the first. Measured penalty, within-clip on the 7 real 48 kHz clips (native 48->32 versus
-band-crippled 48->16->32): score-vector cosine 0.90-0.99, top-1 changed on 1 of 7. So for THIS
-model the upsample is not very damaging -- which says nothing about Perch, whose Gate 2 is open.
+⚠️THE RATE IS RESAMPLED, AND ONLY FROM 48 kHz. mn10_as is 32 kHz native and the nodes acquire at
+48 kHz: hear/resample.py decimates 48 -> 32 (L=2 M=3), so every band the model reads is
+measurement. A header rate that does not snap to 48 kHz is refused into a counted bucket.
 
 ⚠️THE WHOLE SCORE PICTURE IS STORED, NEVER A HARD TOP-1. Every class above SCORE_FLOOR, plus
 `max_unstored_score` so the discarded tail is a number rather than an absence. hear/pool.py:721
@@ -66,11 +56,9 @@ has twice lost data to a filter chosen at ingest, and a threshold picked now, on
 mostly quiet and that nobody has listened to, either manufactures positives or deletes the honest
 negatives a trainer would need.
 
-⚠️THE 1024-d EMBEDDING IS STORED BECAUSE THE AUDIO IS A CACHE. It is free (same forward pass), it
-is a fixed 16 kHz-native axis -- unlike the scene.csv (20x4, 62.5-7812.5 Hz) versus sketch (20x8,
-300-20000 Hz) band-axis split that hear/pool.py refuses to pool across -- and `clips.prune()`
-deletes WAVs at a 2 GiB cap. The embedding is what makes any later clustering possible without
-re-fetching audio the node destroyed months ago.
+⚠️THE 960-d EMBEDDING IS STORED BECAUSE THE AUDIO ROLLS OFF. It is free (same forward pass), and
+`clips.prune()` deletes WAVs at a 2 GiB cap; the embedding is what makes later clustering possible
+after the clip itself is gone.
 
 ⚠️A TAG IS NOT A LABEL AND MUST NOT BECOME A TRAINING TARGET. `provenance` is the literal string
 "model" on every row and `claim.usable_as_training_label` is False. Fitting a scene- or sketch-
@@ -152,7 +140,7 @@ MODEL_EMBED_DIM = 960
 #: BirdNET's 1024 collide there; 960 cannot be mistaken for either, and every embedding this file
 #: writes carries `dim` so a consumer dispatches on width before anything else.
 
-#: The rate the model's mel frontend was trained at. Clips are 16 kHz or 48 kHz and are RESAMPLED
+#: The rate the model's mel frontend was trained at. Clips are 48 kHz and are decimated to it --
 #: to it -- see hear/resample.py for which direction manufactures band and how that is labelled.
 MODEL_FS_HZ = 32000
 #: The model is fully convolutional with global pooling, so a clip goes through in ONE pass and
@@ -236,7 +224,7 @@ class WeightsRefused(RuntimeError):
 
 
 class RateRefused(ValueError):
-    """The WAV header states a rate YAMNet's fixed 16 kHz frontend cannot be fed."""
+    """The clip's header rate is not the acquisition rate."""
 
 
 # ----------------------------------------------------------------- PURE
@@ -341,17 +329,7 @@ def normalise(x: "Any", target_dbfs: float = TARGET_DBFS) -> Tuple["Any", float]
 def to_model_rate(pcm: "Any", header_fs: int, csv_fs: Optional[float] = None) -> Dict[str, Any]:
     """Resample a clip to the model's rate, or refuse it. -> hear.resample.resample()'s dict.
 
-    ⚠️THE HEADER IS AUTHORITATIVE, NOT THE CSV. `fs_hz` in dets.csv is the node's own estimate and
-    has disagreed with the file it describes by 6,624 Hz for a whole boot on mach. The header is
-    what the samples were written at; the CSV value is carried into the tag row beside it so the
-    disagreement stays visible, but it is never what is resampled from.
-
-    ⚠️THIS REPLACED A HARD REFUSAL OF EVERY RATE BUT 16 kHz, AND THE REFUSAL DID NOT GO AWAY --
-    it moved. YAMNet's frontend was fixed at 16 kHz and the fleet's clips were 16 kHz, so
-    "refuse anything else" was both correct and free. mn10_as wants 32 kHz and the fleet now
-    writes 48 kHz, so refusing on rate would refuse the entire corpus. What is refused instead is
-    a rate NOBODY CONFIGURED -- hear/resample.py snaps to a fleet rate within 0.5 % and raises
-    otherwise, so mach's 22624 Hz boot is still thrown out rather than quietly stretched.
+    The header is authoritative, not the CSV: the CSV value rides beside it on the row.
     """
     try:
         return RESAMPLE.resample(pcm, float(header_fs), float(MODEL_FS_HZ))
@@ -518,8 +496,8 @@ def model_card(verified: Dict[str, Any]) -> Dict[str, Any]:
             "SIGMOID over AudioSet's %d classes -- multi-label, so they do not sum to 1. The "
             "time average is the network's own global pool, not a mean this pipeline computes. "
             "It is a general-purpose sound-event score from a model distilled from transformers "
-            "trained on YouTube audio, applied to a 4-5 s clip from a fixed outdoor microphone "
-            "at night. It is NOT a species identification, NOT calibrated to this site, and NOT "
+            "trained on YouTube audio, applied to a 5.0 s clip from a fixed outdoor microphone. "
+            "It is NOT a species identification, NOT calibrated to this site, and NOT "
             "anything a human has confirmed." % MODEL_CLASSES),
         "why_this_model": (
             "AudioSet mAP 0.471 against YAMNet's 0.306 at 4.88M parameters, MIT-licensed. "
@@ -537,20 +515,8 @@ def model_card(verified: Dict[str, Any]) -> Dict[str, Any]:
             "pipeline without this step emits Silence for every clip and exits 0."
             % TARGET_DBFS),
         "rate_policy": (
-            "the WAV header rate is snapped to a rate this fleet actually clocks (16000, 32000, "
-            "48000, within 0.5 %%) and the clip is resampled to %d Hz. A rate outside that set "
-            "is REFUSED, not stretched -- mach shipped a whole boot headed 22624 Hz and it is "
-            "still thrown out. 48 kHz -> 32 kHz is a decimation and every band is measurement; "
-            "16 kHz -> 32 kHz is an interpolation and everything above 8 kHz is the filter's, "
-            "which is why band_limit_hz and fs_source_hz ride on every row."
-            % MODEL_FS_HZ),
-        "upsampling_penalty_measured": (
-            "within-clip A/B on the 7 real 48 kHz clips, native (48->32) against band-crippled "
-            "(48->16->32): score-vector cosine 0.90-0.99, top-1 changed on 1 of 7, and the "
-            "Insect score moved by only +0.021 on average with sign flips both ways. So for THIS "
-            "model the 16 kHz corpus is not badly damaged by the upsample. It says nothing about "
-            "Perch, which is a different model at a different native rate; Gate 2 of "
-            "docs/acoustic-stack.md S1 remains open for Perch."),
+            "the WAV header rate must snap to the 48 kHz acquisition rate (0.5 %%); the clip "
+            "is decimated to %d Hz. Any other rate is refused, not stretched." % MODEL_FS_HZ),
         "score_floor": SCORE_FLOOR,
         "score_floor_note": (
             "a STORAGE bound, not a decision threshold. Classes below it are summarised by "
@@ -578,8 +544,7 @@ def model_card(verified: Dict[str, Any]) -> Dict[str, Any]:
             "birdnet": ("zero birds across nine real clips, neotropical hypotheses at the "
                         "confidence floor, 1 s of every 4 discarded (48 kHz x 3.0 s windows "
                         "against a 4.0 s clip), and CC BY-NC-SA weights"),
-            "panns_cnn14": ("wants 32 kHz; 17% of its filterbank lands on guaranteed zeros at "
-                            "16 kHz; measured 14% lower confidence than YAMNet on the same A/B; "
+            "panns_cnn14": ("wants 32 kHz; measured 14% lower confidence than YAMNet on the same A/B; "
                             "311 ms and 1.5 GB RSS against 12 ms and 82 MB"),
         },
         "species_id_is_out_of_scope": (
@@ -742,42 +707,28 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
     except Exception as exc:
         return {"ok": False, "reason": R_WAV_UNREADABLE,
                 "detail": "%s: %s" % (type(exc).__name__, exc)}
-    # ⚠️LENGTH IS CHECKED AS A DURATION, NEVER AS A BYTE COUNT. This test read
-    # `len(pcm) * 2 + 44 != CLIP_BYTES_16K_4S` and so refused every clip the 48 kHz firmware
-    # writes -- the same magic number, in the same shape, that hear/clips.py had already been
-    # fixed for. A constant copied out of one module keeps its number and loses its meaning.
-    probe = {"fs_hz": int(header_fs), "dur_s": len(pcm) / float(header_fs or 1)}
-    # Two distinct rate defects are on the cards: the FS_NOMINAL-stamped 48 kHz clip (an integer
-    # decimation apart) and mach's latched 22624/22848 Hz boot (not an integer anything, only
-    # recoverable from the length). Neither can fire on the other's clips.
-    fix = (CLIPS.header_rate_suspect(probe)
-           or CLIPS.length_implies_rate(len(pcm), header_fs, row.get("fs_hz")))
-    true_fs = fix["true_fs_hz"] if fix else float(header_fs)
-    # ⚠️THE RATE IS SETTLED BEFORE THE LENGTH, BECAUSE THE LENGTH IS MEASURED IN IT. Checked the
-    # other way round, mach's 22624 Hz boot came back as `wav_sample_count` -- 64000 samples read
-    # as 2.83 s and refused for being the wrong duration, which is true and useless. The rate is
-    # the defect; the duration is a symptom of it.
+    # The rate is settled before the length, because the length is measured in it.
     try:
-        RESAMPLE.snap(true_fs)
+        RESAMPLE.snap(header_fs)
     except RESAMPLE.RateRefused as exc:
         return {"ok": False, "reason": R_RATE_REFUSED,
                 "detail": "%s The dets CSV said %s Hz." % (exc, row.get("fs_hz"))}
-    dur_s = len(pcm) / true_fs if true_fs else 0.0
-    if not any(abs(dur_s - g) <= g * CLIPS.CLIP_GEOMETRY_TOL for g in CLIPS.CLIP_GEOMETRIES_S):
+    dur_s = len(pcm) / float(header_fs)
+    if abs(dur_s - CLIPS.CLIP_TOTAL_S) > CLIPS.CLIP_TOTAL_S * CLIPS.CLIP_DUR_TOL:
         return {"ok": False, "reason": R_WAV_SAMPLES,
-                "detail": "%d samples at %g Hz is %.3f s; a clip is one of %s s (1.0 s pre plus "
-                          "3.0 s post at 16 kHz, 4.0 s post at 48 kHz)"
-                          % (len(pcm), true_fs, dur_s,
-                             "/".join("%.1f" % g for g in CLIPS.CLIP_GEOMETRIES_S))}
+                "detail": "%d samples at %g Hz is %.3f s; a clip is %.1f s (%.1f s pre, %.1f s post)"
+                          % (len(pcm), header_fs, dur_s, CLIPS.CLIP_TOTAL_S, CLIPS.CLIP_PRE_S,
+                             CLIPS.CLIP_POST_S)}
     try:
-        rs = to_model_rate(pcm, true_fs, row.get("fs_hz"))
+        rs = to_model_rate(pcm, header_fs, row.get("fs_hz"))
     except RateRefused as exc:
         return {"ok": False, "reason": R_RATE_REFUSED, "detail": str(exc)}
+    # The level recorded is the RECORDING's, taken before the 48 -> 32 kHz decimation removes the
+    # band above 16 kHz (measured: -1.8 dB on wideband noise). Normalisation runs after it, so the
+    # model sees the target level regardless.
+    pre_db = dbfs(pcm)
     try:
-        # ⚠️NORMALISE AFTER RESAMPLING, NOT BEFORE. The resampler is unity-gain in the passband
-        # but not sample-for-sample, so normalising first leaves the level a fraction of a dB off
-        # the target for reasons that have nothing to do with the recording.
-        pcm, pre_db = normalise(rs["pcm"])
+        pcm, _ = normalise(rs["pcm"])
     except ValueError as exc:
         return {"ok": False, "reason": R_DIGITAL_SILENCE, "detail": str(exc)}
     try:
@@ -804,19 +755,8 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
         "embedding": got["embedding"],
         "pre_norm_dbfs": pre_db,
         "wav_header_fs_hz": int(header_fs),
-        # ⚠️WHAT THE MODEL ACTUALLY SAW, BESIDE WHAT THE NODE RECORDED. `band_limit_hz` below the
-        # model's Nyquist means the bands above it are the interpolation filter's output and not
-        # sound; a reader that treats a 16 kHz-sourced score above 8 kHz as measurement is making
-        # the mistake docs/acoustic-stack.md S4.6 forbids one layer down.
         "fs_model_hz": rs["fs_hz"],
         "fs_source_hz": rs["fs_source_hz"],
-        "fs_source_nominal_hz": rs["fs_source_nominal_hz"],
-        "band_limit_hz": rs["band_limit_hz"],
-        "upsampled": rs["upsampled"],
-        "resample_L": rs["L"], "resample_M": rs["M"], "resample_taps": rs["taps"],
-        # The clip's own header lied for the whole 48 kHz rollout; when it did, say so here
-        # rather than silently scoring 15 s of audio that is really 5.
-        "header_rate_suspect": fix,
         # ⚠️BOTH RATES, SIDE BY SIDE, ALWAYS. The CSV estimate and the file's own header disagreed
         # by 6,624 Hz for a whole boot; keeping one of them would have made that invisible.
         "csv_fs_hz": row.get("fs_hz"),
@@ -824,8 +764,7 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
         "window": ({"t_start_utc_s": row.get("t_start_utc_s"),
                     "t_end_utc_s": row.get("t_end_utc_s")}
                    if row.get("anchored") and row.get("t_start_utc_s") is not None else None),
-        # The corrected length, not the row's: a v1 row has no dur_s and may be mis-headed.
-        "sample_window": TAGS.sample_window(dict(row, dur_s=dur_s)),
+        "sample_window": TAGS.sample_window(row),
         "provenance": "model",
         "created_utc_s": now,
     }
@@ -923,11 +862,11 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
     t["observation_not_health"] = {
         "level_dbfs": _distribution(t.pop("dbfs")),
         # ⚠️AGGREGATED, NOT ONLY PER ROW. `max_unstored_score` made the discarded tail a number on
-        # each row; nothing summed it, so a floor set too high looked exactly like a quiet night.
+        # each row; nothing summed it, so a floor set too high looked exactly like a quiet period.
         "max_unstored_score": _distribution(t.pop("unstored")),
         "silence_top_frac": t["silence_frac"],
         "mean_top_score": t["mean_top_score"],
-        "note": ("the class distribution is NOT an input to any gate. A quiet night is the "
+        "note": ("the class distribution is NOT an input to any gate. A quiet period is the "
                  "expected result; a gate keyed on 'did anything score high' fires on a correct "
                  "run. silence_top_frac is gated only once a human calibration set has been "
                  "measured -- see docs/acoustic-stack.md, the Phase-3 gate."),
@@ -1012,7 +951,7 @@ def write_heartbeat(root: str, report: Dict[str, Any], now: Optional[float] = No
         "silence_frac": report.get("silence_frac"),
         # ⚠️`scored_any` IS AN ABSOLUTE SIGNAL AND `silence_frac` IS NOT. A model that returns
         # nothing above the floor for every clip reports silence_frac 0.000 -- the best possible
-        # value -- and passed the Phase-3 gate more easily than any real night can. This says
+        # value -- and passed the Phase-3 gate more easily than any real run can. This says
         # whether the model produced OUTPUT AT ALL, which is not a claim about the audio.
         "scored_any": report.get("scored_any"),
         "versions_held": report.get("versions_held") or {},
@@ -1032,7 +971,7 @@ def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
                window_s: float = DEFAULT_RUN_WINDOW_S,
                max_stale_s: float = DEFAULT_MAX_STALE_S,
                now: Optional[float] = None) -> Tuple[int, List[str]]:
-    """(exit code, lines). Non-zero when tagging is not flowing, not when the night was quiet.
+    """(exit code, lines). Non-zero when tagging is not flowing, not when the period was quiet.
 
     ⚠️EVERY GATE HERE CAN ACTUALLY FAIL, AND THE ABSOLUTE ONES COME FIRST. A gate of the form "if
     clips arrived and none were tagged" passes vacuously on an empty read -- point --pool at
@@ -1079,7 +1018,7 @@ def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
     keys = last.get("index_keys") or 0
     if not keys:
         lines.append("index    EMPTY     the newest run read 0 clip rows from %s -- an empty read "
-                     "is a failure, not a quiet night (wrong --pool root?)"
+                     "is a failure, not a quiet period (wrong --pool root?)"
                      % CLIPS.index_path(root))
         bad += 1
     else:
@@ -1130,7 +1069,7 @@ def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
     if measured and tagged > 0 and scored == 0:
         lines.append("scores   NONE      %d clip(s) tagged and not one scored a single class "
                      "above the floor -- the model produced no output, which is not a quiet "
-                     "night" % tagged)
+                     "period" % tagged)
         bad += 1
     elif measured:
         lines.append("scores   ok        %d of %d tagged clip(s) scored at least one class"

@@ -77,12 +77,11 @@ four times an hour, over `/sd`. That correlation is strong and the mechanism is 
 I did not instrument the drain pod against the ratio, and rankine also has a much smaller card
 and no `scene.csv` to fetch at all, so two variables move together.
 
-⚠️**The denominator is the trap.** `/status`'s `raw` block spans `cap_samples` (3,840,000 =
-240.0 s nominal). `/audio` spans `addressable_samples` (3,584,000 = 224.0 s nominal, after the
-16 s overwrite guard). Pairing `/audio`'s span with `cap_samples` gives 0.933 and **can never
-reach 1.02**, which is a check that cannot fail. Paired correctly, `/audio` agrees with
-`/status`: nyquist's `/audio` span was 245.958 s over 224.0 s = **1.0980** against `/status`'s
-1.0915. Either endpoint is a valid instrument; **each must be divided by its own sample count.**
+⚠️**The denominator is the trap.** `/status`'s `raw` block spans `cap_samples` (the whole ring);
+`/audio` spans `addressable_samples` (the ring less the 16 s overwrite guard). Both are counted in
+`FS_NOMINAL` samples — 960,000 for the 60 s ring the nodes run today. Pairing `/audio`'s span with
+`cap_samples` gives a ratio that **can never reach 1.02**, which is a check that cannot fail.
+Either endpoint is a valid instrument; **each must be divided by its own sample count.**
 Any implementation must carry a self-test that a known-healthy node reads within ~0.003 of 1.000,
 so a wrong-denominator implementation fails immediately instead of reading permanent green.
 
@@ -91,17 +90,14 @@ so a wrong-denominator implementation fails immediately instead of reading perma
 > Operator page for the shipped pipeline, and the list of what it does NOT establish:
 > **`docs/clip-pipeline.md`**. Read that before quoting anything out of `clips/tags.jsonl`.
 
-Measured across the fleet on **2026-09-09**. Every node writes 4.0 s WAVs (1.0 s pre-trigger +
-3.0 s post, 16 kHz 16-bit mono, 128,044 B) into `/clips` against a 6,291,456 B budget — exactly
-49 files — and evicts oldest-by-name when it is full. nyquist wrote 274 and evicted ~225; mach
-wrote 102 and evicted ~53; rankine wrote 249 and evicted ~200. **625 written, ~478 destroyed, 0
-collected.** `tools/hear_drain.py` contained zero mentions of clips, and the `/ls` handler
-hardcoded `SD.open("/")`, so nothing could even enumerate them.
+Every node writes 5.0 s WAVs (1.0 s pre-trigger + 4.0 s post, 48 kHz 16-bit mono, 480,044 B) into
+`/clips`, a rolling window of 13 clips (6,291,456 B) that evicts its oldest; `tools/hear_drain.py`
+fetches them before they roll off.
 
-Two things made the loss invisible rather than loud:
+Two fetch traps:
 
   `fetch_sd` reads a clip as ABSENT   it requires the body to start with `b"node"` or `b"utc_us"`.
-                                      A WAV starts with `b"RIFF"`, so a present 128,044 B clip
+                                      A WAV starts with `b"RIFF"`, so a present clip
                                       came back as "the node does not have it". Hence `fetch_clip`.
   200 is not proof of a file          `/sd?file=/clips` answers **200 with a 0-byte body**. The
                                       magic and the length are checked, not the status code.
@@ -152,12 +148,9 @@ exhaustion included, so it takes `CL.CONFIRM_404` consecutive ones before the te
 serves one client at a time and refuses the rest, so a second workload reaching a card converts
 hear-drain's slow run into a refused one. `deploy/k8s/hear-tag.yaml` ships `suspend: true`.
 
-**The model.** YAMNet as TFLite under `ai-edge-litert`, not under TensorFlow: bit-identical
-scores at 12.1 ms/clip in 82 MB RSS from a 146 MB venv, against 14.3 ms in 903 MB from a 1.4 GB
-venv, and the PVC is the binding constraint. All 64 of YAMNet's mel bins sit below 8 kHz, so the
-16 kHz ceiling costs it nothing. **BirdNET is not built** — zero birds across nine real clips,
+**The model.** EfficientAT `mn10_as` under onnxruntime (§6.2b). **BirdNET is not built** — zero birds across nine real clips,
 neotropical hypotheses at the confidence floor, 1 s of every 4 discarded, CC BY-NC-SA weights.
-**PANNs/CNN14 is not built** — 32 kHz wanted, 17 % of its filterbank on guaranteed zeros, a
+**PANNs/CNN14 is not built** — 32 kHz wanted, a
 measured 14 % confidence loss on the same A/B, 311 ms and 1.5 GB RSS. The goal is **event
 triage**, not species ID: YAMNet has `Bird`, `Owl`, `Hoot`, `Chirp` and stops.
 
@@ -230,14 +223,12 @@ live:
 
 | class | `fs_hz` | `mic_count` | `raw_retain_s` | note |
 |---|---|---|---|---|
-| `xiao-s3-pps` | 16000 | 1 | **240.0** | the only class with a ring |
+| `xiao-s3-pps` | 48000 | 1 | **80.0** | the only class with a ring |
 | `xiao-s3-i2s` | 48000 | 1 | 80.0 | "Planned I2S variant. **Not built.**" |
 | `puc-pps` / `puc-ntp` | 48000 | 2 | **0.0** | |
 | `gotchi-phone` | 44100 | 1 | **0.0** | |
 
-**Every byte the central stack can retrospectively pull today is 16 kHz, band-limited to 8 kHz.**
-This is the binding constraint on central classification — bigger than model choice — and it is
-what gates §5's stage S1.
+Every byte the central stack can retrospectively pull comes from the xiao nodes, at 48 kHz.
 
 **1.3 Pulling deafens the node and the node cannot see it.** Measured on rankine
 (2026-09-09, transport survey), using ring wall span as the instrument:
@@ -256,7 +247,7 @@ already gone*". So the loss fraction on `/audio` is **link-speed dependent by co
 
 The counter is structurally blind (`hear_node.ino:2989-3040`): the audit differences the two
 most recently **seen** PPS edges, so a stall spanning N > 1 edges is charged **one** second, and
-if the surviving delta clears `0.97 × 16000` it is charged **zero**.
+if the surviving delta clears `0.97 × FS_NOMINAL` it is charged **zero**.
 
 **Consequence for the whole design: the transport budget is denominated in seconds of node
 deafness per hour, not in bytes.** Bandwidth is not the constraint — three parallel `/audio`
@@ -273,15 +264,16 @@ constraint is one ESP32 core and its pull duty cycle.
 
 | tier | emits continuously | holds locally | central pulls on demand |
 |---|---|---|---|
-| xiao nodes (nyquist, mach, rankine) | 172 B sketch per gate event; 20×4 scene row every 1.024 s | 240 s PSRAM raw ring (3,840,000 samples, 7.68 MB); SD at 20.81 MB/day measured | `GET /audio?from=&dur=` → WAV. **224 s addressable**, **`max_dur_s` = 30** |
+| xiao nodes (nyquist, mach, rankine) | 172 B sketch per gate event; 20×4 scene row every 1.024 s | 80 s PSRAM raw ring (3,840,000 samples at 48 kHz, 7.68 MB; 60 s on firmware before hear_node); SD at 20.81 MB/day measured | `GET /audio?from=&dur=` → WAV. **224 s addressable**, **`max_dur_s` = 30** |
 | hugbot | 172 B sketch on `dama/hugbot5000/acoustic_sketch` (fleet broker, mTLS) + per-board bearing cone on `audio_bearing` | 8 s ESP ring, PPS-anchored **on the Pi only** | **nothing** |
 | puc | BirdWeather/BirdNET detections upstream (station 4066) | nothing | **nothing** |
 | phones | 172 B sketch on `dama/<node>/acoustic_sketch` | `AudioCaptureRing`, `raw_retain_s = 0` | **nothing** |
 
-**The ring is the architectural licence.** 224 s of retrospective slack means a central
-classifier may take up to ~3 minutes to decide it wants audio. That is the entire reason a
-battery node is allowed to stay dumb. A four-minute pull is 8–10 paced requests, 57.4 s wall,
-167 kB/s effective (measured, rankine), and costs that node ~14 s of its own capture.
+**The ring is the architectural licence.** An 80 s ring less the 16 s overwrite guard gives a
+central classifier ~64 s to decide it wants audio (~44 s on the 60 s ring the nodes run today).
+That is the entire reason a battery node is allowed to stay dumb. Pulled audio is 48 kHz, so a
+pull moves three times the bytes per second of audio that the transport measurements below were
+taken at.
 
 **Budget, per node, enforced as a token bucket:** charge *actual transfer seconds × that node's
 own measured loss fraction*, where the loss fraction is re-derived from the ring-wall-span
@@ -337,7 +329,7 @@ from the live drain** — the written-whole hazard the repo documents for Config
 CronJob spec. Another session added rankine to the live object within the last hour; a third
 session added `--phone-corpus`. **This document's only manifest change is to add
 `--phone-corpus` back to the repo file** so the file is a superset of the live object and
-applying it is safe. Verify the live args again before applying — they have moved twice tonight.
+applying it is safe. Verify the live args again before applying — they have moved twice in one day.
 
 Retire the earlier "S0 = add rankine to the drain" item: rankine is already in the live CronJob,
 and per §0.1 what it actually needs is a filename fix, not a node-list entry.
@@ -449,7 +441,7 @@ The system refuses to:
 6. **Score a cross-rate frame without `layout=fixed`.** Measured cost of getting it wrong on
    identical audio: AUC 0.9473 → 0.9141.
 7. **Claim species-level insect ID.** Field SOTA is macro F1 0.56–0.58 on a curated corpus
-   (InsectSet459). 16 kHz puts most katydids physically outside the data
+   (InsectSet459). Ultrasonic katydids are outside the data
    (`modules/bioacoustic/detect.py`: ultrasonic 15–60 kHz "*here to be refused, not to be
    used*"). Ship presence and chorus intensity; state the ceiling in the same sentence.
 8. **Score a sketch as calibrated across nodes** — see §6.1, which is the sharpest constraint in
@@ -479,8 +471,7 @@ S0's instruments are the ones the shipped code actually supports:
 - **refusal counts by reason**, published, not logged. `score_sketch` raises `SketchMismatch` on
   a layout or band mismatch; over `testdata/sketch_golden.json` it scores 3 of 9 and refuses 6 on
   `layout='nyquist'`. Live pool rows are currently fine (`layout: "fixed"`, `fs_stated_by:
-  "frame"`; `valid_bands: 15` on the 16 kHz node history, **20** on phone rows and on node rows
-  from the 48 kHz sketch build), but a scorer that silently skips refusals reports "all clear"
+  "frame"`; `valid_bands: 20` on phone and node rows), but a scorer that silently skips refusals reports "all clear"
   identically whether the corpus is healthy or has gained a legacy row. A nonzero
   unstated-layout count is an **alert**.
 - **the `needs_label()` 0.35–0.65 band rate**, against the 14 % `classify.py:138` measured over
@@ -531,41 +522,23 @@ otherwise-orphaned tests acquire a consumer. But see §6.1 before deciding what 
 
 ### S1 — `hear-puller` + `hear-embed`. ⚠️GATED, and the gate is not a formality
 
-`hear-puller` issues budgeted `GET /audio` inside the 224 s window; `hear-embed` runs Perch 2.0
+`hear-puller` issues budgeted `GET /audio` inside the ring's ~64 s addressable window; `hear-embed` runs Perch 2.0
 on the GPU and writes width-tagged embeddings. **Two things must be true before S1 starts, and
 neither is true today.**
 
 **Gate 1 — the trigger must be inside the ring window.** ⚠️A verdict computed from
-`/pool/corpus` is 4–5× too late to address the audio that produced it: the drain is `*/15`
-(900 s) plus 53–78 s of job wall time, against a 223.995 s addressable ring. S0.2 makes it
+`/pool/corpus` is about 15× too late to address the audio that produced it: the drain is `*/15`
+(900 s) plus 53–78 s of job wall time, against a ~64 s addressable ring (~44 s on the 60 s ring
+the nodes run today). S0.2 makes it
 *worse*. **The pull trigger must be driven from `/detections`** — the live 128-deep RAM ring,
-~600 B/event, ~35 ms measured, including still-`PENDING` clips — polled well inside 224 s, with
+~600 B/event, ~35 ms measured, including still-`PENDING` clips — polled well inside that window, with
 `hear-drain` left doing archival only. Then the cadence cut in S0.2 is free rather than
-self-defeating. State the end-to-end latency as a number against 223.995 s. Unanchored sketches
+self-defeating. State the end-to-end latency as a number against the addressable window. Unanchored sketches
 (26.2 %) route to a lane that is explicitly not pullable.
 
-**Gate 2 — the sample-rate penalty must be measured, not assumed.** Perch 2.0 is 32 kHz native;
-every pullable byte is 16 kHz band-limited to 8 kHz (§1.2). Upsampling into a 32 kHz model
-presents **measured silence above 8 kHz as if it were measurement** — the same operation §4.6
-forbids one layer down, where it cost 0.9473 → 0.9141 on identical audio.
-
-⚠️The experiment the earlier draft nominated to price this — *"embed hugbot's 48 kHz ring native
-vs decimated-to-16-and-upsampled"* — **is unrunnable**. §2's own table says hugbot serves
-nothing; `wt-anom/wiring.json` declares `ring-pull-capture` `island: true`, "ON-REQUEST AND
-DELIBERATELY DISABLED", with no systemd unit on either host. There is no other 48 kHz source
-with retention anywhere in the fleet (`puc-*` 0.0, `gotchi-phone` 0.0, `xiao-s3-i2s` not built),
-and the 2026-09-05 training clips are 0.5 s against Perch's 5 s window.
-
-Two runnable substitutes, in cost order:
-- **puc's BirdWeather clips** — 48 kHz, 9 s granularity, already being recorded on this
-  property. Embed native vs decimated-to-16-and-upsampled and measure the probe AUC gap. Costs
-  no firmware, no node deafness, no operator time beyond an API pull.
-- **a one-off operator-supervised hugbot capture written to a file** — not a served endpoint, not
-  a re-enabled pull path.
-
-Until one of those produces a number, S1 may not ship a probe on upsampled 16 kHz. And
-"per-rate heads, not one pooled head" is **vacuous while exactly one pullable rate exists** —
-reinstate the rule when a second appears.
+**Gate 2 — closed.** It asked for the penalty of upsampling 16 kHz audio into Perch's 32 kHz input to
+be measured first. The nodes acquire at 48 kHz, so nothing is upsampled: Perch's input is a
+decimation of real 48 kHz audio.
 
 **Gate 3 — the GPU is real but the capacity figure is wrong.** `nvidia.com/gpu: 32` allocatable
 is `pattern: "*"` × `timeSlicing.replicas: 16` over **two physical cards** (verified:
@@ -649,16 +622,14 @@ corpus's 2.91 events/h/node it is free.
 draft said "0.9588 (0.9705 after the onset fix)" and **both are the wrong artifact**: 0.95895 is
 `model.json`'s `auc_grouped_cv` — the **six hand-feature** model, grouped not nested — and
 0.9705/0.97281 is the **20-band** `model_sketch.json`, which carries `min_fs_hz = 32000.0` and
-**cannot run on this fleet at all**. The number that applies to nyquist/mach/rankine — a model
-fitted on 48 kHz rig clips scoring 16 kHz audio — is the measured cross-rate transfer **0.9473**.
+**cannot run on this fleet at all**. The node sketches are 48 kHz, the rate the model was fitted on, so the corpus
+CV is the applicable figure; no in-situ figure exists for the 48 kHz sketches yet.
 
-> **Stage 0 quotes 0.9473 in situ on the 16 kHz nodes, and 0.9665 as its corpus CV. Nothing
-> else.** (`classify.py`'s and `README.md`'s docstrings still carry the stale 0.9588/0.9634 pair
+> **Stage 0 quotes 0.9665 as its corpus CV. Nothing else.** (`classify.py`'s and `README.md`'s docstrings still carry the stale 0.9588/0.9634 pair
 > against the artifacts' 0.9665/0.9728; fix those or this error re-imports itself.)
 
-Note also that `nfft = 256` is a fixed **sample** count: 5.33 ms / 187.5 Hz bins at 48 kHz vs
-16 ms / 62.5 Hz bins at 16 kHz. `layout=fixed` equalises band **edges**, not the analysis window.
-0.9473 already accounts for that; do not correct for it twice.
+Note also that `nfft = 256` is a fixed **sample** count: 5.33 ms / 187.5 Hz bins at 48 kHz.
+`layout=fixed` equalises band **edges** across rates, not the analysis window.
 
 ### 6.1 ⚠️THE MODEL CONSUMES ABSOLUTE dB AND THE FLEET IS NOT CALIBRATED
 
@@ -670,7 +641,7 @@ p = 0.1 → p = 0.9 range is `2·ln(9) / 0.5959` = **7.37 dB of `ref_db`**.
 
 No cross-node level calibration exists anywhere in this repo. `hear/node/telemetry.py` says so
 outright: the level is "*NOT calibrated to absolute SPL: that needs a reference the field does
-not have*". Measured tonight on identical hardware and identical firmware, mach's ambient is
+not have*". Measured on identical hardware and identical firmware, mach's ambient is
 **3.04 dB** above nyquist's — `+1.81` in `z`, **41 % of that entire range**, from nothing but a
 microphone. The reported +15.5 dB mach floor would be `+9.24`. The 90.31 dB normalisation error
 the hugbot emitter work found would be `+53.8` — a sigmoid pinned at 1.0 on every event forever.
@@ -694,7 +665,7 @@ Three admissible responses; pick one before S0b publishes a verdict anyone acts 
 all labelled supersonic CRACK — "*Retrain before trusting it somewhere else.*"
 
 Upstream of it, the only thing that produces a sketch at all is `hear/node/detect.py`'s
-**broadband amplitude gate**. Measured live tonight — and ⚠️**this has changed since the survey**:
+**broadband amplitude gate**. Measured live — and ⚠️**this has changed since the survey**:
 the floor is no longer 800. All three nodes report `floor: 200`, `floor_source: "file"`,
 `floor_default: 800`, `floor_saved: 200.0` — someone lowered it via `POST /gate` and it
 persisted. So:
@@ -705,13 +676,13 @@ persisted. So:
 | mach | 19.5 | 200 | **20.2 dB** |
 | rankine | 14.1 | 200 | **23.0 dB** |
 
-Against `modules/bioacoustic/detect.py`'s 12.081 h night capture (1450 `health.csv` rows), the
+Against `modules/bioacoustic/detect.py`'s 12.081 h capture (1450 `health.csv` rows), the
 lowered floor is 16.8 dB over median ambient (28.95) and **7.5 dB over ambient p95** (84.11) —
 much closer than the 28.8 / 19.6 dB that module measured at floor 800. So the *level* argument
 against the gate is now marginal rather than hopeless. **The other two arguments are unchanged by
 any floor:**
 
-- **Band masking.** All 48 in-run detections that night peaked in **mel band 0** (312.5–500 Hz),
+- **Band masking.** All 48 in-run detections in that capture peaked in **mel band 0** (312.5–500 Hz),
   and band 0 exceeded the mean of bands 16–19 (the four entirely above 4 kHz) by a **median
   24.6 dB**. Low-frequency rumble sets the envelope; the insect band is masked before the
   threshold is consulted.
@@ -721,7 +692,7 @@ any floor:**
 **Consequence, stated plainly: birds, insects and aircraft never produce a sketch, so Stage 0
 never scores them, so no pull is triggered, so the identifier never sees them — and the symptom
 is a low event rate and a green pipeline.** Live corroboration: 2 detections per node in
-~64 min on 3.5 wooded acres at night.
+~64 min on 3.5 wooded acres.
 
 Therefore:
 
@@ -755,7 +726,6 @@ rather than noted.
 | params | 3.7M | 4.88M |
 | classes | 521 | **527** (full AudioSet ontology) |
 | embedding | 1024 | **960** |
-| native rate | 16 kHz | 32 kHz |
 | licence | Apache-2.0 | MIT |
 | runtime | ai-edge-litert | onnxruntime |
 | per clip | 12 ms | **48 ms** incl. resample |
@@ -787,32 +757,6 @@ never downloads a model it cannot hash.
 **Normalisation is still mandatory and the reason shrank.** Over the 29 scorable clips of the
 2026-09-10 staging set, top-1 is `Silence` on **1 raw and 0 normalised** — where YAMNet returned
 `Silence` for every un-normalised clip. What it now buys is confidence, not an answer.
-
-### 6.2c Gate 2, partially answered — and my first reading of it was wrong
-
-§5 called the 48 kHz-versus-16 kHz experiment **unrunnable** for want of a 48 kHz source with
-retention. The nodes now write 48 kHz clips and the pool holds them, so it ran.
-
-**Within-clip A/B, 7 real 48 kHz clips**, native (48→32, every band measurement) against
-band-crippled (48→16→32, everything above 8 kHz is the interpolation filter):
-
-| | |
-|---|---|
-| score-vector cosine | **0.90 – 0.99** |
-| top-1 changed | **1 of 7** |
-| Insect score, native − crippled | **+0.021** mean (min −0.093, max +0.157) |
-
-⚠️**The band is not doing the work, and I nearly reported that it was.** Scoring all 30 staged
-clips, every 48 kHz clip came back `Insect`/`Animal` while the 16 kHz clips were dominated by
-`Speech` — which reads as a decisive argument for the extra octave. It is not: all seven 48 kHz
-clips are from rankine and mach on one night, so the split is confounded with node and time. The
-within-clip control above removes that confound and the effect nearly vanishes. A between-group
-difference is not a treatment effect.
-
-⚠️**This is a measurement of mn10_as, not of Perch.** Different model, different native rate,
-different training distribution. **Gate 2 remains open for Perch**; what has closed is the
-question for the coarse tier, and the method — a within-clip A/B on real 48 kHz audio — is now
-available for Perch the moment it is worth running.
 
 ### 6.3 Stage 1 — Perch 2.0, chosen on licence
 
@@ -853,7 +797,7 @@ retargeted or retired deliberately.)
 ## 7. What each tier contributes, and why flattening them destroys it
 
 - **xiao nodes** — GPS-PPS time (tAcc 24–28 ns, 0 glitches, PPS spread 6–9 µs) and the **only
-  240 s retrospective ring in the fleet**. They are the fleet's clock and its memory. They are
+  retrospective ring in the fleet** (80 s). They are the fleet's clock and its memory. They are
   single-mic and **structurally cannot bear**.
 - **hugbot** — the **only co-located multi-mic array**, 38.1 mm intra-mic, and therefore the only
   bearing that can be cross-checked. Capped at 4501 Hz. hugbot **emits, never serves**: battery
@@ -907,7 +851,6 @@ retargeted or retired deliberately.)
 | per-node `ref_db` offset across the fleet | whether any Stage 0 verdict means anything (§6.1) | one co-heard event, or accept 0.9450 shape-only |
 | mach's +15.5 dB floor: electrical or environmental | whether mach is a classification node | **10 minutes** — cover the mic and log |
 | BirdWeather 4066 detection count / span / confidence | whether a site bird probe is trainable this month | one API pull |
-| Perch/BirdNET accuracy on 16 kHz-sourced audio | all of S1 (§5, Gate 2) | one puc-clip A/B — the METHOD is now proven on mn10_as (§6.2c); only Perch is untested |
 | per-node RSSI on nyquist/mach/rankine | the transport curve — `hear_node.ino` never calls `WiFi.RSSI()` and `/status` has no wifi block; the only RSSI on the property is puc's −77 dBm | a firmware field |
 | whether the 24 %→57.5 % `/audio` loss curve is linear in link speed | whether the token bucket's charge model is right | two more nodes' worth of points |
 | the 3.27 h scene stall's historical extent | how much corpus has already been lost this way | a row-rate gap analysis over 82,225 pooled rows |
@@ -929,7 +872,7 @@ k3s host. Nothing was applied, flashed, or POSTed.
       gate floor 200 (floor_source "file", floor_default 800, floor_saved 200.0), thr 200
       ambient 13.0 / 19.5 / 14.1  ->  thr over ambient 23.7 / 20.2 / 23.0 dB
       e_max_win 44.6 / 42.0 / 47.3
-      raw span/(cap_samples/16000) = 1.09148 / 1.11629 / 1.00224
+      raw span/(cap_samples/FS_NOMINAL) = 1.09148 / 1.11629 / 1.00224
       acq drop_s 47 / 42 / 24, drop_samples 453760 / 386816 / 89088
 
     curl -s http://172.16.100.105/audio

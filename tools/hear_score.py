@@ -20,7 +20,7 @@ It degrades to zero input by construction, and `by_source` reports `phone: 0` as
 than as an absence, so the day a publisher appears the count moves without a code change.
 
 ⚠️REFUSALS ARE THE PRODUCT, NOT AN ERROR PATH. `score_sketch` refuses rather than pads, and a
-scorer that swallowed those refusals would report a quiet night from a corpus it could not read.
+scorer that swallowed those refusals would report a quiet period from a corpus it could not read.
 Measured on one real 1038-record pool: 955 (92.0%) refused, every one on the legacy `nyquist`
 band layout, and the same corpus split by day is 0% scorable in the 2026-09-07 partition and
 100% in the 2026-09-08 one. A single scalar refusal count reports neither of those honestly, so
@@ -31,7 +31,7 @@ below it, so a rate drift crosses from 0% refused to 100% refused with nothing i
 is therefore no threshold to tune: a reason appearing in a bucket that never had it is an EVENT.
 `--check` fails on a newly-seen reason, not on a percentage.
 
-⚠️HEALTH MUST NOT KEY ON THE CLASS DISTRIBUTION. A normal night is P at the floor everywhere --
+⚠️HEALTH MUST NOT KEY ON THE CLASS DISTRIBUTION. A normal period is P at the floor everywhere --
 measured, 1 record of 1690 above 0.5 in one population and a maximum of 1.24e-5 across the 83
 scorable rows of another. A check asking "did anything score high" reads a correct result as a
 broken service. `--check` keys on THROUGHPUT, REFUSALS, PARSE FAILURES and STALENESS. The class
@@ -44,7 +44,7 @@ a 1e-3 field prior is -6.66 logits, which at this model's 0.5959 logits/dB is 11
 total p0.1-p0.9 range of 7.37 dB). It is not comparable between two nodes: median `ref_db` on one
 real pool is 73.2 dB on mach and 44.9 dB on nyquist, a 28.4 dB gap = 16.9 logits = 3.9x that whole
 range, on identical hardware. And a low P is not evidence of absence -- no true positive has ever
-been scored on the night population, so no measured detection rate for it exists. Every row
+been scored on the field population, so no measured detection rate for it exists. Every row
 carries those four facts as booleans so a reader cannot get the number without them.
 
 ⚠️THE SHIPPED AUC WAS NOT MEASURED AT THE RATE THE FLEET RUNS. `auc_nested_grouped_cv` is a
@@ -124,7 +124,7 @@ CV_GROUP_WIDTH_S, DECORRELATION_LAG_S = 3.0, 22.4
 
 #: 10*log10(0 + 1e-12) -- hear/sketch.py:174's floor, i.e. an ALL-ZERO sketch. Such a frame is
 #: scorable and scores at the floor, so it is invisible to the refusal counter; it is a producer
-#: defect rather than a quiet night and gets its own tag. Measured at 2.4% of one real pool.
+#: defect rather than a quiet period and gets its own tag. Measured at 2.4% of one real pool.
 SILENT_REF_DB = -119.9
 
 #: How many runs the heartbeat keeps. The scorer runs 4x as often as the check (see
@@ -305,7 +305,7 @@ def model_card(model: Dict[str, Any], path: str, sha: str) -> Dict[str, Any]:
         "labels_were": "y=1 for operator label 'crack' or 'both'; y=0 for everything else",
         "negatives_were": (
             "other amplitude-gate triggers at the same range on the same afternoon -- NOT "
-            "insects, machinery, aircraft or any night-time sound. The model has never seen a "
+            "insects, machinery, aircraft or any other ambient sound. The model has never seen a "
             "single negative from the population it is being applied to here."),
         "upstream_gate": (
             "broadband amplitude over a 0.2083 s running ambient (hear/node/detect.py "
@@ -354,10 +354,10 @@ def model_card(model: Dict[str, Any], path: str, sha: str) -> Dict[str, Any]:
         "evidence_of_absence": False,
         "operating_point_validated": False,
         "sensitivity_note": (
-            "no true positive has ever been scored on the night population, so this tool has NO "
+            "no true positive has ever been scored on the field population, so this tool has NO "
             "measured detection rate on it. The only tpr/fpr in the model file are in-sample and "
             "the training code itself calls the matching in-sample AUC meaningless. A run of "
-            "near-zero scores is not 'no shots last night'."),
+            "near-zero scores is not 'no shots in that period'."),
         "in_sample_only": {k: model.get(k) for k in
                            ("auc_in_sample_MEANINGLESS", "tpr_at_0.5_in_sample",
                             "fpr_at_0.5_in_sample") if k in model},
@@ -487,7 +487,7 @@ def distribution(ps: List[float]) -> Dict[str, Any]:
     """⚠️OBSERVATION, NOT A HEALTH INPUT, and the key it is published under says so.
 
     Measured basis: one population scored 437/437 non-zero with exactly 1 above 0.5; another had
-    a maximum of 1.24e-5 over 83 rows. A normal night is P at the floor, so a gate keyed on "did
+    a maximum of 1.24e-5 over 83 rows. A normal period is P at the floor, so a gate keyed on "did
     anything score high" fires on a correct result and stays quiet on a broken one.
     """
     if not ps:
@@ -779,7 +779,7 @@ def check(root: str, max_stale_s: float = DEFAULT_MAX_STALE_S,
     seen = last.get("records_seen") or 0
     if not seen:
         lines.append("pool     EMPTY     the newest run read 0 records from %s -- an empty read "
-                     "is a failure, not a quiet night (wrong --pool root?)" % records_dir(root))
+                     "is a failure, not a quiet period (wrong --pool root?)" % records_dir(root))
         bad += 1
     else:
         lines.append("pool     ok        %d record(s) in the store" % seen)

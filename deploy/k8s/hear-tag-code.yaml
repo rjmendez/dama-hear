@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-tag-code.yaml
-# apply-mode client: 154910 B serialised against a 262144 B last-applied-configuration cap.
+# apply-mode client: 131984 B serialised against a 262144 B last-applied-configuration cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tag
   annotations:
-    dama-hear/commit: '93bb6df-dirty'
+    dama-hear/commit: '8f00deb-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '154910'
+    dama-hear/serialised-bytes: '131984'
 data:
   hear__init__.py: |
     
@@ -263,10 +263,9 @@ data:
     #!/usr/bin/env python3
     """The clip store: names off a node, WAV bytes into the pool, and one append-only index of both.
     
-    ⚠️NOT ONE CLIP HAD EVER LEFT A NODE. Measured 2026-09-09 across the fleet: 625 clips written,
-    ~478 already destroyed. Every node writes 4.0 s WAVs into /clips against a 6,291,456 B budget --
-    exactly 49 files of 128,044 B -- and evicts to make room. The pool is the archive; the card is a
-    buffer that is already full on all three nodes (`budget_left_clips 0`).
+    Every node writes 5.0 s 48 kHz WAVs into /clips, a rolling window of 13 files (6,291,456 B of
+    480,044 B each) that evicts its oldest to make room. The drain fetches a clip before it rolls off,
+    and the pool holds it for identification under its own byte cap.
     
     WHAT THIS MODULE IS FOR, and what it deliberately is not:
     
@@ -294,34 +293,18 @@ data:
     import shutil
     from typing import Any, Dict, Iterable, List, Optional
     
-    #: 2 adds `dur_s` and `header_rate_suspect`. ⚠️A v1 row carries neither, and v1 rows DO include
-    #: mis-headed 48 kHz clips -- they were stored before this field existed. A reader must not take
-    #: bytes / wav_header_fs_hz at face value for a v1 row; hear/tags.py `_post_s` re-derives the
-    #: length by the same uniqueness rule header_rate_suspect() uses.
-    CLIP_SCHEMA_VERSION = 2
-    #: 44-byte canonical header + 64000 samples * 2 bytes, at the 16 kHz / 4.0 s geometry.
-    #: ⚠️KEPT ONLY AS THE HISTORICAL SIZE. It is NOT a validity test any more -- see wav_probe.
-    CLIP_BYTES_16K_4S = 128044
-    
-    #: What a clip may be, as a DURATION rather than a byte count. The node's geometry has already
-    #: changed once -- 4.0 s at 16 kHz became 5.0 s at 48 kHz, 128044 B to 480044 B -- and the fixed
-    #: total here did not move with it, so the drain refused every clip the fleet wrote
-    #: ("total_480044_expected_128044") while reporting itself healthy. A magic number layered on a
-    #: SELF-DESCRIBING format is what made a firmware change into silent data loss.
+    #: 3 drops `header_rate_suspect`: one clip geometry, and old clips roll off.
+    CLIP_SCHEMA_VERSION = 3
+    #: What a clip may be, as a duration: the header proves the body, not a byte count.
     CLIP_MIN_S, CLIP_MAX_S = 0.5, 30.0
     CLIP_PRE_S = 1.0
-    #: ⚠️A FALLBACK, NOT THE TRUTH. Both clip geometries are live in the corpus at once: the 16 kHz
-    #: era wrote 1.0 + 3.0 s (128044 B) and the 48 kHz firmware writes 1.0 + 4.0 s (480044 B, sized
-    #: for Perch's non-overlapping 5 s window). Pinning one number here is the same mistake
-    #: CLIP_BYTES_16K_4S was -- so `clip_total_s()` reads it off the clip and this is only what a row
-    #: with no body falls back to. The PRE-roll is 1.0 s in both, which is what makes the split
-    #: derivable at all.
     CLIP_POST_S = 4.0
+    #: The firmware writes exactly this many seconds per clip.
+    CLIP_TOTAL_S = CLIP_PRE_S + CLIP_POST_S
+    #: Slack on a header-derived duration: the header's integer rate against the node's clock.
+    CLIP_DUR_TOL = 0.02
     CLIP_DIR = "/clips"
     INDEX_NAME = "index.jsonl"
-    FS_NOMINAL_HZ = 16000.0
-    #: Measured header spread is 15986-16000 Hz; 64 Hz is 4x the observed 14 Hz.
-    FS_TOLERANCE_HZ = 64.0
     
     #: Every terminal and non-terminal state one clip can be in. `index_row` refuses anything else --
     #: an outcome that is not on this list cannot be counted, and an uncounted refusal is the failure
@@ -332,10 +315,10 @@ data:
     
     #: Once an index row reaches one of these, the name is never probed again. Without it the drain
     #: re-probes 321 already-dead nyquist names every 15 minutes forever (measured 2026-09-09).
-    #: ⚠️`probed_404` IS DELIBERATELY NOT HERE. night_node.ino:2436 answers 404 for ANY failed
+    #: ⚠️`probed_404` IS DELIBERATELY NOT HERE. hear_node.ino:2436 answers 404 for ANY failed
     #: SD.open, not only for a missing file: max_files is 8 and the long-lived set reaches 6
     #: (dets.csv + scene.csv + the open clip + /ls's directory and entry + health.csv) with
-    #: clip_evict_worse_than() taking 2 more during an eviction (night_node.ino:1725-1731). One
+    #: clip_evict_worse_than() taking 2 more during an eviction (hear_node.ino:1725-1731). One
     #: descriptor-exhausted moment must not retire a clip that is still on the card.
     TERMINAL_OUTCOMES = ("stored", "evicted_before_fetch")
     
@@ -427,9 +410,8 @@ data:
     def wav_probe(body: bytes) -> Dict[str, Any]:
         """Parse the 44-byte canonical header. No audio is decoded.
     
-        ⚠️IT DOES NOT REQUIRE 16000 Hz. mach shipped a whole boot headed 22624 Hz, and refusing it
-        here would delete the evidence of the fs_clean latch bug rather than record it. The rate is
-        REPORTED; whether it is usable is the tagger's decision, not the store's.
+        The rate is REPORTED, not required; whether it is usable is the tagger's decision, not the
+        store's.
         """
         out: Dict[str, Any] = {"ok": False, "reason": None, "fs_hz": None, "channels": None,
                                "bits": None, "data_bytes": None, "total_bytes": len(body), "dur_s": None, "fs_nameable": None}
@@ -468,11 +450,9 @@ data:
         # ⚠️THE HEADER ALREADY PROVED THE BODY. `44 + data_bytes == len(body)` above catches a
         # truncated or padded fetch, so what is left to check is whether this is a PLAUSIBLE CLIP --
         # a question about duration and rate, not about one firmware's byte count.
-        # ⚠️A RATE THIS FORMAT CANNOT NAME IS REPORTED, NOT REFUSED. mach once wrote a whole boot
-        # headed 22624 Hz while its CSV said 16000; refusing on the header would have discarded every
-        # clip of it. `fs_nameable` travels with the row so the disagreement stays visible and the
-        # tagger decides -- which is the same rule the index already follows by carrying BOTH the
-        # header rate and the dets rate side by side.
+        # A rate this format cannot name is reported, not refused: `fs_nameable` travels with the row
+        # and the tagger decides, the same rule the index follows by carrying both the header rate and
+        # the dets rate.
         if not out["fs_hz"]:
             out["reason"] = "fs_zero"
             return out
@@ -485,169 +465,6 @@ data:
         return out
     
     
-    #: Decimation between the acquisition rate the clip is written at and the FS_NOMINAL rate every
-    #: other lane runs at. Mirrors DECIM in night_node.ino.
-    CLIP_DECIM_CANDIDATES = (2, 3, 4)
-    #: Acquisition rates a node may legally clock the mic at, for confirming a suspected mis-header.
-    #: MSM261D3526H1CPM Standard Performance Mode caps at 62.5 kHz; 32000 is the earlier target.
-    CLIP_ACQ_RATES_HZ = (32000.0, 48000.0)
-    #: A clip longer than this cannot be a clip -- the firmware writes a fixed CLIP_SAMPLES and
-    #: refuses rather than shortening. Used only to notice a header that must be lying.
-    CLIP_PLAUSIBLE_MAX_S = 8.0
-    #: ⚠️EVERY CLIP LENGTH THIS FLEET HAS EVER WRITTEN. 4.0 s is the 16 kHz era (1.0 + 3.0); 5.0 s is
-    #: the 48 kHz firmware (1.0 + 4.0), sized so Perch's non-overlapping 5 s window is not padded with
-    #: fabricated silence. A correction is only accepted when it lands on one of these -- a duration
-    #: "in a plausible range" is not evidence, and admitting a range is what let the /2 reading of a
-    #: /3 mis-header look just as good as the right one.
-    CLIP_GEOMETRIES_S = (4.0, 5.0)
-    #: Clock drift on the header's integer rate. 2% is ~30x the 14 Hz observed header spread.
-    CLIP_GEOMETRY_TOL = 0.02
-    #: Rates a node is ever configured to clock the microphone at. Mirrors hear/resample.py, repeated
-    #: rather than imported: clips.py ships in bundles that resample.py is not in.
-    FLEET_ACQ_RATES_HZ = (16000.0, 32000.0, 48000.0)
-    FLEET_RATE_TOL = 0.005
-    
-    
-    def header_rate_suspect(probe: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Is this clip's header rate provably wrong, and by what integer factor?
-    
-        ⚠️night_node.ino stamped every 48 kHz clip with the FS_NOMINAL timebase for the whole of the
-        48 kHz rollout: the body is CLIP_SAMPLES at FS_ACQ, the header said ~16000 Hz. A 5.0 s clip
-        reads back as 15.0 s and plays an octave and a half low, and NOTHING downstream could catch
-        it -- 16000 is exactly the rate hear_tag.py's assert_rate wants, so the lying header walks
-        straight past the guard built to stop wrong-rate audio reaching a model. Fixed in firmware,
-        but clips written before the reflash are on the PVC and are not rewritable.
-    
-        ⚠️IT REFUSES TO GUESS, AND THE UNIQUENESS CHECK IS THE WHOLE OF THAT. A correction is
-        returned only when EXACTLY ONE factor closes: the recovered duration must land on a length
-        this fleet actually writes AND the recovered rate on one the mic can legally be clocked at.
-        Written first against a plausible RANGE instead, a 15.0 s body matched /2 (7.5 s at 32 kHz)
-        before it matched the correct /3 (5.0 s at 48 kHz), and returned the first hit. Two readings
-        that both close means the header is not recoverable, not that the first one wins.
-        """
-        fs = probe.get("fs_hz")
-        dur = probe.get("dur_s")
-        if not fs or not dur or dur <= CLIP_PLAUSIBLE_MAX_S:
-            return None
-        hits = []
-        for d in CLIP_DECIM_CANDIDATES:
-            true_fs = float(fs) * d
-            if not any(abs(true_fs - r) <= FS_TOLERANCE_HZ * d for r in CLIP_ACQ_RATES_HZ):
-                continue
-            true_dur = dur / d
-            if not any(abs(true_dur - g) <= g * CLIP_GEOMETRY_TOL for g in CLIP_GEOMETRIES_S):
-                continue
-            hits.append((d, true_fs, true_dur))
-        if len(hits) != 1:
-            return None
-        d, true_fs, true_dur = hits[0]
-        return {"header_fs_hz": float(fs), "true_fs_hz": true_fs, "decim": d,
-                "header_dur_s": dur, "true_dur_s": true_dur,
-                "why": ("body is %.1f s at the header's %g Hz, which is not a length this fleet "
-                        "writes; at %g Hz it is %.2f s -- the FS_NOMINAL-stamped 48 kHz clip bug"
-                        % (dur, fs, true_fs, true_dur))}
-    
-    
-    def length_implies_rate(n_samples: int, header_fs: float,
-                            csv_fs: Optional[float] = None) -> Optional[Dict[str, Any]]:
-        """A header rate nobody clocks -> the fleet rate its LENGTH says it must be. Or None.
-    
-        ⚠️A DIFFERENT DEFECT FROM header_rate_suspect, WITH A DIFFERENT SHAPE. That one is a
-        decimation mismatch: the body is at FS_ACQ, the header at FS_NOMINAL, and the two are an
-        integer factor apart. This one is a rate that was simply LATCHED WRONG -- mach shipped a whole
-        boot headed 22624/22848 Hz over 16 kHz audio, and 22848/16000 is not an integer anything. The
-        only handle on it is that 64000 samples is 2.80 s at the header's rate, which is not a length
-        this fleet writes, and 4.00 s at 16 kHz, which is.
-    
-        ⚠️IT ONLY LOOKS AT A HEADER THAT IS ALREADY IMPOSSIBLE. A rate the fleet clocks is left alone
-        even if the length is odd -- then the LENGTH is the anomaly and rewriting the rate to explain
-        it away would be exactly backwards.
-    
-        ⚠️UNIQUENESS IS THE PROOF. Exactly one fleet rate must turn the sample count into a length
-        this fleet writes; two candidates or none means the header is not recoverable.
-    
-        ⚠️THE CSV IS NOT INDEPENDENT EVIDENCE, AND ASSUMING IT WAS COST A CLIP. This function first
-        required `csv_fs` to agree with the recovered rate. It does not, on the very boot this exists
-        for: mach-a75b9e4c has BOTH the header and dets.csv at 22848 Hz, so the veto fired and the
-        clip stayed broken. night_node.ino writes both from `fs_timebase()` -- the clip header at
-        :1958 and the detection row at :3498 -- so when `fs_clean` latches wrong, both inherit it.
-        Their DISAGREEMENT is informative and is why they travel side by side; their AGREEMENT is one
-        measurement written twice.
-    
-        So `csv_fs` may only veto when it names a rate the fleet ACTUALLY CLOCKS and that rate is not
-        the recovered one -- a real three-way disagreement. A `csv_fs` that merely echoes an
-        impossible header carries no information and is ignored.
-        """
-        if not n_samples or not header_fs or header_fs <= 0:
-            return None
-        for r in FLEET_ACQ_RATES_HZ:
-            if abs(float(header_fs) - r) <= r * FLEET_RATE_TOL:
-                return None                     # the header names a rate we really do clock
-        hits = []
-        for r in FLEET_ACQ_RATES_HZ:
-            d = n_samples / r
-            if any(abs(d - g) <= g * CLIP_GEOMETRY_TOL for g in CLIP_GEOMETRIES_S):
-                hits.append((r, d))
-        if len(hits) != 1:
-            return None
-        r, d = hits[0]
-        csv_names_a_fleet_rate = bool(csv_fs) and any(
-            abs(float(csv_fs) - q) <= q * FLEET_RATE_TOL for q in FLEET_ACQ_RATES_HZ)
-        if csv_names_a_fleet_rate and abs(float(csv_fs) - r) > r * FLEET_RATE_TOL:
-            return None                         # a real three-way disagreement: recover nothing
-        return {"header_fs_hz": float(header_fs), "true_fs_hz": r, "true_dur_s": d,
-                "header_dur_s": n_samples / float(header_fs),
-                "csv_fs_hz": None if csv_fs is None else float(csv_fs),
-                "csv_was_independent": csv_names_a_fleet_rate,
-                "why": ("header states %g Hz, which this fleet never clocks; %d samples is %.2f s "
-                        "there and %.2f s at %g Hz, the one rate that makes it a clip -- the latched "
-                        "fs_clean bug, not a decimation mismatch"
-                        % (header_fs, n_samples, n_samples / float(header_fs), d, r))}
-    
-    
-    def clip_total_s(row: Dict[str, Any]) -> Optional[float]:
-        """The clip's length in seconds from its OWN header, mis-header corrected. None if unknowable.
-    
-        Both geometries are live in the corpus at once -- 1.0+3.0 s at 16 kHz and 1.0+4.0 s at
-        48 kHz -- so a caller that needs the window has to read it off the clip. CLIP_PRE_S is 1.0 s
-        in both, which is the only reason the pre/post split is derivable from a total.
-        """
-        n = row.get("bytes")
-        fs = row.get("wav_header_fs_hz")
-        if not n or not fs:
-            return None
-        dur = (int(n) - 44) / float(int(fs) * 2)
-        fix = (header_rate_suspect({"fs_hz": fs, "dur_s": dur})
-               or length_implies_rate((int(n) - 44) // 2, fs, row.get("fs_hz")))
-        return fix["true_dur_s"] if fix else dur
-    
-    
-    def _post_s_of(probe: Optional[Dict[str, Any]], csv_fs: Optional[float] = None) -> float:
-        """Post-roll from the clip's own length; CLIP_POST_S only when there is no clip to read."""
-        total = _row_dur_s(probe, csv_fs)
-        if total is None or not (CLIP_PRE_S < total <= CLIP_PLAUSIBLE_MAX_S):
-            return CLIP_POST_S
-        return total - CLIP_PRE_S
-    
-    
-    def _rate_fix(probe: Optional[Dict[str, Any]], csv_fs: Optional[float] = None):
-        """Either rate correction, or None. The two cannot both fire on one clip."""
-        if not probe or not probe.get("dur_s"):
-            return None
-        n = probe.get("data_bytes")
-        return (header_rate_suspect(probe)
-                or (length_implies_rate(int(n) // 2, probe.get("fs_hz"), csv_fs) if n else None))
-    
-    
-    def _row_dur_s(probe: Optional[Dict[str, Any]], csv_fs: Optional[float] = None) -> Optional[float]:
-        # ⚠️BOTH corrections. With only header_rate_suspect here, mach's 22848 Hz clips were indexed
-        # at 2.80 s and every scene/sketch window built on them ended 1.2 s early.
-        if not probe or not probe.get("dur_s"):
-            return None
-        fix = _rate_fix(probe, csv_fs)
-        return fix["true_dur_s"] if fix else probe["dur_s"]
-    
-    
     def index_row(*, clip: str, parts: Optional[Dict[str, Any]], node: str, body: Optional[bytes],
                   probe: Optional[Dict[str, Any]], dets: Dict[str, Any], path: Optional[str],
                   outcome: str, fetched_at: float, reason: Optional[str] = None,
@@ -658,9 +475,7 @@ data:
         and `t_start/t_end` are null for an unanchored clip rather than derived from `fetched_at`.
         They exist at all so no consumer re-derives CLIP_PRE_SAMPLES for itself.
     
-        ⚠️`fs_hz` AND `wav_header_fs_hz` TRAVEL SIDE BY SIDE, ALWAYS. The CSV's estimate and the
-        file's own header disagreed by 6,624 Hz for a whole boot on mach. Keeping one would have made
-        that invisible; keeping the disagreement is the point.
+        `fs_hz` and `wav_header_fs_hz` travel side by side, so a disagreement between them is visible.
         """
         if outcome not in OUTCOMES:
             raise ValueError("unknown clip outcome %r; known: %s" % (outcome, ", ".join(OUTCOMES)))
@@ -685,20 +500,11 @@ data:
             "ts_utc_s": ts,
             "anchored": anchored,
             "t_start_utc_s": (ts - CLIP_PRE_S) if (anchored and ts) else None,
-            # ⚠️THE END COMES FROM THE CLIP, NOT FROM A CONSTANT. A 16 kHz-era clip is 1.0+3.0 s and
-            # a 48 kHz one is 1.0+4.0 s; both are in the corpus. Adding a fixed CLIP_POST_S put
-            # t_end 1.0 s wrong for one era or the other, and every scene/sketch join downstream is
-            # built on this pair.
-            "t_end_utc_s": (ts + _post_s_of(probe, dets.get("fs_hz"))) if (anchored and ts) else None,
+            "t_end_utc_s": (ts + CLIP_POST_S) if (anchored and ts) else None,
             "uptime_s": dets.get("uptime_s"),
             "fs_hz": dets.get("fs_hz"),
             "wav_header_fs_hz": (probe or {}).get("fs_hz"),
-            # ⚠️DERIVED HERE SO NO CONSUMER RE-DERIVES IT. Two clip geometries are live at once and
-            # one firmware build stamped the wrong rate, so "how long is this clip" stopped being a
-            # constant. Computing it once at index time is what lets hear/tags.py keep its no-import
-            # bundle discipline without duplicating the correction logic.
-            "dur_s": _row_dur_s(probe, dets.get("fs_hz")),
-            "header_rate_suspect": _rate_fix(probe, dets.get("fs_hz")),
+            "dur_s": (probe or {}).get("dur_s"),
             "trigger": dets.get("trigger"),
             "clip_why": dets.get("clip_why"),
             "dets_origin": dets.get("dets_origin"),
@@ -832,7 +638,7 @@ data:
         """Delete abandoned `*.tmp` part-files under clips/<day>/<node>/.
     
         ⚠️`_audio_files` FILTERS ON `.wav`, SO A `.wav.<pid>.tmp` IS INVISIBLE TO THE CAP. A pod
-        killed by `activeDeadlineSeconds: 780` mid-write leaks up to 128044 B per node per run onto a
+        killed by `activeDeadlineSeconds: 780` mid-write leaks up to 480044 B per node per run onto a
         5Gi PVC that nothing else would ever reclaim. `older_than_s` is one drain interval, and the
         pid in the name means a live writer's file is never the one being swept.
         """
@@ -976,14 +782,11 @@ data:
     #: imported so that a bundle carrying tags.py without clips.py still parses; the two are checked
     #: against each other by tests/test_hear_tag.py.
     CLIP_PRE_S = 1.0
-    #: ⚠️FALLBACK ONLY -- see hear/clips.py. Two clip geometries are live in the corpus at once
-    #: (1.0+3.0 s at 16 kHz, 1.0+4.0 s at 48 kHz); `sample_window` reads the length off the row and
-    #: uses this only when the row has no body to read it from.
     CLIP_POST_S = 4.0
     FS_NOMINAL_HZ = 16000.0
     
-    #: How many scene rows one overlap query will return before it says it truncated. A 4.0 s clip
-    #: covers 4 or 5 rows of 1.024 s, so anything near this cap means the query matched something it
+    #: How many scene rows one overlap query will return before it says it truncated. A 5.0 s clip
+    #: covers 5 or 6 rows of 1.024 s, so anything near this cap means the query matched something it
     #: should not have -- it is a tripwire, not a page size.
     SCENE_ROWS_CAP = 64
     
@@ -1085,60 +888,17 @@ data:
         return n
     
     
-    def _post_s(row: Dict[str, Any]) -> float:
-        """The clip's post-roll, read off the row rather than assumed.
-    
-        ⚠️CLIP_POST_S IS THE FALLBACK, NOT THE ANSWER. The 16 kHz era wrote 1.0 + 3.0 s and the
-        48 kHz firmware writes 1.0 + 4.0 s, and both are in the corpus right now -- a window built
-        from one constant is 1.0 s wrong at the END for every clip of the other era. hear/clips.py
-        derives `dur_s` at index time (mis-header corrected) precisely so this can be a lookup, and
-        the pre-roll is 1.0 s in both eras, which is what makes the split recoverable from a total.
-        """
-        total = row.get("dur_s")
-        if total is None:
-            total = _v1_total_s(row.get("bytes"), row.get("wav_header_fs_hz"))
-        if total is None or not (CLIP_PRE_S < total <= 8.0):
-            return CLIP_POST_S
-        return total - CLIP_PRE_S
-    
-    
-    #: The clip lengths this fleet writes and the rates it clocks. Repeated from hear/clips.py rather
-    #: than imported, because clips.py imports THIS module; test_hear_tag asserts the copies agree.
-    _GEOMETRIES_S = (4.0, 5.0)
-    _GEOMETRY_TOL = 0.02
-    _FLEET_RATES_HZ = (16000.0, 32000.0, 48000.0)
-    
-    
-    def _v1_total_s(n_bytes, header_fs) -> Optional[float]:
-        """A v1 row's length, for rows written before `dur_s` existed. None when unknowable.
-    
-        ⚠️NOT bytes / header rate. v1 rows include 48 kHz clips headed 16000 Hz, which that division
-        reads as 15.0 s. The header is believed only when it yields a length the fleet writes;
-        otherwise exactly one fleet rate must, or nothing is claimed.
-        """
-        if not n_bytes or not header_fs:
-            return None
-        n = (int(n_bytes) - 44) / 2.0
-        def is_geom(d):
-            return any(abs(d - g) <= g * _GEOMETRY_TOL for g in _GEOMETRIES_S)
-        at_header = n / float(header_fs)
-        if is_geom(at_header):
-            return at_header
-        hits = [n / r for r in _FLEET_RATES_HZ if is_geom(n / r)]
-        return hits[0] if len(hits) == 1 else None
-    
-    
     def sample_window(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """The clip's window in the node's own sample counter, or None when the name carried none.
     
-        night_node.ino:1848 writes the clip from `d.sample - CLIP_PRE_SAMPLES`, and clip_name()
+        hear_node.ino:1848 writes the clip from `d.sample - CLIP_PRE_SAMPLES`, and clip_name()
         embeds `d.sample` -- the TRIGGER, not the window start. Deriving the start here is what stops
         every consumer re-deriving CLIP_PRE_SAMPLES for itself and getting it 1.0 s wrong.
         """
         s = row.get("sample")
         if s is None:
             return None
-        post = _post_s(row)
+        post = CLIP_POST_S
         return {"node": row.get("node"), "boot": row.get("boot"),
                 "start_sample": int(s) - int(CLIP_PRE_S * FS_NOMINAL_HZ),
                 "end_sample": int(s) + int(post * FS_NOMINAL_HZ),
@@ -1167,7 +927,7 @@ data:
     
     
     def _days_touched(t0: float, t1: float) -> List[str]:
-        """The UTC day partitions a [t0, t1] window can land in. A 4.0 s clip at 23:59:58 straddles
+        """The UTC day partitions a [t0, t1] window can land in. A 5.0 s clip at 23:59:58 straddles
         midnight, and scanning only its start day would silently drop the rows after it."""
         import datetime as _dt
         out = []
@@ -1188,7 +948,7 @@ data:
         -> {"basis": "utc"|"sample"|"none", "rows": [...], "refused": str|None, "weak": bool,
             "weakness": str|None, "truncated": bool, "scanned": int, "refused_records": int}
     
-        ⚠️A 4.0 s clip against 1.024 s scene rows is 64000/16384 = 3.906 rows, so the answer is 4 or 5
+        ⚠️A 5.0 s clip against 1.024 s scene rows is 80000/16384 = 4.883 rows, so the answer is 5 or 6
         depending on phase and NEVER fewer. A query returning 0 on an anchored clip means the scene
         store does not hold that node/day, which is a real finding and is returned as an empty list
         with basis "utc" -- not as a refusal, and not as a silent fallback to the sample basis.
@@ -1284,7 +1044,7 @@ data:
     def _sketch_span_s(fs_hz: Any) -> Optional[float]:
         """The sketch's own window length in seconds, at the rate IT was cut at.
     
-        night_node.ino: `SKETCH_SPAN = NFFT + (FRAMES-1)*HOP` samples. NFFT is a SAMPLE count, so its
+        hear_node.ino: `SKETCH_SPAN = NFFT + (FRAMES-1)*HOP` samples. NFFT is a SAMPLE count, so its
         duration depends on fs -- 256/16000 = 16 ms, 256/48000 = 5.33 ms -- while HOP_S is a fixed
         4 ms grid regardless of fs. That is why docs/acoustic-stack.md measures the sketch window at
         33-44 ms rather than one number: 5.33 + 7*4 = 33.3 ms at 48 kHz, 16 + 7*4 = 44 ms at 16 kHz,
@@ -1325,7 +1085,7 @@ data:
                        allow_sample_basis: bool = False,
                        max_rows: int = SCENE_ROWS_CAP) -> Dict[str, Any]:
         """READ-ONLY. The pooled sketches (dets/detection records, hear.pool's `records` store) whose
-        ~33-44 ms window overlaps this clip's 4.0 s window.
+        ~33-44 ms window overlaps this clip's 5.0 s window.
     
         `pl` is a hear.pool.Pool, taken as an argument, never imported -- see the module docstring;
         the same reason `scene_overlap` does it. `row` is one clips/index.jsonl row.
@@ -1335,7 +1095,7 @@ data:
     
         One row of `rows` carries `is_trigger: True` when its `key` equals `row["record_key"]` -- the
         clip's OWN triggering sketch, already joined by identity and not by a window guess. Every
-        other row is a DIFFERENT detection that happened to fall inside the same 4.0 s clip; on the
+        other row is a DIFFERENT detection that happened to fall inside the same 5.0 s clip; on the
         live fleet a retrigger inside `CLIP_DEDUPE_SAMPLES` is common, so 2+ rows is a real finding,
         not a bug.
     
@@ -1412,7 +1172,7 @@ data:
                 continue
             # ⚠️TWO RATES, ONE ROW. `span` is a TIME and depends on the frame's own rate (fs_hz is
             # 48000.0 for every node frame cut after the acquisition-rate move). `sample` is a
-            # DECIMATED position -- night_node.ino writes `dets[idx].sample = g_samples + i` and
+            # DECIMATED position -- hear_node.ino writes `dets[idx].sample = g_samples + i` and
             # deliberately keeps it there -- so FS_NOMINAL_HZ is the only rate that turns a time into
             # this counter's samples, and it is the rate sample_window() built cs0/cs1 with. Using
             # the frame's rate here makes the window 3x too long and starts it 3x too far back.
@@ -1481,73 +1241,40 @@ data:
         }
     
   hear_resample.py: |
-    """Rational resampling to a model's native rate, and the refusal when it cannot be honest.
+    """Rational resampling from the node's acquisition rate to a model's native rate.
     
-    ⚠️THE CLASSIFIER'S RATE IS NOT THE FLEET'S RATE AND NEVER WILL BE. EfficientAT wants 32 kHz; the
-    nodes clock the mic at 48 kHz and, before that, 16 kHz. Both directions have to be crossed, and
-    they are not the same operation:
-    
-        48000 -> 32000   L=2 M=3   a DECIMATION. Every band the model reads is real measurement;
-                                   the mic gave 24 kHz of band and 16 kHz of it survives.
-        16000 -> 32000   L=2 M=1   an INTERPOLATION. The model's mel bank runs to 15 kHz and the
-                                   recording stops at 8. Everything above 8 kHz that the model sees
-                                   is a property of this filter, not of the night.
-    
-    ⚠️THE SECOND CASE IS THE ONE THAT LIES, SO IT IS THE ONE THAT IS LABELLED. `band_limit_hz` rides
-    with every resampled clip and every score derived from it. §4.6 of docs/acoustic-stack.md forbids
-    exactly this operation one layer down, where presenting measured silence as measurement cost
-    0.9473 -> 0.9141 on identical audio; here it is unavoidable (the corpus is what it is) so the
-    requirement is that it can never be mistaken for anything else downstream.
-    
-    ⚠️THE RATIO COMES FROM THE NOMINAL RATE, NOT THE MEASURED ONE. A node reports fs_clean like
-    16004.741 Hz; the exact ratio 32000/16004.741 is not rational in any useful sense and chasing it
-    would build a 32000-tap filter to correct 0.03 % of pitch -- four cents, ~1/50th of the model's
-    mel bin spacing. The nominal rate is snapped to, the measured rate is RECORDED, and the snap is
-    refused outright when the measured rate is not near a rate this fleet actually clocks.
-    
-    ⚠️A RATE NOBODY CONFIGURED IS REFUSED, NOT SNAPPED TO THE NEAREST. mach shipped an entire boot
-    headed 22624 Hz. Resampling that as though it were 16 kHz or 48 kHz would launder a known
-    firmware defect into audio a model answers confidently about.
+    The nodes acquire at 48 kHz and EfficientAT wants 32 kHz: L=2 M=3, a decimation, so every band the
+    model reads is measurement. The header rate is snapped to 48 kHz within SNAP_TOLERANCE; a rate
+    nobody configured is refused rather than stretched to the nearest.
     """
     
     from __future__ import annotations
     
     import math
-    from typing import Any, Dict, Optional
+    from typing import Any, Dict
     
-    #: Rates a dama-hear node is ever configured to clock the microphone at. FS_NOMINAL, its 48 kHz
-    #: replacement, and the 32 kHz target that was the acquisition rate for one firmware generation.
-    FLEET_RATES_HZ = (16000.0, 32000.0, 48000.0)
-    #: How far a MEASURED rate may sit from a nominal one and still be snapped to it. The observed
-    #: header spread on the pool is 15968-16050 Hz, so 0.5 % (80 Hz at 16 kHz) covers it with room,
-    #: while 22624 Hz is 41 % away and stays refused.
+    #: The rate the nodes clock the microphone at.
+    ACQ_RATE_HZ = 48000.0
+    #: How far a measured header rate may sit from ACQ_RATE_HZ and still be snapped to it.
     SNAP_TOLERANCE = 0.005
-    #: Kaiser stopband attenuation for the anti-alias/interpolation filter, in dB. 72 dB puts the
-    #: fold below the 16-bit quantisation floor of the source, so the filter is not what limits the
-    #: clip. Matches the discipline of firmware/gen_decim.py, which measured -63.4 dB and said so.
+    #: Kaiser stopband attenuation, dB. Puts the fold under the int16 floor of the source.
     STOPBAND_DB = 72.0
-    #: Transition width as a fraction of the passband edge. 0.10 with 72 dB gives ~130 taps at L=2,
-    #: which is 4 ms of group delay at 32 kHz -- immaterial for a tagger, and the clip is not used
-    #: for timing.
+    #: Transition width as a fraction of the passband edge.
     TRANSITION = 0.10
     
     
     class RateRefused(Exception):
-        """The clip's rate is not one this fleet clocks, so it is not resampled at all."""
+        """The clip's rate is not the acquisition rate, so it is not resampled at all."""
     
     
     def snap(fs_hz: float) -> float:
-        """Measured rate -> the nominal rate it is. Raises RateRefused for anything else."""
+        """Measured header rate -> ACQ_RATE_HZ. Raises RateRefused for anything else."""
         if not fs_hz or fs_hz <= 0:
             raise RateRefused("rate %r is not a rate" % (fs_hz,))
-        for r in FLEET_RATES_HZ:
-            if abs(float(fs_hz) - r) <= r * SNAP_TOLERANCE:
-                return r
-        raise RateRefused(
-            "%.1f Hz is not within %.1f%% of any rate this fleet clocks (%s). It is not resampled: "
-            "a rate nobody configured is evidence of a defect, and snapping it to the nearest would "
-            "hide that defect behind a confident answer."
-            % (fs_hz, SNAP_TOLERANCE * 100, ", ".join("%g" % r for r in FLEET_RATES_HZ)))
+        if abs(float(fs_hz) - ACQ_RATE_HZ) <= ACQ_RATE_HZ * SNAP_TOLERANCE:
+            return ACQ_RATE_HZ
+        raise RateRefused("%.1f Hz is not within %.1f%% of the %g Hz acquisition rate; refused "
+                          "rather than resampled" % (fs_hz, SNAP_TOLERANCE * 100, ACQ_RATE_HZ))
     
     
     def _kaiser_beta(att_db: float) -> float:
@@ -1559,54 +1286,37 @@ data:
     
     
     def design(L: int, M: int):
-        """Windowed-sinc low-pass for an L/M polyphase resampler, as a numpy array.
-    
-        Cutoff is 1/(2*max(L, M)) of the L-upsampled rate: the tighter of "do not alias when
-        decimating by M" and "do not admit the images the L-upsample created".
-        """
+        """Windowed-sinc low-pass for an L/M polyphase resampler, unity gain through zero-stuffing."""
         import numpy as np
         cutoff = 0.5 / max(L, M)
         width = cutoff * TRANSITION * 2.0
-        n = int(math.ceil((STOPBAND_DB - 8.0) / (2.285 * 2.0 * math.pi * width)))
-        n = max(n, 8)
+        n = max(int(math.ceil((STOPBAND_DB - 8.0) / (2.285 * 2.0 * math.pi * width))), 8)
         if n % 2 == 0:
-            n += 1                                   # odd -> integer group delay, exactly (n-1)/2
+            n += 1
         k = np.arange(n) - (n - 1) / 2.0
         h = 2.0 * cutoff * np.sinc(2.0 * cutoff * k) * np.kaiser(n, _kaiser_beta(STOPBAND_DB))
-        return (h * L / h.sum()).astype(np.float64)  # unity gain THROUGH the zero-stuffing
+        return (h * L / h.sum()).astype(np.float64)
     
     
     def resample(x, fs_in: float, fs_out: float) -> Dict[str, Any]:
-        """-> {"pcm", "fs_hz", "fs_source_hz", "band_limit_hz", "upsampled", "L", "M", "taps"}.
-    
-        `band_limit_hz` is the highest frequency that carries measurement: min(Nyquist in, Nyquist
-        out). When it is below the output Nyquist the extra band is filter output, not sound, and
-        `upsampled` says so.
-        """
+        """-> {"pcm", "fs_hz", "fs_source_hz", "L", "M", "taps"}. fs_in must snap to ACQ_RATE_HZ."""
         import numpy as np
         src = snap(fs_in)
-        dst = snap(fs_out)
+        dst = float(fs_out)
+        if dst <= 0 or dst != int(dst):
+            raise RateRefused("output rate %r is not a positive integer rate" % (fs_out,))
         g = math.gcd(int(src), int(dst))
         L, M = int(dst) // g, int(src) // g
         x = np.asarray(x, dtype=np.float64)
         if L == 1 and M == 1:
-            y = x.copy()
-            h = np.zeros(0)
+            y, h = x.copy(), np.zeros(0)
         else:
             h = design(L, M)
             up = np.zeros(len(x) * L, dtype=np.float64)
             up[::L] = x
             y = np.convolve(up, h, mode="same")[::M]
-        band = min(src, dst) / 2.0
-        return {
-            "pcm": y.astype(np.float32),
-            "fs_hz": dst,
-            "fs_source_hz": float(fs_in),
-            "fs_source_nominal_hz": src,
-            "band_limit_hz": band,
-            "upsampled": bool(dst > src),
-            "L": L, "M": M, "taps": int(len(h)),
-        }
+        return {"pcm": y.astype(np.float32), "fs_hz": dst, "fs_source_hz": float(fs_in),
+                "L": L, "M": M, "taps": int(len(h))}
     
   tools_hear_tag.py: |
     #!/usr/bin/env python3
@@ -1639,7 +1349,7 @@ data:
       * BirdNET V2.4: the only thing that answers WHICH bird, 48 kHz native -- and CC BY-NC-SA, which
         plausibly follows every probe onto the APK. Take BirdNET's answers via puc's BirdWeather
         feed; do not take its weights.
-      * PANNs/CNN14: wants 32 kHz, 17 % of its filterbank lands on guaranteed zeros at 16 kHz, and it
+      * PANNs/CNN14: wants 32 kHz, and it
         measured 14 % lower confidence than YAMNet on the same A/B for 311 ms and 1.5 GB RSS.
       * Perch 2.0 is NOT a competitor to this file. It is the bioacoustic embedding tier, 1536-d,
         Apache-2.0, and it is still gated (docs/acoustic-stack.md S5). This is the coarse tier.
@@ -1656,19 +1366,9 @@ data:
     log-power with a fixed (log + 4.5) / 5 offset so absolute level moves every band. Still
     mandatory, no longer load-bearing on its own.
     
-    ⚠️THE RATE IS RESAMPLED NOW, AND THE REFUSAL MOVED RATHER THAN VANISHED. mn10_as is 32 kHz
-    native; the fleet writes 48 kHz and used to write 16 kHz, so "refuse anything but 16 kHz" would
-    now refuse the entire corpus. hear/resample.py snaps the header rate to a rate this fleet
-    actually clocks and RAISES otherwise -- mach's 22624 Hz boot is still thrown out into a counted
-    bucket rather than stretched into plausible-looking tags. What crosses:
-    
-        48000 -> 32000  L=2 M=3  decimation.    Every band the model reads is measurement.
-        16000 -> 32000  L=2 M=1  interpolation. Above 8 kHz is the filter, not the night.
-    
-    `band_limit_hz`, `fs_source_hz` and `upsampled` ride on every row so the second case can never be
-    read as the first. Measured penalty, within-clip on the 7 real 48 kHz clips (native 48->32 versus
-    band-crippled 48->16->32): score-vector cosine 0.90-0.99, top-1 changed on 1 of 7. So for THIS
-    model the upsample is not very damaging -- which says nothing about Perch, whose Gate 2 is open.
+    ⚠️THE RATE IS RESAMPLED, AND ONLY FROM 48 kHz. mn10_as is 32 kHz native and the nodes acquire at
+    48 kHz: hear/resample.py decimates 48 -> 32 (L=2 M=3), so every band the model reads is
+    measurement. A header rate that does not snap to 48 kHz is refused into a counted bucket.
     
     ⚠️THE WHOLE SCORE PICTURE IS STORED, NEVER A HARD TOP-1. Every class above SCORE_FLOOR, plus
     `max_unstored_score` so the discarded tail is a number rather than an absence. hear/pool.py:721
@@ -1677,11 +1377,9 @@ data:
     mostly quiet and that nobody has listened to, either manufactures positives or deletes the honest
     negatives a trainer would need.
     
-    ⚠️THE 1024-d EMBEDDING IS STORED BECAUSE THE AUDIO IS A CACHE. It is free (same forward pass), it
-    is a fixed 16 kHz-native axis -- unlike the scene.csv (20x4, 62.5-7812.5 Hz) versus sketch (20x8,
-    300-20000 Hz) band-axis split that hear/pool.py refuses to pool across -- and `clips.prune()`
-    deletes WAVs at a 2 GiB cap. The embedding is what makes any later clustering possible without
-    re-fetching audio the node destroyed months ago.
+    ⚠️THE 960-d EMBEDDING IS STORED BECAUSE THE AUDIO ROLLS OFF. It is free (same forward pass), and
+    `clips.prune()` deletes WAVs at a 2 GiB cap; the embedding is what makes later clustering possible
+    after the clip itself is gone.
     
     ⚠️A TAG IS NOT A LABEL AND MUST NOT BECOME A TRAINING TARGET. `provenance` is the literal string
     "model" on every row and `claim.usable_as_training_label` is False. Fitting a scene- or sketch-
@@ -1763,7 +1461,7 @@ data:
     #: BirdNET's 1024 collide there; 960 cannot be mistaken for either, and every embedding this file
     #: writes carries `dim` so a consumer dispatches on width before anything else.
     
-    #: The rate the model's mel frontend was trained at. Clips are 16 kHz or 48 kHz and are RESAMPLED
+    #: The rate the model's mel frontend was trained at. Clips are 48 kHz and are decimated to it --
     #: to it -- see hear/resample.py for which direction manufactures band and how that is labelled.
     MODEL_FS_HZ = 32000
     #: The model is fully convolutional with global pooling, so a clip goes through in ONE pass and
@@ -1847,7 +1545,7 @@ data:
     
     
     class RateRefused(ValueError):
-        """The WAV header states a rate YAMNet's fixed 16 kHz frontend cannot be fed."""
+        """The clip's header rate is not the acquisition rate."""
     
     
     # ----------------------------------------------------------------- PURE
@@ -1952,17 +1650,7 @@ data:
     def to_model_rate(pcm: "Any", header_fs: int, csv_fs: Optional[float] = None) -> Dict[str, Any]:
         """Resample a clip to the model's rate, or refuse it. -> hear.resample.resample()'s dict.
     
-        ⚠️THE HEADER IS AUTHORITATIVE, NOT THE CSV. `fs_hz` in dets.csv is the node's own estimate and
-        has disagreed with the file it describes by 6,624 Hz for a whole boot on mach. The header is
-        what the samples were written at; the CSV value is carried into the tag row beside it so the
-        disagreement stays visible, but it is never what is resampled from.
-    
-        ⚠️THIS REPLACED A HARD REFUSAL OF EVERY RATE BUT 16 kHz, AND THE REFUSAL DID NOT GO AWAY --
-        it moved. YAMNet's frontend was fixed at 16 kHz and the fleet's clips were 16 kHz, so
-        "refuse anything else" was both correct and free. mn10_as wants 32 kHz and the fleet now
-        writes 48 kHz, so refusing on rate would refuse the entire corpus. What is refused instead is
-        a rate NOBODY CONFIGURED -- hear/resample.py snaps to a fleet rate within 0.5 % and raises
-        otherwise, so mach's 22624 Hz boot is still thrown out rather than quietly stretched.
+        The header is authoritative, not the CSV: the CSV value rides beside it on the row.
         """
         try:
             return RESAMPLE.resample(pcm, float(header_fs), float(MODEL_FS_HZ))
@@ -2129,8 +1817,8 @@ data:
                 "SIGMOID over AudioSet's %d classes -- multi-label, so they do not sum to 1. The "
                 "time average is the network's own global pool, not a mean this pipeline computes. "
                 "It is a general-purpose sound-event score from a model distilled from transformers "
-                "trained on YouTube audio, applied to a 4-5 s clip from a fixed outdoor microphone "
-                "at night. It is NOT a species identification, NOT calibrated to this site, and NOT "
+                "trained on YouTube audio, applied to a 5.0 s clip from a fixed outdoor microphone. "
+                "It is NOT a species identification, NOT calibrated to this site, and NOT "
                 "anything a human has confirmed." % MODEL_CLASSES),
             "why_this_model": (
                 "AudioSet mAP 0.471 against YAMNet's 0.306 at 4.88M parameters, MIT-licensed. "
@@ -2148,20 +1836,8 @@ data:
                 "pipeline without this step emits Silence for every clip and exits 0."
                 % TARGET_DBFS),
             "rate_policy": (
-                "the WAV header rate is snapped to a rate this fleet actually clocks (16000, 32000, "
-                "48000, within 0.5 %%) and the clip is resampled to %d Hz. A rate outside that set "
-                "is REFUSED, not stretched -- mach shipped a whole boot headed 22624 Hz and it is "
-                "still thrown out. 48 kHz -> 32 kHz is a decimation and every band is measurement; "
-                "16 kHz -> 32 kHz is an interpolation and everything above 8 kHz is the filter's, "
-                "which is why band_limit_hz and fs_source_hz ride on every row."
-                % MODEL_FS_HZ),
-            "upsampling_penalty_measured": (
-                "within-clip A/B on the 7 real 48 kHz clips, native (48->32) against band-crippled "
-                "(48->16->32): score-vector cosine 0.90-0.99, top-1 changed on 1 of 7, and the "
-                "Insect score moved by only +0.021 on average with sign flips both ways. So for THIS "
-                "model the 16 kHz corpus is not badly damaged by the upsample. It says nothing about "
-                "Perch, which is a different model at a different native rate; Gate 2 of "
-                "docs/acoustic-stack.md S1 remains open for Perch."),
+                "the WAV header rate must snap to the 48 kHz acquisition rate (0.5 %%); the clip "
+                "is decimated to %d Hz. Any other rate is refused, not stretched." % MODEL_FS_HZ),
             "score_floor": SCORE_FLOOR,
             "score_floor_note": (
                 "a STORAGE bound, not a decision threshold. Classes below it are summarised by "
@@ -2189,8 +1865,7 @@ data:
                 "birdnet": ("zero birds across nine real clips, neotropical hypotheses at the "
                             "confidence floor, 1 s of every 4 discarded (48 kHz x 3.0 s windows "
                             "against a 4.0 s clip), and CC BY-NC-SA weights"),
-                "panns_cnn14": ("wants 32 kHz; 17% of its filterbank lands on guaranteed zeros at "
-                                "16 kHz; measured 14% lower confidence than YAMNet on the same A/B; "
+                "panns_cnn14": ("wants 32 kHz; measured 14% lower confidence than YAMNet on the same A/B; "
                                 "311 ms and 1.5 GB RSS against 12 ms and 82 MB"),
             },
             "species_id_is_out_of_scope": (
@@ -2353,42 +2028,28 @@ data:
         except Exception as exc:
             return {"ok": False, "reason": R_WAV_UNREADABLE,
                     "detail": "%s: %s" % (type(exc).__name__, exc)}
-        # ⚠️LENGTH IS CHECKED AS A DURATION, NEVER AS A BYTE COUNT. This test read
-        # `len(pcm) * 2 + 44 != CLIP_BYTES_16K_4S` and so refused every clip the 48 kHz firmware
-        # writes -- the same magic number, in the same shape, that hear/clips.py had already been
-        # fixed for. A constant copied out of one module keeps its number and loses its meaning.
-        probe = {"fs_hz": int(header_fs), "dur_s": len(pcm) / float(header_fs or 1)}
-        # Two distinct rate defects are on the cards: the FS_NOMINAL-stamped 48 kHz clip (an integer
-        # decimation apart) and mach's latched 22624/22848 Hz boot (not an integer anything, only
-        # recoverable from the length). Neither can fire on the other's clips.
-        fix = (CLIPS.header_rate_suspect(probe)
-               or CLIPS.length_implies_rate(len(pcm), header_fs, row.get("fs_hz")))
-        true_fs = fix["true_fs_hz"] if fix else float(header_fs)
-        # ⚠️THE RATE IS SETTLED BEFORE THE LENGTH, BECAUSE THE LENGTH IS MEASURED IN IT. Checked the
-        # other way round, mach's 22624 Hz boot came back as `wav_sample_count` -- 64000 samples read
-        # as 2.83 s and refused for being the wrong duration, which is true and useless. The rate is
-        # the defect; the duration is a symptom of it.
+        # The rate is settled before the length, because the length is measured in it.
         try:
-            RESAMPLE.snap(true_fs)
+            RESAMPLE.snap(header_fs)
         except RESAMPLE.RateRefused as exc:
             return {"ok": False, "reason": R_RATE_REFUSED,
                     "detail": "%s The dets CSV said %s Hz." % (exc, row.get("fs_hz"))}
-        dur_s = len(pcm) / true_fs if true_fs else 0.0
-        if not any(abs(dur_s - g) <= g * CLIPS.CLIP_GEOMETRY_TOL for g in CLIPS.CLIP_GEOMETRIES_S):
+        dur_s = len(pcm) / float(header_fs)
+        if abs(dur_s - CLIPS.CLIP_TOTAL_S) > CLIPS.CLIP_TOTAL_S * CLIPS.CLIP_DUR_TOL:
             return {"ok": False, "reason": R_WAV_SAMPLES,
-                    "detail": "%d samples at %g Hz is %.3f s; a clip is one of %s s (1.0 s pre plus "
-                              "3.0 s post at 16 kHz, 4.0 s post at 48 kHz)"
-                              % (len(pcm), true_fs, dur_s,
-                                 "/".join("%.1f" % g for g in CLIPS.CLIP_GEOMETRIES_S))}
+                    "detail": "%d samples at %g Hz is %.3f s; a clip is %.1f s (%.1f s pre, %.1f s post)"
+                              % (len(pcm), header_fs, dur_s, CLIPS.CLIP_TOTAL_S, CLIPS.CLIP_PRE_S,
+                                 CLIPS.CLIP_POST_S)}
         try:
-            rs = to_model_rate(pcm, true_fs, row.get("fs_hz"))
+            rs = to_model_rate(pcm, header_fs, row.get("fs_hz"))
         except RateRefused as exc:
             return {"ok": False, "reason": R_RATE_REFUSED, "detail": str(exc)}
+        # The level recorded is the RECORDING's, taken before the 48 -> 32 kHz decimation removes the
+        # band above 16 kHz (measured: -1.8 dB on wideband noise). Normalisation runs after it, so the
+        # model sees the target level regardless.
+        pre_db = dbfs(pcm)
         try:
-            # ⚠️NORMALISE AFTER RESAMPLING, NOT BEFORE. The resampler is unity-gain in the passband
-            # but not sample-for-sample, so normalising first leaves the level a fraction of a dB off
-            # the target for reasons that have nothing to do with the recording.
-            pcm, pre_db = normalise(rs["pcm"])
+            pcm, _ = normalise(rs["pcm"])
         except ValueError as exc:
             return {"ok": False, "reason": R_DIGITAL_SILENCE, "detail": str(exc)}
         try:
@@ -2415,19 +2076,8 @@ data:
             "embedding": got["embedding"],
             "pre_norm_dbfs": pre_db,
             "wav_header_fs_hz": int(header_fs),
-            # ⚠️WHAT THE MODEL ACTUALLY SAW, BESIDE WHAT THE NODE RECORDED. `band_limit_hz` below the
-            # model's Nyquist means the bands above it are the interpolation filter's output and not
-            # sound; a reader that treats a 16 kHz-sourced score above 8 kHz as measurement is making
-            # the mistake docs/acoustic-stack.md S4.6 forbids one layer down.
             "fs_model_hz": rs["fs_hz"],
             "fs_source_hz": rs["fs_source_hz"],
-            "fs_source_nominal_hz": rs["fs_source_nominal_hz"],
-            "band_limit_hz": rs["band_limit_hz"],
-            "upsampled": rs["upsampled"],
-            "resample_L": rs["L"], "resample_M": rs["M"], "resample_taps": rs["taps"],
-            # The clip's own header lied for the whole 48 kHz rollout; when it did, say so here
-            # rather than silently scoring 15 s of audio that is really 5.
-            "header_rate_suspect": fix,
             # ⚠️BOTH RATES, SIDE BY SIDE, ALWAYS. The CSV estimate and the file's own header disagreed
             # by 6,624 Hz for a whole boot; keeping one of them would have made that invisible.
             "csv_fs_hz": row.get("fs_hz"),
@@ -2435,8 +2085,7 @@ data:
             "window": ({"t_start_utc_s": row.get("t_start_utc_s"),
                         "t_end_utc_s": row.get("t_end_utc_s")}
                        if row.get("anchored") and row.get("t_start_utc_s") is not None else None),
-            # The corrected length, not the row's: a v1 row has no dur_s and may be mis-headed.
-            "sample_window": TAGS.sample_window(dict(row, dur_s=dur_s)),
+            "sample_window": TAGS.sample_window(row),
             "provenance": "model",
             "created_utc_s": now,
         }
@@ -2534,11 +2183,11 @@ data:
         t["observation_not_health"] = {
             "level_dbfs": _distribution(t.pop("dbfs")),
             # ⚠️AGGREGATED, NOT ONLY PER ROW. `max_unstored_score` made the discarded tail a number on
-            # each row; nothing summed it, so a floor set too high looked exactly like a quiet night.
+            # each row; nothing summed it, so a floor set too high looked exactly like a quiet period.
             "max_unstored_score": _distribution(t.pop("unstored")),
             "silence_top_frac": t["silence_frac"],
             "mean_top_score": t["mean_top_score"],
-            "note": ("the class distribution is NOT an input to any gate. A quiet night is the "
+            "note": ("the class distribution is NOT an input to any gate. A quiet period is the "
                      "expected result; a gate keyed on 'did anything score high' fires on a correct "
                      "run. silence_top_frac is gated only once a human calibration set has been "
                      "measured -- see docs/acoustic-stack.md, the Phase-3 gate."),
@@ -2623,7 +2272,7 @@ data:
             "silence_frac": report.get("silence_frac"),
             # ⚠️`scored_any` IS AN ABSOLUTE SIGNAL AND `silence_frac` IS NOT. A model that returns
             # nothing above the floor for every clip reports silence_frac 0.000 -- the best possible
-            # value -- and passed the Phase-3 gate more easily than any real night can. This says
+            # value -- and passed the Phase-3 gate more easily than any real run can. This says
             # whether the model produced OUTPUT AT ALL, which is not a claim about the audio.
             "scored_any": report.get("scored_any"),
             "versions_held": report.get("versions_held") or {},
@@ -2643,7 +2292,7 @@ data:
                    window_s: float = DEFAULT_RUN_WINDOW_S,
                    max_stale_s: float = DEFAULT_MAX_STALE_S,
                    now: Optional[float] = None) -> Tuple[int, List[str]]:
-        """(exit code, lines). Non-zero when tagging is not flowing, not when the night was quiet.
+        """(exit code, lines). Non-zero when tagging is not flowing, not when the period was quiet.
     
         ⚠️EVERY GATE HERE CAN ACTUALLY FAIL, AND THE ABSOLUTE ONES COME FIRST. A gate of the form "if
         clips arrived and none were tagged" passes vacuously on an empty read -- point --pool at
@@ -2690,7 +2339,7 @@ data:
         keys = last.get("index_keys") or 0
         if not keys:
             lines.append("index    EMPTY     the newest run read 0 clip rows from %s -- an empty read "
-                         "is a failure, not a quiet night (wrong --pool root?)"
+                         "is a failure, not a quiet period (wrong --pool root?)"
                          % CLIPS.index_path(root))
             bad += 1
         else:
@@ -2741,7 +2390,7 @@ data:
         if measured and tagged > 0 and scored == 0:
             lines.append("scores   NONE      %d clip(s) tagged and not one scored a single class "
                          "above the floor -- the model produced no output, which is not a quiet "
-                         "night" % tagged)
+                         "period" % tagged)
             bad += 1
         elif measured:
             lines.append("scores   ok        %d of %d tagged clip(s) scored at least one class"
