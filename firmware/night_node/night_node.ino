@@ -1659,7 +1659,7 @@ static void wav_header(uint8_t *h, uint32_t data_bytes, uint32_t fs) {
 // addressed by time" -- a clip still works for a detection stamped utc_us == 0. Three of the 62
 // rows in the 2026-09-07 capture's dets.csv are exactly that.
 //
-// LENGTH: 1 s before the trigger, 3 s after. The post-roll is the long half because the events
+// LENGTH: 1 s before the trigger, 4 s after. The post-roll is the long half because the events
 // are longer than the descriptor: across the 8 frames of each in-run sketch the median energy
 // varies only ~4 dB and the peak frame is spread over all 8 positions, so what fired the gate is
 // not an impulse that has finished inside the 44 ms window.
@@ -1670,8 +1670,8 @@ static void wav_header(uint8_t *h, uint32_t data_bytes, uint32_t fs) {
 // with fabricated silence, and BirdNET's 3.0 s window against 4.0 s discarded 1 s in 4.
 #define CLIP_PRE_SAMPLES  ((uint32_t)FS_ACQ)              // 1.0 s
 #define CLIP_POST_SAMPLES ((uint32_t)(4 * FS_ACQ))        // 4.0 s
-#define CLIP_SAMPLES      (CLIP_PRE_SAMPLES + CLIP_POST_SAMPLES)   // 160000 @ 32 kHz
-#define CLIP_BYTES        (44u + CLIP_SAMPLES * 2u)       // 320044 B, header included
+#define CLIP_SAMPLES      (CLIP_PRE_SAMPLES + CLIP_POST_SAMPLES)   // 240000 @ 48 kHz
+#define CLIP_BYTES        (44u + CLIP_SAMPLES * 2u)       // 480044 B, header included
 // Every written clip is exactly CLIP_BYTES. A clip whose window has fallen off either end of the
 // ring is refused rather than shortened, which is what makes the budget arithmetic below exact
 // instead of an estimate -- and what stops a caller believing it has audio it does not have, the
@@ -1701,7 +1701,8 @@ static void wav_header(uint8_t *h, uint32_t data_bytes, uint32_t fs) {
 // 35 x 128044 = 4481540 B = 4.27 MiB, a 2.26x margin. The budget is set above that rather than at
 // it, because the events are not spread evenly: 34 of the 48 triggers fall in the two hours
 // 09:00-10:59, so a per-night average protects nothing. A byte budget does.
-#define CLIP_BUDGET_B  6291456u   // 6 MiB = 49 clips = 1.4x the measured 12 h event count, and
+#define CLIP_BUDGET_B  6291456u   // 6 MiB. 49 clips at 16 kHz (1.4x the measured 12 h event
+                                  // count) but only 13 at 48 kHz (~0.37x); CLIP_BYTES moved, this did not. And
                                   // leaves 3.64 MiB of the remainder for the CSVs to overrun into
 // And a live floor under that, because the budget assumes the card started at 19 MiB free and
 // nothing here can know that it did. 2 MiB is ~2.6 h of scene rows (227 B per 1.024 s = 221.7
@@ -1956,7 +1957,14 @@ static void clip_pump() {
   // wav_header says. There are no HTTP headers on a file, so the exact rate travels in dets.csv's
   // fs_hz column instead -- per detection, which is where it belongs anyway.
   double fsu = fs_timebase();
-  wav_header(hdr, CLIP_SAMPLES * 2, (uint32_t)lrint(fsu));
+  // ⚠️CLIP_SAMPLES IS COUNTED AT FS_ACQ, SO THE HEADER RATE IS fsu * DECIM. fs_timebase() is the
+  // FS_NOMINAL-domain rate -- correct for everything else on this node and wrong for exactly this
+  // file. Stamping it unscaled headed a 5.0 s 48 kHz clip as 15.0 s of 16 kHz: every player and
+  // every model reads it three times too slow, an octave and a half down. It cannot be caught
+  // downstream either, because 16000 is precisely the rate hear_tag.py's assert_rate wants, so a
+  // lying header sails past the guard that exists to stop wrong-rate audio reaching the model.
+  // /praw already scales by DECIM at line 3142; this writer did not get the same edit.
+  wav_header(hdr, CLIP_SAMPLES * 2, (uint32_t)lrint(fsu * DECIM));
   if (f.write(hdr, sizeof hdr) != sizeof hdr) {
     f.close(); SD.remove(path); d.clip_st = CLIP_FAIL; clip_fail++; return;
   }
