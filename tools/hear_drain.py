@@ -1299,8 +1299,8 @@ def node_from_path(path: str, default_node: Optional[str] = None) -> Optional[st
     return default_node
 
 
-def backfill(pl: "P.Pool", paths: List[str], default_node: Optional[str] = None
-             ) -> List[Dict[str, Any]]:
+def backfill(pl: "P.Pool", paths: List[str], default_node: Optional[str] = None,
+             scene_is_tail: bool = False) -> List[Dict[str, Any]]:
     """Ingest historical files: a dets.csv, a sketches-*.jsonl, or a directory of either.
 
     ⚠️A REFUSAL IS RECORDED, NOT SWALLOWED. An unreadable file returns an entry carrying `error`
@@ -1313,6 +1313,15 @@ def backfill(pl: "P.Pool", paths: List[str], default_node: Optional[str] = None
     column -- so it comes from `default_node` and is recorded as asserted. When a directory is
     given, a file whose NAME begins `<something>_` is allowed to name its own node from that
     prefix, which is how the existing hand-made drains are laid out.
+
+    ⚠️AN ARCHIVED scene.csv IS USUALLY A TAIL, AND A TAIL CANNOT BE RE-INGESTED BY DEFAULT.
+    `archive()` stores the body of `GET /sd?file=scene-YYYYMMDD.csv&tail=N` verbatim, so it
+    begins mid-row and carries no header -- and `ingest_scene(partial=False)` refuses the WHOLE
+    file as UnknownSchema, naming half a hex mel string as the header. Measured on the live pool:
+    13 archived rankine scene files, 10 of them refused entire. `scene_is_tail` (CLI
+    `--ingest-scene-tails`) says these files are tails, which drops the leading fragment and
+    reports it. It is an ASSERTION BY THE CALLER, not a sniff: a whole file that begins mid-row
+    is corruption, and the default keeps reading it as corruption.
 
     ⚠️THE PATH IS READ BY COMPONENT, AND THE ROSTER HAS TO BE COMPLETE. Both halves were wrong:
     the roster was ("nyquist", "mach", "puc") -- no `rankine`, though the pool has archived 23 of
@@ -1338,7 +1347,8 @@ def backfill(pl: "P.Pool", paths: List[str], default_node: Optional[str] = None
             if base.startswith("sketches-") and base.endswith(".jsonl"):
                 out.append(pl.ingest_mqtt_jsonl(p))
             elif "scene" in base:
-                out.append(pl.ingest_scene(p, default_node=node_from_path(p, default_node)))
+                out.append(pl.ingest_scene(p, default_node=node_from_path(p, default_node),
+                                           partial=scene_is_tail))
             else:
                 out.append(pl.ingest_dets(p, default_node=node_from_path(p, default_node)))
         except Exception as e:
@@ -1643,6 +1653,11 @@ def main(argv=None) -> int:
                     help="backfill a dets.csv / sketches-*.jsonl, or a directory of them; "
                          "repeatable and idempotent. Node name is taken from the file when it "
                          "carries one and from --ingest-node otherwise")
+    ap.add_argument("--ingest-scene-tails", action="store_true",
+                    help="the scene.csv files named by --ingest are archived byte-range TAILS "
+                         "(what hear-drain's archive/ holds), so a leading part-row is dropped "
+                         "and reported rather than refusing the file. Do NOT pass it for whole "
+                         "files: a whole file that starts mid-row is corruption")
     ap.add_argument("--ingest-node", default=None,
                     help="node name for backfilled dets.csv files whose schema carries none "
                          "(G1-G3). Recorded as asserted, not as read from the file")
@@ -1666,7 +1681,8 @@ def main(argv=None) -> int:
         return 0
 
     if a.ingest:
-        entries = backfill(pl, a.ingest, default_node=a.ingest_node)
+        entries = backfill(pl, a.ingest, default_node=a.ingest_node,
+                           scene_is_tail=a.ingest_scene_tails)
         for e in entries:
             print("%-46s %s" % (os.path.basename(e["path"]),
                                 {k: e[k] for k in ("generation", "rows", "added", "duplicate",

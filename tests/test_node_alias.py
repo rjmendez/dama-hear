@@ -244,3 +244,46 @@ class TestBackfillNaming:
         # no identity to check against. Anything the pool has archived must be nameable.
         from tools import hear_drain as D
         assert "rankine" in D.KNOWN_NODES
+
+
+class TestBackfillingAnArchivedTail:
+    """⚠️MEASURED ON THE LIVE POOL, 2026-09-10. Ten of rankine's thirteen archived scene files --
+    every one carrying the rows this fix recovers -- were refused ENTIRE by `backfill`, with the
+    reader naming half a hex mel string as the file's header. `archive()` stores the body of a
+    byte-range GET, so an archived scene.csv begins mid-row; `ingest_scene` refuses that by
+    default and must keep refusing it, because a WHOLE file that starts mid-row is corruption.
+    The caller says which it has.
+    """
+
+    def _tail(self, tmp_path, name="1789057032-scene-20260910.csv"):
+        rows = ([_scene_row("rankine", UTC0 + i * 1024000, i) for i in range(3)]
+                + [_scene_row(RAW, UTC0 + (10 + i) * 1024000, 50 + i) for i in range(4)])
+        whole = "\n".join([",".join(SF.S2.declared)] + rows) + "\n"
+        cut = whole.index("\n", whole.index("\n") + 1) - 12       # mid-row, as a tail arrives
+        p = tmp_path / name
+        p.write_text(whole[cut:])
+        return str(p)
+
+    def test_a_tail_is_refused_by_default(self, tmp_path):
+        from tools import hear_drain as D
+        pl = P.Pool(str(tmp_path / "pool"))
+        out = D.backfill(pl, [self._tail(tmp_path)])
+        assert "error" in out[0] and "UnknownSchema" in out[0]["error"]
+
+    def test_the_caller_may_assert_it_is_a_tail_and_then_it_reads(self, tmp_path):
+        from tools import hear_drain as D
+        pl = P.Pool(str(tmp_path / "pool"))
+        out = D.backfill(pl, [self._tail(tmp_path)], scene_is_tail=True)
+        assert "error" not in out[0]
+        assert out[0]["partial_first_line"]                       # the drop is REPORTED
+        assert out[0]["aliased"] == {RAW: 4}
+        assert out[0]["added"] >= 6                               # all but the dropped fragment
+        assert {os.path.basename(f) for d in os.listdir(pl.scene_dir)
+                for f in os.listdir(os.path.join(pl.scene_dir, d))} == {"rankine.jsonl.gz"}
+
+    def test_re_ingesting_the_tail_adds_nothing(self, tmp_path):
+        from tools import hear_drain as D
+        pl = P.Pool(str(tmp_path / "pool"))
+        path = self._tail(tmp_path)
+        D.backfill(pl, [path], scene_is_tail=True)
+        assert D.backfill(pl, [path], scene_is_tail=True)[0]["added"] == 0
