@@ -47,7 +47,8 @@ import wave
 RMS_TARGET_DBFS = -20.0
 #: Peak ceiling for the listening copy. -1 dBFS leaves a sample of headroom against rounding.
 PEAK_TARGET_DBFS = -1.0
-FULL_SCALE = 32767.0
+#: int16 full scale is 32768, matching hear_tag's /32768.0. 32767 put a -32768 sample above 0 dBFS.
+FULL_SCALE = 32768.0
 #: Silence floor for the per-clip silence fraction, in dBFS over 20 ms frames. Reported only --
 #: this file does not set a threshold, it produces the distribution one can be set from.
 SILENCE_FRAME_DBFS = -60.0
@@ -143,17 +144,26 @@ def load_index(pool):
     if not os.path.exists(p):
         raise SystemExit("no clip index at %s -- has hear-drain run?" % p)
     rows = []
-    for line in open(p, "r", encoding="utf-8", errors="replace"):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            r = json.loads(line)
-        except ValueError:
-            continue
-        if r.get("outcome") != "stored":
-            continue
-        rows.append(r)
+    malformed = 0
+    with open(p, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                malformed += 1
+                continue
+            if not isinstance(r, dict) or r.get("outcome") != "stored":
+                continue
+            # A torn or older-schema row must cost one clip, not the whole staging run.
+            if not all(isinstance(r.get(k), str) and r.get(k) for k in ("path", "node", "clip_key")):
+                malformed += 1
+                continue
+            rows.append(r)
+    if malformed:
+        print("skipped %d malformed index row(s)" % malformed)
     return rows
 
 
@@ -246,7 +256,10 @@ def sheet(picked, staged, out, day_tag):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--pool", default="/pool", help="pool root holding corpus/clips/")
-    ap.add_argument("--out", required=True, help="directory to stage into (created)")
+    ap.add_argument("--out", required=True,
+                    help="directory to stage into; created, and refused if it already holds files")
+    ap.add_argument("--force", action="store_true",
+                    help="stage into a non-empty --out anyway (earlier runs' files stay mixed in)")
     ap.add_argument("--n", type=int, default=30, help="clips to stage (gate wants >= 30)")
     ap.add_argument("--node", action="append", default=None,
                     help="restrict to this node; repeatable")
@@ -270,6 +283,10 @@ def main():
     missing = [nd for nd in (args.require_node or []) if nd not in require]
     picked = stratify(rows, args.n, rng, require)
 
+    if os.path.isdir(args.out) and os.listdir(args.out) and not args.force:
+        raise SystemExit("%s already holds files; staging into it would mix this run's clips "
+                         "and sheet with an earlier run's. Use an empty directory, or --force."
+                         % args.out)
     os.makedirs(args.out, exist_ok=True)
     staged = []
     kept = []

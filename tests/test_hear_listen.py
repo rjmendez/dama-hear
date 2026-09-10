@@ -171,3 +171,36 @@ def test_sheet_has_one_blank_row_per_staged_clip(tmp_path):
             and "---" not in l]
     assert len(data) == 5
     assert all(l.rstrip().endswith("|  |  |  |") for l in data), "sheet arrived pre-filled"
+
+
+def test_a_full_scale_negative_sample_does_not_read_above_zero_dbfs():
+    """int16 full scale is 32768, as hear_tag uses. At 32767 a -32768 sample measured > 0 dBFS."""
+    m = HL.measure([-32768] * 1600, 16000)
+    assert m["peak_dbfs_orig"] <= 0.0
+
+
+def test_a_malformed_index_row_is_skipped_not_fatal(tmp_path):
+    pool = _pool(tmp_path / "p", [_row("mach", "2026-09-10", "a", _tone(64000, 200))])
+    idx = os.path.join(pool, "corpus", "clips", "index.jsonl")
+    with open(idx, "a") as fh:
+        fh.write('{"outcome": "stored", "node": "mach"}\n')          # no path, no clip_key
+        fh.write('{"outcome": "stored", "path": 7, "node": "mach", "clip_key": "x"}\n')
+        fh.write("{torn\n")
+    out = str(tmp_path / "out")
+    r = subprocess.run([sys.executable, TOOL, "--pool", pool, "--out", out, "--n", "5",
+                        "--seed", "1"], check=True, capture_output=True, text=True)
+    assert "skipped 3 malformed" in r.stdout
+    assert json.load(open(os.path.join(out, "manifest.json")))["staged"] == 1
+
+
+def test_a_non_empty_out_dir_is_refused_unless_forced(tmp_path):
+    """Staging into a used directory mixes two runs' clips under one sheet."""
+    pool = _pool(tmp_path / "p", [_row("mach", "2026-09-10", "a", _tone(64000, 200))])
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "stale.loud.wav").write_bytes(b"x")
+    r = subprocess.run([sys.executable, TOOL, "--pool", pool, "--out", str(out), "--n", "1",
+                        "--seed", "1"], capture_output=True, text=True)
+    assert r.returncode != 0 and "already holds files" in (r.stderr + r.stdout)
+    subprocess.run([sys.executable, TOOL, "--pool", pool, "--out", str(out), "--n", "1",
+                    "--seed", "1", "--force"], check=True, capture_output=True)
