@@ -18,7 +18,7 @@ FIRST THING TO KNOW ABOUT THIS TOOL. Every consumer of the shard stream hard-cod
 
 The first three CONTINUE past anything else -- the record is dropped, not routed -- and the fourth
 scores it 0.0, "not anomalous", which is worse than dropping because it looks like an answer. A
-hear node's impulse sketch is MEL16_BANDS x MEL16_FRAMES cells (160 at the geometry this build
+hear node's impulse sketch is NODE_BANDS x NODE_FRAMES cells (160 at the geometry this build
 pins) and its scene descriptor is bands x slices, both read from the data rather than assumed
 here; neither width is 1024, so as of today 100% of what this tool emits is discarded or
 scored-as-normal by the pipeline it feeds.
@@ -56,9 +56,10 @@ written so that it dereferences: see that function for what `from` is and is not
 THE TWO FEATURES, AND THE TWO FILES THEY COME FROM. They are different shapes from different
 firmware paths and they are NOT one code path:
 
-  dets.csv  frame_hex  the IMPULSE sketch, 20 bands x 8 frames = 160 cells over 44 ms, gated,
-                       packed in the v1/v2 wire header (hear/sketch.py, hear/wire.py) and decoded
-                       through hear.wire.decode.
+  dets.csv  frame_hex  the IMPULSE sketch, 20 bands x 8 frames = 160 cells over its own span --
+                       44.0 ms on a 16 kHz node, 33.3 ms on a 48 kHz one, the frame's own stated
+                       rate deciding which (feature_span_ms) -- gated, packed in the v1/v2 wire
+                       header (hear/sketch.py, hear/wire.py) and decoded through hear.wire.decode.
   scene.csv mel_hex    the SCENE descriptor, `bands` x `slices` cells over the row's own
                        `span_ms`, written every row whether or not anything triggered. It is a
                        BARE quantised array -- bands x slices int8 half-dB steps relative to the
@@ -83,6 +84,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hear import sketch as SK  # noqa: E402
 from hear import wire as WR  # noqa: E402
 
 SHARD_PREFIX = "telem"
@@ -105,12 +107,13 @@ SHARD_S = 60                    # audio_embed_archiver.py:51,104; log_forwarder.
 # emits is this wide, which is the point of consumer_note().
 CONSUMER_EMBED_DIM = 1024
 
-# The nominal rate, used only where a row's own fs_hz is missing or implausible. The true rate,
-# PPS-disciplined, is the LAST ROW of the capture's health.csv: fs_clean_hz 16000.1690 over
-# fs_win_s 3030 s. (16000.169 - 16000) / 16000 is +10.5625 ppm, which over a 2 s retrieval window
-# is 21.1 us -- a third of one sample at 1e6/16000 = 62.5 us -- so the fallback does not move a
-# pointer. It is NOT the cumulative fs_cum_hz of 15991.4821 in that same row, which is poisoned by
-# boot loss.
+# The DECIMATED rate, used to turn `sample` (always a g_samples index -- decimated, a key, never
+# converted, see audio_pointer's docstring) into time when a row's own fs_hz is missing or
+# implausible. The true rate, PPS-disciplined, is the LAST ROW of the capture's health.csv:
+# fs_clean_hz 16000.1690 over fs_win_s 3030 s. (16000.169 - 16000) / 16000 is +10.5625 ppm, which
+# over a 2 s retrieval window is 21.1 us -- a third of one sample at 1e6/16000 = 62.5 us -- so the
+# fallback does not move a pointer. It is NOT the cumulative fs_cum_hz of 15991.4821 in that same
+# row, which is poisoned by boot loss.
 #
 # ⚠️`fs_cum_hz` IS A COLUMN OF THAT CAPTURE, NOT OF NEW ONES. The firmware renamed it `fs_ok_hz`
 # on 2026-09-08 when its meaning changed from "every sample over every second" to "the seconds the
@@ -122,20 +125,25 @@ CONSUMER_EMBED_DIM = 1024
 # is only meaningful because that row's window was 3030 s (a 5.3 ppm step). See docs/timing.md.
 NOMINAL_FS = 16000.0
 
-# The node's impulse geometry, COPIED from firmware/night_node/mel16.h (MEL16_BANDS,
-# MEL16_FRAMES, MEL16_HOP, MEL16_NFFT). Held here so a frame of a DIFFERENT shape is recognised as
-# different rather than silently measured with these.
-#
-# ⚠️A COPY DRIFTS, AND HOP AND NFFT ARE NOT ON THE WIRE. Bands and frames are: a frame of another
-# shape decodes to another shape and `known` in to_record() goes False, so span_ms becomes an
-# honest null. Hop and nfft are not, so an edit to MEL16_HOP or MEL16_NFFT alone leaves `known`
-# True and makes feature_span_ms() quietly wrong by exactly the edit. Nothing in this module can
-# see that, so the detector is a test:
-# tests/test_bridge.py::TestFirmwareConstantsDoNotDrift parses mel16.h and night_node.ino and
-# fails on any of the four, on MEL16_FS against NOMINAL_FS, and on AUDIO_MAX_S against
-# NODE_MAX_DUR_S. Change a firmware constant and that test tells you these four are now a lie.
+# The span-fs fallback for a SKETCH frame that does not state its own rate (dec["fs_hz"] is None
+# -- an old frame packed before hear.sketch carried a rate code, or an odd fs SK.fs_code() cannot
+# name). ⚠️SAME NUMBER AS NOMINAL_FS, TWO DIFFERENT JOBS: NOMINAL_FS converts `sample`, a DECIMATED
+# index, into time for the /audio pointer; LEGACY_NODE_FS guesses the SKETCH's own acquisition
+# rate when the frame itself will not say. Bumping the pointer's fallback to 48000 would put
+# `sample` in the wrong domain (D8); bumping this one would too, for a stated-nowhere frame that
+# is, historically, always a 16 kHz node's. Two names because they are two quantities that only
+# happen to coincide today.
+LEGACY_NODE_FS = 16000.0
+
+# The node's sketch shape, COPIED from firmware/night_node/mel_impulse.h (MELIMP_BANDS,
+# MELIMP_FRAMES). Held here so a frame of a DIFFERENT shape is recognised as different rather than
+# silently measured with these -- bands and frames ARE on the wire, so a frame of another shape
+# decodes to another shape and `known` in to_record() goes False, and span_ms becomes an honest
+# null rather than a wrong number. (Hop and nfft are NOT copied here at all any more: they came
+# from hear.sketch, not from a second reading of it -- see feature_span_ms.)
+# tests/test_bridge.py::TestFirmwareConstantsDoNotDrift parses mel_impulse.h and night_node.ino
+# and fails on either of the two, or on AUDIO_MAX_S against NODE_MAX_DUR_S.
 NODE_BANDS, NODE_FRAMES = 20, 8
-NODE_HOP, NODE_NFFT = 64, 256
 
 # The node caps `dur` at AUDIO_MAX_S (night_node.ino, the "/audio" handler: `if (dur >
 # (float)AUDIO_MAX_S) dur = (float)AUDIO_MAX_S;`). A pointer asking for more would silently come
@@ -407,7 +415,7 @@ def decode_scene_row(row: Dict) -> Dict:
         # way out into the record: see the mel_scene feature block in to_record() for why it must
         # not be called `frames`.
         "slices": slices,
-        # The node's own measurement of the row's span (SCENE_FRAMES x MEL16_NFFT / FS_NOMINAL,
+        # The node's own measurement of the row's span (SCENE_FRAMES x MELS_NFFT / FS_NOMINAL,
         # evaluated on the node with the node's constants and written into the row), not a number
         # derived here and not one this file may pin a value for. Required,
         # because it IS the retrieval window: a scene record with no span would emit a pointer
@@ -471,19 +479,23 @@ def feature_vector(dec: Dict) -> List[float]:
     return [round(float(x), 6) for x in v]
 
 
-def feature_span_ms(frames: int, hop: int = NODE_HOP, nfft: int = NODE_NFFT,
-                    fs: float = NOMINAL_FS) -> float:
-    """Milliseconds of audio one IMPULSE sketch covers: (nfft + (frames - 1) * hop) / fs.
+def feature_span_ms(frames: int, fs: float) -> float:
+    """Milliseconds of audio one IMPULSE sketch covers, AT ITS OWN RATE: NFFT/fs seconds for the
+    last frame's window plus (frames - 1) hops of HOP_S seconds each, both read from hear.sketch
+    -- not copied here, so there is nothing in this module to drift (D8; hear/tags.py:_sketch_span_s
+    is the same formula, kept for the same reason). A 16 kHz node's frame covers
+    256/16000 + 7*0.004 = 44.0 ms; a 48 kHz node's covers 256/48000 + 7*0.004 = 33.333... ms.
+    NFFT does not scale with rate, HOP_S is a fixed time grid, so the window covers LESS time
+    at the higher rate -- correct, and what the 20-band model was fitted on.
 
-    At this build's pinned geometry -- MEL16_FRAMES 8, MEL16_HOP 64, MEL16_NFFT 256, MEL16_FS
-    16000 -- that is 256 + 7 x 64 = 704 samples and 704 / 16000 * 1000 = 44.0 ms exactly. The
-    firmware fetches `MEL16_NFFT + (MEL16_FRAMES - 1) * MEL16_HOP + 32` = 736 samples
-    (night_node.ino, sketch_frame's caller); the extra 32 is guard, not span.
-
-    ⚠️`hop` and `nfft` DEFAULT TO A COPY of firmware's -- see NODE_HOP/NODE_NFFT and the drift
-    test named there. A scene row does not go through here at all: it carries its own measured
-    span_ms in its own column."""
-    return (nfft + (int(frames) - 1) * hop) / float(fs) * 1000.0
+    ⚠️`fs` IS REQUIRED and must be the FRAME's own rate, not a module-wide constant: hop and nfft
+    were never on the wire and a frame is only knowable as 20x8 -- which rate it was cut at comes
+    from flags bits 8-11 (SK.unpack's `fs_hz`) or, for a frame that predates that field, from
+    LEGACY_NODE_FS. Passing the wrong fs here silently relabels the span; nothing catches that
+    from inside this function, which is why NODE_HOP/NODE_NFFT existed and drifted once already
+    and are gone rather than fixed. A scene row does not go through here at all: it carries its
+    own measured span_ms in its own column."""
+    return (SK.NFFT / float(fs) + (int(frames) - 1) * SK.HOP_S) * 1000.0
 
 
 def _bucket_name(value: float, edges: Sequence[float], names: Sequence[str]) -> str:
@@ -724,8 +736,12 @@ def to_record(row: Dict, node: str, node_id: Optional[int] = None,
             "bands": bands,
             "frames": frames,
             # None, not a guess: hop is not on the wire, so span is only knowable for a geometry
-            # this build recognises. A frame of an unknown shape gets an honest null.
-            "span_ms": round(feature_span_ms(frames), 3) if known else None,
+            # this build recognises. A frame of an unknown shape gets an honest null. The rate is
+            # the FRAME's own (dec["fs_hz"], from flags bits 8-11) so a 48 kHz node's span is not
+            # measured at a 16 kHz assumption; LEGACY_NODE_FS is the fallback only for a frame
+            # that predates the rate code and so cannot say (D8).
+            "span_ms": (round(feature_span_ms(frames, dec.get("fs_hz") or LEGACY_NODE_FS), 3)
+                       if known else None),
             "ref_db": float(dec.get("ref_db", 0.0)),
             "peak": int(dec.get("peak", 0)),
             "retrigger": retrigger,

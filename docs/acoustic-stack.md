@@ -478,8 +478,9 @@ S0's instruments are the ones the shipped code actually supports:
 
 - **refusal counts by reason**, published, not logged. `score_sketch` raises `SketchMismatch` on
   a layout or band mismatch; over `testdata/sketch_golden.json` it scores 3 of 9 and refuses 6 on
-  `layout='nyquist'`. Live pool rows are currently fine (`layout: "fixed"`, `valid_bands: 15`,
-  `fs_stated_by: "frame"`), but a scorer that silently skips refusals reports "all clear"
+  `layout='nyquist'`. Live pool rows are currently fine (`layout: "fixed"`, `fs_stated_by:
+  "frame"`; `valid_bands: 15` on the 16 kHz node history, **20** on phone rows and on node rows
+  from the 48 kHz sketch build), but a scorer that silently skips refusals reports "all clear"
   identically whether the corpus is healthy or has gained a legacy row. A nonzero
   unstated-layout count is an **alert**.
 - **the `needs_label()` 0.35–0.65 band rate**, against the 14 % `classify.py:138` measured over

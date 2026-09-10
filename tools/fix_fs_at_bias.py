@@ -30,7 +30,7 @@ import argparse
 import csv
 import sys
 
-BLOCK = 256          # night_node BLOCK, and MEL16_NFFT
+BLOCK = 256          # night_node BLOCK, and MELIMP_NFFT
 FS_TRUE = 16000.0    # FS_NOMINAL; the crystal is tens of ppm from it, not percent
 
 
