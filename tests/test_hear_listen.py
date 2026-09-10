@@ -171,3 +171,35 @@ def test_sheet_has_one_blank_row_per_staged_clip(tmp_path):
             and "---" not in l]
     assert len(data) == 5
     assert all(l.rstrip().endswith("|  |  |  |") for l in data), "sheet arrived pre-filled"
+
+
+def test_a_misheaded_48k_clip_is_staged_at_its_real_rate(tmp_path):
+    """⚠️7 clips on the live PVC are 5.0 s of 48 kHz audio headed 16000 Hz. Staged at the header
+    rate they play 15 s long and an octave and a half low, and an operator would write "some kind
+    of low rumble" on a row that is really a bird."""
+    s = _tone(240000, 3000, fs=48000, f=1000.0)
+    pool = _pool(tmp_path / "p", [_row("mach", "2026-09-10", "a", s, _fs=16000)])
+    out = str(tmp_path / "out")
+    r = subprocess.run([sys.executable, TOOL, "--pool", pool, "--out", out, "--n", "1",
+                        "--seed", "1"], check=True, capture_output=True, text=True)
+    c = json.load(open(os.path.join(out, "manifest.json")))["clips"][0]
+    assert c["header_fs_hz"] == 16000
+    assert c["wav_fs_hz"] == 48000.0
+    assert c["dur_s"] == pytest.approx(5.0)
+    assert c["header_rate_suspect"]["decim"] == 3
+    with wave.open(os.path.join(out, c["loud"]), "rb") as w:
+        assert w.getframerate() == 48000
+    assert "wrong WAV header rate" in r.stdout
+    assert "⚠️was 16000" in open(os.path.join(out, "sheet.md")).read()
+
+
+def test_an_honest_clip_is_staged_at_the_rate_it_claims(tmp_path):
+    """The correction must not touch a clip that is what it says it is."""
+    pool = _pool(tmp_path / "p", [_row("mach", "2026-09-10", "a", _tone(64000, 3000))])
+    out = str(tmp_path / "out")
+    r = subprocess.run([sys.executable, TOOL, "--pool", pool, "--out", out, "--n", "1",
+                        "--seed", "1"], check=True, capture_output=True, text=True)
+    c = json.load(open(os.path.join(out, "manifest.json")))["clips"][0]
+    assert c["header_rate_suspect"] is None
+    assert c["wav_fs_hz"] == 16000
+    assert "wrong WAV header rate" not in r.stdout
