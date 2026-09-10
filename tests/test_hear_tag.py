@@ -14,6 +14,7 @@ which are properties of YAMNet. `TestAgainstTheRealModel` runs only when both ar
 
 ⚠️NOTHING HERE WRITES OUTSIDE tmp_path.
 """
+import collections
 import json
 import os
 import re
@@ -986,6 +987,7 @@ class TestTheCheckCanActuallyFail:
                 "cap_hit": False, "stop_reason": None, "conservation_ok": True,
                 "weights_ok": True, "silence_top": 0, "by_reason": {}, "by_node": {},
                 "by_node_day_reason": {}, "model": {}, "silence_frac": 0.0,
+                "mean_top_score": 0.25, "n_top_scores": 1,
                 "observation_not_health": {}}
         base.update(kw)
         HT.write_heartbeat(str(tmp_path), base, now=kw.pop("now", 1000.0))
@@ -1061,10 +1063,35 @@ class TestTheCheckCanActuallyFail:
         line = [l for l in lines if l.startswith("silence")][0]
         assert "REPORT" in line and "NOT GATED" in line and "1.000" in line
 
-    def test_it_does_fire_once_a_threshold_is_set(self, tmp_path):
-        self._beat(tmp_path, tagged=10, silence_top=10, now=1000.0)
+    def test_the_score_floor_fires_when_the_run_goes_quiet(self, tmp_path):
+        """⚠️THE CANARY THAT REPLACED THE SILENCE ONE, AND THE REASON IS MEASURED. Over the
+        69-clip human calibration set mn10_as returns Silence top-1 on 0 healthy and 3
+        un-normalised, so `max_silence_frac` cannot separate them without resting on 3 clips.
+        The run's mean top score does: 0.254 against 0.162, 13.6 sigma apart at 400 clips."""
+        self._beat(tmp_path, tagged=10, mean_top_score=0.162, n_top_scores=10, now=1000.0)
+        code, lines = HT.check_tags(str(tmp_path), min_mean_top_score=0.20, now=1000.0)
+        assert code == 1 and any(l.startswith("score    LOW") for l in lines), lines
+
+    def test_the_score_floor_passes_a_healthy_run(self, tmp_path):
+        self._beat(tmp_path, tagged=10, mean_top_score=0.254, n_top_scores=10, now=1000.0)
+        code, lines = HT.check_tags(str(tmp_path), min_mean_top_score=0.20, now=1000.0)
+        assert any(l.startswith("score    ok") for l in lines), lines
+
+    def test_the_silence_fraction_is_reported_and_never_gated(self, tmp_path):
+        """⚠️It used to be gateable-in-principle and merely un-set. The calibration retired it,
+        so passing a threshold must NOT resurrect a gate that rests on three clips."""
+        self._beat(tmp_path, tagged=10, silence_top=10, silence_frac=1.0, now=1000.0)
         code, lines = HT.check_tags(str(tmp_path), max_silence_frac=0.5, now=1000.0)
-        assert code == 1 and any("HIGH" in l for l in lines)
+        sil = [l for l in lines if l.startswith("silence")]
+        assert sil and "REPORT" in sil[0] and "HIGH" not in sil[0], sil
+        assert "NOT GATED" in sil[0]
+
+    def test_the_score_floor_is_calibrated_against_one_failure_and_says_so(self, tmp_path):
+        """A canary tuned on a single failure mode must not read as a health certificate."""
+        self._beat(tmp_path, tagged=10, mean_top_score=0.10, n_top_scores=10, now=1000.0)
+        _, lines = HT.check_tags(str(tmp_path), min_mean_top_score=0.20, now=1000.0)
+        low = [l for l in lines if l.startswith("score    LOW")][0]
+        assert "ONE failure" in low and "not proof" in low
 
     def test_a_quiet_night_is_not_a_failure(self, tmp_path):
         """⚠️A gate keyed on 'did anything score high' fires on a correct result. Nothing here
@@ -1522,3 +1549,54 @@ class TestTheModelIdentityIsTheWholeChain:
         src = p.read_text()
         assert HT.UPSTREAM_SHA256 in src, "the export names the checkpoint it converts"
         assert HT.MODEL_SHA256 in src, "and the digest of what it produces"
+
+
+# ----------------------------------------------------------------- the calibration set
+
+class TestTheHumanCalibrationSetIsRealAndBounded:
+    """⚠️69 rows, one listener, 2 marked "sure". Enough to REFUTE things -- it already refuted
+    two -- and not enough to FIT anything. These tests pin the shape so a later reader cannot
+    mistake it for a reference standard."""
+
+    @staticmethod
+    def _labels():
+        import pathlib
+        p = pathlib.Path(__file__).resolve().parents[1] / "testdata" / "clip-labels-2026-09-10.jsonl"
+        return [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+
+    def test_the_gate_is_met_on_count_and_on_mach(self):
+        rows = self._labels()
+        assert len(rows) >= 30
+        assert sum(1 for r in rows if r["node"] == "mach") >= 1
+        assert {r["node"] for r in rows} == {"mach", "nyquist", "rankine"}
+
+    def test_every_row_is_either_a_tag_or_an_explicit_nothing(self):
+        for r in self._labels():
+            assert bool(r["nothing"]) != bool(r["heard"]), r
+
+    def test_the_listeners_own_confidence_is_recorded_and_mostly_low(self):
+        """A set where 67 of 69 rows say "probably" is not ground truth, and the numbers derived
+        from it inherit that. The field exists so nobody has to take it on trust."""
+        conf = collections.Counter(r["confidence"] for r in self._labels())
+        assert set(conf) <= {"sure", "probably", "guess"}
+        assert conf["sure"] < len(self._labels()) / 2
+
+    def test_the_silence_measure_does_not_separate_empty_from_sound(self):
+        """⚠️THE MEASUREMENT THAT RETIRED GATE CONDITION 3, pinned so it cannot quietly come back.
+        AUC of silence_frac against the listener's `nothing` is BELOW chance: a quiet insect
+        chorus sits under -60 dBFS most of the time and an empty windy clip does not."""
+        rows = [r for r in self._labels() if r.get("silence_frac") is not None]
+        emp = [r["silence_frac"] for r in rows if r["nothing"]]
+        snd = [r["silence_frac"] for r in rows if not r["nothing"]]
+        assert emp and snd
+        wins = sum(1 for a in emp for b in snd if a > b)
+        ties = sum(1 for a in emp for b in snd if a == b)
+        auc = (wins + 0.5 * ties) / (len(emp) * len(snd))
+        assert auc < 0.5, ("silence_frac AUC is %.3f; if this ever rises above chance the "
+                           "retirement of --max-silence-frac deserves revisiting" % auc)
+
+    def test_no_gate_reads_the_silence_fraction(self):
+        import inspect
+        src = inspect.getsource(HT.check_tags)
+        gate = src[src.index("silence  REPORT"):src.index("tops = [")]
+        assert "bad += 1" not in gate, "the silence fraction must not gate anything"
