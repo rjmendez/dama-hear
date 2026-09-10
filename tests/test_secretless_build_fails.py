@@ -52,6 +52,17 @@ def test_the_guard_comes_after_the_secrets_include(sketch):
         "%s includes the guard before secrets.h, so it can never see WIFI_N" % sketch.name)
 
 
+def test_a_secrets_file_declaring_zero_networks_does_not_slip_through():
+    """⚠️THE HOLE COPILOT FOUND. Testing only `defined(WIFI_N)` let a secrets.h declaring zero
+    networks pass the guard AND report configured:true -- strictly worse than no secrets.h, because
+    it looks deliberate. secrets.h is GENERATED from a credentials store by a parser, and the one
+    written on 2026-09-10 would have emitted exactly `#define WIFI_N 0` had its regex matched
+    nothing. The guard must COUNT, not merely detect."""
+    code = _code(GUARD)
+    assert re.search(r"\(?\s*WIFI_N\s*\)?\s*<=\s*0", code), (
+        "the guard tests only whether WIFI_N is defined, so WIFI_N 0 bypasses it")
+
+
 def test_the_guard_errors_by_default_and_only_yields_to_an_explicit_flag():
     code = _code(GUARD)
     assert "#    error" in code or "#error" in code, "the guard does not actually stop the build"
