@@ -2118,7 +2118,8 @@ static String status_json() {
     "\"from_utc_us\":%lld,\"to_utc_us\":%lld,\"marks\":%lu,\"bytes\":%lu},"
     // scene: fft_us_per_row is MEASURED on this part, summed over the 64 frames of one row.
     // bands/f_lo_hz/f_hi_hz: the scene bank is NOT the detection bank any more, and a reader
-    // that assumes MELIMP's 312 Hz band 0 would misread every row. Say which bank produced them.
+      // that assumes MELIMP's band 0 would misread every row -- at 48 kHz that is bins 2-3,
+      // i.e. 375.0-750.0 Hz at 187.5 Hz per bin, not the 312 Hz it was at 16 kHz.
     "\"scene\":{\"rows\":%lu,\"written\":%lu,\"row_span_ms\":%d,\"fft_us_per_row\":%lu,\"fft_us_max\":%lu,"
     "\"short_blocks\":%lu,\"write_fail\":%lu,\"bands\":%d,\"slices\":%d,\"f_lo_hz\":%.1f,\"f_hi_hz\":%.1f},"
     // clips: written advances only on a full CLIP_BYTES landing, skip_budget only when one was
@@ -2620,7 +2621,7 @@ void setup() {
     double cyc_i32 = (double)(uint64_t)(e1 - e0) / reps;
 
     uint32_t f0 = esp_cpu_get_cycle_count();
-    for (int k = 0; k < reps; k++) { for (int i = 0; i < MEL16_NFFT; i++) { fft_re[i] = (float)bin[i]; fft_im[i] = 0.0f; } fft256(); }
+    for (int k = 0; k < reps; k++) { for (int i = 0; i < MELIMP_NFFT; i++) { fft_re[i] = (float)bin[i]; fft_im[i] = 0.0f; } fft256(); }
     uint32_t f1 = esp_cpu_get_cycle_count();
     double cyc_fft = (double)(uint64_t)(f1 - f0) / reps;
 
