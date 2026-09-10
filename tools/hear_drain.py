@@ -283,13 +283,19 @@ LS_RETRY_BACKOFF_S = 1.5
 
 def ls_sizes_retrying(ip: str, timeout: float = DEFAULT_TIMEOUT_S, retries: int = LS_RETRIES,
                       backoff: float = LS_RETRY_BACKOFF_S,
-                      sleep=time.sleep) -> Tuple[Optional[Dict[str, int]], Optional[str], int]:
+                      sleep=None) -> Tuple[Optional[Dict[str, int]], Optional[str], int]:
     """(sizes, error repr, attempts). None sizes means every attempt failed.
+
+    ⚠️`sleep` RESOLVES AT CALL TIME, NOT AT DEF TIME. A `sleep=time.sleep` default binds the
+    function object when the module is imported, so patching `time.sleep` afterwards does nothing
+    -- which made two of this module's own tests sleep for real while appearing to be patched.
 
     ⚠️THE ATTEMPT COUNT IS RETURNED SO THE RUN RECORD CAN SAY A RETRY HAPPENED. A retry that
     silently succeeds turns a node with a real contention problem into a node that looks healthy,
     and the contention is worth seeing before it becomes a failure.
     """
+    if sleep is None:
+        sleep = time.sleep
     last = None
     for attempt in range(1, max(1, retries) + 1):
         try:
@@ -1037,7 +1043,10 @@ def main(argv=None) -> int:
                       "run, not clean" % (r.get("ls_attempts", 1), r["ls_error"]))
             elif r.get("ls_retried"):
                 # Succeeded, but not first time. Contention worth seeing before it becomes loss.
-                print("    /ls needed %d attempts -- the node is refusing concurrent requests"
+                # ⚠️STATES THE MEASUREMENT, NOT THE CAUSE. Concurrent-client refusal is the
+                # mechanism seen on nyquist, but any transport fault retries the same way and a
+                # log line must not name a cause it did not establish.
+                print("    /ls needed %d attempts -- the node did not answer first time"
                       % r["ls_retried"])
             elif r.get("unfetched_unknown"):
                 print("    reach-back UNMEASURED this run, not clean: %s"
