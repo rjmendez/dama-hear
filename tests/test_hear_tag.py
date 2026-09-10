@@ -7,7 +7,7 @@ and Animal/Wild animals/Bird. A tagger that skips `normalise` exits 0 forever an
 clip Silence, so `TestNormalisationIsNotAnOptimisation` drives a stub model with exactly that
 level dependence -- it FAILS if the call is removed, which no assertion on the output shape can.
 
-⚠️THE MODEL IS STUBBED EVERYWHERE EXCEPT ONE OPT-IN TEST. ai-edge-litert and the 16 MB weights
+⚠️THE MODEL IS STUBBED EVERYWHERE EXCEPT ONE OPT-IN TEST. onnxruntime and the 24 MB weights
 are not in this checkout and must not be a test dependency: the assertions here are about
 normalisation, rate refusal, the refusal census, the accounting invariant and the store, none of
 which are properties of YAMNet. `TestAgainstTheRealModel` runs only when both are present.
@@ -83,12 +83,13 @@ class StubTagger:
         keep = {k: v for k, v in scores.items() if v >= floor}
         dropped = [v for v in scores.values() if v < floor] + list(self.tail)
         return {"scores": keep, "max_unstored_score": max(dropped) if dropped else 0.0,
-                "n_classes_scored": HT.YAMNET_CLASSES, "n_frames": HT.YAMNET_FRAMES,
-                "embedding": [0.0] * HT.YAMNET_EMBED_DIM}
+                "n_classes_scored": HT.MODEL_CLASSES, "n_passes": HT.MODEL_PASSES,
+                "embedding": [0.0] * HT.MODEL_EMBED_DIM,
+                "embedding_dim": HT.MODEL_EMBED_DIM}
 
 
-VERIFIED = {"ok": True, "model_sha256": HT.YAMNET_SHA256, "class_map_sha256": HT.CLASSMAP_SHA256,
-            "model_bytes": HT.YAMNET_BYTES, "class_map_bytes": HT.CLASSMAP_BYTES, "problems": []}
+VERIFIED = {"ok": True, "model_sha256": HT.MODEL_SHA256, "class_map_sha256": HT.CLASSMAP_SHA256,
+            "model_bytes": HT.MODEL_BYTES, "class_map_bytes": HT.CLASSMAP_BYTES, "problems": []}
 
 
 def store_clip(root, *, node="nyquist", boot="db21acd5", sample=1082421378, ts=1788997850.8,
@@ -139,14 +140,14 @@ class TestTheWeightsAreProvenOrTheRunStops:
     def test_absent_weights_are_refused_and_name_the_url(self, tmp_path):
         v = HT.verify_weights(str(tmp_path))
         assert not v["ok"]
-        assert any("is absent" in p and "kaggle" in p for p in v["problems"]), v["problems"]
+        assert any("is absent" in p and "EfficientAT" in p for p in v["problems"]), v["problems"]
 
     def test_the_right_size_and_the_wrong_bytes_is_still_refused(self, tmp_path):
         """The size check alone would pass this. sha256 is what separates the pinned artifact from
         the next 16 MB file somebody drops in the same directory."""
         mp, cp = HT.weights_paths(str(tmp_path))
         with open(mp, "wb") as fh:
-            fh.write(b"\0" * HT.YAMNET_BYTES)
+            fh.write(b"\0" * HT.MODEL_BYTES)
         with open(cp, "wb") as fh:
             fh.write(b"\0" * HT.CLASSMAP_BYTES)
         v = HT.verify_weights(str(tmp_path))
@@ -166,19 +167,26 @@ class TestTheWeightsAreProvenOrTheRunStops:
     def test_verify_weights_alone_exits_2(self, tmp_path):
         assert HT.main(["--model-dir", str(tmp_path), "--verify-weights"]) == 2
 
+    def test_the_upstream_checkpoint_is_pinned_too_not_only_the_export(self):
+        """⚠️THE CHAIN HAS THREE LINKS. Upstream ships PyTorch, this repo ships an export script,
+        the pod loads ONNX. Pinning only the ONNX would make the digest a record of what was
+        built rather than a check on what it was built FROM."""
+        assert re.fullmatch(r"[0-9a-f]{64}", HT.UPSTREAM_SHA256)
+        assert HT.UPSTREAM_BYTES == 19708753
+        assert "EfficientAT" in HT.UPSTREAM_URL and "v0.0.1" in HT.UPSTREAM_URL
+        assert "mn10_as_mAP_471" in HT.UPSTREAM_URL, "the mAP is in the filename; eleven assets \
+in that release are all called mn10_as and differ only in mel bins and hop"
+        assert "export_mn10_onnx" in HT.MODEL_URL
+
+    def test_the_class_map_is_pinned_to_a_release_tag_not_a_branch(self):
+        assert "/v0.0.1/" in HT.CLASSMAP_URL
+        assert "/main/" not in HT.CLASSMAP_URL and "/master/" not in HT.CLASSMAP_URL
+
     def test_the_pinned_digests_are_hex_of_the_right_length(self):
-        # A placeholder left in the source ("<pin the 16.1 MB .tflite>") would make every
+        # A placeholder left in the source ("<pin the 24 MB .onnx>") would make every
         # verification fail closed, but silently -- and nobody would know the pin was never done.
-        for s in (HT.YAMNET_SHA256, HT.CLASSMAP_SHA256):
+        for s in (HT.MODEL_SHA256, HT.CLASSMAP_SHA256):
             assert re.fullmatch(r"[0-9a-f]{64}", s), s
-        assert re.fullmatch(r"[0-9a-f]{40}", HT.CLASSMAP_COMMIT)
-
-    def test_the_class_map_url_is_pinned_to_a_commit_not_to_master(self):
-        """`master` is a moving ref. The bytes were checked byte-identical to what master served
-        on 2026-09-09, and the commit is what keeps that true tomorrow."""
-        assert "/master/" not in HT.CLASSMAP_URL
-        assert HT.CLASSMAP_COMMIT in HT.CLASSMAP_URL
-
 
 # ----------------------------------------------------------------- normalisation
 
@@ -224,7 +232,7 @@ class TestNormalisationIsNotAnOptimisation:
 
 # ----------------------------------------------------------------- the rate
 
-class TestTheRateIsAssertedNeverResampled:
+class TestTheRateIsSnappedOrRefused:
     """⚠️A SHIPPED CONDITION, NOT A HYPOTHETICAL. mach headed a whole boot 22624 Hz. YAMNet
     neither validates nor resamples its input rate, so feeding it that degrades silently towards
     Silence; a resampler here would launder a known firmware defect into plausible tags."""
@@ -270,7 +278,7 @@ class TestTheWholeScorePictureIsStored:
         store_clip(tmp_path)
         run(tmp_path, StubTagger())
         row = next(iter(TAGS.read_tags(str(tmp_path))))
-        assert len(row["embedding"]) == HT.YAMNET_EMBED_DIM
+        assert len(row["embedding"]) == HT.MODEL_EMBED_DIM
 
     def test_no_hard_top_one_is_stored(self, tmp_path):
         store_clip(tmp_path)
@@ -296,7 +304,7 @@ class TestEveryRowNamesItsModelAndItsStatus:
         store_clip(tmp_path)
         run(tmp_path, StubTagger())
         row = next(iter(TAGS.read_tags(str(tmp_path))))
-        assert row["model"]["sha256"] == HT.YAMNET_SHA256
+        assert row["model"]["sha256"] == HT.MODEL_SHA256
         assert row["model"]["class_map_sha256"] == HT.CLASSMAP_SHA256
         assert row["model"]["name"] == HT.MODEL_NAME and row["model"]["version"] == HT.MODEL_VERSION
 
@@ -503,13 +511,14 @@ class TestResumeIsTheStoreItself:
         about audio the byte cap may already have deleted."""
         store_clip(tmp_path)
         run(tmp_path, StubTagger())
-        monkeypatch.setattr(HT, "MODEL_VERSION", "tflite-2")
+        monkeypatch.setattr(HT, "MODEL_VERSION", "onnx-2")
         assert run(tmp_path, StubTagger())["tagged"] == 1
         # ⚠️KEYED ON THE DIGEST TOO. Pre-change this returned `name/version` only, so two
         # different weight files scored under one version string reported as ONE model -- the
         # mixing the docstring says is reported.
         held = TAGS.versions_held(str(tmp_path))
-        assert sorted(k.rsplit("/", 1)[0] for k in held) == ["yamnet/tflite-1", "yamnet/tflite-2"]
+        assert sorted(k.rsplit("/", 1)[0] for k in held) == [
+            "efficientat-mn10_as/onnx-1", "efficientat-mn10_as/onnx-2"]
         assert all(len(k.rsplit("/", 1)[1]) == 64 for k in held), held
 
     def test_the_limit_defers_rather_than_dropping(self, tmp_path):
@@ -872,7 +881,7 @@ class TestTheJoinedContextNeverPresentsAModelScoreAsGroundTruth:
 
     def _tag_row(self, **over):
         row = {"tag_key": "t1", "clip_key": "c1", "provenance": "model",
-              "model": {"name": "yamnet", "version": "tflite-1"},
+              "model": {"name": "efficientat-mn10_as", "version": "onnx-1"},
               "claim": {"usable_as_training_label": False, "human_verified": False}}
         row.update(over)
         return row
@@ -896,7 +905,7 @@ class TestTheJoinedContextNeverPresentsAModelScoreAsGroundTruth:
         row = store_clip(tmp_path, ts=1788997845.0)
         got = TAGS.joined_context(pl, self._tag_row(), row)
         assert got["provenance"] == "model"
-        assert got["model"] == {"name": "yamnet", "version": "tflite-1"}
+        assert got["model"] == {"name": "efficientat-mn10_as", "version": "onnx-1"}
         assert got["claim"]["usable_as_training_label"] is False
         assert got["tag_key"] == "t1" and got["clip_key"] == "c1"
         assert got["scene"]["basis"] == "utc"
@@ -1112,8 +1121,16 @@ class TestTheWeightsAreVerifiedBeforeAnythingIsTagged:
         last = body.rindex("--verify-weights")
         assert last < body.index("exec python"), (
             "the unconditional verify must run BEFORE the tagging exec, not after it")
-        assert body.count("--verify-weights") >= 2, (
-            "one conditional probe to decide whether to fetch, one unconditional gate")
+        # ⚠️THE INVARIANT IS "VERIFY GATES THE EXEC", NOT "VERIFY IS CALLED TWICE". Under YAMNet
+        # the model was fetchable, so the shape was a probe, a fetch, then a gate -- and the test
+        # counted calls. mn10_as is staged out of band (upstream ships PyTorch; converting it in
+        # the pod would mean 3 GB of torch in a 5 Gi PVC), so there is one call and it exits.
+        # Counting calls would now fail a preamble that is strictly stricter than the old one.
+        gate = body[last:body.index("exec python")]
+        assert "exit 1" in gate, (
+            "the verify must FAIL the job, not warn: no path may reach the exec unverified")
+        assert "|| true" not in body.split("exec python")[0], (
+            "a verify swallowed by `|| true` gates nothing")
 
     def test_the_preamble_is_valid_shell(self, docs, tmp_path):
         s = docs[0]["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["args"][0]
@@ -1209,7 +1226,7 @@ class TestEveryBundleKeyIsMounted:
         """16,096,668 B against a 1 MiB ConfigMap limit. The digest ships instead, in the code
         that enforces it."""
         for _key, rel in GC.BUNDLES["hear-tag-code"][1]:
-            assert not rel.endswith((".tflite", ".csv")), rel
+            assert not rel.endswith((".onnx", ".tflite", ".csv")), rel
         assert GC.BUNDLES["hear-tag-code"][2] == []
 
     def test_the_bundle_does_not_drag_in_the_pool(self):
@@ -1241,7 +1258,7 @@ def _have_real_model():
     if not _MODEL_DIR:
         return False
     try:
-        import ai_edge_litert                                   # noqa: F401
+        import onnxruntime                                      # noqa: F401
     except Exception:
         return False
     return HT.verify_weights(_MODEL_DIR)["ok"]
@@ -1249,7 +1266,8 @@ def _have_real_model():
 
 @pytest.mark.skipif(not _have_real_model(),
                     reason="set HEAR_TAG_MODEL_DIR to a directory holding the pinned "
-                           "yamnet.tflite + yamnet_class_map.csv, with ai-edge-litert installed")
+                           "mn10_as.onnx + audioset_class_labels_indices.csv, with "
+                           "onnxruntime installed")
 class TestAgainstTheRealModel:
     """⚠️OPT-IN. The weights are 16 MB and are not in this checkout; the assertions above are
     about the pipeline, not about YAMNet. What this class proves is the one thing a stub cannot:
@@ -1259,9 +1277,9 @@ class TestAgainstTheRealModel:
         mp, cp = HT.weights_paths(_MODEL_DIR)
         t = HT.Tagger(mp, cp)
         got = t.tag(np.zeros(CLIP_SAMPLES, dtype=np.float32))
-        assert got["n_classes_scored"] == HT.YAMNET_CLASSES
-        assert got["n_frames"] == HT.YAMNET_FRAMES
-        assert len(got["embedding"]) == HT.YAMNET_EMBED_DIM
+        assert got["n_classes_scored"] == HT.MODEL_CLASSES
+        assert got["n_passes"] == HT.MODEL_PASSES
+        assert len(got["embedding"]) == HT.MODEL_EMBED_DIM
 
     def test_the_model_is_level_sensitive_which_is_why_normalise_exists(self):
         """⚠️THE CLAIM ASSERTED HERE IS ONLY WHAT THIS TEST CAN REPRODUCE. The Silence flip was
@@ -1299,8 +1317,9 @@ class TestAModelThatScoredNothingIsNotAQuietNight:
 
         def tag(self, pcm, floor=HT.SCORE_FLOOR):
             return {"scores": {}, "max_unstored_score": 0.0,
-                    "n_classes_scored": HT.YAMNET_CLASSES, "n_frames": HT.YAMNET_FRAMES,
-                    "embedding": [0.0] * HT.YAMNET_EMBED_DIM}
+                    "n_classes_scored": HT.MODEL_CLASSES, "n_passes": HT.MODEL_PASSES,
+                    "embedding_dim": HT.MODEL_EMBED_DIM,
+                    "embedding": [0.0] * HT.MODEL_EMBED_DIM}
 
     def _report(self, tmp_path, tagger, n=3):
         for i in range(n):
@@ -1335,7 +1354,7 @@ class TestAModelThatScoredNothingIsNotAQuietNight:
 
 class TestOneVersionStringMeansOneWeightsFile:
     """⚠️`model_block` says the sha256 IS the identity, but `tag_key` keyed on MODEL_VERSION
-    alone: a re-exported yamnet.tflite under an unchanged version string was treated as
+    alone: a re-exported mn10_as.onnx under an unchanged version string was treated as
     already-tagged for every clip already scored, and nothing anywhere compared digests."""
 
     def test_new_weights_under_the_same_version_still_re_tag(self, tmp_path, monkeypatch):
@@ -1357,3 +1376,104 @@ class TestOneVersionStringMeansOneWeightsFile:
         text = "\n".join(lines)
         assert code == 1, text
         assert "weights  MIXED" in text, text
+
+
+# ----------------------------------------------------------------- the model swap
+
+class TestTheClipReachesTheModelAtTheModelsRate:
+    """mn10_as is 32 kHz and the fleet is not. What crosses, what is refused, what is labelled."""
+
+    def test_a_48k_clip_is_tagged_rather_than_refused_for_its_size(self, tmp_path):
+        """⚠️REGRESSION. tag_one tested `len(pcm) * 2 + 44 != CLIP_BYTES_16K_4S` and so refused
+        every clip the 48 kHz firmware writes -- the identical magic number, in the identical
+        shape, that hear/clips.py had already been fixed for. A constant copied between modules
+        keeps its number and loses its meaning."""
+        row = store_clip(tmp_path, pcm=quiet_noise(n=240000), fs=48000, fs_csv=48000.0)
+        got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
+        assert got["ok"], got
+        assert got["row"]["fs_source_nominal_hz"] == 48000.0
+        assert got["row"]["fs_model_hz"] == HT.MODEL_FS_HZ
+
+    def test_the_16k_clip_says_which_band_is_real(self, tmp_path):
+        """The model's Nyquist is 16 kHz; a 16 kHz clip carries measurement to 8. A reader that
+        cannot tell the difference will treat the interpolation filter as the night."""
+        row = store_clip(tmp_path)
+        got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
+        assert got["ok"], got
+        assert got["row"]["upsampled"] is True
+        assert got["row"]["band_limit_hz"] == 8000.0
+        assert got["row"]["resample_L"] == 2 and got["row"]["resample_M"] == 1
+
+    def test_the_48k_clip_is_not_flagged_as_upsampled(self, tmp_path):
+        row = store_clip(tmp_path, pcm=quiet_noise(n=240000), fs=48000, fs_csv=48000.0)
+        got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
+        assert got["row"]["upsampled"] is False
+        assert got["row"]["band_limit_hz"] == 16000.0
+        assert (got["row"]["resample_L"], got["row"]["resample_M"]) == (2, 3)
+
+    def test_machs_22624_boot_is_still_refused_and_as_a_RATE_problem(self, tmp_path):
+        """⚠️THE REFUSAL MOVED, IT DID NOT GO AWAY -- and the REASON has to stay right. Checked
+        after the duration test, the same clip came back `wav_sample_count`: 64000 samples read
+        as 2.83 s and refused for the wrong length. True, and useless. The rate is the defect."""
+        row = store_clip(tmp_path, fs=22624, fs_csv=16000.0)
+        got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
+        assert not got["ok"]
+        assert got["reason"] == HT.R_RATE_REFUSED, got
+        assert "22624" in got["detail"]
+
+    def test_a_clip_of_no_known_length_is_refused_by_duration_not_by_bytes(self, tmp_path):
+        row = store_clip(tmp_path, pcm=quiet_noise(n=16000))       # 1.0 s at 16 kHz
+        got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
+        assert not got["ok"] and got["reason"] == HT.R_WAV_SAMPLES
+        assert "1.000 s" in got["detail"] and "4.0/5.0" in got["detail"]
+
+    def test_a_misheaded_48k_clip_is_scored_at_48k_and_says_so(self, tmp_path):
+        """240000 samples headed 16000 Hz is the FS_NOMINAL-stamped 48 kHz clip bug. Scored at
+        the header's rate it is 15 s of audio an octave and a half low."""
+        row = store_clip(tmp_path, pcm=quiet_noise(n=240000), fs=16000, fs_csv=16000.0)
+        got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
+        assert got["ok"], got
+        assert got["row"]["header_rate_suspect"]["true_fs_hz"] == 48000.0
+        assert got["row"]["fs_source_nominal_hz"] == 48000.0
+        assert got["row"]["wav_header_fs_hz"] == 16000, "the lying header is KEPT beside the correction"
+
+
+class TestTheEmbeddingWidthCannotBeConfused:
+
+    def test_the_width_is_960_and_travels_on_every_row(self, tmp_path):
+        """⚠️hear_bridge.py has four consumers that hard-code len(e) == 1024; three drop a
+        mismatch SILENTLY and audio_anomaly_score.py returns 0.0 / "not anomalous", which its own
+        docstring calls worse than dropping. YAMNet's 1024 and BirdNET's 1024 are mutually
+        confusable there. 960 is not either of them, and the row says which it is."""
+        row = store_clip(tmp_path)
+        got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
+        assert got["row"]["embedding_dim"] == 960 == HT.MODEL_EMBED_DIM
+        assert len(got["row"]["embedding"]) == 960
+        assert HT.MODEL_EMBED_DIM != 1024, "the whole point of recording the width"
+
+    def test_the_model_block_carries_the_width_and_the_rate(self, tmp_path):
+        mb = HT.model_block(VERIFIED)
+        assert mb["embed_dim"] == 960 and mb["n_classes"] == 527
+        assert mb["input_fs_hz"] == 32000 and mb["runtime"] == "onnxruntime"
+
+
+class TestTheModelIdentityIsTheWholeChain:
+
+    def test_the_card_names_the_upstream_checkpoint_and_the_export_script(self):
+        card = HT.model_card(VERIFIED)
+        assert card["upstream_sha256"] == HT.UPSTREAM_SHA256
+        assert card["export_script"] == "tools/export_mn10_onnx.py"
+        assert card["upstream_licence"] == "MIT"
+
+    def test_the_card_states_the_measured_upsampling_penalty_rather_than_a_hope(self):
+        card = HT.model_card(VERIFIED)
+        t = card["upsampling_penalty_measured"]
+        assert "cosine" in t and "0.90" in t
+        assert "Perch" in t, "the measurement is for THIS model and must not be read as Perch's"
+
+    def test_the_export_script_exists_and_pins_what_hear_tag_pins(self):
+        import pathlib
+        p = pathlib.Path(__file__).resolve().parents[1] / "tools" / "export_mn10_onnx.py"
+        src = p.read_text()
+        assert HT.UPSTREAM_SHA256 in src, "the export names the checkpoint it converts"
+        assert HT.MODEL_SHA256 in src, "and the digest of what it produces"
