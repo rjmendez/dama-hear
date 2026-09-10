@@ -1,5 +1,13 @@
 # 2026-09-08 — first data pulled off `nyquist` and `mach`
 
+⚠️**A RECORD OF WHAT WAS FLASHED THAT DAY, NOT OF THE CURRENT BUILD.** Every `MEL16_*` symbol,
+`fs_code 2`, `fs=16000` and `valid_bands=15` below is what those two nodes were running on
+2026-09-08 and is still what the rows they wrote declare. The node sketch has since moved to the
+acquisition rate: the bank is `mel_impulse.h` / `MELIMP_*` at 48 kHz, `fs_code 7`, `valid_bands 20`,
+and the frame is format-identical to a phone's. Nothing here was rewritten — the stored frames say
+`fs_code 2` forever and this file is what explains them.
+
+
 Both XIAO S3 Sense nodes are up and recording. `puc` is up but is not timing anything.
 
 | node | addr | class | uptime | GPS | PPS | SD |

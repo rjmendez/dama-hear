@@ -817,9 +817,44 @@ class TestTheSketchJoinIsReadOnlyAndSaysHowStrongItIs:
         """tags.py restates FRAMES/NFFT/HOP_S so it can ship without hear/sketch.py (TAG_CODE
         excludes it deliberately). The two must agree."""
         from hear import sketch as SK
+        from hear.node import detect as DET
         assert TAGS.SKETCH_FRAMES == SK.FRAMES
         assert TAGS.SKETCH_NFFT == SK.NFFT
         assert TAGS.SKETCH_HOP_S == SK.HOP_S
+        # a THIRD constant, equal to the hop by coincidence at every rate so far
+        assert TAGS.SKETCH_BACK_S == DET.SKETCH_BACK_S
+
+    @pytest.mark.parametrize("fs_hz", [16000.0, 48000.0, 32000.0])
+    def test_the_sample_basis_window_is_in_the_decimated_counter_at_every_frame_rate(
+            self, tmp_path, fs_hz):
+        """The pool row pairs `sample` -- night_node's DECIMATED counter -- with `fs_hz`, the rate
+        the frame was CUT at, 48000.0 on every node frame since the sketch moved to the
+        acquisition stream. Only FS_NOMINAL_HZ indexes the counter sample_window() built cs0/cs1
+        in; the frame's own rate gives the window's LENGTH IN SECONDS and nothing else.
+
+        Both edges are recovered by probing rather than recomputed, so this fails against
+        `start = trig - round(SKETCH_HOP_S * fs)` / `end = start + round(span * fs)`: at
+        fs_hz=48000 that form measures back=192 and length=1600 decimated samples (12.0 ms and
+        100.0 ms) where the frame really covers 4.0 ms and 33.3 ms. 32000.0 is here because a
+        guard aimed at the one rate that broke goes blind at the next one."""
+        pl = P.Pool(str(tmp_path))
+        s = 1082421378
+        row = store_clip(tmp_path, anchored=False, sample=s)
+        win = TAGS.sample_window({"sample": s})
+        cs0, cs1 = win["start_sample"], win["end_sample"]
+        probes = list(range(cs0 - 2000, cs0 + 50)) + list(range(cs1 - 50, cs1 + 2000))
+        for t in probes:
+            store_sketch(tmp_path, anchored=False, sample=t, fs_hz=fs_hz, key="p%d" % t)
+        got = TAGS.sketch_overlap(pl, row, allow_sample_basis=True, max_rows=10 ** 6)
+        hit = sorted(int(r["sample"]) for r in got["rows"])
+        assert hit and not got["truncated"]
+        assert probes[0] < hit[0] and hit[-1] < probes[-1], \
+            "the window ran off the probed range, so its edges were not measured"
+        # overlap is `start < cs1 and end > cs0`, so the two extreme hits name both edges exactly
+        back = hit[-1] + 1 - cs1
+        length = cs0 + back - hit[0] + 1
+        assert back == int(round(TAGS.SKETCH_BACK_S * TAGS.FS_NOMINAL_HZ)), back
+        assert length == int(round(TAGS._sketch_span_s(fs_hz) * TAGS.FS_NOMINAL_HZ)), length
 
 
 class TestTheJoinedContextNeverPresentsAModelScoreAsGroundTruth:

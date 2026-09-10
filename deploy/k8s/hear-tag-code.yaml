@@ -6,7 +6,7 @@ metadata:
   labels:
     app: hear-tag
   annotations:
-    dama-hear/commit: 'c373f37-dirty'
+    dama-hear/commit: '699438b-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
 data:
   hear__init__.py: |
@@ -773,17 +773,28 @@ data:
     SKETCH_FRAMES = 8
     SKETCH_NFFT = 256
     SKETCH_HOP_S = 0.004
+    #: How far BEFORE the onset the window starts -- hear/node/detect.py SKETCH_BACK_S, a DIFFERENT
+    #: constant from HOP_S that happens to hold the same 0.004. Named separately here because the
+    #: window's start and its hop grid move for different reasons.
+    SKETCH_BACK_S = 0.004
     
     
     def _sketch_span_s(fs_hz: Any) -> Optional[float]:
         """The sketch's own window length in seconds, at the rate IT was cut at.
     
-        night_node.ino: `SKETCH_SPAN = NFFT + (FRAMES-1)*HOP` samples, `SKETCH_BACK = HOP` samples,
-        the window starting one hop before the trigger sample. NFFT is a SAMPLE count, so its
-        duration depends on fs -- 256/16000 = 16 ms on a node, 256/48000 = 5.33 ms on a 48 kHz phone
-        -- while HOP_S is a fixed 4 ms grid regardless of fs. That is why docs/acoustic-stack.md
-        measures the sketch window at 33-44 ms rather than one number: 5.33 + 7*4 = 33.3 ms at 48 kHz,
-        16 + 7*4 = 44 ms at 16 kHz, both reproduced by this formula.
+        night_node.ino: `SKETCH_SPAN = NFFT + (FRAMES-1)*HOP` samples. NFFT is a SAMPLE count, so its
+        duration depends on fs -- 256/16000 = 16 ms, 256/48000 = 5.33 ms -- while HOP_S is a fixed
+        4 ms grid regardless of fs. That is why docs/acoustic-stack.md measures the sketch window at
+        33-44 ms rather than one number: 5.33 + 7*4 = 33.3 ms at 48 kHz, 16 + 7*4 = 44 ms at 16 kHz,
+        both reproduced by this formula. The node now cuts at 48 kHz like every phone, so 44 ms is
+        the LEGACY case; this function still has to reproduce it for stored rows.
+    
+        ⚠️THE BACK-OFF IS NOT THE HOP, though it equalled it at 16 kHz and equals it again at 48 kHz.
+        `SKETCH_BACK` is `SKETCH_BACK_S * fs` and `HOP` is `HOP_S * fs`; hear/node/detect.py's
+        SKETCH_BACK_S and hear/sketch.py's HOP_S are two independent constants that both happen to be
+        0.004 s. It does not enter the span either way -- the window is FRAMES hops wide wherever it
+        starts -- so this formula is unaffected, and that is the only reason the coincidence was
+        survivable here.
         """
         try:
             fs = float(fs_hz)
@@ -796,7 +807,12 @@ data:
     
     def _sketch_ref(r: Dict[str, Any], is_trigger: bool) -> Dict[str, Any]:
         """The sketch record's identity and window, not its frame bytes -- same discipline as
-        `_scene_ref`: a reader joins on `key`, it does not need the mel payload restated."""
+        `_scene_ref`: a reader joins on `key`, it does not need the mel payload restated.
+    
+        ⚠️`sample` and `fs_hz` in this dict are in DIFFERENT domains and always have been: `sample` is
+        the node's decimated counter (FS_NOMINAL_HZ) and `fs_hz` is the rate the frame was CUT at,
+        48000.0 on every node frame since the sketch moved to the acquisition stream. sample/fs_hz is
+        not a time."""
         return {"key": r.get("key"), "node": r.get("node"), "ts_utc_s": r.get("ts_utc_s"),
                 "utc_us": r.get("utc_us"), "sample": r.get("sample"), "fs_hz": r.get("fs_hz"),
                 "anchored": bool(r.get("anchored")), "trigger": r.get("trigger"),
@@ -853,7 +869,7 @@ data:
                     if span is None:
                         out["refused_records"] += 1
                         continue
-                    s0 = float(r["ts_utc_s"]) - SKETCH_HOP_S
+                    s0 = float(r["ts_utc_s"]) - SKETCH_BACK_S
                     s1 = s0 + span
                     if s0 < float(t1) and s1 > float(t0):
                         if len(out["rows"]) >= max_rows:
@@ -892,18 +908,18 @@ data:
             except (TypeError, ValueError):
                 out["refused_records"] += 1
                 continue
-            fs = r.get("fs_hz") or FS_NOMINAL_HZ
-            try:
-                fs = float(fs)
-            except (TypeError, ValueError):
-                out["refused_records"] += 1
-                continue
-            start = trig_sample - int(round(SKETCH_HOP_S * fs))
+            # ⚠️TWO RATES, ONE ROW. `span` is a TIME and depends on the frame's own rate (fs_hz is
+            # 48000.0 for every node frame cut after the acquisition-rate move). `sample` is a
+            # DECIMATED position -- night_node.ino writes `dets[idx].sample = g_samples + i` and
+            # deliberately keeps it there -- so FS_NOMINAL_HZ is the only rate that turns a time into
+            # this counter's samples, and it is the rate sample_window() built cs0/cs1 with. Using
+            # the frame's rate here makes the window 3x too long and starts it 3x too far back.
             span = _sketch_span_s(r.get("fs_hz"))
             if span is None:
                 out["refused_records"] += 1
                 continue
-            end = start + int(round(span * fs))
+            start = trig_sample - int(round(SKETCH_BACK_S * FS_NOMINAL_HZ))
+            end = start + int(round(span * FS_NOMINAL_HZ))
             if start < cs1 and end > cs0:
                 if len(out["rows"]) >= max_rows:
                     out["truncated"] = True
