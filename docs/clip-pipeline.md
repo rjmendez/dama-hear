@@ -322,7 +322,7 @@ audioset_class_labels_indices.csv       14,675 B  cdd1049833c4b861…
 ```
 
 ⚠️**The `.onnx` is not fetchable, and the job says so instead of guessing.** Upstream publishes
-PyTorch checkpoints; converting one needs torch and torchvision — roughly 3 GB into a 5 Gi PVC to
+PyTorch checkpoints; converting one needs torch, torchaudio and torchvision (EfficientAT's model code imports it) — roughly 3 GB into a 5 Gi PVC to
 produce a 24 MB graph once. `tools/export_mn10_onnx.py` builds it on a workstation, from a
 sha-pinned upstream `.pt`, byte-reproducibly, and it is staged onto the PVC. The CronJob verifies
 and **exits 1 with the two commands to run**; it never builds, and never loads a graph it has not
