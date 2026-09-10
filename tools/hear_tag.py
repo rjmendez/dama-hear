@@ -1,40 +1,63 @@
 #!/usr/bin/env python3
-"""Tag the pooled clips with YAMNet, and say what it could NOT tag.
+"""Tag the pooled clips with EfficientAT mn10_as, and say what it could NOT tag.
 
-    python3 tools/hear_tag.py --pool ~/hear-pool --model-dir ~/hear-pool/models/yamnet
+    python3 tools/hear_tag.py --pool ~/hear-pool --model-dir ~/hear-pool/models/mn10_as
     python3 tools/hear_tag.py --pool ~/hear-pool --census          # read-only, writes nothing
     python3 tools/hear_tag.py --model-dir ... --verify-weights     # exit 2 unless both shas match
     python3 tools/hear_tag.py --pool ~/hear-pool --check           # exit 1 if not flowing
 
-WHY THIS EXISTS. hear-drain now pulls clips off the cards into `clips/index.jsonl` and
+WHY THIS EXISTS. hear-drain pulls clips off the cards into `clips/index.jsonl` and
 `clips/<day>/<node>/*.wav`. Until this file nothing had ever opened one. 478 clips were destroyed
 unheard before collection landed; collecting them and never listening is the same outcome with
 more disk used.
 
-⚠️IT IS EVENT TRIAGE, NOT SPECIES ID, AND THAT IS A PROPERTY OF THE MODEL. YAMNet has `Bird`,
-`Owl`, `Hoot`, `Chirp` and stops -- it is structurally incapable of Barred Owl vs Great Horned
-Owl. BirdNET was evaluated for the species question and refused: zero birds across nine real
-clips, neotropical hypotheses at the confidence floor, 1 second of every 4 discarded (48 kHz x
-3.0 s windows against a 4.0 s clip), and CC BY-NC-SA weights. PANNs/CNN14 was refused too: it
-wants 32 kHz, 17% of its filterbank lands on guaranteed zeros at 16 kHz, and it measured 14%
-lower confidence than YAMNet on the same A/B for 311 ms and 1.5 GB RSS against 12 ms and 82 MB.
+⚠️THE MODEL IS EfficientAT mn10_as, NOT YAMNet, AND THE SWAP WAS MADE ON MEASUREMENTS.
+AudioSet mAP 0.471 against YAMNet's 0.306, at 4.88M parameters and 0.54 GMACs, MIT-licensed --
+which matters on a fleet that also ships an Android APK. YAMNet was refused as a BACKBONE on this
+corpus specifically: 361 of its 1024 dimensions hold exactly zero variance and 43.2 % of
+directions are pinned by the covariance floor, against the scene corpus's rank 80/80 and 0 %
+floored. The hugbot detector built on those embeddings measured mean AUC 0.624 and caught 0 % of
+gaussian noise matched to the corpus. Its validation machinery was worth porting; its weights
+were not.
 
-⚠️NORMALISATION IS MANDATORY AND IT IS THE WHOLE FAILURE MODE. Measured on two real nyquist clips
-pulled off the card 2026-09-09:
+⚠️THE ALTERNATIVES WERE REFUSED WITH NUMBERS, NOT PREFERENCES.
+  * AST / PaSST / BEATs: 87-90M parameters for ~1 mAP over mn10_as at 4.88M. Self-supervised
+    AudioSet models now reach 0.502. The decisive measurement is elsewhere: AudioSet-trained
+    embeddings LOSE to bird-trained embeddings on all six bioacoustic datasets tested, bats and
+    marine mammals included. Three of this site's four named targets are bioacoustic.
+  * BirdNET V2.4: the only thing that answers WHICH bird, 48 kHz native -- and CC BY-NC-SA, which
+    plausibly follows every probe onto the APK. Take BirdNET's answers via puc's BirdWeather
+    feed; do not take its weights.
+  * PANNs/CNN14: wants 32 kHz, 17 % of its filterbank lands on guaranteed zeros at 16 kHz, and it
+    measured 14 % lower confidence than YAMNet on the same A/B for 311 ms and 1.5 GB RSS.
+  * Perch 2.0 is NOT a competitor to this file. It is the bioacoustic embedding tier, 1536-d,
+    Apache-2.0, and it is still gated (docs/acoustic-stack.md S5). This is the coarse tier.
 
-    nyquist-db21acd5-1082421378  raw -56.9 dBFS  ->  Silence 0.406 | Speech 0.183 | Animal 0.147
-                                 RMS to -20 dBFS ->  Animal 0.307 | Cricket 0.204 | Speech 0.198
-    nyquist-db21acd5-1082530195  raw -62.1 dBFS  ->  Silence 0.723 | Animal 0.055 | Fowl 0.042
-                                 RMS to -20 dBFS ->  Animal 0.464 | Wild animals 0.331 | Bird 0.226
+⚠️IT IS EVENT TRIAGE, NOT SPECIES ID, AND THAT IS A PROPERTY OF THE ONTOLOGY. AudioSet has `Bird`,
+`Owl`, `Hoot`, `Chirp` and stops -- 527 classes, structurally incapable of Barred Owl vs Great
+Horned Owl no matter how good the backbone gets.
 
-A pipeline that skips `normalise` exits 0 forever and emits Silence for every clip. It is not an
-optimisation and it is not tuning; the un-normalised answer is wrong and looks healthy.
+⚠️NORMALISATION IS STILL MANDATORY, AND THE REASON CHANGED SIZE. Under YAMNet it was the
+difference between an answer and no answer: at -49 to -62 dBFS every un-normalised clip came back
+`Silence`. Measured over the 29 scorable clips of the 2026-09-10 staging set, mn10_as answers
+`Silence` on 1 raw and 0 normalised -- it is not defeated by the level. What normalisation buys
+is confidence (Speech 0.15 -> 0.29, Insect 0.13 -> 0.27 on individual clips), because the mel is
+log-power with a fixed (log + 4.5) / 5 offset so absolute level moves every band. Still
+mandatory, no longer load-bearing on its own.
 
-⚠️THE RATE IS ASSERTED, NEVER RESAMPLED. YAMNet does not validate its input rate and does not
-resample -- feed it 22624 Hz audio and it degrades silently towards Silence rather than raising.
-mach shipped a whole boot headed 22624 Hz, so this is a condition on the card today and not a
-hypothetical. `assert_rate` REFUSES it, into a counted bucket. A resampler here would launder a
-known firmware defect into plausible-looking tags.
+⚠️THE RATE IS RESAMPLED NOW, AND THE REFUSAL MOVED RATHER THAN VANISHED. mn10_as is 32 kHz
+native; the fleet writes 48 kHz and used to write 16 kHz, so "refuse anything but 16 kHz" would
+now refuse the entire corpus. hear/resample.py snaps the header rate to a rate this fleet
+actually clocks and RAISES otherwise -- mach's 22624 Hz boot is still thrown out into a counted
+bucket rather than stretched into plausible-looking tags. What crosses:
+
+    48000 -> 32000  L=2 M=3  decimation.    Every band the model reads is measurement.
+    16000 -> 32000  L=2 M=1  interpolation. Above 8 kHz is the filter, not the night.
+
+`band_limit_hz`, `fs_source_hz` and `upsampled` ride on every row so the second case can never be
+read as the first. Measured penalty, within-clip on the 7 real 48 kHz clips (native 48->32 versus
+band-crippled 48->16->32): score-vector cosine 0.90-0.99, top-1 changed on 1 of 7. So for THIS
+model the upsample is not very damaging -- which says nothing about Perch, whose Gate 2 is open.
 
 ⚠️THE WHOLE SCORE PICTURE IS STORED, NEVER A HARD TOP-1. Every class above SCORE_FLOOR, plus
 `max_unstored_score` so the discarded tail is a number rather than an absence. hear/pool.py:721
@@ -84,40 +107,58 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hear import clips as CLIPS                                            # noqa: E402
 from hear import tags as TAGS                                             # noqa: E402
+from hear import resample as RESAMPLE                                     # noqa: E402
 
 TAG_SCHEMA = "hear.clip_tag.v1"
 
-MODEL_NAME = "yamnet"
+MODEL_NAME = "efficientat-mn10_as"
 #: Bumping this is what makes a re-tag a NEW row beside the old one rather than an overwrite.
-#: It names the artifact, not the code: change it when the .tflite or the class map changes.
-MODEL_VERSION = "tflite-1"
+#: It names the artifact, not the code: change it when the .onnx or the class map changes.
+MODEL_VERSION = "onnx-1"
 
-MODEL_FILE = "yamnet.tflite"
-CLASSMAP_FILE = "yamnet_class_map.csv"
+MODEL_FILE = "mn10_as.onnx"
+CLASSMAP_FILE = "audioset_class_labels_indices.csv"
 
-#: ⚠️VERIFIED BY DOWNLOADING AND HASHING THEM, 2026-09-09, not copied from a page. The Kaggle
-#: endpoint serves a gzipped tar whose single member is `1.tflite`; the digest below is of that
-#: MEMBER, because the tar wrapper carries an mtime and is not a stable identity.
-YAMNET_SHA256 = "141fba1cdaae842c816f28edc4937e8b4f0af4c8df21862ccc6b52dc567993c3"
-YAMNET_BYTES = 16096668
-YAMNET_URL = ("https://www.kaggle.com/api/v1/models/google/yamnet/tfLite/tflite/1/download"
-              "  (gzipped tar, member `1.tflite`)")
+#: ⚠️THE ONNX IS BUILT HERE, SO THE CHAIN HAS THREE LINKS AND ALL THREE ARE PINNED. Upstream
+#: publishes PyTorch checkpoints, not ONNX; `tools/export_mn10_onnx.py` converts one. The digest
+#: below is of THAT script's output, and it is reproducible -- two runs of the export are
+#: byte-identical (checked 2026-09-10). Verify the chain, not one end of it:
+#:
+#:     mn10_as_mAP_471.pt  0bd7dc24...  19,708,753 B   upstream, MIT, GitHub release v0.0.1
+#:       -> tools/export_mn10_onnx.py                  in this repo, under review like any code
+#:         -> mn10_as.onnx  1b718a05...  24,016,402 B  what the pod loads
+MODEL_SHA256 = "1b718a05a68ba8eecf73ce87b5ce74fe266f4228ecaf2c8bdf8b972347dd553d"
+MODEL_BYTES = 24016402
+UPSTREAM_SHA256 = "0bd7dc2443af498c289a2e739f02ebb515d6aa3fd3ab9db539c86123ae368a4e"
+UPSTREAM_BYTES = 19708753
+UPSTREAM_URL = ("https://github.com/fschmid56/EfficientAT/releases/download/v0.0.1/"
+                "mn10_as_mAP_471.pt")
+MODEL_URL = "built by tools/export_mn10_onnx.py from " + UPSTREAM_URL
 
-#: ⚠️PINNED TO A COMMIT, NOT TO `master`. The class map's own repo default branch is a moving ref;
-#: this commit is the last one that touched the file (2019-11-21) and its bytes were checked to be
-#: byte-identical to what `master` served on 2026-09-09.
-CLASSMAP_SHA256 = "cdf24d193e196d9e95912a2667051ae203e92a2ba09449218ccb40ef787c6df2"
-CLASSMAP_BYTES = 14096
-CLASSMAP_COMMIT = "dfffd623b6be8d1d9744b8e261fbac370d17c46d"
-CLASSMAP_URL = ("https://raw.githubusercontent.com/tensorflow/models/" + CLASSMAP_COMMIT
-                + "/research/audioset/yamnet/yamnet_class_map.csv")
+#: AudioSet's 527-class ontology index, from the same repo and release as the weights. YAMNet's
+#: 521-class map is NOT interchangeable with it: different length, different order.
+CLASSMAP_SHA256 = "cdd1049833c4b86127c2773ac0d14a2754b6a6d0d1798002ed5c66e699708429"
+CLASSMAP_BYTES = 14675
+CLASSMAP_URL = ("https://github.com/fschmid56/EfficientAT/raw/v0.0.1/"
+                "metadata/class_labels_indices.csv")
 
-#: What the interpreter must actually produce. Checked at load, so a substituted model that
-#: happens to hash right for some other reason still cannot be scored as if it were this one.
-YAMNET_CLASSES = 521
-YAMNET_EMBED_DIM = 1024
-#: 64000 samples in -> 8 hops of 0.48 s. Measured against the real interpreter, not assumed.
-YAMNET_FRAMES = 8
+#: What the session must actually produce. Checked at load, so a substituted model that happens
+#: to hash right for some other reason still cannot be scored as if it were this one.
+MODEL_CLASSES = 527
+MODEL_EMBED_DIM = 960
+#: ⚠️960, AND IT IS NOT 1024. tools/hear_bridge.py has four consumers that hard-code
+#: `len(e) == 1024`; three drop a non-matching record SILENTLY and audio_anomaly_score.py returns
+#: 0.0 / "not anomalous", which its own docstring calls worse than dropping. YAMNet's 1024 and
+#: BirdNET's 1024 collide there; 960 cannot be mistaken for either, and every embedding this file
+#: writes carries `dim` so a consumer dispatches on width before anything else.
+
+#: The rate the model's mel frontend was trained at. Clips are 16 kHz or 48 kHz and are RESAMPLED
+#: to it -- see hear/resample.py for which direction manufactures band and how that is labelled.
+MODEL_FS_HZ = 32000
+#: The model is fully convolutional with global pooling, so a clip goes through in ONE pass and
+#: the time average is the network's own. There is no hop count to average over as there was
+#: under YAMNet, and inventing a windowing scheme here would be an unmeasured knob.
+MODEL_PASSES = 1
 
 #: RMS target. -20 dBFS is where the two real clips above stop reading as Silence; it is also far
 #: enough below 0 that a 0.0134 peak clip does not clip after scaling.
@@ -142,6 +183,24 @@ DEFAULT_DEADLINE_S = 600.0
 #: a single clip would be a number from a guess dressed as a measurement; this repo's own rule is
 #: to derive a threshold from the measured envelope.
 SILENCE_FRAC_REPORT_ONLY = -1.0
+
+#: ⚠️THE NORMALISATION CANARY, AND THE ONE IT REPLACED COULD NOT FIRE. `--max-silence-frac` gated
+#: the fraction of clips whose top class is `Silence`, which worked under YAMNet because an
+#: un-normalised clip came back Silence every time. Measured on the 69-clip human calibration set
+#: (docs/clip-calibration-2026-09-10.md), mn10_as gives silence_top_frac 0.0000 normalised and
+#: 0.0435 un-normalised -- a threshold resting on THREE clips, whose 95 % interval reaches from
+#: 0.9 % to 12 %, so a 2 % gate could pass a completely broken run.
+#:
+#: The run's MEAN TOP SCORE uses all 69 instead of 3: 0.254 healthy against 0.162 un-normalised,
+#: higher on 58 of 69 clips, and at the job's 400-clip --limit the two run-level means are 13.6
+#: sigma apart. The floor sits between them, nearer the broken end because a false HIGH is a
+#: woken operator and a false ok is a quiet lane.
+MEAN_TOP_SCORE_FLOOR = 0.20
+#: Negative disables the gate and prints the number instead, the same convention as above.
+MEAN_TOP_SCORE_REPORT_ONLY = -1.0
+#: ⚠️IT IS CALIBRATED AGAINST EXACTLY ONE FAILURE. The `broken` arm above is normalisation
+#: disabled and nothing else. Wrong weights, a corrupt resample or silence on the wire may not
+#: move this number at all, so a run that passes is not a run that is known good.
 SILENCE_CLASS = "Silence"
 
 # ----------------------------------------------------------------- refusal vocabulary
@@ -208,7 +267,7 @@ def verify_weights(model_dir: str) -> Dict[str, Any]:
                            "model_sha256": None, "class_map_sha256": None,
                            "model_bytes": None, "class_map_bytes": None}
     for path, want_sha, want_n, sha_field, n_field, url in (
-            (mp, YAMNET_SHA256, YAMNET_BYTES, "model_sha256", "model_bytes", YAMNET_URL),
+            (mp, MODEL_SHA256, MODEL_BYTES, "model_sha256", "model_bytes", MODEL_URL),
             (cp, CLASSMAP_SHA256, CLASSMAP_BYTES, "class_map_sha256", "class_map_bytes",
              CLASSMAP_URL)):
         if not os.path.exists(path):
@@ -258,8 +317,13 @@ def dbfs(x: "Any") -> float:
 def normalise(x: "Any", target_dbfs: float = TARGET_DBFS) -> Tuple["Any", float]:
     """(scaled audio, PRE-normalisation dBFS). Raises on digital silence.
 
-    ⚠️MANDATORY. See the module docstring for the measured before/after on two real clips: at the
-    -49 to -62 dBFS these are recorded at, YAMNet answers Silence and nothing else.
+    ⚠️STILL MANDATORY, BUT FOR A SMALLER REASON THAN UNDER YAMNET, AND THE DIFFERENCE IS
+    MEASURED. Over the 29 scorable clips of the 2026-09-10 staging set, top-1 was `Silence` on
+    1 raw and 0 normalised -- where YAMNet answered `Silence` for every un-normalised clip. What
+    normalisation buys mn10_as is confidence, not an answer: Speech 0.15 -> 0.29 and Insect
+    0.13 -> 0.27 on individual clips. It stays mandatory because the model's mel is log-power
+    with a fixed (log + 4.5) / 5 offset, so absolute level moves every band; it is no longer the
+    difference between a result and no result.
 
     ⚠️AN ALL-ZERO CLIP IS REFUSED, NOT SCALED. Its gain is undefined, and tagging it `Silence` --
     which is what any finite gain would produce -- makes a producer defect indistinguishable from
@@ -274,82 +338,116 @@ def normalise(x: "Any", target_dbfs: float = TARGET_DBFS) -> Tuple["Any", float]
     return y.astype(np.float32), pre
 
 
-def assert_rate(header_fs: int, csv_fs: Optional[float] = None) -> None:
-    """Raise unless the WAV header is within clips.FS_TOLERANCE_HZ of 16 kHz.
+def to_model_rate(pcm: "Any", header_fs: int, csv_fs: Optional[float] = None) -> Dict[str, Any]:
+    """Resample a clip to the model's rate, or refuse it. -> hear.resample.resample()'s dict.
 
     ⚠️THE HEADER IS AUTHORITATIVE, NOT THE CSV. `fs_hz` in dets.csv is the node's own estimate and
     has disagreed with the file it describes by 6,624 Hz for a whole boot on mach. The header is
     what the samples were written at; the CSV value is carried into the tag row beside it so the
-    disagreement stays visible, but it is never what is checked.
+    disagreement stays visible, but it is never what is resampled from.
+
+    ⚠️THIS REPLACED A HARD REFUSAL OF EVERY RATE BUT 16 kHz, AND THE REFUSAL DID NOT GO AWAY --
+    it moved. YAMNet's frontend was fixed at 16 kHz and the fleet's clips were 16 kHz, so
+    "refuse anything else" was both correct and free. mn10_as wants 32 kHz and the fleet now
+    writes 48 kHz, so refusing on rate would refuse the entire corpus. What is refused instead is
+    a rate NOBODY CONFIGURED -- hear/resample.py snaps to a fleet rate within 0.5 % and raises
+    otherwise, so mach's 22624 Hz boot is still thrown out rather than quietly stretched.
     """
-    if abs(float(header_fs) - CLIPS.FS_NOMINAL_HZ) > CLIPS.FS_TOLERANCE_HZ:
-        raise RateRefused(
-            "WAV header states %d Hz; YAMNet's frontend is fixed at %d Hz and does not resample, "
-            "so this would degrade silently towards Silence rather than fail. Tolerance is "
-            "+/-%.0f Hz (measured header spread is 15986-16000; mach shipped a boot at 22624). "
-            "The dets CSV said %s Hz."
-            % (int(header_fs), int(CLIPS.FS_NOMINAL_HZ), CLIPS.FS_TOLERANCE_HZ, csv_fs))
+    try:
+        return RESAMPLE.resample(pcm, float(header_fs), float(MODEL_FS_HZ))
+    except RESAMPLE.RateRefused as e:
+        raise RateRefused("%s The dets CSV said %s Hz." % (e, csv_fs))
 
 
 class Tagger:
-    """YAMNet under ai-edge-litert. One interpreter, reused across clips.
+    """EfficientAT mn10_as under onnxruntime. One session, reused across clips.
 
-    ⚠️LiteRT, NOT TensorFlow. Bit-identical scores to the SavedModel at 12.1 ms/clip in 82 MB RSS
-    from a 146 MB venv, against 14.3 ms in 903 MB from a 1.4 GB venv -- and the PVC is the binding
-    constraint on this cluster, not CPU.
+    ⚠️mn10_as REPLACED YAMNet ON THE MEASUREMENT, NOT ON NOVELTY. AudioSet mAP 0.471 against
+    YAMNet's 0.306 at 4.88M parameters (MIT, so no licence question follows it onto a fleet that
+    also ships an APK). YAMNet was additionally refused as a BACKBONE: 361 of its 1024 dimensions
+    hold exactly zero variance on this corpus and 43.2 % of directions are pinned by the
+    covariance floor, against the scene corpus's 80/80 and 0 % (hear/validate.py). The hugbot
+    detector built on it measured mean AUC 0.624 and 0 % detection on matched gaussian noise.
+    Its validation machinery was worth keeping; the weights were not.
 
-    ⚠️THE THREE OUTPUTS ARE IDENTIFIED BY THEIR LAST DIMENSION, NOT BY POSITION OR NAME. The
-    exported graph names all three tensors `Identity`, `Identity_1`, `Identity_2`, which says
-    nothing about which is which, and the order they are listed in is an implementation detail of
-    the converter. 521 is the class count, 1024 the embedding width, 64 the mel bins; each is
-    required to appear exactly once or the model is refused as not-this-model.
+    ⚠️THE MEL FRONTEND IS INSIDE THE GRAPH. tools/export_mn10_onnx.py bakes EfficientAT's mel
+    filterbank in as a constant and replaces torch.stft with a DFT conv1d, so this pod needs
+    onnxruntime and numpy -- no torch, no torchaudio, no librosa. The PVC is the binding
+    constraint on this cluster, which is the whole reason. The baked frontend reproduces
+    AugmentMelSTFT to 8.4e-05 max abs error, and the exported graph reproduces PyTorch to
+    7.6e-06 on logits and 1.0e-06 on embeddings (both checked on real-shaped audio, 2026-09-10).
+
+    ⚠️THE OUTPUTS ARE IDENTIFIED BY THEIR LAST DIMENSION, NOT BY NAME OR POSITION. 527 is the
+    class count and 960 the embedding width; each is required to appear exactly once, so a
+    graph that hashes right for some other reason still cannot be scored as if it were this one.
+
+    ⚠️LOGITS, NOT PROBABILITIES. The graph ends at the classifier's linear layer. AudioSet is
+    multi-label, so the score is a per-class SIGMOID and the 527 scores do not sum to 1 -- a
+    softmax here would invent a competition between Bird and Wind that the model never ran.
     """
 
     def __init__(self, model_path: str, class_map_path: str):
-        from ai_edge_litert.interpreter import Interpreter        # lazy: absent in the test env
+        import numpy as np
+        import onnxruntime as ort                                 # lazy: absent in the test env
         self.class_names = load_class_map(class_map_path)
-        if len(self.class_names) != YAMNET_CLASSES:
-            raise WeightsRefused("class map holds %d names, expected %d"
-                                 % (len(self.class_names), YAMNET_CLASSES))
-        self._it = Interpreter(model_path=model_path)
-        self._in = self._it.get_input_details()[0]
-        widths = [int(d["shape"][-1]) for d in self._it.get_output_details()]
-        for want in (YAMNET_CLASSES, YAMNET_EMBED_DIM):
+        if len(self.class_names) != MODEL_CLASSES:
+            raise WeightsRefused("class map holds %d names, expected %d. YAMNet's 521-class map "
+                                 "is not interchangeable with AudioSet's 527-class index"
+                                 % (len(self.class_names), MODEL_CLASSES))
+        opts = ort.SessionOptions()
+        # One clip at a time on a shared node; letting ORT fan out across every core would
+        # contend with whatever else the cluster is running for no wall-clock that matters at
+        # ~20 events/hour.
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        self._s = ort.InferenceSession(model_path, opts, providers=["CPUExecutionProvider"])
+        ins = self._s.get_inputs()
+        if len(ins) != 1:
+            raise WeightsRefused("the graph takes %d inputs, expected 1 waveform" % len(ins))
+        self._in = ins[0].name
+        widths = [int(o.shape[-1]) if isinstance(o.shape[-1], int) else -1
+                  for o in self._s.get_outputs()]
+        for want in (MODEL_CLASSES, MODEL_EMBED_DIM):
             if widths.count(want) != 1:
                 raise WeightsRefused(
-                    "the model exposes output widths %r; exactly one tensor of width %d is "
-                    "required and this is not YAMNet's tflite export" % (widths, want))
-        self._score_i = [d["index"] for d in self._it.get_output_details()
-                         if int(d["shape"][-1]) == YAMNET_CLASSES][0]
-        self._embed_i = [d["index"] for d in self._it.get_output_details()
-                         if int(d["shape"][-1]) == YAMNET_EMBED_DIM][0]
+                    "the graph exposes output widths %r; exactly one tensor of width %d is "
+                    "required and this is not the mn10_as export" % (widths, want))
+        names = [o.name for o in self._s.get_outputs()]
+        self._logit_o = names[widths.index(MODEL_CLASSES)]
+        self._embed_o = names[widths.index(MODEL_EMBED_DIM)]
+        self._np = np
 
     def tag(self, pcm: "Any", floor: float = SCORE_FLOOR) -> Dict[str, Any]:
-        """-> {"scores", "max_unstored_score", "n_classes_scored", "n_frames", "embedding"}.
+        """-> {"scores", "max_unstored_score", "n_classes_scored", "n_passes", "embedding", ...}.
 
-        Scores and embedding are the MEAN over the model's 8 hops. A max would report the loudest
-        0.48 s of a 4.0 s clip as the whole clip, which for a 1.0 s pre-roll plus a transient is
-        exactly the wrong summary.
+        ⚠️THE CLIP GOES THROUGH WHOLE, ONCE. mn10_as is fully convolutional and ends in a global
+        pool, so the time average is the network's own rather than something this file computes.
+        YAMNet needed a mean over 8 fixed hops; imposing a window scheme on a model that does not
+        need one would be an unmeasured knob, and this repo's standard is that a knob is derived
+        from a measured distribution or it does not exist.
+
+        ⚠️THE AUDIO MUST ALREADY BE AT MODEL_FS_HZ. `to_model_rate` is the only way there, and it
+        is what refuses a rate nobody configured.
         """
-        import numpy as np
-        x = np.asarray(pcm, dtype=np.float32)
-        self._it.resize_tensor_input(self._in["index"], [len(x)], strict=False)
-        self._it.allocate_tensors()
-        self._it.set_tensor(self._in["index"], x)
-        self._it.invoke()
-        s = np.asarray(self._it.get_tensor(self._score_i), dtype=np.float64)
-        e = np.asarray(self._it.get_tensor(self._embed_i), dtype=np.float64)
-        n_frames = int(s.shape[0])
-        s, e = s.mean(axis=0), e.mean(axis=0)
+        np = self._np
+        x = np.asarray(pcm, dtype=np.float32).reshape(1, -1)
+        logits, embed = None, None
+        out = self._s.run([self._logit_o, self._embed_o], {self._in: x})
+        logits = np.asarray(out[0], dtype=np.float64).reshape(-1)
+        embed = np.asarray(out[1], dtype=np.float64).reshape(-1)
+        s = 1.0 / (1.0 + np.exp(-logits))
         keep = {self.class_names[i]: float(s[i]) for i in range(len(s)) if s[i] >= floor}
-        dropped = [float(v) for i, v in enumerate(s) if v < floor]
+        dropped = [float(v) for v in s if v < floor]
         return {"scores": keep,
                 # ⚠️THE DISCARDED TAIL IS A NUMBER, NOT AN ABSENCE. Without it a floor that is too
                 # high and a clip that genuinely scored nothing are the same empty dict.
                 "max_unstored_score": max(dropped) if dropped else 0.0,
                 "n_classes_scored": int(len(s)),
-                "n_frames": n_frames,
-                "embedding": [float(v) for v in e]}
+                "n_passes": MODEL_PASSES,
+                "embedding": [float(v) for v in embed],
+                # ⚠️THE WIDTH TRAVELS WITH THE VECTOR. hear_bridge's consumers hard-code 1024 and
+                # drop anything else in silence; a consumer of these rows dispatches on `dim`.
+                "embedding_dim": int(len(embed))}
 
 
 def load_class_map(path: str) -> List[str]:
@@ -369,15 +467,16 @@ def load_class_map(path: str) -> List[str]:
 def model_block(verified: Dict[str, Any]) -> Dict[str, Any]:
     """Model identity carried on EVERY row, refused ones included.
 
-    ⚠️THE sha256 IS THE IDENTITY. "yamnet" names a family with a SavedModel, a TFLite export, a
-    quantised export and several forks; the digest is what separates the artifact that produced
-    these numbers from the next thing somebody drops in the same directory.
+    ⚠️THE sha256 IS THE IDENTITY. "mn10_as" names a checkpoint family -- eleven assets in one
+    upstream release differ only in mel bins and hop and every one of them is called mn10_as --
+    plus whatever an export script makes of them. The digest is what separates the artifact that
+    produced these numbers from the next thing dropped in the same directory.
     """
     return {"name": MODEL_NAME, "version": MODEL_VERSION,
             "file": MODEL_FILE, "sha256": verified.get("model_sha256"),
             "class_map_file": CLASSMAP_FILE, "class_map_sha256": verified.get("class_map_sha256"),
-            "runtime": "ai-edge-litert", "input_fs_hz": int(CLIPS.FS_NOMINAL_HZ),
-            "n_classes": YAMNET_CLASSES, "embed_dim": YAMNET_EMBED_DIM,
+            "runtime": "onnxruntime", "input_fs_hz": MODEL_FS_HZ,
+            "n_classes": MODEL_CLASSES, "embed_dim": MODEL_EMBED_DIM,
             "target_dbfs": TARGET_DBFS, "score_floor": SCORE_FLOOR,
             "card": "tag_model_card.json"}
 
@@ -404,18 +503,32 @@ def model_card(verified: Dict[str, Any]) -> Dict[str, Any]:
         "model_version": MODEL_VERSION,
         "model_sha256": verified.get("model_sha256"),
         "model_bytes": verified.get("model_bytes"),
-        "model_source": YAMNET_URL,
+        "model_source": MODEL_URL,
+        "upstream_sha256": UPSTREAM_SHA256,
+        "upstream_bytes": UPSTREAM_BYTES,
+        "upstream_url": UPSTREAM_URL,
+        "upstream_licence": "MIT",
+        "export_script": "tools/export_mn10_onnx.py",
         "class_map_sha256": verified.get("class_map_sha256"),
         "class_map_bytes": verified.get("class_map_bytes"),
         "class_map_source": CLASSMAP_URL,
-        "class_map_pinned_to_commit": CLASSMAP_COMMIT,
-        "runtime": "ai-edge-litert==2.2.0",
+        "runtime": "onnxruntime==1.27.0",
         "what_a_score_is": (
-            "the mean over the clip's %d hops of YAMNet's per-class sigmoid on AudioSet's 521 "
-            "classes. It is a general-purpose sound-event score from a model trained on YouTube "
-            "audio, applied to a 4.0 s 16 kHz clip from a fixed outdoor microphone at night. It "
-            "is NOT a species identification, NOT calibrated to this site, and NOT anything a "
-            "human has confirmed." % YAMNET_FRAMES),
+            "one forward pass of EfficientAT mn10_as over the whole clip, read as a per-class "
+            "SIGMOID over AudioSet's %d classes -- multi-label, so they do not sum to 1. The "
+            "time average is the network's own global pool, not a mean this pipeline computes. "
+            "It is a general-purpose sound-event score from a model distilled from transformers "
+            "trained on YouTube audio, applied to a 4-5 s clip from a fixed outdoor microphone "
+            "at night. It is NOT a species identification, NOT calibrated to this site, and NOT "
+            "anything a human has confirmed." % MODEL_CLASSES),
+        "why_this_model": (
+            "AudioSet mAP 0.471 against YAMNet's 0.306 at 4.88M parameters, MIT-licensed. "
+            "AST/PaSST/BEATs were refused at 87-90M parameters for ~1 mAP, and self-supervised "
+            "AudioSet models reach 0.502 -- but the decisive measurement is that AudioSet-trained "
+            "embeddings LOSE to bird-trained embeddings on all six bioacoustic datasets tested, "
+            "and three of the four named targets here are bioacoustic. This model is the coarse "
+            "triage tier; the bioacoustic tier is Perch 2.0 and it is still gated (docs/"
+            "acoustic-stack.md S5)."),
         "normalisation": (
             "every clip is RMS-normalised to %.1f dBFS before inference, and the pre-"
             "normalisation level is stored per row. Measured on two real nyquist clips: at their "
@@ -424,10 +537,20 @@ def model_card(verified: Dict[str, Any]) -> Dict[str, Any]:
             "pipeline without this step emits Silence for every clip and exits 0."
             % TARGET_DBFS),
         "rate_policy": (
-            "the WAV header rate is asserted within +/-%.0f Hz of %d and REFUSED otherwise. No "
-            "resampling anywhere: YAMNet neither validates nor resamples its input, so a wrong "
-            "rate degrades silently. mach shipped a boot headed 22624 Hz."
-            % (CLIPS.FS_TOLERANCE_HZ, int(CLIPS.FS_NOMINAL_HZ))),
+            "the WAV header rate is snapped to a rate this fleet actually clocks (16000, 32000, "
+            "48000, within 0.5 %%) and the clip is resampled to %d Hz. A rate outside that set "
+            "is REFUSED, not stretched -- mach shipped a whole boot headed 22624 Hz and it is "
+            "still thrown out. 48 kHz -> 32 kHz is a decimation and every band is measurement; "
+            "16 kHz -> 32 kHz is an interpolation and everything above 8 kHz is the filter's, "
+            "which is why band_limit_hz and fs_source_hz ride on every row."
+            % MODEL_FS_HZ),
+        "upsampling_penalty_measured": (
+            "within-clip A/B on the 7 real 48 kHz clips, native (48->32) against band-crippled "
+            "(48->16->32): score-vector cosine 0.90-0.99, top-1 changed on 1 of 7, and the "
+            "Insect score moved by only +0.021 on average with sign flips both ways. So for THIS "
+            "model the 16 kHz corpus is not badly damaged by the upsample. It says nothing about "
+            "Perch, which is a different model at a different native rate; Gate 2 of "
+            "docs/acoustic-stack.md S1 remains open for Perch."),
         "score_floor": SCORE_FLOOR,
         "score_floor_note": (
             "a STORAGE bound, not a decision threshold. Classes below it are summarised by "
@@ -435,10 +558,13 @@ def model_card(verified: Dict[str, Any]) -> Dict[str, Any]:
             "%s as an operating point -- none has been validated on this corpus."
             % SCORE_FLOOR),
         "embedding_note": (
-            "%d floats, the mean of the same forward pass's per-hop embeddings. Stored because "
+            "%d floats from the same forward pass's global pool. NOT 1024: four consumers in "
+            "tools/hear_bridge.py hard-code that width and three drop a mismatch silently, so "
+            "YAMNet's 1024 and BirdNET's 1024 are mutually confusable and 960 is not. Every row "
+            "carries embedding_dim so a consumer dispatches on width first. Stored because "
             "clips.prune() deletes WAVs at a byte cap and the embedding is then the only "
             "fixed-axis representation of audio the node already destroyed."
-            % YAMNET_EMBED_DIM),
+            % MODEL_EMBED_DIM),
         "provenance": "model",
         "human_verified": False,
         "usable_as_training_label": False,
@@ -543,7 +669,7 @@ def empty_tally() -> Dict[str, Any]:
             "superseded": 0,
             "tagged": 0, "refused": 0, "already_tagged": 0, "deferred": 0,
             "by_reason": {}, "by_node": {}, "by_node_day_reason": {},
-            "silence_top": 0, "scored_any": 0, "dbfs": [], "unstored": []}
+            "silence_top": 0, "scored_any": 0, "dbfs": [], "unstored": [], "top_scores": []}
 
 
 def tally(t: Dict[str, Any], node: str, day: str, outcome: str,
@@ -561,6 +687,8 @@ def tally(t: Dict[str, Any], node: str, day: str, outcome: str,
             if top == SILENCE_CLASS:
                 t["silence_top"] += 1
                 n["silence_top"] += 1
+            if top is not None:
+                t["top_scores"].append(float(scores[top]))
             if row.get("pre_norm_dbfs") is not None:
                 t["dbfs"].append(float(row["pre_norm_dbfs"]))
             if row.get("max_unstored_score") is not None:
@@ -614,17 +742,42 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
     except Exception as exc:
         return {"ok": False, "reason": R_WAV_UNREADABLE,
                 "detail": "%s: %s" % (type(exc).__name__, exc)}
-    if len(pcm) * 2 + 44 != CLIPS.CLIP_BYTES_16K_4S:
-        return {"ok": False, "reason": R_WAV_SAMPLES,
-                "detail": "%d samples; a clip is %d (%.1f s pre + %.1f s post at %d Hz)"
-                          % (len(pcm), (CLIPS.CLIP_BYTES_16K_4S - 44) // 2, CLIPS.CLIP_PRE_S,
-                             CLIPS.CLIP_POST_S, int(CLIPS.FS_NOMINAL_HZ))}
+    # ⚠️LENGTH IS CHECKED AS A DURATION, NEVER AS A BYTE COUNT. This test read
+    # `len(pcm) * 2 + 44 != CLIP_BYTES_16K_4S` and so refused every clip the 48 kHz firmware
+    # writes -- the same magic number, in the same shape, that hear/clips.py had already been
+    # fixed for. A constant copied out of one module keeps its number and loses its meaning.
+    probe = {"fs_hz": int(header_fs), "dur_s": len(pcm) / float(header_fs or 1)}
+    # Two distinct rate defects are on the cards: the FS_NOMINAL-stamped 48 kHz clip (an integer
+    # decimation apart) and mach's latched 22624/22848 Hz boot (not an integer anything, only
+    # recoverable from the length). Neither can fire on the other's clips.
+    fix = (CLIPS.header_rate_suspect(probe)
+           or CLIPS.length_implies_rate(len(pcm), header_fs, row.get("fs_hz")))
+    true_fs = fix["true_fs_hz"] if fix else float(header_fs)
+    # ⚠️THE RATE IS SETTLED BEFORE THE LENGTH, BECAUSE THE LENGTH IS MEASURED IN IT. Checked the
+    # other way round, mach's 22624 Hz boot came back as `wav_sample_count` -- 64000 samples read
+    # as 2.83 s and refused for being the wrong duration, which is true and useless. The rate is
+    # the defect; the duration is a symptom of it.
     try:
-        assert_rate(header_fs, row.get("fs_hz"))
+        RESAMPLE.snap(true_fs)
+    except RESAMPLE.RateRefused as exc:
+        return {"ok": False, "reason": R_RATE_REFUSED,
+                "detail": "%s The dets CSV said %s Hz." % (exc, row.get("fs_hz"))}
+    dur_s = len(pcm) / true_fs if true_fs else 0.0
+    if not any(abs(dur_s - g) <= g * CLIPS.CLIP_GEOMETRY_TOL for g in CLIPS.CLIP_GEOMETRIES_S):
+        return {"ok": False, "reason": R_WAV_SAMPLES,
+                "detail": "%d samples at %g Hz is %.3f s; a clip is one of %s s (1.0 s pre plus "
+                          "3.0 s post at 16 kHz, 4.0 s post at 48 kHz)"
+                          % (len(pcm), true_fs, dur_s,
+                             "/".join("%.1f" % g for g in CLIPS.CLIP_GEOMETRIES_S))}
+    try:
+        rs = to_model_rate(pcm, true_fs, row.get("fs_hz"))
     except RateRefused as exc:
         return {"ok": False, "reason": R_RATE_REFUSED, "detail": str(exc)}
     try:
-        pcm, pre_db = normalise(pcm)
+        # ⚠️NORMALISE AFTER RESAMPLING, NOT BEFORE. The resampler is unity-gain in the passband
+        # but not sample-for-sample, so normalising first leaves the level a fraction of a dB off
+        # the target for reasons that have nothing to do with the recording.
+        pcm, pre_db = normalise(rs["pcm"])
     except ValueError as exc:
         return {"ok": False, "reason": R_DIGITAL_SILENCE, "detail": str(exc)}
     try:
@@ -646,10 +799,24 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
         "scores": got["scores"],
         "max_unstored_score": got["max_unstored_score"],
         "n_classes_scored": got["n_classes_scored"],
-        "n_frames": got["n_frames"],
+        "n_passes": got["n_passes"],
+        "embedding_dim": got["embedding_dim"],
         "embedding": got["embedding"],
         "pre_norm_dbfs": pre_db,
         "wav_header_fs_hz": int(header_fs),
+        # ⚠️WHAT THE MODEL ACTUALLY SAW, BESIDE WHAT THE NODE RECORDED. `band_limit_hz` below the
+        # model's Nyquist means the bands above it are the interpolation filter's output and not
+        # sound; a reader that treats a 16 kHz-sourced score above 8 kHz as measurement is making
+        # the mistake docs/acoustic-stack.md S4.6 forbids one layer down.
+        "fs_model_hz": rs["fs_hz"],
+        "fs_source_hz": rs["fs_source_hz"],
+        "fs_source_nominal_hz": rs["fs_source_nominal_hz"],
+        "band_limit_hz": rs["band_limit_hz"],
+        "upsampled": rs["upsampled"],
+        "resample_L": rs["L"], "resample_M": rs["M"], "resample_taps": rs["taps"],
+        # The clip's own header lied for the whole 48 kHz rollout; when it did, say so here
+        # rather than silently scoring 15 s of audio that is really 5.
+        "header_rate_suspect": fix,
         # ⚠️BOTH RATES, SIDE BY SIDE, ALWAYS. The CSV estimate and the file's own header disagreed
         # by 6,624 Hz for a whole boot; keeping one of them would have made that invisible.
         "csv_fs_hz": row.get("fs_hz"),
@@ -657,7 +824,8 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
         "window": ({"t_start_utc_s": row.get("t_start_utc_s"),
                     "t_end_utc_s": row.get("t_end_utc_s")}
                    if row.get("anchored") and row.get("t_start_utc_s") is not None else None),
-        "sample_window": TAGS.sample_window(row),
+        # The corrected length, not the row's: a v1 row has no dur_s and may be mis-headed.
+        "sample_window": TAGS.sample_window(dict(row, dur_s=dur_s)),
         "provenance": "model",
         "created_utc_s": now,
     }
@@ -749,12 +917,16 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
     t["weights_ok"] = bool(verified["ok"])
     t["at"] = now
     t["silence_frac"] = (t["silence_top"] / float(t["tagged"])) if t["tagged"] else None
+    _tops = t.pop("top_scores")
+    t["mean_top_score"] = (sum(_tops) / len(_tops)) if _tops else None
+    t["n_top_scores"] = len(_tops)
     t["observation_not_health"] = {
         "level_dbfs": _distribution(t.pop("dbfs")),
         # ⚠️AGGREGATED, NOT ONLY PER ROW. `max_unstored_score` made the discarded tail a number on
         # each row; nothing summed it, so a floor set too high looked exactly like a quiet night.
         "max_unstored_score": _distribution(t.pop("unstored")),
         "silence_top_frac": t["silence_frac"],
+        "mean_top_score": t["mean_top_score"],
         "note": ("the class distribution is NOT an input to any gate. A quiet night is the "
                  "expected result; a gate keyed on 'did anything score high' fires on a correct "
                  "run. silence_top_frac is gated only once a human calibration set has been "
@@ -835,6 +1007,8 @@ def write_heartbeat(root: str, report: Dict[str, Any], now: Optional[float] = No
         "conservation_ok": bool(report.get("conservation_ok")),
         "weights_ok": bool(report.get("weights_ok")),
         "silence_top": report.get("silence_top"),
+        "mean_top_score": report.get("mean_top_score"),
+        "n_top_scores": report.get("n_top_scores"),
         "silence_frac": report.get("silence_frac"),
         # ⚠️`scored_any` IS AN ABSOLUTE SIGNAL AND `silence_frac` IS NOT. A model that returns
         # nothing above the floor for every clip reports silence_frac 0.000 -- the best possible
@@ -854,6 +1028,7 @@ def write_heartbeat(root: str, report: Dict[str, Any], now: Optional[float] = No
 
 
 def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
+               min_mean_top_score: float = MEAN_TOP_SCORE_REPORT_ONLY,
                window_s: float = DEFAULT_RUN_WINDOW_S,
                max_stale_s: float = DEFAULT_MAX_STALE_S,
                now: Optional[float] = None) -> Tuple[int, List[str]]:
@@ -866,7 +1041,10 @@ def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
     that saw zero index rows fails, unverified weights fail, and a stale heartbeat fails whatever
     the store looks like. hear_drain.check()'s `if not sensors: return 1` is the same shape.
 
-    ⚠️THE SILENCE FRACTION IS REPORT-ONLY UNTIL A HUMAN HAS CALIBRATED IT. At max_silence_frac < 0
+    ⚠️THE SILENCE FRACTION IS REPORT-ONLY FOREVER NOW, AND CALIBRATION IS WHAT RETIRED IT. It was
+    "report-only until a human calibrates it"; 69 clips were heard and the answer was that
+    mn10_as returns Silence top-1 on 0 of them healthy and 3 un-normalised, so any gate rests on
+    three clips. `min_mean_top_score` is the canary that replaced it. At max_silence_frac < 0
     it prints the measured value and says on its own line that it is not gating. Setting it from
     a guess rather than from the measured envelope is the failure this repo names as its own.
     """
@@ -975,18 +1153,36 @@ def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
 
     sil = sum(int(r.get("silence_top") or 0) for r in window)
     frac = (sil / float(tagged)) if tagged else None
-    if max_silence_frac < 0:
-        lines.append("silence  REPORT    %s of tagged clips top-class Silence -- NOT GATED. The "
-                     "threshold is set from a measured human calibration set, not from a guess; "
-                     "see the Phase-3 gate in docs/acoustic-stack.md"
-                     % ("%.3f" % frac if frac is not None else "n/a"))
-    elif frac is not None and frac > max_silence_frac:
-        lines.append("silence  HIGH      %.3f of tagged clips top-class Silence, over %.3f -- the "
-                     "usual cause is normalisation not running" % (frac, max_silence_frac))
+    # ⚠️REPORTED, NEVER GATED, AND NOT BECAUSE IT IS UNCALIBRATED. It IS calibrated now, and the
+    # calibration is what retired it: mn10_as returns Silence top-1 on 0 of 69 human-heard clips
+    # normalised and 3 of 69 un-normalised. A gate between those rests on three clips. Kept as an
+    # observation because a sudden non-zero IS informative; it is just not a threshold.
+    lines.append("silence  REPORT    %s of tagged clips top-class Silence -- NOT GATED, and it "
+                 "cannot be: 0/69 healthy vs 3/69 un-normalised on the human calibration set "
+                 "(docs/clip-calibration-2026-09-10.md S1.2). The normalisation canary is the "
+                 "score floor below."
+                 % ("%.3f" % frac if frac is not None else "n/a"))
+
+    tops = [(float(r["mean_top_score"]), int(r.get("n_top_scores") or 0)) for r in window
+            if r.get("mean_top_score") is not None]
+    n_scored = sum(n for _, n in tops)
+    mean_top = (sum(m * n for m, n in tops) / n_scored) if n_scored else None
+    if min_mean_top_score < 0:
+        lines.append("score    REPORT    mean top score %s over %d clip(s) -- NOT GATED"
+                     % ("%.3f" % mean_top if mean_top is not None else "n/a", n_scored))
+    elif mean_top is None:
+        lines.append("score    ok        no scored clips in the window (min %.3f)"
+                     % min_mean_top_score)
+    elif mean_top < min_mean_top_score:
+        lines.append("score    LOW       mean top score %.3f over %d clip(s), under %.3f -- the "
+                     "measured cause is normalisation not running (0.254 healthy against 0.162 "
+                     "un-normalised, 13.6 sigma apart at a 400-clip run). ⚠️It is calibrated "
+                     "against that ONE failure; passing is not proof of health."
+                     % (mean_top, n_scored, min_mean_top_score))
         bad += 1
     else:
-        lines.append("silence  ok        %s (max %.3f)"
-                     % ("%.3f" % frac if frac is not None else "n/a", max_silence_frac))
+        lines.append("score    ok        mean top score %.3f over %d clip(s) (min %.3f)"
+                     % (mean_top, n_scored, min_mean_top_score))
 
     reasons: Dict[str, int] = {}
     for r in window:
@@ -1047,6 +1243,10 @@ def main(argv=None) -> int:
                     help="tag everything and report, writing nothing")
     ap.add_argument("--check", action="store_true",
                     help="read the heartbeat and exit non-zero if tagging is not flowing")
+    ap.add_argument("--min-mean-top-score", type=float, default=MEAN_TOP_SCORE_REPORT_ONLY,
+                    help="fail --check when the window's mean top score falls below this. "
+                         "%.2f is the calibrated floor; negative reports without gating"
+                         % MEAN_TOP_SCORE_FLOOR)
     ap.add_argument("--max-silence-frac", type=float, default=SILENCE_FRAC_REPORT_ONLY,
                     help="--check fails above this fraction of tagged clips whose top class is "
                          "Silence. Negative (the default) means REPORT ONLY -- set it from a "
@@ -1071,6 +1271,7 @@ def main(argv=None) -> int:
 
     if a.check:
         code, lines = check_tags(root, max_silence_frac=a.max_silence_frac,
+                                 min_mean_top_score=a.min_mean_top_score,
                                  window_s=a.window_s, max_stale_s=a.max_stale_s)
         print("\n".join(lines))
         return code

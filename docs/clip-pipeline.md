@@ -240,8 +240,22 @@ operator to ignore it). The unsuspend condition is written onto the object as
    consecutive days.
 2. A human has **listened to ≥ 30 of them**, including at least one from mach, and written what they
    heard into `docs/clip-calibration-<date>.md`.
-3. `max_silence_frac` is set from the **measured** distribution in that calibration set. Threshold
-   from the envelope, never a single sample.
+3. ~~`max_silence_frac` is set from the **measured** distribution in that calibration set.~~
+   ✅**Met by retirement, 2026-09-10.** The distribution was measured and it killed the knob:
+   `mn10_as` returns `Silence` top-1 on **0 of 69** clips healthy and **3 of 69** un-normalised, so
+   any threshold between those rests on three clips. The normalisation canary is now
+   `--min-mean-top-score` (0.254 healthy against 0.162 un-normalised, **13.6 σ** apart at a
+   400-clip run). See `docs/clip-calibration-2026-09-10.md`.
+
+⚠️**All three conditions are met.** 473 stored clips across three nodes over 2026-09-08…10; 69
+heard by a person including 25 from mach, written up and with the labels checked in at
+`testdata/clip-labels-2026-09-10.jsonl`. Unsuspending is a human decision now, not a blocked one —
+the `.onnx` still has to reach the PVC first.
+
+⚠️**The listening tool's own `silence_frac` is not a gate either, and the same set is why.**
+Against what the listener called empty it scores **AUC 0.401** — below chance, in the wrong
+direction. A quiet insect chorus sits under −60 dBFS most of the time and an empty windy clip does
+not; frame-level level is not occupancy.
 
 `tools/hear_listen.py` stages condition 2. It draws a node-balanced sample from `index.jsonl`,
 copies each clip out unchanged **and** writes an audible `.loud.wav` beside it, and emits the
@@ -299,18 +313,34 @@ first one wins. The lying header is **kept** on the row beside the correction.
 
 Until 3 is set, `check_tags` runs report-only and says so on its own output line.
 
-**Model: YAMNet as TFLite under `ai-edge-litert`, not under TensorFlow.** Bit-identical scores at
-12.1 ms/clip in 82 MB RSS from a 146 MB venv, against 14.3 ms in 903 MB from a 1.4 GB venv — and the
-PVC is the binding constraint. All 64 of YAMNet's mel bins sit below 8 kHz, so the 16 kHz ceiling
-costs it nothing.
+**Model: EfficientAT `mn10_as` as ONNX under `onnxruntime`.** MIT, 4.88M params, AudioSet
+**mAP 0.471** against YAMNet's 0.306 — `docs/acoustic-stack.md` §6.2b has why this and not
+AST/PaSST/BEATs/BirdNET. 527 classes, **960**-d embeddings (not 1024: `hear_bridge.py`'s consumers
+hard-code that width and drop mismatches silently, and YAMNet's 1024 and BirdNET's 1024 are
+mutually confusable there). 48 ms/clip against YAMNet's 12 — irrelevant at ~20 events/hour, which
+is 0.03 % duty on one core.
 
-Weights live on the PVC at `/pool/models/yamnet/`, never in a ConfigMap (16,096,668 B against a
+The model is **32 kHz native** and the fleet writes 16 and 48, so `hear/resample.py` crosses:
+48 kHz → 32 kHz is a decimation and every band is measurement; 16 kHz → 32 kHz is an interpolation
+and everything above 8 kHz is the filter. `band_limit_hz`, `fs_source_hz` and `upsampled` ride on
+every tag row so the second can never be read as the first. A rate **nobody configured** — mach's
+22624 Hz boot — is still refused into a counted bucket rather than stretched into a confident
+answer.
+
+Weights live on the PVC at `/pool/models/mn10_as/`, never in a ConfigMap (24,016,402 B against a
 1 MiB cap). They are **verified against a pinned sha256**, not checked for existence:
 
 ```
-yamnet.tflite         16,096,668 B  141fba1cdaae842c…
-yamnet_class_map.csv      14,096 B  cdf24d193e196d9e…
+mn10_as.onnx                        24,016,402 B  1b718a05a68ba8ee…
+audioset_class_labels_indices.csv       14,675 B  cdd1049833c4b861…
 ```
+
+⚠️**The `.onnx` is not fetchable, and the job says so instead of guessing.** Upstream publishes
+PyTorch checkpoints; converting one needs torch, torchaudio and torchvision (EfficientAT's model code imports it) — roughly 3 GB into a 5 Gi PVC to
+produce a 24 MB graph once. `tools/export_mn10_onnx.py` builds it on a workstation, from a
+sha-pinned upstream `.pt`, byte-reproducibly, and it is staged onto the PVC. The CronJob verifies
+and **exits 1 with the two commands to run**; it never builds, and never loads a graph it has not
+hashed.
 
 A digest mismatch exits **2**, not 1, so a monitor can tell "the model is not what it says" from
 "tagging is behind".

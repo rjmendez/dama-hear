@@ -2295,9 +2295,32 @@ static bool gps_autobaud() {
     // Count UBX frames as well as NMEA lines. A module that came off a flight controller is very
     // often configured UBX-binary only with NMEA disabled -- so a NMEA-only scan sees a live,
     // driven, busy line and reports nothing at every rate, which is exactly what happened.
-    static const uint32_t cand[] = {9600, 38400, 115200, 57600, 19200, 230400, 460800, 4800};
+    // ⚠️THE NODE COULD NAME A RATE IT REFUSED TO TRY. gps_snap_baud() snaps a MEASURED bit time to
+    // the nearest standard rate and GPS_BAUDS[] knows 128000 -- but this scan list did not, so on
+    // mach (2026-09-10) /gpsbaud reported "bit time 8 us, implies 125000, nearest 128000, 2.3%
+    // away" and the sweep then walked eight rates that excluded it and gave up. Measure first and
+    // try what the wire says before walking a list.
+    uint32_t bit_us = gps_bit_time_us(gps_rx_pin, 400, NULL, NULL);
+    float snap_err = 0;
+    uint32_t measured = bit_us ? gps_snap_baud(bit_us, &snap_err) : 0;
+    // A large residual means it is not a UART at that rate -- inverted logic, another protocol, or
+    // two drivers fighting -- so a bad snap is not worth a dwell. The standard rates are far enough
+    // apart that a real one lands well inside 5%.
+    if (measured && snap_err > 5.0f) measured = 0;
+    // Now every rate gps_snap_baud() can name, most likely first. A module off a flight controller
+    // can be on any of them and the cost of a miss is one dwell.
+    static const uint32_t fixed[] = {9600, 38400, 115200, 57600, 19200, 230400, 460800, 4800,
+                                     128000, 76800, 256000, 921600, 14400, 2400, 1200};
+    uint32_t cand[1 + sizeof(fixed) / sizeof(fixed[0])];
+    unsigned nc = 0;
+    if (measured) cand[nc++] = measured;
+    for (unsigned i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++)
+      if (fixed[i] != measured) cand[nc++] = fixed[i];
+    if (measured)
+      logf("gps   measured %lu us/bit -> %lu baud (%.1f%% off standard), trying it first\n",
+           (unsigned long)bit_us, (unsigned long)measured, (double)snap_err);
     uint32_t best_b = 0; int best_score = 0; bool best_ubx = false;
-    for (unsigned k = 0; k < sizeof(cand) / sizeof(cand[0]); k++) {
+    for (unsigned k = 0; k < nc; k++) {
       Serial1.begin(cand[k], SERIAL_8N1, gps_rx_pin, gps_tx_pin);
       delay(60); while (Serial1.available()) Serial1.read();
       int nm = 0, ub = 0, i = 0; char ln[100]; uint8_t prev = 0; uint32_t t0 = millis();
@@ -2328,6 +2351,32 @@ static bool gps_autobaud() {
 }
 
 
+// ⚠️A HINT, NOT A LOCK, BECAUSE THE WIRING IS GOING TO CHANGE. mach is wired with its TX/RX pair
+// reversed and will be re-soldered the right way round; a persisted "swapped" that outlived that
+// would leave the node deaf and the file would be the reason. So the order is only ever tried
+// FIRST, never trusted -- if it fails the full search runs exactly as before and overwrites it.
+// The value is written only after a link is PROVEN by decoded traffic, never from the pin probe,
+// which is the thing that cannot see a transmitter on the pin it is driving.
+#define GPS_CFG "/gps.cfg"
+// The card is mounted before bring-up in setup(), so at boot this writes straight through. The
+// pending path stays for a node with no card at bring-up that gains one later.
+static int gps_pins_pending = -1;
+static void gps_pins_persist(bool swapped) {
+  if (!sd_ok) { gps_pins_pending = swapped ? 1 : 0; return; }
+  File f = SD.open(GPS_CFG, FILE_WRITE);                 // FILE_WRITE truncates: one value, no log
+  if (!f) return;
+  f.printf("%d\n", swapped ? 1 : 0);
+  f.close();
+}
+static int gps_pins_hint() {                             // -1 none, 0 documented, 1 swapped
+  if (!sd_ok || !SD.exists(GPS_CFG)) return -1;
+  File f = SD.open(GPS_CFG, FILE_READ);
+  if (!f) return -1;
+  int v = f.parseInt();
+  f.close();
+  return (v == 0 || v == 1) ? v : -1;
+}
+
 static void gps_bringup() {
   // DETACH THE UART FIRST. gps_pick_pins() reads both pins with digitalRead, and on a RETRY the
   // UART peripheral still owns them -- so the probe measured a pin it did not control, saw nothing
@@ -2341,7 +2390,21 @@ static void gps_bringup() {
   // UART is open yet, which is exactly why it survived until the fleet started retrying.
   Serial1.end();
   gps_pick_pins();
+  // A proven order from a previous boot beats a probe that cannot see a transmitter on the pin it
+  // is driving. Tried first, never trusted: if it does not decode, the search below runs unchanged.
+  int hint = gps_pins_hint();
+  if (hint >= 0) {
+    bool want_swap = (hint == 1);
+    bool have_swap = (gps_rx_pin != GPS_RX);
+    if (want_swap != have_swap) {
+      gps_rx_pin = want_swap ? GPS_TX : GPS_RX;
+      gps_tx_pin = want_swap ? GPS_RX : GPS_TX;
+      gps_pin_src = want_swap ? "hint: SWAPPED at the module" : "hint: as documented";
+      logf("gps   trying the order that worked last time first: RX=GPIO%d\n", gps_rx_pin);
+    }
+  }
   bool decoded = gps_autobaud();
+  if (decoded) gps_pins_persist(gps_rx_pin != GPS_RX);
 
   // IF NOTHING DECODED, TRY THE OTHER PIN ORDER BEFORE GIVING UP.
   //
@@ -2366,6 +2429,7 @@ static void gps_bringup() {
          rx, gps_rx_pin);
     if (gps_autobaud()) {
       gps_pin_src = "measured: SWAPPED at the module (found by fallback)";
+      gps_pins_persist(gps_rx_pin != GPS_RX);   // proven by decoded traffic, worth remembering
     } else {
       // Neither order works. Put the pins back AND SWEEP AGAIN, because the failed attempt left
       // the UART open at whatever that sweep settled on -- 9600 -- and restoring only the pin
@@ -2440,6 +2504,17 @@ void setup() {
   // transmitter is connected" on mach for a pin with nothing on it: a pulled-up module input reads
   // exactly like a transmitter idling high, so the test could not tell the two apart. Counting
   // RECURRING run lengths on both pins can, and it also says which way round the pair is wired.
+  // Mounted BEFORE gps_bringup(): the pin-order hint lives on the card, and read before the
+  // mount it is always -1, so the one boot where it matters would never see it.
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
+  sd_cs = 0;
+  // max_files 8, not the library's default 5 (SD.h:29). The clip writer holds a WAV open across
+  // loop iterations, so the long-lived set is now dets.csv + scene.csv + the clip = 3, and /ls
+  // holds a directory plus an entry while the 30 s health block opens health.csv -- which is 6,
+  // one past the default, and an SD.open past the limit just returns a falsy File. Raising it
+  // costs a pointer array; the per-file caches are allocated on open, not here.
+  if (SD.begin(21, SPI, 20000000, "/sd", 8)) { sd_ok = true; sd_cs = 21; }
+  else if (SD.begin(3, SPI, 20000000, "/sd", 8)) { sd_ok = true; sd_cs = 3; }
   gps_bringup();
   logln("gps   UBX config sent (TP1 1 Hz locked+unlocked, NAV-PVT, TIM-TP; RAM layer)");
 
@@ -2451,15 +2526,7 @@ void setup() {
   i2c_scan();
   if (!bmp_begin()) logln("bmp   no BMP280/BME280 -- sound speed reported as null");
 
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
-  sd_cs = 0;
-  // max_files 8, not the library's default 5 (SD.h:29). The clip writer holds a WAV open across
-  // loop iterations, so the long-lived set is now dets.csv + scene.csv + the clip = 3, and /ls
-  // holds a directory plus an entry while the 30 s health block opens health.csv -- which is 6,
-  // one past the default, and an SD.open past the limit just returns a falsy File. Raising it
-  // costs a pointer array; the per-file caches are allocated on open, not here.
-  if (SD.begin(21, SPI, 20000000, "/sd", 8)) { sd_ok = true; sd_cs = 21; }
-  else if (SD.begin(3, SPI, 20000000, "/sd", 8)) { sd_ok = true; sd_cs = 3; }
+  if (sd_ok && gps_pins_pending >= 0) { gps_pins_persist(gps_pins_pending == 1); gps_pins_pending = -1; }
   logf("sd    %s%s", sd_ok ? "mounted, CS=" : "no card", sd_ok ? "" : "\n");
   if (sd_ok) logf("%d\n", sd_cs);
   snprintf(clip_boot, sizeof clip_boot, "%08lx", (unsigned long)esp_random());
