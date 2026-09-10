@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 // The sketch path's domain arithmetic, pure and host-compilable, so tests/test_firmware_sketch_domain.py
-// can EXECUTE it rather than pattern-match the .ino. night_node.ino must not open-code any of it.
+// can EXECUTE it rather than pattern-match the .ino. hear_node.ino must not open-code any of it.
 //
 // Argument names carry the domain and the kind: _dec/_acq is the rate, _at is an INSTANT (the FIR
 // group delay already subtracted, so it names when a sound reached the microphone), _pos is a

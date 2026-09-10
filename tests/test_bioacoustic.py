@@ -446,7 +446,7 @@ class TestCannotGoDeaf:
     hear/node/detect.py updates its ambient only on the armed-and-below-threshold branch, so once
     a rising floor disarms it, it stops learning the very level that keeps it disarmed. The
     firmware measured the result in the field and fixed it there -- see `gate()` in
-    firmware/night_node/night_node.ino and the `ALPHA_UP` constant above it, whose comment records
+    firmware/hear_node/hear_node.ino and the `ALPHA_UP` constant above it, whose comment records
     the measurement: "156 s solid disarmed, envelope 1400-1600 against thr 800, ambient frozen at
     73.2, two detections all night". A chorus IS a floor that rises for hours, so this detector
     cannot afford it. These tests are the proof that it does not have it.

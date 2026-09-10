@@ -191,7 +191,7 @@ def _v1_total_s(n_bytes, header_fs) -> Optional[float]:
 def sample_window(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """The clip's window in the node's own sample counter, or None when the name carried none.
 
-    night_node.ino:1848 writes the clip from `d.sample - CLIP_PRE_SAMPLES`, and clip_name()
+    hear_node.ino:1848 writes the clip from `d.sample - CLIP_PRE_SAMPLES`, and clip_name()
     embeds `d.sample` -- the TRIGGER, not the window start. Deriving the start here is what stops
     every consumer re-deriving CLIP_PRE_SAMPLES for itself and getting it 1.0 s wrong.
     """
@@ -344,7 +344,7 @@ SKETCH_BACK_S = 0.004
 def _sketch_span_s(fs_hz: Any) -> Optional[float]:
     """The sketch's own window length in seconds, at the rate IT was cut at.
 
-    night_node.ino: `SKETCH_SPAN = NFFT + (FRAMES-1)*HOP` samples. NFFT is a SAMPLE count, so its
+    hear_node.ino: `SKETCH_SPAN = NFFT + (FRAMES-1)*HOP` samples. NFFT is a SAMPLE count, so its
     duration depends on fs -- 256/16000 = 16 ms, 256/48000 = 5.33 ms -- while HOP_S is a fixed
     4 ms grid regardless of fs. That is why docs/acoustic-stack.md measures the sketch window at
     33-44 ms rather than one number: 5.33 + 7*4 = 33.3 ms at 48 kHz, 16 + 7*4 = 44 ms at 16 kHz,
@@ -472,7 +472,7 @@ def sketch_overlap(pl, row: Dict[str, Any], *, source: str = "node",
             continue
         # ⚠️TWO RATES, ONE ROW. `span` is a TIME and depends on the frame's own rate (fs_hz is
         # 48000.0 for every node frame cut after the acquisition-rate move). `sample` is a
-        # DECIMATED position -- night_node.ino writes `dets[idx].sample = g_samples + i` and
+        # DECIMATED position -- hear_node.ino writes `dets[idx].sample = g_samples + i` and
         # deliberately keeps it there -- so FS_NOMINAL_HZ is the only rate that turns a time into
         # this counter's samples, and it is the rate sample_window() built cs0/cs1 with. Using
         # the frame's rate here makes the window 3x too long and starts it 3x too far back.

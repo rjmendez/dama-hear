@@ -21,7 +21,7 @@ import sys
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-INO = ROOT / "firmware" / "night_node" / "night_node.ino"
+INO = ROOT / "firmware" / "hear_node" / "hear_node.ino"
 sys.path.insert(0, str(ROOT))
 
 import hear.clips as CLIPS  # noqa: E402
@@ -201,7 +201,7 @@ class TestALatchedWrongRateIsRecoveredFromTheLengthAlone:
     def test_a_csv_that_merely_echoes_the_broken_header_does_not_veto(self):
         """⚠️MEASURED REGRESSION, AND IT COST A REAL CLIP. This first required the CSV to agree
         with the recovered rate. mach-a75b9e4c has BOTH the header and dets.csv at 22848, because
-        night_node writes both from fs_timebase() -- :1958 and :3498 -- so a bad fs_clean latch
+        hear_node writes both from fs_timebase() -- :1958 and :3498 -- so a bad fs_clean latch
         lands in both. The veto fired and the clip stayed broken. Two copies of one measurement
         are not two measurements."""
         fix = CLIPS.length_implies_rate(64000, 22848, 22848.0)

@@ -202,7 +202,7 @@ when the name carries it and is never read for ordering.
 
 ### `/ls?dir=` — compiled, not flashed
 
-`firmware/night_node/night_node.ino` gained an optional `dir` argument on `/ls`: streamed,
+`firmware/hear_node/hear_node.ino` gained an optional `dir` argument on `/ls`: streamed,
 `..`-rejecting, 404 on a non-directory, capped at `LS_MAX_ENTRIES 256` with an explicit
 `! truncated at <n> entries` marker. **It compiles and stops there. No node has been flashed.**
 

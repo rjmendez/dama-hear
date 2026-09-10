@@ -44,7 +44,7 @@ def _row(utc_us=UTC_US, q=None, ref_db=52.5, peak=818, flags=0, sample=2222, fs_
 # A /scene.csv row in the firmware's own format: 20 bands x 4 slices of BARE int8 half-dB steps,
 # band-major, no wire header, geometry and reference in the row's own columns. No scene capture
 # exists yet (the 2026-09-07 night predates the feature), so this is synthesised to the format
-# night_node.ino's scene_emit() writes rather than lifted from a file.
+# hear_node.ino's scene_emit() writes rather than lifted from a file.
 def _scene_q(bands=20, slices=4, seed=7):
     r = np.random.RandomState(seed)
     return np.clip(r.normal(-24, 10, (bands, slices)), -128, 0).round().astype(np.int8)
@@ -805,7 +805,7 @@ class TestFirmwareConstantsDoNotDrift:
     a firmware edit to leave stale -- the risk that remains is passing feature_span_ms the WRONG
     fs, and that is what test_the_span_... below proves against, for both rates the fleet has.
 
-    ⚠️THIS CLASS USED TO POINT AT firmware/night_node/mel16.h, WHICH IS GONE (D1: the night_node
+    ⚠️THIS CLASS USED TO POINT AT firmware/hear_node/mel16.h, WHICH IS GONE (D1: the hear_node
     bank was renamed mel_impulse.h / MELIMP_ when it moved to 48 kHz, precisely so a stale
     reference to the old name fails loudly -- FileNotFoundError -- instead of reading a real,
     valid, WRONG-RATE header and passing green. That FileNotFoundError firing here, once, on this
@@ -813,10 +813,10 @@ class TestFirmwareConstantsDoNotDrift:
     new rate, not to make it tolerant of either."""
 
     ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    IMPULSE = os.path.join(ROOT, "firmware", "night_node", "mel_impulse.h")
+    IMPULSE = os.path.join(ROOT, "firmware", "hear_node", "mel_impulse.h")
     PATH_TEST = os.path.join(ROOT, "firmware", "path_test", "mel16.h")
     BOARD = os.path.join(ROOT, "firmware", "boards", "xiao_s3_sense.h")
-    INO = os.path.join(ROOT, "firmware", "night_node", "night_node.ino")
+    INO = os.path.join(ROOT, "firmware", "hear_node", "hear_node.ino")
 
     @staticmethod
     def _define(path, name):
@@ -840,11 +840,11 @@ class TestFirmwareConstantsDoNotDrift:
             self._define(self.INO, "DECIM"))
 
     def test_the_span_this_module_reports_is_the_span_the_firmware_fetches(self):
-        # night_node.ino: `#define SKETCH_SPAN (MELIMP_NFFT + (MELIMP_FRAMES - 1) * MELIMP_HOP)`.
+        # hear_node.ino: `#define SKETCH_SPAN (MELIMP_NFFT + (MELIMP_FRAMES - 1) * MELIMP_HOP)`.
         # No +32 guard term any more -- the ring fetch IS the span (D2/D4 replaced the old
         # over-fetch with an exact readiness test) -- so this is the rate-agnostic property with
         # nothing subtracted off either side, checked against the header that is actually built
-        # into a night_node: mel_impulse.h, at its own (48 kHz) rate.
+        # into a hear_node: mel_impulse.h, at its own (48 kHz) rate.
         nfft = int(self._define(self.IMPULSE, "MELIMP_NFFT"))
         hop = int(self._define(self.IMPULSE, "MELIMP_HOP"))
         frames = int(self._define(self.IMPULSE, "MELIMP_FRAMES"))
@@ -877,7 +877,7 @@ class TestFirmwareConstantsDoNotDrift:
         the rest of the SAME row instead: the row's own frame_hex states its rate (flags bits
         8-11), and sketch_back / that rate is SKETCH_BACK_S regardless of which row it is.
 
-        Proved against the firmware's own SKETCH_BACK_S and the value night_node.ino currently
+        Proved against the firmware's own SKETCH_BACK_S and the value hear_node.ino currently
         writes to the column (SKETCH_BACK, derived per sketch_domain.h's sk_back_acq_len -- see
         tests/test_firmware_sketch_domain.py::test_the_back_off_is_derived_from_time_not_from_the_hop
         for that derivation itself), plus the legacy pairing every stored row before this move

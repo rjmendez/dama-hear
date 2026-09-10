@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build and flash ONE node, with its identity and its destination named in the same command.
 
-    python3 firmware/night_node/flash.py mach 172.16.100.116     # over the air
-    python3 firmware/night_node/flash.py mach /dev/ttyACM0       # over USB
-    python3 firmware/night_node/flash.py nyquist nyquist.local
+    python3 firmware/hear_node/flash.py mach 172.16.100.116     # over the air
+    python3 firmware/hear_node/flash.py mach /dev/ttyACM0       # over USB
+    python3 firmware/hear_node/flash.py nyquist nyquist.local
 
 WHY THIS EXISTS. Generating secrets.h and choosing where to send the image were two separate
 manual steps, and I got them out of order: regenerated secrets.h for `nyquist`, then flashed that
@@ -84,7 +84,7 @@ def main(argv):
     if r.returncode:
         die("compile failed")
 
-    bin_path = os.path.join(outdir, "night_node.ino.bin")
+    bin_path = os.path.join(outdir, "hear_node.ino.bin")
     if not os.path.exists(bin_path):
         die("no image at %s" % bin_path)
 

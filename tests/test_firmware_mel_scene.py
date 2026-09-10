@@ -33,8 +33,8 @@ import pytest
 from hear import sketch as SK
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SCENE_H = ROOT / "firmware" / "night_node" / "mel_scene.h"
-IMPULSE_H = ROOT / "firmware" / "night_node" / "mel_impulse.h"
+SCENE_H = ROOT / "firmware" / "hear_node" / "mel_scene.h"
+IMPULSE_H = ROOT / "firmware" / "hear_node" / "mel_impulse.h"
 GEN = ROOT / "firmware" / "gen_mel_scene.py"
 
 # ⚠️LITERAL ON PURPOSE. Importing these from SK would make the test agree with whatever SK says
@@ -163,7 +163,7 @@ def test_regenerating_the_header_reproduces_it_byte_for_byte(tmp_path):
     r = subprocess.run([sys.executable, str(GEN), str(out)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert out.read_bytes() == SCENE_H.read_bytes(), \
-        "firmware/night_node/mel_scene.h is not what gen_mel_scene.py emits -- regenerate it"
+        "firmware/hear_node/mel_scene.h is not what gen_mel_scene.py emits -- regenerate it"
 
 
 def test_the_scene_bank_is_not_the_detection_bank():

@@ -70,10 +70,10 @@ OUTCOMES = ("stored", "already_held", "evicted_before_fetch", "refused_bad_body"
 
 #: Once an index row reaches one of these, the name is never probed again. Without it the drain
 #: re-probes 321 already-dead nyquist names every 15 minutes forever (measured 2026-09-09).
-#: ⚠️`probed_404` IS DELIBERATELY NOT HERE. night_node.ino:2436 answers 404 for ANY failed
+#: ⚠️`probed_404` IS DELIBERATELY NOT HERE. hear_node.ino:2436 answers 404 for ANY failed
 #: SD.open, not only for a missing file: max_files is 8 and the long-lived set reaches 6
 #: (dets.csv + scene.csv + the open clip + /ls's directory and entry + health.csv) with
-#: clip_evict_worse_than() taking 2 more during an eviction (night_node.ino:1725-1731). One
+#: clip_evict_worse_than() taking 2 more during an eviction (hear_node.ino:1725-1731). One
 #: descriptor-exhausted moment must not retire a clip that is still on the card.
 TERMINAL_OUTCOMES = ("stored", "evicted_before_fetch")
 
@@ -224,7 +224,7 @@ def wav_probe(body: bytes) -> Dict[str, Any]:
 
 
 #: Decimation between the acquisition rate the clip is written at and the FS_NOMINAL rate every
-#: other lane runs at. Mirrors DECIM in night_node.ino.
+#: other lane runs at. Mirrors DECIM in hear_node.ino.
 CLIP_DECIM_CANDIDATES = (2, 3, 4)
 #: Acquisition rates a node may legally clock the mic at, for confirming a suspected mis-header.
 #: MSM261D3526H1CPM Standard Performance Mode caps at 62.5 kHz; 32000 is the earlier target.
@@ -249,7 +249,7 @@ FLEET_RATE_TOL = 0.005
 def header_rate_suspect(probe: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Is this clip's header rate provably wrong, and by what integer factor?
 
-    ⚠️night_node.ino stamped every 48 kHz clip with the FS_NOMINAL timebase for the whole of the
+    ⚠️hear_node.ino stamped every 48 kHz clip with the FS_NOMINAL timebase for the whole of the
     48 kHz rollout: the body is CLIP_SAMPLES at FS_ACQ, the header said ~16000 Hz. A 5.0 s clip
     reads back as 15.0 s and plays an octave and a half low, and NOTHING downstream could catch
     it -- 16000 is exactly the rate hear_tag.py's assert_rate wants, so the lying header walks
@@ -307,7 +307,7 @@ def length_implies_rate(n_samples: int, header_fs: float,
     ⚠️THE CSV IS NOT INDEPENDENT EVIDENCE, AND ASSUMING IT WAS COST A CLIP. This function first
     required `csv_fs` to agree with the recovered rate. It does not, on the very boot this exists
     for: mach-a75b9e4c has BOTH the header and dets.csv at 22848 Hz, so the veto fired and the
-    clip stayed broken. night_node.ino writes both from `fs_timebase()` -- the clip header at
+    clip stayed broken. hear_node.ino writes both from `fs_timebase()` -- the clip header at
     :1958 and the detection row at :3498 -- so when `fs_clean` latches wrong, both inherit it.
     Their DISAGREEMENT is informative and is why they travel side by side; their AGREEMENT is one
     measurement written twice.

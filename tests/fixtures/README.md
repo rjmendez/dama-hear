@@ -39,7 +39,7 @@ block will be pinned against hardware again.
 ⚠️THIS ONE IS NOT A LIVE CAPTURE AND MUST NOT BE READ AS ONE. Every other file here came off a
 node; this one could not, because the `/ls?dir=` handler it exercises exists only in this
 checkout and **the fleet has not been flashed**. It is built from two things that ARE measured:
-the line format the handler in `firmware/night_node/night_node.ino` emits (dir-qualified name,
+the line format the handler in `firmware/hear_node/hear_node.ino` emits (dir-qualified name,
 two spaces, size, ` B`), and real clip names and the real 128044 B clip size observed on nyquist
 on 2026-09-09.
 

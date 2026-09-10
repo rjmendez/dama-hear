@@ -1,4 +1,4 @@
-// Overnight node: PDM mic + real GPS PPS + WiFi, on a XIAO ESP32-S3 Sense.
+// Overnode: PDM mic + real GPS PPS + WiFi, on a XIAO ESP32-S3 Sense.
 //
 // The point of leaving this outside is ONE measurement the project has never been able to make.
 // firmware/path_test could only ever check the capture path, because its pulse and esp_timer came
@@ -14,7 +14,7 @@
 //
 //     cp secrets.h.example secrets.h   # then edit
 //     arduino-cli compile -u -p /dev/ttyACM0 \
-//       --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi firmware/night_node
+//       --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi firmware/hear_node
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
@@ -2253,7 +2253,7 @@ static void h_root() {
              "<style>body{font:14px system-ui;margin:2rem;max-width:44rem}"
              "td{padding:.2rem .8rem .2rem 0}b{font-variant-numeric:tabular-nums}"
              "code{background:#eee;padding:.1rem .3rem}</style>"
-             "<h2>dama-hear night node</h2><table id=t></table>"
+             "<h2>dama-hear node</h2><table id=t></table>"
              "<p><a href='/detections'>detections</a> &middot; <a href='/status'>json</a></p>"
              "<script>async function u(){const s=await(await fetch('/status')).json();"
              // The rate and the window that supports it, together. A rate printed to four decimals with no
@@ -2540,7 +2540,7 @@ void setup() {
   logf("boot  attempt %lu on partition %s\n", (unsigned long)hear_boot_try(),
                 esp_ota_get_running_partition()->label);
   node_identity();          // before anything logs or joins: the id names the log and the AP
-  logf("\n=== dama-hear night node %s (%s) fw %s ===\n", node_id, NODE_CLASS, FW_BUILD);
+  logf("\n=== dama-hear node %s (%s) fw %s ===\n", node_id, NODE_CLASS, FW_BUILD);
 
   // Try each configured network in turn. An outdoor node may only reach one of them, and which
   // one is not knowable from indoors.
@@ -2568,7 +2568,7 @@ void setup() {
     WiFi.mode(WIFI_AP); WiFi.softAP(ap, AP_PASS);
     logf("wifi  AP   ssid \"%s\" pass \"%s\"  http://%s/\n",
                   ap, AP_PASS, WiFi.softAPIP().toString().c_str());
-    logln("      (no secrets.h, or the join failed -- see firmware/night_node/README)");
+    logln("      (no secrets.h, or the join failed -- see firmware/hear_node/README)");
   }
   if (MDNS.begin(node_id)) logf("mdns  http://%s.local/\n", node_id);
 
@@ -3959,7 +3959,7 @@ void loop() {
                      "connected. Running the module's stock config; PPS will appear only on fix.");
   }
 
-  if (sta_ok && WiFi.status() != WL_CONNECTED) {     // AP blipped; an overnight node reconnects
+  if (sta_ok && WiFi.status() != WL_CONNECTED) {     // AP blipped; an overnode reconnects
     static uint32_t retry = 0;
     if (millis() - retry > 15000) { retry = millis(); WiFi.reconnect(); }
   }

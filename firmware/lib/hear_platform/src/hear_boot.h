@@ -1,12 +1,12 @@
 // OTA failback: count boots in RTC memory, revert the partition when an image never proves itself.
 //
 // SECOND module out of the sketches, and the one with a live defect behind it. This code existed
-// TWICE -- night_node.ino and puc_node.ino -- and the copies had drifted apart:
+// TWICE -- hear_node.ino and puc_node.ino -- and the copies had drifted apart:
 //
 //   mark_healthy_once()   45.2% identical
 //   boot_guard()          80.9% identical
 //
-// night_node's copy refuses to mark an image healthy unless the node is REACHABLE, and says why in
+// hear_node's copy refuses to mark an image healthy unless the node is REACHABLE, and says why in
 // a comment. puc_node's copy marks healthy after 30 s unconditionally, sets proven_ok, and thereby
 // switches off its own partition revert for good -- on a node that tracks sta_ok in seven other
 // places and simply does not consult it here. The warning did not travel with the copy. That is the
@@ -21,7 +21,7 @@
 // constructor -- because nothing then increments the counter. And a HANG rather than a fault: this
 // counts RESETS, and a setup() that never returns produces none. rankine was lost to exactly that
 // on 2026-09-10; the answer is a watchdog around whatever can block, which turns the hang into a
-// reset this file already handles. See night_node's boot_wdt_arm().
+// reset this file already handles. See hear_node's boot_wdt_arm().
 #pragma once
 #include <Arduino.h>
 
