@@ -2536,12 +2536,25 @@ void setup() {
   // The input is a fixed pseudo-random buffer so two builds are comparable, and the result is
   // reported per MAC as well as per call so it can be scaled to a channel count directly.
   http.on("/dsp", []() {
+    // ⚠️THE CYCLE COUNTER IS 32-BIT AND THIS IS NOT A GENEROUS BOUND. One decimate() call measured
+    // 2,073,459 cycles, so the counter wraps after 2071 reps -- past which the answer is silently
+    // wrong, not obviously wrong. 4000 was allowed and would have wrapped TWICE and spent 34 s in
+    // one handler, well past the 15 s watchdog. 400 is 3.5 s and 0.83 G cycles, a fifth of the way
+    // to the wrap, and still averages over 102,400 output samples.
     int reps = http.hasArg("reps") ? http.arg("reps").toInt() : 200;
-    if (reps < 1) reps = 1; if (reps > 4000) reps = 4000;
+    if (reps < 1) reps = 1; if (reps > 400) reps = 400;
     static int16_t bin[ABLOCK];
     uint32_t r = 22222;
     for (int i = 0; i < ABLOCK; i++) { r = r * 1664525u + 1013904223u; bin[i] = (int16_t)(r >> 16); }
     static int16_t bout[BLOCK];
+
+    // ⚠️decimate() ADVANCES THE LIVE FIR HISTORY. Benchmarking it against a pseudo-random buffer
+    // leaves dhist full of noise, and the next REAL block is then filtered against that noise --
+    // about 448 acquisition samples, 9.3 ms, of corrupted audio in the scene and sketch path, per
+    // request, on a deployed node. This endpoint was run three times on rankine before the review
+    // caught it. Snapshot and restore, so measuring costs the node nothing but the CPU time.
+    static int16_t dhist_save[DECIM_TAPS - 1];
+    decim_hist_save(dhist_save);
 
     // Warm the caches: the first pass pays for filling them and would flatter or punish the rest.
     (void)decimate(bin, ABLOCK, bout);
@@ -2573,7 +2586,9 @@ void setup() {
     double blocks_s = (double)FS_ACQ / (double)ABLOCK;      // decimator calls per second, one mic
     double load1 = cyc_call * blocks_s / (double)getCpuFrequencyMhz() / 1e6 * 100.0;
 
-    char b[720];
+    decim_hist_restore(dhist_save);                 // live path restored before we answer
+
+    char b[760];
     snprintf(b, sizeof b,
       "cpu_mhz        %lu\n"
       "reps           %d\n"
@@ -3302,6 +3317,11 @@ static bool    dhist_ready = false;
 // and re-measured on the QUANTISED values -- the step that caught a 25 dB error once already.
 static int32_t dh14[DECIM_TAPS];
 // Arduino auto-prototypes functions, not variables, and /dsp is above these definitions.
+// Arduino auto-prototypes functions, not variables, and /dsp sits above these definitions -- so
+// the benchmark reaches the live FIR history through these rather than touching dhist directly.
+static void decim_hist_save(int16_t *dst)    { memcpy(dst, dhist, (size_t)(DECIM_TAPS - 1) * 2); }
+static void decim_hist_restore(const int16_t *src) { memcpy(dhist, src, (size_t)(DECIM_TAPS - 1) * 2); }
+
 static long decim_set_q14() {
   long worst = 0;
   for (int t = 0; t < DECIM_TAPS; t++) { dh14[t] = DECIM_H[t] >> 1; worst += labs((long)dh14[t]); }
