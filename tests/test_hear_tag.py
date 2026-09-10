@@ -14,6 +14,7 @@ which are properties of YAMNet. `TestAgainstTheRealModel` runs only when both ar
 
 ⚠️NOTHING HERE WRITES OUTSIDE tmp_path.
 """
+import collections
 import json
 import os
 import re
@@ -233,31 +234,68 @@ class TestNormalisationIsNotAnOptimisation:
 # ----------------------------------------------------------------- the rate
 
 class TestTheRateIsSnappedOrRefused:
-    """⚠️A SHIPPED CONDITION, NOT A HYPOTHETICAL. mach headed a whole boot 22624 Hz. YAMNet
-    neither validates nor resamples its input rate, so feeding it that degrades silently towards
-    Silence; a resampler here would launder a known firmware defect into plausible tags."""
+    """⚠️A SHIPPED CONDITION, NOT A HYPOTHETICAL. mach headed a whole boot 22624/22848 Hz over
+    16 kHz audio.
 
-    def test_a_22624_header_refuses_rather_than_tagging(self, tmp_path):
-        store_clip(tmp_path, fs=22624)
+    ⚠️THE RULE CHANGED ONCE AND THE DISTINCTION IS THE WHOLE POINT. The original rule was "a rate
+    nobody configured is refused, because snapping it to the nearest would hide a firmware defect
+    behind a confident answer". Snapping to the nearest is a GUESS and stays refused. Recovering
+    the rate from the sample count is a PROOF: exactly one rate this fleet clocks turns 64000
+    samples into a length this fleet writes, and the node's own fs_hz estimate has to agree. When
+    the proof closes the clip is scored and the row carries `header_rate_suspect` saying what was
+    corrected and why; when it does not close, the refusal is exactly as it was.
+    """
+
+    def test_a_22624_header_whose_length_proves_16k_is_recovered_not_discarded(self, tmp_path):
+        """The audio is real 16 kHz audio and the header is the only broken thing about it.
+        Throwing it away loses a real detection to a header bug we can prove and correct."""
+        store_clip(tmp_path, fs=22624, fs_csv=16000.169)
+        t = run(tmp_path, StubTagger(), write=False)
+        assert t["tagged"] == 1 and t["refused"] == 0
+
+    def test_the_recovery_is_recorded_on_the_row_never_silent(self, tmp_path):
+        row = store_clip(tmp_path, fs=22624, fs_csv=16000.169)
+        got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
+        assert got["ok"], got
+        fix = got["row"]["header_rate_suspect"]
+        assert fix["true_fs_hz"] == 16000.0 and fix["header_fs_hz"] == 22624.0
+        assert got["row"]["wav_header_fs_hz"] == 22624, "the lying header is KEPT"
+        assert "never clocks" in fix["why"]
+
+    def test_a_bad_rate_the_length_does_NOT_explain_is_still_refused(self, tmp_path):
+        """⚠️The refusal did not go away. A clip that is neither a known length at a known rate
+        nor recoverable is thrown out, into its own counted bucket."""
+        store_clip(tmp_path, fs=22624, pcm=quiet_noise(n=12345), fs_csv=16000.169)
         t = run(tmp_path, StubTagger(), write=False)
         assert t["tagged"] == 0 and t["refused"] == 1
         assert t["by_reason"] == {HT.R_RATE_REFUSED: 1}
+
+    def test_the_nodes_own_estimate_can_veto_the_recovery(self, tmp_path):
+        """fs_hz and wav_header_fs_hz are kept side by side because they once disagreed by
+        6,624 Hz. When they disagree about the RECOVERED rate too, nothing is recovered."""
+        store_clip(tmp_path, fs=22624, fs_csv=48000.0)
+        t = run(tmp_path, StubTagger(), write=False)
+        assert t["refused"] == 1 and t["by_reason"] == {HT.R_RATE_REFUSED: 1}
 
     def test_the_measured_15986_spread_is_inside_the_tolerance(self, tmp_path):
         store_clip(tmp_path, fs=15986)
         assert run(tmp_path, StubTagger(), write=False)["tagged"] == 1
 
     def test_the_refusal_names_both_rates(self, tmp_path):
-        store_clip(tmp_path, fs=22624, fs_csv=16000.169)
+        store_clip(tmp_path, fs=22624, pcm=quiet_noise(n=12345), fs_csv=16000.169)
         got = HT.tag_one(StubTagger(), CLIPS.read_index(str(tmp_path)).popitem()[1],
                          str(tmp_path), HT.model_block(VERIFIED))
+        assert not got["ok"]
         assert "22624" in got["detail"] and "16000.169" in got["detail"]
 
-    def test_no_resampler_is_reachable_from_this_module(self):
-        """A source scan that would match its own explanation is worthless, so this reads the
-        module's NAMES rather than its text."""
-        for banned in ("resample", "resample_poly", "decimate", "interp1d"):
-            assert not hasattr(HT, banned), "%s must not exist: §12.4 refuses resampling" % banned
+    def test_resampling_is_deliberate_and_labelled_not_incidental(self, tmp_path):
+        """This test used to assert no resampler existed at all. One does now -- the model is
+        32 kHz and the fleet is not -- so the invariant moved to what every row must SAY."""
+        row = store_clip(tmp_path)
+        got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
+        assert got["ok"], got
+        for field in ("band_limit_hz", "fs_source_hz", "upsampled"):
+            assert field in got["row"], "%s must ride on every tag row" % field
 
 
 # ----------------------------------------------------------------- the score picture
@@ -435,7 +473,8 @@ class TestNothingFallsIntoADefault:
         assert t["by_reason"] == {HT.R_MODEL_ERROR: 1}
 
     def test_refusals_are_broken_out_by_node_and_day(self, tmp_path):
-        store_clip(tmp_path, node="mach", fs=22624)
+        # A bad rate the length cannot explain: recoverable ones are now tagged, not refused.
+        store_clip(tmp_path, node="mach", fs=22624, pcm=quiet_noise(n=12345))
         store_clip(tmp_path, node="nyquist", outcome="evicted_before_fetch")
         t = run(tmp_path, StubTagger(), write=False)
         assert sorted(t["by_node_day_reason"]) == [
@@ -941,6 +980,7 @@ class TestTheCheckCanActuallyFail:
                 "cap_hit": False, "stop_reason": None, "conservation_ok": True,
                 "weights_ok": True, "silence_top": 0, "by_reason": {}, "by_node": {},
                 "by_node_day_reason": {}, "model": {}, "silence_frac": 0.0,
+                "mean_top_score": 0.25, "n_top_scores": 1,
                 "observation_not_health": {}}
         base.update(kw)
         HT.write_heartbeat(str(tmp_path), base, now=kw.pop("now", 1000.0))
@@ -1016,10 +1056,39 @@ class TestTheCheckCanActuallyFail:
         line = [l for l in lines if l.startswith("silence")][0]
         assert "REPORT" in line and "NOT GATED" in line and "1.000" in line
 
-    def test_it_does_fire_once_a_threshold_is_set(self, tmp_path):
-        self._beat(tmp_path, tagged=10, silence_top=10, now=1000.0)
+    def test_the_score_floor_fires_when_the_run_goes_quiet(self, tmp_path):
+        """⚠️THE CANARY THAT REPLACED THE SILENCE ONE, AND THE REASON IS MEASURED. Over the
+        69-clip human calibration set mn10_as returns Silence top-1 on 0 healthy and 3
+        un-normalised, so `max_silence_frac` cannot separate them without resting on 3 clips.
+        The run's mean top score does: 0.254 against 0.162, 13.6 sigma apart at 400 clips."""
+        self._beat(tmp_path, tagged=10, mean_top_score=0.162, n_top_scores=10, now=1000.0)
+        code, lines = HT.check_tags(str(tmp_path), min_mean_top_score=0.20, now=1000.0)
+        assert code == 1 and any(l.startswith("score    LOW") for l in lines), lines
+
+    def test_the_score_floor_passes_a_healthy_run(self, tmp_path):
+        self._beat(tmp_path, tagged=10, mean_top_score=0.254, n_top_scores=10, now=1000.0)
+        code, lines = HT.check_tags(str(tmp_path), min_mean_top_score=0.20, now=1000.0)
+        assert any(l.startswith("score    ok") for l in lines), lines
+        assert code == 0, lines
+
+    def test_the_silence_fraction_is_reported_and_never_gated(self, tmp_path):
+        """⚠️It used to be gateable-in-principle and merely un-set. The calibration retired it,
+        so passing a threshold must NOT resurrect a gate that rests on three clips."""
+        self._beat(tmp_path, tagged=10, silence_top=10, silence_frac=1.0, now=1000.0)
         code, lines = HT.check_tags(str(tmp_path), max_silence_frac=0.5, now=1000.0)
-        assert code == 1 and any("HIGH" in l for l in lines)
+        sil = [l for l in lines if l.startswith("silence")]
+        assert sil and "REPORT" in sil[0] and "HIGH" not in sil[0], sil
+        assert "NOT GATED" in sil[0]
+        # Behavioural, not a source scan: a run that is 100% Silence-top with a threshold passed
+        # must still exit 0 when every other gate is healthy.
+        assert code == 0, lines
+
+    def test_the_score_floor_is_calibrated_against_one_failure_and_says_so(self, tmp_path):
+        """A canary tuned on a single failure mode must not read as a health certificate."""
+        self._beat(tmp_path, tagged=10, mean_top_score=0.10, n_top_scores=10, now=1000.0)
+        _, lines = HT.check_tags(str(tmp_path), min_mean_top_score=0.20, now=1000.0)
+        low = [l for l in lines if l.startswith("score    LOW")][0]
+        assert "ONE failure" in low and "not proof" in low
 
     def test_a_quiet_night_is_not_a_failure(self, tmp_path):
         """⚠️A gate keyed on 'did anything score high' fires on a correct result. Nothing here
@@ -1411,11 +1480,11 @@ class TestTheClipReachesTheModelAtTheModelsRate:
         assert got["row"]["band_limit_hz"] == 16000.0
         assert (got["row"]["resample_L"], got["row"]["resample_M"]) == (2, 3)
 
-    def test_machs_22624_boot_is_still_refused_and_as_a_RATE_problem(self, tmp_path):
-        """⚠️THE REFUSAL MOVED, IT DID NOT GO AWAY -- and the REASON has to stay right. Checked
-        after the duration test, the same clip came back `wav_sample_count`: 64000 samples read
-        as 2.83 s and refused for the wrong length. True, and useless. The rate is the defect."""
-        row = store_clip(tmp_path, fs=22624, fs_csv=16000.0)
+    def test_an_unrecoverable_bad_rate_is_refused_AS_A_RATE_PROBLEM(self, tmp_path):
+        """⚠️THE REASON HAS TO STAY RIGHT. Checked after the duration test, a bad-rate clip came
+        back `wav_sample_count`: 64000 samples read as 2.83 s and refused for the wrong length.
+        True, and useless. The rate is the defect and the length is a symptom of it."""
+        row = store_clip(tmp_path, fs=22624, pcm=quiet_noise(n=12345), fs_csv=16000.0)
         got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
         assert not got["ok"]
         assert got["reason"] == HT.R_RATE_REFUSED, got
@@ -1477,3 +1546,49 @@ class TestTheModelIdentityIsTheWholeChain:
         src = p.read_text()
         assert HT.UPSTREAM_SHA256 in src, "the export names the checkpoint it converts"
         assert HT.MODEL_SHA256 in src, "and the digest of what it produces"
+
+
+# ----------------------------------------------------------------- the calibration set
+
+class TestTheHumanCalibrationSetIsRealAndBounded:
+    """⚠️69 rows, one listener, 2 marked "sure". Enough to REFUTE things -- it already refuted
+    two -- and not enough to FIT anything. These tests pin the shape so a later reader cannot
+    mistake it for a reference standard."""
+
+    @staticmethod
+    def _labels():
+        import pathlib
+        p = pathlib.Path(__file__).resolve().parents[1] / "testdata" / "clip-labels-2026-09-10.jsonl"
+        return [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+
+    def test_the_gate_is_met_on_count_and_on_mach(self):
+        rows = self._labels()
+        assert len(rows) >= 30
+        assert sum(1 for r in rows if r["node"] == "mach") >= 1
+        assert {r["node"] for r in rows} == {"mach", "nyquist", "rankine"}
+
+    def test_every_row_is_either_a_tag_or_an_explicit_nothing(self):
+        for r in self._labels():
+            assert bool(r["nothing"]) != bool(r["heard"]), r
+
+    def test_the_listeners_own_confidence_is_recorded_and_mostly_low(self):
+        """A set where 67 of 69 rows say "probably" is not ground truth, and the numbers derived
+        from it inherit that. The field exists so nobody has to take it on trust."""
+        conf = collections.Counter(r["confidence"] for r in self._labels())
+        assert set(conf) <= {"sure", "probably", "guess"}
+        assert conf["sure"] < len(self._labels()) / 2
+
+    def test_the_silence_measure_does_not_separate_empty_from_sound(self):
+        """⚠️THE MEASUREMENT THAT RETIRED GATE CONDITION 3, pinned so it cannot quietly come back.
+        AUC of silence_frac against the listener's `nothing` is BELOW chance: a quiet insect
+        chorus sits under -60 dBFS most of the time and an empty windy clip does not."""
+        rows = [r for r in self._labels() if r.get("silence_frac") is not None]
+        emp = [r["silence_frac"] for r in rows if r["nothing"]]
+        snd = [r["silence_frac"] for r in rows if not r["nothing"]]
+        assert emp and snd
+        wins = sum(1 for a in emp for b in snd if a > b)
+        ties = sum(1 for a in emp for b in snd if a == b)
+        auc = (wins + 0.5 * ties) / (len(emp) * len(snd))
+        assert auc < 0.5, ("silence_frac AUC is %.3f; if this ever rises above chance the "
+                           "retirement of --max-silence-frac deserves revisiting" % auc)
+
