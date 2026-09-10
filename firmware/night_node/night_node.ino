@@ -211,7 +211,17 @@ static const char HEALTH_HDR[] =
   //             coarser than the tolerance you need must not have its fs_clean_hz used at all.
   // over_s      seconds that delivered too MANY samples: catch-up after a stall, or a missed edge
   // pps_gaps    intervals that were not one second, i.e. edges the node never saw
-  "clean_s,fs_used_hz,fs_step_ppm,over_s,pps_gaps";
+  // ⚠️THE NEXT FOUR ARE THE ONES THAT ANSWER "WHY IS THIS NODE UNANCHORED". Reconstructing that
+  // from the columns above needed pos_n == 0 AND tacc_ns == 0 AND sats == 0 read together, and
+  // even then it could not separate "no NAV-PVT arrived" from "NAV-PVT arrived with no fix" --
+  // pos_n only advances on a 3D fix. ubx_pvt separates them outright.
+  // ubx_pvt        NAV-PVT messages decoded, fix or no fix. Flat while the UART is the problem.
+  // dets_unlabelled detections written with utc_us == 0. THE loss; label_rejects is not it.
+  // first_label_s  uptime at the first accepted UTC label, 0 = never. Time-to-first-label,
+  //                measurable without waiting for a detection to happen to fall in the window.
+  // ubx_silent_max longest run of seconds with the timepulse advancing and no NAV-PVT at all
+  "clean_s,fs_used_hz,fs_step_ppm,over_s,pps_gaps,"
+  "ubx_pvt,dets_unlabelled,first_label_s,ubx_silent_max";
 static double   fs_clean      = (double)FS_NOMINAL;
 static uint32_t fs_clean_secs = 0;    // length of the current unbroken window, in GPS seconds
 // The window behind the value fs_clean currently HOLDS, which is not fs_clean_secs: that one is
@@ -285,6 +295,26 @@ static volatile int32_t  last_nano     = 0;    // NAV-PVT fractional part; large
 static volatile uint32_t time_glitch   = 0;    // labellings rejected as inconsistent
 static int64_t  prev_unix_s = 0;               // last accepted label, for the +1s/edge check
 static uint32_t prev_edge_n = 0;
+// millis() at the end of setup's first statement. It lived below, in the `state` block, and is
+// here now because the UBX parser above needs it to stamp first_label_s.
+static uint32_t boot_ms = 0;
+
+// ⚠️time_glitch (published as `label_rejects`) IS NOT THE LOSS COUNTER, AND IT WAS READ AS ONE.
+// It counts exactly one branch -- a NAV-PVT whose second did not advance one-per-edge -- and
+// nothing else. Every OTHER way an edge goes unnamed increments nothing: no NAV-PVT arrived at
+// all, it arrived outside the 900 ms window, or its validity bits were clear.
+//
+// Measured 2026-09-10 on the archived health.csv: across four mach boots the node ran 2401
+// proven seconds with PPS advancing (pps_bad 0, pps_gaps 0) and tAcc still 0 -- i.e. not one
+// NAV-PVT decoded -- 1016 s of it in one boot and 1317 s in another that never recovered.
+// 475 of mach's 517 unanchored pool rows fall in windows like those. Over the same archive
+// mach's label_rejects read 50 against rankine's 135, so the counter that looks like it
+// describes this loss ranks the worst node BEST. These three do describe it.
+static volatile uint32_t dets_unlabelled = 0;  // detections written with utc_us == 0: THE loss
+static volatile uint32_t first_label_s   = 0;  // uptime at the first accepted label; 0 = never
+static volatile uint32_t ubx_silent_s    = 0;  // seconds with PPS advancing and no NAV-PVT
+static volatile uint32_t ubx_silent_run  = 0;  // the run in progress; 0 once a NAV-PVT lands
+static volatile uint32_t ubx_silent_max  = 0;  // longest such run this boot -- reporting only
 
 static void IRAM_ATTR pps_isr() {
   uint64_t now = (uint64_t)esp_timer_get_time();
@@ -646,9 +676,19 @@ static int gps_rx_pin = GPS_RX, gps_tx_pin = GPS_TX;
 static const char *gps_pin_src = "default (not probed)";
 static uint32_t gps_pulse_d7 = 0, gps_pulse_d6 = 0;
 
+// ⚠️250 ms WAS SHORTER THAN THE THING IT WAS LOOKING FOR. The module is configured here for one
+// solution per second (K_RATE_NAV 1), so it transmits in a burst of a few tens of ms and is idle
+// for the rest of the second. A 250 ms window therefore misses a perfectly healthy, talking
+// module about three times in four -- and a miss on BOTH pins is "module silent, using
+// documented wiring", which on mach is the pinout it does not have.
+//
+// One full second plus margin, so a 1 Hz burst cannot fall between the windows. It costs 1.9 s
+// once per bring-up against the ~11 s a failed baud sweep costs, and it is only reached on a
+// path that is already spending seconds.
+#define GPS_PIN_PROBE_MS 1200
 static void gps_pick_pins() {
-  gps_pulse_d7 = gps_min_pulse_us(GPS_RX, 250);
-  gps_pulse_d6 = gps_min_pulse_us(GPS_TX, 250);
+  gps_pulse_d7 = gps_min_pulse_us(GPS_RX, GPS_PIN_PROBE_MS);
+  gps_pulse_d6 = gps_min_pulse_us(GPS_TX, GPS_PIN_PROBE_MS);
   if (gps_pulse_d7 && !gps_pulse_d6) {
     gps_rx_pin = GPS_RX; gps_tx_pin = GPS_TX; gps_pin_src = "measured: as documented";
   } else if (gps_pulse_d6 && !gps_pulse_d7) {
@@ -813,6 +853,13 @@ static void ubx_msg() {
             edge_local_us = pend_local_us;
             edge_unix_us = (int64_t)unix_s * 1000000LL;
             time_valid = true;
+            // Latched once. The gap between this and 0 is the node's real time-to-first-label,
+            // and until now the only way to bound it was to notice that a detection had no
+            // stamp -- which needs a detection to have happened.
+            if (!first_label_s) {
+              uint32_t up = (millis() - boot_ms) / 1000;
+              first_label_s = up ? up : 1;            // 0 stays reserved for "never"
+            }
           }
           prev_unix_s = unix_s; prev_edge_n = pend_edge_n;   // re-sync either way
         }
@@ -1145,7 +1192,6 @@ static I2SClass i2s;
 static WebServer http(80);
 static bool sd_ok = false, sta_ok = false;
 static int sd_cs = 0;
-static uint32_t boot_ms = 0;
 
 // ---------------------------------------------------------------- OTA + failback
 // Moved to hear_platform/hear_boot.{h,cpp}. It lived here AND in puc_node.ino, and the copies had
@@ -2106,7 +2152,11 @@ static String status_json() {
     // ppm_vs_gps averages only intervals that were really one second. It used to divide the whole
     // first-to-last span by the EDGE count, which reported 37,988 ppm on a node that had resynced.
     "\"esp_clock\":{\"ppm_vs_gps\":%.3f,\"pps_intervals\":%lu},"
-    "\"time\":{\"valid\":%s,\"utc_us\":%lld,\"since_edge_us\":%llu,\"navpvt_nano\":%ld,\"label_rejects\":%lu},"
+    // ⚠️label_rejects IS ONE BRANCH, NOT THE LOSS. See the counters beside time_glitch: the
+    // four fields after it are the ones that describe an unlabelled node, and they are here
+    // because reading label_rejects as the loss ranked the worst node in the fleet best.
+    "\"time\":{\"valid\":%s,\"utc_us\":%lld,\"since_edge_us\":%llu,\"navpvt_nano\":%ld,\"label_rejects\":%lu,"
+      "\"dets_unlabelled\":%lu,\"first_label_s\":%lu,\"ubx_silent_s\":%lu,\"ubx_silent_max_s\":%lu},"
     // acq_slip: g_acq (what pass 1 really wrote to the sketch ring) minus the g_samples*DECIM rule
     // praw and clip_pump address by. It is 0 unless an I2S read was not a multiple of DECIM, and it
     // is the number that says whether that pre-existing rule needs its own fix. Measured, not
@@ -2165,6 +2215,8 @@ static String status_json() {
     esp_ppm, (unsigned long)esp_n,
     time_valid ? "true" : "false", (long long)utc_now, (unsigned long long)since_edge,
     (long)last_nano, (unsigned long)time_glitch,
+    (unsigned long)dets_unlabelled, (unsigned long)first_label_s,
+    (unsigned long)ubx_silent_s, (unsigned long)ubx_silent_max,
     (unsigned long)det_n, (unsigned long)det_flushed, (unsigned long)det_lost,
     g_amb, env_peak_seen, (long)(int32_t)(g_acq - (uint32_t)g_samples * DECIM),
     armed, gate_thr(), env_e_max_win, env_e_max_win / gate_thr(),
@@ -2287,6 +2339,46 @@ static File detf;
 // that: those are incremented by the runtime parser, never by this sweep, so they read 0 after a
 // SUCCESSFUL sweep just as they do after a failed one. Using them cost nyquist and rankine their
 // fix -- the fallback below fired even when the first sweep had found 230400.
+// One listen on the port as it is currently open. Returns NMEA lines in *nm and UBX sync words
+// in *ub. Extracted from the sweep so the WINNER can be re-listened to for longer -- see
+// GPS_DECODE_QUORUM below -- rather than the confirmation being a second copy of this loop.
+static void gps_listen(uint32_t window_ms, int *nm_out, int *ub_out) {
+  delay(60); while (Serial1.available()) Serial1.read();
+  int nm = 0, ub = 0, i = 0; char ln[100]; uint8_t prev = 0; uint32_t t0 = millis();
+  while (millis() - t0 < window_ms) {
+    while (Serial1.available()) {
+      uint8_t c = (uint8_t)Serial1.read();
+      if (prev == 0xB5 && c == 0x62) ub++;            // UBX sync word
+      prev = c;
+      if (c == '\n' || i >= 99) {
+        ln[i] = 0;
+        if (i > 6 && ln[0] == '$' && ln[1] >= 'A' && ln[1] <= 'Z' && ln[2] >= 'A' && ln[2] <= 'Z') nm++;
+        i = 0;
+      } else if (c != '\r' && c >= 32 && c < 127) ln[i++] = (char)c;
+    }
+  }
+  *nm_out = nm; *ub_out = ub;
+}
+
+// ⚠️ONE COUNT USED TO BE ENOUGH, AND ONE COUNT IS NOISE. `best_b != 0` accepted any candidate
+// that scored a single unit -- and a single unit is two adjacent bytes reading B5 62 on a
+// floating pin beside an active line, which is ~1 in 65k per byte pair and therefore expected
+// several times over an eight-rate sweep. gps_bit_time_us() already refuses to call a run length
+// a bit time until it has recurred GPS_RUN_QUORUM = 20 times, for exactly this reason; the sweep
+// never got the same discipline.
+//
+// The cost of the missing quorum is not a wrong baud, it is the FALLBACK NOT RUNNING: gps_bringup
+// only tries the other pin order `if (!decoded)`, so one spurious count on the wrong pin makes a
+// node with a reversed pair look linked and skips the swap that would have fixed it. On mach that
+// is the difference between a 13 s boot and the 1016 s and 1317 s NAV-PVT-silent windows measured
+// in the 2026-09-10 health archive.
+//
+// A confirmation listen on the WINNER only, long enough that a 1 Hz module cannot be quiet
+// through it: 2500 ms carries >= 2 NAV-PVT + >= 2 TIM-TP for a UBX-only node (nyquist measured
+// 1.9 UBX frames/s) and ~40 lines for a NMEA one (mach measured 16.8 valid lines/s). Two is the
+// quorum because two is what the leanest healthy configuration on this fleet actually delivers.
+#define GPS_CONFIRM_MS 2500
+#define GPS_DECODE_QUORUM 2
 static bool gps_autobaud() {
   // Find the module's baud instead of assuming it. Assuming 9600 produced a stream that a lenient
   // parser happily counted as 22 "sentences" while zero of them were valid NMEA -- a wrong number
@@ -2322,20 +2414,8 @@ static bool gps_autobaud() {
     uint32_t best_b = 0; int best_score = 0; bool best_ubx = false;
     for (unsigned k = 0; k < nc; k++) {
       Serial1.begin(cand[k], SERIAL_8N1, gps_rx_pin, gps_tx_pin);
-      delay(60); while (Serial1.available()) Serial1.read();
-      int nm = 0, ub = 0, i = 0; char ln[100]; uint8_t prev = 0; uint32_t t0 = millis();
-      while (millis() - t0 < 1200) {
-        while (Serial1.available()) {
-          uint8_t c = (uint8_t)Serial1.read();
-          if (prev == 0xB5 && c == 0x62) ub++;            // UBX sync word
-          prev = c;
-          if (c == '\n' || i >= 99) {
-            ln[i] = 0;
-            if (i > 6 && ln[0] == '$' && ln[1] >= 'A' && ln[1] <= 'Z' && ln[2] >= 'A' && ln[2] <= 'Z') nm++;
-            i = 0;
-          } else if (c != '\r' && c >= 32 && c < 127) ln[i++] = (char)c;
-        }
-      }
+      int nm = 0, ub = 0;
+      gps_listen(1200, &nm, &ub);
       logf("gps   %6lu baud -> %d NMEA, %d UBX\n", (unsigned long)cand[k], nm, ub);
       int score = nm + ub;
       if (score > best_score) { best_score = score; best_b = cand[k]; best_ubx = (ub > nm); }
@@ -2343,10 +2423,18 @@ static bool gps_autobaud() {
     }
     gps_baud = best_b ? best_b : 9600;
     Serial1.begin(gps_baud, SERIAL_8N1, gps_rx_pin, gps_tx_pin);
-    logf("gps   using %lu baud (%s)%s\n", (unsigned long)gps_baud,
-                  best_ubx ? "UBX binary" : "NMEA",
-                  best_b ? "" : " -- nothing decoded at any rate");
-    return best_b != 0;
+    // Confirm the winner rather than trusting its sweep score. A rate that only ever scored
+    // once has not been distinguished from noise, and reporting it as a decoded link is what
+    // stops the caller trying the other pin order.
+    int cnm = 0, cub = 0;
+    gps_listen(GPS_CONFIRM_MS, &cnm, &cub);
+    bool confirmed = best_b && (cnm + cub) >= GPS_DECODE_QUORUM;
+    logf("gps   using %lu baud (%s) -- confirm %d NMEA, %d UBX in %d ms: %s\n",
+                  (unsigned long)gps_baud, best_ubx ? "UBX binary" : "NMEA",
+                  cnm, cub, GPS_CONFIRM_MS,
+                  best_b ? (confirmed ? "linked" : "NOT confirmed, treating as silent")
+                         : "nothing decoded at any rate");
+    return confirmed;
   }
 }
 
@@ -3578,6 +3666,7 @@ static void audio_pump() {
           dets[idx].pps_n = pn;
           dets[idx].us_since_pps = (int32_t)off;
           dets[idx].utc_us = tok ? t : 0;       // 0 = the anchor was not trusted at that instant
+          if (!tok) dets_unlabelled++;          // the loss itself, counted where it happens
           dets[idx].trigger = sac;
           dets[idx].fs_at = fsu;
           dets[idx].uptime_s = (millis() - boot_ms) / 1000;
@@ -3648,15 +3737,32 @@ void loop() {
   // fell back to the documented pinout mach does not have, and the node ran for 8 minutes with
   // fix 0 and ubx_pvt 0. It would have run all night.
   //
-  // Retry only while NOTHING has ever decoded. Once a single sentence or UBX frame lands, the
-  // link is proven and this never fires again -- so a node that is merely waiting for sky is
-  // left alone, and a working node never pays the ~11 s the sweep costs.
+  // ⚠️THE CADENCE IS PART OF THE LOSS. A flat 120 s retry means each failed attempt costs two
+  // minutes of detections with no timestamp; mach's 1016 s NAV-PVT-silent window in the
+  // 2026-09-10 health archive is about eight of them back to back, and the 45 s arming delay is
+  // 45 more seconds before the first one. Arm early and back off instead -- the early tries are
+  // where the value is, and the backoff is what stops a genuinely unpowered module sweeping for
+  // ever. 20 / 30 / 60 / 120 s, capped.
+  //
+  // ⚠️AND RE-ARM IF A PROVEN LINK GOES QUIET. The old condition was `nothing has EVER decoded`,
+  // so a module that reset, or a UART that dropped after one good frame, disarmed the watchdog
+  // permanently -- the node then had a perfect PPS, no NAV-PVT, and nothing that would ever look
+  // again. ubx_silent_max is now measured, so the "went quiet after working" case can be driven
+  // by evidence: 60 s with the timepulse advancing and not one NAV-PVT is not sky, it is the
+  // link. NAV-PVT arrives with or without a fix, so this cannot fire on a node waiting for sky.
   { static uint32_t last_try_ms = 0, gps_retries = 0;
+    static const uint32_t GPS_RETRY_MS[] = {20000UL, 30000UL, 60000UL, 120000UL};
     uint32_t up_ms = millis() - boot_ms;
-    if (nmea_valid == 0 && ubx_pvt == 0 && up_ms > 45000UL &&
-        (last_try_ms == 0 || millis() - last_try_ms > 120000UL)) {
-      last_try_ms = millis();
-      logf("gps   nothing decoded in %lus -- re-running bring-up (attempt %lu)\n",
+    uint32_t wait = GPS_RETRY_MS[gps_retries < 4 ? gps_retries : 3];
+    bool never = (nmea_valid == 0 && ubx_pvt == 0);
+    bool went_quiet = (ubx_pvt != 0 && ubx_silent_run >= 60);
+    if ((never || went_quiet) && up_ms > 20000UL &&
+        (last_try_ms == 0 ? up_ms > wait : millis() - last_try_ms > wait)) {
+      // The RUN is the trigger and gets cleared so one outage cannot fire every pass;
+      // ubx_silent_max is the record of what happened and is never reset here.
+      ubx_silent_run = 0;
+      logf("gps   %s in %lus -- re-running bring-up (attempt %lu)\n",
+           never ? "nothing decoded" : "link went quiet",
            (unsigned long)(up_ms / 1000), (unsigned long)(++gps_retries));
       // The sweep detaches the UART and re-sends CFG-VALSET, which drops the timepulse for
       // ~11 s. Without this flag that gap is averaged in as a real PPS interval: mach came back
@@ -3666,6 +3772,12 @@ void loop() {
       pps_resync = true; pps_resyncs++; fs_clean_secs = 0;
       pps_int_min = 0xFFFFFFFF; pps_int_max = 0;
       gps_bringup();
+      // ⚠️STAMPED AFTER, NOT BEFORE. A bring-up that has to sweep both pin orders and then
+      // restore takes tens of seconds, so a start-stamped clock has already spent the whole
+      // 20 s wait by the time it returns and the next two attempts fire back to back -- the
+      // backoff table is consumed before it can back anything off. The interval that matters is
+      // between the END of one attempt and the start of the next.
+      last_try_ms = millis();
       logf("gps   bring-up retry done: %s, RX=GPIO%d, %lu baud\n",
            gps_pin_src, gps_rx_pin, (unsigned long)gps_baud);
     }
@@ -3695,6 +3807,29 @@ void loop() {
         uint32_t span = e - seen_edge;
         uint32_t d = sm - prev_sm;
         uint64_t expect = (uint64_t)FS_NOMINAL * span;
+        // ---- is the module PULSING but not TALKING? ---------------------------------------
+        // The two halves of the GPS reach this node on different copper: the timepulse on its
+        // own pin, NAV-PVT over the UART. mach's UART is the pair that is reversed at the
+        // module, and when bring-up settles on the wrong pin order the node keeps a perfect
+        // 1 Hz edge -- pps_bad 0, pps_gaps 0, spread 2-6 us -- and cannot name a single one of
+        // them. From the outside that is indistinguishable from a node waiting for sky, which
+        // is exactly why it ran 1016 s once and 1317 s another time without anyone noticing.
+        // Charge the SPAN, not one second, for the same reason the sample audit below does.
+        { static uint32_t seen_pvt = 0;
+          uint32_t p = ubx_pvt;
+          if (p == seen_pvt) {
+            // `probed` seconds are excluded: a bring-up sweep detaches the UART for ~11 s on
+            // purpose, and charging its own diagnostic as an outage is how a health metric
+            // comes to read as catastrophic failure. Same exclusion as esp_clock_ppm's.
+            if (!probed) {
+              ubx_silent_s += span;
+              ubx_silent_run += span;
+              if (ubx_silent_run > ubx_silent_max) ubx_silent_max = ubx_silent_run;
+            }
+          } else {
+            seen_pvt = p; ubx_silent_run = 0;
+          }
+        }
         // Only when this pass covers exactly one second does the field mean what it says. A
         // straddle leaves the previous value rather than dividing a multi-second count by a span
         // and calling the quotient "the most recent GPS second".
@@ -3877,7 +4012,8 @@ void loop() {
                  "%s,%s,%s,%s,"
                  "%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
                  "%.7f,%.7f,%.3f,%.3f,%.2f,%.2f,%lu,%s,%s,%s,%s,"
-                 "%lu,%.4f,%.1f,%lu,%lu\n",
+                 "%lu,%.4f,%.1f,%lu,%lu,"
+                 "%lu,%lu,%lu,%lu\n",
                  node_id, (long long)tnow, tok ? 1 : 0,
                  (unsigned long)up, gps_fix, gps_sats, (unsigned long)gps_tacc_ns,
                  (unsigned long)pps_count, (unsigned long)pps_glitch,
@@ -3900,7 +4036,9 @@ void loop() {
                  pos_hacc_mm / 1000.0, pos_vacc_mm / 1000.0,
                  (unsigned long)pos_n, mlat, mlon, mhe, mhm,
                  (unsigned long)clean_seconds, fs_timebase(), fs_step_ppm(),
-                 (unsigned long)over_seconds, (unsigned long)pps_gaps);
+                 (unsigned long)over_seconds, (unsigned long)pps_gaps,
+                 (unsigned long)ubx_pvt, (unsigned long)dets_unlabelled,
+                 (unsigned long)first_label_s, (unsigned long)ubx_silent_max);
         f.close();
       }
       // scene.csv is held open and written every 1.024 s; committing it costs the same 20-50 ms
