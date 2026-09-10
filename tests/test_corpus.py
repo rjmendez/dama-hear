@@ -90,6 +90,32 @@ class TestNode:
         assert e48[-1] == pytest.approx(20000.0)
         assert e16[-1] == pytest.approx(7840.0)
 
+    def test_the_records_band_edges_are_the_frames_own_and_not_the_nyquist_axis(self):
+        """⚠️Record.band_edges_hz() is the accessor a caller uses to decide whether two frames are
+        comparable, so it has to answer from the axis the frame states. Fails against
+        `SK.band_edges_hz(self.fs_hz, self.bands)` -- the layout argument defaulted, which gives
+        a fixed-layout 16 kHz node frame a 7840.0 Hz top edge against its own frame's 20000.0 and
+        so makes two frames on ONE axis compare as two.
+
+        16 kHz is the rate that reproduces it: at 48 kHz the two layouts coincide, which is why
+        every frame the node emits from here on hides this and only the stored history shows it.
+        """
+        for fs in (16000.0, 48000.0):
+            frame = SK.pack(123456, -20.0, 500,
+                            SK.sketch(np.random.default_rng(5).normal(0, 1000, 4096), fs)[0],
+                            fs=fs, layout=SK.LAYOUT_FIXED)
+            rec = C.from_node(frame, "n")
+            assert rec.extra["layout"] == SK.LAYOUT_FIXED
+            assert np.allclose(rec.band_edges_hz(), SK.unpack(frame)["band_edges_hz"]), fs
+        # and the two rates are then the same axis, which is the question this accessor answers
+        r16 = C.from_node(SK.pack(1, -20.0, 500, SK.sketch(
+            np.random.default_rng(5).normal(0, 1000, 4096), 16000.0)[0],
+            fs=16000.0, layout=SK.LAYOUT_FIXED), "n")
+        r48 = C.from_node(SK.pack(1, -20.0, 500, SK.sketch(
+            np.random.default_rng(5).normal(0, 1000, 4096), 48000.0)[0],
+            fs=48000.0, layout=SK.LAYOUT_FIXED), "p")
+        assert np.allclose(r16.band_edges_hz(), r48.band_edges_hz())
+
 
 class TestFeatureMatrix:
     def test_it_will_not_stack_two_frequency_axes(self):
@@ -227,6 +253,17 @@ class TestCrossRateAlignment:
         recs = [self._rec(48000.0, 0), self._rec(16000.0, 1, layout=SK.LAYOUT_NYQUIST)]
         with pytest.raises(ValueError, match="nyquist"):
             C.aligned_matrix(recs)
+
+    def test_a_record_that_states_no_axis_is_refused_not_assumed_onto_the_shared_one(self):
+        """The refusal above reads `extra["layout"]`, so what an ABSENT key means decides whether
+        an axis-less record is checked at all. Fails against `extra.get("layout",
+        SK.LAYOUT_FIXED)`, which walks it straight through the one refusal this function exists
+        for. Nothing in-tree builds such a Record today -- all three constructors set the key --
+        which is exactly why the default has to be the refusing one."""
+        r = self._rec(48000.0, 0)
+        r.extra.pop("layout")
+        with pytest.raises(ValueError, match="nyquist"):
+            C.aligned_matrix([r])
 
     def test_an_unstated_rate_is_dropped_because_its_empty_bands_are_unknown(self):
         q, ref = SK.sketch(np.zeros(4096), 16000.0, layout=SK.LAYOUT_FIXED)
