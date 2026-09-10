@@ -1171,7 +1171,7 @@ def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
         lines.append("score    REPORT    mean top score %s over %d clip(s) -- NOT GATED"
                      % ("%.3f" % mean_top if mean_top is not None else "n/a", n_scored))
     elif mean_top is None:
-        lines.append("score    ok        no scored clips in the window (max %.3f)"
+        lines.append("score    ok        no scored clips in the window (min %.3f)"
                      % min_mean_top_score)
     elif mean_top < min_mean_top_score:
         lines.append("score    LOW       mean top score %.3f over %d clip(s), under %.3f -- the "

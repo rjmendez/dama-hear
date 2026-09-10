@@ -1069,6 +1069,7 @@ class TestTheCheckCanActuallyFail:
         self._beat(tmp_path, tagged=10, mean_top_score=0.254, n_top_scores=10, now=1000.0)
         code, lines = HT.check_tags(str(tmp_path), min_mean_top_score=0.20, now=1000.0)
         assert any(l.startswith("score    ok") for l in lines), lines
+        assert code == 0, lines
 
     def test_the_silence_fraction_is_reported_and_never_gated(self, tmp_path):
         """⚠️It used to be gateable-in-principle and merely un-set. The calibration retired it,
@@ -1078,6 +1079,9 @@ class TestTheCheckCanActuallyFail:
         sil = [l for l in lines if l.startswith("silence")]
         assert sil and "REPORT" in sil[0] and "HIGH" not in sil[0], sil
         assert "NOT GATED" in sil[0]
+        # Behavioural, not a source scan: a run that is 100% Silence-top with a threshold passed
+        # must still exit 0 when every other gate is healthy.
+        assert code == 0, lines
 
     def test_the_score_floor_is_calibrated_against_one_failure_and_says_so(self, tmp_path):
         """A canary tuned on a single failure mode must not read as a health certificate."""
@@ -1588,8 +1592,3 @@ class TestTheHumanCalibrationSetIsRealAndBounded:
         assert auc < 0.5, ("silence_frac AUC is %.3f; if this ever rises above chance the "
                            "retirement of --max-silence-frac deserves revisiting" % auc)
 
-    def test_no_gate_reads_the_silence_fraction(self):
-        import inspect
-        src = inspect.getsource(HT.check_tags)
-        gate = src[src.index("silence  REPORT"):src.index("tops = [")]
-        assert "bad += 1" not in gate, "the silence fraction must not gate anything"
