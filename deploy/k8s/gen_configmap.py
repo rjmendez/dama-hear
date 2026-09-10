@@ -40,6 +40,12 @@ DRAIN_CODE = [
     # regenerate, and tests/test_configmap_sync.py is what stops the two copies drifting.
     ("hear_clips.py", "hear/clips.py"),
     ("tools_hear_drain.py", "tools/hear_drain.py"),
+    # ⚠️SHIPPED BECAUSE THE CHECK JOB NOW RUNS IT. hear-drain.yaml's hourly check calls
+    # `python /app/tools/fleet.py --require-one-build ...`, and /app is this ConfigMap: a file
+    # that is not listed here does not exist in the cluster, and the job would have failed on a
+    # missing path rather than on the drift it was added to find. fleet.py imports nothing from
+    # this repo -- stdlib only -- so it costs one key and drags in no other file.
+    ("tools_fleet.py", "tools/fleet.py"),
 ]
 
 # ⚠️SMALL ON PURPOSE. hear_score imports `hear.sketch` and `modules.supersonic.classify` and

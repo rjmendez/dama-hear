@@ -103,6 +103,7 @@ spec:
                 - { name: code, mountPath: /app/hear/pool.py,      subPath: hear_pool.py }
                 - { name: code, mountPath: /app/hear/clips.py,     subPath: hear_clips.py }
                 - { name: code, mountPath: /app/tools/hear_drain.py, subPath: tools_hear_drain.py }
+                - { name: code, mountPath: /app/tools/fleet.py,    subPath: tools_fleet.py }
                 - { name: pool, mountPath: /pool }
               resources:
                 requests: { cpu: 100m, memory: 128Mi }
@@ -178,6 +179,28 @@ spec:
                   # summary is wanted. Its own status is discarded so it cannot mask rc.
                   echo "--- pool ---"
                   python /app/tools/hear_drain.py --pool /pool/corpus --stats || true
+                  # ⚠️BUILD DRIFT IS CHECKED HERE BECAUSE THIS IS THE ONLY THING THAT REACHES
+                  # EVERY NODE ON A SCHEDULE. tools/fleet.py has always been able to spot a split
+                  # fleet and was never run: it addressed nodes as `<name>.local`, and .local does
+                  # not resolve from WSL or from in here, so wherever anyone tried it every node
+                  # came back UNREACHABLE. It now takes `name=host`, the same form the drain above
+                  # already uses, so one node map serves both.
+                  #
+                  # It went unwatched long enough that the three nodes ran three different builds,
+                  # one of them a hand-built sketch reporting `fw: unknown` -- arrivals that are
+                  # not comparable, with nothing in the fleet saying so.
+                  #
+                  # --require-one-build gates on the SPLIT ALONE. A node with no fix yet is not a
+                  # failure and must not turn this job red; a split never self-heals.
+                  echo "--- builds ---"
+                  python /app/tools/fleet.py --require-one-build \
+                    nyquist=172.16.100.105 \
+                    mach=172.16.100.116 \
+                    rankine=172.16.100.50
+                  fw_rc=$?
+                  # ⚠️A SPLIT MUST NOT BE MASKED BY A CLEAN DRAIN. rc is still preferred when both
+                  # fail, because a stale pool is the more urgent of the two.
+                  if [ "$rc" = "0" ] && [ "$fw_rc" != "0" ]; then rc="$fw_rc"; fi
                   exit "$rc"
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py,  subPath: hear__init__.py }
@@ -188,6 +211,7 @@ spec:
                 - { name: code, mountPath: /app/hear/pool.py,      subPath: hear_pool.py }
                 - { name: code, mountPath: /app/hear/clips.py,     subPath: hear_clips.py }
                 - { name: code, mountPath: /app/tools/hear_drain.py, subPath: tools_hear_drain.py }
+                - { name: code, mountPath: /app/tools/fleet.py,    subPath: tools_fleet.py }
                 - { name: pool, mountPath: /pool }
               resources:
                 requests: { cpu: 100m, memory: 128Mi }
