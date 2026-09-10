@@ -58,8 +58,30 @@ static const char *WIFI_PASSES[] = {""};
 #define GPS_RX_PIN 44               // module TX -> here
 #define GPS_TX_PIN 43               // here -> module RX
 #define GPS_BAUD   9600
-#define PPS_PIN    18               // WHERE THE WIRE GOES. Held low, not a strapping pin, clear of
-                                    // flash, PSRAM and USB. Nothing drives it today.
+// ⚠️17, NOT 18. GPIO18 was the landing pad for two months on the strength of "reads low and is
+// not a strapping pin" -- both true, both insufficient. The vendor dump configures GPIO18 as an
+// INPUT (gpio_config pin_bit_mask 0x40000), and measured on the live board it reads LOW against
+// the ESP32's ~45k internal PULLUP: something external already owns that net. The L86's 1PPS is a
+// push-pull output, so landing it there would have been two drivers on one signal.
+//
+// GPIO17 was chosen by measurement, not by elimination. /scanpu and /scanpd on the bench board,
+// backup battery lifted:
+//     gpio  pullup  pulldown
+//       15   HIGH     low      floats -- free
+//       16   HIGH     low      floats -- free
+//       17   HIGH     low      free, and this is the joint that exists
+//       18   low      low      HELD LOW -- not free
+//       39   low      low      HELD LOW -- not free (and puc.h's FREE_PADS lists it, wrongly)
+// A pin that floats follows whichever internal resistor is engaged; 18 and 39 do not.
+//
+// 2 and 21 also float, and are NOT used: both are in the set the vendor firmware drives as
+// OUTPUTS at boot, and the scan ran with this firmware rather than the vendor's, so it cannot
+// speak for what stock does to them.
+//
+// ⚠️THE FIX FOR THIS LANDED IN firmware/boards/puc.h IN a6bbdab AND puc.h IS INCLUDED BY NOTHING.
+// The header carried PPS_PIN -1 and the correct analysis while this file -- the one that compiles
+// -- still said 18. A safety finding written only into a file no compiler reads is not applied.
+#define PPS_PIN    17               // L86 pin 6 (1PPS) lands here. Wired 2026-09-09.
 
 static char node_id[24];
 static WebServer http(80);
