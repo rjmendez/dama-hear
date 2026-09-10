@@ -241,3 +241,83 @@ class TestFile:
         sv = SV.from_dict(d)
         assert list(sv.position(1)) == [0.0, 0.0, 0.0]
         assert sv.diameter_m() == pytest.approx(math.sqrt(2) * 100.0, abs=1e-9)
+
+
+class TheSurveyStatesWhichNodesCanRange:
+    """⚠️A SURVEYED POSITION IS NOT PERMISSION TO USE THE NODE AS AN ARRIVAL.
+
+    hear/nodeclass.py has always known that a PUC timed by NTP is 3 ms -- 1.0 m of range -- and
+    must be refused as a TDoA arrival. `require_arrival` was called from tests and from NOWHERE
+    else, so nothing in the pipeline ever asked. Adding a non-ranging node to the survey for its
+    position then made it indistinguishable from a PPS node at 3.4 cm.
+    """
+
+    @staticmethod
+    def _d(nodes):
+        return {"frame": "enu_local", "units": "m", "nodes": nodes}
+
+    @staticmethod
+    def _n(nid, name, e, n, cls=None):
+        o = {"node_id": nid, "name": name, "e_m": e, "n_m": n, "u_m": 0.0, "sigma_m": 0.5}
+        if cls is not None:
+            o["class"] = cls
+        return o
+
+    def test_an_ntp_class_node_is_not_an_arrival_source(self):
+        s = SV.from_dict(self._d([
+            self._n(1, "a", 0.0, 0.0, "xiao-s3-pps"),
+            self._n(2, "b", -16.0, 0.0, "xiao-s3-pps"),
+            self._n(3, "c", -4.0, 10.0, "xiao-s3-pps"),
+            self._n(4, "puc", -22.0, 9.0, "puc-ntp"),
+        ]))
+        assert s.arrival_ids() == [1, 2, 3], "the NTP-timed node must not be a TDoA arrival"
+        assert 4 in s.ids, "but it must still be IN the survey -- it has a position"
+
+    def test_a_pps_puc_would_be_admitted(self):
+        # the same hardware, once its 1PPS is wired: 3 ms -> 100 us
+        s = SV.from_dict(self._d([
+            self._n(1, "a", 0.0, 0.0, "xiao-s3-pps"),
+            self._n(2, "b", -16.0, 0.0, "xiao-s3-pps"),
+            self._n(3, "puc", -22.0, 9.0, "puc-pps"),
+        ]))
+        assert s.arrival_ids() == [1, 2, 3]
+
+    def test_an_unstated_class_is_included_not_silently_dropped(self):
+        # every survey written before the field existed omits it; dropping those nodes would be a
+        # worse failure than the one this guards. Unset means "unstated", not "no".
+        s = SV.from_dict(self._d([
+            self._n(1, "a", 0.0, 0.0),
+            self._n(2, "b", -16.0, 0.0),
+            self._n(3, "c", -4.0, 10.0),
+        ]))
+        assert s.arrival_ids() == [1, 2, 3]
+
+    def test_an_unknown_class_name_is_included_rather_than_refused(self):
+        s = SV.from_dict(self._d([
+            self._n(1, "a", 0.0, 0.0, "no-such-class"),
+            self._n(2, "b", -16.0, 0.0),
+            self._n(3, "c", -4.0, 10.0),
+        ]))
+        assert 1 in s.arrival_ids()
+
+    def test_a_non_string_class_is_refused_at_parse(self):
+        import pytest as _p
+        with _p.raises(SV.SurveyError):
+            SV.from_dict(self._d([
+                {"node_id": 1, "name": "a", "e_m": 0.0, "n_m": 0.0, "u_m": 0.0,
+                 "sigma_m": 0.5, "class": 7},
+                self._n(2, "b", -16.0, 0.0),
+                self._n(3, "c", -4.0, 10.0),
+            ]))
+
+    def test_the_shipped_survey_refuses_the_puc(self):
+        import os
+        p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "survey.json")
+        s = SV.load_survey(p)
+        by = {s.names[i]: i for i in s.ids}
+        assert "puc" in by, "the PUC is in the survey for its position"
+        assert by["puc"] not in s.arrival_ids(), \
+            "the PUC is PROVISIONAL and NTP-timed -- it must not be a TDoA arrival"
+        assert s.sigma_m[by["puc"]] >= 5.0, \
+            "its sigma must record that the position came from a 6.5 m rms GPS scatter"

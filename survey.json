@@ -37,6 +37,17 @@
       "sigma_m": 0.49,
       "u_source": "same storey as mach, operator-stated; NOT measured",
       "sigma_u_m": 1.0
+    },
+    {
+      "node_id": 4,
+      "name": "puc",
+      "class": "puc-ntp",
+      "e_m": -22.16,
+      "n_m": 8.98,
+      "u_m": 0.0,
+      "sigma_m": 6.5,
+      "u_source": "PROVISIONAL -- not installed. e/n from the PUC's own GPS mean over 18 fixes (4-6 sats, HDOP 1.3-3.9), which scattered 6.5 m rms / 10.0 m max while stationary; u is a placeholder, NOT measured. Re-survey when sited.",
+      "sigma_u_m": 5.0
     }
   ]
 }
