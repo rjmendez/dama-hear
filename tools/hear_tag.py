@@ -804,7 +804,8 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
         "window": ({"t_start_utc_s": row.get("t_start_utc_s"),
                     "t_end_utc_s": row.get("t_end_utc_s")}
                    if row.get("anchored") and row.get("t_start_utc_s") is not None else None),
-        "sample_window": TAGS.sample_window(row),
+        # The corrected length, not the row's: a v1 row has no dur_s and may be mis-headed.
+        "sample_window": TAGS.sample_window(dict(row, dur_s=dur_s)),
         "provenance": "model",
         "created_utc_s": now,
     }
