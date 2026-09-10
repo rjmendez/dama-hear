@@ -82,3 +82,11 @@ def test_the_wifi_join_is_not_inside_the_watchdog_window(body):
     """The join deliberately spends up to 12 s retrying and must not be killed for it."""
     assert _pos(body, "WiFi.begin(") < _pos(body, "boot_wdt_arm("), (
         "the WiFi join is inside the watchdog window and will be shot for being slow")
+
+
+def test_the_card_is_mounted_before_gps_bringup_reads_its_hint():
+    """gps_pins_hint() reads /gps.cfg and returns -1 when !sd_ok. With SD.begin after
+    gps_bringup() in setup(), the stored pin order was never seen at boot (Copilot, PR #26)."""
+    body = _setup_body()
+    assert _pos(body, "SD.begin(") < _pos(body, "gps_bringup()"), (
+        "gps_bringup() runs before the card is mounted, so its pin-order hint is always -1")
