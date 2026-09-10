@@ -72,13 +72,42 @@ class Survey:
     def __init__(self, positions: Dict[int, Sequence[float]],
                  names: Optional[Dict[int, str]] = None,
                  sigma_m: Optional[Dict[int, float]] = None,
-                 origin: Optional[Dict] = None) -> None:
+                 origin: Optional[Dict] = None,
+                 classes: Optional[Dict[int, str]] = None) -> None:
         self.ids: List[int] = sorted(int(k) for k in positions)
         self._pos: Dict[int, np.ndarray] = {
             int(k): np.asarray(v, float).reshape(3) for k, v in positions.items()}
         self.names: Dict[int, str] = {i: (names or {}).get(i, "") for i in self.ids}
         self.sigma_m: Dict[int, float] = {i: float((sigma_m or {}).get(i, 0.0)) for i in self.ids}
+        self.classes: Dict[int, str] = {i: (classes or {}).get(i, "") for i in self.ids}
         self.origin: Optional[Dict] = origin
+
+    def arrival_ids(self) -> List[int]:
+        """The subset whose hardware class admits its timestamps as TDoA arrivals.
+
+        ⚠️BEING IN THE SURVEY IS NOT THE SAME AS BEING SOLVABLE. hear/nodeclass.py already knows
+        which classes can produce an arrival and raises saying what the alternative would cost --
+        but `require_arrival` was called from tests and from nowhere else, so nothing in the
+        pipeline ever asked. A node added to the survey for its position (a PUC on NTP, 3 ms =
+        1.0 m of range) was then indistinguishable from a PPS node at 3.4 cm.
+
+        A node with NO stated class is included, because every survey written before the field
+        existed omits it and silently dropping those nodes would be a worse failure than the one
+        this fixes. State the class to be refused.
+        """
+        from .. import nodeclass                       # local: keeps survey.py importable alone
+        out = []
+        for i in self.ids:
+            c = self.classes.get(i, "")
+            if not c:
+                out.append(i)
+                continue
+            try:
+                if nodeclass.get(c).contributes_arrival():
+                    out.append(i)
+            except Exception:                          # unknown class name: unstated, not "no"
+                out.append(i)
+        return out
 
     def __len__(self) -> int:
         return len(self.ids)
@@ -216,7 +245,16 @@ def _read_node(entry, index: int, seen: Dict[int, int]) -> Dict:
     name = entry.get("name", "")
     if not isinstance(name, str):
         raise SurveyError("node %d has name %r, which is not a string" % (nid, name))
-    return {"node_id": nid, "xyz": xyz, "name": name, "sigma_m": float(sig)}
+    # ⚠️A SURVEYED POSITION IS NOT PERMISSION TO USE THE NODE AS AN ARRIVAL. `class` names the
+    # hardware class from hear/nodeclass.py, which is what says whether the node's timestamps are
+    # TDoA arrivals at all -- a PUC timed by NTP is 3 ms, 1.0 m of range, and is refused. Before
+    # this field existed the survey carried no such statement, so an entry added for a node that
+    # cannot range was indistinguishable from one that can. Unset means "unstated", not "yes".
+    cls = entry.get("class")
+    if cls is not None and not isinstance(cls, str):
+        raise SurveyError("node %d has class %r, which is not a string" % (nid, cls))
+    return {"node_id": nid, "xyz": xyz, "name": name, "sigma_m": float(sig),
+            "class": cls or ""}
 
 
 def from_dict(d: Dict, min_nodes: int = 3) -> Survey:
@@ -249,6 +287,7 @@ def from_dict(d: Dict, min_nodes: int = 3) -> Survey:
     sv = Survey({r["node_id"]: r["xyz"] for r in rows},
                 names={r["node_id"]: r["name"] for r in rows},
                 sigma_m={r["node_id"]: r["sigma_m"] for r in rows},
+                classes={r["node_id"]: r["class"] for r in rows},
                 origin=d.get("origin"))
 
     P = sv.positions(sv.ids)
