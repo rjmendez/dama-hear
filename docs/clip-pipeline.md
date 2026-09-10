@@ -56,11 +56,19 @@ Measured on the live fleet 2026-09-09:
 | rankine | 249 | ~200 |
 | **fleet** | **625** | **~478** |
 
-**Not one clip had ever left a node.** Each node writes a fixed-length WAV (1.0 s pre-trigger plus
-3.0 s post at 16 kHz, 4.0 s post at 48 kHz — see §6.1,
-16 kHz 16-bit mono, 128,044 B) into `/clips` under a 6,291,456 B budget — exactly 49 clips
-(`6291456 / 128044 = 49`, confirmed live: all three nodes report `budget_left_clips 0` and
-`6291456 - 17300 = 6274156 = 49 × 128044`). The 50th evicts the oldest.
+**Not one clip had ever left a node.** Each node writes a fixed-length 16-bit mono WAV into
+`/clips` under a 6,291,456 B budget (`CLIP_BUDGET_B`), and the oldest is evicted when it is full.
+How many that holds depends on which clip geometry the firmware writes (§6.1):
+
+| era | clip | bytes | clips in budget |
+|---|---|---|---|
+| 16 kHz | 1.0 + 3.0 s | 128,044 | **49** — confirmed live when measured: all three nodes reported `budget_left_clips 0` and `6291456 − 17300 = 49 × 128044` |
+| 48 kHz | 1.0 + 4.0 s | 480,044 | **13** (`6291456 // 480044`, 50,884 B left over) |
+
+⚠️**The 48 kHz switch cut the on-card buffer from 49 clips to 13** and nothing re-derived it. The
+firmware's own comment still calls the budget "1.4x the measured 12 h event count"; at 13 clips it
+is about 0.37×, so a busy night now depends on the drain's 15-minute cadence rather than on the
+card.
 
 Two things kept them there. The `/ls` handler hardcoded `SD.open("/")` and ignored every argument,
 so it listed root only and clip names — which embed a boot id and a millis counter — were
