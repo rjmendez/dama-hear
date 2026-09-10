@@ -48,11 +48,7 @@ struct NtpResult {
 #if __has_include("secrets.h")
 #include "secrets.h"
 #endif
-#ifndef WIFI_N
-static const char *WIFI_SSIDS[] = {""};
-static const char *WIFI_PASSES[] = {""};
-#define WIFI_N 0
-#endif
+#include <hear_wifi_guard.h>   // no credentials -> compile error, not a silent AP-only node
 #ifndef NODE_CLASS
 #define NODE_CLASS "puc-ntp"        // until 1PPS is wired. hear/nodeclass.py refuses this class
 #endif                              // as a TDoA arrival source, and is right to.
@@ -686,7 +682,8 @@ static void routes() {
       "\"baud\":%d,\"rx_pin\":%d,\"tx_pin\":%d,\"last\":\"%s\"},"
       "\"pps\":{\"pin\":%d,\"edges\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,"
       "\"wired\":%s},"
-      "\"wifi\":{\"sta\":%s,\"rssi\":%d,\"ip\":\"%s\"}}",
+      // configured is a BUILD fact (were there credentials at all); sta is the link state.
+      "\"wifi\":{\"configured\":%s,\"sta\":%s,\"rssi\":%d,\"ip\":\"%s\"}}",
       node_id, NODE_CLASS, (unsigned long)(millis() / 1000),
       reset_name(), esp_reset_reason() == ESP_RST_POWERON ? "true" : "false",
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getFreePsram(),
@@ -698,7 +695,7 @@ static void routes() {
       // Not a configuration flag: it reports whether edges have ACTUALLY arrived. The wire either
       // exists and pulses or it does not, and nothing else should be allowed to claim otherwise.
       pps_count > 2 ? "true" : "false",
-      sta_ok ? "true" : "false", WiFi.RSSI(),
+      HEAR_WIFI_CONFIGURED ? "true" : "false", sta_ok ? "true" : "false", WiFi.RSSI(),
       sta_ok ? WiFi.localIP().toString().c_str() : "0.0.0.0");
     http.send(200, "application/json", b);
   });

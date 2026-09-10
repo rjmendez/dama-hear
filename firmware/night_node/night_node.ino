@@ -57,11 +57,7 @@
 #define logf    hear_logf
 #define logln   hear_logln
 #define log_put hear_log_put
-#ifndef WIFI_N                        // no secrets.h -- fall back to the node's own AP
-#define WIFI_N 0
-static const char *WIFI_SSIDS[] = {""};
-static const char *WIFI_PASSES[] = {""};
-#endif
+#include <hear_wifi_guard.h>   // no credentials -> compile error, not a silent AP-only node
 
 // ---------------------------------------------------------------- identity
 // A record that does not name its node cannot be paired with anything, which makes it useless for
@@ -2035,7 +2031,11 @@ static String status_json() {
   snprintf(b, sizeof b,
     // fw is FIRST after the identity, because the question it answers -- is this node running
     // the same binary as its neighbours -- is asked of the whole fleet at once.
-    "{\"node\":\"%s\",\"class\":\"%s\",\"fw\":\"%s\",\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
+    // ⚠️wifi_configured IS A BUILD FACT, NOT A LINK STATE. An image built with -DHEAR_ALLOW_NO_WIFI
+    // can only ever be its own AP; without this a node reachable on its AP reports a plausible
+    // status and never says why the LAN cannot see it.
+    "{\"node\":\"%s\",\"class\":\"%s\",\"fw\":\"%s\",\"wifi_configured\":%s,"
+    "\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
     // hell_m is height above the WGS84 ELLIPSOID and is the field a geodetic transform wants;
@@ -2088,7 +2088,7 @@ static String status_json() {
     "\"budget_left_clips\":%lu,\"pre_s\":%.1f,\"post_s\":%.1f,\"dir\":\"%s\",\"boot\":\"%s\"},"
     "\"env\":{\"temp_c\":%s,\"press_hpa\":%s,\"c_mps\":%s,\"rh_pct\":%s,\"reads\":%lu,\"fail\":%lu},"
     "\"sd\":%s,\"sd_free_mb\":%lu,\"sd_total_mb\":%lu,\"i2c\":\"%s\"}",
-    node_id, NODE_CLASS, FW_BUILD,
+    node_id, NODE_CLASS, FW_BUILD, HEAR_WIFI_CONFIGURED ? "true" : "false",
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
     gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences,
