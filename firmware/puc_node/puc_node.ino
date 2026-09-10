@@ -56,8 +56,31 @@ struct NtpResult {
 #define GPS_RX_PIN 44               // module TX -> here
 #define GPS_TX_PIN 43               // here -> module RX
 #define GPS_BAUD   9600
-#define PPS_PIN    18               // WHERE THE WIRE GOES. Held low, not a strapping pin, clear of
-                                    // flash, PSRAM and USB. Nothing drives it today.
+// ⚠️17, NOT 18, AND THIS IS THE SECOND TIME. GPIO18 was the landing pad for two months on the
+// strength of "reads low and is not a strapping pin" -- both true, both insufficient. The vendor
+// dump configures GPIO18 as an INPUT (gpio_config pin_bit_mask 0x40000), and measured on the live
+// board with /scanpu and /scanpd it reads LOW against the ESP32's ~45k internal PULLUP:
+//
+//     gpio   pullup   pulldown   reading
+//       15    HIGH      low      floats -- free
+//       16    HIGH      low      floats -- free
+//       17    HIGH      low      free, and where the joint is
+//       18    low       low      HELD LOW -- something external owns this net
+//       39    low       low      HELD LOW -- and puc.h's FREE_PADS lists it, wrongly
+//       38    8 edges, 50% duty -- the DS3231 1 Hz, which is what proves the scan can see 1 Hz
+//
+// A floating pin follows whichever internal resistor is engaged; 18 and 39 do not. The L86's 1PPS
+// is a push-pull output (Hardware Design Table 3: VOHmin 2.4 V), so landing it on 18 puts two
+// drivers on one net. GPIO17 is physical pin 10 on ESP32-S3-WROOM-1, pad silkscreen IO17.
+//
+// ⚠️THIS LINE HAS BEEN REVERTED TWICE, BY TWO DIFFERENT ROUTES, AND THAT IS THE REAL HAZARD.
+// First a6bbdab wrote the correction into firmware/boards/puc.h, which `grep -rn "puc\.h"` shows
+// is included by NOTHING -- so the header held -1 while this file, the one that compiles, said 18.
+// Then cfe3ec4 fixed it here and b2d47de ("platform: one failback...") reverted it back to 18 as a
+// side effect of a 125-line refactor from a branch carrying an older copy of this file. Neither
+// revert was noticed, because nothing compares the compiled pin against the measurement.
+// puc.h now points HERE as the file that builds. Do not let a stale branch quietly undo it again.
+#define PPS_PIN    17               // L86 pin 6 (1PPS) lands here. Wired 2026-09-09.
 
 static char node_id[24];
 static WebServer http(80);
