@@ -134,10 +134,15 @@ node writes the `%02u-` priority prefix), so oldest-first is most-at-risk-first.
 recorded when the name carries it and is never read for ordering.
 
 The index (`clips/index.jsonl`) is the durable record and the audio is a cache: `prune()` deletes
-WAVs and never index lines. A refusal line is written for **every** 404 and every bad body, so
-the census of what was destroyed is countable from the pool rather than reconstructed by diffing,
-and `clips_seen == fetched + already_held + already_gone + gone + refused + deferred_by_cap` is an
-assertion in `drain_clips`, not a hope. A run that never reached the node reports
+WAVs and never index lines. Each row is appended **as its clip resolves**, never buffered to the
+end of the pass: `activeDeadlineSeconds: 780` makes a mid-pass kill a designed event, and a run
+that kept the audio and lost the ledger let the next run's 404 write a false
+`evicted_before_fetch` over bytes sitting on the PVC. A refusal line is written for **every** 404
+and every bad body, so the census of what was destroyed is countable from the pool rather than
+reconstructed by diffing, and `clips_seen == fetched + already_held + already_gone + gone +
+probed_404 + refused + deferred_by_cap` is an assertion in `drain_clips`, not a hope. One 404 is
+**not** an eviction: `night_node.ino`'s `/sd` answers 404 for any failed `SD.open`, descriptor
+exhaustion included, so it takes `CL.CONFIRM_404` consecutive ones before the terminal row. A run that never reached the node reports
 `clips_unknown` with its own reason — **never `clips_gone: 0`**.
 
 ### 0.4 THE TAG LANE — YAMNet over the collected clips, suspended until somebody listens

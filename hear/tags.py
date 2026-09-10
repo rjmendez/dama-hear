@@ -27,7 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from typing import Any, Dict, Iterator, List, Optional, Set
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 TAG_SCHEMA_VERSION = 1
 TAGS_NAME = "tags.jsonl"
@@ -53,16 +53,23 @@ def tags_path(root: str) -> str:
     return os.path.join(root, "clips", TAGS_NAME)
 
 
-def tag_key(clip_key: str, model_name: str, model_version: str) -> str:
-    """Identity of one (clip, model, model version). sha256 truncated to 32 hex.
+def tag_key(clip_key: str, model_name: str, model_version: str,
+            model_sha256: Optional[str] = None) -> str:
+    """Identity of one (clip, model, model version, WEIGHTS DIGEST). sha256 truncated to 32 hex.
 
-    Re-tagging with the SAME version is a no-op duplicate the reader collapses; a NEW version
-    produces a DIFFERENT key and therefore a new row beside the old one. Nothing is overwritten,
-    because the old row is the only record of what the previous model said about audio that may
-    already have been pruned.
+    Re-tagging with the SAME weights is a no-op duplicate the reader collapses; a NEW version or a
+    NEW digest produces a DIFFERENT key and therefore a new row beside the old one. Nothing is
+    overwritten, because the old row is the only record of what the previous model said about
+    audio that may already have been pruned.
+
+    ⚠️THE DIGEST IS IN THE KEY BECAUSE THE VERSION STRING IS A PROMISE AND THE DIGEST IS A
+    MEASUREMENT. `model_block` already says "the sha256 IS the identity"; keying on the version
+    alone meant a re-exported yamnet.tflite dropped in under the same MODEL_VERSION was treated
+    as already-tagged for every clip already scored, and clips/tags.jsonl then held two models'
+    scores under one version string with nothing anywhere comparing digests.
     """
     h = hashlib.sha256()
-    for part in ("tag", clip_key, model_name, model_version):
+    for part in ("tag", clip_key, model_name, model_version, model_sha256 or ""):
         h.update(part.encode())
         h.update(b"\x1f")
     return h.hexdigest()[:32]
@@ -85,22 +92,43 @@ def read_tags(root: str) -> Iterator[Dict[str, Any]]:
                 continue
 
 
+def read_resume(root: str) -> Tuple[Set[str], Dict[str, int]]:
+    """ONE pass over the tag store -> (every tag_key held, `name/version/sha256` -> row count).
+
+    One pass because `run()` needs both and the store is the only thing either can be read from;
+    two passes over a file that grows with the corpus is the kind of cost that gets a check
+    disabled. `versions_held` is the reported half, and it is now on a production path rather
+    than being a function only the tests ever called.
+    """
+    keys: Set[str] = set()
+    versions: Dict[str, int] = {}
+    for r in read_tags(root):
+        k = r.get("tag_key")
+        if isinstance(k, str):
+            keys.add(k)
+        m = r.get("model") or {}
+        vk = "%s/%s/%s" % (m.get("name"), m.get("version"), m.get("sha256"))
+        versions[vk] = versions.get(vk, 0) + 1
+    return keys, versions
+
+
 def read_tagged(root: str) -> Set[str]:
     """Every tag_key already held. THE resume token, the same shape as hear_score's key rescan --
     no watermark, so there is nothing to tear and no second source of truth to disagree with."""
-    return {r["tag_key"] for r in read_tags(root) if isinstance(r.get("tag_key"), str)}
+    return read_resume(root)[0]
 
 
 def versions_held(root: str) -> Dict[str, int]:
-    """`name/version` -> row count. ⚠️VERSION MIXING IS REPORTED, NEVER MERGED. Two model versions
-    scoring the same clip produce two rows by construction (the version is in the key), and a
-    consumer that averaged or de-duplicated across them would be averaging two different models."""
-    out: Dict[str, int] = {}
-    for r in read_tags(root):
-        m = r.get("model") or {}
-        k = "%s/%s" % (m.get("name"), m.get("version"))
-        out[k] = out.get(k, 0) + 1
-    return out
+    """`name/version/sha256` -> row count. ⚠️VERSION MIXING IS REPORTED, NEVER MERGED. Two model
+    versions scoring the same clip produce two rows by construction (both the version and the
+    weights digest are in the key), and a consumer that averaged or de-duplicated across them
+    would be averaging two different models.
+
+    ⚠️THE DIGEST IS IN THE REPORTED KEY, NOT ONLY IN THE ROW. Keyed on `name/version` this
+    returned ONE entry for two different weight files scored under one version string -- the
+    exact mixing the docstring claims is reported.
+    """
+    return read_resume(root)[1]
 
 
 def append_tags(root: str, rows) -> int:
