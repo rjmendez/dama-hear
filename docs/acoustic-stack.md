@@ -223,7 +223,7 @@ live:
 
 | class | `fs_hz` | `mic_count` | `raw_retain_s` | note |
 |---|---|---|---|---|
-| `xiao-s3-pps` | 48000 | 1 | **80.0** | the only class with a ring |
+| `xiao-s3-pps` | 48000 | 1 | **60.0** | the only class with a ring |
 | `xiao-s3-i2s` | 48000 | 1 | 80.0 | "Planned I2S variant. **Not built.**" |
 | `puc-pps` / `puc-ntp` | 48000 | 2 | **0.0** | |
 | `gotchi-phone` | 44100 | 1 | **0.0** | |
@@ -264,13 +264,13 @@ constraint is one ESP32 core and its pull duty cycle.
 
 | tier | emits continuously | holds locally | central pulls on demand |
 |---|---|---|---|
-| xiao nodes (nyquist, mach, rankine) | 172 B sketch per gate event; 20×4 scene row every 1.024 s | 80 s PSRAM raw ring (3,840,000 samples at 48 kHz, 7.68 MB; 60 s on firmware before hear_node); SD at 20.81 MB/day measured | `GET /audio?from=&dur=` → WAV. **224 s addressable**, **`max_dur_s` = 30** |
+| xiao nodes (nyquist, mach, rankine) | 172 B sketch per gate event; 20×4 scene row every 1.024 s | 60 s PSRAM raw ring, measured; hear_node asks for 80 s (7.68 MB) and gets it only if one contiguous block that large is free; SD at 20.81 MB/day measured | `GET /audio?from=&dur=` → WAV. **224 s addressable**, **`max_dur_s` = 30** |
 | hugbot | 172 B sketch on `dama/hugbot5000/acoustic_sketch` (fleet broker, mTLS) + per-board bearing cone on `audio_bearing` | 8 s ESP ring, PPS-anchored **on the Pi only** | **nothing** |
 | puc | BirdWeather/BirdNET detections upstream (station 4066) | nothing | **nothing** |
 | phones | 172 B sketch on `dama/<node>/acoustic_sketch` | `AudioCaptureRing`, `raw_retain_s = 0` | **nothing** |
 
-**The ring is the architectural licence.** An 80 s ring less the 16 s overwrite guard gives a
-central classifier ~64 s to decide it wants audio (~44 s on the 60 s ring the nodes run today).
+**The ring is the architectural licence.** The 60 s ring the nodes run, less the 16 s overwrite
+guard, gives a central classifier ~44 s to decide it wants audio (~64 s if the 80 s ring allocates).
 That is the entire reason a battery node is allowed to stay dumb. Pulled audio is 48 kHz, so a
 pull moves three times the bytes per second of audio that the transport measurements below were
 taken at.
@@ -522,12 +522,12 @@ otherwise-orphaned tests acquire a consumer. But see §6.1 before deciding what 
 
 ### S1 — `hear-puller` + `hear-embed`. ⚠️GATED, and the gate is not a formality
 
-`hear-puller` issues budgeted `GET /audio` inside the ring's ~64 s addressable window; `hear-embed` runs Perch 2.0
+`hear-puller` issues budgeted `GET /audio` inside the ring's ~44–64 s addressable window; `hear-embed` runs Perch 2.0
 on the GPU and writes width-tagged embeddings. **Two things must be true before S1 starts, and
 neither is true today.**
 
 **Gate 1 — the trigger must be inside the ring window.** ⚠️A verdict computed from
-`/pool/corpus` is about 15× too late to address the audio that produced it: the drain is `*/15`
+`/pool/corpus` is 15–22× too late to address the audio that produced it: the drain is `*/15`
 (900 s) plus 53–78 s of job wall time, against a ~64 s addressable ring (~44 s on the 60 s ring
 the nodes run today). S0.2 makes it
 *worse*. **The pull trigger must be driven from `/detections`** — the live 128-deep RAM ring,
@@ -797,7 +797,7 @@ retargeted or retired deliberately.)
 ## 7. What each tier contributes, and why flattening them destroys it
 
 - **xiao nodes** — GPS-PPS time (tAcc 24–28 ns, 0 glitches, PPS spread 6–9 µs) and the **only
-  retrospective ring in the fleet** (80 s). They are the fleet's clock and its memory. They are
+  retrospective ring in the fleet** (60 s measured). They are the fleet's clock and its memory. They are
   single-mic and **structurally cannot bear**.
 - **hugbot** — the **only co-located multi-mic array**, 38.1 mm intra-mic, and therefore the only
   bearing that can be cross-checked. Capped at 4501 Hz. hugbot **emits, never serves**: battery

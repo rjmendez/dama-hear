@@ -287,7 +287,7 @@ and reporting that unsigned would put the event 999 ms — 343 m — from where 
 
 ## A WAV per detection
 
-The PSRAM ring holds the last ~80 s and `/audio` can serve any window of it. What it cannot do is outlive
+The PSRAM ring holds the last 60–80 s, whichever allocated, and `/audio` can serve any window of it. What it cannot do is outlive
 that span. Each
 detection now also gets a fixed-length WAV on the card, so the audio is still there when
 the drain comes to identify it.

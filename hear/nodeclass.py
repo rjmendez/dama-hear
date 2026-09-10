@@ -350,7 +350,7 @@ register(NodeClass(
     # the datasheet's response ends at 10 kHz, so at 48 kHz the microphone binds, not Nyquist.
     band_hz=(50.0, 10000.0),
     env=("temp", "press"),
-    raw_retain_s=80.0,   # 7.68 MB of PSRAM at 48 kHz; firmware before hear_node stepped to 60 s
+    raw_retain_s=60.0,   # measured on all three nodes; 80 s only if 7.94 MB of PSRAM is contiguous
     notes="XIAO ESP32-S3 Sense + u-blox GPS on D0 PPS + BMP280 + microSD. nyquist, mach, rankine "
           "-- all three answered GET /status with this class 2026-09-10.",
 ))
