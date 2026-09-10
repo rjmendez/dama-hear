@@ -355,22 +355,34 @@ def clip_total_s(row: Dict[str, Any]) -> Optional[float]:
     if not n or not fs:
         return None
     dur = (int(n) - 44) / float(int(fs) * 2)
-    fix = header_rate_suspect({"fs_hz": fs, "dur_s": dur})
+    fix = (header_rate_suspect({"fs_hz": fs, "dur_s": dur})
+           or length_implies_rate((int(n) - 44) // 2, fs, row.get("fs_hz")))
     return fix["true_dur_s"] if fix else dur
 
 
-def _post_s_of(probe: Optional[Dict[str, Any]]) -> float:
+def _post_s_of(probe: Optional[Dict[str, Any]], csv_fs: Optional[float] = None) -> float:
     """Post-roll from the clip's own length; CLIP_POST_S only when there is no clip to read."""
-    total = _row_dur_s(probe)
+    total = _row_dur_s(probe, csv_fs)
     if total is None or not (CLIP_PRE_S < total <= CLIP_PLAUSIBLE_MAX_S):
         return CLIP_POST_S
     return total - CLIP_PRE_S
 
 
-def _row_dur_s(probe: Optional[Dict[str, Any]]) -> Optional[float]:
+def _rate_fix(probe: Optional[Dict[str, Any]], csv_fs: Optional[float] = None):
+    """Either rate correction, or None. The two cannot both fire on one clip."""
     if not probe or not probe.get("dur_s"):
         return None
-    fix = header_rate_suspect(probe)
+    n = probe.get("data_bytes")
+    return (header_rate_suspect(probe)
+            or (length_implies_rate(int(n) // 2, probe.get("fs_hz"), csv_fs) if n else None))
+
+
+def _row_dur_s(probe: Optional[Dict[str, Any]], csv_fs: Optional[float] = None) -> Optional[float]:
+    # ⚠️BOTH corrections. With only header_rate_suspect here, mach's 22848 Hz clips were indexed
+    # at 2.80 s and every scene/sketch window built on them ended 1.2 s early.
+    if not probe or not probe.get("dur_s"):
+        return None
+    fix = _rate_fix(probe, csv_fs)
     return fix["true_dur_s"] if fix else probe["dur_s"]
 
 
@@ -415,7 +427,7 @@ def index_row(*, clip: str, parts: Optional[Dict[str, Any]], node: str, body: Op
         # a 48 kHz one is 1.0+4.0 s; both are in the corpus. Adding a fixed CLIP_POST_S put
         # t_end 1.0 s wrong for one era or the other, and every scene/sketch join downstream is
         # built on this pair.
-        "t_end_utc_s": (ts + _post_s_of(probe)) if (anchored and ts) else None,
+        "t_end_utc_s": (ts + _post_s_of(probe, dets.get("fs_hz"))) if (anchored and ts) else None,
         "uptime_s": dets.get("uptime_s"),
         "fs_hz": dets.get("fs_hz"),
         "wav_header_fs_hz": (probe or {}).get("fs_hz"),
@@ -423,8 +435,8 @@ def index_row(*, clip: str, parts: Optional[Dict[str, Any]], node: str, body: Op
         # one firmware build stamped the wrong rate, so "how long is this clip" stopped being a
         # constant. Computing it once at index time is what lets hear/tags.py keep its no-import
         # bundle discipline without duplicating the correction logic.
-        "dur_s": _row_dur_s(probe),
-        "header_rate_suspect": header_rate_suspect(probe) if probe else None,
+        "dur_s": _row_dur_s(probe, dets.get("fs_hz")),
+        "header_rate_suspect": _rate_fix(probe, dets.get("fs_hz")),
         "trigger": dets.get("trigger"),
         "clip_why": dets.get("clip_why"),
         "dets_origin": dets.get("dets_origin"),
