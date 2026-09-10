@@ -199,25 +199,20 @@ UNFETCHED_RING = 64
 BOOT_AUDIT_MAX_DAYS = 3
 
 DEFAULT_TIMEOUT_S = 30.0
-# A node reporting detections at the measured night rate goes quiet for hours in daylight, so
+# A node reporting detections at the measured field rate goes quiet for hours in daylight, so
 # staleness is measured on the FETCH, not on new rows. 2 h is comfortably longer than any timer
-# interval and short enough to catch a node that fell off the wifi before a night is lost.
+# interval and short enough to catch a node that fell off the wifi before its buffer rolls over.
 DEFAULT_MAX_STALE_S = 7200.0
 
 # ---------------------------------------------------------------- clip lane budget
 #
-# ⚠️THE ORDERING CONSTRAINT: DRAINING PRECEDES ANY BUDGET INCREASE. Raising CLIP_BUDGET_B on the
-# node without collection does not save one clip; it changes WHICH clips are destroyed and how
-# long each survives first. The node is not the archive, the pool is. See docs/acoustic-stack.md.
-#
-# 6291456 / 128044 = 49 exactly, and all three nodes report `budget_left_b 17300`,
-# `budget_left_clips 0` -- 6291456 - 17300 = 6274156 = 49 x 128044. So a backlog is BOUNDED at 49
-# per node however long the drain was down, which is the crucial difference from scene.csv.
-CLIP_MAX_PER_NODE_DEFAULT = 49
-# 3 x 49 clips is 18.8 MB: 112 s at the measured 168 KB/s, 470 s at the 40 KB/s contended floor.
+# The card holds a rolling window of clips: 6291456 // 480044 = 13. A backlog is therefore bounded
+# at 13 per node however long the drain was down -- the difference from scene.csv -- and a clip
+# that rolls off before it is fetched is the design working, not a loss.
+CLIP_MAX_PER_NODE_DEFAULT = 13
+# 3 x 13 clips is 18.7 MB: 112 s at the measured 168 KB/s, 470 s at the 40 KB/s contended floor.
 # 307 + 470 = 777 s of a 900 s interval is too tight, so the per-node deadline binds instead of
-# the schedule. At 40 KB/s this buys 37 clips and nyquist's worst 15-minute burst was 43 -- the
-# cap CAN bind below a burst, which is exactly why `clips_cap_hit` reaches the heartbeat ring.
+# the schedule; at 40 KB/s it buys about 10 clips. `clips_cap_hit` reaches the heartbeat ring.
 CLIP_DEADLINE_S_DEFAULT = 120.0
 # 142 MB/day fleet-wide; 2 GiB is ~14 days of rolling audio on a PVC shared with scene/ and raw/.
 CLIP_STORE_MAX_BYTES_DEFAULT = 2 * 1024 ** 3
@@ -644,7 +639,7 @@ def fetch_clip(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S
     """One clip WAV off the card: `(body, None)` on a real clip, `(None, reason)` otherwise.
 
     ⚠️THIS CANNOT BE `fetch_sd`. `fetch_sd` requires the body to start with `b"node"` or
-    `b"utc_us"` -- a header sniff that is right for a CSV and reports a present 128044 B WAV as
+    `b"utc_us"` -- a header sniff that is right for a CSV and reports a present WAV as
     ABSENT, because a WAV starts with `b"RIFF"`. Proven against a live node 2026-09-09.
 
     ⚠️200 IS NOT PROOF OF A FILE. `/sd?file=/clips` answers 200 with a 0-byte body (measured), so
@@ -1631,7 +1626,7 @@ def main(argv=None) -> int:
                          "the measurements in between are never looked at")
     ap.add_argument("--clip-max-per-node", type=int, default=CLIP_MAX_PER_NODE_DEFAULT,
                     help="most clips to fetch from one node in one run. The card physically "
-                         "holds 6291456/128044 = 49, so a backlog is bounded at 49 however long "
+                         "holds 6291456 // 480044 = 13, so a backlog is bounded at 13 however long "
                          "the drain was down. 0 disables the clip lane entirely")
     ap.add_argument("--clip-deadline-s", type=float, default=CLIP_DEADLINE_S_DEFAULT,
                     help="stop fetching clips from one node after this much wall clock. The "

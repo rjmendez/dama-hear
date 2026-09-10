@@ -90,7 +90,7 @@ class TestNullControl:
         assert d["above_0_5"] == 0, "a quiet corpus must not produce a positive"
 
     def test_the_class_distribution_is_not_an_input_to_any_gate(self, tmp_path):
-        """A normal night is P at the floor. A check keyed on 'did anything score high' would
+        """A normal period is P at the floor. A check keyed on 'did anything score high' would
         read that correct result as a broken service, so it is published as an observation."""
         build_pool(tmp_path, quiet_rows(8))
         HS.run(str(tmp_path), MODEL_PATH)
@@ -330,7 +330,7 @@ class TestTheFsGuardScoreSketchSkips:
 
     def test_a_silent_frame_is_tagged_but_still_scored(self, model, mb):
         """ref_db at the 10*log10(1e-12) floor is an all-zero sketch: a producer defect, not a
-        quiet night. It is scorable, so the refusal counter cannot see it -- hence its own tag,
+        quiet period. It is scorable, so the refusal counter cannot see it -- hence its own tag,
         and hence `silent` is orthogonal to the buckets rather than one of them."""
         q, _ = SK.sketch(np.zeros(4096), 16000.0, layout=SK.LAYOUT_FIXED)
         rec = one_record(SK.pack(1, -120.0, 0, q, fs=16000.0, layout=SK.LAYOUT_FIXED))

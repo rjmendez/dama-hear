@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Poll the node and keep a durable record. Runs detached; survives this terminal.
 
-    nohup python3 watch.py http://damahear.local >> ~/dama-hear-night.log 2>&1 &
+    nohup python3 watch.py http://damahear.local >> ~/dama-hear-watch.log 2>&1 &
 
-Writes one JSON object per poll to ~/dama-hear-night.jsonl, and prints a line ONLY when something
+Writes one JSON object per poll to ~/dama-hear-watch.jsonl, and prints a line ONLY when something
 changes -- fix gained or lost, the first PPS edge, glitches climbing, the node going away or coming
 back. A log that prints every poll is a log nobody reads in the morning.
 """
@@ -16,7 +16,7 @@ import urllib.request
 
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://damahear.local").rstrip("/")
 EVERY = float(sys.argv[2]) if len(sys.argv) > 2 else 30.0
-JSONL = os.path.expanduser("~/dama-hear-night.jsonl")
+JSONL = os.path.expanduser("~/dama-hear-watch.jsonl")
 
 
 def say(msg):

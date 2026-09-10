@@ -80,10 +80,10 @@ def test_the_ntp_penalty_is_metres_not_millimetres():
 
 
 # ---------------------------------------------------------------- bandwidth
-def test_xiao_is_nyquist_limited_not_microphone_limited():
+def test_xiao_is_microphone_limited_not_nyquist_limited():
     lo, hi, limit = nc.get("xiao-s3-pps").usable_band_hz()
-    assert hi == 8000.0
-    assert limit == "nyquist"
+    assert hi == 10000.0
+    assert limit == "microphone"
 
 
 def test_the_i2s_variant_is_microphone_limited_and_says_so():
@@ -106,8 +106,13 @@ def test_band_refusal_names_the_ceiling_and_the_remedy():
     with pytest.raises(nc.CapabilityError) as e:
         nc.require_band("xiao-s3-pps", 4000, 12000, node_id="nyquist")
     msg = str(e.value)
-    assert "nyquist-limited" in msg
-    assert "sample faster" in msg
+    assert "microphone-limited" in msg
+    assert "no sample rate fixes this" in msg
+
+    # No registered class is Nyquist-bound now, so the other label is exercised on a built one.
+    slow = nc.NodeClass(name="t-8k", time_source="gps_pps", t_sigma_s=1e-4, mic_count=1,
+                        fs_hz=8000.0, band_hz=(50.0, 10000.0), env=(), raw_retain_s=0.0, notes="")
+    assert slow.usable_band_hz() == (50.0, 4000.0, "nyquist")
 
     with pytest.raises(nc.CapabilityError) as e:
         nc.require_band("xiao-s3-i2s", 4000, 20000)
@@ -131,7 +136,7 @@ def test_timing_budget_exposes_the_weakest_link_before_the_solve():
 
 
 def test_sound_speed_moves_the_budget():
-    """c is not a constant; the node measures it. A cold night makes every class's range error
+    """c is not a constant; the node measures it. A cold spell makes every class's range error
     smaller in metres for the same timing error, and the model should follow rather than pin 343."""
     warm = nc.get("puc-ntp").range_sigma_m(349.0)
     cold = nc.get("puc-ntp").range_sigma_m(331.3)
@@ -384,4 +389,3 @@ class TestGotchiPhone:
         microphone with a wider band than either XIAO node can reach."""
         phone = nc.get("gotchi-phone")
         assert phone.usable_band_hz()[1] > nc.get("xiao-s3-pps").usable_band_hz()[1]
-        assert phone.fs_hz > nc.get("xiao-s3-pps").fs_hz

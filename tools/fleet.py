@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One line per node: is the fleet on the same build, and is each node fit to contribute tonight?
+"""One line per node: is the fleet on the same build, and is each node fit to contribute?
 
     python3 tools/fleet.py nyquist mach rankine                 # needs mDNS
     python3 tools/fleet.py nyquist=172.16.100.105 mach=172.16.100.116   # anywhere
@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Sequence
 # A node flushing its SD card blocks its HTTP loop for tens of milliseconds, and a mDNS lookup
 # can take a second on its own. 8 s was enough to report mach as UNREACHABLE while it was serving
 # 200s to a plain curl a moment later -- a false negative from the tool meant to decide whether
-# tonight's capture can run.
+# a capture can run.
 TIMEOUT_S = 15.0
 RETRIES = 2
 
@@ -39,9 +39,9 @@ RETRIES = 2
 # ⚠️The first version of this check flagged anything under 200 MB as unable to contribute, on my
 # guess that rankine's 72 MB was "about two hours". It is about sixty. 200 MB is a week of
 # continuous capture, so that threshold condemned a card with days of headroom -- and a tool that
-# cries wolf about tonight's run is worse than no tool.
+# cries wolf is worse than no tool.
 SCENE_MB_PER_H = 335 * (3600 / 1.024) / 1e6      # 1.18 MB/h
-NIGHT_H = 14.0                                    # dusk to well past dawn
+SCENE_HEADROOM_H = 14.0                           # scene-row hours the card must hold if the drain stops
 
 
 def split_target(node: str) -> tuple:
@@ -97,7 +97,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("nodes", nargs="+")
     # ⚠️OPT-IN, AND ONLY FOR THE SPLIT. This tool's default is to report and not gate, because a
-    # node with no sky yet is not a failure and a tool that cries wolf about tonight teaches its
+    # node with no sky yet is not a failure and a tool that cries wolf teaches its
     # operator to ignore it. A SPLIT FLEET is different in kind: it is never transient, never
     # self-healing, and it silently invalidates the capture -- arrivals from different builds are
     # not comparable. So a scheduled caller can ask for that one condition to be an error, and
@@ -138,7 +138,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("  Arrivals from different builds are not comparable until you know what "
                   "changed between them.")
 
-        # Anything that would make tonight's capture unusable, said once rather than left to be
+        # Anything that would make this node's capture unusable, said once rather than left to be
         # spotted in a column.
         for n, d in got.items():
             n = d.get("node") or names.get(n, n)
@@ -151,8 +151,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 why.append("no SD card")
             elif isinstance(d.get("sd_free_mb"), int):
                 hours = d["sd_free_mb"] / SCENE_MB_PER_H
-                if hours < NIGHT_H:
-                    why.append("%d MB free = %.1f h of scene rows, short of a night"
+                if hours < SCENE_HEADROOM_H:
+                    why.append("%d MB free = %.1f h of scene rows, below the headroom floor"
                                % (d["sd_free_mb"], hours))
             if why:
                 print("  %-9s %s" % (n, "; ".join(why)))

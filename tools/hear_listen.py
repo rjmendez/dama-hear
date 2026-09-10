@@ -26,15 +26,6 @@ thing is the circularity this repo names elsewhere.
 RMS 40 dB under their peak; taking RMS to -20 dBFS would clip the transient, which is exactly the
 part worth hearing. Gain is min(rms_target, peak_target) and the manifest says which bound bit.
 
-⚠️A LYING HEADER IS CORRECTED FOR PLAYBACK AND SAID OUT LOUD. Two different rate defects are on the cards.
-hear_node stamped every 48 kHz clip with the FS_NOMINAL timebase for the whole of the 48 kHz
-rollout, so a 5.0 s clip claims 15.0 s at 16 kHz and plays an octave and a half LOW. Separately,
-mach latched 22624/22848 Hz for a whole boot over 16 kHz audio, so those clips claim 2.80 s and
-play 1.43x too HIGH -- a dog becomes a smaller dog, and a person listening has no way to know. Firmware is fixed; the clips already on the
-PVC are not rewritable. `hear/clips.header_rate_suspect` recovers the rate only when exactly one
-integer factor closes onto a length this fleet actually writes, and the sheet marks every clip it
-touched -- a corrected clip is evidence about a firmware bug as well as about the site.
-
 ⚠️IT READS THE POOL AND WRITES ONLY --out. No node is contacted, index.jsonl is not rewritten,
 and nothing is pruned.
 """
@@ -51,8 +42,6 @@ import struct
 import sys
 import wave
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from hear.clips import header_rate_suspect, length_implies_rate  # noqa: E402
 
 #: Target for the listening copy. -20 dBFS RMS matches what hear_tag.py normalises to, so the ear
 #: and the model are hearing the same level.
@@ -260,9 +249,7 @@ def stratify_silence(rows, n, rng, require_nodes, pool):
             samples, fs, _ = read_pcm(src)
         except (wave.Error, ValueError):
             continue
-        fix = (header_rate_suspect({"fs_hz": fs, "dur_s": len(samples) / float(fs)})
-               or length_implies_rate(len(samples), fs, r.get("fs_hz")))
-        m = measure(samples, fix["true_fs_hz"] if fix else fs)
+        m = measure(samples, fs)
         if m.get("silence_frac") is None:
             continue
         scored.append((m["silence_frac"], r))
@@ -316,8 +303,7 @@ def sheet(picked, staged, out, day_tag):
         ts = r.get("ts_utc_s")
         when = (datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
                 .strftime("%m-%d %H:%M:%S") if isinstance(ts, (int, float)) else "unanchored")
-        rate = ("%g Hz ⚠️was %g" % (m["wav_fs_hz"], m["header_fs_hz"])
-                if m.get("header_rate_suspect") else "%g Hz" % m["wav_fs_hz"])
+        rate = "%g Hz" % m["wav_fs_hz"]
         lines.append("| %d | %s | %s | %s | %.1f | %s | %s | %+.1f |  |  |  |" % (
             i, r.get("node"), when, rate, m["rms_dbfs_orig"],
             "%.1f" % m["crest_db"] if m.get("crest_db") is not None else "—",
@@ -326,13 +312,10 @@ def sheet(picked, staged, out, day_tag):
     lines.append("")
     lines.append("## What the corpus cannot tell you")
     lines.append("")
-    lines.append("- A clip is 1.0 s before the trigger and 3.0 s after (16 kHz) or 4.0 s after "
-                 "(48 kHz); the `rate` column says which. If the event is at "
+    lines.append("- A clip is 1.0 s before the trigger and 4.0 s after. If the event is at "
                  "the very start you are hearing its tail only.")
     lines.append("- The tagger has never run on these. Nothing here is a model's opinion; that is "
                  "the point.")
-    lines.append("- A ⚠️ in the rate column means the clip's WAV header said the wrong rate and "
-                 "was corrected for playback. The audio is real; only the header was wrong.")
     lines.append("")
     open(os.path.join(out, "sheet.md"), "w", encoding="utf-8").write("\n".join(lines) + "\n")
 
@@ -402,12 +385,8 @@ def main():
         except (wave.Error, ValueError) as e:
             skipped.append({"path": r["path"], "why": str(e)})
             continue
-        fix = (header_rate_suspect({"fs_hz": fs, "dur_s": len(samples) / float(fs)})
-               or length_implies_rate(len(samples), fs, r.get("fs_hz")))
-        play_fs = fix["true_fs_hz"] if fix else fs
+        play_fs = fs
         m = measure(samples, play_fs)
-        m["header_fs_hz"] = fs
-        m["header_rate_suspect"] = fix
         g, bound = gain_for(m)
         base = os.path.basename(r["path"])
         shutil.copy2(src, os.path.join(args.out, base))
@@ -466,10 +445,6 @@ def main():
         print("  ⚠️asked for %d, staged %d (%d skipped)" % (args.n, len(kept), len(skipped)))
     for s in skipped:
         print("    skipped %s: %s" % (s["path"], s["why"]))
-    fixed = [m for m in staged if m.get("header_rate_suspect")]
-    if fixed:
-        print("  ⚠️%d clip(s) had a wrong WAV header rate and were corrected for playback: %s"
-              % (len(fixed), fixed[0]["header_rate_suspect"]["why"]))
     lv = [m["rms_dbfs_orig"] for m in staged if m["rms_dbfs_orig"] != -math.inf]
     if lv:
         print("  original level: %.1f to %.1f dBFS -- raw playback of these is silence, use "

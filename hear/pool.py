@@ -226,8 +226,8 @@ def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
     d = SK.unpack(frame)
     utc_us = int(row.get("utc_us") or 0)
     node = row["node"]
-    # fs: the FRAME is authoritative when it states a rate, because the CSV column is the node's
-    # running estimate and the fs_clean latch has already put 22624.0 in it for a whole boot.
+    # fs: the FRAME is authoritative when it states a rate; the CSV column is only the node's
+    # running estimate.
     fs_csv = row.get("fs_hz")
     fs_csv = float(fs_csv) if fs_csv not in (None, "") else None
     return {
