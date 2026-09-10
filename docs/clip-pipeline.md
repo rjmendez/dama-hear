@@ -240,8 +240,22 @@ operator to ignore it). The unsuspend condition is written onto the object as
    consecutive days.
 2. A human has **listened to ≥ 30 of them**, including at least one from mach, and written what they
    heard into `docs/clip-calibration-<date>.md`.
-3. `max_silence_frac` is set from the **measured** distribution in that calibration set. Threshold
-   from the envelope, never a single sample.
+3. ~~`max_silence_frac` is set from the **measured** distribution in that calibration set.~~
+   ✅**Met by retirement, 2026-09-10.** The distribution was measured and it killed the knob:
+   `mn10_as` returns `Silence` top-1 on **0 of 69** clips healthy and **3 of 69** un-normalised, so
+   any threshold between those rests on three clips. The normalisation canary is now
+   `--min-mean-top-score` (0.254 healthy against 0.162 un-normalised, **13.6 σ** apart at a
+   400-clip run). See `docs/clip-calibration-2026-09-10.md`.
+
+⚠️**All three conditions are met.** 473 stored clips across three nodes over 2026-09-08…10; 69
+heard by a person including 25 from mach, written up and with the labels checked in at
+`testdata/clip-labels-2026-09-10.jsonl`. Unsuspending is a human decision now, not a blocked one —
+the `.onnx` still has to reach the PVC first.
+
+⚠️**The listening tool's own `silence_frac` is not a gate either, and the same set is why.**
+Against what the listener called empty it scores **AUC 0.401** — below chance, in the wrong
+direction. A quiet insect chorus sits under −60 dBFS most of the time and an empty windy clip does
+not; frame-level level is not occupancy.
 
 `tools/hear_listen.py` stages condition 2. It draws a node-balanced sample from `index.jsonl`,
 copies each clip out unchanged **and** writes an audible `.loud.wav` beside it, and emits the
