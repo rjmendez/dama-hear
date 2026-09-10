@@ -1,5 +1,5 @@
 # kubectl apply --server-side -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 490920 B serialised against a 262144 B last-applied-configuration cap.
+# apply-mode server: 492146 B serialised against a 262144 B last-applied-configuration cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '2fcb7fa-dirty'
+    dama-hear/commit: '5e206f2-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '490920'
+    dama-hear/serialised-bytes: '492146'
 data:
   hear__init__.py: |
     
@@ -1516,6 +1516,20 @@ data:
                             else None),
             "sample": row.get("sample"),
             "uptime_s": row.get("uptime_s"),
+            # ⚠️THE INGEST USED TO DROP THESE TWO, WHICH IS WHY AN UNANCHORED ROW WAS UNRECOVERABLE
+            # THE MOMENT IT LANDED. Every generation of dets.csv has carried them -- they are in
+            # `hear.detsfile._BASE`, i.e. even G1 -- and they are the only fields that place a row on
+            # the node's own PPS edge counter. `utc_us == 0` says the node could not NAME the edge;
+            # `pps_n` still says WHICH edge, and `us_since_pps` how far into it. Without the pair, a
+            # row whose neighbours in the same boot ARE anchored cannot be placed even in principle,
+            # and 517 mach records were stored that way (2026-09-10, /pool/corpus/records).
+            # Keeping them does NOT make a row anchored -- see hear/unanchored.py for what may and
+            # may not be reconstructed from them, and why the pre-lock case is refused.
+            # ⚠️Records already written keep the shape they were written with: the pool is
+            # content-addressed and a re-fetch of the same row dedupes rather than rewrites. These
+            # fields appear on rows ingested from here on, not retroactively.
+            "pps_n": row.get("pps_n"),
+            "us_since_pps": row.get("us_since_pps"),
             "trigger": row.get("trigger"),
             "clip": row.get("clip") or None,
             "dets_schema": row.get("schema"),
