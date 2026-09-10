@@ -7,10 +7,16 @@
 #   2. A human has LISTENED to >= 30 of them, including at least one from mach, and written what
 #      they heard into docs/clip-calibration-<date>.md, per node. Three models agreeing on "Dog"
 #      is corroboration, not ground truth, and nobody has yet heard a single clip this fleet
-#      recorded.
-#   3. --max-silence-frac on the check job below is set from the MEASURED distribution in that
-#      calibration set. Until then it stays negative and the gate prints REPORT and does not fire.
-#      A threshold from a guess is the failure this repo names as its own.
+#      recorded. `tools/hear_listen.py` stages this: the pool WAVs sit at -65.7 to -43.3 dBFS and
+#      are INAUDIBLE played directly, so the tool writes a gain-corrected copy beside each one
+#      plus the worksheet. Condition 3 comes from the ORIGINAL levels it records, never the
+#      audible copy.
+#   3. ⚠️MET BY BEING RETIRED, 2026-09-10. The condition asked for --max-silence-frac to be set
+#      from the measured distribution. 69 clips were heard and the measurement killed the knob:
+#      mn10_as returns Silence top-1 on 0 of 69 healthy and 3 of 69 un-normalised, so any gate
+#      between those rests on three clips. The normalisation canary is now --min-mean-top-score
+#      (0.254 healthy against 0.162 un-normalised, 13.6 sigma apart at a 400-clip run).
+#      docs/clip-calibration-2026-09-10.md has the working.
 #
 # ⚠️IT TOUCHES THE PVC AND NEVER A NODE. The ESP32 serves one client at a time and REFUSES the
 # rest rather than queueing, so a second workload reaching a node would convert hear-drain's slow
@@ -33,18 +39,21 @@ metadata:
     app: hear-tag
   annotations:
     dama-hear/what: >-
-      Runs YAMNet (TFLite, ai-edge-litert) over the clips hear-drain pulled off the cards and
+      Runs EfficientAT mn10_as (ONNX, onnxruntime) over the clips hear-drain pulled off the cards and
       appends /pool/corpus/clips/tags.jsonl. Reads clips/index.jsonl, touches no node.
     dama-hear/what-a-tag-is-not: >-
-      A tag is a MODEL's opinion. It is NOT a species identification (YAMNet has Bird, Owl, Hoot,
+      A tag is a MODEL's opinion. It is NOT a species identification (AudioSet has Bird, Owl, Hoot,
       Chirp and stops), NOT calibrated to this site, NOT confirmed by any human, and NOT usable
       as a training label -- fitting a scene- or sketch-based model on these targets would
       reproduce the circular self-labelling that all 35 dama ant models were trained on. Every
       row carries those as booleans; clips/tag_model_card.json carries the reasoning.
     dama-hear/unsuspend-gate: >-
-      >=300 stored clips over >=3 days, >=30 of them listened to by a human and written up in
-      docs/clip-calibration-<date>.md including at least one from mach, and --max-silence-frac
-      set from that measured distribution.
+      ALL THREE MET 2026-09-10. 473 stored clips across nyquist/mach/rankine over 09-08..10;
+      69 heard by a human (25 from mach) and written up in docs/clip-calibration-2026-09-10.md
+      with the labels in testdata/clip-labels-2026-09-10.jsonl; condition 3 met by RETIREMENT --
+      the calibration set showed --max-silence-frac cannot separate healthy from broken, so the
+      canary is --min-mean-top-score instead. Unsuspending is now a human decision, not a
+      blocked one; the .onnx still has to be staged onto the PVC first.
 spec:
   suspend: true
   # Twice an hour against a drain that runs every 15 minutes. Inference is ~12 ms per clip, so
@@ -72,46 +81,51 @@ spec:
                 - |
                   set -e
                   # ⚠️A SEPARATE TARGET DIR FROM THE DRAIN'S /pool/pylib, ON PURPOSE. The tag lane
-                  # pulls ai-edge-litert and its transitive pins; resolving those into the dir the
+                  # pulls onnxruntime and its transitive pins; resolving those into the dir the
                   # drain imports from would let a tagger dependency break the collector that
-                  # feeds it. 146 MB once is cheap insurance.
+                  # feeds it.
                   LIB=/pool/pylib-tag
-                  MODELS=/pool/models/yamnet
+                  MODELS=/pool/models/mn10_as
                   export PYTHONPATH="$LIB:/app"
-                  if ! python -c 'import ai_edge_litert,sys; sys.exit(0 if ai_edge_litert.__version__=="2.2.0" else 1)' 2>/dev/null; then
-                    echo "installing ai-edge-litert==2.2.0 into $LIB"
-                    pip install --no-cache-dir --upgrade --target "$LIB" 'ai-edge-litert==2.2.0' 'numpy==2.2.6' >/dev/null 2>&1
+                  if ! python -c 'import onnxruntime,sys; sys.exit(0 if onnxruntime.__version__=="1.27.0" else 1)' 2>/dev/null; then
+                    echo "installing onnxruntime==1.27.0 into $LIB"
+                    pip install --no-cache-dir --upgrade --target "$LIB" 'onnxruntime==1.27.0' 'numpy==2.2.6' >/dev/null 2>&1
                   fi
-                  python -c 'import ai_edge_litert,numpy; print("litert",ai_edge_litert.__version__,"numpy",numpy.__version__)'
+                  python -c 'import onnxruntime,numpy; print("onnxruntime",onnxruntime.__version__,"numpy",numpy.__version__)'
                   mkdir -p "$MODELS"
-                  # ⚠️FETCHED ONCE, WITH PYTHON, NOT wget OR curl -- neither exists in python:*-slim,
+                  # ⚠️THE CLASS MAP IS FETCHABLE; THE MODEL IS NOT, AND THAT IS DELIBERATE.
+                  # Upstream publishes PyTorch checkpoints. Converting one needs torch, torchaudio and
+                  # torchvision (EfficientAT's model code imports it) -- roughly 3 GB into a 5 Gi PVC to run a 24 MB graph once. So the
+                  # .onnx is built OUT OF BAND by tools/export_mn10_onnx.py, whose own input is
+                  # the sha256-pinned upstream .pt, and staged onto the PVC. This job VERIFIES it
+                  # and refuses; it never builds and never downloads a model it cannot check.
+                  # ⚠️FETCHED WITH PYTHON, NOT wget OR curl -- neither exists in python:*-slim,
                   # and a loader that shells out to one of them is a documented reason PANNs was
-                  # refused. The fetch runs only when the pinned digests do not already verify.
-                  if ! python /app/tools/hear_tag.py --model-dir "$MODELS" --verify-weights; then
-                    echo "fetching YAMNet into $MODELS"
-                    python - "$MODELS" <<'PY'
-                  import io, sys, tarfile, urllib.request
+                  # refused.
+                  python - "$MODELS" <<'PY'
+                  import os, sys, urllib.request
                   d = sys.argv[1]
-                  kaggle = "https://www.kaggle.com/api/v1/models/google/yamnet/tfLite/tflite/1/download"
-                  cmap = ("https://raw.githubusercontent.com/tensorflow/models/"
-                          "dfffd623b6be8d1d9744b8e261fbac370d17c46d/research/audioset/yamnet/"
-                          "yamnet_class_map.csv")
-                  blob = urllib.request.urlopen(kaggle, timeout=300).read()
-                  with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
-                      m = [x for x in tf.getmembers() if x.name.endswith(".tflite")]
-                      if len(m) != 1:
-                          raise SystemExit("archive holds %d .tflite members, expected 1" % len(m))
-                      open(d + "/yamnet.tflite", "wb").write(tf.extractfile(m[0]).read())
-                  open(d + "/yamnet_class_map.csv", "wb").write(
-                      urllib.request.urlopen(cmap, timeout=120).read())
+                  cmap = ("https://github.com/fschmid56/EfficientAT/raw/v0.0.1/"
+                          "metadata/class_labels_indices.csv")
+                  p = d + "/audioset_class_labels_indices.csv"
+                  if not os.path.exists(p):
+                      open(p, "wb").write(urllib.request.urlopen(cmap, timeout=120).read())
                   PY
-                  fi
                   # ⚠️UNCONDITIONAL AND FATAL. The digests are pinned in tools/hear_tag.py, which
                   # is shipped in this ConfigMap, so the check travels with the code that enforces
                   # it. A mismatch stops the job; it does not degrade to tagging with whatever is
                   # on the PVC. Hashing the FILE is the point -- the existing numpy guard in
                   # hear-drain.yaml tested only that a directory existed, which enforces nothing.
-                  python /app/tools/hear_tag.py --model-dir "$MODELS" --verify-weights
+                  if ! python /app/tools/hear_tag.py --model-dir "$MODELS" --verify-weights; then
+                    echo "-----------------------------------------------------------------"
+                    echo "mn10_as.onnx is missing or is not the pinned graph. Build and stage:"
+                    echo "  python tools/export_mn10_onnx.py --out mn10_as.onnx"
+                    echo "  kubectl -n dama cp mn10_as.onnx <a pod mounting hear-pool>:$MODELS/"
+                    echo "The export is byte-reproducible and its input .pt is sha-pinned, so"
+                    echo "the digest in tools/hear_tag.py checks the whole chain."
+                    echo "-----------------------------------------------------------------"
+                    exit 1
+                  fi
                   exec python /app/tools/hear_tag.py \
                     --pool /pool/corpus \
                     --model-dir "$MODELS" \
@@ -122,6 +136,7 @@ spec:
                 - { name: code, mountPath: /app/hear/sketch.py,   subPath: hear_sketch.py }
                 - { name: code, mountPath: /app/hear/clips.py,    subPath: hear_clips.py }
                 - { name: code, mountPath: /app/hear/tags.py,     subPath: hear_tags.py }
+                - { name: code, mountPath: /app/hear/resample.py, subPath: hear_resample.py }
                 - { name: code, mountPath: /app/tools/hear_tag.py, subPath: tools_hear_tag.py }
                 - { name: pool, mountPath: /pool }
               resources:
@@ -146,6 +161,13 @@ spec:
 # anything score high" fires on a correct run and stays silent on a broken one. The gates are
 # throughput, refusal buckets, torn lines, the accounting invariant, weight verification and
 # staleness. The class distribution prints under `OBSERVATION, not a gate`.
+#
+# ⚠️--min-mean-top-score 0.20 IS THE CALIBRATED FLOOR, NOT A GUESS. Measured over the 69-clip
+# human calibration set: 0.254 with normalisation, 0.162 without, and at this job's 400-clip
+# --limit the two run-level means are 13.6 sigma apart. 0.20 sits between them, nearer the broken
+# end because a false HIGH wakes an operator and a false ok leaves a dead lane looking alive.
+# ⚠️IT IS CALIBRATED AGAINST ONE FAILURE -- normalisation disabled. Wrong weights, a corrupt
+# resample or silence on the wire may not move it. Passing is not proof the lane is healthy.
 #
 # ⚠️--max-silence-frac IS NEGATIVE ON PURPOSE AND THE OUTPUT SAYS "REPORT". Silence-dominated
 # output is the exact signature of normalisation not running -- measured, two real clips at -56.9
@@ -189,16 +211,18 @@ spec:
                   set +e
                   export PYTHONPATH=/pool/pylib-tag:/app
                   python /app/tools/hear_tag.py --pool /pool/corpus --check \
-                    --window-s 7200 --max-stale-s 14400 --max-silence-frac -1
+                    --window-s 7200 --max-stale-s 14400 --max-silence-frac -1 \
+                    --min-mean-top-score 0.20
                   rc=$?
                   echo "--- weights ---"
-                  python /app/tools/hear_tag.py --model-dir /pool/models/yamnet --verify-weights || true
+                  python /app/tools/hear_tag.py --model-dir /pool/models/mn10_as --verify-weights || true
                   exit "$rc"
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
                 - { name: code, mountPath: /app/hear/sketch.py,   subPath: hear_sketch.py }
                 - { name: code, mountPath: /app/hear/clips.py,    subPath: hear_clips.py }
                 - { name: code, mountPath: /app/hear/tags.py,     subPath: hear_tags.py }
+                - { name: code, mountPath: /app/hear/resample.py, subPath: hear_resample.py }
                 - { name: code, mountPath: /app/tools/hear_tag.py, subPath: tools_hear_tag.py }
                 - { name: pool, mountPath: /pool }
               resources:

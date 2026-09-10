@@ -36,7 +36,10 @@ TAGS_NAME = "tags.jsonl"
 #: imported so that a bundle carrying tags.py without clips.py still parses; the two are checked
 #: against each other by tests/test_hear_tag.py.
 CLIP_PRE_S = 1.0
-CLIP_POST_S = 3.0
+#: ⚠️FALLBACK ONLY -- see hear/clips.py. Two clip geometries are live in the corpus at once
+#: (1.0+3.0 s at 16 kHz, 1.0+4.0 s at 48 kHz); `sample_window` reads the length off the row and
+#: uses this only when the row has no body to read it from.
+CLIP_POST_S = 4.0
 FS_NOMINAL_HZ = 16000.0
 
 #: How many scene rows one overlap query will return before it says it truncated. A 4.0 s clip
@@ -142,6 +145,49 @@ def append_tags(root: str, rows) -> int:
     return n
 
 
+def _post_s(row: Dict[str, Any]) -> float:
+    """The clip's post-roll, read off the row rather than assumed.
+
+    ⚠️CLIP_POST_S IS THE FALLBACK, NOT THE ANSWER. The 16 kHz era wrote 1.0 + 3.0 s and the
+    48 kHz firmware writes 1.0 + 4.0 s, and both are in the corpus right now -- a window built
+    from one constant is 1.0 s wrong at the END for every clip of the other era. hear/clips.py
+    derives `dur_s` at index time (mis-header corrected) precisely so this can be a lookup, and
+    the pre-roll is 1.0 s in both eras, which is what makes the split recoverable from a total.
+    """
+    total = row.get("dur_s")
+    if total is None:
+        total = _v1_total_s(row.get("bytes"), row.get("wav_header_fs_hz"))
+    if total is None or not (CLIP_PRE_S < total <= 8.0):
+        return CLIP_POST_S
+    return total - CLIP_PRE_S
+
+
+#: The clip lengths this fleet writes and the rates it clocks. Repeated from hear/clips.py rather
+#: than imported, because clips.py imports THIS module; test_hear_tag asserts the copies agree.
+_GEOMETRIES_S = (4.0, 5.0)
+_GEOMETRY_TOL = 0.02
+_FLEET_RATES_HZ = (16000.0, 32000.0, 48000.0)
+
+
+def _v1_total_s(n_bytes, header_fs) -> Optional[float]:
+    """A v1 row's length, for rows written before `dur_s` existed. None when unknowable.
+
+    ⚠️NOT bytes / header rate. v1 rows include 48 kHz clips headed 16000 Hz, which that division
+    reads as 15.0 s. The header is believed only when it yields a length the fleet writes;
+    otherwise exactly one fleet rate must, or nothing is claimed.
+    """
+    if not n_bytes or not header_fs:
+        return None
+    n = (int(n_bytes) - 44) / 2.0
+    def is_geom(d):
+        return any(abs(d - g) <= g * _GEOMETRY_TOL for g in _GEOMETRIES_S)
+    at_header = n / float(header_fs)
+    if is_geom(at_header):
+        return at_header
+    hits = [n / r for r in _FLEET_RATES_HZ if is_geom(n / r)]
+    return hits[0] if len(hits) == 1 else None
+
+
 def sample_window(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """The clip's window in the node's own sample counter, or None when the name carried none.
 
@@ -152,9 +198,11 @@ def sample_window(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     s = row.get("sample")
     if s is None:
         return None
+    post = _post_s(row)
     return {"node": row.get("node"), "boot": row.get("boot"),
             "start_sample": int(s) - int(CLIP_PRE_S * FS_NOMINAL_HZ),
-            "end_sample": int(s) + int(CLIP_POST_S * FS_NOMINAL_HZ)}
+            "end_sample": int(s) + int(post * FS_NOMINAL_HZ),
+            "post_s": post}
 
 
 def _scene_ref(r: Dict[str, Any]) -> Dict[str, Any]:
