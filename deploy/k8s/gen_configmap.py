@@ -23,6 +23,7 @@ cluster, which is the failure this script exists to make impossible -- and the d
 half it did not have. Adding an import or a model file without adding it here fails generation.
 """
 import ast
+import json
 import os
 import subprocess
 import sys
@@ -239,13 +240,68 @@ def check(code, data):
                  + "\n  ".join(sorted(set(missing))))
 
 
+#: The API server's cap on `metadata.annotations` in bytes. A CLIENT-SIDE `kubectl apply` stores
+#: the ENTIRE submitted object in the `kubectl.kubernetes.io/last-applied-configuration`
+#: annotation, so a bundle whose serialised object clears this cap cannot be applied that way at
+#: all -- the request is rejected outright:
+#:
+#:     $ kubectl apply --dry-run=server -f deploy/k8s/hear-tdoa-code.yaml
+#:     The ConfigMap "hear-tdoa-code" is invalid: metadata.annotations:
+#:     Too long: may not be more than 262144 bytes
+#:
+#: ⚠️IT IS NOT THE 1 MiB ConfigMap LIMIT AND IT BITES AT A QUARTER OF IT. `--server-side` writes
+#: managed fields instead of that annotation and applies the same file cleanly (verified against
+#: the live cluster the same day, same file: "configmap/hear-tdoa-code serverside-applied").
+CLIENT_APPLY_ANNOTATION_CAP = 262144
+
+#: The API server's hard cap on one object. Server-side apply does NOT lift this one, so it is
+#: the real ceiling on how much source a bundle may carry however it is applied.
+OBJECT_CAP = 1048576
+
+
+def apply_mode(code, data):
+    """"client" or "server": how this bundle has to be applied, and the two numbers behind it.
+
+    ⚠️MEASURED ON THE SERIALISED OBJECT, NOT ON THE RENDERED YAML. What counts against the
+    annotation cap is the JSON `kubectl` puts in last-applied-configuration, which is the object
+    it is about to send -- so that is what is sized here. Sizing the YAML instead would be a
+    proxy that is wrong in both directions: block-scalar indentation inflates it, and JSON's
+    escaping of every newline inflates the other.
+    """
+    payload = {"apiVersion": "v1", "kind": "ConfigMap",
+               "metadata": {"name": "x", "namespace": "dama"},
+               "data": {key: open(os.path.join(ROOT, rel)).read() for key, rel in code + data}}
+    n = len(json.dumps(payload, separators=(",", ":")))
+    return ("server" if n > CLIENT_APPLY_ANNOTATION_CAP else "client"), n
+
+
+def apply_command(name, mode):
+    """The command that actually works for this bundle, so the file can carry its own."""
+    return "kubectl apply %s-f deploy/k8s/%s.yaml" % (
+        "--server-side " if mode == "server" else "", name)
+
+
 def render(name, app, code, data, sha):
-    out = ["apiVersion: v1", "kind: ConfigMap", "metadata:",
+    mode, n_bytes = apply_mode(code, data)
+    if n_bytes > OBJECT_CAP:
+        sys.exit("%s serialises to %d B, past the %d B object cap. Server-side apply does not "
+                 "lift this one -- the bundle has to be split." % (name, n_bytes, OBJECT_CAP))
+    out = ["# %s" % apply_command(name, mode),
+           "# apply-mode %s: %d B serialised against a %d B last-applied-configuration cap."
+           % (mode, n_bytes, CLIENT_APPLY_ANNOTATION_CAP),
+           "apiVersion: v1", "kind: ConfigMap", "metadata:",
            "  name: %s" % name, "  namespace: dama",
            "  labels:", "    app: %s" % app,
            "  annotations:",
            "    dama-hear/commit: %r" % sha,
            "    dama-hear/generated-by: deploy/k8s/gen_configmap.py",
+           # ⚠️STRUCTURED, NOT PROSE. The test that checks a bundle over the cap is marked
+           # server-side reads THIS field. A test that grepped the document for the string
+           # "--server-side" would also match the copy of this generator's own source, or of
+           # tools/hear_tdoa.py, embedded in the bundle's `data` -- a guard matching its own
+           # explanation and passing for the wrong reason.
+           "    dama-hear/apply-mode: %s" % mode,
+           "    dama-hear/serialised-bytes: %r" % str(n_bytes),
            "data:"]
     for key, rel in code + data:
         out.append("  %s: |" % key)
@@ -262,7 +318,13 @@ def main(argv=None):
     check(code, data)
     sha = subprocess.check_output(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"]).decode().strip()
     dirty = subprocess.check_output(["git", "-C", ROOT, "status", "--porcelain"]).decode().strip()
-    print(render(name, app, code, data, sha + ("-dirty" if dirty else "")))
+    text = render(name, app, code, data, sha + ("-dirty" if dirty else ""))
+    mode, n_bytes = apply_mode(code, data)
+    # stderr, because stdout is redirected into the .yaml by the documented command and an
+    # operator who never opens the file would otherwise never see which apply works.
+    sys.stderr.write("%s: %d B serialised, apply-mode %s\n  %s\n"
+                     % (name, n_bytes, mode, apply_command(name, mode)))
+    print(text)
 
 
 if __name__ == "__main__":
