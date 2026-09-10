@@ -828,12 +828,33 @@ static void routes() {
     // what was left, so the next holdover measurement can subtract it instead of guessing.
     double frac = now - floor(now);
     uint32_t wait_us = (uint32_t)((1.0 - frac) * 1e6);
-    if (wait_us > 1000000) wait_us = 0;
+    // Already on the boundary: `>=`, or a frac of exactly 0 spins a full second to arrive where
+    // it already was.
+    if (wait_us >= 1000000) wait_us = 0;
     uint64_t w0 = (uint64_t)esp_timer_get_time();
-    while ((uint64_t)esp_timer_get_time() - w0 < wait_us) { }
+    // ⚠️YIELD WHILE WAITING. A tight spin of up to a second starves WiFi and HTTP and can trip the
+    // task watchdog, and an unreachable node is not a theoretical cost here -- one was lost to a
+    // setup() that never yielded on 2026-09-10. Coarse delay(1) until the last 2 ms, then
+    // delayMicroseconds, because scheduler granularity would overshoot the boundary this whole
+    // dance exists to hit. The residual it removes is ~1 ms of I2C latency, so yielding above
+    // that threshold costs nothing it was measuring.
+    while (true) {
+      uint32_t gone = (uint32_t)((uint64_t)esp_timer_get_time() - w0);
+      if (gone >= wait_us) break;
+      uint32_t left = wait_us - gone;
+      if (left > 2000) delay(1); else { delayMicroseconds(left); break; }
+    }
     bool rtc_ok = ds3231_write_time(47, 48, (time_t)ceil(now));
-    g_rtc_set_epoch = ceil(now);
-    g_rtc_set_resid_us = (int32_t)(((uint64_t)esp_timer_get_time() - w0) - wait_us);
+    // ⚠️ONLY RECORD A SET THAT HAPPENED. Stamping these on a failed write makes /time report an
+    // RTC that was never set, and holdover then subtracts a residual against a phase that does not
+    // exist -- a confident wrong number, which is worse than an absent one.
+    if (rtc_ok) {
+      g_rtc_set_epoch = ceil(now);
+      g_rtc_set_resid_us = (int32_t)(((uint64_t)esp_timer_get_time() - w0) - wait_us);
+    } else {
+      g_rtc_set_epoch = 0;
+      g_rtc_set_resid_us = 0;
+    }
     g_sync_bound_s = r.rtt_best / 2.0; g_sync_at_ms = millis();
     g_sync_off_s = r.offset_s; g_sync_count++;
     char b[520];
@@ -1131,7 +1152,7 @@ static void routes() {
       "GPIO%d over 2.5 s: %lu edges (total %lu)\n\n%s\n",
       PPS_PIN, (unsigned long)(e1 - e0), (unsigned long)e1,
       (e1 - e0) >= 2 ? "PULSING."
-        : "No edges. Either the wire from L86 pin 11 is not there yet, or the module has no fix\n"
+        : "No edges. Either the wire from L86 pin 6 is not there yet, or the module has no fix\n"
           "and its timepulse is off -- force it with /pmtk?cmd=PMTK285,4,100 and try again.");
     http.send(200, "text/plain", b);
   });

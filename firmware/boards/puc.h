@@ -4,6 +4,10 @@
 // Everything here was measured off the hardware -- a flash dump, a boot log and a whole-bank pin
 // scan -- because there is no schematic and no published firmware source. What is still unknown is
 // marked as such rather than guessed, since a wrong pin here is a soldering error.
+// ⚠️NOTHING INCLUDES THIS FILE. Verified by grep across firmware/: puc_node.ino carries its own
+// pin defines and does not include this header, so every value below is DOCUMENTATION, not
+// configuration -- editing it changes no built firmware. A fix landed here in a6bbdab and had no
+// effect on any node for exactly this reason. Change puc_node.ino, or make it include this.
 #pragma once
 
 #define BOARD_NAME     "puc-ntp"
