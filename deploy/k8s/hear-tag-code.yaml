@@ -6,7 +6,7 @@ metadata:
   labels:
     app: hear-tag
   annotations:
-    dama-hear/commit: '87eb4d3-dirty'
+    dama-hear/commit: '951a6f7-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
 data:
   hear__init__.py: |
@@ -290,7 +290,10 @@ data:
     import shutil
     from typing import Any, Dict, Iterable, List, Optional
     
-    CLIP_SCHEMA_VERSION = 1
+    #: 2 adds `dur_s` and `header_rate_suspect`. A v1 row carries neither; readers fall back to
+    #: bytes/wav_header_fs_hz, which is right for every v1 row because the mis-header only ever
+    #: reached 48 kHz clips and none were stored under v1.
+    CLIP_SCHEMA_VERSION = 2
     #: 44-byte canonical header + 64000 samples * 2 bytes, at the 16 kHz / 4.0 s geometry.
     #: ⚠️KEPT ONLY AS THE HISTORICAL SIZE. It is NOT a validity test any more -- see wav_probe.
     CLIP_BYTES_16K_4S = 128044
@@ -302,7 +305,13 @@ data:
     #: SELF-DESCRIBING format is what made a firmware change into silent data loss.
     CLIP_MIN_S, CLIP_MAX_S = 0.5, 30.0
     CLIP_PRE_S = 1.0
-    CLIP_POST_S = 3.0
+    #: ⚠️A FALLBACK, NOT THE TRUTH. Both clip geometries are live in the corpus at once: the 16 kHz
+    #: era wrote 1.0 + 3.0 s (128044 B) and the 48 kHz firmware writes 1.0 + 4.0 s (480044 B, sized
+    #: for Perch's non-overlapping 5 s window). Pinning one number here is the same mistake
+    #: CLIP_BYTES_16K_4S was -- so `clip_total_s()` reads it off the clip and this is only what a row
+    #: with no body falls back to. The PRE-roll is 1.0 s in both, which is what makes the split
+    #: derivable at all.
+    CLIP_POST_S = 4.0
     CLIP_DIR = "/clips"
     INDEX_NAME = "index.jsonl"
     FS_NOMINAL_HZ = 16000.0
@@ -471,6 +480,96 @@ data:
         return out
     
     
+    #: Decimation between the acquisition rate the clip is written at and the FS_NOMINAL rate every
+    #: other lane runs at. Mirrors DECIM in night_node.ino.
+    CLIP_DECIM_CANDIDATES = (2, 3, 4)
+    #: Acquisition rates a node may legally clock the mic at, for confirming a suspected mis-header.
+    #: MSM261D3526H1CPM Standard Performance Mode caps at 62.5 kHz; 32000 is the earlier target.
+    CLIP_ACQ_RATES_HZ = (32000.0, 48000.0)
+    #: A clip longer than this cannot be a clip -- the firmware writes a fixed CLIP_SAMPLES and
+    #: refuses rather than shortening. Used only to notice a header that must be lying.
+    CLIP_PLAUSIBLE_MAX_S = 8.0
+    #: ⚠️EVERY CLIP LENGTH THIS FLEET HAS EVER WRITTEN. 4.0 s is the 16 kHz era (1.0 + 3.0); 5.0 s is
+    #: the 48 kHz firmware (1.0 + 4.0), sized so Perch's non-overlapping 5 s window is not padded with
+    #: fabricated silence. A correction is only accepted when it lands on one of these -- a duration
+    #: "in a plausible range" is not evidence, and admitting a range is what let the /2 reading of a
+    #: /3 mis-header look just as good as the right one.
+    CLIP_GEOMETRIES_S = (4.0, 5.0)
+    #: Clock drift on the header's integer rate. 2% is ~30x the 14 Hz observed header spread.
+    CLIP_GEOMETRY_TOL = 0.02
+    
+    
+    def header_rate_suspect(probe: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Is this clip's header rate provably wrong, and by what integer factor?
+    
+        ⚠️night_node.ino stamped every 48 kHz clip with the FS_NOMINAL timebase for the whole of the
+        48 kHz rollout: the body is CLIP_SAMPLES at FS_ACQ, the header said ~16000 Hz. A 5.0 s clip
+        reads back as 15.0 s and plays an octave and a half low, and NOTHING downstream could catch
+        it -- 16000 is exactly the rate hear_tag.py's assert_rate wants, so the lying header walks
+        straight past the guard built to stop wrong-rate audio reaching a model. Fixed in firmware,
+        but clips written before the reflash are on the PVC and are not rewritable.
+    
+        ⚠️IT REFUSES TO GUESS, AND THE UNIQUENESS CHECK IS THE WHOLE OF THAT. A correction is
+        returned only when EXACTLY ONE factor closes: the recovered duration must land on a length
+        this fleet actually writes AND the recovered rate on one the mic can legally be clocked at.
+        Written first against a plausible RANGE instead, a 15.0 s body matched /2 (7.5 s at 32 kHz)
+        before it matched the correct /3 (5.0 s at 48 kHz), and returned the first hit. Two readings
+        that both close means the header is not recoverable, not that the first one wins.
+        """
+        fs = probe.get("fs_hz")
+        dur = probe.get("dur_s")
+        if not fs or not dur or dur <= CLIP_PLAUSIBLE_MAX_S:
+            return None
+        hits = []
+        for d in CLIP_DECIM_CANDIDATES:
+            true_fs = float(fs) * d
+            if not any(abs(true_fs - r) <= FS_TOLERANCE_HZ * d for r in CLIP_ACQ_RATES_HZ):
+                continue
+            true_dur = dur / d
+            if not any(abs(true_dur - g) <= g * CLIP_GEOMETRY_TOL for g in CLIP_GEOMETRIES_S):
+                continue
+            hits.append((d, true_fs, true_dur))
+        if len(hits) != 1:
+            return None
+        d, true_fs, true_dur = hits[0]
+        return {"header_fs_hz": float(fs), "true_fs_hz": true_fs, "decim": d,
+                "header_dur_s": dur, "true_dur_s": true_dur,
+                "why": ("body is %.1f s at the header's %g Hz, which is not a length this fleet "
+                        "writes; at %g Hz it is %.2f s -- the FS_NOMINAL-stamped 48 kHz clip bug"
+                        % (dur, fs, true_fs, true_dur))}
+    
+    
+    def clip_total_s(row: Dict[str, Any]) -> Optional[float]:
+        """The clip's length in seconds from its OWN header, mis-header corrected. None if unknowable.
+    
+        Both geometries are live in the corpus at once -- 1.0+3.0 s at 16 kHz and 1.0+4.0 s at
+        48 kHz -- so a caller that needs the window has to read it off the clip. CLIP_PRE_S is 1.0 s
+        in both, which is the only reason the pre/post split is derivable from a total.
+        """
+        n = row.get("bytes")
+        fs = row.get("wav_header_fs_hz")
+        if not n or not fs:
+            return None
+        dur = (int(n) - 44) / float(int(fs) * 2)
+        fix = header_rate_suspect({"fs_hz": fs, "dur_s": dur})
+        return fix["true_dur_s"] if fix else dur
+    
+    
+    def _post_s_of(probe: Optional[Dict[str, Any]]) -> float:
+        """Post-roll from the clip's own length; CLIP_POST_S only when there is no clip to read."""
+        total = _row_dur_s(probe)
+        if total is None or not (CLIP_PRE_S < total <= CLIP_PLAUSIBLE_MAX_S):
+            return CLIP_POST_S
+        return total - CLIP_PRE_S
+    
+    
+    def _row_dur_s(probe: Optional[Dict[str, Any]]) -> Optional[float]:
+        if not probe or not probe.get("dur_s"):
+            return None
+        fix = header_rate_suspect(probe)
+        return fix["true_dur_s"] if fix else probe["dur_s"]
+    
+    
     def index_row(*, clip: str, parts: Optional[Dict[str, Any]], node: str, body: Optional[bytes],
                   probe: Optional[Dict[str, Any]], dets: Dict[str, Any], path: Optional[str],
                   outcome: str, fetched_at: float, reason: Optional[str] = None,
@@ -508,10 +607,20 @@ data:
             "ts_utc_s": ts,
             "anchored": anchored,
             "t_start_utc_s": (ts - CLIP_PRE_S) if (anchored and ts) else None,
-            "t_end_utc_s": (ts + CLIP_POST_S) if (anchored and ts) else None,
+            # ⚠️THE END COMES FROM THE CLIP, NOT FROM A CONSTANT. A 16 kHz-era clip is 1.0+3.0 s and
+            # a 48 kHz one is 1.0+4.0 s; both are in the corpus. Adding a fixed CLIP_POST_S put
+            # t_end 1.0 s wrong for one era or the other, and every scene/sketch join downstream is
+            # built on this pair.
+            "t_end_utc_s": (ts + _post_s_of(probe)) if (anchored and ts) else None,
             "uptime_s": dets.get("uptime_s"),
             "fs_hz": dets.get("fs_hz"),
             "wav_header_fs_hz": (probe or {}).get("fs_hz"),
+            # ⚠️DERIVED HERE SO NO CONSUMER RE-DERIVES IT. Two clip geometries are live at once and
+            # one firmware build stamped the wrong rate, so "how long is this clip" stopped being a
+            # constant. Computing it once at index time is what lets hear/tags.py keep its no-import
+            # bundle discipline without duplicating the correction logic.
+            "dur_s": _row_dur_s(probe),
+            "header_rate_suspect": header_rate_suspect(probe) if probe else None,
             "trigger": dets.get("trigger"),
             "clip_why": dets.get("clip_why"),
             "dets_origin": dets.get("dets_origin"),
@@ -789,7 +898,10 @@ data:
     #: imported so that a bundle carrying tags.py without clips.py still parses; the two are checked
     #: against each other by tests/test_hear_tag.py.
     CLIP_PRE_S = 1.0
-    CLIP_POST_S = 3.0
+    #: ⚠️FALLBACK ONLY -- see hear/clips.py. Two clip geometries are live in the corpus at once
+    #: (1.0+3.0 s at 16 kHz, 1.0+4.0 s at 48 kHz); `sample_window` reads the length off the row and
+    #: uses this only when the row has no body to read it from.
+    CLIP_POST_S = 4.0
     FS_NOMINAL_HZ = 16000.0
     
     #: How many scene rows one overlap query will return before it says it truncated. A 4.0 s clip
@@ -895,6 +1007,25 @@ data:
         return n
     
     
+    def _post_s(row: Dict[str, Any]) -> float:
+        """The clip's post-roll, read off the row rather than assumed.
+    
+        ⚠️CLIP_POST_S IS THE FALLBACK, NOT THE ANSWER. The 16 kHz era wrote 1.0 + 3.0 s and the
+        48 kHz firmware writes 1.0 + 4.0 s, and both are in the corpus right now -- a window built
+        from one constant is 1.0 s wrong at the END for every clip of the other era. hear/clips.py
+        derives `dur_s` at index time (mis-header corrected) precisely so this can be a lookup, and
+        the pre-roll is 1.0 s in both eras, which is what makes the split recoverable from a total.
+        """
+        total = row.get("dur_s")
+        if total is None:
+            n, fs = row.get("bytes"), row.get("wav_header_fs_hz")
+            if n and fs:
+                total = (int(n) - 44) / float(int(fs) * 2)
+        if total is None or not (CLIP_PRE_S < total <= 8.0):
+            return CLIP_POST_S
+        return total - CLIP_PRE_S
+    
+    
     def sample_window(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """The clip's window in the node's own sample counter, or None when the name carried none.
     
@@ -905,9 +1036,11 @@ data:
         s = row.get("sample")
         if s is None:
             return None
+        post = _post_s(row)
         return {"node": row.get("node"), "boot": row.get("boot"),
                 "start_sample": int(s) - int(CLIP_PRE_S * FS_NOMINAL_HZ),
-                "end_sample": int(s) + int(CLIP_POST_S * FS_NOMINAL_HZ)}
+                "end_sample": int(s) + int(post * FS_NOMINAL_HZ),
+                "post_s": post}
     
     
     def _scene_ref(r: Dict[str, Any]) -> Dict[str, Any]:

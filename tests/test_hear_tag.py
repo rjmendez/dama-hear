@@ -349,7 +349,11 @@ class TestTheTaggerReadsOnlyWhatClipsDeclares:
                 "prio", "outcome", "reason", "path", "bytes", "sha256", "utc_us", "ts_utc_s",
                 "anchored", "t_start_utc_s", "t_end_utc_s", "uptime_s", "fs_hz",
                 "wav_header_fs_hz", "trigger", "clip_why", "dets_origin", "record_key",
-                "fetched_at", "audio_pruned_at", "probe_404s"}
+                "fetched_at", "audio_pruned_at", "probe_404s",
+                # schema 2: the clip's own length (mis-header corrected) and, when its header
+                # rate is provably wrong, what it really is. Two clip geometries and one
+                # wrong-rate firmware build made "how long is this clip" stop being a constant.
+                "dur_s", "header_rate_suspect"}
 
     def test_index_row_declares_exactly_these_fields(self, tmp_path):
         row = store_clip(tmp_path)
@@ -840,7 +844,11 @@ class TestTheSketchJoinIsReadOnlyAndSaysHowStrongItIs:
         pl = P.Pool(str(tmp_path))
         s = 1082421378
         row = store_clip(tmp_path, anchored=False, sample=s)
-        win = TAGS.sample_window({"sample": s})
+        # ⚠️THE ROW, NOT A BARE {"sample": s}. sample_window() reads the clip's LENGTH off the
+        # row now, because the 16 kHz era wrote 1.0+3.0 s and the 48 kHz firmware writes
+        # 1.0+4.0 s. A synthetic dict takes the fallback post-roll, so this compared a window
+        # built from the fallback against rows joined with the row-derived one.
+        win = TAGS.sample_window(row)
         cs0, cs1 = win["start_sample"], win["end_sample"]
         probes = list(range(cs0 - 2000, cs0 + 50)) + list(range(cs1 - 50, cs1 + 2000))
         for t in probes:

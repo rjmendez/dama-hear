@@ -56,7 +56,8 @@ Measured on the live fleet 2026-09-09:
 | rankine | 249 | ~200 |
 | **fleet** | **625** | **~478** |
 
-**Not one clip had ever left a node.** Each node writes 4.0 s WAVs (1.0 s pre-trigger + 3.0 s post,
+**Not one clip had ever left a node.** Each node writes a fixed-length WAV (1.0 s pre-trigger plus
+3.0 s post at 16 kHz, 4.0 s post at 48 kHz — see §6.1,
 16 kHz 16-bit mono, 128,044 B) into `/clips` under a 6,291,456 B budget — exactly 49 clips
 (`6291456 / 128044 = 49`, confirmed live: all three nodes report `budget_left_clips 0` and
 `6291456 - 17300 = 6274156 = 49 × 128044`). The 50th evicts the oldest.
@@ -253,6 +254,38 @@ failure `hear_tag.py` documents from the model's side, where an un-normalised cl
 ⚠️**Condition 3 is derived from `rms_dbfs_orig`/`silence_frac` in `manifest.json`, which are
 measured on the ORIGINAL.** Deriving a silence threshold from the normalised copy would measure
 the tool's own gain.
+
+### 6.1 Two clip geometries, and one build that headed them wrong
+
+The clip is the one artefact written at `FS_ACQ` rather than `FS_NOMINAL`, and its length changed
+with the rate:
+
+| era | geometry | samples | bytes |
+|-----|----------|---------|-------|
+| 16 kHz | 1.0 + 3.0 s | 64,000 | 128,044 |
+| 48 kHz | 1.0 + 4.0 s | 240,000 | 480,044 |
+
+5.0 s is deliberate: Perch reads **non-overlapping 5 s windows**, so a 4.0 s clip would be padded
+20% with fabricated silence. Both eras are in the corpus right now, so a consumer that assumes one
+is 1.0 s wrong at the **end** for every clip of the other. `clips.clip_total_s()` reads the length
+off the clip; `CLIP_PRE_S`/`CLIP_POST_S` are the fallback for a row with no body, nothing more.
+
+⚠️**The 48 kHz clip writer stamped the FS_NOMINAL rate into the WAV header.** The body is
+`CLIP_SAMPLES` at `FS_ACQ`; `fs_timebase()` returns the decimated rate, and it went in unscaled.
+A 5.0 s 48 kHz clip therefore reads back as **15.0 s of 16 kHz**, an octave and a half low.
+`/praw` got its `* DECIM` when the rate moved and the clip writer did not — nobody owned the seam.
+
+It could not be caught downstream: `hear_tag.py`'s `assert_rate` refuses any clip whose header is
+not 16 kHz, so a header lying by saying *exactly* 16000 is the one wrong rate that guard is blind
+to. The audio would have entered YAMNet 3× too slow and degraded silently towards `Silence` with
+every counter green.
+
+Firmware is fixed. Clips already on the PVC are not rewritable, so `clips.header_rate_suspect()`
+recovers the rate — **only** when exactly one integer factor closes onto a length this fleet
+actually writes and a rate the mic can legally be clocked at. Written first against a plausible
+*range*, a 15.0 s body matched ÷2 (7.5 s at 32 kHz) before it matched the correct ÷3 and returned
+the first hit; two readings that both close means the header is not recoverable, not that the
+first one wins. The lying header is **kept** on the row beside the correction.
 
 Until 3 is set, `check_tags` runs report-only and says so on its own output line.
 
