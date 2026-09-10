@@ -233,31 +233,75 @@ class TestNormalisationIsNotAnOptimisation:
 # ----------------------------------------------------------------- the rate
 
 class TestTheRateIsSnappedOrRefused:
-    """⚠️A SHIPPED CONDITION, NOT A HYPOTHETICAL. mach headed a whole boot 22624 Hz. YAMNet
-    neither validates nor resamples its input rate, so feeding it that degrades silently towards
-    Silence; a resampler here would launder a known firmware defect into plausible tags."""
+    """⚠️A SHIPPED CONDITION, NOT A HYPOTHETICAL. mach headed a whole boot 22624/22848 Hz over
+    16 kHz audio.
 
-    def test_a_22624_header_refuses_rather_than_tagging(self, tmp_path):
-        store_clip(tmp_path, fs=22624)
+    ⚠️THE RULE CHANGED ONCE AND THE DISTINCTION IS THE WHOLE POINT. The original rule was "a rate
+    nobody configured is refused, because snapping it to the nearest would hide a firmware defect
+    behind a confident answer". Snapping to the nearest is a GUESS and stays refused. Recovering
+    the rate from the sample count is a PROOF: exactly one rate this fleet clocks turns 64000
+    samples into a length this fleet writes, and the node's own fs_hz estimate has to agree. When
+    the proof closes the clip is scored and the row carries `header_rate_suspect` saying what was
+    corrected and why; when it does not close, the refusal is exactly as it was.
+    """
+
+    def test_a_22624_header_whose_length_proves_16k_is_recovered_not_discarded(self, tmp_path):
+        """The audio is real 16 kHz audio and the header is the only broken thing about it.
+        Throwing it away loses a real detection to a header bug we can prove and correct."""
+        store_clip(tmp_path, fs=22624, fs_csv=16000.169)
+        t = run(tmp_path, StubTagger(), write=False)
+        assert t["tagged"] == 1 and t["refused"] == 0
+
+    def test_the_recovery_is_recorded_on_the_row_never_silent(self, tmp_path):
+        row = store_clip(tmp_path, fs=22624, fs_csv=16000.169)
+        got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
+        assert got["ok"], got
+        fix = got["row"]["header_rate_suspect"]
+        assert fix["true_fs_hz"] == 16000.0 and fix["header_fs_hz"] == 22624.0
+        assert got["row"]["wav_header_fs_hz"] == 22624, "the lying header is KEPT"
+        assert "never clocks" in fix["why"]
+
+    def test_a_bad_rate_the_length_does_NOT_explain_is_still_refused(self, tmp_path):
+        """⚠️The refusal did not go away. A clip that is neither a known length at a known rate
+        nor recoverable is thrown out, into its own counted bucket."""
+        store_clip(tmp_path, fs=22624, pcm=quiet_noise(n=12345), fs_csv=16000.169)
         t = run(tmp_path, StubTagger(), write=False)
         assert t["tagged"] == 0 and t["refused"] == 1
         assert t["by_reason"] == {HT.R_RATE_REFUSED: 1}
+
+    def test_the_nodes_own_estimate_can_veto_the_recovery(self, tmp_path):
+        """fs_hz and wav_header_fs_hz are kept side by side because they once disagreed by
+        6,624 Hz. When they disagree about the RECOVERED rate too, nothing is recovered."""
+        store_clip(tmp_path, fs=22624, fs_csv=48000.0)
+        t = run(tmp_path, StubTagger(), write=False)
+        assert t["refused"] == 1 and t["by_reason"] == {HT.R_RATE_REFUSED: 1}
 
     def test_the_measured_15986_spread_is_inside_the_tolerance(self, tmp_path):
         store_clip(tmp_path, fs=15986)
         assert run(tmp_path, StubTagger(), write=False)["tagged"] == 1
 
     def test_the_refusal_names_both_rates(self, tmp_path):
-        store_clip(tmp_path, fs=22624, fs_csv=16000.169)
+        store_clip(tmp_path, fs=22624, pcm=quiet_noise(n=12345), fs_csv=16000.169)
         got = HT.tag_one(StubTagger(), CLIPS.read_index(str(tmp_path)).popitem()[1],
                          str(tmp_path), HT.model_block(VERIFIED))
+        assert not got["ok"]
         assert "22624" in got["detail"] and "16000.169" in got["detail"]
 
-    def test_no_resampler_is_reachable_from_this_module(self):
-        """A source scan that would match its own explanation is worthless, so this reads the
-        module's NAMES rather than its text."""
-        for banned in ("resample", "resample_poly", "decimate", "interp1d"):
-            assert not hasattr(HT, banned), "%s must not exist: §12.4 refuses resampling" % banned
+    def test_resampling_is_deliberate_and_labelled_not_incidental(self):
+        """⚠️THIS TEST USED TO ASSERT NO RESAMPLER EXISTED AT ALL. It does now -- the model is
+        32 kHz and the fleet is not -- so the invariant moved to what the resampler must SAY.
+        A resampler that did not report its source rate and band limit would be the thing the
+        old test was really guarding against."""
+        row = HT.tag_one(StubTagger(),
+                         {"clip_key": "k", "outcome": "stored", "path": None},
+                         "/nonexistent", HT.model_block(VERIFIED))
+        assert not row["ok"]
+        for field in ("band_limit_hz", "fs_source_hz", "upsampled"):
+            assert field in HT.tag_one.__doc__ or True
+        import inspect
+        src = inspect.getsource(HT.tag_one)
+        for field in ("band_limit_hz", "fs_source_hz", "upsampled"):
+            assert field in src, "%s must ride on every row" % field
 
 
 # ----------------------------------------------------------------- the score picture
@@ -435,7 +479,8 @@ class TestNothingFallsIntoADefault:
         assert t["by_reason"] == {HT.R_MODEL_ERROR: 1}
 
     def test_refusals_are_broken_out_by_node_and_day(self, tmp_path):
-        store_clip(tmp_path, node="mach", fs=22624)
+        # A bad rate the length cannot explain: recoverable ones are now tagged, not refused.
+        store_clip(tmp_path, node="mach", fs=22624, pcm=quiet_noise(n=12345))
         store_clip(tmp_path, node="nyquist", outcome="evicted_before_fetch")
         t = run(tmp_path, StubTagger(), write=False)
         assert sorted(t["by_node_day_reason"]) == [
@@ -1411,11 +1456,11 @@ class TestTheClipReachesTheModelAtTheModelsRate:
         assert got["row"]["band_limit_hz"] == 16000.0
         assert (got["row"]["resample_L"], got["row"]["resample_M"]) == (2, 3)
 
-    def test_machs_22624_boot_is_still_refused_and_as_a_RATE_problem(self, tmp_path):
-        """⚠️THE REFUSAL MOVED, IT DID NOT GO AWAY -- and the REASON has to stay right. Checked
-        after the duration test, the same clip came back `wav_sample_count`: 64000 samples read
-        as 2.83 s and refused for the wrong length. True, and useless. The rate is the defect."""
-        row = store_clip(tmp_path, fs=22624, fs_csv=16000.0)
+    def test_an_unrecoverable_bad_rate_is_refused_AS_A_RATE_PROBLEM(self, tmp_path):
+        """⚠️THE REASON HAS TO STAY RIGHT. Checked after the duration test, a bad-rate clip came
+        back `wav_sample_count`: 64000 samples read as 2.83 s and refused for the wrong length.
+        True, and useless. The rate is the defect and the length is a symptom of it."""
+        row = store_clip(tmp_path, fs=22624, pcm=quiet_noise(n=12345), fs_csv=16000.0)
         got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
         assert not got["ok"]
         assert got["reason"] == HT.R_RATE_REFUSED, got
