@@ -52,12 +52,15 @@ def test_the_tick_is_passed_real_reachability_not_a_literal(sketch):
     """⚠️THE WHOLE POINT. hear_boot_tick(true) would compile, restore the exact bug the parameter
     exists to prevent, and look like a call to the fixed function."""
     code = _code(sketch)
-    m = re.search(r"hear_boot_tick\(\s*([^)]*)\)", code)
-    assert m, "no hear_boot_tick call found"
-    arg = m.group(1).strip()
-    assert arg not in ("true", "1", ""), (
-        "%s passes a constant (%r) as reachability, which disables the failback exactly as the "
-        "duplicated copy did" % (sketch.name, arg))
+    # ⚠️EVERY CALL SITE, NOT THE FIRST. re.search stops at one match, so a second call added later
+    # could pass a literal and this guard would sail past it -- a guard that checks one instance of
+    # the thing it forbids. (Copilot review, PR #19.)
+    args = [m.group(1).strip() for m in re.finditer(r"hear_boot_tick\(\s*([^)]*)\)", code)]
+    assert args, "no hear_boot_tick call found"
+    bad = [a for a in args if a in ("true", "1", "")]
+    assert not bad, (
+        "%s passes a constant %r as reachability at %d of %d call sites, which disables the "
+        "failback exactly as the duplicated copy did" % (sketch.name, bad, len(bad), len(args)))
 
 
 @pytest.mark.parametrize("sketch", SKETCHES, ids=lambda p: p.name)
@@ -68,7 +71,11 @@ def test_the_include_is_not_nested_in_the_secrets_guard(sketch):
     i = src.find("#include <hear_boot.h>")
     assert i > 0, "%s does not include hear_boot.h" % sketch.name
     before = src[:i]
-    depth = len(re.findall(r"^#if", before, re.M)) - len(re.findall(r"^#endif", before, re.M))
+    # `^#if` is a PREFIX match and therefore already counts #ifdef and #ifndef; `^#endif` cannot
+    # match them back. Verified rather than assumed -- see the unit test below, which was written
+    # because a review believed this missed #ifdef/#ifndef. \s* allows indented directives.
+    depth = (len(re.findall(r"^\s*#if", before, re.M))
+             - len(re.findall(r"^\s*#endif", before, re.M)))
     assert depth == 0, (
         "%s includes hear_boot.h inside a conditional block (depth %d)" % (sketch.name, depth))
 
@@ -83,3 +90,13 @@ def test_healthy_still_requires_reachable_in_the_library():
 def test_the_library_is_the_only_definition():
     hits = [p.name for p in LIB.glob("*.cpp") if re.search(r"\bhear_boot_tick\s*\(", _code(p))]
     assert hits == ["hear_boot.cpp"], "hear_boot_tick defined in %s" % hits
+
+
+def test_the_nesting_guard_really_counts_ifdef_and_ifndef():
+    """The depth arithmetic above relies on `#if` being a prefix of `#ifdef` and `#ifndef`. That is
+    load-bearing and non-obvious, so it is checked rather than reasoned about."""
+    sample = "#ifndef A\n#ifdef B\n#if C\n#endif\n#endif\n#endif\n"
+    opens = len(re.findall(r"^\s*#if", sample, re.M))
+    closes = len(re.findall(r"^\s*#endif", sample, re.M))
+    assert opens == 3, "the open-directive count misses #ifdef/#ifndef: got %d" % opens
+    assert closes == 3 and opens - closes == 0

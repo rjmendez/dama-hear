@@ -29,7 +29,10 @@
 // GPIO18 is where the wire should land -- held low, not a strapping pin, clear of the flash
 // (26-32), PSRAM (33-37) and USB (19-20) ranges. Set to -1 until the joint exists; a node with
 // PPS_PIN -1 must be refused as a TDoA arrival source rather than quietly trusted.
-#define PPS_PIN        18
+// ⚠️STALE AND INCONSISTENT WITH ITS OWN COMMENT, kept only because nothing compiles this file.
+// The measured pad is GPIO17 (see puc_node.ino, which is what builds); 18 was a guess from before
+// the pin scan, and the comment above says to use -1 until the joint exists. Do not copy this line.
+#define PPS_PIN        -1
 #define PPS_WIRED      0         // flip to 1 only when /pps has actually reported edges
 
 // ---- the tick that DOES exist ---------------------------------------------------------------
