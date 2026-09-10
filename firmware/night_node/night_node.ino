@@ -1898,12 +1898,20 @@ static void clip_pump() {
   // Wait for the post-roll to exist. It does not yet at the instant the gate fires -- that is the
   // whole reason this is a deferred queue and not something audio_pump could do inline.
   uint32_t up = (millis() - boot_ms) / 1000;
-  if ((int32_t)(acq_of(g_samples) - (acq_of(d.sample) + CLIP_POST_SAMPLES)) < 0) {
+  // g_samples is the WRITE HEAD, not an instant, so acq_of() does not belong on it -- the group
+  // delay it subtracts happens to cancel in this subtraction, which is a correct answer by
+  // accident and an invitation to get the next one wrong. The gap in decimated samples, scaled.
+  if ((int32_t)((int32_t)(g_samples - d.sample) * DECIM - (int32_t)CLIP_POST_SAMPLES) < 0) {
     if (up - d.uptime_s > CLIP_WAIT_MAX_S) { d.clip_st = CLIP_STALLED; clip_skip_ring++; }
     return;                                   // otherwise: not an error, just not yet
   }
   uint32_t start = acq_of(d.sample) - CLIP_PRE_SAMPLES;   // acquisition domain
-  if ((int32_t)(start - acq_of(praw_oldest())) < 0) { d.clip_st = CLIP_RING; clip_skip_ring++; return; }
+  // ⚠️THE RING FLOOR IS praw_oldest()*DECIM, NOT acq_of(praw_oldest()). acq_of() converts a
+  // DETECTION index and subtracts the FIR group delay to name the instant the sound arrived. A ring
+  // floor is not an instant, it is the oldest sample the buffer still holds -- and subtracting the
+  // delay from it makes the bound EARLIER than what is really there, so a clip could be cut from
+  // samples already overwritten. Two different conversions; I used one for both. (Copilot, PR #15.)
+  if ((int32_t)(start - praw_oldest() * DECIM) < 0) { d.clip_st = CLIP_RING; clip_skip_ring++; return; }
 
   clip_prio_pending = prio;
   char path[48]; clip_name(path, sizeof path, d.sample);
@@ -3202,14 +3210,30 @@ static bool    dhist_ready = false;
 
 // One decimated output per DECIM inputs, taken from acblk with dhist in front of it. Returns the
 // number of outputs written. Q15 taps, int64 accumulate: 257 taps x 32767 x 32767 overflows int32.
+// ⚠️FOLDED, BECAUSE THE FILTER IS SYMMETRIC. A linear-phase FIR has h[t] == h[N-1-t], verified for
+// the shipped taps by tests/test_decim_filter.py, so each coefficient can multiply the SUM of its
+// two samples: 449 multiplies become 225. That is not a micro-optimisation here -- the unfolded
+// version was the second reason PR #15 was blocked, at an estimated 24-36% of a core.
+//
+// ⚠️THE ACCUMULATOR STAYS int64 AND THAT IS NOT PARANOIA: sum|h| is 2.54 in Q15, so the worst case
+// is 2.73e9 against an int32 ceiling of 2.15e9 -- 0.79x, it does NOT fit. Measured from the actual
+// coefficients rather than assumed from "it's a unity-gain lowpass", which would have said 1.05.
 static int decimate(const int16_t *in, int n_in, int16_t *out) {
   int n_out = 0;
+  const int half = DECIM_TAPS / 2;                 // centre tap index; DECIM_TAPS is odd
   for (int k = 0; k + DECIM <= n_in; k += DECIM) {
     int64_t acc = 0;
-    for (int t = 0; t < DECIM_TAPS; t++) {
-      int idx = k + DECIM - 1 - t;                 // newest-first
-      int16_t v = idx >= 0 ? in[idx] : dhist[(DECIM_TAPS - 1) + idx];
-      acc += (int64_t)DECIM_H[t] * (int64_t)v;
+    for (int t = 0; t < half; t++) {
+      int ia = k + DECIM - 1 - t;                  // newest-first
+      int ib = k + DECIM - 1 - (DECIM_TAPS - 1 - t);
+      int32_t a = ia >= 0 ? in[ia] : dhist[(DECIM_TAPS - 1) + ia];
+      int32_t b = ib >= 0 ? in[ib] : dhist[(DECIM_TAPS - 1) + ib];
+      acc += (int64_t)DECIM_H[t] * (int64_t)(a + b);
+    }
+    {
+      int ic = k + DECIM - 1 - half;
+      int32_t c = ic >= 0 ? in[ic] : dhist[(DECIM_TAPS - 1) + ic];
+      acc += (int64_t)DECIM_H[half] * (int64_t)c;
     }
     int32_t y = (int32_t)(acc >> DECIM_SHIFT);
     out[n_out++] = (int16_t)(y > 32767 ? 32767 : (y < -32768 ? -32768 : y));
