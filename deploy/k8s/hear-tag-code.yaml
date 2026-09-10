@@ -6,7 +6,7 @@ metadata:
   labels:
     app: hear-tag
   annotations:
-    dama-hear/commit: 'c85eb33-dirty'
+    dama-hear/commit: '1f34e68-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
 data:
   hear__init__.py: |
@@ -2334,7 +2334,8 @@ data:
             "window": ({"t_start_utc_s": row.get("t_start_utc_s"),
                         "t_end_utc_s": row.get("t_end_utc_s")}
                        if row.get("anchored") and row.get("t_start_utc_s") is not None else None),
-            "sample_window": TAGS.sample_window(row),
+            # The corrected length, not the row's: a v1 row has no dur_s and may be mis-headed.
+            "sample_window": TAGS.sample_window(dict(row, dur_s=dur_s)),
             "provenance": "model",
             "created_utc_s": now,
         }

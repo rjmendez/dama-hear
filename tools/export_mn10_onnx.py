@@ -4,7 +4,7 @@
     python tools/export_mn10_onnx.py --out mn10_as.onnx
     kubectl -n dama cp mn10_as.onnx <a pod mounting hear-pool>:/pool/models/mn10_as/
 
-⚠️THIS RUNS ON A WORKSTATION, NEVER IN THE CLUSTER. It needs torch and torchvision -- about 3 GB
+⚠️THIS RUNS ON A WORKSTATION, NEVER IN THE CLUSTER. It needs torch, torchaudio and torchvision (EfficientAT's model code imports it) -- about 3 GB
 into a 5 Gi PVC to produce a 24 MB graph once. deploy/k8s/hear-tag.yaml therefore verifies the
 graph and refuses; it does not build one and does not download a model it cannot check.
 
