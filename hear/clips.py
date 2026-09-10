@@ -32,9 +32,10 @@ import re
 import shutil
 from typing import Any, Dict, Iterable, List, Optional
 
-#: 2 adds `dur_s` and `header_rate_suspect`. A v1 row carries neither; readers fall back to
-#: bytes/wav_header_fs_hz, which is right for every v1 row because the mis-header only ever
-#: reached 48 kHz clips and none were stored under v1.
+#: 2 adds `dur_s` and `header_rate_suspect`. ⚠️A v1 row carries neither, and v1 rows DO include
+#: mis-headed 48 kHz clips -- they were stored before this field existed. A reader must not take
+#: bytes / wav_header_fs_hz at face value for a v1 row; hear/tags.py `_post_s` re-derives the
+#: length by the same uniqueness rule header_rate_suspect() uses.
 CLIP_SCHEMA_VERSION = 2
 #: 44-byte canonical header + 64000 samples * 2 bytes, at the 16 kHz / 4.0 s geometry.
 #: ⚠️KEPT ONLY AS THE HISTORICAL SIZE. It is NOT a validity test any more -- see wav_probe.
