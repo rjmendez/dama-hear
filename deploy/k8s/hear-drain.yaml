@@ -38,6 +38,17 @@ spec:
   # only for scene.csv, every run reporting `ok` over a 3.27 h hole -- is fixed in the drain, not
   # in this file: tools/hear_drain.py now DISCOVERS the names from /ls. See
   # docs/acoustic-stack.md section 0.1.
+  # ⚠️THE CLIP LANE, AND ITS ORDERING CONSTRAINT. Measured 2026-09-09: 625 clips written across
+  # the fleet, ~478 already destroyed, and NOT ONE CLIP HAD EVER LEFT A NODE. `--clip-max-per-node
+  # 49` is the card's own ceiling (6291456/128044 = 49 exactly, and all three nodes report
+  # `budget_left_clips 0`), so a backlog is BOUNDED at 49 per node however long this was down --
+  # the crucial difference from scene.csv, which grows without bound.
+  #
+  # ⚠️DRAINING PRECEDES ANY BUDGET INCREASE. Raising CLIP_BUDGET_B on the node without collection
+  # does not save one clip; it changes WHICH clips are destroyed and how long each survives first.
+  # Raise the node budget and this cap in the SAME change, and only after >= 7 days of
+  # `clips_deferred_by_cap == 0` read off the heartbeat ring rather than off one run.
+  #
   # Every 15 minutes. The nodes roll dets.csv to dets-prev.csv on reflash, so the window a
   # missed run can lose is bounded well under one boot; the fetch is tens of KB.
   schedule: "*/15 * * * *"
@@ -47,6 +58,12 @@ spec:
   startingDeadlineSeconds: 600
   jobTemplate:
     spec:
+      # ⚠️Runs already take 218-307 s of the 900 s interval, and `Forbid` with no deadline means
+      # one overrun silently SKIPS the next tick -- a 15-minute schedule quietly becomes a
+      # 30-minute one. Simulated against the measured write rate: 15 min loses 0 clips, 30 min
+      # loses 0, 45 min loses 3 of nyquist's 321. The margin is exactly two missed runs, and the
+      # clip lane below is what spends part of it, so the bound goes in WITH it.
+      activeDeadlineSeconds: 780
       backoffLimit: 2
       template:
         metadata:
@@ -74,7 +91,9 @@ spec:
                     --node nyquist=172.16.100.105 \
                     --node mach=172.16.100.116 \
                     --phone-corpus /pool/sketch_corpus \
-                    --node rankine=172.16.100.50
+                    --node rankine=172.16.100.50 \
+                    --clip-max-per-node 49 \
+                    --clip-deadline-s 120
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py,  subPath: hear__init__.py }
                 - { name: code, mountPath: /app/hear/sketch.py,    subPath: hear_sketch.py }
@@ -82,6 +101,7 @@ spec:
                 - { name: code, mountPath: /app/hear/detsfile.py,  subPath: hear_detsfile.py }
                 - { name: code, mountPath: /app/hear/scenefile.py, subPath: hear_scenefile.py }
                 - { name: code, mountPath: /app/hear/pool.py,      subPath: hear_pool.py }
+                - { name: code, mountPath: /app/hear/clips.py,     subPath: hear_clips.py }
                 - { name: code, mountPath: /app/tools/hear_drain.py, subPath: tools_hear_drain.py }
                 - { name: pool, mountPath: /pool }
               resources:
@@ -151,7 +171,8 @@ spec:
                   set +e
                   export PYTHONPATH=/pool/pylib:/app
                   python /app/tools/hear_drain.py --pool /pool/corpus --check \
-                    --unfetched-window-s 7200
+                    --unfetched-window-s 7200 \
+                    --max-clips-deferred 0
                   rc=$?
                   # --stats runs EVEN WHEN THE CHECK FAILED: a failure is exactly when the pool
                   # summary is wanted. Its own status is discarded so it cannot mask rc.
@@ -165,6 +186,7 @@ spec:
                 - { name: code, mountPath: /app/hear/detsfile.py,  subPath: hear_detsfile.py }
                 - { name: code, mountPath: /app/hear/scenefile.py, subPath: hear_scenefile.py }
                 - { name: code, mountPath: /app/hear/pool.py,      subPath: hear_pool.py }
+                - { name: code, mountPath: /app/hear/clips.py,     subPath: hear_clips.py }
                 - { name: code, mountPath: /app/tools/hear_drain.py, subPath: tools_hear_drain.py }
                 - { name: pool, mountPath: /pool }
               resources:

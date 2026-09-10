@@ -12,7 +12,7 @@ not exist yet arrives.
 
 ---
 
-## 0. Two live failures found while writing this
+## 0. Three live failures found while writing this
 
 Both were found by running the design's own proposed instruments against the fleet at
 **2026-09-09 05:20 UTC**. Both are silent. Both report `ok`. They are at the top of this document
@@ -85,6 +85,122 @@ reach 1.02**, which is a check that cannot fail. Paired correctly, `/audio` agre
 1.0915. Either endpoint is a valid instrument; **each must be divided by its own sample count.**
 Any implementation must carry a self-test that a known-healthy node reads within ~0.003 of 1.000,
 so a wrong-denominator implementation fails immediately instead of reading permanent green.
+
+### 0.3 ⚠️THE CLIP LANE — 478 CLIPS DESTROYED, AND NOT ONE HAD EVER LEFT A NODE
+
+> Operator page for the shipped pipeline, and the list of what it does NOT establish:
+> **`docs/clip-pipeline.md`**. Read that before quoting anything out of `clips/tags.jsonl`.
+
+Measured across the fleet on **2026-09-09**. Every node writes 4.0 s WAVs (1.0 s pre-trigger +
+3.0 s post, 16 kHz 16-bit mono, 128,044 B) into `/clips` against a 6,291,456 B budget — exactly
+49 files — and evicts oldest-by-name when it is full. nyquist wrote 274 and evicted ~225; mach
+wrote 102 and evicted ~53; rankine wrote 249 and evicted ~200. **625 written, ~478 destroyed, 0
+collected.** `tools/hear_drain.py` contained zero mentions of clips, and the `/ls` handler
+hardcoded `SD.open("/")`, so nothing could even enumerate them.
+
+Two things made the loss invisible rather than loud:
+
+  `fetch_sd` reads a clip as ABSENT   it requires the body to start with `b"node"` or `b"utc_us"`.
+                                      A WAV starts with `b"RIFF"`, so a present 128,044 B clip
+                                      came back as "the node does not have it". Hence `fetch_clip`.
+  200 is not proof of a file          `/sd?file=/clips` answers **200 with a 0-byte body**. The
+                                      magic and the length are checked, not the status code.
+
+Discovery ships through the `clip` column of `dets.csv`, not through `/ls?dir=`: **we may not
+flash**, and `det_flush` refuses to write a detection's row until its clip has resolved, so a
+name in `dets.csv` is a clip that already landed. `/ls?dir=` is compile-only and becomes a second
+candidate source at the next reflash — it closes exactly one case, a clip that outlives the dets
+file that named it.
+
+⚠️**THE ORDERING CONSTRAINT.** *Draining clips must precede any budget increase. A bigger
+`CLIP_BUDGET_B` without collection just evicts faster.* Today the card holds 49 and the node
+destroys the 50th; raising the budget to 196 without a drain does not save a single clip. It
+changes *which* 478 are destroyed and how long each survives before it is destroyed anyway, while
+consuming SD space and lengthening `clip_evict_worse_than`'s directory scan. **The node is not
+the archive; the pool is.** Until something collects, every byte of budget is a byte of delay
+before the same loss. The permitted sequence: land collection → observe ≥ 7 days of
+`clips_deferred_by_cap == 0` and `clips_cap_hit == false` across all three nodes, read off the
+heartbeat *ring* and not off one run → only then raise `CLIP_BUDGET_B` **and**
+`--clip-max-per-node` in the same change, because the cap and the budget are one number in two
+places. `activeDeadlineSeconds` goes in **with** the clip lane for the same reason: the clip
+margin *is* the schedule margin.
+
+Fetch is **strictly sequential**. The ESP32 serves one client at a time and refuses the rest
+rather than queueing — `/ls` answers in 35–118 ms idle, degrades to 7.3 s during a large transfer,
+and is refused outright mid-request — so a second CronJob or a thread pool would convert a slow
+run into a refused one. Order is oldest-first by `(boot, sample)`, which is by **eviction risk**:
+the flashed fleet evicts plain FIFO (prefix histogram over 370 live names is `{'ny': 370}` — no
+node writes the `%02u-` priority prefix), so oldest-first is most-at-risk-first. `prio` is
+recorded when the name carries it and is never read for ordering.
+
+The index (`clips/index.jsonl`) is the durable record and the audio is a cache: `prune()` deletes
+WAVs and never index lines. A refusal line is written for **every** 404 and every bad body, so
+the census of what was destroyed is countable from the pool rather than reconstructed by diffing,
+and `clips_seen == fetched + already_held + already_gone + gone + refused + deferred_by_cap` is an
+assertion in `drain_clips`, not a hope. A run that never reached the node reports
+`clips_unknown` with its own reason — **never `clips_gone: 0`**.
+
+### 0.4 THE TAG LANE — YAMNet over the collected clips, suspended until somebody listens
+
+`tools/hear_tag.py` reads `clips/index.jsonl`, opens the WAVs on the PVC and appends
+`clips/tags.jsonl`. It **touches no node** — the ordering constraint above is why: the ESP32
+serves one client at a time and refuses the rest, so a second workload reaching a card converts
+hear-drain's slow run into a refused one. `deploy/k8s/hear-tag.yaml` ships `suspend: true`.
+
+**The model.** YAMNet as TFLite under `ai-edge-litert`, not under TensorFlow: bit-identical
+scores at 12.1 ms/clip in 82 MB RSS from a 146 MB venv, against 14.3 ms in 903 MB from a 1.4 GB
+venv, and the PVC is the binding constraint. All 64 of YAMNet's mel bins sit below 8 kHz, so the
+16 kHz ceiling costs it nothing. **BirdNET is not built** — zero birds across nine real clips,
+neotropical hypotheses at the confidence floor, 1 s of every 4 discarded, CC BY-NC-SA weights.
+**PANNs/CNN14 is not built** — 32 kHz wanted, 17 % of its filterbank on guaranteed zeros, a
+measured 14 % confidence loss on the same A/B, 311 ms and 1.5 GB RSS. The goal is **event
+triage**, not species ID: YAMNet has `Bird`, `Owl`, `Hoot`, `Chirp` and stops.
+
+⚠️**NORMALISATION IS THE WHOLE FAILURE MODE.** Measured 2026-09-09 on two clips pulled off
+nyquist:
+
+| clip | raw | RMS-normalised to −20 dBFS |
+|---|---|---|
+| `nyquist-db21acd5-1082421378` (−56.9 dBFS) | `Silence 0.406 \| Speech 0.183 \| Animal 0.147` | `Animal 0.307 \| Cricket 0.204 \| Speech 0.198` |
+| `nyquist-db21acd5-1082530195` (−62.1 dBFS) | `Silence 0.723 \| Animal 0.055 \| Fowl 0.042` | `Animal 0.464 \| Wild animals 0.331 \| Bird 0.226` |
+
+Clips are recorded at −49 to −62 dBFS, so this is the whole corpus. A pipeline that skips
+`normalise()` **exits 0 forever and tags every clip Silence**.
+
+⚠️**THE RATE IS ASSERTED, NEVER RESAMPLED.** YAMNet neither validates nor resamples its input, so
+a wrong rate degrades silently. The header must be within ±64 Hz of 16 000 or the clip is
+REFUSED into a counted bucket — mach shipped a whole boot headed 22 624 Hz, which is a condition
+on the card today. A resampler would launder a firmware defect into plausible-looking tags.
+
+⚠️**WEIGHTS ARE PINNED BY sha256 AND THE TOOL NEVER FETCHES THEM.** `yamnet.tflite`
+(16 096 668 B, `141fba1c…`) and `yamnet_class_map.csv` (14 096 B, `cdf24d19…`, pinned to commit
+`dfffd623`) live on the PVC at `/pool/models/yamnet`. The CronJob preamble fetches them once with
+Python — not `wget` or `curl`, neither of which exists in `python:*-slim` — and
+`hear_tag --verify-weights` runs **unconditionally and fatally** before any tagging. Hashing the
+file is the point: the existing numpy guard tested only that a directory existed, which enforces
+nothing. A mismatch exits **2**, distinct from "tagging is behind".
+
+**What a row carries.** Every class above `SCORE_FLOOR` (a storage bound, *not* an operating
+point), `max_unstored_score` so the discarded tail is a number rather than an absence, the
+1024-d embedding (free from the same forward pass, and the only fixed-axis record that survives
+`prune()`), both sample rates side by side, the model sha256, and `provenance: "model"` with
+`claim.usable_as_training_label: false`.
+
+⚠️**A TAG IS NOT A LABEL.** No scene- or sketch-based model may be trained on these. Doing so
+would measure whether a 20-band descriptor can reconstruct what a full-fidelity model already
+decided, which is not correctness — and this project has that exact failure on file: all 35 dama
+ant models were trained on circular self-labels. `hear/tags.py` ships a **read-only**
+`scene_overlap()` query and nothing more. It reports `basis: "utc"` for an anchored clip, and its
+sample-counter fallback is off by default and marks itself `weak` when used, because neither
+scene.csv nor dets.csv carries a boot id and `sample` restarts at 0 every boot.
+
+**THE PHASE-3 GATE.** `hear-tag` stays suspended until all three hold: (1) ≥ 300 `stored` rows
+across all three nodes over ≥ 3 consecutive days; (2) a human has **listened to ≥ 30 of them**,
+including at least one from mach, and written what they heard into
+`docs/clip-calibration-<date>.md`; (3) `--max-silence-frac` is set from **that measured
+distribution**. Until (3), the check prints `silence REPORT … NOT GATED` and cannot fire. Three
+models agreeing on "Dog" is corroboration, not ground truth, and nobody has yet heard one clip
+this fleet recorded.
 
 ---
 
