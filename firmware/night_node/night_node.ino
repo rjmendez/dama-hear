@@ -2350,10 +2350,8 @@ static bool gps_autobaud() {
 // The value is written only after a link is PROVEN by decoded traffic, never from the pin probe,
 // which is the thing that cannot see a transmitter on the pin it is driving.
 #define GPS_CFG "/gps.cfg"
-// ⚠️gps_bringup() RUNS BEFORE THE CARD IS MOUNTED (setup: bring-up at one point, SD.begin ~18
-// lines later), so a write here at boot -- the one time it matters most -- would silently do
-// nothing. Held and flushed once the card is up. The retry paths later in loop() do have a card
-// and write straight through.
+// The card is mounted before bring-up in setup(), so at boot this writes straight through. The
+// pending path stays for a node with no card at bring-up that gains one later.
 static int gps_pins_pending = -1;
 static void gps_pins_persist(bool swapped) {
   if (!sd_ok) { gps_pins_pending = swapped ? 1 : 0; return; }
@@ -2498,6 +2496,17 @@ void setup() {
   // transmitter is connected" on mach for a pin with nothing on it: a pulled-up module input reads
   // exactly like a transmitter idling high, so the test could not tell the two apart. Counting
   // RECURRING run lengths on both pins can, and it also says which way round the pair is wired.
+  // Mounted BEFORE gps_bringup(): the pin-order hint lives on the card, and read before the
+  // mount it is always -1, so the one boot where it matters would never see it.
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
+  sd_cs = 0;
+  // max_files 8, not the library's default 5 (SD.h:29). The clip writer holds a WAV open across
+  // loop iterations, so the long-lived set is now dets.csv + scene.csv + the clip = 3, and /ls
+  // holds a directory plus an entry while the 30 s health block opens health.csv -- which is 6,
+  // one past the default, and an SD.open past the limit just returns a falsy File. Raising it
+  // costs a pointer array; the per-file caches are allocated on open, not here.
+  if (SD.begin(21, SPI, 20000000, "/sd", 8)) { sd_ok = true; sd_cs = 21; }
+  else if (SD.begin(3, SPI, 20000000, "/sd", 8)) { sd_ok = true; sd_cs = 3; }
   gps_bringup();
   logln("gps   UBX config sent (TP1 1 Hz locked+unlocked, NAV-PVT, TIM-TP; RAM layer)");
 
@@ -2509,16 +2518,6 @@ void setup() {
   i2c_scan();
   if (!bmp_begin()) logln("bmp   no BMP280/BME280 -- sound speed reported as null");
 
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
-  sd_cs = 0;
-  // max_files 8, not the library's default 5 (SD.h:29). The clip writer holds a WAV open across
-  // loop iterations, so the long-lived set is now dets.csv + scene.csv + the clip = 3, and /ls
-  // holds a directory plus an entry while the 30 s health block opens health.csv -- which is 6,
-  // one past the default, and an SD.open past the limit just returns a falsy File. Raising it
-  // costs a pointer array; the per-file caches are allocated on open, not here.
-  if (SD.begin(21, SPI, 20000000, "/sd", 8)) { sd_ok = true; sd_cs = 21; }
-  else if (SD.begin(3, SPI, 20000000, "/sd", 8)) { sd_ok = true; sd_cs = 3; }
-  // The card is up now, so a pin order proven during bring-up can finally be written.
   if (sd_ok && gps_pins_pending >= 0) { gps_pins_persist(gps_pins_pending == 1); gps_pins_pending = -1; }
   logf("sd    %s%s", sd_ok ? "mounted, CS=" : "no card", sd_ok ? "" : "\n");
   if (sd_ok) logf("%d\n", sd_cs);
