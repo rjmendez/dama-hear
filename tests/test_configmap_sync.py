@@ -21,12 +21,14 @@ the fix is always the same one line, never an edit to the YAML:
 It deliberately does NOT check the `dama-hear/commit` annotation, which is a stamp of when the
 file was generated and legitimately says `-dirty` in a working tree (the committed copy did).
 """
+import json
 import os
 import pathlib
 import re
 import sys
 
 import pytest
+import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -186,3 +188,42 @@ def test_every_mount_path_matches_the_bundle_path(bundle):
         seen += 1
     assert seen >= 2 * len(by_key), (
         "only %d mounts parsed out of %s; the parser missed some" % (seen, manifest.name))
+
+
+#: `kubectl apply` writes the whole object into the `kubectl.kubernetes.io/last-applied-
+#: configuration` ANNOTATION, and an annotation may not exceed 256 KiB. It is not the 1 MiB
+#: ConfigMap limit and it bites at a quarter of it.
+ANNOTATION_CAP = 256 * 1024
+
+
+@pytest.mark.parametrize("bundle", sorted(_gen()["BUNDLES"]))
+def test_a_bundle_still_fits_what_kubectl_apply_can_annotate(bundle):
+    """⚠️MEASURED ON A SIBLING BUNDLE, NOT IMAGINED. deploy/k8s/hear-tdoa-code.yaml is 444,270 B
+    and `kubectl apply` refuses it -- "metadata.annotations: Too long" -- while `kubectl create`
+    and a plain `get` are perfectly happy, so the object looks fine right up to the redeploy.
+    THE FIX IS NOT `--validate=false`: it is `kubectl apply --server-side` (which stores no such
+    annotation) or splitting the bundle.
+
+    ⚠️SIZE THE SERIALISED OBJECT, NOT THE .yaml FILE. What lands in the annotation is the JSON
+    kubectl is about to send, and the two differ by thousands of bytes in BOTH directions: YAML
+    block-scalar indentation adds two spaces per source line, while JSON escapes every newline
+    into two characters and drops the indentation entirely. Measuring the file is a proxy that
+    is wrong by more than the headroom it is guarding.
+
+    That is not a theory. On 2026-09-10 this test failed hear-drain-code at 269,381 B of YAML
+    while the same file's serialised object was 260,833 B and the live API server answered
+    `configmap/hear-drain-code configured (server dry run)`. A test that refuses what the
+    cluster accepts sends the next person to `--validate=false`, which does not help and hides
+    the real cap.
+
+    1,311 B of real headroom is still thin -- about one small module -- and that is the point of
+    asserting it here rather than finding out during a redeploy.
+    """
+    path = ROOT / "deploy" / "k8s" / (bundle + ".yaml")
+    if not path.exists():
+        pytest.skip("no ConfigMap at %s" % path)
+    size = len(json.dumps(yaml.safe_load(path.read_text()), separators=(",", ":")))
+    assert size < ANNOTATION_CAP, (
+        "%s serialises to %d B, over the %d B annotation cap -- `kubectl apply` will refuse it "
+        "with metadata.annotations: Too long. Apply it --server-side, or split the bundle."
+        % (path.name, size, ANNOTATION_CAP))

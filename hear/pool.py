@@ -55,6 +55,7 @@ import numpy as np
 
 from . import corpus as C
 from . import detsfile as DF
+from . import identity as ID
 from . import scenefile as SF
 from . import sketch as SK
 
@@ -149,6 +150,23 @@ def _why_geoms_differ(a: Tuple[Any, Any, Any, Any], b: Tuple[Any, Any, Any, Any]
     return "; and ".join(why) if why else "they compare unequal on no named field"
 
 
+def _resolve_identity(row: Dict[str, Any]) -> Optional[str]:
+    """Rename an UNPROVISIONED id in place to the node it is declared to be. Returns the raw id
+    when it renamed one, None otherwise.
+
+    ⚠️CALLED BEFORE `_node_mismatch`, NEVER INSTEAD OF IT. The guard below still has to agree
+    with the fetch afterwards; all this does is decide which name the guard is comparing. See
+    `hear.identity` for what may be renamed (only night_node.ino:88's `hear-<mac tail>` form, and
+    only with an entry stating its evidence) and why the raw id is kept on the row rather than
+    overwritten.
+    """
+    node, node_from, raw = ID.resolve(row.get("node"), row.get("node_from"))
+    if raw is None:
+        return None
+    row["node"], row["node_from"], row["node_alias_of"] = node, node_from, raw
+    return raw
+
+
 def _node_mismatch(row: Dict[str, Any], expect: Optional[str]) -> Optional[str]:
     """The name the ROW carries against the name the FETCH says it came from. Returns the row's
     name when they disagree, None when they agree or when there is nothing to compare.
@@ -180,11 +198,24 @@ def _node_mismatch(row: Dict[str, Any], expect: Optional[str]) -> Optional[str]:
     Refusing rather than relabelling is deliberate. The label is evidence that a node was flashed
     with the wrong identity; rewriting it to the fetch's name would file the rows correctly and
     destroy the only trace of the flashing error.
+
+    ⚠️ONE THING IS RENAMED BEFORE THIS RUNS, AND IT IS NOT A NAME. `_resolve_identity` maps an
+    UNPROVISIONED id -- night_node.ino:88's `hear-<mac tail>`, emitted only by a build with no
+    NODE_ID compiled in -- to the node that board is declared to be, keeping the raw id on the
+    row as `node_alias_of`. That is a different act from the one refused above: `nyquist` is a
+    name someone chose and can be wrong about, a MAC tail is the board itself. This guard is
+    unchanged and still fires on the renamed name, so a `hear-...` row that turns up on the wrong
+    card is refused exactly as it was. See `hear.identity`.
     """
     if not expect:
         return None
     node = row.get("node")
-    if not node or row.get("node_from") != "file":
+    # ⚠️"alias" IS A NAME THE ROW CARRIES, exactly as "file" is. Only "argument" means the name
+    # came from `expect` itself and so cannot disagree with it. Reading this as `!= "file"`
+    # disarmed the guard for every renamed row -- caught by
+    # tests/test_node_alias.py::test_an_unnamed_boot_on_the_WRONG_card_is_still_refused, which
+    # put rankine's card in mach's fetch and watched six rows walk in.
+    if not node or row.get("node_from") not in ("file", "alias"):
         return None            # the name came from `expect` itself: nothing disagrees
     return None if node == expect else str(node)
 
@@ -205,6 +236,9 @@ def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "source": "node",
         "node": node,
         "node_from": row.get("node_from"),
+        # Present ONLY on a renamed row: absent is not False, it is "this row was never
+        # renamed". Every row already written is absent, and stays byte-identical.
+        **({"node_alias_of": row["node_alias_of"]} if row.get("node_alias_of") else {}),
         "utc_us": utc_us,
         "anchored": utc_us > 0,
         "ts_utc_s": (utc_us / 1e6) if utc_us > 0 else None,
@@ -314,8 +348,11 @@ class Pool:
         raw = open(path, "rb").read()
         sha = hashlib.sha256(raw).hexdigest()
         read = DF.read_text(raw.decode("utf-8", "replace"), default_node=default_node)
-        recs, bad, mism = [], {}, {}
+        recs, bad, mism, aliased = [], {}, {}, {}
         for row in read.rows:
+            raw_id = _resolve_identity(row)
+            if raw_id:
+                aliased[raw_id] = aliased.get(raw_id, 0) + 1
             wrong = _node_mismatch(row, default_node)
             if wrong:
                 mism[wrong] = mism.get(wrong, 0) + 1
@@ -345,6 +382,10 @@ class Pool:
             "rows": len(read.rows) + len(read.skips), "decoded": len(recs), "added": added,
             "duplicate": len(recs) - added,
             "skipped": skipped, "skip_reasons": reasons, "node_mismatch": mism,
+            # ⚠️NOT a skip reason and not part of the sum: an aliased row was KEPT. It is its own
+            # field so "how many rows did this file need renaming to be readable at all" is a
+            # number the ledger answers, beside the refusals rather than inside them.
+            "aliased": aliased,
             "decode_errors": bad, "schema_version": SCHEMA_VERSION,
         }
         assert entry["rows"] == added + entry["duplicate"] + skipped, entry
@@ -481,9 +522,13 @@ class Pool:
         recs: List[Dict[str, Any]] = []
         bad: Dict[str, int] = {}
         mism: Dict[str, int] = {}
+        aliased: Dict[str, int] = {}
         for row in read.rows:
             # BEFORE the decode, because a row whose identity is wrong is not a row this file may
             # contribute no matter how well it decodes. See `_node_mismatch`.
+            raw_id = _resolve_identity(row)
+            if raw_id:
+                aliased[raw_id] = aliased.get(raw_id, 0) + 1
             wrong = _node_mismatch(row, default_node)
             if wrong:
                 mism[wrong] = mism.get(wrong, 0) + 1
@@ -508,6 +553,7 @@ class Pool:
                 # into one record.
                 "key": key("scene", node, utc_us, row.get("sample"), d["q"].tobytes()),
                 "source": "scene", "node": node, "node_from": row.get("node_from"),
+                **({"node_alias_of": row["node_alias_of"]} if row.get("node_alias_of") else {}),
                 "utc_us": utc_us, "anchored": utc_us > 0, "ts_utc_s": ts,
                 "mel_b64": base64.b64encode(d["q"].tobytes()).decode(),
                 "ref_db": d["ref_db"], "bands": d["bands"],
@@ -562,6 +608,9 @@ class Pool:
             # Which OTHER node's name the refused rows carried, and how many. A count in
             # skip_reasons says the drain refused something; this says a node is flashed wrong.
             "node_mismatch": mism,
+            # Kept rows that had to be renamed first. See `ingest_dets` for why it sits outside
+            # `skip_reasons` and outside the conservation sum.
+            "aliased": aliased,
             "decode_errors": bad, "partial_first_line": read.partial_first_line,
             "schema_version": SCHEMA_VERSION,
         }

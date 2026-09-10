@@ -35,6 +35,9 @@ DRAIN_CODE = [
     ("hear_corpus.py", "hear/corpus.py"),
     ("hear_detsfile.py", "hear/detsfile.py"),
     ("hear_scenefile.py", "hear/scenefile.py"),
+    # ⚠️pool.py imports it: the alias table that lets a node's own pre-provisioning rows in.
+    # Shipping pool.py without it is a drain that crashes on import in the cluster only.
+    ("hear_identity.py", "hear/identity.py"),
     ("hear_pool.py", "hear/pool.py"),
     # ⚠️ALSO IN TAG_CODE, the way hear_sketch.py is in two bundles: one edit, two ConfigMaps to
     # regenerate, and tests/test_configmap_sync.py is what stops the two copies drifting.
