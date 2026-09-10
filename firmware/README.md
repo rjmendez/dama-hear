@@ -94,3 +94,42 @@ Two smaller traps on the way: `digitalRead` on an LEDC-driven pad returns nothin
 the input buffer is off, which made a working generator look dead — `GPIO_MODE_INPUT_OUTPUT` fixes
 it. And a generator self-check is worth the ten lines: without one, "no pulse" and "no jumper" are
 indistinguishable, and the first version blamed the wiring for a code fault.
+
+## Building: credentials are not optional by accident
+
+`secrets.h` is gitignored, so a fresh checkout has none. A build without it **fails**:
+
+```
+error: "No secrets.h: this build would come up as its own AP and be unreachable from the LAN."
+```
+
+That is deliberate. Before the guard existed, `#ifndef WIFI_N` quietly supplied `WIFI_N 0` and two
+empty SSID arrays; the compile reported success and the node came up broadcasting its own AP on
+192.168.4.1, invisible from the LAN. On 2026-09-10 one was flashed that way, ran for hours awake
+with a GPS fix writing scene rows to its card, and was diagnosed as bricked and retrieved from the
+field. Everything needed to explain it was on the serial console — the one thing a deployed node
+does not have.
+
+**Normal build.** Generate `firmware/<sketch>/secrets.h` defining `WIFI_N`, `WIFI_SSIDS[]` and
+`WIFI_PASSES[]`:
+
+```c
+#define WIFI_N 2
+static const char *WIFI_SSIDS[]  = {"net-a", "net b with spaces"};
+static const char *WIFI_PASSES[] = {"...", "..."};
+```
+
+⚠️SSIDs may contain spaces and the quotes in a credentials file are usually **file syntax, not part
+of the value**. A parser that captures `\S+` and keeps the quotes produces credentials that match no
+AP, which looks exactly like being out of range. Check the built image against the SSID names seen
+on the air — not against your own extraction, which will happily agree with itself.
+
+**Bench / compile-check build**, when an AP-only image is genuinely what you want:
+
+```
+arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi --libraries firmware/lib \
+  --build-property "compiler.cpp.extra_flags=-DHEAR_ALLOW_NO_WIFI" firmware/night_node
+```
+
+Such an image reports `wifi_configured: false` in `/status`, so a node answering on its own AP says
+why the LAN cannot see it rather than merely reporting `sta: false`.
