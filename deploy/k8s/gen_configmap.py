@@ -3,6 +3,7 @@
 
     python3 deploy/k8s/gen_configmap.py                  > deploy/k8s/hear-drain-code.yaml
     python3 deploy/k8s/gen_configmap.py hear-score-code  > deploy/k8s/hear-score-code.yaml
+    python3 deploy/k8s/gen_configmap.py hear-tag-code    > deploy/k8s/hear-tag-code.yaml
 
 ⚠️THE CONFIGMAP IS WRITTEN WHOLE, so it must be GENERATED whole. Hand-editing one key in the
 cluster works right up until the next apply silently reverts it, and a code ConfigMap that has
@@ -35,6 +36,9 @@ DRAIN_CODE = [
     ("hear_detsfile.py", "hear/detsfile.py"),
     ("hear_scenefile.py", "hear/scenefile.py"),
     ("hear_pool.py", "hear/pool.py"),
+    # ⚠️ALSO IN TAG_CODE, the way hear_sketch.py is in two bundles: one edit, two ConfigMaps to
+    # regenerate, and tests/test_configmap_sync.py is what stops the two copies drifting.
+    ("hear_clips.py", "hear/clips.py"),
     ("tools_hear_drain.py", "tools/hear_drain.py"),
 ]
 
@@ -61,11 +65,31 @@ SCORE_DATA = [
     ("modules_supersonic_model_sketch_15.json", "modules/supersonic/model_sketch_15.json"),
 ]
 
+# ⚠️SMALLER STILL, AND DELIBERATELY WITHOUT pool.py. hear_tag walks clips/index.jsonl itself --
+# the same discipline that keeps hear-score's bundle to four files. hear/tags.py's scene_overlap
+# TAKES a Pool as an argument rather than importing one, which is what makes that honest: the
+# audit below is an `ast.walk` and would find a function-local import exactly as well as a
+# top-level one, so "import it inside the function" would not have worked. hear_clips.py is in
+# BOTH this bundle and DRAIN_CODE, the way hear_sketch.py is already in two -- one edit, two
+# ConfigMaps to regenerate, and tests/test_configmap_sync.py is what stops the copies drifting.
+#
+# ⚠️THE WEIGHTS ARE NOT HERE AND CANNOT BE. yamnet.tflite is 16,096,668 B against a 1 MiB
+# ConfigMap limit. It lives on the PVC at /pool/models/yamnet, fetched once by the CronJob's
+# preamble and verified against the sha256 pinned in tools/hear_tag.py -- which IS shipped, so the
+# digest travels with the code that enforces it.
+TAG_CODE = [
+    ("hear__init__.py", "hear/__init__.py"),
+    ("hear_clips.py", "hear/clips.py"),
+    ("hear_tags.py", "hear/tags.py"),
+    ("tools_hear_tag.py", "tools/hear_tag.py"),
+]
+
 #: name -> (app label, code files, data files). The first entry is the default, so the command
 #: documented in deploy/k8s/README.md keeps working with no argument.
 BUNDLES = {
     "hear-drain-code": ("hear-drain", DRAIN_CODE, []),
     "hear-score-code": ("hear-score", SCORE_CODE, SCORE_DATA),
+    "hear-tag-code": ("hear-tag", TAG_CODE, []),
 }
 DEFAULT_BUNDLE = "hear-drain-code"
 
