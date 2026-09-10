@@ -259,3 +259,25 @@ class TestAV1RowIsNotReadAtFaceValue:
         assert TAGS._v1_total_s(12345 * 2 + 44, 48000) is None
         assert TAGS.sample_window({"sample": 1, "bytes": 12345 * 2 + 44,
                                    "wav_header_fs_hz": 48000})["post_s"] == TAGS.CLIP_POST_S
+
+
+class TestTheIndexRowCarriesTheLatchedRateCorrection:
+
+    def test_a_22848_clip_is_indexed_at_its_real_length(self):
+        import struct
+        d = b"\0\0" * 64000
+        body = (b"RIFF" + struct.pack("<I", 36 + len(d)) + b"WAVEfmt " + struct.pack("<I", 16)
+                + struct.pack("<HHIIHH", 1, 1, 22848, 45696, 2, 16)
+                + b"data" + struct.pack("<I", len(d)) + d)
+        row = CLIPS.index_row(
+            clip="/clips/mach-a75b9e4c-0026897593.wav",
+            parts=CLIPS.parse_clip_name("/clips/mach-a75b9e4c-0026897593.wav"),
+            node="mach", body=body, probe=CLIPS.wav_probe(body),
+            dets={"utc_us": 1788881847478265, "ts_utc_s": 1788881847.478265, "anchored": True,
+                  "uptime_s": 1, "fs_hz": 22848.0, "trigger": "lf", "clip_why": "ok",
+                  "dets_origin": "mach:/dets.csv", "record_key": "aa" * 16},
+            path="clips/2026-09-08/mach/x.wav", outcome="stored", fetched_at=1.0)
+        assert row["dur_s"] == pytest.approx(4.0)
+        assert row["t_end_utc_s"] - row["ts_utc_s"] == pytest.approx(3.0)
+        assert row["header_rate_suspect"]["true_fs_hz"] == 16000.0
+        assert CLIPS.clip_total_s(row) == pytest.approx(4.0)

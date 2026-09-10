@@ -26,7 +26,7 @@ thing is the circularity this repo names elsewhere.
 RMS 40 dB under their peak; taking RMS to -20 dBFS would clip the transient, which is exactly the
 part worth hearing. Gain is min(rms_target, peak_target) and the manifest says which bound bit.
 
-⚠️A LYING HEADER IS CORRECTED FOR PLAYBACK AND SAID OUT LOUD. two different rate defects are on the card.
+⚠️A LYING HEADER IS CORRECTED FOR PLAYBACK AND SAID OUT LOUD. Two different rate defects are on the cards.
 night_node stamped every 48 kHz clip with the FS_NOMINAL timebase for the whole of the 48 kHz
 rollout, so a 5.0 s clip claims 15.0 s at 16 kHz and plays an octave and a half LOW. Separately,
 mach latched 22624/22848 Hz for a whole boot over 16 kHz audio, so those clips claim 2.80 s and
@@ -364,7 +364,8 @@ def main():
 
     rows = load_index(args.pool)
     if args.exclude and os.path.exists(args.exclude):
-        skip = {ln.strip() for ln in open(args.exclude) if ln.strip()}
+        with open(args.exclude, encoding="utf-8") as fh:
+            skip = {ln.strip() for ln in fh if ln.strip()}
         before = len(rows)
         rows = [r for r in rows if r.get("clip_key") not in skip]
         print("excluded %d already-heard clip(s)" % (before - len(rows)))
