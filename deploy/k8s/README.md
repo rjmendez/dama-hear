@@ -25,7 +25,28 @@ kubectl -n dama create job --from=cronjob/hear-score hear-score-manual-1   # the
 #           --max-silence-frac set from that measured distribution.
 python3 deploy/k8s/gen_configmap.py hear-tag-code > deploy/k8s/hear-tag-code.yaml
 kubectl apply -f deploy/k8s/hear-tag-code.yaml -f deploy/k8s/hear-tag.yaml
+
+# hear-tdoa  ⚠️--server-side ON THE CODE BUNDLE, AND IT IS NOT A STYLE PREFERENCE.
+#            A plain apply is REJECTED by the API server, not merely discouraged:
+#              The ConfigMap "hear-tdoa-code" is invalid: metadata.annotations:
+#              Too long: may not be more than 262144 bytes
+#            Client-side apply stores the whole submitted object in
+#            kubectl.kubernetes.io/last-applied-configuration, and this bundle carries the
+#            entire solve stack -- 478,902 B serialised, 1.8x that 256 KiB annotation cap
+#            (and still inside the 1 MiB object cap, which server-side apply does NOT lift).
+#            Each generated -code.yaml states its own mode on line 1 and in the
+#            dama-hear/apply-mode annotation; gen_configmap.py prints the command on stderr.
+#            The MANIFEST is small and applies normally.
+python3 deploy/k8s/gen_configmap.py hear-tdoa-code > deploy/k8s/hear-tdoa-code.yaml
+kubectl apply --server-side -f deploy/k8s/hear-tdoa-code.yaml
+kubectl apply -f deploy/k8s/hear-tdoa.yaml
 ```
+
+⚠️**A bundle that grows past 256 KiB changes how it must be applied, silently.** `hear-drain-code`
+is at 236,037 B — 90% of the cap — so one more module in its import closure moves it across and
+the apply that has always worked starts failing. That is why the mode is computed per bundle by
+`gen_configmap.apply_mode()` from the SERIALISED OBJECT and written into the file, rather than
+being remembered here.
 
 | object | what |
 |---|---|

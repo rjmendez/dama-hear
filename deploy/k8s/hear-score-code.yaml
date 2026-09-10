@@ -1,3 +1,5 @@
+# kubectl apply -f deploy/k8s/hear-score-code.yaml
+# apply-mode client: 77252 B serialised against a 262144 B last-applied-configuration cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -6,8 +8,10 @@ metadata:
   labels:
     app: hear-score
   annotations:
-    dama-hear/commit: '87eb4d3-dirty'
+    dama-hear/commit: '2fcb7fa-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
+    dama-hear/apply-mode: client
+    dama-hear/serialised-bytes: '77252'
 data:
   hear__init__.py: |
     

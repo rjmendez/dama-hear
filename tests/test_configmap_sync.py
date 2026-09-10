@@ -195,35 +195,57 @@ def test_every_mount_path_matches_the_bundle_path(bundle):
 #: ConfigMap limit and it bites at a quarter of it.
 ANNOTATION_CAP = 256 * 1024
 
+#: The API server's hard cap on one object. `--server-side` stores managed fields instead of the
+#: annotation and clears the cap above, but it does NOT lift this one.
+OBJECT_CAP = 1024 * 1024
+
 
 @pytest.mark.parametrize("bundle", sorted(_gen()["BUNDLES"]))
-def test_a_bundle_still_fits_what_kubectl_apply_can_annotate(bundle):
-    """⚠️MEASURED ON A SIBLING BUNDLE, NOT IMAGINED. deploy/k8s/hear-tdoa-code.yaml is 444,270 B
-    and `kubectl apply` refuses it -- "metadata.annotations: Too long" -- while `kubectl create`
-    and a plain `get` are perfectly happy, so the object looks fine right up to the redeploy.
-    THE FIX IS NOT `--validate=false`: it is `kubectl apply --server-side` (which stores no such
-    annotation) or splitting the bundle.
+def test_a_bundle_still_fits_the_way_it_declares_it_is_applied(bundle):
+    """A bundle must fit the cap belonging to the apply mode it declares, and must declare the
+    mode its own size demands.
 
     ⚠️SIZE THE SERIALISED OBJECT, NOT THE .yaml FILE. What lands in the annotation is the JSON
-    kubectl is about to send, and the two differ by thousands of bytes in BOTH directions: YAML
+    kubectl is about to send. The two differ by thousands of bytes in BOTH directions: YAML
     block-scalar indentation adds two spaces per source line, while JSON escapes every newline
-    into two characters and drops the indentation entirely. Measuring the file is a proxy that
-    is wrong by more than the headroom it is guarding.
-
-    That is not a theory. On 2026-09-10 this test failed hear-drain-code at 269,381 B of YAML
-    while the same file's serialised object was 260,833 B and the live API server answered
+    into two characters and drops the indentation entirely. Measuring the file is a proxy wrong
+    by more than the headroom it guards -- on 2026-09-10 the file metric failed hear-drain-code
+    at 269,381 B while its serialised object was 260,833 B and the live API server answered
     `configmap/hear-drain-code configured (server dry run)`. A test that refuses what the
-    cluster accepts sends the next person to `--validate=false`, which does not help and hides
-    the real cap.
+    cluster accepts sends the next reader to `--validate=false`, which does not help.
 
-    1,311 B of real headroom is still thin -- about one small module -- and that is the point of
-    asserting it here rather than finding out during a redeploy.
+    All four states verified against the live cluster the same day:
+
+        hear-drain-code  260,833 B  client  -> "configured"
+        hear-tdoa-code   491,138 B  client  -> "metadata.annotations: Too long"
+        hear-tdoa-code   491,138 B  server  -> "serverside-applied"
+        hear-drain-code  300,849 B  client  -> "metadata.annotations: Too long"  (bloated on purpose)
+
+    THE FIX FOR AN OVERSIZE BUNDLE IS NOT `--validate=false`: it is `--server-side`, which is
+    what `dama-hear/apply-mode` records, or splitting the bundle. Past OBJECT_CAP neither helps.
     """
     path = ROOT / "deploy" / "k8s" / (bundle + ".yaml")
     if not path.exists():
         pytest.skip("no ConfigMap at %s" % path)
-    size = len(json.dumps(yaml.safe_load(path.read_text()), separators=(",", ":")))
-    assert size < ANNOTATION_CAP, (
-        "%s serialises to %d B, over the %d B annotation cap -- `kubectl apply` will refuse it "
-        "with metadata.annotations: Too long. Apply it --server-side, or split the bundle."
-        % (path.name, size, ANNOTATION_CAP))
+    doc = yaml.safe_load(path.read_text())
+    size = len(json.dumps(doc, separators=(",", ":")))
+    mode = (doc.get("metadata", {}).get("annotations", {}) or {}).get("dama-hear/apply-mode")
+    assert mode in ("client", "server"), (
+        "%s declares apply-mode %r; gen_configmap.py writes it and the caller needs it to pick "
+        "between `kubectl apply` and `kubectl apply --server-side`." % (path.name, mode))
+
+    # the load-bearing half: a bundle that has outgrown client-side apply must SAY so, or the
+    # next redeploy is the thing that finds out
+    if size > ANNOTATION_CAP:
+        assert mode == "server", (
+            "%s serialises to %d B, over the %d B annotation cap, but declares apply-mode "
+            "'client' -- `kubectl apply` will refuse it with metadata.annotations: Too long. "
+            "Regenerate it: gen_configmap.py picks the mode from this same number."
+            % (path.name, size, ANNOTATION_CAP))
+
+    cap = OBJECT_CAP if mode == "server" else ANNOTATION_CAP
+    assert size < cap, (
+        "%s serialises to %d B, over the %d B cap for apply-mode '%s'.%s"
+        % (path.name, size, cap, mode,
+           "" if mode == "client" else
+           " --server-side does NOT lift the object cap -- the bundle has to be split."))
