@@ -299,8 +299,16 @@ def solve(positions: Sequence, arrivals: Sequence[float], source_class: str,
     if fixed_up_m is not None:
         u0 = float(fixed_up_m)
         _lift = lambda s2: np.array([s2[0], s2[1], u0])
+        # ⚠️CLIPPED, exactly as the 3D branch below clips its seeds. `_grid_seed` builds its axes
+        # with np.arange(lo, hi + step/2, step), which OVERSHOOTS `hi` by up to step/2 -- on a
+        # 17 m array with the default 500 m margin and 10 m step that is 3.4 m past the east
+        # bound. When the coarse minimum happens to land in that last cell, least_squares raises
+        # "Initial guess is outside of provided bounds" and the whole event is refused. It is
+        # data-dependent, so it fires on some temperatures/geometries and not others: found by
+        # tools/hear_tdoa.py at --temp-c 0 on a layout that solves cleanly at 20.
         fit = least_squares(lambda s2, *a: _residual(_lift(s2), *a),
-                            seed[:2], jac=lambda s2, *a: _jacobian(_lift(s2), *a)[:, :2],
+                            np.clip(seed[:2], lo[:2], hi[:2]),
+                            jac=lambda s2, *a: _jacobian(_lift(s2), *a)[:, :2],
                             args=(P, t, c), bounds=(lo[:2], hi[:2]),
                             xtol=1e-14, ftol=1e-14, gtol=1e-14)
         s = _lift(fit.x)
