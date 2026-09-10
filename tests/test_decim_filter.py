@@ -113,3 +113,65 @@ def test_the_firmware_derives_the_acquisition_rate_and_never_hardcodes_it():
     for guard in ("static_assert((int)MEL16_FS == FS_NOMINAL",
                   "static_assert((int)MELS_FS  == FS_NOMINAL"):
         assert guard in ino, "the mel-bank rate guard is gone: %s" % guard
+
+
+# ---------------------------------------------------------------- the folded implementation
+
+def _sat(y):
+    return 32767 if y > 32767 else (-32768 if y < -32768 else y)
+
+
+def _run(H, x, hist, decim, shift, fold):
+    """Both forms of the same filter, in the same arithmetic the firmware uses."""
+    n, half, out = len(H), len(H) // 2, []
+    for k in range(0, len(x) - decim + 1, decim):
+        acc = 0
+        if fold:
+            for t in range(half):
+                ia, ib = k + decim - 1 - t, k + decim - 1 - (n - 1 - t)
+                a = x[ia] if ia >= 0 else hist[(n - 1) + ia]
+                b = x[ib] if ib >= 0 else hist[(n - 1) + ib]
+                acc += H[t] * (a + b)
+            ic = k + decim - 1 - half
+            acc += H[half] * (x[ic] if ic >= 0 else hist[(n - 1) + ic])
+        else:
+            for t in range(n):
+                idx = k + decim - 1 - t
+                acc += H[t] * (x[idx] if idx >= 0 else hist[(n - 1) + idx])
+        out.append(_sat(acc >> shift))
+    return out
+
+
+def test_the_taps_are_symmetric_which_is_what_licenses_folding():
+    _d, taps = _defines()
+    n = len(taps)
+    assert all(taps[t] == taps[n - 1 - t] for t in range(n // 2)), (
+        "the filter is not symmetric, so night_node's folded decimate() is computing something else")
+    assert n % 2 == 1, "an even-length filter has no centre tap for the folded loop to add"
+
+
+def test_folding_changes_the_cost_and_not_one_output_sample():
+    """⚠️THE WHOLE RISK OF FOLDING. Half the multiplies is worthless if it is half a different
+    filter, and a fold bug would be inaudible in a spectrum plot and wrong in every clip."""
+    import random
+    d, taps = _defines()
+    H = [int(t) for t in taps]
+    rng = random.Random(7)
+    for _ in range(4):
+        hist = [rng.randint(-32768, 32767) for _ in range(len(H) - 1)]
+        x = [rng.randint(-32768, 32767) for _ in range(768)]
+        a = _run(H, x, hist, d["DECIM_TAPS"] and 3, d["DECIM_SHIFT"], fold=False)
+        b = _run(H, x, hist, 3, d["DECIM_SHIFT"], fold=True)
+        assert a == b, "folded and unfolded disagree on %d of %d outputs" % (
+            sum(1 for p, q in zip(a, b) if p != q), len(a))
+
+
+def test_the_accumulator_really_does_need_64_bits():
+    """⚠️KEEPS int64 HONEST. 'It is a unity-gain lowpass so it fits int32' predicts sum|h| ~ 1.05;
+    the real filter is 2.54 in Q15 because a sharp design has large tap ripple. If a future design
+    genuinely fits, this test fails and says so rather than leaving int64 as folklore."""
+    d, taps = _defines()
+    worst = int(sum(abs(int(t)) for t in taps)) * 32768
+    assert worst > 2**31 - 1, (
+        "worst-case accumulator is %d, which now FITS int32 -- decimate() can drop to 32-bit "
+        "arithmetic and should" % worst)
