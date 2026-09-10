@@ -665,7 +665,10 @@ def fetch_clip(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S
         return None, "empty"
     if body[:4] != b"RIFF":
         return None, "not_riff"
-    if len(body) < CL.CLIP_BYTES:
+    # ⚠️A FLOOR, NOT AN EQUALITY, AND NOT ONE FIRMWARE'S SIZE. wav_probe decides validity from the
+    # header the clip carries; this only rejects a body too short to hold a 44-byte header plus
+    # CLIP_MIN_S of the slowest rate the format can name.
+    if len(body) < 44 + int(CL.CLIP_MIN_S * 8000 * 2):
         return None, "short"
     return body, None
 
