@@ -94,7 +94,7 @@ converts a slow run into a refused run.
 
 | path | pruned? |
 |---|---|
-| `clips/<day>/<node>/<basename>.wav` | **yes** — 2 GiB cap, oldest UTC day first |
+| `clips/<day>/<node>/<basename>.wav` | **yes** — 2 GiB cap, `unanchored` first (by mtime), then oldest UTC day |
 | `clips/index.jsonl` | **never** |
 | `clips/tags.jsonl` | **never** |
 
@@ -102,6 +102,14 @@ converts a slow run into a refused run.
 cache of something the node already destroyed. A pruned row keeps every field and gains
 `audio_pruned_at`. `<day>` is the UTC day when the clip is anchored and the literal `unanchored`
 when it is not — never an invented zero.
+
+⚠️**`unanchored` is pruned FIRST.** An anchored clip carries `utc_us`, `t_start/t_end_utc_s` and a
+`record_key` that joins it to its sketch and its scene rows; an unanchored one joins to nothing.
+Sorting it last paid the whole cap out of the joinable clips and protected the least recoverable
+ones. Within `unanchored` the order is file mtime — a measured arrival time, not a guessed day.
+Abandoned `<basename>.wav.<pid>.tmp` part-files are swept on every `prune()` call, cap or no cap:
+`_audio_files` filters on `.wav`, so a part-file left by an `activeDeadlineSeconds` kill was
+invisible to the cap and nothing ever removed it.
 
 Each index row carries **both** rate readings side by side: `fs_hz` from the dets CSV and
 `wav_header_fs_hz` from the file. They disagree in the field — mach shipped an entire boot headed
@@ -143,14 +151,15 @@ kubectl get cronjob hear-drain -n dama -o jsonpath='{.spec.jobTemplate.spec.temp
 ### Every way a clip can fail to arrive
 
 Nothing falls into a default. `clips_seen == fetched + already_held + already_gone + gone +
-sum(refused) + deferred_by_cap` is an `assert` in `drain_clips`, not a hope.
+probed_404 + sum(refused) + deferred_by_cap` is an `assert` in `drain_clips`, not a hope.
 
 | counter | means |
 |---|---|
 | `clips_fetched` | 128,044 B RIFF stored |
 | `clips_already_held` | index says `stored`; not re-fetched |
 | `clips_already_gone` | index says `evicted_before_fetch`; **not re-probed** |
-| `clips_gone` | 404 this run — newly confirmed destroyed |
+| `clips_gone` | `CL.CONFIRM_404` consecutive 404s — newly confirmed destroyed |
+| `clips_probed_404` | 404 once, **not yet terminal** — the firmware answers 404 for any failed `SD.open` |
 | `clips_refused[...]` | `short` / `not_riff` / `empty` / `http_%d` / `transport` / `bad_name` / `store_*` |
 | `clips_deferred_by_cap` | still on the card; retried next run |
 | `clips_cap_hit` / `clips_cap_reason` | `count` / `deadline` / `disk` |

@@ -543,7 +543,7 @@ def empty_tally() -> Dict[str, Any]:
             "superseded": 0,
             "tagged": 0, "refused": 0, "already_tagged": 0, "deferred": 0,
             "by_reason": {}, "by_node": {}, "by_node_day_reason": {},
-            "silence_top": 0, "scored_any": 0, "dbfs": []}
+            "silence_top": 0, "scored_any": 0, "dbfs": [], "unstored": []}
 
 
 def tally(t: Dict[str, Any], node: str, day: str, outcome: str,
@@ -563,6 +563,8 @@ def tally(t: Dict[str, Any], node: str, day: str, outcome: str,
                 n["silence_top"] += 1
             if row.get("pre_norm_dbfs") is not None:
                 t["dbfs"].append(float(row["pre_norm_dbfs"]))
+            if row.get("max_unstored_score") is not None:
+                t["unstored"].append(float(row["max_unstored_score"]))
     elif outcome == "refused":
         t["refused"] += 1
         n["refused"] += 1
@@ -634,7 +636,7 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
     out = {
         "tag_schema_version": TAGS.TAG_SCHEMA_VERSION,
         "schema": TAG_SCHEMA,
-        "tag_key": TAGS.tag_key(ck, MODEL_NAME, MODEL_VERSION),
+        "tag_key": TAGS.tag_key(ck, MODEL_NAME, MODEL_VERSION, mb.get("sha256")),
         "clip_key": ck,
         "det_ref": row.get("record_key"),
         "node": row.get("node"),
@@ -705,7 +707,7 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
     t["census_keys"] = census["keys"]
     index = CLIPS.read_index(root)
     t["index_keys"] = len(index)
-    held = TAGS.read_tagged(root)
+    held, t["versions_held"] = TAGS.read_resume(root)
 
     out_rows: List[Dict[str, Any]] = []
     t0 = time.time()
@@ -713,7 +715,8 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
     for row in work_order(index):
         node, day = row.get("node") or "?", _row_day(row)
         ck = row.get("clip_key")
-        if isinstance(ck, str) and TAGS.tag_key(ck, MODEL_NAME, MODEL_VERSION) in held:
+        if isinstance(ck, str) and TAGS.tag_key(ck, MODEL_NAME, MODEL_VERSION,
+                                                mb.get("sha256")) in held:
             tally(t, node, day, "already_tagged")
             continue
         if stop_reason is None:
@@ -748,12 +751,21 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
     t["silence_frac"] = (t["silence_top"] / float(t["tagged"])) if t["tagged"] else None
     t["observation_not_health"] = {
         "level_dbfs": _distribution(t.pop("dbfs")),
+        # ⚠️AGGREGATED, NOT ONLY PER ROW. `max_unstored_score` made the discarded tail a number on
+        # each row; nothing summed it, so a floor set too high looked exactly like a quiet night.
+        "max_unstored_score": _distribution(t.pop("unstored")),
         "silence_top_frac": t["silence_frac"],
         "note": ("the class distribution is NOT an input to any gate. A quiet night is the "
                  "expected result; a gate keyed on 'did anything score high' fires on a correct "
                  "run. silence_top_frac is gated only once a human calibration set has been "
                  "measured -- see docs/acoustic-stack.md, the Phase-3 gate."),
     }
+
+    # `versions_held` was read before this run wrote anything, so this run's own model is added
+    # to it. Without that a new weights file is invisible to the gate until the NEXT run.
+    if out_rows:
+        vk = "%s/%s/%s" % (mb.get("name"), mb.get("version"), mb.get("sha256"))
+        t["versions_held"][vk] = t["versions_held"].get(vk, 0) + len(out_rows)
 
     if write:
         if out_rows:
@@ -824,6 +836,12 @@ def write_heartbeat(root: str, report: Dict[str, Any], now: Optional[float] = No
         "weights_ok": bool(report.get("weights_ok")),
         "silence_top": report.get("silence_top"),
         "silence_frac": report.get("silence_frac"),
+        # ⚠️`scored_any` IS AN ABSOLUTE SIGNAL AND `silence_frac` IS NOT. A model that returns
+        # nothing above the floor for every clip reports silence_frac 0.000 -- the best possible
+        # value -- and passed the Phase-3 gate more easily than any real night can. This says
+        # whether the model produced OUTPUT AT ALL, which is not a claim about the audio.
+        "scored_any": report.get("scored_any"),
+        "versions_held": report.get("versions_held") or {},
         "by_reason": report.get("by_reason") or {},
         "by_node": report.get("by_node") or {},
         "new_buckets": new_buckets,
@@ -924,7 +942,37 @@ def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
     else:
         lines.append("cap      ok        %d clip(s) deferred across the window" % deferred)
 
+    # ⚠️ABSOLUTE, AND BEFORE THE SILENCE LINE. `tagged > 0 and scored_any == 0` says the model
+    # emitted no class above the floor for a single clip -- an interpreter that loaded and is fed
+    # or read wrong, or a --score-floor set past the top of the distribution. It is not a claim
+    # about the class distribution and it can fire today.
     tagged = sum(int(r.get("tagged") or 0) for r in window)
+    scored = sum(int(r.get("scored_any") or 0) for r in window)
+    measured = any(r.get("scored_any") is not None for r in window)
+    if measured and tagged > 0 and scored == 0:
+        lines.append("scores   NONE      %d clip(s) tagged and not one scored a single class "
+                     "above the floor -- the model produced no output, which is not a quiet "
+                     "night" % tagged)
+        bad += 1
+    elif measured:
+        lines.append("scores   ok        %d of %d tagged clip(s) scored at least one class"
+                     % (scored, tagged))
+
+    # ⚠️ONE VERSION STRING, ONE WEIGHTS DIGEST. `model_block` calls the sha256 the identity;
+    # MODEL_VERSION is a promise a human keeps by hand. Two digests under one version string
+    # means the store holds two models' scores that a consumer cannot tell apart.
+    shas: Dict[str, set] = {}
+    for r in window:
+        for vk in (r.get("versions_held") or {}):
+            name_ver, _, sha = vk.rpartition("/")
+            shas.setdefault(name_ver, set()).add(sha)
+    mixed = {k: sorted(v) for k, v in shas.items() if len(v) > 1}
+    if mixed:
+        lines.append("weights  MIXED     %s -- one version string, several weight files"
+                     % json.dumps({k: [x[:12] for x in v] for k, v in mixed.items()},
+                                  sort_keys=True))
+        bad += 1
+
     sil = sum(int(r.get("silence_top") or 0) for r in window)
     frac = (sil / float(tagged)) if tagged else None
     if max_silence_frac < 0:

@@ -45,11 +45,21 @@ FS_TOLERANCE_HZ = 64.0
 #: an outcome that is not on this list cannot be counted, and an uncounted refusal is the failure
 #: this whole lane exists to prevent.
 OUTCOMES = ("stored", "already_held", "evicted_before_fetch", "refused_bad_body",
-            "refused_short", "refused_http", "deferred_by_cap", "refused_name")
+            "refused_short", "refused_http", "deferred_by_cap", "refused_name",
+            "probed_404", "refused_store")
 
 #: Once an index row reaches one of these, the name is never probed again. Without it the drain
 #: re-probes 321 already-dead nyquist names every 15 minutes forever (measured 2026-09-09).
+#: ⚠️`probed_404` IS DELIBERATELY NOT HERE. night_node.ino:2436 answers 404 for ANY failed
+#: SD.open, not only for a missing file: max_files is 8 and the long-lived set reaches 6
+#: (dets.csv + scene.csv + the open clip + /ls's directory and entry + health.csv) with
+#: clip_evict_worse_than() taking 2 more during an eviction (night_node.ino:1725-1731). One
+#: descriptor-exhausted moment must not retire a clip that is still on the card.
 TERMINAL_OUTCOMES = ("stored", "evicted_before_fetch")
+
+#: Consecutive 404s before a name is called destroyed. 2, not 1: a 404 costs ~0.1 s, so
+#: confirming the 321 already-dead nyquist names costs one extra ~32 s pass, once.
+CONFIRM_404 = 2
 
 #: ⚠️BOTH SHIPPED SHAPES. The flashed fleet writes `<node>-<boot>-<sample>.wav`; the checkout's
 #: clip_name() prepends `%02u-` priority. A parser that knew only one would refuse the entire
@@ -182,7 +192,8 @@ def wav_probe(body: bytes) -> Dict[str, Any]:
 
 def index_row(*, clip: str, parts: Optional[Dict[str, Any]], node: str, body: Optional[bytes],
               probe: Optional[Dict[str, Any]], dets: Dict[str, Any], path: Optional[str],
-              outcome: str, fetched_at: float, reason: Optional[str] = None) -> Dict[str, Any]:
+              outcome: str, fetched_at: float, reason: Optional[str] = None,
+              probe_404s: int = 0) -> Dict[str, Any]:
     """One index line.
 
     ⚠️IT NEVER INVENTS A TIME. Every time field is copied from the parent dets row or left None,
@@ -225,6 +236,7 @@ def index_row(*, clip: str, parts: Optional[Dict[str, Any]], node: str, body: Op
         "dets_origin": dets.get("dets_origin"),
         "record_key": dets.get("record_key"),
         "fetched_at": fetched_at,
+        "probe_404s": probe_404s,
     }
     return row
 
@@ -252,6 +264,61 @@ def read_index(root: str) -> Dict[str, Dict[str, Any]]:
             k = row.get("clip_key")
             if isinstance(k, str):
                 out[k] = row
+    return out
+
+
+def read_outcomes(root: str) -> Dict[str, Dict[str, Any]]:
+    """clip_key -> just the two fields the negative cache needs. The SAME last-line-wins pass as
+    `read_index`, at a measured 191 B resident per key against that function's 3,096 B.
+
+    ⚠️THE DRAIN MUST NOT MATERIALISE THE WHOLE INDEX. The index is append-only and never
+    compacted; at the spec's 1,109 clips/day the full-row dict reaches the drain container's
+    512Mi limit in ~152 days and the drain then OOMKills, which returns the fleet to destroying
+    every clip. The same walk at 191 B/key is ~7 years, and nothing here reads a field the
+    dispatch loop does not use.
+    """
+    p = index_path(root)
+    out: Dict[str, Dict[str, Any]] = {}
+    if not os.path.exists(p):
+        return out
+    with open(p, "r", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            k = row.get("clip_key")
+            if isinstance(k, str):
+                out[k] = {"outcome": row.get("outcome"), "probe_404s": row.get("probe_404s") or 0}
+    return out
+
+
+def rows_for_basenames(root: str, names) -> Dict[str, Dict[str, Any]]:
+    """basename -> its LAST index row, for the given basenames only.
+
+    Same reason as `read_outcomes`: `prune` needs whole rows, but only for the handful of files it
+    actually deleted, so it streams the index rather than holding all of it.
+    """
+    want = set(names)
+    out: Dict[str, Dict[str, Any]] = {}
+    p = index_path(root)
+    if not want or not os.path.exists(p):
+        return out
+    with open(p, "r", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            b = row.get("basename")
+            if b in want:
+                out[b] = row
     return out
 
 
@@ -285,10 +352,47 @@ def _audio_files(root: str) -> List[Dict[str, Any]]:
                     continue
                 p = os.path.join(nd, fn)
                 try:
-                    sz = os.path.getsize(p)
+                    st = os.stat(p)
                 except OSError:
                     continue
-                out.append({"day": day, "node": node, "basename": fn, "path": p, "bytes": sz})
+                out.append({"day": day, "node": node, "basename": fn, "path": p,
+                            "bytes": st.st_size, "mtime": st.st_mtime})
+    return out
+
+
+def sweep_tmp(root: str, now: float, older_than_s: float = 900.0) -> Dict[str, Any]:
+    """Delete abandoned `*.tmp` part-files under clips/<day>/<node>/.
+
+    ⚠️`_audio_files` FILTERS ON `.wav`, SO A `.wav.<pid>.tmp` IS INVISIBLE TO THE CAP. A pod
+    killed by `activeDeadlineSeconds: 780` mid-write leaks up to 128044 B per node per run onto a
+    5Gi PVC that nothing else would ever reclaim. `older_than_s` is one drain interval, and the
+    pid in the name means a live writer's file is never the one being swept.
+    """
+    base = clips_dir(root)
+    out: Dict[str, Any] = {"tmp_deleted": 0, "tmp_bytes": 0}
+    if not os.path.isdir(base):
+        return out
+    for day in sorted(os.listdir(base)):
+        d = os.path.join(base, day)
+        if not os.path.isdir(d):
+            continue
+        for node in sorted(os.listdir(d)):
+            nd = os.path.join(d, node)
+            if not os.path.isdir(nd):
+                continue
+            for fn in sorted(os.listdir(nd)):
+                if not fn.endswith(".tmp"):
+                    continue
+                p = os.path.join(nd, fn)
+                try:
+                    st = os.stat(p)
+                    if now - st.st_mtime < older_than_s:
+                        continue
+                    os.remove(p)
+                except OSError:
+                    continue
+                out["tmp_deleted"] += 1
+                out["tmp_bytes"] += st.st_size
     return out
 
 
@@ -302,8 +406,23 @@ def _day_order(day: str) -> tuple:
     return (1, "") if day == "unanchored" else (0, day)
 
 
+def _prune_order(f: Dict[str, Any]) -> tuple:
+    """Deletion order: `unanchored` FIRST, by file mtime, then the dated days oldest first.
+
+    ⚠️THE OPPOSITE OF `_day_order`, AND DELIBERATELY. An anchored clip carries utc_us,
+    t_start/t_end and a record_key that joins it to its sketch and its scene rows; an unanchored
+    one carries none of that and joins to nothing. Sorting unanchored last paid the whole cap out
+    of the joinable clips and protected the ones with the least recoverable context. Within
+    `unanchored` the order is mtime -- a measured arrival time, not a day guessed from nothing.
+    """
+    if f["day"] == "unanchored":
+        return (0, f["mtime"], f["node"], f["basename"])
+    return (1, f["day"], f["node"], f["basename"])
+
+
 def prune(root: str, max_bytes: int, now: float) -> Dict[str, Any]:
-    """Delete whole WAV files, oldest UTC day first, until the audio tree is at or under max_bytes.
+    """Delete whole WAV files, `unanchored` first and then oldest UTC day, until the audio tree
+    is at or under max_bytes. Abandoned `*.tmp` part-files are swept on every call, cap or no cap.
 
     ⚠️AUDIO IS THE ONLY PRUNABLE THING. The index row survives and gains `audio_pruned_at`, which
     is appended as a new line (the index is append-only and `read_index` keeps the last line per
@@ -315,11 +434,11 @@ def prune(root: str, max_bytes: int, now: float) -> Dict[str, Any]:
     before = sum(f["bytes"] for f in files)
     out: Dict[str, Any] = {"bytes_before": before, "bytes_after": before,
                            "files_deleted": 0, "days_touched": []}
+    out.update(sweep_tmp(root, now))
     if max_bytes is None or before <= max_bytes:
         return out
-    by_basename = {r.get("basename"): r for r in read_index(root).values() if r.get("basename")}
-    files.sort(key=lambda f: (_day_order(f["day"]), f["node"], f["basename"]))
-    running, deleted, days, rows = before, 0, [], []
+    files.sort(key=_prune_order)
+    running, deleted, days, gone = before, 0, [], []
     for f in files:
         if running <= max_bytes:
             break
@@ -331,11 +450,12 @@ def prune(root: str, max_bytes: int, now: float) -> Dict[str, Any]:
         deleted += 1
         if f["day"] not in days:
             days.append(f["day"])
-        row = by_basename.get(f["basename"])
-        if row is not None:
-            r = dict(row)
-            r["audio_pruned_at"] = now
-            rows.append(r)
+        gone.append(f["basename"])
+    rows = []
+    for row in rows_for_basenames(root, gone).values():
+        r = dict(row)
+        r["audio_pruned_at"] = now
+        rows.append(r)
     if rows:
         append_index(root, rows)
     out["bytes_after"] = running

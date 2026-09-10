@@ -349,7 +349,7 @@ class TestTheTaggerReadsOnlyWhatClipsDeclares:
                 "prio", "outcome", "reason", "path", "bytes", "sha256", "utc_us", "ts_utc_s",
                 "anchored", "t_start_utc_s", "t_end_utc_s", "uptime_s", "fs_hz",
                 "wav_header_fs_hz", "trigger", "clip_why", "dets_origin", "record_key",
-                "fetched_at", "audio_pruned_at"}
+                "fetched_at", "audio_pruned_at", "probe_404s"}
 
     def test_index_row_declares_exactly_these_fields(self, tmp_path):
         row = store_clip(tmp_path)
@@ -501,7 +501,12 @@ class TestResumeIsTheStoreItself:
         run(tmp_path, StubTagger())
         monkeypatch.setattr(HT, "MODEL_VERSION", "tflite-2")
         assert run(tmp_path, StubTagger())["tagged"] == 1
-        assert TAGS.versions_held(str(tmp_path)) == {"yamnet/tflite-1": 1, "yamnet/tflite-2": 1}
+        # ⚠️KEYED ON THE DIGEST TOO. Pre-change this returned `name/version` only, so two
+        # different weight files scored under one version string reported as ONE model -- the
+        # mixing the docstring says is reported.
+        held = TAGS.versions_held(str(tmp_path))
+        assert sorted(k.rsplit("/", 1)[0] for k in held) == ["yamnet/tflite-1", "yamnet/tflite-2"]
+        assert all(len(k.rsplit("/", 1)[1]) == 64 for k in held), held
 
     def test_the_limit_defers_rather_than_dropping(self, tmp_path):
         for i in range(5):
@@ -1238,3 +1243,74 @@ class TestAgainstTheRealModel:
         assert max(abs(quiet[k] - loud[k]) for k in shared) > 0.05, (
             "the model gave the same answer at -57 and -20 dBFS, so normalise() would be "
             "pointless -- and the measured Silence-for-every-clip failure could not happen")
+
+
+class TestAModelThatScoredNothingIsNotAQuietNight:
+    """⚠️Pre-change `scored_any` was tallied and then dropped: not in the run report's heartbeat
+    entry, not read by `check_tags`. A tagger returning `{}` for every clip reported
+    silence_frac 0.000 -- the BEST possible value -- and passed the Phase-3 gate more easily than
+    any real night can. `max_unstored_score` was quantified per row and never aggregated."""
+
+    class Mute:
+        """An interpreter that loaded and is fed or read wrong; or --score-floor past the top."""
+
+        def tag(self, pcm, floor=HT.SCORE_FLOOR):
+            return {"scores": {}, "max_unstored_score": 0.0,
+                    "n_classes_scored": HT.YAMNET_CLASSES, "n_frames": HT.YAMNET_FRAMES,
+                    "embedding": [0.0] * HT.YAMNET_EMBED_DIM}
+
+    def _report(self, tmp_path, tagger, n=3):
+        for i in range(n):
+            store_clip(tmp_path, sample=1082421378 + i)
+        return run(tmp_path, tagger, now=1789000000.0)
+
+    def test_the_run_that_scored_nothing_fails_the_gate(self, tmp_path):
+        t = self._report(tmp_path, self.Mute())
+        assert t["tagged"] == 3 and t["scored_any"] == 0 and t["silence_frac"] == 0.0
+        code, lines = HT.check_tags(str(tmp_path), now=1789000010.0)
+        text = "\n".join(lines)
+        assert code == 1, text
+        assert "scores   NONE" in text, text
+        # ⚠️And the silence line still reports the best possible value on the same run -- which
+        # is exactly why the absolute gate has to exist and be read first.
+        assert "0.000" in text, text
+
+    def test_a_run_that_scored_passes_and_says_how_many(self, tmp_path):
+        t = self._report(tmp_path, StubTagger())
+        assert t["scored_any"] == 3
+        code, lines = HT.check_tags(str(tmp_path), now=1789000010.0)
+        text = "\n".join(lines)
+        assert code == 0, text
+        assert "scores   ok" in text and "3 of 3" in text, text
+
+    def test_the_discarded_tail_is_aggregated_not_only_per_row(self, tmp_path):
+        t = self._report(tmp_path, StubTagger())
+        d = t["observation_not_health"]["max_unstored_score"]
+        assert d["n"] == 3, d
+        assert d["median"] > 0.0, d
+
+
+class TestOneVersionStringMeansOneWeightsFile:
+    """⚠️`model_block` says the sha256 IS the identity, but `tag_key` keyed on MODEL_VERSION
+    alone: a re-exported yamnet.tflite under an unchanged version string was treated as
+    already-tagged for every clip already scored, and nothing anywhere compared digests."""
+
+    def test_new_weights_under_the_same_version_still_re_tag(self, tmp_path, monkeypatch):
+        store_clip(tmp_path)
+        assert run(tmp_path, StubTagger())["tagged"] == 1
+        assert run(tmp_path, StubTagger())["already_tagged"] == 1
+        other = dict(VERIFIED, model_sha256="ff" * 32)
+        t = HT.run(str(tmp_path), model_dir="/nonexistent", tagger=StubTagger(), verified=other)
+        assert t["tagged"] == 1, (
+            "a different weights file under the same version string was treated as done")
+
+    def test_two_digests_under_one_version_fail_the_gate(self, tmp_path):
+        store_clip(tmp_path)
+        run(tmp_path, StubTagger(), now=1789000000.0)
+        other = dict(VERIFIED, model_sha256="ff" * 32)
+        HT.run(str(tmp_path), model_dir="/nonexistent", tagger=StubTagger(), verified=other,
+               now=1789000100.0)
+        code, lines = HT.check_tags(str(tmp_path), now=1789000110.0)
+        text = "\n".join(lines)
+        assert code == 1, text
+        assert "weights  MIXED" in text, text

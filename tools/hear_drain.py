@@ -769,11 +769,15 @@ def _store_clip(root: str, node: str, cand: Dict[str, Any], body: bytes) -> str:
 
     tmp + `os.replace`, because a pod killed mid-write would otherwise leave a truncated WAV that
     the index calls `stored` -- and `stored` is terminal, so it would never be fetched again.
+
+    The pid is IN the temp name so `CL.sweep_tmp` can reclaim an abandoned part-file without ever
+    racing a live writer: `activeDeadlineSeconds: 780` makes the killed-mid-write case a designed
+    event, and `_audio_files` cannot see a `.tmp` to charge it against the cap.
     """
     day = CL._day(cand["ts_utc_s"] if cand.get("anchored") else None)
     p = CL.store_path(root, day, node, cand["parts"]["basename"])
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    tmp = p + ".tmp"
+    tmp = "%s.%d.tmp" % (p, os.getpid())
     with open(tmp, "wb") as fh:
         fh.write(body)
     os.replace(tmp, p)
@@ -806,7 +810,7 @@ def drain_clips(pl: "P.Pool", node: str, ip: str, candidates: List[Dict[str, Any
     now = t0 if now is None else now
     out: Dict[str, Any] = {
         "clips_seen": len(candidates), "clips_fetched": 0, "clips_already_held": 0,
-        "clips_already_gone": 0, "clips_gone": 0, "clips_refused": {},
+        "clips_already_gone": 0, "clips_gone": 0, "clips_probed_404": 0, "clips_refused": {},
         "clips_deferred_by_cap": 0, "clips_cap_hit": False, "clips_cap_reason": None,
         "clips_bytes": 0, "clips_elapsed_s": 0.0,
         "clips_unknown": True,
@@ -817,8 +821,16 @@ def drain_clips(pl: "P.Pool", node: str, ip: str, candidates: List[Dict[str, Any
     # after. It deletes WAVs only; index lines are the durable record and are never deleted.
     out["prune"] = CL.prune(pl.root, store_max_bytes, now)
 
-    held = CL.read_index(pl.root)
-    rows: List[Dict[str, Any]] = []
+    held = CL.read_outcomes(pl.root)
+
+    # ⚠️ONE APPEND PER CLIP, AS IT RESOLVES, NEVER A BATCH AT THE END. `_store_clip` makes the
+    # bytes durable immediately; buffering the ledger meant a pod killed between the two kept the
+    # audio and lost the row, and the NEXT run's 404 then wrote `evicted_before_fetch` -- which is
+    # terminal -- over clips whose bytes were sitting on the PVC. `activeDeadlineSeconds: 780`
+    # against a 218-307 s run plus 3 x (120 s clip deadline + a 30 s final fetch) makes that kill
+    # a designed event. append_index opens and closes per call; 49 appends per node is nothing.
+    def emit(**kw) -> None:
+        CL.append_index(pl.root, (CL.index_row(node=node, fetched_at=now, **kw),))
 
     def refuse(reason: str) -> None:
         out["clips_refused"][reason] = out["clips_refused"].get(reason, 0) + 1
@@ -835,9 +847,8 @@ def drain_clips(pl: "P.Pool", node: str, ip: str, candidates: List[Dict[str, Any
             continue
         if parts is None:
             refuse("bad_name")
-            rows.append(CL.index_row(clip=cand["clip"], parts=None, node=node, body=None,
-                                     probe=None, dets=cand, path=None, outcome="refused_name",
-                                     fetched_at=now, reason=cand["bad_name"]))
+            emit(clip=cand["clip"], parts=None, body=None, probe=None, dets=cand, path=None,
+                 outcome="refused_name", reason=cand["bad_name"])
             continue
         # The cap is tested BEFORE the request is spent, so `deferred_by_cap` means "still on the
         # card, not asked for", never "asked for and lost".
@@ -850,56 +861,68 @@ def drain_clips(pl: "P.Pool", node: str, ip: str, candidates: List[Dict[str, Any
                 out["clips_cap_hit"], out["clips_cap_reason"] = True, "disk"
         if out["clips_cap_hit"]:
             out["clips_deferred_by_cap"] += 1
-            rows.append(CL.index_row(clip=cand["clip"], parts=parts, node=node, body=None,
-                                     probe=None, dets=cand, path=None, outcome="deferred_by_cap",
-                                     fetched_at=now, reason=out["clips_cap_reason"]))
+            # ⚠️ONE DEFERRAL ROW PER CLIP, NOT ONE PER RUN. The row is worth writing once: when
+            # the clip is evicted before it is ever fetched AND its dets row has rolled off the
+            # card, it is the only record the clip existed. Rewriting it every 15 minutes for a
+            # standing backlog is pure index growth, and the index is never compacted.
+            if outcome_before != "deferred_by_cap":
+                emit(clip=cand["clip"], parts=parts, body=None, probe=None, dets=cand, path=None,
+                     outcome="deferred_by_cap", reason=out["clips_cap_reason"])
             continue
 
         body, reason = fetch_clip(ip, cand["clip"], timeout)
         if reason == "http_404":
-            # The node already destroyed it. Terminal: the row is the only thing left of the clip.
-            out["clips_gone"] += 1
-            rows.append(CL.index_row(clip=cand["clip"], parts=parts, node=node, body=None,
-                                     probe=None, dets=cand, path=None,
-                                     outcome="evicted_before_fetch", fetched_at=now,
-                                     reason="http_404"))
+            # ⚠️ONE 404 IS NOT PROOF OF AN EVICTION. night_node.ino:2436 answers 404 for ANY
+            # failed SD.open -- the no-card case is a 503 at :2435, but descriptor exhaustion,
+            # which the firmware's own comment at :2340-2344 says is reachable with max_files 8,
+            # collapses to 404 as well. Calling that terminal on first sight writes "the node
+            # destroyed this" into the durable record for a clip still on the card, and the name
+            # is then never probed again. It takes CL.CONFIRM_404 consecutive 404s.
+            n404 = int(prev.get("probe_404s") or 0) + 1
+            if n404 >= CL.CONFIRM_404:
+                out["clips_gone"] += 1
+                emit(clip=cand["clip"], parts=parts, body=None, probe=None, dets=cand, path=None,
+                     outcome="evicted_before_fetch", reason="http_404 x%d" % n404,
+                     probe_404s=n404)
+            else:
+                out["clips_probed_404"] += 1
+                emit(clip=cand["clip"], parts=parts, body=None, probe=None, dets=cand, path=None,
+                     outcome="probed_404", reason="http_404", probe_404s=n404)
             continue
         if reason is not None:
             refuse(reason)
-            rows.append(CL.index_row(clip=cand["clip"], parts=parts, node=node, body=None,
-                                     probe=None, dets=cand, path=None,
-                                     outcome=_refusal_outcome(reason), fetched_at=now,
-                                     reason=reason))
+            emit(clip=cand["clip"], parts=parts, body=None, probe=None, dets=cand, path=None,
+                 outcome=_refusal_outcome(reason), reason=reason)
             continue
         probe = CL.wav_probe(body)
         if not probe["ok"]:
             refuse(probe["reason"])
-            rows.append(CL.index_row(clip=cand["clip"], parts=parts, node=node, body=body,
-                                     probe=probe, dets=cand, path=None,
-                                     outcome="refused_bad_body", fetched_at=now,
-                                     reason=probe["reason"]))
+            emit(clip=cand["clip"], parts=parts, body=body, probe=probe, dets=cand, path=None,
+                 outcome="refused_bad_body", reason=probe["reason"])
             continue
         try:
             path = _store_clip(pl.root, node, cand, body)
         except OSError as e:
-            # The bytes reached us and could not be written. NOT terminal: no row is appended, so
-            # the next run asks again. Counted, because a write that failed is not a clip stored.
+            # The bytes reached us and could not be written -- a read-only or full PVC. NOT
+            # terminal, so the next run asks again, but a ROW IS WRITTEN: without one the clip was
+            # invisible in the index as well as at the gate, and every run re-fetched 128 kB to
+            # store nothing while `check` printed a clean line.
             refuse("store_%s" % type(e).__name__)
+            emit(clip=cand["clip"], parts=parts, body=body, probe=probe, dets=cand, path=None,
+                 outcome="refused_store", reason="%s: %s" % (type(e).__name__, e))
             continue
         out["clips_fetched"] += 1
         out["clips_bytes"] += len(body)
-        rows.append(CL.index_row(clip=cand["clip"], parts=parts, node=node, body=body,
-                                 probe=probe, dets=cand, path=path, outcome="stored",
-                                 fetched_at=now))
+        emit(clip=cand["clip"], parts=parts, body=body, probe=probe, dets=cand, path=path,
+             outcome="stored")
 
-    CL.append_index(pl.root, rows)
     out["clips_elapsed_s"] = time.time() - t0
     out["clips_unknown"] = False
     out["clips_reason"] = None
     # ⚠️THE CENSUS TOTALS ITSELF, AS AN ASSERTION AND NOT AS A HOPE. Every name found reaches
     # exactly one bucket; a bucket added later without a home here fails loudly and immediately.
     seen = (out["clips_fetched"] + out["clips_already_held"] + out["clips_already_gone"]
-            + out["clips_gone"] + sum(out["clips_refused"].values())
+            + out["clips_gone"] + out["clips_probed_404"] + sum(out["clips_refused"].values())
             + out["clips_deferred_by_cap"])
     assert seen == out["clips_seen"], (seen, out)
     return out
@@ -933,6 +956,7 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
                            # unmeasured-looks-clean failure this whole module is built against.
                            "clips_seen": None, "clips_fetched": None, "clips_already_held": None,
                            "clips_already_gone": None, "clips_gone": None,
+                           "clips_probed_404": None,
                            "clips_refused": None, "clips_deferred_by_cap": None,
                            "clips_cap_hit": None, "clips_cap_reason": None,
                            "clips_bytes": None, "clips_elapsed_s": None,
@@ -1142,11 +1166,22 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
         # that could not read dets.csv has not measured what dets would have named, and on the
         # flashed fleet `ls_candidates` returns [] regardless -- so there is nothing to trade for
         # the honesty. Revisit that branch when, and only when, a node runs the /ls?dir= handler.
-        cand = merge_candidates(clip_candidates(dets_bodies, node),
-                                ls_candidates(sizes, node))
-        out.update(drain_clips(pl, node, ip, cand, timeout,
-                               max_per_node=clip_max_per_node, deadline_s=clip_deadline_s,
-                               store_max_bytes=clip_store_max_bytes, now=stamp))
+        # ⚠️CONTAINED, LIKE EVERY OTHER LANE. The nodes are drained in one list comprehension in
+        # main(); an OSError out of prune / read_outcomes / append_index / free_bytes here -- a
+        # full PVC, an unreadable clips/ subtree, a permissions fault on index.jsonl -- used to
+        # propagate out of drain_node and kill the process before write_heartbeat, so the nodes
+        # AFTER this one were never contacted and no ring entry was written for any of them. The
+        # clip lane must not be able to take down the lanes that were resilient before it existed.
+        try:
+            cand = merge_candidates(clip_candidates(dets_bodies, node),
+                                    ls_candidates(sizes, node))
+            out.update(drain_clips(pl, node, ip, cand, timeout,
+                                   max_per_node=clip_max_per_node, deadline_s=clip_deadline_s,
+                                   store_max_bytes=clip_store_max_bytes, now=stamp))
+        except Exception as e:
+            out["errors"].append("clips: %r" % (e,))
+            out["clips_unknown"] = True
+            out["clips_reason"] = "the clip lane raised %r, so no clip was measured" % (e,)
 
     out["ok"] = not out["errors"]
     return out
@@ -1263,6 +1298,9 @@ def write_heartbeat(root: str, results: List[Dict[str, Any]], phone: Optional[Di
         measured = None if r.get("unfetched_unknown") else r.get("unfetched_bytes")
         s["last_unfetched_bytes"] = measured
         s["last_unfetched_reason"] = r.get("unfetched_reason")
+        # A listing the node itself says it cut short is a PARTIAL CENSUS: scene_names() and
+        # ls_candidates() both work off it, so it must not read as a short card.
+        s["ls_truncated_at"] = r.get("ls_truncated_at")
         # ⚠️APPENDED, NOT OVERWRITTEN. The drain runs every 15 min and the check hourly, so a
         # per-run field is 4 runs stale by the time anything reads it and 3 of every 4 loss
         # reports were invisible to the gate. The ring keeps them; `check()` sums a window of it.
@@ -1279,11 +1317,17 @@ def write_heartbeat(root: str, results: List[Dict[str, Any]], phone: Optional[Di
         cring = s.get("clips_recent")
         if not isinstance(cring, list):
             cring = []
+        # ⚠️`refused` IS IN HERE BECAUSE THE GATE IS BLIND WITHOUT IT. A node answering every
+        # /sd?file= with a truncated body produced `+0 fetched / 0 destroyed / 0 deferred` --
+        # character-for-character what an empty card produces -- and `check` exited 0. The house
+        # standard is that refusals are counted BY REASON where something reads them.
         cring.append({"at": now,
                       "seen": None if c_unknown else r.get("clips_seen"),
                       "fetched": None if c_unknown else r.get("clips_fetched"),
                       "gone": None if c_unknown else r.get("clips_gone"),
                       "deferred": None if c_unknown else r.get("clips_deferred_by_cap"),
+                      "probed_404": None if c_unknown else r.get("clips_probed_404"),
+                      "refused": None if c_unknown else (r.get("clips_refused") or {}),
                       "cap_reason": r.get("clips_cap_reason"),
                       "unknown": c_unknown,
                       "reason": r.get("clips_reason")})
@@ -1363,6 +1407,11 @@ def _clip_note(s: Dict[str, Any], now: float, max_deferred: int, max_lost: int,
 
     ⚠️A MEASURED ZERO PRINTS. The whole point of this lane is that 478 clips were destroyed while
     every dashboard read green, so "0 fetched, 0 gone" is stated rather than left blank.
+
+    ⚠️AND IT PRINTS HOW MANY WERE NAMED, AND WHY EACH REFUSAL HAPPENED. `+0 fetched` out of 6
+    named and `+0 fetched` out of 0 named rendered identically before, so a node refusing every
+    clip read exactly like an empty card. A `store_*` refusal FAILS: the bytes arrived and the
+    pool could not write them, which is a fault on this side of the wire and never a quiet one.
     """
     ring = s.get("clips_recent")
     if not isinstance(ring, list) or not ring:
@@ -1375,11 +1424,24 @@ def _clip_note(s: Dict[str, Any], now: float, max_deferred: int, max_lost: int,
     fetched = sum(int(e.get("fetched") or 0) for e in known)
     gone = sum(int(e.get("gone") or 0) for e in known)
     deferred = sum(int(e.get("deferred") or 0) for e in known)
+    named = sum(int(e.get("seen") or 0) for e in known)
+    probed = sum(int(e.get("probed_404") or 0) for e in known)
     caps = [e.get("cap_reason") for e in known if e.get("cap_reason")]
+    refused: Dict[str, int] = {}
+    for e in known:
+        for reason, n in (e.get("refused") or {}).items():
+            refused[reason] = refused.get(reason, 0) + int(n)
     note, bad = "", False
     if known:
-        note += ("  clips +%d fetched / %d destroyed / %d deferred over %d run(s)"
-                 % (fetched, gone, deferred, len(known)))
+        note += ("  clips %d named: +%d fetched / %d destroyed / %d deferred over %d run(s)"
+                 % (named, fetched, gone, deferred, len(known)))
+        if probed:
+            note += "  (%d name(s) 404 once, not yet confirmed destroyed)" % probed
+    if refused:
+        note += "  ⚠️REFUSED %s" % json.dumps(refused, sort_keys=True)
+        if any(k.startswith("store_") for k in refused):
+            note += " -- the bytes arrived and the pool could not write them"
+            bad = True
     if max_deferred >= 0 and deferred > max_deferred:
         note += ("  ⚠️CAP BOUND: %d clip(s) left on the card unfetched (%s) -- they "
                  "are one eviction from gone"
@@ -1432,6 +1494,12 @@ def check(root: str, max_stale_s: float = DEFAULT_MAX_STALE_S,
         clip_note, clip_bad = _clip_note(s, now, max_clips_deferred, max_clips_lost,
                                          unfetched_window_s)
         bad += clip_bad
+        if s.get("ls_truncated_at"):
+            # Not fatal: the fetch and the ingest are unaffected. But scene_names() and the clip
+            # work list are both built from a listing the node says it cut short, so a run on a
+            # partial census must not read as a run on a complete one.
+            clip_note += ("  ls listing TRUNCATED at %d entries -- the census is partial"
+                          % int(s["ls_truncated_at"]))
         last = s.get("last_success_s")
         if last is None:
             lines.append("%-10s NEVER succeeded (last error: %s)%s%s"
@@ -1553,12 +1621,16 @@ def main(argv=None) -> int:
                 print("    clips UNMEASURED this run, not clean: %s" % r.get("clips_reason"))
             elif r.get("clips_seen"):
                 print("    clips %d named: +%d fetched (%.1f MB), %d already held, %d already "
-                      "gone, %d destroyed now, %d deferred%s%s"
+                      "gone, %d destroyed now, %d 404 once, %d deferred%s%s"
                       % (r["clips_seen"], r["clips_fetched"], r["clips_bytes"] / 1e6,
                          r["clips_already_held"], r["clips_already_gone"], r["clips_gone"],
-                         r["clips_deferred_by_cap"],
+                         r["clips_probed_404"], r["clips_deferred_by_cap"],
                          "  CAP HIT (%s)" % r["clips_cap_reason"] if r["clips_cap_hit"] else "",
                          "  refused %s" % r["clips_refused"] if r["clips_refused"] else ""))
+            if r.get("ls_truncated_at"):
+                print("    ⚠️/ls stopped at %d entries -- this census is PARTIAL, not a short "
+                      "card; scene files and clip names past that point were not seen"
+                      % r["ls_truncated_at"])
             if r.get("ls_error"):
                 print("    /ls failed (%s) -- reach-back UNMEASURED this run, not clean"
                       % r["ls_error"])
