@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """One line per node: is the fleet on the same build, and is each node fit to contribute tonight?
 
-    python3 tools/fleet.py nyquist mach rankine
+    python3 tools/fleet.py nyquist mach rankine                 # needs mDNS
+    python3 tools/fleet.py nyquist=172.16.100.105 mach=172.16.100.116   # anywhere
 
 WHY THIS EXISTS. Three nodes reported byte-identical /status SHAPES while running binaries built
 from different commits, and nothing in the fleet could tell them apart -- "are they all on the
@@ -43,8 +44,31 @@ SCENE_MB_PER_H = 335 * (3600 / 1.024) / 1e6      # 1.18 MB/h
 NIGHT_H = 14.0                                    # dusk to well past dawn
 
 
+def split_target(node: str) -> tuple:
+    """`name`, `name=host`, or a bare URL -> (display name, status URL).
+
+    ⚠️`.local` DOES NOT RESOLVE from WSL or from inside k3s -- /etc/nsswitch.conf is `files dns`
+    with no mDNS, and DHCP registers the chip hostname (`esp32s3-5B4B40`) rather than the friendly
+    one. So the bare-name form works only from a host with mDNS, which is not where this gets run:
+    the drain that reaches every node hourly lives in the cluster and addresses them by IP.
+
+    That is not a cosmetic gap. This tool exists to catch exactly the drift it then missed -- three
+    nodes on three different builds, one of them a hand-built sketch reporting `fw: unknown` for
+    long enough that nobody could say what it was running. It could not have caught that, because
+    it could not resolve a single node from the machine anyone was going to run it on.
+
+    `name=host` is the form tools/hear_drain.py already takes, so one map serves both.
+    """
+    if node.startswith("http"):
+        return node, node if node.rstrip("/").endswith("/status") else node.rstrip("/") + "/status"
+    if "=" in node:
+        name, _, host = node.partition("=")
+        return name, "http://%s/status" % host
+    return node, "http://%s.local/status" % node
+
+
 def fetch(node: str) -> Dict:
-    url = node if node.startswith("http") else "http://%s.local/status" % node
+    _, url = split_target(node)
     last: Optional[Exception] = None
     for _ in range(RETRIES):
         try:
@@ -72,20 +96,32 @@ def row(name: str, d: Dict) -> str:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("nodes", nargs="+")
+    # ⚠️OPT-IN, AND ONLY FOR THE SPLIT. This tool's default is to report and not gate, because a
+    # node with no sky yet is not a failure and a tool that cries wolf about tonight teaches its
+    # operator to ignore it. A SPLIT FLEET is different in kind: it is never transient, never
+    # self-healing, and it silently invalidates the capture -- arrivals from different builds are
+    # not comparable. So a scheduled caller can ask for that one condition to be an error, and
+    # gets nothing else. Unreachability still only affects the exit code as it always did.
+    ap.add_argument("--require-one-build", action="store_true",
+                    help="exit non-zero if the nodes that ANSWERED are not all on one build")
     a = ap.parse_args(argv)
 
     got: Dict[str, Dict] = {}
     dead: List[str] = []
+    names: Dict[str, str] = {}
     for n in a.nodes:
+        names[n] = split_target(n)[0]
         try:
             got[n] = fetch(n)
         except Exception as e:
-            dead.append("%s: %s" % (n, e))
+            dead.append("%s: %s" % (names[n], e))
 
     print("%-9s %-14s %s" % ("node", "fw", "state"))
     for n in a.nodes:
         if n in got:
-            print(row(n, got[n]))
+            # the node's OWN name when it gave one -- an argument is what was asked for, and a
+            # flash that landed the wrong identity is the failure this whole column exists for
+            print(row(got[n].get("node") or names[n], got[n]))
     for d in dead:
         print("  UNREACHABLE  " + d)
 
@@ -105,6 +141,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Anything that would make tonight's capture unusable, said once rather than left to be
         # spotted in a column.
         for n, d in got.items():
+            n = d.get("node") or names.get(n, n)
             why = []
             if not d["time"]["valid"]:
                 why.append("no UTC anchor")
@@ -119,6 +156,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                % (d["sd_free_mb"], hours))
             if why:
                 print("  %-9s %s" % (n, "; ".join(why)))
+    if a.require_one_build and len({d.get("fw", "?") for d in got.values()}) > 1:
+        return 2
     return 0 if not dead else 1
 
 
