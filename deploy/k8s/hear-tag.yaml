@@ -119,6 +119,7 @@ spec:
                     --deadline-s 600
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/sketch.py,   subPath: hear_sketch.py }
                 - { name: code, mountPath: /app/hear/clips.py,    subPath: hear_clips.py }
                 - { name: code, mountPath: /app/hear/tags.py,     subPath: hear_tags.py }
                 - { name: code, mountPath: /app/tools/hear_tag.py, subPath: tools_hear_tag.py }
@@ -195,6 +196,7 @@ spec:
                   exit "$rc"
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/sketch.py,   subPath: hear_sketch.py }
                 - { name: code, mountPath: /app/hear/clips.py,    subPath: hear_clips.py }
                 - { name: code, mountPath: /app/hear/tags.py,     subPath: hear_tags.py }
                 - { name: code, mountPath: /app/tools/hear_tag.py, subPath: tools_hear_tag.py }

@@ -85,6 +85,10 @@ SCORE_DATA = [
 # digest travels with the code that enforces it.
 TAG_CODE = [
     ("hear__init__.py", "hear/__init__.py"),
+    # ⚠️clips.py READS THE WAV HEADER'S RATE AND ASKS sketch.py WHETHER THE FORMAT CAN NAME IT, so
+    # sketch.py is in this closure too. It is now in all three bundles: one edit, three ConfigMaps
+    # to regenerate, which is what check() exists to keep saying out loud.
+    ("hear_sketch.py", "hear/sketch.py"),
     ("hear_clips.py", "hear/clips.py"),
     ("hear_tags.py", "hear/tags.py"),
     ("tools_hear_tag.py", "tools/hear_tag.py"),
