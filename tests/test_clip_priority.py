@@ -11,7 +11,7 @@ a grep over the whole file would match the very comment that explains the rule.
 import re
 from pathlib import Path
 
-INO = Path(__file__).resolve().parents[1] / "firmware" / "night_node" / "night_node.ino"
+INO = Path(__file__).resolve().parents[1] / "firmware" / "hear_node" / "hear_node.ino"
 
 
 def _body(name):

@@ -87,7 +87,7 @@ static WebServer http(80);
 static bool sta_ok = false;
 
 // ---------------------------------------------------------------- boot failback
-// Same shape as night_node: count boots in RTC memory, and flip back if a new image never proves
+// Same shape as hear_node: count boots in RTC memory, and flip back if a new image never proves
 // itself. It does NOT rely on the bootloader's rollback, which this core's prebuilt bootloader may
 // not have enabled -- depending on that would be depending on something unverified.
 // Failback lives in hear_platform/hear_boot.{h,cpp}. It used to be a SECOND COPY here, and
@@ -128,7 +128,7 @@ static void node_identity() {
 }
 
 // ---------------------------------------------------------------- GPS (PMTK, not UBX)
-// The L86 speaks MediaTek's PMTK, so none of night_node's UBX config applies here: no CFG-VALSET,
+// The L86 speaks MediaTek's PMTK, so none of hear_node's UBX config applies here: no CFG-VALSET,
 // no TIM-TP, no NAV-PVT. Fix and satellite count come from NMEA, and the timepulse -- when there
 // is a wire for it -- is set with PMTK285 rather than CFG-TP-*.
 static uint32_t gps_sentences = 0, gps_valid = 0;

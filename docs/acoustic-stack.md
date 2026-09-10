@@ -141,7 +141,7 @@ that kept the audio and lost the ledger let the next run's 404 write a false
 and every bad body, so the census of what was destroyed is countable from the pool rather than
 reconstructed by diffing, and `clips_seen == fetched + already_held + already_gone + gone +
 probed_404 + refused + deferred_by_cap` is an assertion in `drain_clips`, not a hope. One 404 is
-**not** an eviction: `night_node.ino`'s `/sd` answers 404 for any failed `SD.open`, descriptor
+**not** an eviction: `hear_node.ino`'s `/sd` answers 404 for any failed `SD.open`, descriptor
 exhaustion included, so it takes `CL.CONFIRM_404` consecutive ones before the terminal row. A run that never reached the node reports
 `clips_unknown` with its own reason — **never `clips_gone: 0`**.
 
@@ -214,7 +214,7 @@ this fleet recorded.
 These reshape the architecture and are not editorial.
 
 **1.1 There is no radio.** `grep -E 'lora|meshtastic|sx126|RadioLib|rf95|mqtt|PubSub|WiFiUDP|
-HTTPClient'` across `firmware/night_node/`, `firmware/puc_node/`, `firmware/hear_poc/` and
+HTTPClient'` across `firmware/hear_node/`, `firmware/puc_node/`, `firmware/hear_poc/` and
 `firmware/lib/hear_platform` returns a comment about the nRF52840 and `SPI.begin(SD_SCK, ...)` —
 the SD card. A node **ships nothing**. It is a single-client `WebServer` that gets polled. The
 "radio carries 172 B sketches, WiFi carries audio" split is real in `docs/uplink.md`,
@@ -249,12 +249,12 @@ what gates §5's stage S1.
 | `/audio?dur=30` | 960,170 | 7.01 s | +1.7 s (~24 %) | 0.49 s | **3.5×** |
 
 Mechanism, read from source: only the `/audio` handler calls `audio_pump()` between chunks
-(`night_node.ino:2712-2721`); `/sd` (2181) and `/perf` (2217) do not. Even `/audio` caps
+(`hear_node.ino:2712-2721`); `/sd` (2181) and `/perf` (2217) do not. Even `/audio` caps
 catch-up at `AUDIO_PUMP_MAX` = 6 blocks = 96 ms, the I2S DMA depth — past that "*the samples are
 already gone*". So the loss fraction on `/audio` is **link-speed dependent by construction**:
 24 % at rankine's 137 kB/s, 57.5 % measured on mach at ~71 kB/s effective.
 
-The counter is structurally blind (`night_node.ino:2989-3040`): the audit differences the two
+The counter is structurally blind (`hear_node.ino:2989-3040`): the audit differences the two
 most recently **seen** PPS edges, so a stall spanning N > 1 edges is charged **one** second, and
 if the surviving delta clears `0.97 × 16000` it is charged **zero**.
 
@@ -908,7 +908,7 @@ retargeted or retired deliberately.)
 | mach's +15.5 dB floor: electrical or environmental | whether mach is a classification node | **10 minutes** — cover the mic and log |
 | BirdWeather 4066 detection count / span / confidence | whether a site bird probe is trainable this month | one API pull |
 | Perch/BirdNET accuracy on 16 kHz-sourced audio | all of S1 (§5, Gate 2) | one puc-clip A/B — the METHOD is now proven on mn10_as (§6.2c); only Perch is untested |
-| per-node RSSI on nyquist/mach/rankine | the transport curve — `night_node.ino` never calls `WiFi.RSSI()` and `/status` has no wifi block; the only RSSI on the property is puc's −77 dBm | a firmware field |
+| per-node RSSI on nyquist/mach/rankine | the transport curve — `hear_node.ino` never calls `WiFi.RSSI()` and `/status` has no wifi block; the only RSSI on the property is puc's −77 dBm | a firmware field |
 | whether the 24 %→57.5 % `/audio` loss curve is linear in link speed | whether the token bucket's charge model is right | two more nodes' worth of points |
 | the 3.27 h scene stall's historical extent | how much corpus has already been lost this way | a row-rate gap analysis over 82,225 pooled rows |
 | whether the drain causes the 1.09/1.12 ring excess | whether S0.2 actually recovers what §0.2 implies | instrument the ratio across a drain run with no other traffic |

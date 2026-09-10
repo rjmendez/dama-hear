@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit firmware/night_node/secrets.h from ~/.wifi. secrets.h is gitignored.
+"""Emit firmware/hear_node/secrets.h from ~/.wifi. secrets.h is gitignored.
 
     python3 gen_secrets.py <node-id> [node-class]
 

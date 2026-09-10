@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Generate firmware/night_node/decim.h -- the anti-alias FIR the /2 decimator runs.
+"""Generate firmware/hear_node/decim.h -- the anti-alias FIR the /2 decimator runs.
 
-    python3 firmware/gen_decim.py > firmware/night_node/decim.h
+    python3 firmware/gen_decim.py > firmware/hear_node/decim.h
 
 ⚠️THE FILTER REPLACES ONE THE MICROPHONE USED TO PROVIDE. Running the PDM mic at 16 kHz let its
 internal decimator do the anti-aliasing. Acquiring at 32 kHz and decimating in software moves that

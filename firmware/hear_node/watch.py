@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Poll the night node and keep a durable record. Runs detached; survives this terminal.
+"""Poll the node and keep a durable record. Runs detached; survives this terminal.
 
     nohup python3 watch.py http://damahear.local >> ~/dama-hear-night.log 2>&1 &
 

@@ -65,7 +65,7 @@ and the arithmetic reproduces `hear.sketch` **byte-for-byte over 6 cases**. A fr
 those flags decodes as `fs=16000, layout=fixed, valid_bands=15`, and `FLEET_SKETCH_MODEL`
 now **accepts** it while the 20-band model still refuses it by name.
 
-⚠️`gen_mel.py` wrote only `path_test/mel16.h` while `night_node/` carried its own copy. They
+⚠️`gen_mel.py` wrote only `path_test/mel16.h` while `hear_node/` carried its own copy. They
 happened to be identical; that was luck, and it now writes both.
 
 **Compiled clean** (`esp32:esp32:XIAO_ESP32S3:PSRAM=opi`, core 3.3.11): 1 122 054 B of program
@@ -106,7 +106,7 @@ node with credentials for a network it cannot reach makes it unreachable and nee
 nodes'  `/status` does not report the SSID they are on, so there is nothing here to reconstruct it
 from.
 
-⚠️**When.** ⚠️CORRECTED 2026-09-08 — the earlier text here called these "night nodes" and put
+⚠️**When.** ⚠️CORRECTED 2026-09-08 — the earlier text here called these "nodes" and put
 detections at 20:00–08:00 local, peaking 22:00–00:00 (191 of 392). **Neither reproduces.** There
 is no node class by that name (the two are `xiao-s3-pps`; `puc` is `puc-ntp`), and over the 638
 anchored sketches in the pooled corpus **0 fall in 20:00–08:00 local** while **515 (81%) fall in

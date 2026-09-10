@@ -6,7 +6,7 @@
 //
 // No window is emitted. np.hanning(nfft) is a function of nfft alone -- NOT of fs -- so
 // MELIMP_WIN is the same array this bank would produce even though the two banks are now
-// at different rates; night_node.ino static_asserts the two NFFTs match and reuses it,
+// at different rates; hear_node.ino static_asserts the two NFFTs match and reuses it,
 // saving 1024 B of flash for a duplicate.
 //
 // band  bins            Hz

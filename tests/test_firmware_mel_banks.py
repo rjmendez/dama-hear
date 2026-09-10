@@ -9,10 +9,10 @@ and the table come from one call to hear.sketch in firmware/gen_mel.py so they c
 There is no ESP32 toolchain in CI, so this reads the generated header and reimplements
 sketch_frame() from it -- the same technique the Kotlin port is checked with.
 
-TWO BANKS, TWO RATES. night_node's own sketch moved to the acquisition rate (48 kHz); path_test's
+TWO BANKS, TWO RATES. hear_node's own sketch moved to the acquisition rate (48 kHz); path_test's
 did not (firmware/path_test/path_test.ino:143 feeds its MEL16_FS straight into i2s.begin, so
 regenerating it would silently move a second sketch's microphone). The renamed file
-(firmware/night_node/mel_impulse.h, prefix MELIMP_ -- not mel16.h/MEL16_ any more, deliberately:
+(firmware/hear_node/mel_impulse.h, prefix MELIMP_ -- not mel16.h/MEL16_ any more, deliberately:
 see test_the_two_banks_are_at_different_rates_and_only_one_of_them_moved) is what makes a stale
 reference to the old name fail loudly instead of reading a real, valid, wrong-rate header.
 """
@@ -26,10 +26,10 @@ import pytest
 from hear import sketch as SK
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-IMPULSE = ROOT / "firmware" / "night_node" / "mel_impulse.h"
+IMPULSE = ROOT / "firmware" / "hear_node" / "mel_impulse.h"
 PATH_TEST = ROOT / "firmware" / "path_test" / "mel16.h"
 BOARD = ROOT / "firmware" / "boards" / "xiao_s3_sense.h"
-INO = ROOT / "firmware" / "night_node" / "night_node.ino"
+INO = ROOT / "firmware" / "hear_node" / "hear_node.ino"
 
 #: (header, its #define prefix). Every test below is parametrized over this pair rather than
 #: hardcoding either, so a rate or a name checked for one bank is checked for both.
@@ -93,7 +93,7 @@ def test_the_header_declares_the_rate_and_the_layout(path, prefix):
 
 def test_the_two_banks_are_at_different_rates_and_only_one_of_them_moved():
     """Fails against the un-renamed two-file layout this replaced: mel16.h regenerated for BOTH
-    night_node and path_test at one shared rate, which is the exact defect (D1) that made
+    hear_node and path_test at one shared rate, which is the exact defect (D1) that made
     path_test's own i2s.begin(MEL16_FS) move with it."""
     fs_nominal = float(re.search(r"#define\s+FS_NOMINAL\s+(\d+)", BOARD.read_text()).group(1))
     decim = int(re.search(r"#define\s+DECIM\s+(\d+)", INO.read_text()).group(1))
@@ -102,8 +102,8 @@ def test_the_two_banks_are_at_different_rates_and_only_one_of_them_moved():
     assert d_path("FS") == fs_nominal
     assert d_impulse("FS") == fs_nominal * decim
     assert not any(re.search(r"\bMEL16_FS\b", p.read_text())
-                  for p in ROOT.glob("firmware/night_node/*.h")), \
-        "a night_node header still defines MEL16_FS: the old name is back"
+                  for p in ROOT.glob("firmware/hear_node/*.h")), \
+        "a hear_node header still defines MEL16_FS: the old name is back"
 
 
 def test_the_node_arithmetic_reproduces_hear_sketch_byte_for_byte():
@@ -149,7 +149,7 @@ def test_the_node_arithmetic_reproduces_hear_sketch_byte_for_byte():
 def test_a_frame_with_those_flags_decodes_and_the_fleet_model_takes_it():
     """The point of the original change: a 16 kHz node's frames were refused by every shipped
     model. Now split in two (D1/T2), because the two headers no longer agree on anything a model
-    cares about: night_node's 48 kHz frame is what DEFAULT_SKETCH_MODEL (20-band) was fitted on
+    cares about: hear_node's 48 kHz frame is what DEFAULT_SKETCH_MODEL (20-band) was fitted on
     and path_test's 16 kHz frame is what still needs FLEET_SKETCH_MODEL (15-band)."""
     sys.path.insert(0, str(ROOT / "modules" / "supersonic"))
     import classify as CL

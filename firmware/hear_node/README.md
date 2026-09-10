@@ -1,4 +1,4 @@
-# Night node
+# node
 
 A XIAO ESP32-S3 Sense left outside overnight, reporting over WiFi. It exists for **one
 measurement**: the true I²S sample rate, disciplined against a real GPS PPS.
@@ -10,9 +10,9 @@ averages out to well under a ppm.
 
 ## Before you flash
 
-    cp firmware/night_node/secrets.h.example firmware/night_node/secrets.h   # then edit
+    cp firmware/hear_node/secrets.h.example firmware/hear_node/secrets.h   # then edit
     arduino-cli compile -u -p /dev/ttyACM0 \
-      --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi firmware/night_node
+      --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi firmware/hear_node
 
 `secrets.h` is gitignored. Without it the node starts its own AP (`dama-hear-node` / `damahear`,
 http://192.168.4.1/) — fine for a bench check, useless in the garden.
@@ -103,7 +103,7 @@ detections** and, until this build, no way to listen to a single one.
 
 ⚠️**48 is the in-run count.** Recipe, on `dets.csv` from the 2026-09-07 capture: 62 data rows, 14
 of them at `uptime_s == 12` — the first 12 s of a boot, before the mic has settled — and 48 with
-`uptime_s > 12`, all of which also carry a valid `utc_us`. This README and `night_node.ino` used
+`uptime_s > 12`, all of which also carry a valid `utc_us`. This README and `hear_node.ino` used
 to say 45 and "the counter ends on 47"; **neither reproduces and both are gone.**
 
 The file and the counter reconcile exactly once you remember that **`dets.csv` persists across
@@ -573,8 +573,8 @@ that must be named, not "the most recent edge", or a late report renames the wro
 ## OTA, and what happens when a bad image lands
 
     arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi \
-      --output-dir .otabuild/out firmware/night_node
-    curl -F firmware=@.otabuild/out/night_node.ino.bin http://<ip>/update
+      --output-dir .otabuild/out firmware/hear_node
+    curl -F firmware=@.otabuild/out/hear_node.ino.bin http://<ip>/update
 
 `/ota` shows the running partition, the boot counter, and whether this image has been accepted.
 
@@ -630,13 +630,13 @@ everything that happens out there — a distinguishable outcome from silence, wh
 
 ## Credentials and watching it
 
-    python3 firmware/night_node/gen_secrets.py     # reads ~/.wifi, writes gitignored secrets.h
+    python3 firmware/hear_node/gen_secrets.py     # reads ~/.wifi, writes gitignored secrets.h
 
 Takes every `WIFI_<n>_SSID`/`WIFI_<n>_PSK` pair and tries each in turn, because an outdoor node may
 only reach one of them and which one is not knowable from indoors. It prints a count and masked
 names, never the credentials. `secrets.h` is written 0600 and is gitignored.
 
-    nohup python3 firmware/night_node/watch.py http://<ip> 30 >> ~/dama-hear-night.log 2>&1 &
+    nohup python3 firmware/hear_node/watch.py http://<ip> 30 >> ~/dama-hear-night.log 2>&1 &
 
 `watch.py` polls `/status`, appends every sample to `~/dama-hear-night.jsonl`, and prints a line
 only when something *changes* — fix gained or lost, the first PPS edge, glitches climbing, a reboot,

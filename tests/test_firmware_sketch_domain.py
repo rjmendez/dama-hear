@@ -1,9 +1,9 @@
 """The sketch path's domain arithmetic, EXECUTED -- plus the source-shape guards that the
 arithmetic alone cannot cover.
 
-firmware/night_node/sketch_domain.h is host-compilable on purpose: this repo has no ESP32 test
+firmware/hear_node/sketch_domain.h is host-compilable on purpose: this repo has no ESP32 test
 harness, so the choice was between running the real expressions and pattern-matching them. The
-functions run here are the same translation units night_node.ino includes; nothing is re-derived
+functions run here are the same translation units hear_node.ino includes; nothing is re-derived
 in Python except the WRONG variants, which are written out explicitly so each test says what it
 is refusing rather than merely what it wants.
 
@@ -23,18 +23,18 @@ sys.path.insert(0, str(ROOT))
 from hear import sketch as SK              # noqa: E402
 from hear.node import detect as DET        # noqa: E402
 
-INO = ROOT / "firmware" / "night_node" / "night_node.ino"
-HDR = ROOT / "firmware" / "night_node" / "sketch_domain.h"
-BANK = ROOT / "firmware" / "night_node" / "mel_impulse.h"
-DECIM_H = ROOT / "firmware" / "night_node" / "decim.h"
-# The rate is the BOARD's, not the sketch's -- night_node.ino:99 includes it rather than restating
+INO = ROOT / "firmware" / "hear_node" / "hear_node.ino"
+HDR = ROOT / "firmware" / "hear_node" / "sketch_domain.h"
+BANK = ROOT / "firmware" / "hear_node" / "mel_impulse.h"
+DECIM_H = ROOT / "firmware" / "hear_node" / "decim.h"
+# The rate is the BOARD's, not the sketch's -- hear_node.ino:99 includes it rather than restating
 # it, and this test must read it from the same place or it stops guarding a board swap.
 BOARD = ROOT / "firmware" / "boards" / "xiao_s3_sense.h"
 
 
 # ---------------------------------------------------------------- source, with the prose removed
 def _strip_comments(src):
-    """⚠️A source-scanning guard that does not strip comments matches its own prose. night_node.ino
+    """⚠️A source-scanning guard that does not strip comments matches its own prose. hear_node.ino
     names MELIMP_HOP, dcblk and aring_w in the comments that explain why they are NOT used."""
     src = re.sub(r"/\*.*?\*/", " ", src, flags=re.S)
     return re.sub(r"//.*", "", src)
@@ -49,7 +49,7 @@ def _define(src, name, cast=int):
     return cast(m.group(1).rstrip("fu"))
 
 
-assert '#include "../boards/xiao_s3_sense.h"' in CODE, "night_node changed boards"
+assert '#include "../boards/xiao_s3_sense.h"' in CODE, "hear_node changed boards"
 FS_NOMINAL = _define(_strip_comments(BOARD.read_text()), "FS_NOMINAL")
 DECIM = _define(CODE, "DECIM")
 FS_ACQ = FS_NOMINAL * DECIM
@@ -281,7 +281,7 @@ SK_CALL_SITES = {
 
 
 def test_every_domain_helper_is_called_from_the_function_that_owns_it():
-    """sketch_domain.h's own header says night_node.ino must not open-code any of this. Fails
+    """sketch_domain.h's own header says hear_node.ino must not open-code any of this. Fails
     against dropping ANY of these call sites -- including the D3 revert, which removes the only
     sk_onset_acq_at() call. The map is checked against the header both ways, so a helper added
     there and never wired up is a failure rather than dead code nobody notices."""
@@ -293,7 +293,7 @@ def test_every_domain_helper_is_called_from_the_function_that_owns_it():
     for fn, owner in sorted(SK_CALL_SITES.items()):
         where = CODE if owner is None else _fn(owner)
         assert fn + "(" in where, \
-            "%s() is never called from %s" % (fn, owner or "night_node.ino")
+            "%s() is never called from %s" % (fn, owner or "hear_node.ino")
 
 
 def test_the_onset_instant_is_recorded_where_the_block_offset_is_known():

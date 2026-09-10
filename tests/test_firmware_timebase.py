@@ -30,14 +30,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hear import nodeclass as NC                                  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1] / "firmware"
-INO = ROOT / "night_node" / "night_node.ino"
+INO = ROOT / "hear_node" / "hear_node.ino"
 # FS_NOMINAL is the BOARD's, not the sketch's: the sample rate belongs to the hardware profile.
 BOARD = ROOT / "boards" / "xiao_s3_sense.h"
 
 
 def _source(strip=True):
     if not INO.exists():
-        pytest.skip("night_node.ino not in this checkout")
+        pytest.skip("hear_node.ino not in this checkout")
     src = INO.read_text()
     if not strip:
         return src
@@ -159,7 +159,7 @@ class TestTheTwoPoisonedFigures:
 
     def test_the_reported_sample_rate_is_the_drop_free_one(self):
         """i2s.measured_hz is not an inert diagnostic: it is the headline of the node's own web UI
-        and what firmware/night_node/watch.py announces on every 0.02 Hz move. Cumulative-over-
+        and what firmware/hear_node/watch.py announces on every 0.02 Hz move. Cumulative-over-
         cumulative served 7984.6726 Hz (-500,958 ppm) and 15332.5601 Hz (-41,715 ppm) from two
         nodes that were acquiring about 16 kHz."""
         src = _source()

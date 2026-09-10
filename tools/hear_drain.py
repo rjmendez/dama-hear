@@ -77,7 +77,7 @@ So the drain MEASURES the reach-back instead of assuming it, and does not try to
 
 ⚠️A CATCH-UP REFETCH IS DELIBERATELY ABSENT, AND THIS IS THE SECOND TIME THAT HAS BEEN DECIDED.
 The node has no offset argument and no Range header, so the only reach-back control is a bigger
-`tail=` -- and `/sd` seeks against the size AT REFETCH TIME (night_node.ino:1985-1986,
+`tail=` -- and `/sd` seeks against the size AT REFETCH TIME (hear_node.ino:1985-1986,
 `size_t remain = f.size(); if (tail > 0 && remain > (size_t)tail) f.seek(remain - tail)`). The
 file grows underneath for the whole of the first fetch (2 MB at the measured 40-135 KB/s is
 15-50 s, ~3.5-12 KB at ~235 B/s), so a tail sized against the pre-fetch `size_now` lands FORWARD
@@ -322,7 +322,7 @@ def _ls_sizes(ip: str, timeout: float = DEFAULT_TIMEOUT_S,
     """`GET /ls` -> {filename: bytes}. Raises on a transport failure; never returns a guess.
 
     The node prints one line per card entry, `- <name>  <N> B` for a file and `d ` for a
-    directory (night_node.ino, the /ls handler). Only files are returned, and the name is
+    directory (hear_node.ino, the /ls handler). Only files are returned, and the name is
     normalised without its leading slash because the core has served it both ways.
 
     ⚠️AN UNPARSEABLE LINE IS DROPPED, WHICH MAKES ITS FILE ABSENT FROM THE RESULT, WHICH THE
@@ -512,7 +512,7 @@ def scene_gap(size_now: Optional[int], fetched_bytes: int, prev_size: Optional[i
 def status_audit(st: Dict[str, Any]) -> Dict[str, Any]:
     """The node's own production counters, so the ledger can be checked against the source.
 
-    ⚠️THE KEY NAMES ARE THE FIRMWARE'S, verified against night_node.ino's /status writer and
+    ⚠️THE KEY NAMES ARE THE FIRMWARE'S, verified against hear_node.ino's /status writer and
     against both live nodes: `acq.drop_s` (not drop_seconds) and `acq.fs_clean_hz` (not fs_clean).
     A wrong name here reads as None and an audit full of Nones looks like a node with nothing to
     report rather than like a reader with the wrong spelling.
@@ -938,7 +938,7 @@ def drain_clips(pl: "P.Pool", node: str, ip: str, candidates: List[Dict[str, Any
 
         body, reason = fetch_clip(ip, cand["clip"], timeout)
         if reason == "http_404":
-            # ⚠️ONE 404 IS NOT PROOF OF AN EVICTION. night_node.ino:2436 answers 404 for ANY
+            # ⚠️ONE 404 IS NOT PROOF OF AN EVICTION. hear_node.ino:2436 answers 404 for ANY
             # failed SD.open -- the no-card case is a 503 at :2435, but descriptor exhaustion,
             # which the firmware's own comment at :2340-2344 says is reachable with max_files 8,
             # collapses to 404 as well. Calling that terminal on first sight writes "the node
@@ -1185,7 +1185,7 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
         write_watermarks(pl.root, wm)
 
     # ⚠️THE DETS BODIES ARE KEPT. dets.csv is where clip names come from -- `det_flush` refuses to
-    # write a detection's row until its clip has resolved (night_node.ino), so a name in this file
+    # write a detection's row until its clip has resolved (hear_node.ino), so a name in this file
     # is a clip that already landed on the card. Discovery via /ls?dir= needs a reflash and this
     # does not, which is why this is the shipping path.
     dets_bodies: List[Tuple[str, bytes]] = []

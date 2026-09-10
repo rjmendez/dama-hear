@@ -135,22 +135,22 @@ NOMINAL_FS = 16000.0
 # happen to coincide today.
 LEGACY_NODE_FS = 16000.0
 
-# The node's sketch shape, COPIED from firmware/night_node/mel_impulse.h (MELIMP_BANDS,
+# The node's sketch shape, COPIED from firmware/hear_node/mel_impulse.h (MELIMP_BANDS,
 # MELIMP_FRAMES). Held here so a frame of a DIFFERENT shape is recognised as different rather than
 # silently measured with these -- bands and frames ARE on the wire, so a frame of another shape
 # decodes to another shape and `known` in to_record() goes False, and span_ms becomes an honest
 # null rather than a wrong number. (Hop and nfft are NOT copied here at all any more: they came
 # from hear.sketch, not from a second reading of it -- see feature_span_ms.)
-# tests/test_bridge.py::TestFirmwareConstantsDoNotDrift parses mel_impulse.h and night_node.ino
+# tests/test_bridge.py::TestFirmwareConstantsDoNotDrift parses mel_impulse.h and hear_node.ino
 # and fails on either of the two, or on AUDIO_MAX_S against NODE_MAX_DUR_S.
 NODE_BANDS, NODE_FRAMES = 20, 8
 
-# The node caps `dur` at AUDIO_MAX_S (night_node.ino, the "/audio" handler: `if (dur >
+# The node caps `dur` at AUDIO_MAX_S (hear_node.ino, the "/audio" handler: `if (dur >
 # (float)AUDIO_MAX_S) dur = (float)AUDIO_MAX_S;`). A pointer asking for more would silently come
 # back short, so audio_pointer clamps to it here and says so in the record instead.
 NODE_MAX_DUR_S = 30.0
 
-# v1 FLAGS ONLY. hear/sketch.py's 2-byte flags word is free-form and the firmware (night_node.ino,
+# v1 FLAGS ONLY. hear/sketch.py's 2-byte flags word is free-form and the firmware (hear_node.ino,
 # in the gate's detection branch) uses exactly these two bits: bit 0 retrigger, bit 1 "the ring had
 # not filled behind the trigger". ⚠️A v2 frame's flags word means something else entirely --
 # seq<<8 | version<<5 | profile<<1 | retrigger (hear/wire.py: _F_SEQ_SHIFT, _F_VERSION_SHIFT,
@@ -159,7 +159,7 @@ NODE_MAX_DUR_S = 30.0
 V1_FLAG_RETRIGGER = 0x0001
 V1_FLAG_NO_CONTEXT = 0x0002
 
-# The literal header the firmware writes (night_node.ino: DETS_HDR). Checked rather than trusted:
+# The literal header the firmware writes (hear_node.ino: DETS_HDR). Checked rather than trusted:
 # File::size() returns uninitialised memory on a file SD.open() has just created, so a node can
 # and does produce a dets.csv with NO header at all. Parsed with csv.DictReader, a headerless
 # file turns its first detection into the column names and every later row into plausible
@@ -167,7 +167,7 @@ V1_FLAG_NO_CONTEXT = 0x0002
 DETS_COLUMNS = ["utc_us", "uptime_s", "sample", "pps_n", "us_since_pps",
                 "trigger", "flags", "fs_hz", "frame_hex"]
 
-# The literal header the firmware writes for the scene feature (night_node.ino: SCENE_HDR),
+# The literal header the firmware writes for the scene feature (hear_node.ino: SCENE_HDR),
 # checked for the same reason.
 SCENE_COLUMNS = ["utc_us", "uptime_s", "sample", "bands", "slices", "span_ms",
                  "ref_db4", "frames", "fft_us", "mel_hex"]
@@ -321,7 +321,7 @@ def _parse_csv(text: str, columns: Sequence[str], src: str) -> List[Dict]:
 def rows_from_detections(obj: Sequence[Dict]) -> List[Dict]:
     """Rows from the node's /detections JSON, normalised to the dets.csv column names.
 
-    /detections is the live ring (night_node.ino: h_dets()): the newest MAXDET=128, oldest first,
+    /detections is the live ring (hear_node.ino: h_dets()): the newest MAXDET=128, oldest first,
     in RAM. It carries `frame` and `frame_len` where the card carries `frame_hex`; frame_len is
     checked against the hex it came with, because a truncated JSON body is otherwise
     indistinguishable from a short frame and would decode as a smaller sketch.
@@ -369,7 +369,7 @@ def decode_scene_row(row: Dict) -> Dict:
     feature_vector() sees one kind of thing. The second axis is `slices`, not `frames`: see the
     note on frames_summed below.
 
-    THE FORMAT, as the firmware writes it (night_node.ino: scene_emit()): mel_hex is a BARE array
+    THE FORMAT, as the firmware writes it (hear_node.ino: scene_emit()): mel_hex is a BARE array
     of bands x slices int8 values, hex-encoded, band-major (index b*slices + s), each a 0.5 dB
     step below the row's own reference -- `roundf((scene_db[i] - ref) * 2.0f)` clamped to int8 --
     and the reference is the row's `ref_db4` column in quarter-dB. There is NO v1/v2 header on it
@@ -434,7 +434,7 @@ def frame_flags(dec: Dict) -> Tuple[bool, Optional[bool]]:
 
     ⚠️THE FLAGS WORD IS NOT ONE FORMAT. v1 (hear/sketch.py) hands its 16 bits to the firmware,
     which spends two of them: bit 0 retrigger, bit 1 "the ring had not filled behind the trigger"
-    (night_node.ino, the gate's detection branch). v2 (hear/wire.py) packs the SAME word as
+    (hear_node.ino, the gate's detection branch). v2 (hear/wire.py) packs the SAME word as
     seq<<8 | version<<5 | profile<<1 | retrigger, so bit 1 is profile-id bit 0: masking
     V1_FLAG_NO_CONTEXT against a v2 frame carrying profile 1 (flags 0x0342) reports "no context"
     for a frame that has full context. Reproduced in tests/test_bridge.py.
@@ -519,7 +519,7 @@ def level_tags(peak: float, retrigger: bool = False, context_ok: Optional[bool] 
     this site's quartiles to another.
 
     `no_context` leads when the frame says so, because a v1 sketch taken before the ring filled is
-    all-equal bands (night_node.ino, the gate's detection branch sets bit 1 when
+    all-equal bands (hear_node.ino, the gate's detection branch sets bit 1 when
     `aring_total < back`) and its shape is an artefact -- "the vector is meaningless" is the
     honest dominant label, and it puts those rows in their own cluster instead of seeding a false
     one. `context_ok=None` (a v2 frame, which has no such bit) adds no tag either way: it is
@@ -675,7 +675,7 @@ def to_record(row: Dict, node: str, node_id: Optional[int] = None,
     if utc_us is None:
         raise Reject("malformed_row", "row has no utc_us column; it cannot be placed in time")
     if utc_us <= 0:
-        # The firmware writes 0 when the GPS anchor was not trusted at that instant (night_node
+        # The firmware writes 0 when the GPS anchor was not trusted at that instant (hear_node
         # .ino: `dets[idx].utc_us = tok ? t : 0;`, and scene_emit's `sample_to_utc` returning 0).
         # Zero is not "unknown" to anything downstream: the archiver buckets it into
         # telem_0.jsonl and cluster_audio_embed's coverage footprint spans it against the rest of

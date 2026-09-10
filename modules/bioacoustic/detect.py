@@ -371,7 +371,7 @@ class TonalGate:
     updates its ambient only on the armed-and-under-threshold branch, which is safe for impulses
     and deadlocks on a rising floor: once disarmed it stops learning, so it can never learn the
     level that is keeping it disarmed. The firmware hit this in the field and fixed it -- see
-    `gate()` in firmware/night_node/night_node.ino and the `ALPHA_UP` constant above it, whose
+    `gate()` in firmware/hear_node/hear_node.ino and the `ALPHA_UP` constant above it, whose
     comment records the measurement: "156 s solid disarmed, envelope 1400-1600 against thr 800,
     ambient frozen at 73.2, two detections all night". A chorus IS a floor that rises for hours,
     so this module cannot afford that failure and does not have the branch.

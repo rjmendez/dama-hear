@@ -879,7 +879,7 @@ class TestTheSketchJoinIsReadOnlyAndSaysHowStrongItIs:
     @pytest.mark.parametrize("fs_hz", [16000.0, 48000.0, 32000.0])
     def test_the_sample_basis_window_is_in_the_decimated_counter_at_every_frame_rate(
             self, tmp_path, fs_hz):
-        """The pool row pairs `sample` -- night_node's DECIMATED counter -- with `fs_hz`, the rate
+        """The pool row pairs `sample` -- hear_node's DECIMATED counter -- with `fs_hz`, the rate
         the frame was CUT at, 48000.0 on every node frame since the sketch moved to the
         acquisition stream. Only FS_NOMINAL_HZ indexes the counter sample_window() built cs0/cs1
         in; the frame's own rate gives the window's LENGTH IN SECONDS and nothing else.

@@ -18,7 +18,7 @@ import re
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SKETCHES = [ROOT / "firmware" / "night_node" / "night_node.ino",
+SKETCHES = [ROOT / "firmware" / "hear_node" / "hear_node.ino",
             ROOT / "firmware" / "puc_node" / "puc_node.ino"]
 GUARD = ROOT / "firmware" / "lib" / "hear_platform" / "src" / "hear_wifi_guard.h"
 

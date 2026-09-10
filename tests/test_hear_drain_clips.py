@@ -51,7 +51,7 @@ def _dets_csv(rows):
 
 
 def _wav(fs=16000, samples=64000, channels=1, bits=16):
-    """A canonical 44-byte-header WAV, byte-for-byte the shape night_node.ino writes."""
+    """A canonical 44-byte-header WAV, byte-for-byte the shape hear_node.ino writes."""
     data = b"\x11\x22" * samples
     return (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt "
             + struct.pack("<IHHIIHH", 16, 1, channels, fs, fs * channels * bits // 8,
@@ -263,7 +263,7 @@ class TestTheIndexIsTheDedupKey:
     def test_a_404_is_confirmed_before_it_is_called_an_eviction(self, tmp_path, wired):
         # ⚠️WITHOUT THE NEGATIVE CACHE the drain re-probes 321 dead nyquist names every 15 min
         # forever -- measured: 321 of 370 dets-named clips are already 404. ⚠️AND WITHOUT THE
-        # CONFIRMATION a single 404 retires a clip that is still on the card: night_node.ino:2436
+        # CONFIRMATION a single 404 retires a clip that is still on the card: hear_node.ino:2436
         # answers 404 for ANY failed SD.open, descriptor exhaustion included (:2340-2344).
         # Pre-change the FIRST run booked `clips_gone: 1` and the name was never probed again.
         rows = [_dets_row(_name(700), sample=700)]

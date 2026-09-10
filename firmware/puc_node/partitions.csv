@@ -3,7 +3,7 @@
 # slot and no OTA at all. OTA is the entire requirement here -- this board goes to the bench and
 # should never need the cable again -- so the table is written out rather than chosen.
 #
-# 3 MB per slot is generous against night_node's 1.1 MB, and leaves room for the scene/mel work
+# 3 MB per slot is generous against hear_node's 1.1 MB, and leaves room for the scene/mel work
 # and anything a 48 kHz two-microphone node grows into. The rest is FAT, because the PUC records
 # to flash as well as to its SD slot and 26 MB is a lot of audio.
 #

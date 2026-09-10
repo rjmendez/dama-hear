@@ -18,7 +18,7 @@ length is CHECKED against them, because a truncated line is otherwise indistingu
 smaller descriptor.
 
 ⚠️THE SECOND AXIS IS `slices`, NOT `frames`, AND `frames` IS A ROW TOTAL. The column carries
-`SCENE_FRAMES = SCENE_SLICES * SCENE_FRAMES_PER_SLICE` (night_node.ino:1138-1140, written at
+`SCENE_FRAMES = SCENE_SLICES * SCENE_FRAMES_PER_SLICE` (hear_node.ino:1138-1140, written at
 :1239) -- 64 for the whole row, at 4 slices of 16. The per-slice averaging divides by
 SCENE_FRAMES_PER_SLICE, so a reader that takes this column as the per-slice count is out by a
 factor of `slices`. Neither number is the shape. `frames_per_slice()` derives the per-slice count

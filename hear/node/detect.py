@@ -41,7 +41,7 @@ AMBIENT_TAU_S = 10000.0 / 48000.0   # 0.2083 s -- the LEGACY symmetric constant;
 #: Slow up, quick down. The rise must outlast an event string (a clap burst, a magazine, a
 #: firework finale) so the floor cannot be lifted by the very events it is there to catch; the
 #: fall only has to outlast one event, so the node recovers when a site genuinely quietens.
-#: Mirrored in firmware/night_node/night_node.ino as AMB_TAU_RISE_S / AMB_TAU_FALL_S.
+#: Mirrored in firmware/hear_node/hear_node.ino as AMB_TAU_RISE_S / AMB_TAU_FALL_S.
 AMBIENT_TAU_RISE_S = 30.0
 AMBIENT_TAU_FALL_S = 5.0
 

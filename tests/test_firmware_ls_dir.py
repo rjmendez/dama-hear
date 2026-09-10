@@ -6,7 +6,7 @@ producer is checked by reading its source and the consumer by feeding it a golde
 two meet at the line format `- <name>  <N> B`.
 
 ⚠️THESE READ ONE HANDLER BODY, NEVER THE WHOLE FILE, AND THAT SCOPING IS LOAD-BEARING. Measured:
-`SD.open("/")` appears once MORE in this file, at night_node.ino:1379, so
+`SD.open("/")` appears once MORE in this file, at hear_node.ino:1379, so
 `test_ls_takes_a_directory_argument`'s negative assertion would fail against a correct handler if
 it scanned the file. The same is true in reverse for the positive ones -- the prose above the
 handler discusses `dir`, `..` and the entry cap.
@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT))
 
 from tools import hear_drain as D  # noqa: E402
 
-INO = ROOT / "firmware" / "night_node" / "night_node.ino"
+INO = ROOT / "firmware" / "hear_node" / "hear_node.ino"
 GOLDEN = Path(__file__).resolve().parent / "fixtures" / "ls-clips-nyquist.txt"
 ROOT_CAPTURE = Path(__file__).resolve().parent / "fixtures" / "ls_nyquist.txt"
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Undo the fs_clean latch's timestamp bias in a captured dets.csv.
 
-⚠️WHY A CAPTURE NEEDS THIS. night_node back-dates each sample's stamp from the end of the block
+⚠️WHY A CAPTURE NEEDS THIS. hear_node back-dates each sample's stamp from the end of the block
 it arrived in:
 
-    back_us = (BLOCK - 1 - i) * 1e6 / fs_at        (night_node.ino, at the gate edge)
+    back_us = (BLOCK - 1 - i) * 1e6 / fs_at        (hear_node.ino, at the gate edge)
     cap_us  = esp_timer_get_time() - back_us
 
 `fs_at` is the node's own measured rate, and on mach it LATCHED at 22624.0 Hz -- the short-second
@@ -30,7 +30,7 @@ import argparse
 import csv
 import sys
 
-BLOCK = 256          # night_node BLOCK, and MELIMP_NFFT
+BLOCK = 256          # hear_node BLOCK, and MELIMP_NFFT
 FS_TRUE = 16000.0    # FS_NOMINAL; the crystal is tens of ppm from it, not percent
 
 

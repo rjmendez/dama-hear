@@ -84,10 +84,10 @@ touches 0.0009% of mach cells, so no floor estimate is clamp-biased.
 | p10 spread across bands 3–18 | **0.50 dB** | 1.75 dB pooled; 1.50/2.50/15.00/16.50 per boot |
 | row max (ref_db), median / p99 | 52.5 / 89.6 dB | 50.2 / 83.0 dB |
 
-Read the frequencies off the **scene** bank, not the detection bank: `firmware/night_node/
+Read the frequencies off the **scene** bank, not the detection bank: `firmware/hear_node/
 mel_scene.h` puts band 3 at 437.5 Hz, band 7 at 1062.5–1437.5 Hz, band 11 at 2062.5–2687.5 Hz,
 band 18 at 5375–6875 Hz. (`hear/sketch.py`'s F_LO/F_HI of 300/20000 belong to the DETECTION bank
-and band *k* is a different frequency in each — `night_node.ino` says so where the two are
+and band *k* is a different frequency in each — `hear_node.ino` says so where the two are
 defined. An earlier write-up of this measurement labelled band 7 as "500 Hz" and bands 7–18 as
 "3.5 octaves" by taking the wrong axis; corrected, the flat span is bands 3–18 = 437.5–6875 Hz =
 **3.97 octaves flat to 0.50 dB**, which is wider than the claim it replaces.)
