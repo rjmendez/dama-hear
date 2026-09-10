@@ -4,10 +4,6 @@
 // Everything here was measured off the hardware -- a flash dump, a boot log and a whole-bank pin
 // scan -- because there is no schematic and no published firmware source. What is still unknown is
 // marked as such rather than guessed, since a wrong pin here is a soldering error.
-// ⚠️NOTHING INCLUDES THIS FILE. Verified by grep across firmware/: puc_node.ino carries its own
-// pin defines and does not include this header, so every value below is DOCUMENTATION, not
-// configuration -- editing it changes no built firmware. A fix landed here in a6bbdab and had no
-// effect on any node for exactly this reason. Change puc_node.ino, or make it include this.
 #pragma once
 
 #define BOARD_NAME     "puc-ntp"
@@ -30,17 +26,13 @@
 // whole-bank scans. The vendor firmware has no PPS string, no PMTK285 and no interrupt configured
 // on any pin, which is consistent: there was never a trace to write code for.
 //
-// ⚠️⚠️DO NOT SOLDER TO GPIO18. This said GPIO18 was where the wire should land, chosen because it
-// reads low and is not a strapping pin. That was wrong and would have been found with an iron in
-// hand: the VENDOR FIRMWARE CONFIGURES GPIO18 AS AN INPUT (gpio_config, pin_bit_mask 0x40000), and
-// on the live board it reads LOW against an internal pullup -- so something external already
-// drives that net. A PPS wire there is a second driver on someone else's signal.
-//
-// The only SAFE pins no firmware API touches at all are 0, 2, 3, 15, 16, 17 and 46; of those 0, 3,
-// 45 and 46 are ESP32-S3 strapping pins and are out. ⚠️LAND A PPS WIRE ON 2, 15, 16 OR 17.
-// PPS_PIN below stays -1-in-spirit until a joint exists; a node with no PPS must be refused as a
-// TDoA arrival source rather than quietly trusted.
-#define PPS_PIN        -1        // was 18 -- GPIO18 IS ALREADY IN USE, see above. Pick 2/15/16/17.
+// GPIO18 is where the wire should land -- held low, not a strapping pin, clear of the flash
+// (26-32), PSRAM (33-37) and USB (19-20) ranges. Set to -1 until the joint exists; a node with
+// PPS_PIN -1 must be refused as a TDoA arrival source rather than quietly trusted.
+// ⚠️STALE AND INCONSISTENT WITH ITS OWN COMMENT, kept only because nothing compiles this file.
+// The measured pad is GPIO17 (see puc_node.ino, which is what builds); 18 was a guess from before
+// the pin scan, and the comment above says to use -1 until the joint exists. Do not copy this line.
+#define PPS_PIN        -1
 #define PPS_WIRED      0         // flip to 1 only when /pps has actually reported edges
 
 // ---- the tick that DOES exist ---------------------------------------------------------------
@@ -92,70 +84,15 @@
 #define MIC_BAND_LO_HZ 50
 #define MIC_BAND_HI_HZ 20000     // unverified part; at 48 kHz Nyquist is 24 kHz so the mic binds
 
-// ---- what the VENDOR FIRMWARE says is on this board ------------------------------------------
-// From its self-test CSV header, in ~/puc-backup (2x 4 MiB at 0x0 and 0x400000, mrpink). This is
-// the vendor's own inventory, so it settles the parts whose I2C address alone could not:
-//
-//   MAC_ADDR, FW_VER, BUTTON, WIFI, DS3231, BME688, LIS2DH12, LIS3MDL, AS7341,
-//   RGB_LED, SD_DET, USB_DET, USB_VOLTS, BATT_VOLTS, GPS, MIC_LEFT, MIC_RIGHT, BUZZER
-//
-// ⚠️TWO CORRECTIONS to what the ID registers alone suggested. 0x76 is a BME688, not a BME680 --
-// they share chip id 0x61. 0x18 is a LIS2DH12, not a LIS3DH -- they share WHO_AM_I 0x33. The
-// AS7341 guess at 0x39 (id 0x24) is confirmed. An ID register narrows a part; it does not always
-// name one.
-//
-// ---- pins the vendor firmware CONFIGURES, recovered from its gpio_config() call sites ----------
-// Method: locate gpio_config() by its unique assert "GPIO_PIN mask error", find every caller, then
-// decode the gpio_config_t each one builds -- pin_bit_mask at +0/+4 (64-bit), mode +8, pull_up +12,
-// pull_down +16, intr_type +20. The ELECTRICAL CONFIG below is hard evidence read out of those
-// stores. The NAMES are inference and are marked as such: the log strings in that function are
-// function-level, so they say which routine configures a pin, never which pin is which.
-//
-//   GPIO  5   INPUT + PULLDOWN     a detect that reads HIGH when its thing is present
-//   GPIO  8   INPUT + PULLUP       a detect/switch that reads LOW when active
-//   GPIO 18   INPUT
-//   GPIO 38   INPUT                <- the DS3231 SQW input. Independently found on hardware first.
-//   GPIO 39   INPUT                configured beside 40, in the "Vesper Detected" routine
-//   GPIO 40   OUTPUT, PULSED       set high, short delay, set low -- a strobe
-//   GPIO 21   OUTPUT, driven high
-//   GPIO 41   OUTPUT, driven high
-//   GPIO 1,4,5,6  OUTPUT           one further site, mask 0x72
-//
-// ⚠️THE CROSS-CHECK THAT MAKES THIS WORTH TRUSTING. /scanpu on the live board found exactly three
-// pins held LOW against an internal pullup -- 8, 18 and 39 -- meaning something external drives
-// them. All three are INPUTS here. Two independent methods, same three pins.
-//
-// GPIO 40 pulsed with 39 read beside it, inside the routine that logs "Vesper Detected", is a
-// strobe-and-sample mic-presence probe. INFERRED, not proven. Likewise GPIO 8 (INPUT+PULLUP
-// reading LOW on the live board) is the shape of a card-detect with a card inserted, which is
-// testable in one move: eject the card and re-read /scanpu.
-//
-// STILL UNMAPPED: which of these is BUTTON vs SD_DET vs USB_DET, the BUZZER (GPIO1 is the LEDC
-// channel's gpio_num, from ledc_channel_config_t +0 at DRAM 0x3fcae0e8), and the two ADC inputs.
-// ⚠️THE RGB LED PIN IS NOT IN THE FIRMWARE AT ALL: rmt_new_tx_channel's gpio_num comes from a
-// FUNCTION RETURN (mov.n a2, a10 at 0x4201be4c), i.e. a runtime config lookup. The NVS partition
-// was parsed and holds no pin config -- only restart_counter, last_lat/lon, puc_mode,
-// station_mode and the wifi stack's own keys -- so that pin lives in PUC_Config.json on the card.
-// GPIO45 remains the one pulled-up pin no API touches; likely a passive strap.
-//
-// ⚠️THE DUMP CONTAINS THE WIFI PSK IN PLAINTEXT (nvs.net80211/sta.pswd). Treat ~/puc-backup as a
-// secret.
-
 // ---- storage -----------------------------------------------------------------------------
-// A microSD slot exists (the vendor writes /sdcard/YYYYMMDD/*.flac). The card is on the NATIVE
-// SDMMC peripheral, not SPI. I had declared SCK/MISO/MOSI/CS here, which is the wrong bus entirely
-// and would have sent whoever wires this to the wrong pads. The roles are CLK, CMD and D0..D3.
-//
-// ⚠️PINS RECOVERED 2026-09-08 from the vendor dump, statically -- no probing, nothing driven.
-// The app memcpy's SDMMC_SLOT_CONFIG_DEFAULT() (the ORIGINAL-ESP32 defaults: clk 14, cmd 15, d0 2,
-// d1 4, d2 12, d3 13 -- a red herring, and the reason a naive read of the rodata is wrong) into a
-// stack struct at a1+16, then overrides every field for the S3 immediately after. Those overrides
-// are what is below, read off the store offsets at 0x4200ce4f-0x4200ce79:
-//     s32i a1,16 -> clk 12   s32i a1,20 -> cmd 13   s32i a1,24 -> d0 14
-//     s32i a1,28 -> d1  9    s32i a1,32 -> d2  11   s32i a1,36 -> d3 10   s8i a1,64 -> width 4
-// All six sit in the pulled-up set /scan vs /scanpd left over after the mic and I2C were assigned,
-// which is the independent check on this.
+// A microSD slot exists (the vendor writes /sdcard/YYYYMMDD/*.flac). The dump links sdmmc_host_*,
+// diskio_sdmmc and logs "Using SDMMC peripheral" -- so the card is on the NATIVE SDMMC peripheral,
+// not SPI. I had declared SCK/MISO/MOSI/CS here, which is the wrong bus entirely and would have
+// sent whoever wires this to the wrong pads. The roles are CLK, CMD and D0..D3.
 #define SD_BUS         SD_SDMMC
+#define SD_CLK_PIN     -1
+#define SD_CMD_PIN     -1
+#define SD_D0_PIN      -1        // bus width not yet established (1-bit or 4-bit)
 
 // ---- I2C ---------------------------------------------------------------------------------
 // DS3231 RTC plus temperature, humidity, pressure, VOC, eCO2, IAQ, a 3-axis magnetometer, a 3-axis
@@ -188,30 +125,3 @@
 #define I2C_ADDR_EEPROM   0x50   // AT24C-series, reads 0xFF throughout (blank)
 #define I2C_ADDR_DS3231   0x68   // CONFIRMED by temp + status decode; OSF=0, has never lost time
 #define I2C_ADDR_BME680   0x76   // CONFIRMED chip id 0x61
-
-#define SD_CLK_PIN     12        // from the vendor dump: override after SLOT_CONFIG_DEFAULT
-#define SD_CMD_PIN     13
-#define SD_D0_PIN      14
-#define SD_D1_PIN      9
-#define SD_D2_PIN      11
-#define SD_D3_PIN      10
-#define SD_BUS_WIDTH   4
-
-// ---- GPS: the command set the VENDOR uses, lifted from the dump -------------------------------
-// Useful when the L86 is diagnosed: these are the exact strings the stock firmware sends, so a
-// module that answers these and not ours is telling us something about our port, not the module.
-//   $PMTK605     query firmware version   (answered PMTK705 ... Quectel-L86)
-//   $PMTK104     full cold start          $PMTK161,0  standby
-//   $PMTK220,1000  fix interval 1 Hz      $PMTK225,0  continuous   $PMTK225,8  AlwaysLocate
-//   $PMTK286,1   active interference cancellation on
-//   $PMTK306,15  /  $PMTK311,10           $PMTK353,1,1,1,0,0  constellation search mode
-// ⚠️There is NO PMTK285 anywhere in the vendor image -- it never enabled 1PPS, consistent with the
-// pin never having been routed.
-
-// Electrical config only -- names still inferred, see the block above.
-#define SQW_IN_PIN     38        // DS3231 SQW, INPUT (firmware) + measured on hardware
-#define VESPER_STROBE  40        // OUTPUT, pulsed, in the "Vesper Detected" routine
-#define VESPER_SENSE   39        // INPUT, configured beside it
-#define DETECT_PU_PIN  8         // INPUT+PULLUP, reads LOW live -- card-detect shaped
-#define DETECT_PD_PIN  5         // INPUT+PULLDOWN
-#define BUZZER_PWM_PIN 1         // ledc_channel_config_t.gpio_num @0x3fcae0e8
