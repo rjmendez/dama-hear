@@ -778,7 +778,11 @@ static void routes() {
     double now = tv.tv_sec + tv.tv_usec / 1e6 + r.offset_s;
     tv.tv_sec = (time_t)now; tv.tv_usec = (suseconds_t)((now - tv.tv_sec) * 1e6);
     settimeofday(&tv, nullptr);
-    bool rtc_ok = ds3231_write_time(47, 48, (time_t)now);
+    // ⚠️ROUND, DO NOT TRUNCATE. The DS3231 holds whole seconds, so (time_t)now discards the
+    // fraction just computed and lands up to 1 s behind; nearest halves the worst case. The
+    // /timesync path avoids this properly by waiting for the second boundary -- this path does
+    // not wait, so rounding is the best available here. (Copilot review, PR #19.)
+    bool rtc_ok = ds3231_write_time(47, 48, (time_t)llround(now));
     g_sync_bound_s = r.rtt_best / 2.0; g_sync_at_ms = millis();
     g_sync_off_s = r.offset_s; g_sync_count++;
     char b[520];
