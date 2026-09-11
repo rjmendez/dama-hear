@@ -1294,12 +1294,24 @@ class TestTheDeployBundle:
 
     @pytest.mark.parametrize("bundle", sorted(GC.BUNDLES))
     def test_every_bundle_declares_the_mode_its_own_SIZE_implies(self, bundle):
-        """Not just this one. hear-drain-code is at 90% of the cap, so the bundle that has
-        always applied cleanly is one import-closure member away from crossing -- and the
-        failure mode is an apply that starts being rejected with no source change to blame."""
+        """Not just this one. hear-drain-code crossed on 2026-09-10 -- the bundle that had always
+        applied cleanly took one import-closure member and was 15 B from the cap, which is the
+        failure mode this test exists for: an apply that starts being rejected with no source
+        change to blame.
+
+        ⚠️THE THRESHOLD IS THE CAP MINUS A MARGIN, NOT THE CAP. Fifteen bytes of headroom is not
+        a passing grade: the `dama-hear/commit` stamp alone moves the object by 6 B between a
+        clean and a dirty tree, so a mode chosen at the exact byte would alternate between runs
+        and the documented deploy command with it. Inside the margin the bundle is called
+        `server`, which always works.
+        """
         _app, code, data = GC.BUNDLES[bundle]
         mode, n_bytes = GC.apply_mode(code, data)
-        assert mode == ("server" if n_bytes > GC.CLIENT_APPLY_ANNOTATION_CAP else "client")
+        limit = GC.CLIENT_APPLY_ANNOTATION_CAP - GC.CLIENT_APPLY_MARGIN
+        assert mode == ("server" if n_bytes > limit else "client")
+        # whatever the margin is, a bundle past the real cap must never be called client
+        if n_bytes > GC.CLIENT_APPLY_ANNOTATION_CAP:
+            assert mode == "server"
         f = REPO / "deploy" / "k8s" / ("%s.yaml" % bundle)
         if not f.exists():
             pytest.skip("no ConfigMap at %s" % f)
