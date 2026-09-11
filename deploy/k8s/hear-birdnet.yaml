@@ -122,10 +122,12 @@ spec:
               image: python:3.13-slim
               command: ["/bin/sh", "-lc"]
               args:
-                # `set +e` and the gate's rc captured first, as in hear-tag-check.
+                # `set +e` and the gate's rc captured first, as in hear-tag-check. The check needs
+                # numpy (hear.clips imports hear.sketch) but not LiteRT, so it reads the tag
+                # lane's library dir rather than one the birdnet job may be installing into.
                 - |
                   set +e
-                  export PYTHONPATH=/pool/pylib-birdnet:/app
+                  export PYTHONPATH=/pool/pylib-tag:/app
                   python /app/tools/hear_tag.py --pool /pool/corpus --check --lane birdnet_v24 \
                     --window-s 7200 --max-stale-s 14400 --max-silence-frac -1 \
                     --min-mean-top-score -1

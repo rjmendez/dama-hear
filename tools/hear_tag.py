@@ -764,7 +764,9 @@ def birdnet_week(ts_utc_s: Optional[float]) -> int:
 
 
 def birdnet_group(scores: Dict[str, float]) -> str:
-    """The top label's common name when it reaches BIRDNET_REPORT, else "below 0.5"."""
+    """The top class's common name once it reaches BIRDNET_REPORT, else "below 0.5". The class is
+    a species or one of BirdNET's non-species classes (Dog, Engine, ...), which the range filter
+    never removes; both are what the clip was heard as."""
     if not scores:
         return "none"
     top = max(scores, key=scores.get)
@@ -838,7 +840,7 @@ class BirdNETTagger:
                 "embedding": None, "embedding_dim": None,
                 "extra": {"location_filter": {"lat": self.lat, "lon": self.lon, "week": week,
                                               "threshold": BIRDNET_LOCATION_THRESHOLD,
-                                              "species_kept": int(keep.sum())},
+                                              "classes_kept": int(keep.sum())},
                           "max_out_of_range_score": float(p[~keep].max()) if (~keep).any()
                           else 0.0}}
 
