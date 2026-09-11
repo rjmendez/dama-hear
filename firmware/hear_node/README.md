@@ -146,10 +146,10 @@ to check it with: these are bounds on the arithmetic, not a measured accuracy.
     GET /audio?from=<utc_us>&dur=<seconds>  that window as a playable mono 16-bit WAV
 
 `dur` is capped at 30 s. Serving the whole ring would be 7.68 MB, which at the 335 kB/s measured on
-this node is ~23 s inside one handler, and the I2S DMA holds 6 × 240 frames = **90 ms** — a handler
-that does not drain it would throw away more audio than the whole capture lost. So the loop's own
-audio path is pumped between 4 kB chunks, the same reason `/tp` pumps `Serial1` rather than
-`delay()`ing.
+this node is ~23 s inside one handler, and the I2S DMA holds 6 × 240 frames = **30 ms** at 48 kHz —
+a handler that does not drain it would throw away more audio than the whole capture lost. So every
+long handler (`/audio`, `/sd`, `/ls`, `/perf`) goes through `stream_ready()`: it pumps each due
+block and writes a 2 KiB chunk only once the socket can take it without blocking.
 
 The writer does not stop while the response is sent, so the oldest ~16 s of the ring is not served
 (capped at a third of the ring, so a 30 s fallback ring still gives 20 s). If the requested window
@@ -254,7 +254,7 @@ boot rolls the old `scene.csv` aside — that machinery exists for exactly this.
 
 `BLOCK` is 256 and `MELIMP_NFFT` is 256, so **one I2S block is one FFT frame** — enforced by a
 `static_assert`. That is the whole design: the descriptor is built 16 ms at a time at a steady
-62.5 FFT/s, instead of a 64-FFT burst once a second that would have to fit inside the DMA's 90 ms
+62.5 FFT/s, instead of a 64-FFT burst once a second that would have to fit inside the DMA's 30 ms
 of headroom or drop audio. The measured +10.6 ppm rate error is far inside one 62.5 Hz bin of a
 256-point FFT, so tables built for the nominal rates stay correct for both banks.
 
@@ -381,11 +381,11 @@ written by the priority-eviction firmware can still carry `budget`.
 
 ### What it costs the audio, and the one regression
 
-The clip is written **one 4096 B chunk per `loop()` pass**, not in a single 128 kB write that would
-stall the I2S reader far past the DMA's 6 × 240 frames = 90 ms. `loop()` already calls
+The clip is written **one 4096 B chunk per `loop()` pass**, not in a single 480 kB write that would
+stall the I2S reader far past the DMA's 6 × 240 frames = 30 ms. `loop()` already calls
 `audio_pump()` every pass, so the DMA is drained between chunks by the code that already does it,
-with no nested pump inside a card write. A whole clip is 32 chunks, so at the ~16 ms an I2S block
-takes it lands in about half a second.
+with no nested pump inside a card write. A whole clip is 118 chunks, so at the ~16 ms an I2S block
+takes it lands in about 1.9 s.
 
 ⚠️**A clip costs about two dropped seconds, measured on hardware.** Forcing one detection with
 `POST /gate?floor=100` on a quiet evening took `drop_s` from 5 to 7 while the single 128 044 B clip

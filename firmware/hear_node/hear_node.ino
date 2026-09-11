@@ -37,6 +37,7 @@
 #include "esp_heap_caps.h"
 
 #include <esp_mac.h>
+#include <lwip/sockets.h>
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -149,6 +150,7 @@ static volatile uint32_t pps_samp_last = 0, pps_samp_first = 0;
 // interpolated index, and the audit keeps the block-quantised one it was validated against.
 static volatile uint32_t blk_end_samp = 0;     // g_samples at the last completed block
 static volatile uint64_t blk_end_us   = 0;     // esp_timer at that same instant
+static uint64_t blk_read_us = 0;               // esp_timer when that block's read returned
 static volatile uint32_t pps_samp_exact = 0;   // interpolated sample index AT the edge
 static volatile uint32_t pps_samp_prev_exact = 0;  // and the one before it, for the mark
 static volatile uint32_t pps_int_min = 0xFFFFFFFF, pps_int_max = 0;
@@ -1386,7 +1388,7 @@ static bool utc_to_sample(int64_t utc, uint32_t *s) {
 // BLOCK is 256 DECIMATED samples and MELS_NFFT is 256, so one I2S block IS one scene FFT frame.
 // That is deliberate: it lets the descriptor be built 16 ms at a time at a steady 62.5 FFT/s
 // instead of a 64-FFT burst once a second, which would have to finish inside the I2S DMA's
-// 6 x 240 frames = 90 ms of headroom or drop audio. Cost is measured, not assumed -- see scene_fft_us_last and /status.
+// 6 x 240 frames = 30 ms of headroom or drop audio. Cost is measured, not assumed -- see scene_fft_us_last and /status.
 #define SCENE_SLICES           4
 #define SCENE_FRAMES_PER_SLICE 16
 #define SCENE_FRAMES (SCENE_SLICES * SCENE_FRAMES_PER_SLICE)   // 64 x 256 = 16384 samples
@@ -1436,10 +1438,12 @@ static uint32_t scene_written = 0;          // rows that actually reached it. de
                                             // counted on intent makes a dead card read as healthy.
 static uint32_t scene_short_blocks = 0;     // I2S reads that came up short of a whole frame
 static uint32_t scene_write_fail = 0;
+static uint32_t scene_stream_skip = 0;      // rows with no open scene file while a handler held the card
 static uint32_t scene_fft_us = 0;           // accumulating over the row in progress
 static uint32_t scene_fft_us_last = 0;      // us of FFT+filterbank per 1.024 s row, MEASURED
 static uint32_t scene_fft_us_max = 0;
 static File     scenef;
+static uint8_t  sd_streaming = 0;           // a handler holds a card File and is pumping audio
 
 // ---------------------------------------------------------------- append-CSV, header guaranteed
 // Every durable record this node keeps is an append-only CSV whose first line must be its header,
@@ -1570,7 +1574,9 @@ static void scene_emit() {
     // below dropped every row. Measured on rankine right after a format: 614 rows computed, 0
     // written, scene_write_fail 0. Silent, permanent, and invisible in the counters, which is the
     // worst combination for the file this project exists to produce.
-    if (strcmp(day, cur_day) != 0 || !scenef) {
+    // While a handler streams a card File, append to the open handle only: FATFS_FS_LOCK is 0, so
+    // pruning or rolling a file the handler is reading would serve freed clusters.
+    if ((strcmp(day, cur_day) != 0 || !scenef) && !sd_streaming) {
       if (scenef) { scenef.close(); }
       snprintf(cur_day, sizeof cur_day, "%s", day);
       char path[36], prev[40];
@@ -1585,7 +1591,7 @@ static void scene_emit() {
     // Still nothing after trying to open: count it. An unwritable card is a real condition and it
     // must show up in scene_write_fail like every other one, rather than as rows that quietly
     // never existed.
-    if (!scenef) { scene_write_fail++; return; }
+    if (!scenef) { if (sd_streaming) scene_stream_skip++; else scene_write_fail++; return; }
   }
   char line[MELS_BANDS * SCENE_SLICES * 2 + 192];
   int m = snprintf(line, sizeof line, "%s,%lld,%lu,%lu,%d,%d,%d,%d,%d,%lu,",
@@ -1645,25 +1651,56 @@ static void scene_frame(const int16_t *s) {
 }
 
 // ---------------------------------------------------------------- /audio limits and WAV
-// Serving the whole ring is 7.68 MB, and WiFi on this node measured 335 kB/s, so that is ~23 s
-// inside one handler. The I2S DMA holds 6 x 240 frames = 90 ms, so a handler that does not drain
-// it would throw away more audio than the entire capture lost (18 s of 40791). Hence: bounded
-// requests, and the loop's own audio path pumped between chunks -- the same reason /tp pumps
-// Serial1 rather than delay()ing.
+// Serving the whole ring is 7.68 MB, ~23 s inside one handler at the 335 kB/s measured on this
+// node, so requests are bounded and every long handler pumps audio while it sends.
 #define AUDIO_MAX_S   30
-// 4096 B is 12 ms of link time at the measured 335 kB/s, against the 16 ms of audio that one
-// pumped block covers, so the DMA drains faster than it fills. The pump then paces the loop at one
-// block per iteration, which is 62.5 x 4096 = 256 kB/s -- arithmetic from the block rate, not a
-// throughput anyone has measured on this endpoint yet.
-#define AUDIO_CHUNK_B 4096
-// ESP_I2S.cpp ships dma_desc_num 6 x dma_frame_num 240 = 1440 samples = 90 ms, so six BLOCKs is
-// everything the peripheral can be holding. Asking for more would block on audio that does not
-// exist yet.
-#define AUDIO_PUMP_MAX 6
 // The writer does not stop while the response is sent, so refuse to serve the oldest part of the
-// ring. By that arithmetic a 30 s request takes about 4 s, in which the head advances 4 s of
-// samples; 16 s covers it even if the link turns out four times slower than the 335 kB/s measured.
+// ring. The send loop also stops if the head laps its cursor.
 #define AUDIO_GUARD_S 16
+
+// ---------------------------------------------------------------- streaming while the mic runs
+// ESP_I2S (core 3.3.11) I2S_DEFAULT_CFG: dma_desc_num 6 x dma_frame_num 240, at FS_ACQ.
+#define I2S_DMA_SAMPLES (6 * 240)
+#define I2S_DMA_US      ((uint32_t)((uint64_t)I2S_DMA_SAMPLES * 1000000ULL / FS_ACQ))
+#define BLOCK_US        ((uint32_t)((uint64_t)ABLOCK * 1000000ULL / FS_ACQ))
+#define STREAM_PUMP_MAX ((I2S_DMA_SAMPLES + ABLOCK - 1) / ABLOCK)
+#define STREAM_CHUNK_B  2048
+#define STREAM_CARD_US  4000u     // allowance for one chunk's card read; not measured
+#define STREAM_STALL_MS 5000u
+static_assert(I2S_DMA_SAMPLES >= ABLOCK, "the DMA must hold one whole block");
+static_assert(STREAM_CHUNK_B <= CONFIG_LWIP_TCP_SND_BUF_DEFAULT / 2,
+              "a socket that selects writable must take a whole chunk without blocking");
+static_assert(BLOCK_US + STREAM_CARD_US <= I2S_DMA_US,
+              "one chunk read between two due blocks must fit in the DMA");
+static uint8_t stream_buf[STREAM_CHUNK_B];
+
+static uint64_t stream_start() { return blk_read_us + BLOCK_US; }
+
+static void stream_pump(uint64_t *due) {
+  for (int k = 0; k < STREAM_PUMP_MAX; k++) {
+    if ((int64_t)((uint64_t)esp_timer_get_time() - *due) < 0) return;
+    audio_pump();
+    sketch_pump();
+    *due += BLOCK_US;
+  }
+  if ((int64_t)((uint64_t)esp_timer_get_time() - *due) > (int64_t)I2S_DMA_US)
+    *due = blk_read_us + BLOCK_US;
+}
+
+// Pumps until the socket can take STREAM_CHUNK_B without blocking. false: gone or stalled.
+static bool stream_ready(WiFiClient &c, uint64_t *due) {
+  uint32_t t0 = millis();
+  for (;;) {
+    stream_pump(due);
+    int fd = c.fd();
+    if (fd < 0 || !c.connected()) return false;
+    fd_set w; FD_ZERO(&w); FD_SET(fd, &w);
+    struct timeval tv = {0, 0};
+    if (select(fd + 1, NULL, &w, NULL, &tv) > 0) return true;
+    if (millis() - t0 > STREAM_STALL_MS) return false;
+    delay(1);
+  }
+}
 
 // Canonical 44-byte PCM WAV header. The rate field is an integer and cannot carry the measured
 // 16000.169 Hz, so the exact figure goes out in X-Audio-Fs-Hz instead; anything doing timing work
@@ -1741,11 +1778,10 @@ static void wav_header(uint8_t *h, uint32_t data_bytes, uint32_t fs) {
 // B/s), so the record keeps running for hours after clips stop.
 #define CLIP_FREE_RESERVE_MB 2
 // Chunk size, and the reason there is one: a 480044 B write inside loop() would stall the I2S
-// reader far past the DMA's 6 x 240 frames = 90 ms and drop the audio this exists to keep. One
+// reader far past the DMA's 6 x 240 frames = 30 ms and drop the audio this exists to keep. One
 // 4096 B chunk per loop iteration instead -- loop() calls audio_pump() every pass, so the DMA is
 // drained between chunks by the code that already does it, with no nested pump inside a card
-// write. 4096 B is what /audio streams for the same reason. A whole clip is 32 chunks, so at the
-// ~16 ms an I2S block takes it lands in about half a second. If the card is slower than that the
+// write. A whole clip is 118 chunks, so at the ~16 ms an I2S block takes it lands in about 1.9 s. If the card is slower than that the
 // cost is not hidden: it shows up in drop_s, which is the instrument for exactly this.
 #define CLIP_CHUNK_B 4096
 #define CLIP_DIR "/clips"
@@ -2131,7 +2167,7 @@ static String status_json() {
       // that assumes MELIMP's band 0 would misread every row -- at 48 kHz that is bins 2-3,
       // i.e. 375.0-750.0 Hz at 187.5 Hz per bin.
     "\"scene\":{\"rows\":%lu,\"written\":%lu,\"row_span_ms\":%d,\"fft_us_per_row\":%lu,\"fft_us_max\":%lu,"
-    "\"short_blocks\":%lu,\"write_fail\":%lu,\"bands\":%d,\"slices\":%d,\"f_lo_hz\":%.1f,\"f_hi_hz\":%.1f},"
+    "\"short_blocks\":%lu,\"write_fail\":%lu,\"stream_skip\":%lu,\"bands\":%d,\"slices\":%d,\"f_lo_hz\":%.1f,\"f_hi_hz\":%.1f},"
     // clips: written advances only on a full CLIP_BYTES landing, evicted once per clip deleted
     // to make room. A card that filled at 03:00 and a gate that went quiet at 03:00 differ
     // here and nowhere else.
@@ -2184,6 +2220,7 @@ static String status_json() {
     (int)((uint32_t)SCENE_FRAMES * MELS_NFFT * 1000u / FS_NOMINAL),
     (unsigned long)scene_fft_us_last, (unsigned long)scene_fft_us_max,
     (unsigned long)scene_short_blocks, (unsigned long)scene_write_fail,
+    (unsigned long)scene_stream_skip,
     MELS_BANDS, SCENE_SLICES, MELS_F_LO, MELS_F_HI,
     (unsigned long)clip_written, (unsigned long)clip_evicted, (unsigned long)clip_skip_full,
     (unsigned long)clip_skip_dedupe, (unsigned long)clip_skip_ring,
@@ -2643,14 +2680,16 @@ void setup() {
     http.sendHeader("Content-Disposition", "inline; filename=\"" + name.substring(1) + "\"");
     http.setContentLength(remain);
     http.send(200, "text/csv", "");
-    uint8_t buf[512];
-    while (remain) {
-      size_t n = f.read(buf, remain > sizeof buf ? sizeof buf : remain);
-      if (!n) break;
-      http.client().write(buf, n);
+    WiFiClient c = http.client();
+    uint64_t due = stream_start();
+    sd_streaming++;
+    while (remain && stream_ready(c, &due)) {
+      size_t n = f.read(stream_buf, remain > sizeof stream_buf ? sizeof stream_buf : remain);
+      if (!n || c.write(stream_buf, n) != n) break;
       remain -= n;
     }
     f.close();
+    sd_streaming--;
   });
   http.on("/ls", []() {
     // dir defaults to root, so an old caller with no argument gets exactly the old listing.
@@ -2670,8 +2709,12 @@ void setup() {
     String pre = (dir == "/") ? String("") : dir.substring(1) + "/";
     http.setContentLength(CONTENT_LENGTH_UNKNOWN);
     http.send(200, "text/plain", "");
+    WiFiClient c = http.client();
+    uint64_t due = stream_start();
+    sd_streaming++;
     unsigned n = 0;
     for (File e = d.openNextFile(); e; e = d.openNextFile()) {
+      if (!stream_ready(c, &due)) { e.close(); break; }
       if (n++ >= LS_MAX_ENTRIES) {
         http.sendContent("! truncated at " + String(n - 1) + " entries\n");
         e.close();
@@ -2683,6 +2726,7 @@ void setup() {
       e.close();
     }
     d.close();
+    sd_streaming--;
     http.sendContent("");
   });
   // ⚠️CYCLES, NOT MICROSECONDS, AND ON THE REAL SILICON. Sizing a multi-microphone node needs the
@@ -2782,8 +2826,9 @@ void setup() {
     http.setContentLength((size_t)mb * 1024 * 1024);
     http.send(200, "application/octet-stream", "");
     WiFiClient c = http.client();
+    uint64_t due = stream_start();
     size_t sent = 0, total = (size_t)mb * 1024 * 1024;
-    while (sent < total && c.connected()) {
+    while (sent < total && stream_ready(c, &due)) {
       size_t n = total - sent; if (n > sizeof chunk) n = sizeof chunk;
       if (c.write(chunk, n) != n) break;
       sent += n;
@@ -3260,29 +3305,17 @@ void setup() {
     uint8_t hdr[44];
     wav_header(hdr, nout * DECIM * 2, (uint32_t)lrint(fsu * DECIM));   // praw is acquisition-rate
     c.write(hdr, sizeof hdr);
-    static uint8_t obuf[AUDIO_CHUNK_B];
-    uint64_t t_prev = (uint64_t)esp_timer_get_time();
+    uint64_t due = stream_start();
     uint32_t s = acq_of((uint32_t)got0), left = nout * DECIM;   // acquisition domain
-    while (left && c.connected()) {
-      uint32_t nsamp = left > AUDIO_CHUNK_B / 2 ? AUDIO_CHUNK_B / 2 : left;
+    while (left && stream_ready(c, &due)) {
+      if ((int32_t)(s - praw_oldest() * DECIM) < 0) break;
+      uint32_t nsamp = left > STREAM_CHUNK_B / 2 ? STREAM_CHUNK_B / 2 : left;
       uint32_t idx = s % praw_cap;
       uint32_t run = praw_cap - idx; if (run > nsamp) run = nsamp;
-      memcpy(obuf, praw + idx, (size_t)run * 2);
-      if (run < nsamp) memcpy(obuf + run * 2, praw, (size_t)(nsamp - run) * 2);
-      if (c.write(obuf, (size_t)nsamp * 2) != (size_t)nsamp * 2) break;
+      memcpy(stream_buf, praw + idx, (size_t)run * 2);
+      if (run < nsamp) memcpy(stream_buf + run * 2, praw, (size_t)(nsamp - run) * 2);
+      if (c.write(stream_buf, (size_t)nsamp * 2) != (size_t)nsamp * 2) break;
       s += nsamp; left -= nsamp;
-      // The mic does not stop for a download. Drain by ELAPSED TIME rather than one block per
-      // chunk: a block is 16 ms of audio, so a fixed one-per-chunk only keeps up above roughly
-      // 256 kB/s, and below that the DMA's 90 ms overruns after a few chunks and stays overrun
-      // for the rest of the download -- losing more audio than the whole capture did. Capped at
-      // the DMA depth, because past that the samples are already gone and blocking here to ask
-      // for them would only widen the hole.
-      uint64_t t_now = (uint64_t)esp_timer_get_time();
-      uint32_t due = (uint32_t)((((t_now - t_prev) * 2ULL) / 125ULL) / (uint32_t)BLOCK);
-      if (due < 1) due = 1;
-      if (due > AUDIO_PUMP_MAX) due = AUDIO_PUMP_MAX;
-      for (uint32_t k = 0; k < due; k++) audio_pump();
-      t_prev = (uint64_t)esp_timer_get_time();
     }
   });
   fft_init();
@@ -3556,10 +3589,11 @@ static int decimate(const int16_t *in, int n_in, int16_t *out) {
 }
 
 // One I2S block: DC-block, ring, gate, sketch, raw ring, scene frame. Factored out of loop()
-// because /audio has to keep calling it while it streams -- the I2S DMA is 6 x 240 frames = 90 ms
-// and a handler that does not drain it loses audio.
+// because every long handler keeps calling it while it streams -- the I2S DMA is 6 x 240 frames =
+// 30 ms at FS_ACQ and a handler that does not drain it loses audio. See stream_pump().
 static void audio_pump() {
   { size_t got = i2s.readBytes((char *)blk, sizeof blk);
+    blk_read_us = (uint64_t)esp_timer_get_time();
     int n = got / 2;
     // Seed the pedestal from the first block rather than ramping to it from zero, which would
     // otherwise look like a huge transient and fire the gate on every boot.
