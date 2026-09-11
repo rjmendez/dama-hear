@@ -1854,6 +1854,13 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
         "associate": {
             "n_events": len(grouped["events"]), "n_rejected": len(grouped["rejected"]),
             "n_duplicates": len(grouped["duplicates"]),
+            # ⚠️HOW MANY OF n_events COULD BE A POINT SOURCE AT ALL. associate() admits on
+            # d/c + MARGIN_S; this counts against d/c with NO margin. Measured on the live pool
+            # 2026-09-11: 1 of 4, the other three 2.81 m, 7.51 m and 9.01 m past any bound the
+            # array has. A run that solves an impossible group has not found a source.
+            "n_point_source_possible": grouped["events_point_source_possible"],
+            "worst_pair_excess_ms": sorted(
+                round(e["worst_pair_excess_s"] * 1e3, 3) for e in grouped["events"]),
             "by_reason": {r: sum(1 for x in grouped["rejected"] if x["reason"] == r)
                           for r in sorted(AS.REASONS)},
         },
