@@ -178,8 +178,9 @@ def worst_bearing(nodes: Sequence, step_deg: float = 5.0, **kw) -> Dict:
     node layouts it never fell below 4.27 ms against a 0.05 ms floor, and its maximum is exactly
     the closed form 2*delta*cos(theta_Mach)/c = 32.2988 ms at delta 6 m, 900 m/s, 20 degC. A gate
     that cannot fail is not evidence -- the same defect the crack-blast interval bound had.
-    `span_m` is the number that carries the geometry. `swing_outside_band_ms` re-probes one band
-    width outside the band and IS discriminating; `discriminating` reports the contrast.
+    `span_m` is the number that carries the geometry. `swing_outside_band_ms` re-probes at
+    max(10 m, span_m) outside the band and IS discriminating; `discriminating` reports the
+    contrast.
     """
     worst = None
     for b in np.arange(0.0, 180.0, step_deg):
@@ -540,7 +541,7 @@ def main(argv=None) -> int:
     w = worst_bearing(nodes, v_mps=a.speed, temp_c=a.temp)
     print("thinnest bearing %.0f deg: offset observable only for tracks in a %.1f m band"
           % (w["bearing_deg"], w["span_m"]))
-    print("           in-band swing %.2f ms vs %.3f ms one band width outside it -- the band, not"
+    print("           in-band swing %.2f ms vs %.3f ms probed outside it -- the band, not"
           % (w["max_tdoa_swing_ms"], w["swing_outside_band_ms"]))
     print("           the swing, is what this layout is worth")
     print()

@@ -409,6 +409,20 @@ class TestPlacementForTheFleetPair:
         assert ext["span_m"] < 1.0
         assert perp["span_m"] > 15.0
 
+    def test_cli_two_nodes_without_candidates_refuses(self, capsys):
+        assert PL.main(["--nodes", "0,0;-16.602,-0.272"]) == 2
+        out = capsys.readouterr().out
+        assert "TWO NODES GIVE ONE TDoA" in out
+        assert "pass --candidates" in out
+
+    def test_cli_two_nodes_with_candidates_ranks_them(self, capsys):
+        rc = PL.main(["--nodes", "0,0;-16.602,-0.272",
+                      "--candidates=-42.3,-0.7;-8.86,33.86", "--step", "20"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "baseline" in out
+        assert "COLLINEAR: unsolvable" in out, "the axis extension must still sort last"
+
 
 class TestWorstBearingSwingIsNotAVerdict:
     """⚠️`observable` at the band midpoint is true by construction: the probe track straddles
