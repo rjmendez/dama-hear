@@ -1,6 +1,7 @@
 """Event association. The cadence and phantom tests are the point of this file."""
 import itertools
 import os
+import random
 import sys
 
 import numpy as np
@@ -51,6 +52,10 @@ SPREAD = Stub({1: (0, 0, 0), 2: (0, 40, 0), 3: (40, 0, 0), 4: (5, 0, 0)})   # di
 PAIRED = Stub({1: (0, 0, 0), 2: (200, 0, 0), 3: (100, 150, 0), 4: (205, 0, 0)})
 # Diameter 128.1 m -> window 403 ms, wider than the 85 ms round cadence.
 WIDE = Stub({1: (0, 0, 0), 2: (100, 0, 0), 3: (50, 80, 0), 4: (0, 80, 0)})
+# Diameter 169.7 m -> window 524 ms. The operator is deploying over ~3.5 acres, roughly 170 m,
+# where the window is 6.7x today's 78.7 ms and every chance coincidence scales with it. Nothing
+# here is a guess about that array's shape; it is a square whose diagonal is the stated size.
+VAST = Stub({1: (0, 0, 0), 2: (120, 0, 0), 3: (120, 120, 0), 4: (0, 120, 0)})
 
 
 def _round(base_t, seq):
@@ -183,31 +188,91 @@ class TestCadences:
             [100.0 + r * spacing_s for r in range(3)], abs=1e-9)
         _conserved(got, len(dets))
 
-    def test_a_fixed_600_ms_window_swallows_the_next_two_rounds(self):
-        """What the sibling project's constant costs: three rounds in, one event out."""
+    def test_a_fixed_600_ms_window_costs_scan_work_now_instead_of_two_rounds(self):
+        """What the sibling project's constant costs, re-measured after re-seeding.
+
+        It used to cost two of three rounds. It no longer costs any of them -- the second and
+        third rounds are released and seed their own groups -- so what is left to measure is the
+        WORK: the same nine detections that the computed 59.1 ms window groups in 6 candidate
+        visits take 15 at 600 ms, because every member of rounds 2 and 3 is scanned and refused
+        by round 1 before it is reached as a seed. That ratio is the thing that grows: the window
+        is the scan's only bound and a constant one is not bounded by the array at all.
+        """
         dets = [d for r in range(3) for d in _round(100.0 + r * 0.085, r)]
-        got = AS.associate(dets, TIGHT, window_s=0.600)
-        assert len(got["events"]) == 1
-        assert {r["reason"] for r in got["rejected"]} == {"duplicate_node_in_group"}
-        assert len(got["rejected"]) == 6
-        _conserved(got, len(dets))
+        wide = AS.associate(dets, TIGHT, window_s=0.600)
+        computed = AS.associate(dets, TIGHT)
+        assert [e["node_ids"] for e in wide["events"]] == [[1, 2, 3]] * 3
+        assert [e["node_ids"] for e in computed["events"]] == [[1, 2, 3]] * 3
+        assert [e["t0_utc_s"] for e in wide["events"]] == \
+            pytest.approx([e["t0_utc_s"] for e in computed["events"]], abs=1e-9)
+        assert wide["rejected"] == [] and computed["rejected"] == []
+        assert wide["refusals"]["duplicate_node_in_group"] == 9
+        assert computed["refusals"]["duplicate_node_in_group"] == 0
+        assert (wide["scan_candidate_visits"], computed["scan_candidate_visits"]) == (15, 6)
+        _conserved(wide, len(dets))
+        _conserved(computed, len(dets))
 
 
 class TestWideArray:
-    """The documented loss: rejection is terminal, so a wide-enough window eats whole rounds."""
+    """The loss this module used to pin, and now pins the recovery of.
 
-    def test_rounds_after_the_first_are_lost_on_an_array_wider_than_the_cadence(self):
-        """128.1 m diameter -> 403 ms window against an 85 ms cadence. All four nodes heard all
-        three rounds; rounds 2 and 3 come back as rejections, never as events. This is a pin on a
-        known cost, not an endorsement -- if re-seeding lands, this test is what has to change."""
+    A rejected candidate used to be terminal, so once the window (d/c + margin) exceeded the
+    round spacing, round 2 landed inside round 1's scan, every node of it was
+    `duplicate_node_in_group`, and the round was gone. On the 128.1 m fixture that was 1 event
+    of 3 and 8 rejections. This is the scale the array is going to -- 16.9 m to roughly 170 m,
+    window 78.7 ms to 520 ms -- so it is also the scale the release rule has to survive.
+    """
+
+    def test_every_round_is_recovered_on_an_array_wider_than_the_cadence(self):
         dets = [_det(n, 100.0 + r * 0.085 + i * 0.005, r)
                 for r in range(3) for i, n in enumerate((1, 2, 3, 4))]
         got = AS.associate(dets, WIDE)
         assert got["diameter_m"] == pytest.approx(128.06, abs=0.01)
         assert got["window_s"] == pytest.approx(0.4029, abs=1e-4)
         assert got["window_s"] > 0.085, "fixture is void unless the window swallows the cadence"
-        assert [e["node_ids"] for e in got["events"]] == [[1, 2, 3, 4]]
-        assert [r["reason"] for r in got["rejected"]] == ["duplicate_node_in_group"] * 8
+        assert [e["node_ids"] for e in got["events"]] == [[1, 2, 3, 4]] * 3
+        assert [e["t0_utc_s"] for e in got["events"]] == pytest.approx(
+            [100.0, 100.085, 100.170], abs=1e-9)
+        assert got["rejected"] == []
+        # 12 releases: rounds 2 and 3 are each scanned and refused by round 1, and round 3 again
+        # by round 2. Not rows -- a count; see the module docstring for why.
+        assert got["refusals"]["duplicate_node_in_group"] == 12
+        _conserved(got, len(dets))
+
+    @pytest.mark.parametrize("cadence_s", [0.085, 0.328, 0.522])
+    def test_the_same_holds_at_the_scale_the_array_is_going_to(self, cadence_s):
+        """169.7 m diameter -> 520 ms window, which swallows all three MEASURED cadences. Before
+        the release rule this fixture returned 1 event at 85 ms and 2 at 328 ms."""
+        dets = [_det(n, 100.0 + r * cadence_s + i * 0.005, r)
+                for r in range(3) for i, n in enumerate((1, 2, 3, 4))]
+        got = AS.associate(dets, VAST)
+        assert got["window_s"] == pytest.approx(0.52416, abs=1e-4)
+        assert [e["node_ids"] for e in got["events"]] == [[1, 2, 3, 4]] * 3
+        assert [e["t0_utc_s"] for e in got["events"]] == pytest.approx(
+            [100.0 + r * cadence_s for r in range(3)], abs=1e-9)
+        _conserved(got, len(dets))
+
+    def test_a_node_that_misses_a_round_is_still_the_case_this_does_not_resolve(self):
+        """⚠️RELEASING THE DUPLICATE DOES NOT MAKE THE AMBIGUOUS CASE SOLVABLE, AND IT CHANGES
+        WHICH WAY IT FAILS. Node 3 is silent for round 2. On this 128.1 m array node 3's ROUND 3
+        arrival is 95 ms after round 2's seed and the pair bound for nodes 1 and 3 is 94.3 m /
+        343.4 + 30 ms = 305 ms, so the geometry gate has nothing to object to: round 2 absorbs it
+        and round 3 collapses. Consuming the duplicate gave 1 event and seven rejections; this
+        gives 2 events, of which the second is a MIS-ASSOCIATION of round 2 with one arrival from
+        round 3. Both lose round 3. Neither is a solve, and the module's docstring already says
+        this case is not resolved here -- what this test pins is that the new failure mode is
+        known and named rather than discovered in the field.
+        """
+        dets = [_det(n, 100.0 + r * 0.085 + i * 0.005, r)
+                for r in range(3) for i, n in enumerate((1, 2, 3, 4))
+                if not (r == 1 and n == 3)]
+        got = AS.associate(dets, WIDE)
+        assert [e["node_ids"] for e in got["events"]] == [[1, 2, 3, 4], [1, 2, 4, 3]]
+        assert got["events"][1]["arrivals"] == pytest.approx(
+            [100.085, 100.090, 100.100, 100.180], abs=1e-9)
+        assert got["events"][1]["span_s"] == pytest.approx(0.095, abs=1e-9)
+        # ...and the arrival it absorbed really is admissible against every member it joined.
+        assert 0.095 < 94.34 / got["sound_speed_mps"] + got["margin_s"]
         _conserved(got, len(dets))
 
 
@@ -220,16 +285,22 @@ class TestPairwiseGate:
         return dets, AS.associate(dets, SPREAD, **kw)
 
     def test_a_late_round_from_a_nearby_node_is_rejected_by_its_own_separation(self):
+        """⚠️THE TERMINAL REASON IS NO LONGER THE REFUSAL, AND THE NUMBERS STILL HAVE TO SURVIVE.
+        The gate still refuses node 4 -- that is what keeps it out of the event -- but the
+        refusal no longer consumes it, so node 4 goes on to seed a group of one and ends as
+        `too_few_nodes`. The numbers that refused it would then be printed nowhere, which is why
+        they ride along in the detail."""
         dets, got = self._phantom()
         assert len(got["events"]) == 1 and got["events"][0]["n_nodes"] == 3
         assert 4 not in got["events"][0]["node_ids"]
         bad = [r for r in got["rejected"] if r["node_id"] == 4]
         assert len(bad) == 1
-        assert bad[0]["reason"] == "pairwise_dt_exceeds_geometry"
+        assert bad[0]["reason"] == "too_few_nodes"
+        assert got["refusals"]["pairwise_dt_exceeds_geometry"] == 1
         # node 4 is 5 m from node 1: 5/343.42 + 30 ms = 44.6 ms, and it arrived 85 ms late.
         assert "dt 85.0 ms" in bad[0]["detail"]
         assert "> 44.6 ms" in bad[0]["detail"]
-        assert bad[0]["seed_node_id"] == 1
+        assert bad[0]["seed_node_id"] == 4, "it seeds its own group once it is not consumed"
         _conserved(got, len(dets))
 
     def test_the_rejecting_member_need_not_be_the_seed(self):
@@ -241,10 +312,9 @@ class TestPairwiseGate:
         got = AS.associate(dets, PAIRED)
         assert got["window_s"] > 0.5, "fixture is void unless the seed's own window admits node 4"
         assert [e["node_ids"] for e in got["events"]] == [[1, 2, 3]]
-        assert [(r["node_id"], r["reason"]) for r in got["rejected"]] == [
-            (4, "pairwise_dt_exceeds_geometry")]
-        # The seed is node 1; the member that caught it is node 2.
-        assert got["rejected"][0]["seed_node_id"] == 1
+        assert [(r["node_id"], r["reason"]) for r in got["rejected"]] == [(4, "too_few_nodes")]
+        assert got["refusals"]["pairwise_dt_exceeds_geometry"] == 1
+        # The group it was refused from was seeded by node 1; the member that caught it is node 2.
         assert "node 4 vs node 2: dt 400.0 ms > 44.6 ms" in got["rejected"][0]["detail"]
         _conserved(got, len(dets))
 
@@ -293,8 +363,25 @@ class TestEarliestWins:
         assert len(held) == 1
         assert held[0]["seq"] == 0 and held[0]["retrigger"] is False
         assert ev["t0_utc_s"] == pytest.approx(100.0, abs=1e-9)
-        assert [r["reason"] for r in got["rejected"]] == ["duplicate_node_in_group"]
+        # The retrigger is 30 ms out, which is the same-node bound exactly (d = 0, so the bound
+        # IS the margin), so it is released and seeds a group of one. It displaced nothing, which
+        # is what this test is about -- but the terminal reason is now `too_few_nodes` and the
+        # release is counted, not rowed.
+        assert [r["reason"] for r in got["rejected"]] == ["too_few_nodes"]
         assert got["rejected"][0]["seq"] == 1
+        assert got["refusals"]["duplicate_node_in_group"] == 1
+        assert "returned to the pool" in got["rejected"][0]["detail"]
+        _conserved(got, len(dets))
+
+    def test_inside_the_same_node_bound_the_retrigger_stays_terminal(self):
+        """The other side of the boundary, and the case the 60%-within-60 ms measurement is
+        actually about: a second arrival closer to the one already held than that node's own
+        bound (d = 0 m / c + 30 ms margin) cannot be a different event, so it is consumed."""
+        dets = _round(100.0, 0) + [_det(1, 100.020, 1, retrigger=True)]
+        got = AS.associate(dets, TIGHT)
+        assert [r["reason"] for r in got["rejected"]] == ["duplicate_node_in_group"]
+        assert got["refusals"]["duplicate_node_in_group"] == 0
+        assert "earliest wins, no replacement" in got["rejected"][0]["detail"]
         _conserved(got, len(dets))
 
 
@@ -357,3 +444,188 @@ class TestBookkeeping:
         assert [d["node_id"] for d in ev["detections"]] == ev["node_ids"]
         assert ev["span_s"] == pytest.approx(0.008, abs=1e-9)
         assert ev["n_equations"] == 2
+
+
+# The 2026-09-09T11:08:41 episode, verbatim from the live pool (74 h, 6,792 anchored node
+# arrivals, corpus pod dama-sketch-corpus /pool/corpus). Positions are survey.json's own, so the
+# pair bounds here ARE the fleet's: 1-3 is 11.82 m -> 64.1 ms, 1-2 is 16.87 m -> 78.7 ms, 2-3 is
+# 16.13 m -> 76.6 ms at 25 C. Offsets are seconds after 1788952121.0.
+LIVE = Stub({1: (-0.0, 0.0, 0.0), 2: (-16.602, -0.272, 3.0), 3: (-4.58, 10.48, 3.0)})
+LIVE_T = 1788952121.0
+LIVE_ARRIVALS = [
+    (2, 0.164822), (2, 0.168846), (2, 0.173107), (2, 0.181276), (2, 0.185542),
+    (1, 0.271272), (1, 0.321229), (1, 0.333769), (1, 0.338348), (1, 0.359180),
+    (3, 0.340823), (3, 0.343133), (3, 0.345298),
+    (2, 0.380704), (2, 0.383722),
+]
+
+
+def _live_dets():
+    return [{"node_id": n, "seq": i, "t_utc_s": LIVE_T + off, "iface": "lora0"}
+            for i, (n, off) in enumerate(LIVE_ARRIVALS)]
+
+
+def _shape(got):
+    return ([(e["node_ids"], tuple(e["arrivals"])) for e in got["events"]],
+            sorted((r["node_id"], r["seq"], r["reason"]) for r in got["rejected"]),
+            sorted((r["node_id"], r["seq"], r["reason"]) for r in got["duplicates"]),
+            dict(got["refusals"]), got["scan_seeds"], got["scan_candidate_visits"])
+
+
+class TestReseedingARefusedCandidate:
+    """The traced live instance. nyquist at ...121.271272 seeds; rankine at ...121.340823 is
+    69.6 ms away and the 1-3 bound is 64.1 ms, so the gate refuses it -- correctly. Consuming it
+    there ended the episode: 0 events out of an episode whose census holds 24 admissible triples.
+    Returning it to the pool costs the gate nothing and delivers one of them.
+    """
+
+    def test_the_episode_the_shipped_scan_dropped_is_delivered(self):
+        dets = _live_dets()
+        got = AS.associate(dets, LIVE, temp_c=25.0)
+        assert got["window_s"] == pytest.approx(0.078703, abs=1e-6)
+        assert [e["node_ids"] for e in got["events"]] == [[3, 1, 2]]
+        ev = got["events"][0]
+        assert ev["arrivals"] == pytest.approx(
+            [LIVE_T + 0.340823, LIVE_T + 0.359180, LIVE_T + 0.380704], abs=1e-9)
+        assert ev["span_s"] == pytest.approx(0.039881, abs=1e-6)
+        _conserved(got, len(dets))
+
+    def test_the_delivered_group_is_admissible_at_ZERO_margin(self):
+        """⚠️THE POINT IS NOT THAT AN EVENT APPEARED. A group that only fits because of the 30 ms
+        margin is one the aperture cannot vouch for, and over the same 74 h the shipped scan's
+        three deliveries included exactly one that did not need it. This one does not need it
+        either: every pair is inside d/c with the margin removed."""
+        got = AS.associate(_live_dets(), LIVE, temp_c=25.0)
+        ev, c = got["events"][0], got["sound_speed_mps"]
+        for a in range(3):
+            for b in range(a + 1, 3):
+                d_m = float(np.linalg.norm(LIVE.position(ev["node_ids"][a])
+                                           - LIVE.position(ev["node_ids"][b])))
+                assert abs(ev["arrivals"][b] - ev["arrivals"][a]) < d_m / c
+
+    def test_the_gate_still_refuses_the_pair_that_made_it_refuse(self):
+        """Nothing about the bound moved: the refusal still happens, with the same numbers. What
+        changed is only that the refused arrival is still in the pool afterwards."""
+        got = AS.associate(_live_dets(), LIVE, temp_c=25.0)
+        assert got["refusals"]["pairwise_dt_exceeds_geometry"] == 3
+        assert got["margin_s"] == AS.MARGIN_S
+        assert abs(0.340823 - 0.271272) > 11.824 / got["sound_speed_mps"] + AS.MARGIN_S
+
+
+class TestDuplicateReleaseGuard:
+    """Both clauses are load-bearing and neither is tuned: the group must already hold every node
+    this batch heard from, AND the arrival must be further from the one holding its slot than
+    that node's own bound (one node, d = 0, so the bound is the margin).
+    """
+
+    def _three_and_a_late_first_node(self, gap_s):
+        dets = [_det(n, 100.0 + i * 0.005, 0) for i, n in enumerate((1, 2, 3))]
+        dets.append(_det(1, 100.0 + gap_s, 1))
+        return dets
+
+    def test_an_incomplete_group_consumes_the_duplicate(self):
+        """Node 3 reports, but 400 ms later, so the 1-2 group is not complete when the second
+        node-1 arrival reaches it. min_nodes=2 so the pair is an event at all."""
+        dets = [_det(1, 100.0, 0), _det(2, 100.005, 0), _det(1, 100.050, 1), _det(3, 100.400, 0)]
+        got = AS.associate(dets, TIGHT, min_nodes=2)
+        assert got["reporting_nodes"] == 3
+        assert [r["reason"] for r in got["rejected"]
+                if r["node_id"] == 1 and r["seq"] == 1] == ["duplicate_node_in_group"]
+        assert got["refusals"]["duplicate_node_in_group"] == 0
+        _conserved(got, len(dets))
+
+    def test_a_complete_group_releases_a_duplicate_beyond_the_same_node_bound(self):
+        got = AS.associate(self._three_and_a_late_first_node(0.040), TIGHT, min_nodes=2)
+        assert got["reporting_nodes"] == 3
+        assert got["refusals"]["duplicate_node_in_group"] == 1
+        assert [r["reason"] for r in got["rejected"]] == ["too_few_nodes"]
+
+    def test_a_complete_group_still_consumes_one_inside_the_same_node_bound(self):
+        got = AS.associate(self._three_and_a_late_first_node(0.020), TIGHT, min_nodes=2)
+        assert got["refusals"]["duplicate_node_in_group"] == 0
+        assert [r["reason"] for r in got["rejected"]] == ["duplicate_node_in_group"]
+
+    def test_releasing_every_duplicate_is_what_the_second_clause_refuses(self):
+        """⚠️MEASURED ON THE LIVE POOL, NOT PREFERRED. Releasing every duplicate delivered 7
+        events over the 74 h instead of 5, NONE of them admissible at zero margin against 2 for
+        this rule, the median spread back at 70.87 ms from 55.85 ms, and one episode delivered
+        three times. This fixture is the shape of that: three coherent retriggers 20 ms behind
+        the direct arrivals, inside one blast's decay, which an unguarded release turns into a
+        second event at the same place."""
+        dets = _round(100.0, 0) + [_det(n, 100.020 + i * 0.005, 1)
+                                   for i, n in enumerate((1, 2, 3))]
+        got = AS.associate(dets, TIGHT)
+        assert [e["node_ids"] for e in got["events"]] == [[1, 2, 3]]
+        assert got["refusals"]["duplicate_node_in_group"] == 0
+        assert [r["reason"] for r in got["rejected"]] == ["duplicate_node_in_group"] * 3
+        _conserved(got, len(dets))
+
+
+class TestTerminationAndIdempotence:
+    """⚠️A RE-SEEDING GROUPER CAN LOOP, AND THIS IS WHAT STOPS IT: the seed is committed before
+    any candidate can be released, and `used` only ever goes False -> True.
+
+    That is load-bearing and the loop shape is not. Mutation, measured: turning the pass into a
+    worklist, scanning from index 0 instead of i + 1, and pushing a released index back on the
+    queue are all EQUIVALENT -- every answer and every counter here is unchanged, because a
+    released index is already `used` by the time anything reaches it again. Move the seed's own
+    commit below the release and that same worklist re-queues a seed it never consumed: this
+    file then does not terminate at all (measured: no result in 120 s where it passes in 0.12 s).
+    The counters are asserted EXACTLY rather than as ceilings so that an implementation which
+    revisits without looping is caught too.
+    """
+
+    def _one_node_burst(self, n, spacing_s):
+        """Every arrival is from one node, so every group is complete at size 1 and every later
+        arrival is a duplicate beyond the same-node bound -- released, by every seed whose window
+        it falls in. This is the worst case for revisiting."""
+        return [_det(1, 100.0 + i * spacing_s, i) for i in range(n)]
+
+    def test_the_scan_is_one_forward_pass_and_the_work_is_exactly_countable(self):
+        n, spacing = 400, 0.031
+        got = AS.associate(self._one_node_burst(n, spacing), VAST, min_nodes=1)
+        reach = int(got["window_s"] / spacing)
+        expected = sum(min(reach, n - 1 - i) for i in range(n))
+        assert got["scan_seeds"] == n, "every arrival seeds; none is consumed by another"
+        assert got["scan_candidate_visits"] == expected
+        assert got["refusals"]["duplicate_node_in_group"] == expected
+        assert len(got["events"]) == n
+        _conserved(got, n)
+
+    def test_no_detection_is_committed_twice(self):
+        """Conservation is the counted form of the same guarantee, on an input built so that
+        every kind of refusal fires at once."""
+        dets = (_round(100.0, 0) + _round(100.085, 1) + _round(100.170, 2)
+                + [_det(1, 100.020, 9, retrigger=True), _det(9, 100.030, 0),
+                   _det(2, 100.005, 0, iface="mqtt")])
+        got = AS.associate(dets, TIGHT)
+        _conserved(got, len(dets))
+        seen = [(int(d["node_id"]), int(d["seq"]), float(d["t_utc_s"]))
+                for e in got["events"] for d in e["detections"]]
+        assert len(seen) == len(set(seen)), "a detection reached two events"
+
+    def test_running_it_twice_gives_the_same_answer(self):
+        dets = _live_dets()
+        assert _shape(AS.associate(dets, LIVE, temp_c=25.0)) == \
+            _shape(AS.associate(dets, LIVE, temp_c=25.0))
+
+    def test_the_answer_does_not_depend_on_input_order(self):
+        """The pool is sorted by (t, node_id, seq) before the scan, so the caller's order cannot
+        reach the result."""
+        dets = _live_dets()
+        base = _shape(AS.associate(dets, LIVE, temp_c=25.0))
+        rng = random.Random(20260910)
+        for _ in range(20):
+            shuffled = list(dets)
+            rng.shuffle(shuffled)
+            assert _shape(AS.associate(shuffled, LIVE, temp_c=25.0)) == base
+
+    def test_an_event_re_associated_alone_reproduces_itself(self):
+        """The fixed-point form of idempotence: an emitted event's own detections fed back must
+        give that event and nothing else, or the grouping depends on what it discarded."""
+        got = AS.associate(_live_dets(), LIVE, temp_c=25.0)
+        for ev in got["events"]:
+            again = AS.associate(list(ev["detections"]), LIVE, temp_c=25.0)
+            assert [e["node_ids"] for e in again["events"]] == [ev["node_ids"]]
+            assert again["events"][0]["arrivals"] == pytest.approx(ev["arrivals"], abs=1e-12)
+            assert again["rejected"] == [] and again["duplicates"] == []

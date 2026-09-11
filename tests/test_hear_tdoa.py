@@ -594,10 +594,21 @@ class TestWindowComesFromArrivalNodesOnly:
             AS.max_window_s(base) * 3
 
     def test_the_wider_window_costs_a_real_event(self, tmp_path):
-        """⚠️PINS THE DEFECT AND ITS COST. Two full rounds separated by more than the
-        arrival-only window and less than the full-survey window: at the narrow window they are
-        two events, at the wide one the first seed eats the second round's members as
-        `duplicate_node_in_group` and the round is gone."""
+        """⚠️PINS THE DEFECT AND ITS COST, RE-MEASURED AFTER associate() STOPPED CONSUMING ITS
+        REFUSALS. The old mechanism -- the first seed eating a whole second round as
+        `duplicate_node_in_group` -- is gone: that round is now released and seeds itself. What
+        the inflated window still costs is a LONE stale arrival on one node. Here node 1 fires
+        once early and again at `gap`, which is inside the full-survey window and outside the
+        arrival-only one. At the wide window the early seed reaches the second node-1 arrival,
+        holds a group of one -- not every reporting node, so the release guard does not fire --
+        and consumes it; nodes 2 and 3 are then refused on geometry, released, and cannot make
+        min_nodes between them. At the narrow window the early seed never reaches it and the real
+        three-node event is delivered.
+
+        This is not a synthetic shape. On the live pool (74 h, 6,792 node arrivals) the
+        arrival-only 78.7 ms window delivers 4 of the 4 admissible three-node episodes and the
+        99.0 ms full-survey window delivers 3, and the one it loses is lost exactly this way.
+        """
         sv = SV.from_dict(survey_dict(LIVE_NODES + [PUC]))
         arr = HT.arrival_survey(sv)
         margin = HT.derive_margin_s(HT.pair_bounds(arr, C), HT.DEFAULT_MARGIN_FRAC)["margin_s"]
@@ -605,18 +616,23 @@ class TestWindowComesFromArrivalNodesOnly:
         w_wide = AS.max_window_s(sv, TEMP_C, margin)
         gap = 0.5 * (w_narrow + w_wide)
         assert w_narrow < gap < w_wide
-        dets = []
-        for k, t0 in enumerate((T0, T0 + gap)):
-            for j, nid in enumerate(arr.ids):
-                p = arr.position(nid)
-                dets.append({"node_id": nid, "seq": k,
-                             "t_utc_s": t0 + float(np.linalg.norm(
-                                 np.array([40.0, 30.0, 0.0]) - p)) / C})
-        n_narrow = len(AS.associate(dets, arr, temp_c=TEMP_C, margin_s=margin,
-                                    window_s=w_narrow)["events"])
-        n_wide = len(AS.associate(dets, arr, temp_c=TEMP_C, margin_s=margin,
-                                  window_s=w_wide)["events"])
-        assert n_narrow == 2 and n_wide == 1, (n_narrow, n_wide)
+        src = np.array([40.0, 30.0, 0.0])
+        delay = {nid: float(np.linalg.norm(src - arr.position(nid))) / C for nid in arr.ids}
+        first = min(delay, key=delay.get)
+        # The round's own FIRST arrival must land between the two windows, not the round's
+        # nominal t0 -- otherwise the wide seed never reaches the arrival it is supposed to eat.
+        lead = 0.5 * (w_narrow + w_wide) - delay[first]
+        assert w_narrow < lead + delay[first] < w_wide
+        dets = [{"node_id": first, "seq": 0, "t_utc_s": T0}]
+        dets += [{"node_id": nid, "seq": 1, "t_utc_s": T0 + lead + delay[nid]}
+                 for nid in arr.ids]
+        narrow = AS.associate(dets, arr, temp_c=TEMP_C, margin_s=margin, window_s=w_narrow)
+        wide = AS.associate(dets, arr, temp_c=TEMP_C, margin_s=margin, window_s=w_wide)
+        assert [e["n_nodes"] for e in narrow["events"]] == [3]
+        assert wide["events"] == []
+        assert wide["refusals"]["pairwise_dt_exceeds_geometry"] == 1
+        assert [r["reason"] for r in wide["rejected"]].count("duplicate_node_in_group") == 1
+        assert [r["reason"] for r in narrow["rejected"]] == ["too_few_nodes"]
 
     def test_the_run_reports_the_discrepancy(self, tmp_path):
         sv_path = write_survey(tmp_path, LIVE_NODES + [PUC])
