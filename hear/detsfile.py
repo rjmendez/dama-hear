@@ -9,6 +9,7 @@ drains, and one of them writes a header that does not describe its own rows:
     G3  12 cols DECLARED, 11 WRITTEN  ⚠️ header says `node,` and the writer never emits it
     G4  12 cols   node_id, ...                               fs/layout build, node_id populated
     G5  13 cols   + sketch_back before frame_hex             the window fix
+    G6  14 cols   + sync_sigma_ns appended                    the declared-uncertainty stamp
 
 ⚠️G3 IS THE WHOLE REASON THIS MODULE EXISTS. `csv.DictReader` on a G3 file silently shifts every
 value one column left of its name: `utc_us` gets the node name, `uptime_s` gets the timestamp,
@@ -65,9 +66,18 @@ G4 = Generation("G4", ("node_id",) + _BASE + ("frame_hex", "clip", "clip_why"),
                 ("node_id",) + _BASE + ("frame_hex", "clip", "clip_why"))
 G5 = Generation("G5", ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why"),
                 ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why"))
+# ⚠️`sync_sigma_ns` IS THE PHONE'S KEY AND THE PHONE'S UNIT, on purpose. hear/pool.py already
+# reads `sync_sigma_ns` off an MQTT payload as the uncertainty of that producer's clock-to-UTC
+# anchor, 1-sigma, NANOSECONDS. A node now states the same quantity in the same unit under the
+# same name, so one measurement has one spelling across both sensors.
+# ⚠️EMPTY IS "NOT STATED", AND 0 IS NOT A VALUE THIS COLUMN CAN CARRY. A row the node could not
+# stamp at all (utc_us == 0) has no anchor to be uncertain about, and writing 0 there would read
+# as a perfect clock -- which hear/nodeclass.py refuses as a claim no hardware supports.
+_G6 = ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why", "sync_sigma_ns")
+G6 = Generation("G6", _G6, _G6)
 
-GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5)
-LATEST = G5
+GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5, G6)
+LATEST = G6
 
 # One packed v1 sketch is 172 bytes; the column holds it as hex.
 FRAME_HEX_LEN = 344
@@ -166,6 +176,11 @@ def read_text(text: str, default_node: Optional[str] = None) -> DetsRead:
         # the pre-fix value -- the pre-fix builds took the window at a `back` this file cannot
         # know. None travels; nothing here invents 736.
         d.setdefault("sketch_back", None)
+        # G1-G5 never stated it, and an EMPTY G6 cell is the node saying it had no anchor. Both
+        # are None -- "not stated" -- and neither is 0. See hear/pool.py's record builder and
+        # hear/backend/associate.py, where absent means usable and a number is a claim.
+        if not d.get("sync_sigma_ns"):
+            d["sync_sigma_ns"] = None
         out.rows.append(d)
     return out
 

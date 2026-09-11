@@ -202,6 +202,7 @@ D_NOT_ARRIVAL = "not_arrival_class"
 D_CLOCK_UNSTATED = "clock_unstated"
 D_CLOCK_UNTRUSTED = "clock_untrusted"
 D_SYNC_SIGMA = "sync_sigma_exceeds"
+D_STAMP_SIGMA = "stamp_sigma_over_class_budget"
 D_ONSET = "onset_not_found"
 D_ONSET_UNSTATED = "onset_unstated"
 D_LATENCY = "latency_uncorrected"
@@ -210,8 +211,8 @@ D_ADMITTED = "admitted"
 
 DROP_REASONS = (D_UNANCHORED, D_OUTSIDE_WINDOW, D_OUTSIDE_LOOKBACK_EMITTED,
                 D_OUTSIDE_LOOKBACK_UNASSOC, D_PENDING_SETTLE, D_UNSURVEYED, D_NOT_ARRIVAL,
-                D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_SYNC_SIGMA, D_ONSET, D_ONSET_UNSTATED,
-                D_LATENCY, D_UNPARSEABLE)
+                D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_SYNC_SIGMA, D_STAMP_SIGMA, D_ONSET,
+                D_ONSET_UNSTATED, D_LATENCY, D_UNPARSEABLE)
 
 #: Why an admitted arrival's onset quality is UNSTATED, stated once so the ledger detail, the
 #: manifest and the CLI help cannot drift apart. Every clause was checked on 2026-09-10 against
@@ -692,10 +693,29 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
                           % (row.get("clock_tier"), sorted(C.TRUSTED_CLOCK_TIERS))))
             continue
         ssig = row.get("sync_sigma_ns")
+        # ⚠️TWO GATES ON ONE QUANTITY, AND THEY ASK DIFFERENT QUESTIONS. --max-sync-sigma-ns is
+        # APERTURE-relative (DEFAULT_SYNC_SIGMA_FRAC of the tightest pair bound: "is this
+        # receiver contributing information to that pair at all"), and it moves when the array
+        # moves. The one below is HARDWARE-relative: the class's own arrival budget, which does
+        # not. On this array the hardware gate is ~27x tighter (82.1 us of stated sigma against
+        # 3.45 ms), so it binds and the operator knob only ever loosens -- which is the right way
+        # round for a knob. Keep them separate; collapsing them would put site geometry back
+        # inside a hardware admissibility test, which nodeclass.py's own header argues against.
         if max_sync_ns is not None and ssig is not None and float(ssig) > float(max_sync_ns):
             _drop(day, row, D_SYNC_SIGMA,
                   _detail(row, "stated sync_sigma %.0f ns exceeds --max-sync-sigma-ns %.0f"
                           % (float(ssig), float(max_sync_ns))))
+            continue
+        # The per-detection form of the class gate. A node that latched `time_valid` true and
+        # then lost its GPS UART keeps stamping off a frozen anchor; `sync_sigma_ns` is the only
+        # field in which that is visible, and this is the door it is visible AT.
+        # ⚠️THE CLASS IS UNSTATED ON EVERY NODE IN survey.json AND THIS STILL HAS TO BITE. A
+        # gate keyed on a declared class would be dead code on the only survey that exists;
+        # nodeclass charges the strictest arrival class when none is named.
+        cname = sv.classes.get(nid)
+        stamp_ok = NC.stamp_admissible(ssig, cname)
+        if stamp_ok is False:
+            _drop(day, row, D_STAMP_SIGMA, _detail(row, NC.stamp_refusal(ssig, cname) or ""))
             continue
         # ⚠️THREE-STATE, AND THE THIRD STATE IS THE ONE THAT ACTUALLY OCCURS. See the
         # `onset_quality` block returned below for what this pool is made of.
@@ -739,6 +759,10 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
             "retrigger": row.get("retrigger"), "layout": row.get("layout"),
             "fs_hz": row.get("fs_hz"), "clock_tier": row.get("clock_tier"),
             "sync_sigma_ns": ssig, "ts_utc_s_raw": float(row["ts_utc_s"]),
+            # A REAL BOOLEAN for the same reason `utc_trusted` below is one: associate() cannot
+            # resolve it, because the budget is per CLASS and associate has never seen a class.
+            # None here means the producer stated no sigma, which that gate reads as usable.
+            "stamp_admissible": stamp_ok,
             "latency_applied_ms": lat_ms,
             # ⚠️REAL BOOLEANS, not the stored fields. None here means "not stated and admitted
             # under policy", which associate()'s `is not False` reads as usable -- the same

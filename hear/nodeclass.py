@@ -274,6 +274,75 @@ class NodeClass:
         """
         return self.clock_admissible() and self.capture_bias_bounded()
 
+    # ---- the same budget, per DETECTION ------------------------------------------------------
+    # ⚠️WHY A CLASS-WIDE t_sigma_s IS NOT THE WHOLE ANSWER ANY MORE. `t_sigma_s` says what this
+    # hardware is worth when it is WORKING. A xiao-s3-pps whose GPS UART has died keeps stamping
+    # from a frozen PPS anchor -- `time_valid` latches true at the first NAV-PVT and the firmware
+    # never clears it -- and free-runs on the ESP crystal at a MEASURED 4.2 to 11.7 ppm
+    # (health.csv archives, three nodes, 461 windows of >= 300 s, 2026-09-10). That is ~30 ms per
+    # hour of silently wrong stamp on a class whose declared sigma is 100 us, and no class-wide
+    # constant can express it because it is a property of one detection's anchor age, not of the
+    # part number. The firmware now states it per row as dets.csv `sync_sigma_ns`; these three
+    # methods are where that statement meets this budget.
+    def stamp_t_sigma_s(self, sync_sigma_ns: Optional[float]) -> float:
+        """This class's random timestamp sigma for ONE detection, given the producer's own
+        statement about its clock, seconds.
+
+        ⚠️RSS, AND DELIBERATELY DOUBLE-COUNTING THE CLOCK. `t_sigma_s` already contains a clock
+        term -- docs/timing.md's detection-path budget lists "esp_timer between anchors,
+        12.20 us" among the terms RSS'd into it -- so adding a stated clock sigma on top charges
+        the healthy case twice. That is the conservative direction and it costs almost nothing
+        where it is charged twice (100 us RSS 12 us is 100.7 us), which is the same trade
+        `path_bias_s` makes for the 62.47 us block quantisation. Subtracting the class's own
+        clock term instead would need that 12.20 us transplanted into this file as a fourth
+        constant nothing else reads, and it would move the answer in the optimistic direction.
+
+        A `None` statement returns the class figure unchanged: not stated is not zero, and it is
+        also not a refusal here -- see `stamp_admissible`.
+        """
+        if sync_sigma_ns is None:
+            return self.t_sigma_s
+        s = float(sync_sigma_ns) / 1e9
+        return math.sqrt(self.t_sigma_s ** 2 + s * s)
+
+    def stamp_admissible(self, sync_sigma_ns: Optional[float]) -> Optional[bool]:
+        """Is ONE detection's timestamp inside the per-node arrival budget?
+
+        Three states, and the third is the one that occurs: None means the producer did not
+        state a clock sigma, which is every dets.csv row before generation G6 and every phone
+        payload with no `sync_sigma_ns`. None is NOT a refusal -- `associate.arrival_is_usable`
+        reads absent as usable by design, so a new field cannot retroactively delete history.
+        """
+        if sync_sigma_ns is None:
+            return None
+        if not self.clock_admissible():
+            return False
+        return self.stamp_t_sigma_s(sync_sigma_ns) <= ARRIVAL_T_SIGMA_MAX_S
+
+    def stamp_refusal(self, sync_sigma_ns: Optional[float],
+                      c_mps: float = _C_NOMINAL_MPS) -> Optional[str]:
+        """Why this detection's stamp is not an arrival, with the numbers in it, or None."""
+        if self.stamp_admissible(sync_sigma_ns) is not False:
+            return None
+        tot = self.stamp_t_sigma_s(sync_sigma_ns)
+        return ("the producer states a clock sigma of %.1f us, which against class %r's own "
+                "%.1f us gives a per-detection t_sigma of %.1f us = %.3f m of range, over the "
+                "%.1f us per-node bound"
+                % (float(sync_sigma_ns) / 1e3, self.name, self.t_sigma_s * 1e6,
+                   tot * 1e6, tot * float(c_mps), ARRIVAL_T_SIGMA_MAX_S * 1e6))
+
+    def max_stated_clock_sigma_s(self) -> float:
+        """The largest `sync_sigma_ns` (as seconds) this class may state and still be admitted.
+
+        `sqrt(budget**2 - t_sigma_s**2)`, i.e. the inverse of `stamp_t_sigma_s`. 0.0 for a class
+        already over the bound on its class figure alone -- there is no statement that rescues
+        it. Exported so a firmware author can see what the wire number is being spent against
+        without re-deriving the algebra: 82.1 us for xiao-s3-pps today.
+        """
+        if not self.clock_admissible():
+            return 0.0
+        return math.sqrt(max(0.0, ARRIVAL_T_SIGMA_MAX_S ** 2 - self.t_sigma_s ** 2))
+
     def __repr__(self) -> str:
         lo, hi, lim = self.usable_band_hz()
         bias = ("bias unmeasured" if self.path_bias_s is None
@@ -506,6 +575,50 @@ register(NodeClass(
           "table (tools/hear_latency_cal.py) and the bias goes; the clock needs GPSTimingSync on a "
           "better tier than \"location\".",
 ))
+
+
+def strictest_arrival_class() -> NodeClass:
+    """The admissible class with the LEAST room for a stated clock sigma.
+
+    Used where a receiver's class is not stated, which on this array is every receiver: the
+    shipped survey.json names no `class` on any node, and `Survey.arrival_ids()` admits an
+    unstated class by design. A gate that needed the class to be declared would therefore be
+    dead code in production -- that is how the per-detection budget below would have shipped
+    doing nothing at all.
+
+    `min` over `max_stated_clock_sigma_s`, so adding a class can only ever TIGHTEN the fallback.
+    Classes that are not arrival sources at all are excluded: their headroom is 0 and using them
+    would refuse every stated sigma on every unclassed node.
+    """
+    adm = [c for c in CLASSES.values() if c.contributes_arrival()]
+    if not adm:
+        raise CapabilityError("no registered class is an arrival source, so there is no budget "
+                              "an unclassed receiver could be held to")
+    return min(adm, key=lambda c: c.max_stated_clock_sigma_s())
+
+
+def _stamp_class(class_name: Optional[str]) -> NodeClass:
+    """The class to charge a stated sigma against. Unstated or unrecognised -> the strictest."""
+    c = CLASSES.get(class_name or "")
+    return c if c is not None else strictest_arrival_class()
+
+
+def stamp_admissible(sync_sigma_ns: Optional[float],
+                     class_name: Optional[str] = None) -> Optional[bool]:
+    """Is ONE detection's stamp inside the per-node arrival budget? None = the producer did not
+    state a sigma, which every dets.csv row before generation G6 does not."""
+    return _stamp_class(class_name).stamp_admissible(sync_sigma_ns)
+
+
+def stamp_refusal(sync_sigma_ns: Optional[float], class_name: Optional[str] = None,
+                  c_mps: float = _C_NOMINAL_MPS) -> Optional[str]:
+    """Why that stamp is not an arrival, with the numbers in it, or None."""
+    cls = _stamp_class(class_name)
+    why = cls.stamp_refusal(sync_sigma_ns, c_mps)
+    if why is None or class_name in CLASSES:
+        return why
+    return ("%s (the receiver's class is unstated, so the strictest arrival class is charged)"
+            % why)
 
 
 def get(name: str) -> NodeClass:
