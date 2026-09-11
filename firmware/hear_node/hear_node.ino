@@ -2652,6 +2652,9 @@ static void gps_bringup() {
 
 void setup() {
   hear_boot_guard();                    // first statement: a later fault still counts as a failed boot
+  // The USB CDC default is 256 B, and a full queue drops the rest of a packet: a real PROV line is
+  // longer than that. Must precede begin(), which keeps a queue that already exists.
+  Serial.setRxBufferSize(HEAR_PROV_LINE_MAX + 64);
   Serial.begin(115200);
   delay(1500);
   boot_ms = millis();
@@ -3891,7 +3894,8 @@ static void prov_serial_poll() {
   while (Serial.available() > 0) {
     int c = Serial.read();
     if (c == '\n' || c == '\r') {
-      if (n && !over) { line[n] = 0; prov_serial_line(line); }
+      if (over) Serial.println("PROV ERR line too long");
+      else if (n) { line[n] = 0; prov_serial_line(line); }
       n = 0; over = false;
     } else if (n < sizeof line - 1) {
       line[n++] = (char)c;

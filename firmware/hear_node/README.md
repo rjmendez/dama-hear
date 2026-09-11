@@ -15,6 +15,11 @@ and Wi-Fi in its NVS partition, which OTA never writes:
 
     python3 firmware/hear_node/enroll.py <node> /dev/ttyACM0 --release <tag>
 
+The upload resets a board running this firmware into its bootloader over the USB serial line; a
+new board, or one running anything else, needs BOOT held while it is plugged in. The board
+re-enumerates during the upload and on every reboot, so under WSL2 attach it with
+`usbipd attach --wsl --busid <id> --auto-attach`.
+
 After that, every update is the same public image for every node:
 
     python3 firmware/hear_node/flash.py <node> <ip> --release <tag>
