@@ -399,7 +399,16 @@ def main(argv=None):
     app, code, data = BUNDLES[name]
     check(code, data)
     sha = subprocess.check_output(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"]).decode().strip()
-    dirty = subprocess.check_output(["git", "-C", ROOT, "status", "--porcelain"]).decode().strip()
+    # ⚠️THE GENERATED BUNDLES ARE EXCLUDED FROM THE DIRTY TEST, AND THEY HAVE TO BE.
+    # Writing deploy/k8s/<bundle>.yaml dirties the tree, so a committed bundle could never carry
+    # a clean stamp -- every one of them said "-dirty" whatever the tree really was. A flag that
+    # is always set is not a flag; fleet.py's own warning that a -dirty build "did not come from
+    # any commit" is exactly the signal this was drowning. What still dirties the stamp is a
+    # change to any SOURCE the bundle ships, which is the thing worth knowing.
+    porcelain = subprocess.check_output(
+        ["git", "-C", ROOT, "status", "--porcelain"]).decode().splitlines()
+    generated = {"deploy/k8s/%s.yaml" % b for b in BUNDLES}
+    dirty = [ln for ln in porcelain if ln[3:].strip().strip('"') not in generated]
     stamp = sha + ("-dirty" if dirty else "")
     text = render(name, app, code, data, stamp)
     mode, n_bytes = apply_mode(code, data, name=name, sha=stamp, app=app)
