@@ -925,3 +925,42 @@ class TestClipSizeIsNotAMagicNumber:
         p = CL.wav_probe(self._wav(37000, 5.0))
         assert p["ok"], "an odd header rate must not lose the clip: %s" % p["reason"]
         assert p["fs_nameable"] is False
+
+
+# ---------------------------------------------------------------- a node id may contain dashes
+
+class TestADashedNodeIdIsAName:
+    """rankine's dets.csv carries 242 rows written as `hear-5c4c94`, the id hear_node.ino gives
+    itself when built without NODE_ID. Their 30 clips were refused as bad_name on every one of 31
+    drains (930 refused_name rows) because the name grammar had no dash in the node field."""
+
+    RANKINE_RAW = "/clips/47-hear-5c4c94-f60a1696-0487893711.wav"
+
+    def test_every_id_the_firmware_can_emit_parses_back_to_itself(self):
+        # gen_secrets.py: [a-z0-9][a-z0-9-]{0,22}; hear_node.ino fallback: hear-<3 MAC bytes>.
+        for node in ("rankine", "hear-5c4c94", "puc-1", "ab-", "a", "x1-2-3"):
+            for name, prio, boot in (
+                    ("/clips/%s-00002a9f13c0-0240479148.wav" % node, None, "00002a9f13c0"),
+                    ("/clips/%s-f60a1696-0487893711.wav" % node, None, "f60a1696"),
+                    ("/clips/47-%s-f60a1696-0487893711.wav" % node, 47, "f60a1696")):
+                p = CL.parse_clip_name(name)
+                assert (p["prio"], p["node"], p["boot"]) == (prio, node, boot), (name, p)
+
+    def test_the_new_shape_never_reads_a_leading_number_as_priority(self):
+        p = CL.parse_clip_name("/clips/12-x-00002a9f13c0-0240479148.wav")
+        assert (p["prio"], p["node"]) == (None, "12-x")
+
+    def test_malformed_names_are_still_refused(self):
+        for bad in ("/clips/-a-db21acd5-1.wav", "/clips/hear-5c4c94-.wav", "/clips/x.wav",
+                    "/clips/hear 5c4c94-db21acd5-1.wav"):
+            with pytest.raises(ValueError):
+                CL.parse_clip_name(bad)
+
+    def test_rankines_unprovisioned_clip_is_fetched_not_refused(self, tmp_path, wired):
+        raw = self.RANKINE_RAW
+        n = wired(node="rankine", clips={raw: _wav()},
+                  dets_rows=[_dets_row(raw, node="hear-5c4c94", sample=487893711)])
+        r = HD.drain_node(_pool(tmp_path), "rankine", "10.0.0.3")
+        assert "bad_name" not in r["clips_refused"], r["clips_refused"]
+        assert _clip_paths(n) == [raw]
+        assert r["clips_fetched"] == 1
