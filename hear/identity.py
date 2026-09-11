@@ -11,7 +11,7 @@ microphone's position, and TDoA then solves for a source that was never there. T
 exactly as strict. What this module adds is the ONE case the guard cannot tell apart from a
 mis-flash and which is not one: a node that wrote rows before it had a name.
 
-⚠️AN UNPROVISIONED ID IS NOT ANOTHER NODE'S NAME. firmware/night_node/night_node.ino:84-88 is
+⚠️AN UNPROVISIONED ID IS NOT ANOTHER NODE'S NAME. firmware/hear_node/hear_node.ino:84-88 is
 the whole mechanism:
 
     #ifdef NODE_ID
@@ -19,7 +19,7 @@ the whole mechanism:
     #else
       snprintf(node_id, sizeof node_id, "hear-%02x%02x%02x", m[3], m[4], m[5]);
 
-`NODE_ID` is a compile-time #define written by firmware/night_node/gen_secrets.py:58, so a build
+`NODE_ID` is a compile-time #define written by firmware/hear_node/gen_secrets.py:58, so a build
 made before someone ran gen_secrets.py falls back to the last three bytes of that ESP32's OWN
 MAC. `hear-5c4c94` is therefore a name no operator ever chose and no second board can answer to:
 it is a hardware address, and the board that emitted it is by construction the board whose MAC
@@ -49,7 +49,7 @@ import re
 from typing import Dict, Optional, Tuple
 
 #: The only id shape this module will ever rename FROM: `hear-` + three MAC bytes, lower-case
-#: hex, exactly as night_node.ino:88 formats them. A name outside this shape is a name a human
+#: hex, exactly as hear_node.ino:88 formats them. A name outside this shape is a name a human
 #: chose, and no evidence can make one human-chosen name mean another.
 UNPROVISIONED = re.compile(r"^hear-[0-9a-f]{6}$")
 
@@ -57,7 +57,7 @@ UNPROVISIONED = re.compile(r"^hear-[0-9a-f]{6}$")
 #: the pool and the cards; a line here is a claim about hardware, not a convenience.
 ALIASES: Dict[str, Tuple[str, str]] = {
     "hear-5c4c94": ("rankine", (
-        "MEASURED 2026-09-10. (a) The id matches night_node.ino:88's unprovisioned fallback, so "
+        "MEASURED 2026-09-10. (a) The id matches hear_node.ino:88's unprovisioned fallback, so "
         "it is one board's MAC tail and not a name. (b) EXCLUSIVITY: of the archived cards in "
         "the pool's raw/ tree it appears on rankine's and only rankine's -- 23 of 23 rankine "
         "dets archives and 13 scene archives, 0 of mach's and 0 of nyquist's; and rankine's dets "
@@ -82,7 +82,7 @@ def _check_table() -> None:
     """
     for raw, (name, why) in ALIASES.items():
         assert UNPROVISIONED.match(raw), (
-            "alias source %r is not an unprovisioned id -- only night_node.ino:88's "
+            "alias source %r is not an unprovisioned id -- only hear_node.ino:88's "
             "hear-<mac tail> form may be renamed" % raw)
         assert not UNPROVISIONED.match(name), (
             "alias target %r is itself an unprovisioned id" % name)

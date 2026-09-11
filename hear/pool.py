@@ -156,7 +156,7 @@ def _resolve_identity(row: Dict[str, Any]) -> Optional[str]:
 
     ⚠️CALLED BEFORE `_node_mismatch`, NEVER INSTEAD OF IT. The guard below still has to agree
     with the fetch afterwards; all this does is decide which name the guard is comparing. See
-    `hear.identity` for what may be renamed (only night_node.ino:88's `hear-<mac tail>` form, and
+    `hear.identity` for what may be renamed (only hear_node.ino:88's `hear-<mac tail>` form, and
     only with an entry stating its evidence) and why the raw id is kept on the row rather than
     overwritten.
     """
@@ -200,7 +200,7 @@ def _node_mismatch(row: Dict[str, Any], expect: Optional[str]) -> Optional[str]:
     destroy the only trace of the flashing error.
 
     ⚠️ONE THING IS RENAMED BEFORE THIS RUNS, AND IT IS NOT A NAME. `_resolve_identity` maps an
-    UNPROVISIONED id -- night_node.ino:88's `hear-<mac tail>`, emitted only by a build with no
+    UNPROVISIONED id -- hear_node.ino:88's `hear-<mac tail>`, emitted only by a build with no
     NODE_ID compiled in -- to the node that board is declared to be, keeping the raw id on the
     row as `node_alias_of`. That is a different act from the one refused above: `nyquist` is a
     name someone chose and can be wrong about, a MAC tail is the board itself. This guard is
