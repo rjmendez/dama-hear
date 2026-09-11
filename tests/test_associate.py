@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hear.backend import associate as AS  # noqa: E402
 from hear.solve import shockwave as SW  # noqa: E402
+from hear.solve import consistency as CONS  # noqa: E402
 
 
 class Stub:
@@ -629,3 +630,57 @@ class TestTerminationAndIdempotence:
             assert [e["node_ids"] for e in again["events"]] == [ev["node_ids"]]
             assert again["events"][0]["arrivals"] == pytest.approx(ev["arrivals"], abs=1e-12)
             assert again["rejected"] == [] and again["duplicates"] == []
+
+
+class TestAnEventSaysWhetherAPointSourceCouldHaveMadeIt:
+    """⚠️THE GROUPER ADMITS ON d/c + MARGIN_S, AND THAT IS NOT THE PHYSICAL BOUND.
+
+    MARGIN_S is 30 ms = 10.3 m of slop against an array 16.87 m across, so a group can clear
+    admission and still describe arrivals no single point source anywhere could have produced.
+
+    MEASURED on the live pool 2026-09-11 (7,073 anchored arrivals, 74 h): of four three-node
+    events delivered, THREE are impossible -- spans 55.85, 70.37 and 74.70 ms against a largest
+    pair bound of 48.7 ms, i.e. 2.81 m, 7.51 m and 9.01 m past what any source could produce.
+    Before this field, nothing downstream could tell those three from the one real one.
+    """
+
+    def test_a_group_inside_every_pair_bound_is_possible(self):
+        # TIGHT is 10 m across; 1 and 2 are 10 m apart = 29.1 ms at 20 C. 20 ms is inside it.
+        got = AS.associate([_det(1, 100.0), _det(2, 100.020), _det(3, 100.010)], TIGHT)
+        assert len(got["events"]) == 1
+        e = got["events"][0]
+        assert e["point_source_possible"] is True
+        assert e["worst_pair_excess_s"] == 0.0
+        assert got["events_point_source_possible"] == 1
+
+    def test_a_group_the_margin_admits_but_geometry_forbids_is_flagged(self):
+        # 1->2 is 10 m = 29.1 ms. 50 ms clears the 59.1 ms admission bound and is 20.9 ms past
+        # the physical one, so the event is still DELIVERED and now says it cannot be real.
+        got = AS.associate([_det(1, 100.0), _det(2, 100.050), _det(3, 100.025)], TIGHT)
+        assert len(got["events"]) == 1, "it must still be delivered, not silently dropped"
+        e = got["events"][0]
+        assert e["point_source_possible"] is False
+        assert e["worst_pair_excess_s"] > 0.015, e["worst_pair_excess_s"]
+        assert got["events_point_source_possible"] == 0
+
+    def test_the_excess_is_the_distance_past_the_bound_not_the_span(self):
+        got = AS.associate([_det(1, 100.0), _det(2, 100.050), _det(3, 100.025)], TIGHT)
+        e = got["events"][0]
+        c = AS.SW.sound_speed(20.0)
+        d12 = float(np.linalg.norm(TIGHT.position(1) - TIGHT.position(2)))
+        assert e["worst_pair_excess_s"] == pytest.approx(0.050 - d12 / c, abs=1e-9)
+        assert e["worst_pair_excess_s"] < e["span_s"], "excess is not the span"
+
+    def test_the_count_matches_the_events(self):
+        dets = ([_det(1, 100.0), _det(2, 100.020), _det(3, 100.010)]
+                + [_det(1, 200.0), _det(2, 200.050), _det(3, 200.025)])
+        got = AS.associate(dets, TIGHT)
+        assert len(got["events"]) == 2
+        assert got["events_point_source_possible"] == 1
+        assert (got["events_point_source_possible"]
+                == sum(1 for e in got["events"] if e["point_source_possible"]))
+
+    def test_it_uses_the_repos_one_definition_of_the_bound(self):
+        """⚠️A SECOND COPY OF |tau| <= d/c WOULD DRIFT FROM THE FIRST. consistency.py owns it."""
+        import hear.backend.associate as mod
+        assert mod.physically_possible is CONS.physically_possible
