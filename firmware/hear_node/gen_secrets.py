@@ -34,14 +34,10 @@ if "--dir" in sys.argv:
     sketch = os.path.abspath(sys.argv[sys.argv.index("--dir") + 1])
 out = os.path.join(sketch, "secrets.h")
 
-nets = {}
-for line in open(src):
-    m = re.match(r"\s*WIFI_(\d+)_(SSID|PSK)\s*[:=]\s*(.*?)\s*$", line)
-    if m:
-        nets.setdefault(m.group(1), {})[m.group(2)] = m.group(3).strip().strip('"').strip("'")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from wifi_store import read_pairs  # noqa: E402
 
-pairs = [(v["SSID"], v["PSK"]) for _, v in sorted(nets.items(), key=lambda kv: int(kv[0]))
-         if v.get("SSID") and v.get("PSK")]
+pairs = read_pairs(src)
 if not pairs:
     print("no complete SSID/PSK pairs in %s" % src); sys.exit(1)
 

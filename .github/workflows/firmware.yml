@@ -34,6 +34,14 @@ jobs:
           - { sketch: sense_bringup, fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false }
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: build_info.h (what /status reports as fw)
+        run: |
+          printf '#pragma once\n#ifndef FW_BUILD\n#define FW_BUILD "%s"\n#endif\n' \
+            "$(git describe --always --tags --dirty)" > "firmware/${{ matrix.sketch }}/build_info.h"
+          cat "firmware/${{ matrix.sketch }}/build_info.h"
 
       - uses: arduino/setup-arduino-cli@v2
         with:
