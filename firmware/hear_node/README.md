@@ -678,9 +678,11 @@ Added after mach's link fell from ~120 kB/s to ~10 kB/s with 5 % packet loss. Ev
 back truncated, and nothing the node exported could say whether it was the link, a reset or a
 stalled loop.
 
-- **Joining.** At boot the node scans and tries its configured networks strongest first, each
-  pinned to the strongest access point heard for it. The boot log says how many were heard, and
-  the signal and channel of each try. It never names the network.
+- **Joining.** At boot the node scans and tries its configured networks strongest first. Within
+  a network, the driver takes the strongest access point (all-channel scan, sorted by signal) on
+  the join and on every automatic reconnect. The default fast scan takes the first match it hears.
+  Nothing is pinned, so losing one access point cannot strand the node. The boot log says how many
+  networks were heard, and the signal and channel of each try. It never names the network.
 - **`/status` `net`.**
   - `rssi` is the signal now, `null` when not associated. `rssi_join`, `ch` and `bssid` describe
     the join.

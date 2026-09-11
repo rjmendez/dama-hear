@@ -29,22 +29,20 @@ int hear_net_join(const hear_prov_t *p, uint32_t per_try_ms, hear_net_join_t *ou
   uint32_t t0 = millis();
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
+  // Within one network the driver picks: every channel, strongest access point first, on this
+  // join and on every automatic reconnect. The default fast scan takes the first match it hears.
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
 
+  // Across networks nothing picks, so the scan ranks them.
   int best[HEAR_PROV_MAX_NETS], ch[HEAR_PROV_MAX_NETS];
-  uint8_t bs[HEAR_PROV_MAX_NETS][6];
-  for (int k = 0; k < p->n; k++) { best[k] = -127; ch[k] = 0; memset(bs[k], 0, 6); }
+  for (int k = 0; k < p->n; k++) { best[k] = -127; ch[k] = 0; }
   int found = WiFi.scanNetworks(false, true);
   for (int i = 0; i < found; i++) {
     String s = WiFi.SSID(i);
     int r = WiFi.RSSI(i);
-    for (int k = 0; k < p->n; k++) {
-      if (s == p->ssid[k] && r > best[k]) {
-        best[k] = r;
-        ch[k] = WiFi.channel(i);
-        const uint8_t *b = WiFi.BSSID(i);
-        if (b) memcpy(bs[k], b, 6);
-      }
-    }
+    for (int k = 0; k < p->n; k++)
+      if (s == p->ssid[k] && r > best[k]) { best[k] = r; ch[k] = WiFi.channel(i); }
   }
   WiFi.scanDelete();
 
@@ -62,11 +60,9 @@ int hear_net_join(const hear_prov_t *p, uint32_t per_try_ms, hear_net_join_t *ou
 
   for (int j = 0; j < p->n; j++) {
     int k = order[j];
-    bool pinned = best[k] > -127;
-    if (pinned) hear_logf("wifi  trying network %d/%d  rssi %d ch %d\n", k + 1, p->n, best[k], ch[k]);
-    else        hear_logf("wifi  trying network %d/%d  not heard by the scan\n", k + 1, p->n);
-    if (pinned) WiFi.begin(p->ssid[k], p->psk[k], ch[k], bs[k]);
-    else        WiFi.begin(p->ssid[k], p->psk[k]);
+    if (best[k] > -127) hear_logf("wifi  trying network %d/%d  rssi %d ch %d\n", k + 1, p->n, best[k], ch[k]);
+    else                hear_logf("wifi  trying network %d/%d  not heard by the scan\n", k + 1, p->n);
+    WiFi.begin(p->ssid[k], p->psk[k]);
     uint32_t t1 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t1 < per_try_ms) delay(100);
     if (WiFi.status() == WL_CONNECTED) {
