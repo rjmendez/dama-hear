@@ -243,7 +243,10 @@ Mechanism, read from source: only the `/audio` handler calls `audio_pump()` betw
 (`hear_node.ino:2712-2721`); `/sd` (2181) and `/perf` (2217) do not. Even `/audio` caps
 catch-up at `AUDIO_PUMP_MAX` = 6 blocks = 96 ms, the I2S DMA depth — past that "*the samples are
 already gone*". So the loss fraction on `/audio` is **link-speed dependent by construction**:
-24 % at rankine's 137 kB/s, 57.5 % measured on mach at ~71 kB/s effective.
+24 % at rankine's 137 kB/s, 57.5 % measured on mach at ~71 kB/s effective. (The DMA is 30 ms at
+48 kHz, not 96 ms. Every long handler now pumps through `stream_ready()` and writes only when the
+socket will not block, so the loss should no longer depend on link speed. That has not been
+measured on a node yet.)
 
 The counter is structurally blind (`hear_node.ino:2989-3040`): the audit differences the two
 most recently **seen** PPS edges, so a stall spanning N > 1 edges is charged **one** second, and
