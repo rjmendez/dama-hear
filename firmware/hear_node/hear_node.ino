@@ -1864,8 +1864,9 @@ static void stream_pump(uint64_t *due) {
     *due = blk_read_us + BLOCK_US;
 }
 
-// Audio only, never HTTP: gps_bringup() runs inside the /gpspins handler, and other handlers open,
-// close and read Serial1 under the sweep. Before i2s.begin() -- setup()'s bring-up -- a plain wait.
+// Audio and sketches (stream_pump), never HTTP: gps_bringup() runs inside the /gpspins handler, and
+// other handlers open, close and read Serial1 under the sweep. Before i2s.begin() -- setup()'s
+// bring-up -- a plain wait.
 static void gps_pump(uint64_t *due) { if (i2s_up) stream_pump(due); }
 
 static void gps_wait_ms(uint32_t ms) {
