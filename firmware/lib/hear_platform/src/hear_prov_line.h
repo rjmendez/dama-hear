@@ -1,11 +1,14 @@
 // A node's enrolled identity and Wi-Fi, and the one-line USB command that sets it. Plain C, no
 // Arduino, so tests/test_prov_line.py compiles it with cc and drives it with what enroll.py sends.
 //
-//   PROV v=1 node=<id> [class=<id>] net=<ssid hex>:<psk hex> [net=...]
+//   PROV v=1 node=<id> [class=<id>] net=<ssid hex>:<psk hex> [net=...] crc=<8 hex>
 //
-// Hex because an SSID may contain spaces, '=' or ':'.
+// Hex because an SSID may contain spaces, '=' or ':'. crc is CRC-32 (zlib's) of everything before
+// " crc=", and must be the last token: the USB CDC receive path drops the rest of a packet when
+// its queue is full, and a line with a hole in a PSK can still parse.
 #pragma once
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
 #define HEAR_PROV_MAX_NETS 8
@@ -51,16 +54,44 @@ static inline int hear_prov_unhex(const char *h, size_t hn, char *out, size_t ca
   return (int)(hn / 2);
 }
 
+// CRC-32 exactly as zlib.crc32 computes it: reflected 0xEDB88320, init and final xor 0xFFFFFFFF.
+static inline uint32_t hear_prov_crc32(const char *s, size_t n) {
+  uint32_t c = 0xFFFFFFFFu;
+  for (size_t i = 0; i < n; i++) {
+    c ^= (uint8_t)s[i];
+    for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+  }
+  return c ^ 0xFFFFFFFFu;
+}
+
+// The line must END in " crc=" and 8 hex digits matching everything before them. Returns where the
+// signed part ends, or NULL with *why set.
+static inline const char *hear_prov_signed_end(const char *line, const char **why) {
+  size_t len = strlen(line);
+  if (len < 13 || strncmp(line + len - 13, " crc=", 5) != 0) { *why = "missing crc"; return NULL; }
+  uint32_t want = 0;
+  for (size_t i = len - 8; i < len; i++) {
+    int d = hear_prov_nib(line[i]);
+    if (d < 0) { *why = "missing crc"; return NULL; }
+    want = want << 4 | (uint32_t)d;
+  }
+  if (hear_prov_crc32(line, len - 13) != want) { *why = "bad crc"; return NULL; }
+  return line + len - 13;
+}
+
 static inline const char *hear_prov_parse_(const char *line, hear_prov_t *p) {
   if (strncmp(line, "PROV ", 5) != 0) return "not a PROV line";
   if (strlen(line) >= HEAR_PROV_LINE_MAX) return "line too long";
+  const char *why = NULL;
+  const char *end = hear_prov_signed_end(line, &why);
+  if (!end) return why;
   int have_v = 0;
   const char *s = line + 5;
-  while (*s) {
-    while (*s == ' ') s++;
-    if (!*s) break;
+  while (s < end) {
+    while (s < end && *s == ' ') s++;
+    if (s >= end) break;
     const char *e = s;
-    while (*e && *e != ' ') e++;
+    while (e < end && *e != ' ') e++;
     const char *eq = (const char *)memchr(s, '=', (size_t)(e - s));
     if (!eq) return "token without '='";
     size_t kn = (size_t)(eq - s), vn = (size_t)(e - eq - 1);

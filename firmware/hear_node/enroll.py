@@ -11,11 +11,16 @@ update is the same public release image for every node:
     python3 firmware/hear_node/flash.py <node> <ip> --release <tag>
 
 Networks come from ~/.wifi and are never printed. Needs arduino-cli with the esp32 core (the same
-toolchain flash.py uses) and pyserial. If the upload cannot reach a brand-new board, hold BOOT
-while plugging it in and run again.
+toolchain flash.py uses) and pyserial.
+
+The upload resets a board that is running this firmware into its bootloader over the USB serial
+line. A board running anything else (a new one, or one that is wedged) has to be put there by hand:
+hold BOOT while plugging it in. The board re-enumerates during the upload and on every reboot, so
+under WSL2 attach it with `usbipd attach --wsl --busid <id> --auto-attach`, or the port vanishes.
 """
 import argparse
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -23,6 +28,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -35,6 +41,7 @@ SKETCH = "hear_node"
 ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,22}")
 MAX_NETS = 8          # HEAR_PROV_MAX_NETS
 LINE_MAX = 1024       # HEAR_PROV_LINE_MAX
+CHUNK = 64            # bytes per USB write, well under one CDC packet
 # release asset -> the name arduino-cli upload --input-dir expects
 UPLOAD_FILES = {"hear_node-{tag}.bin": SKETCH + ".ino.bin",
                 "hear_node-{tag}-bootloader.bin": SKETCH + ".ino.bootloader.bin",
@@ -46,8 +53,12 @@ def die(msg, code=1):
     sys.exit(code)
 
 
+def sign(line):
+    return "%s crc=%08x" % (line, zlib.crc32(line.encode()) & 0xFFFFFFFF)
+
+
 def prov_line(node, cls, pairs):
-    """The PROV line hear_prov_line.h parses. Raises ValueError for anything it would refuse."""
+    """The signed PROV line hear_prov_line.h parses. Raises ValueError for anything it would refuse."""
     if not ID_RE.fullmatch(node):
         raise ValueError("node id must be lowercase letters, digits and dashes: %r" % node)
     if cls and not ID_RE.fullmatch(cls):
@@ -62,7 +73,7 @@ def prov_line(node, cls, pairs):
         if not 1 <= len(s) <= 32 or not 8 <= len(p) <= 64 or b"\0" in s + p:
             raise ValueError("network %d is not a valid WPA2 SSID/passphrase pair" % i)
         toks.append("net=%s:%s" % (s.hex(), p.hex()))
-    line = " ".join(toks)
+    line = sign(" ".join(toks))
     if len(line) >= LINE_MAX:
         raise ValueError("the PROV line is %d bytes; the node reads at most %d" % (len(line), LINE_MAX - 1))
     return line
@@ -104,7 +115,8 @@ def upload(port, input_dir):
     r = subprocess.run(["arduino-cli", "upload", "-p", port, "--fqbn", FQBN,
                         "--input-dir", input_dir, sketch])
     if r.returncode:
-        die("upload failed (for a brand-new board, hold BOOT while plugging it in and retry)")
+        die("upload failed. A board not running this firmware needs BOOT held while it is plugged "
+            "in; under WSL2 the port must be attached with usbipd --auto-attach")
 
 
 def open_port(port, wait_s=30):
@@ -115,7 +127,7 @@ def open_port(port, wait_s=30):
             return serial.Serial(port, 115200, timeout=0.5)
         except (OSError, serial.SerialException):
             time.sleep(0.5)
-    die("%s did not come back within %d s" % (port, wait_s))
+    die("%s did not come back within %d s (under WSL2: usbipd attach --auto-attach)" % (port, wait_s))
 
 
 def parse_state(line):
@@ -145,6 +157,14 @@ def ask_state(port, wait_s):
     return None
 
 
+def send_line(s, line):
+    data = line.encode() + b"\n"
+    for i in range(0, len(data), CHUNK):
+        s.write(data[i:i + CHUNK])
+        s.flush()
+        time.sleep(0.02)
+
+
 def exchange(port, line, wait_s=120):
     """Send the record, then wait for the node to come back on it and join Wi-Fi."""
     st = ask_state(port, wait_s)
@@ -153,7 +173,7 @@ def exchange(port, line, wait_s=120):
     print("enroll: before  src=%s node=%s nets=%s fw=%s"
           % (st.get("src"), st.get("node"), st.get("nets"), st.get("fw")))
     s = open_port(port)
-    s.write(line.encode() + b"\n")
+    send_line(s, line)
     t0 = time.time()
     while time.time() - t0 < 20:
         got = s.readline().decode("utf-8", "replace").strip()
@@ -198,7 +218,10 @@ def main(argv=None):
 
     if a.release:
         with tempfile.TemporaryDirectory() as d:
-            release_files(a.release, d)
+            try:
+                release_files(a.release, d)
+            except (OSError, ValueError) as e:
+                die("release %s: %s" % (a.release, e))
             upload(a.port, d)
     elif a.input_dir:
         upload(a.port, a.input_dir)
@@ -207,14 +230,14 @@ def main(argv=None):
     print("enroll: %s joined Wi-Fi at %s" % (a.node, ip))
     try:
         with urllib.request.urlopen("http://%s/status" % ip, timeout=6) as r:
-            import json
             st = json.load(r)
-        prov = st.get("prov") or {}
-        if st.get("node") != a.node or prov.get("src") != "nvs":
-            die("%s reports node=%r prov=%r" % (ip, st.get("node"), prov))
-        print("enroll: OK -- %s reports node=%r fw=%r prov=%r" % (ip, st["node"], st.get("fw"), prov))
     except OSError:
         print("enroll: joined, but %s is not reachable from here to confirm /status" % ip)
+        return 0
+    prov = st.get("prov") or {}
+    if st.get("node") != a.node or prov.get("src") != "nvs":
+        die("%s reports node=%r prov=%r" % (ip, st.get("node"), prov))
+    print("enroll: OK -- %s reports node=%r fw=%r prov=%r" % (ip, st["node"], st.get("fw"), prov))
     return 0
 
 
