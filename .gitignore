@@ -7,5 +7,6 @@ __pycache__/
 *.npz
 *.log
 firmware/**/secrets.h
+firmware/**/build_info.h
 .otabuild/
 firmware/**/build/

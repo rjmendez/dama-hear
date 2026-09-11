@@ -75,20 +75,54 @@
 #ifndef NODE_CLASS
 #define NODE_CLASS "xiao-s3-pps"        // 1 PDM mic @48k, GPS PPS, BMP280, microSD. See docs/node-classes.md
 #endif
-// Set by gen_secrets.py from `git describe --always --dirty --tags` at flash time. The fallback
-// matters: a sketch built by hand, without flash.py, is NOT a released build and must not be able
-// to claim a commit it was not built from.
+// `git describe`, from secrets.h in a flash.py build or from build_info.h in a CI build. The
+// fallback matters: a sketch built by hand is NOT a released build and must not be able to claim a
+// commit it was not built from.
+#if __has_include("build_info.h")
+#include "build_info.h"
+#endif
 #ifndef FW_BUILD
 #define FW_BUILD "unset"
 #endif
+// Identity and Wi-Fi come from NVS (written by enroll.py), or from secrets.h in a build that has
+// one. Compiled-in credentials win and are copied into NVS, so a later release image finds them
+// there. With neither, the id comes from the MAC and the node is its own AP.
+#include <hear_prov.h>
 static char node_id[24];
+static char node_class[24];
+static hear_prov_t prov;
+static const char *prov_src = "none";
+static bool prov_nvs = false;       // NVS holds the record this boot runs on
+static bool prov_loaded = false;    // ...and it was read back from NVS, not only written this boot
 static void node_identity() {
+  hear_prov_t nv;
+  bool have_nv = hear_prov_load(&nv);
+  memset(&prov, 0, sizeof prov);
+#if HEAR_WIFI_CONFIGURED
+  prov.n = WIFI_N < HEAR_PROV_MAX_NETS ? WIFI_N : HEAR_PROV_MAX_NETS;
+  for (int k = 0; k < prov.n; k++) {
+    snprintf(prov.ssid[k], sizeof prov.ssid[k], "%s", WIFI_SSIDS[k]);
+    snprintf(prov.psk[k], sizeof prov.psk[k], "%s", WIFI_PASSES[k]);
+  }
 #ifdef NODE_ID
-  snprintf(node_id, sizeof node_id, "%s", NODE_ID);
-#else
-  uint8_t m[6]; esp_efuse_mac_get_default(m);   // the factory MAC, available before WiFi starts
-  snprintf(node_id, sizeof node_id, "hear-%02x%02x%02x", m[3], m[4], m[5]);
+  snprintf(prov.node, sizeof prov.node, "%s", NODE_ID);
 #endif
+  snprintf(prov.cls, sizeof prov.cls, "%s", NODE_CLASS);
+  prov_src = "compiled";
+  prov_loaded = have_nv && hear_prov_same(&nv, &prov);
+  if (hear_prov_id_ok(prov.node))
+    prov_nvs = prov_loaded || hear_prov_save(&prov);
+#else
+  prov_loaded = have_nv;
+  if (have_nv) { prov = nv; prov_src = "nvs"; prov_nvs = true; }
+#endif
+  if (hear_prov_id_ok(prov.node)) {
+    snprintf(node_id, sizeof node_id, "%s", prov.node);
+  } else {
+    uint8_t m[6]; esp_efuse_mac_get_default(m);   // the factory MAC, available before WiFi starts
+    snprintf(node_id, sizeof node_id, "hear-%02x%02x%02x", m[3], m[4], m[5]);
+  }
+  snprintf(node_class, sizeof node_class, "%s", prov.cls[0] ? prov.cls : NODE_CLASS);
 }
 #define AP_SSID   "dama-hear-node"
 #define AP_PASS   "damahear"          // >=8 chars or the AP silently refuses to start
@@ -2200,10 +2234,10 @@ static String status_json() {
   snprintf(b, sizeof b,
     // fw is FIRST after the identity, because the question it answers -- is this node running
     // the same binary as its neighbours -- is asked of the whole fleet at once.
-    // ⚠️wifi_configured IS A BUILD FACT, NOT A LINK STATE. An image built with -DHEAR_ALLOW_NO_WIFI
-    // can only ever be its own AP; without this a node reachable on its AP reports a plausible
-    // status and never says why the LAN cannot see it.
+    // ⚠️wifi_configured means HAS CREDENTIALS, NOT A LINK STATE: false is a node that can only
+    // ever be its own AP. prov says where they came from; nvs:true is what a release image needs.
     "{\"node\":\"%s\",\"class\":\"%s\",\"fw\":\"%s\",\"wifi_configured\":%s,"
+    "\"prov\":{\"src\":\"%s\",\"nets\":%d,\"nvs\":%s,\"loaded\":%s},"
     "\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
@@ -2270,7 +2304,8 @@ static String status_json() {
     "\"budget_left_clips\":%lu,\"held\":%d,\"pre_s\":%.1f,\"post_s\":%.1f,\"dir\":\"%s\",\"boot\":\"%06lx%s\"},"
     "\"env\":{\"temp_c\":%s,\"press_hpa\":%s,\"c_mps\":%s,\"rh_pct\":%s,\"reads\":%lu,\"fail\":%lu},"
     "\"sd\":%s,\"sd_free_mb\":%lu,\"sd_total_mb\":%lu,\"i2c\":\"%s\"}",
-    node_id, NODE_CLASS, FW_BUILD, HEAR_WIFI_CONFIGURED ? "true" : "false",
+    node_id, node_class, FW_BUILD, prov.n > 0 ? "true" : "false",
+    prov_src, prov.n, prov_nvs ? "true" : "false", prov_loaded ? "true" : "false",
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
     gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences,
@@ -2623,16 +2658,17 @@ void setup() {
   logf("boot  attempt %lu on partition %s\n", (unsigned long)hear_boot_try(),
                 esp_ota_get_running_partition()->label);
   node_identity();          // before anything logs or joins: the id names the log and the AP
-  logf("\n=== dama-hear node %s (%s) fw %s ===\n", node_id, NODE_CLASS, FW_BUILD);
+  logf("\n=== dama-hear node %s (%s) fw %s, credentials %s%s ===\n", node_id, node_class, FW_BUILD,
+       prov_src, prov_nvs ? ", in NVS" : "");
 
   // Try each configured network in turn. An outdoor node may only reach one of them, and which
   // one is not knowable from indoors.
   int joined_idx = 0;
-  if (WIFI_N > 0) {
+  if (prov.n > 0) {
     WiFi.mode(WIFI_STA); WiFi.setSleep(false);
-    for (int k = 0; k < WIFI_N && !sta_ok; k++) {
-      logf("wifi  trying network %d/%d", k + 1, WIFI_N);
-      WiFi.begin(WIFI_SSIDS[k], WIFI_PASSES[k]);
+    for (int k = 0; k < prov.n && !sta_ok; k++) {
+      logf("wifi  trying network %d/%d", k + 1, prov.n);
+      WiFi.begin(prov.ssid[k], prov.psk[k]);
       for (int i = 0; i < 24 && WiFi.status() != WL_CONNECTED; i++) { delay(500); Serial.print("."); }
       sta_ok = WiFi.status() == WL_CONNECTED;
       if (sta_ok) joined_idx = k + 1;
@@ -2643,7 +2679,7 @@ void setup() {
   if (sta_ok) {
     // Network NAME deliberately not logged: /log is unauthenticated and this node is meant to sit
     // outdoors. The index is enough to tell which of the configured networks answered.
-    logf("wifi  STA  network %d/%d  http://%s/\n", joined_idx, WIFI_N,
+    logf("wifi  STA  network %d/%d  http://%s/\n", joined_idx, prov.n,
          WiFi.localIP().toString().c_str());
   }
   else {
@@ -2651,7 +2687,8 @@ void setup() {
     WiFi.mode(WIFI_AP); WiFi.softAP(ap, AP_PASS);
     logf("wifi  AP   ssid \"%s\" pass \"%s\"  http://%s/\n",
                   ap, AP_PASS, WiFi.softAPIP().toString().c_str());
-    logln("      (no secrets.h, or the join failed -- see firmware/hear_node/README)");
+    logln(prov.n ? "      (no enrolled network answered -- see firmware/hear_node/README)"
+                 : "      (not enrolled: run firmware/hear_node/enroll.py over USB)");
   }
   if (MDNS.begin(node_id)) logf("mdns  http://%s.local/\n", node_id);
 
@@ -3823,9 +3860,51 @@ static void audio_pump() {
     if (nd == BLOCK) scene_frame(dcblk); else scene_short_blocks++; }
 }
 
+// ---- USB enrollment -------------------------------------------------------------------------
+// firmware/hear_node/enroll.py speaks this over the USB serial port. Lines are read only from
+// loop(), so by the time one is answered setup()'s Wi-Fi attempt is over and PROV STATE can say
+// whether it joined.
+static void prov_serial_line(const char *s) {
+  if (!strcmp(s, "PROV?")) {
+    Serial.printf("PROV STATE src=%s node=%s nets=%d fw=%s ip=%s\n", prov_src, node_id, prov.n,
+                  FW_BUILD, sta_ok ? WiFi.localIP().toString().c_str() : "none");
+    return;
+  }
+  if (strncmp(s, "PROV ", 5)) return;
+#if HEAR_WIFI_CONFIGURED
+  Serial.println("PROV ERR this image has compiled-in credentials, which win at every boot");
+#else
+  static hear_prov_t p;
+  const char *err = hear_prov_parse(s, &p);
+  if (err) { Serial.printf("PROV ERR %s\n", err); return; }
+  if (!p.cls[0]) snprintf(p.cls, sizeof p.cls, "%s", NODE_CLASS);
+  if (!hear_prov_save(&p)) { Serial.println("PROV ERR the NVS write failed"); return; }
+  Serial.printf("PROV OK node=%s nets=%d, rebooting\n", p.node, p.n);
+  Serial.flush(); delay(300); ESP.restart();
+#endif
+}
+
+static void prov_serial_poll() {
+  static char line[HEAR_PROV_LINE_MAX];
+  static size_t n = 0;
+  static bool over = false;
+  while (Serial.available() > 0) {
+    int c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (n && !over) { line[n] = 0; prov_serial_line(line); }
+      n = 0; over = false;
+    } else if (n < sizeof line - 1) {
+      line[n++] = (char)c;
+    } else {
+      over = true;
+    }
+  }
+}
+
 void loop() {
   http.handleClient();
   audio_pump();
+  prov_serial_poll();
 
   // ---- GPS link watchdog ---------------------------------------------------
   // The boot-time pin/baud detection is a measurement of a module that may not have started

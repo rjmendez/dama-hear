@@ -36,9 +36,11 @@ jobs:
       - name: assemble
         run: |
           mkdir dist
-          cp build/hear_node.ino.bin        "dist/hear_node-$TAG.bin"
-          cp build/hear_node.ino.merged.bin "dist/hear_node-$TAG-merged.bin"
-          cp build/hear_node.ino.elf        "dist/hear_node-$TAG.elf"
+          cp build/hear_node.ino.bin            "dist/hear_node-$TAG.bin"
+          cp build/hear_node.ino.bootloader.bin "dist/hear_node-$TAG-bootloader.bin"
+          cp build/hear_node.ino.partitions.bin "dist/hear_node-$TAG-partitions.bin"
+          cp build/hear_node.ino.merged.bin     "dist/hear_node-$TAG-merged.bin"
+          cp build/hear_node.ino.elf            "dist/hear_node-$TAG.elf"
           python3 - <<'PY'
           import json, os
           tag = os.environ["TAG"]
@@ -50,25 +52,30 @@ jobs:
               "esp32_core": "3.3.11",
               "arduino_cli": "1.5.1",
               "build_flags": ["-DHEAR_ALLOW_NO_WIFI"],
-              "wifi_credentials": False,
-              "node_id": None,
+              "credentials": "none compiled in; read from the node's NVS (enroll.py)",
           }, open("dist/build-info.json", "w"), indent=2)
           PY
           (cd dist && sha256sum * > SHA256SUMS)
           cat > notes.md <<EOF
-          Firmware for \`firmware/hear_node\` at \`$GITHUB_SHA\`.
+          Firmware for \`firmware/hear_node\` at \`$GITHUB_SHA\`. \`/status\` reports it as \`fw: $TAG\`.
 
-          ⚠️ These images carry **no Wi-Fi credentials and no node name**. They were built with \`-DHEAR_ALLOW_NO_WIFI\`, so a node booted from one comes up as its own access point, not on the LAN. Use them for bench flashing, for checking a build, or with the \`.elf\` to decode a crash backtrace.
+          These images carry **no Wi-Fi credentials and no node name**. Each node keeps its own in NVS, which OTA does not touch, so the same image goes to every node.
 
-          A field node is flashed from this tag with its credentials compiled in:
+          An enrolled node, over the air:
 
-              git checkout $TAG
-              python3 firmware/hear_node/flash.py <node> <ip>
+              python3 firmware/hear_node/flash.py <node> <ip> --release $TAG
+
+          A new board, over USB, once:
+
+              python3 firmware/hear_node/enroll.py <node> /dev/ttyACM0 --release $TAG
+
+          A board that was never enrolled comes up as its own access point and says so in \`/status\`.
 
           | file | what it is |
           |---|---|
-          | \`hear_node-$TAG.bin\` | app image (what \`/update\` takes) |
-          | \`hear_node-$TAG-merged.bin\` | bootloader + partitions + app, to write at 0x0 over USB |
+          | \`hear_node-$TAG.bin\` | app image, what \`/update\` and \`flash.py --release\` take |
+          | \`hear_node-$TAG-bootloader.bin\`, \`-partitions.bin\` | what \`enroll.py\` uploads beside the app |
+          | \`hear_node-$TAG-merged.bin\` | bootloader + partitions + app, to write at 0x0 with esptool |
           | \`hear_node-$TAG.elf\` | symbols, for backtraces |
           | \`build-info.json\` | toolchain and flags |
           | \`SHA256SUMS\` | checksums of all of the above |
