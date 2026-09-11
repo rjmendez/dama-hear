@@ -201,6 +201,37 @@ OBJECT_CAP = 1024 * 1024
 
 
 @pytest.mark.parametrize("bundle", sorted(_gen()["BUNDLES"]))
+def test_the_declared_size_is_the_size_of_the_real_object(bundle):
+    """`dama-hear/serialised-bytes` must be what the object actually serialises to.
+
+    ⚠️IT IS THE NUMBER THE APPLY MODE IS CHOSEN FROM, so an under-count is a bundle that says
+    "client" and is then refused at redeploy. It has been wrong three ways, each found only
+    because hear-drain-code came within 15 B of the cap and made six bytes matter:
+
+      1. sized a stand-in object with `"name": "x"` and NO annotations   -220 B
+      2. read files raw, but YAML `|` is CLIP and appends the newline
+         three supersonic model JSONs do not have                          -6 B
+      3. then added that newline to hear/__init__.py, which is EMPTY and
+         round-trips as "" rather than "\n"                               +2 B
+
+    The size also appears inside the object it measures, so it is a fixed point; size_of()
+    iterates until it settles. This test is what proves it settled on the truth.
+    """
+    path = ROOT / "deploy" / "k8s" / (bundle + ".yaml")
+    if not path.exists():
+        pytest.skip("no ConfigMap at %s" % path)
+    doc = yaml.safe_load(path.read_text())
+    declared = (doc.get("metadata", {}).get("annotations", {}) or {}).get(
+        "dama-hear/serialised-bytes")
+    actual = len(json.dumps(doc, separators=(",", ":")))
+    assert declared is not None, "%s declares no serialised-bytes" % path.name
+    assert int(declared) == actual, (
+        "%s declares %s B but serialises to %d B (off by %d). The apply mode is chosen from the "
+        "declared number, so an under-count is a redeploy that fails. Regenerate it."
+        % (path.name, declared, actual, actual - int(declared)))
+
+
+@pytest.mark.parametrize("bundle", sorted(_gen()["BUNDLES"]))
 def test_a_bundle_still_fits_the_way_it_declares_it_is_applied(bundle):
     """A bundle must fit the cap belonging to the apply mode it declares, and must declare the
     mode its own size demands.

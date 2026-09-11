@@ -262,8 +262,70 @@ CLIENT_APPLY_ANNOTATION_CAP = 262144
 #: the real ceiling on how much source a bundle may carry however it is applied.
 OBJECT_CAP = 1048576
 
+#: How far under the annotation cap a bundle must sit before it is called client-appliable.
+#:
+#: ⚠️THIS EXISTS BECAUSE THE DECISION FLAPPED. On 2026-09-10 hear-drain-code serialised to
+#: 262,129 B against the 262,144 B cap -- FIFTEEN bytes. The `dama-hear/commit` stamp alone moves
+#: the object by 6 B between a clean and a dirty tree, so consecutive regenerations of the same
+#: source would have alternated between "client" and "server" and the documented deploy command
+#: would have changed with them. A mode that depends on whether the tree was dirty is not a mode.
+#:
+#: 8 KiB is about one more module, so the declaration survives an ordinary edit and only changes
+#: when the bundle genuinely grows. Sitting inside the margin is not an error -- it means the
+#: bundle is applied --server-side from now on, which always works.
+CLIENT_APPLY_MARGIN = 8192
 
-def apply_mode(code, data):
+
+def _object(name, app, code, data, sha, mode, n_bytes):
+    """The ConfigMap exactly as kubectl will serialise it -- the thing the cap applies to.
+
+    `mode` and `n_bytes` land in annotations, so sizing is a fixed point: both candidate modes
+    are 6 characters ("client"/"server") and n_bytes is written as a string, so the length is
+    stable once the digit count is. size_of() below closes the loop.
+    """
+    return {"apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": name, "namespace": "dama",
+                         "labels": {"app": app},
+                         "annotations": {"dama-hear/commit": sha,
+                                         "dama-hear/generated-by": "deploy/k8s/gen_configmap.py",
+                                         "dama-hear/apply-mode": mode,
+                                         "dama-hear/serialised-bytes": str(n_bytes)}},
+            "data": {key: _block(os.path.join(ROOT, rel)) for key, rel in code + data}}
+
+
+def _block(path):
+    """A file's bytes as the YAML `|` block scalar round-trips them.
+
+    ⚠️`|` IS CLIP: it ends the value with exactly one newline whatever the file did. Three of
+    the supersonic model JSONs have no trailing newline, so the shipped value is one byte longer
+    than the file -- two, once JSON escapes it -- and sizing the raw read under-counted by 6 B
+    on hear-score-code. Six bytes did not matter until hear-drain-code had fifteen.
+    """
+    text = open(path).read()
+    if not text:
+        # an empty file renders as `key: |` with no indented lines, which parses back as "",
+        # not "\n" -- hear/__init__.py is empty and is in all four bundles
+        return ""
+    return text if text.endswith("\n") else text + "\n"
+
+
+def size_of(name, app, code, data, sha):
+    """Serialised bytes of the real object, resolved against its own self-reference.
+
+    The size is written into the object, so it is a fixed point: iterate until it stops moving.
+    Two passes settle it unless a digit is gained, three always.
+    """
+    n = 0
+    for _ in range(4):
+        got = len(json.dumps(_object(name, app, code, data, sha, "client", n),
+                             separators=(",", ":")))
+        if got == n:
+            break
+        n = got
+    return n
+
+
+def apply_mode(code, data, name="x", sha="0000000", app="x"):
     """"client" or "server": how this bundle has to be applied, and the two numbers behind it.
 
     ⚠️MEASURED ON THE SERIALISED OBJECT, NOT ON THE RENDERED YAML. What counts against the
@@ -271,22 +333,38 @@ def apply_mode(code, data):
     it is about to send -- so that is what is sized here. Sizing the YAML instead would be a
     proxy that is wrong in both directions: block-scalar indentation inflates it, and JSON's
     escaping of every newline inflates the other.
+
+    ⚠️AND IT MUST BE *THIS* OBJECT, NOT A STAND-IN. This function used to size a payload with
+    `"name": "x"` and no annotations at all, which under-measured the real file by ~220 B. With
+    15 B of headroom that is the difference between "client" and a redeploy that fails, so the
+    caller passes the real name and the byte cost of the real annotation block.
     """
-    payload = {"apiVersion": "v1", "kind": "ConfigMap",
-               "metadata": {"name": "x", "namespace": "dama"},
-               "data": {key: open(os.path.join(ROOT, rel)).read() for key, rel in code + data}}
-    n = len(json.dumps(payload, separators=(",", ":")))
-    return ("server" if n > CLIENT_APPLY_ANNOTATION_CAP else "client"), n
+    n = size_of(name, app, code, data, sha)
+    return ("server" if n > CLIENT_APPLY_ANNOTATION_CAP - CLIENT_APPLY_MARGIN else "client"), n
 
 
 def apply_command(name, mode):
-    """The command that actually works for this bundle, so the file can carry its own."""
-    return "kubectl apply %s-f deploy/k8s/%s.yaml" % (
-        "--server-side " if mode == "server" else "", name)
+    """The command that actually works for this bundle, so the file can carry its own.
+
+    ⚠️`--force-conflicts` IS NOT OPTIONAL ON A BUNDLE THAT USED TO BE CLIENT-APPLIED. The first
+    server-side apply of an object created by `kubectl apply` fails, because every field it
+    touches is still owned by the "kubectl-client-side-apply" manager:
+
+        error: Apply failed with 4 conflicts: conflicts with "kubectl-client-side-apply"
+        - .data.hear_pool.py ...
+
+    Measured on the live cluster 2026-09-10 the day hear-drain-code crossed the cap. Taking
+    ownership is the correct resolution here and only here: a generated bundle has exactly one
+    source of truth, this repo, so there is no other writer whose edit could be lost. Do not
+    copy this flag onto a hand-maintained object.
+    """
+    if mode != "server":
+        return "kubectl apply -f deploy/k8s/%s.yaml" % name
+    return "kubectl apply --server-side --force-conflicts -f deploy/k8s/%s.yaml" % name
 
 
 def render(name, app, code, data, sha):
-    mode, n_bytes = apply_mode(code, data)
+    mode, n_bytes = apply_mode(code, data, name=name, sha=sha, app=app)
     if n_bytes > OBJECT_CAP:
         sys.exit("%s serialises to %d B, past the %d B object cap. Server-side apply does not "
                  "lift this one -- the bundle has to be split." % (name, n_bytes, OBJECT_CAP))
@@ -322,8 +400,9 @@ def main(argv=None):
     check(code, data)
     sha = subprocess.check_output(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"]).decode().strip()
     dirty = subprocess.check_output(["git", "-C", ROOT, "status", "--porcelain"]).decode().strip()
-    text = render(name, app, code, data, sha + ("-dirty" if dirty else ""))
-    mode, n_bytes = apply_mode(code, data)
+    stamp = sha + ("-dirty" if dirty else "")
+    text = render(name, app, code, data, stamp)
+    mode, n_bytes = apply_mode(code, data, name=name, sha=stamp, app=app)
     # stderr, because stdout is redirected into the .yaml by the documented command and an
     # operator who never opens the file would otherwise never see which apply works.
     sys.stderr.write("%s: %d B serialised, apply-mode %s\n  %s\n"

@@ -1,5 +1,5 @@
-# kubectl apply --server-side -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 511493 B serialised against a 262144 B last-applied-configuration cap.
+# kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
+# apply-mode server: 511711 B serialised against a 262144 B last-applied-configuration cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: 'fdeffb7-dirty'
+    dama-hear/commit: '93bb6df-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '511493'
+    dama-hear/serialised-bytes: '511711'
 data:
   hear__init__.py: |
     
