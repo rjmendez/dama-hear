@@ -371,10 +371,31 @@ class TestAdmit:
         assert not r.get(HT.D_UNSURVEYED)
 
     def test_the_not_arrival_message_is_nodeclass_s_own(self, tmp_path):
+        """The refusal the ledger shows must BE nodeclass's, not a copy of it.
+
+        ⚠️THIS TEST USED TO PIN THE LITERAL "timed by ntp, not by GPS PPS" AND THAT IS EXACTLY
+        HOW IT BROKE. feat/arrival-gate-by-sigma replaced the string-name clock test with
+        `clock_admissible() and capture_bias_bounded()` and rewrote the message. Different
+        files, no git conflict, and a green rebase -- the assertion simply described text that
+        no longer existed. Asserting the literal made this test a second, stale copy of the
+        message it was supposed to prove was not copied.
+
+        So it asks nodeclass for the refusal and compares. Any future rewording travels here for
+        free; a driver that starts inventing its own wording still fails.
+        """
         _r, t = self._reasons(tmp_path, [node_row("puc", T0, seed=2)])
+        try:
+            HT.NC.require_arrival(PUC["class"], PUC["node_id"])
+        except HT.NC.CapabilityError as exc:
+            want = str(exc)
+        else:
+            pytest.fail("%s is admitted as an arrival source; this test has no subject"
+                        % PUC["class"])
         led = (pathlib.Path(t["out"]) / "arrivals").rglob("*.jsonl")
         text = "\n".join(p.read_text() for p in led)
-        assert "timed by ntp, not by GPS PPS" in text
+        assert want, "nodeclass raised an empty refusal"
+        assert json.dumps(want)[1:-1] in text, (
+            "the ledger detail is not nodeclass's refusal. nodeclass says:\n  %s" % want)
 
     def test_an_unsurveyed_node_is_never_coerced(self, tmp_path):
         r, _ = self._reasons(tmp_path, [node_row("fancyantsy", T0, seed=3)])
