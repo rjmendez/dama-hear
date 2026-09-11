@@ -79,11 +79,12 @@ import io
 import json
 import os
 import sys
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hear import detsfile as DF  # noqa: E402
 from hear import sketch as SK  # noqa: E402
 from hear import wire as WR  # noqa: E402
 
@@ -159,11 +160,12 @@ NODE_MAX_DUR_S = 30.0
 V1_FLAG_RETRIGGER = 0x0001
 V1_FLAG_NO_CONTEXT = 0x0002
 
-# The literal header the firmware writes (hear_node.ino: DETS_HDR). Checked rather than trusted:
-# File::size() returns uninitialised memory on a file SD.open() has just created, so a node can
-# and does produce a dets.csv with NO header at all. Parsed with csv.DictReader, a headerless
-# file turns its first detection into the column names and every later row into plausible
-# nonsense. Refusing is the only safe reading.
+# The G1 dets.csv layout (hear_node.ino's original DETS_HDR) and the field names /detections'
+# JSON uses. dets.csv itself is no longer single-layout -- see parse_dets_csv, which dispatches on
+# hear/detsfile.py's generation table instead of checking against this list. This constant now
+# serves two narrower jobs: the base names rows_from_detections() pulls out of the live-ring JSON
+# (which has never had a node_id or sync_sigma_ns column to rename), and the fixture shape a few
+# tests build by hand.
 DETS_COLUMNS = ["utc_us", "uptime_s", "sample", "pps_n", "us_since_pps",
                 "trigger", "flags", "fs_hz", "frame_hex"]
 
@@ -263,14 +265,70 @@ def _float_or_none(row: Dict, key: str) -> Optional[float]:
 
 # ------------------------------------------------------------------ input normalisation
 
+def _dets_generation(head: Sequence[str]) -> Optional[Any]:
+    """Which hear/detsfile.py generation wrote this dets.csv header, by EXACT match against its
+    generation table -- the one place dets.csv's six layouts are enumerated. Returns None for a
+    header that extends a known generation with columns neither module has ever seen (tolerated
+    by parse_dets_csv, exactly as before); raises ValueError for a header that matches nothing at
+    all, known extension or otherwise.
+
+    ⚠️THIS MODULE USED TO CHECK dets.csv AGAINST ITS OWN DETS_COLUMNS INSTEAD, A SEPARATE 9-COLUMN
+    G1 LIST THAT NEVER LEARNED node_id, sketch_back OR sync_sigma_ns. Every node has written a
+    node_id-first header since G4 (2026-09-code), so that check refused every real capture from
+    then on -- silently, in the sense that nothing downstream ran this tool against one, and three
+    firmware comments (hear_node.ino:1505,3467,3490) cited this file's trailing-column tolerance
+    as the reason appending sync_sigma_ns was safe, which it never was for the header the firmware
+    actually writes. Importing hear.detsfile's table instead of re-listing it is what a second
+    generation-aware parser this drift-prone would otherwise need to keep doing forever.
+    """
+    h = tuple(head)
+    for gen in DF.GENERATIONS:
+        if h == gen.declared:
+            return gen
+    for gen in DF.GENERATIONS:
+        if h[:len(gen.declared)] == gen.declared:
+            return None
+    raise ValueError(
+        "dets.csv header %r matches no known generation (%s). A node that created the file on "
+        "this boot can write it headerless; prepend the header rather than parsing it blind."
+        % (list(h), ", ".join(g.name for g in DF.GENERATIONS)))
+
+
 def parse_dets_csv(text: str) -> List[Dict]:
     """Rows from a dets.csv pulled off the card over /sd. Pure: takes the file's text.
 
-    Refuses a file whose header is missing or reordered rather than guessing at the columns --
-    see DETS_COLUMNS. Extra trailing columns are allowed and carried, so a future column added to
-    the firmware arrives here without a change.
+    Identifies which hear/detsfile.py generation wrote the header (see _dets_generation) rather
+    than checking a fixed column list, since the firmware has written a node_id-first header since
+    G4 and DETS_COLUMNS never did. A header that extends a known generation with columns neither
+    module recognises is tolerated and carried under its own (file-given) name, so a future column
+    still arrives here without a change; anything else is refused rather than guessed at.
+
+    G3 is the one generation whose declared header lies about its own rows (see
+    hear/detsfile.py's module docstring): read through its DECLARED header with plain
+    csv.DictReader, every value lands one column left of its name. That generation is read through
+    `written` instead, positionally, skipping the (mis-naming) header line itself.
     """
-    return _parse_csv(text, DETS_COLUMNS, "dets.csv")
+    lines = text.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if not lines:
+        raise ValueError(
+            "dets.csv is empty: %d byte(s), no header line and no rows. A file the node created "
+            "but never wrote to, and a file whose content was lost, both read exactly like this, "
+            "and neither is an empty capture: an empty capture still carries a header and zero "
+            "rows." % len(text))
+    head = [c.strip() for c in lines[0].split(",")]
+    gen = _dets_generation(head)
+    if gen is not None and gen.broken_header:
+        reader = csv.DictReader(io.StringIO("\n".join(lines[1:])), fieldnames=list(gen.written))
+    else:
+        reader = csv.DictReader(io.StringIO("\n".join(lines)))
+    out = []
+    for d in reader:
+        d = {k: (v.strip() if isinstance(v, str) else v) for k, v in d.items() if k is not None}
+        d["src"] = "dets.csv"
+        out.append(d)
+    return out
 
 
 def parse_scene_csv(text: str) -> List[Dict]:
