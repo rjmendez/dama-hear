@@ -1126,14 +1126,15 @@ def docs(manifest):
     return [d for d in yaml.safe_load_all(manifest) if d]
 
 
-class TestTheTagJobIsSuspendedUntilAHumanHasListened:
-    """§7. Nine clips left a node before this branch and nobody has listened to any of them.
-    Three models agreeing on "Dog" is corroboration, not ground truth."""
+class TestTheTagJobRunsBecauseAHumanHasListened:
+    """§7. It shipped suspended until a person had heard the clips; 69 were heard on 2026-09-10
+    and the operator enabled it on 2026-09-11. The gate stays on the object as the record."""
 
-    def test_both_cronjobs_ship_suspended(self, docs):
+    def test_both_cronjobs_ship_enabled_with_the_decision_recorded(self, docs):
         assert [d["metadata"]["name"] for d in docs] == ["hear-tag", "hear-tag-check"]
         for d in docs:
-            assert d["spec"]["suspend"] is True, d["metadata"]["name"]
+            assert d["spec"]["suspend"] is False, d["metadata"]["name"]
+        assert "Enabled 2026-09-11" in docs[0]["metadata"]["annotations"]["dama-hear/unsuspend-gate"]
 
     def test_the_unsuspend_condition_is_recorded_on_the_object(self, docs):
         a = docs[0]["metadata"]["annotations"]["dama-hear/unsuspend-gate"]

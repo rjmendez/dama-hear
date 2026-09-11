@@ -49,12 +49,22 @@ BASIS_SAMPLE = "sample"
 BASIS_NONE = "none"
 
 
-def tags_path(root: str) -> str:
-    return os.path.join(root, "clips", TAGS_NAME)
+def tags_path(root: str, store: Optional[str] = None) -> str:
+    """`clips/tags.jsonl` when `store` is None, `clips/tags-<store>.jsonl` otherwise.
+
+    A store is a file name, not a lane name: the tagger maps its original lane to None, so no
+    lane name can be passed here and quietly move that lane's rows to a new file. One file per
+    store keeps lanes in separate pods from appending to the same file.
+    """
+    if store is None:
+        return os.path.join(root, "clips", TAGS_NAME)
+    if not store or not all(c.isalnum() or c == "_" for c in store):
+        raise ValueError("store %r: letters, digits and underscore only" % (store,))
+    return os.path.join(root, "clips", "tags-%s.jsonl" % store)
 
 
 def tag_key(clip_key: str, model_name: str, model_version: str,
-            model_sha256: Optional[str] = None) -> str:
+            model_sha256: Optional[str] = None, variant: Optional[str] = None) -> str:
     """Identity of one (clip, model, model version, WEIGHTS DIGEST). sha256 truncated to 32 hex.
 
     Re-tagging with the SAME weights is a no-op duplicate the reader collapses; a NEW version or a
@@ -67,18 +77,24 @@ def tag_key(clip_key: str, model_name: str, model_version: str,
     alone meant a re-exported yamnet.tflite dropped in under the same MODEL_VERSION was treated
     as already-tagged for every clip already scored, and clips/tags.jsonl then held two models'
     scores under one version string with nothing anywhere comparing digests.
+
+    `variant` names an input policy applied to the same weights (e.g. "pad10"). It is hashed only
+    when given, so every key written before variants existed is unchanged.
     """
     h = hashlib.sha256()
-    for part in ("tag", clip_key, model_name, model_version, model_sha256 or ""):
+    parts = ["tag", clip_key, model_name, model_version, model_sha256 or ""]
+    if variant is not None:
+        parts.append("variant=" + variant)
+    for part in parts:
         h.update(part.encode())
         h.update(b"\x1f")
     return h.hexdigest()[:32]
 
 
-def read_tags(root: str) -> Iterator[Dict[str, Any]]:
+def read_tags(root: str, store: Optional[str] = None) -> Iterator[Dict[str, Any]]:
     """Every stored tag row. An unparseable line is skipped, not fatal: the store is append-only
     and a torn tail from a killed pod must not make the whole resume set unreadable."""
-    p = tags_path(root)
+    p = tags_path(root, store)
     if not os.path.exists(p):
         return
     with open(p, "r", errors="replace") as fh:
@@ -92,7 +108,7 @@ def read_tags(root: str) -> Iterator[Dict[str, Any]]:
                 continue
 
 
-def read_resume(root: str) -> Tuple[Set[str], Dict[str, int]]:
+def read_resume(root: str, store: Optional[str] = None) -> Tuple[Set[str], Dict[str, int]]:
     """ONE pass over the tag store -> (every tag_key held, `name/version/sha256` -> row count).
 
     One pass because `run()` needs both and the store is the only thing either can be read from;
@@ -102,7 +118,7 @@ def read_resume(root: str) -> Tuple[Set[str], Dict[str, int]]:
     """
     keys: Set[str] = set()
     versions: Dict[str, int] = {}
-    for r in read_tags(root):
+    for r in read_tags(root, store):
         k = r.get("tag_key")
         if isinstance(k, str):
             keys.add(k)
@@ -112,13 +128,13 @@ def read_resume(root: str) -> Tuple[Set[str], Dict[str, int]]:
     return keys, versions
 
 
-def read_tagged(root: str) -> Set[str]:
+def read_tagged(root: str, store: Optional[str] = None) -> Set[str]:
     """Every tag_key already held. THE resume token, the same shape as hear_score's key rescan --
     no watermark, so there is nothing to tear and no second source of truth to disagree with."""
-    return read_resume(root)[0]
+    return read_resume(root, store)[0]
 
 
-def versions_held(root: str) -> Dict[str, int]:
+def versions_held(root: str, store: Optional[str] = None) -> Dict[str, int]:
     """`name/version/sha256` -> row count. ⚠️VERSION MIXING IS REPORTED, NEVER MERGED. Two model
     versions scoring the same clip produce two rows by construction (both the version and the
     weights digest are in the key), and a consumer that averaged or de-duplicated across them
@@ -128,11 +144,11 @@ def versions_held(root: str) -> Dict[str, int]:
     returned ONE entry for two different weight files scored under one version string -- the
     exact mixing the docstring claims is reported.
     """
-    return read_resume(root)[1]
+    return read_resume(root, store)[1]
 
 
-def append_tags(root: str, rows) -> int:
-    p = tags_path(root)
+def append_tags(root: str, rows, store: Optional[str] = None) -> int:
+    p = tags_path(root, store)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     n = 0
     with open(p, "a") as fh:

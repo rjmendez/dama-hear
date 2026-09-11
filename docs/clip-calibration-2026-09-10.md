@@ -149,3 +149,44 @@ whose ambient is trees.
   does not exist yet"*. One exists now. It is 69 rows from one listener with 2 marked "sure", so
   it is enough to **refute** things (it already refuted two) and not enough to **fit** anything.
   The card's refusal stands.
+
+---
+
+## 4. The model is scored below its training length (added 2026-09-11)
+
+`mn10_as` was trained on 10 s AudioSet clips; ours are 5.0 s. It is valid at 5 s but not length
+invariant, and below about 4 s it is not valid at all. A 1 kHz tone, RMS-normalised, top class:
+
+| length | upstream PyTorch | the pinned ONNX |
+|---|---|---|
+| 1 s | Male speech 1.00 | Male speech 1.00 |
+| 2 s | Bell 1.00 | Bell 1.00 |
+| 3 s | Sanding 1.00 | Sanding 1.00 |
+| 5 s | Sine wave 0.52 | Sine wave 0.52 |
+| 10 s | Sine wave 0.91 | Sine wave 0.91 |
+
+Upstream, the baked-frontend PyTorch graph and the ONNX agree to within 5e-6 at every length, so
+this is the model, not the export. It also means no window shorter than ~4 s may be scored.
+
+The same 69 clips, same neighbourhood table as §2, paired against the whole-clip pass:
+
+| input | top-1 | top-5 | vs whole (McNemar) |
+|---|---|---|---|
+| whole clip (today) | 18/69 | 42/69 | — |
+| normalised, then zero-padded to 10 s | **30/69** | **54/69** | top-1 +14/−2 p=0.004; top-5 +15/−3 p=0.008 |
+| on the 18 clips that are true 48 kHz audio | 12/18 | 17/18 | top-1 +2/−0; top-5 +4/−0 |
+
+The baseline here is 18/69 rather than §2's 24/69: this run used the pinned export and the same
+table, and the difference is not investigated further.
+
+**The canary does not carry over.** Mean top score, healthy against un-normalised:
+
+| | healthy | un-normalised |
+|---|---|---|
+| whole clip, all 69 | 0.254 | 0.162 |
+| padded, all 69 | 0.288 | **0.297** |
+| padded, the 18 at 48 kHz | 0.349 | 0.240 |
+
+Padded, the broken arm scores higher than the healthy one on the full set, so
+`--min-mean-top-score` cannot gate a padded lane. Hence two lanes: `mn10` keeps the whole-clip
+pass and its calibrated floor, and `mn10_pad10` runs beside it with the floor reported, not gated.
