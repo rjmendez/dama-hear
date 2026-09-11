@@ -221,21 +221,20 @@ def _node_mismatch(row: Dict[str, Any], expect: Optional[str]) -> Optional[str]:
 
 
 def _sync_sigma_ns(v: Any) -> Optional[float]:
-    """A dets.csv G6 cell -> a stated clock sigma in nanoseconds, or None for "not stated".
+    """A stated clock sigma in nanoseconds, or None for "not stated".
 
     ⚠️NON-POSITIVE IS NOT STATED. The firmware writes an EMPTY cell for a row it could not stamp,
     but a 0 that reached here from any source must not become a claim of a perfect clock --
     hear/nodeclass.py refuses `t_sigma_s <= 0` at construction for exactly that reason, and this
-    value is fed to the same budget. Unparseable is None for the same reason: a producer this
-    version does not understand is not one to take a number from.
+    value is fed to the same budget.
+
+    ⚠️ONE COPY OF THE RULE, IN `hear.detsfile`. This used to be a second implementation, and the
+    reader's own version had a hole -- it tested truthiness, so the string "0" survived it. The
+    duplicate is what hid that: this function compensated, so the suite stayed green while the
+    reader's docstring and the reader's behaviour disagreed. This path is still needed because it
+    also normalises MQTT payload values, which never pass through the CSV reader.
     """
-    if v in (None, ""):
-        return None
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return None
-    return f if f > 0.0 else None
+    return DF.stated_sigma_ns(v)
 
 
 def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:

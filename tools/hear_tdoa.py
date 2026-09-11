@@ -264,6 +264,13 @@ V_LOST_TO_GATE = "lost_to_gate"
 VERDICTS = (V_SOLVED, V_SOLVER_REFUSED, V_POSITION_UNOBSERVABLE, V_AT_SEARCH_BOUND,
             V_MARGIN_DEPENDENT, V_INADMISSIBLE, V_LOST_TO_GATE)
 
+# ⚠️`associate_reason` IS NEVER null ON A lost_to_gate ROW. These two are the reasons that are
+# not in associate()'s own `rejected` list: the arrival was not refused, it went to a different
+# event, or (defensively) no event and no refusal claims it at all. A verdict with no reason is
+# the failure mode this module exists to prevent -- see the comment at the ev_of_det build.
+R_MEMBER_OF_OTHER_EVENT = "member_of_event %s seeded at %.6f"
+R_NOT_SEEN_BY_ASSOCIATE = "not_refused_and_in_no_event"
+
 # ---------------------------------------------------------------- binding constraint
 B_NO_RECORDS = "no_records"
 B_CO_ACTIVITY = "co_activity"
@@ -697,9 +704,15 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
         # APERTURE-relative (DEFAULT_SYNC_SIGMA_FRAC of the tightest pair bound: "is this
         # receiver contributing information to that pair at all"), and it moves when the array
         # moves. The one below is HARDWARE-relative: the class's own arrival budget, which does
-        # not. On this array the hardware gate is ~27x tighter (82.1 us of stated sigma against
-        # 3.45 ms), so it binds and the operator knob only ever loosens -- which is the right way
-        # round for a knob. Keep them separate; collapsing them would put site geometry back
+        # not. On this array the hardware gate is ~42x tighter: the largest stated sigma it
+        # admits for xiao-s3-pps is 82.1 us against this knob's 3.44 ms (both measured 2026-09-11
+        # from survey.json and nodeclass.py: tightest pair bound 34.430 ms x 0.10, and
+        # max_stated_clock_sigma_s). ⚠️NOT "~27x": 27 is 3.44 ms over ARRIVAL_T_SIGMA_MAX_S
+        # (129.4 us), which is the per-node TOTAL budget and not a threshold on this quantity --
+        # quoting one gate's ratio against the other gate's number is how the comment read for
+        # two deploys. Either way the hardware gate binds and the operator knob only ever
+        # loosens, which is the right way round for a knob.
+        # Keep them separate; collapsing them would put site geometry back
         # inside a hardware admissibility test, which nodeclass.py's own header argues against.
         if max_sync_ns is not None and ssig is not None and float(ssig) > float(max_sync_ns):
             _drop(day, row, D_SYNC_SIGMA,
@@ -1665,6 +1678,17 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
     rej_by_key = {}
     for r in grouped["rejected"]:
         rej_by_key.setdefault((r["node_id"], r["seq"]), r)
+    # ⚠️AN ARRIVAL CAN BE NEITHER REJECTED NOR THIS CANDIDATE'S SEED. The two scans no longer
+    # consume identically -- associate() releases a candidate its pairwise gate refused, the
+    # driver's ungated scan still consumes it -- so a candidate's members can all be members of
+    # a DIFFERENT associate event, seeded elsewhere. Then `rej_by_key` resolves nothing and the
+    # verdict used to go out as lost_to_gate with associate_reason null: a terminal state with
+    # no reason attached, in the one tool whose charter is that every refusal names its reason.
+    # This maps every arrival to the event that actually holds it, so the verdict can say so.
+    ev_of_det: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for ev in grouped["events"]:
+        for m in ev["detections"]:
+            ev_of_det.setdefault((int(m["node_id"]), int(m["seq"])), ev)
 
     cand_rows: List[Dict[str, Any]] = []
     attempts: List[Dict[str, Any]] = []
@@ -1689,6 +1713,12 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
                 if r is not None:
                     lost_reason = r["reason"]
                     break
+        if not reached and lost_reason is None:
+            other = next((ev_of_det[(int(d["node_id"]), int(d["seq"]))] for d in group
+                          if (int(d["node_id"]), int(d["seq"])) in ev_of_det), None)
+            lost_reason = (R_MEMBER_OF_OTHER_EVENT % (
+                event_key([m["pool_key"] for m in other["detections"]]), other["t0_utc_s"])
+                if other is not None else R_NOT_SEEN_BY_ASSOCIATE)
         cand_rows.append({
             "schema": TDOA_SCHEMA, "candidate_id": gi, "event_key": ek,
             "t0_utc_s": arrivals[0], "span_s": arrivals[-1] - arrivals[0],
@@ -1755,10 +1785,16 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
             key_of_det[d["pool_key"]] = verdict
             ev_key_of_det[d["pool_key"]] = ek
         if verdict == V_SOLVED and bc["admissible"]:
+            # ⚠️THE VERDICT COMES FROM `ev`, NOT FROM `bc`. The solution above was fitted to
+            # ev["node_ids"]/ev["arrivals"]; bound_check ran over `group`, and the two scans do
+            # not always hold the same members. The flag beside a solution has to be the one
+            # computed over the arrivals that solution was fitted to.
             pub = BP.to_dama_event(
                 {"event_id": gi, "model": model, "source_class": policy["source_class"],
                  "n_nodes": len(ev["node_ids"]), "n_equations": len(ev["node_ids"]) - 1,
                  "node_ids": list(ev["node_ids"]), "t0_utc_s": ev["t0_utc_s"],
+                 "point_source_possible": ev["point_source_possible"],
+                 "worst_pair_excess_s": ev["worst_pair_excess_s"],
                  "solution": sol}, array_id=policy.get("array_id") or "hear")
             events_out.append(dict(row, published_payload=pub))
             solved_for_cal.append({"node_ids": list(ev["node_ids"]),

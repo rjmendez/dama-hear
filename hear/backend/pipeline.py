@@ -58,7 +58,15 @@ def to_dama_event(ev: Dict, array_id: str = "hear") -> Dict:
         # residual cannot falsify the fit at this node count; this one says the arrivals could
         # not have come from one point source at all, whatever the fit. A consumer that reads
         # only the residual sees nothing wrong with either.
-        "point_source_possible": ev.get("point_source_possible"),
+        # ⚠️SUBSCRIPTED, NOT `.get`. It shipped as `.get` and the one caller that actually runs
+        # in the cluster -- tools/hear_tdoa.py, which hand-builds this dict -- did not put the
+        # key in, so every published payload carried `point_source_possible: null` while
+        # associate() had computed True or False for that same event. A field that is always
+        # null is worse than an absent one: it reads as "not stated / probably fine". A caller
+        # that omits it is now a KeyError here rather than a silent null downstream.
+        "point_source_possible": ev["point_source_possible"],
+        # The magnitude behind the flag, so False is actionable rather than only alarming.
+        "worst_pair_excess_s": ev["worst_pair_excess_s"],
         "sound_speed_mps": sol.get("sound_speed_mps"),
         "note": sol.get("note"),
     }
