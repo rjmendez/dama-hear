@@ -54,6 +54,11 @@ def to_dama_event(ev: Dict, array_id: str = "hear") -> Dict:
         "contributing_node_ids": list(ev["node_ids"]),
         "rms_residual_ms": sol.get("rms_residual_ms"),
         "residual_is_meaningful": sol.get("residual_is_meaningful"),
+        # ⚠️BESIDE residual_is_meaningful BECAUSE IT ANSWERS THE OTHER HALF. That flag says the
+        # residual cannot falsify the fit at this node count; this one says the arrivals could
+        # not have come from one point source at all, whatever the fit. A consumer that reads
+        # only the residual sees nothing wrong with either.
+        "point_source_possible": ev.get("point_source_possible"),
         "sound_speed_mps": sol.get("sound_speed_mps"),
         "note": sol.get("note"),
     }
@@ -173,6 +178,12 @@ class Backend:
                 "node_ids": list(ev["node_ids"]), "arrivals": list(ev["arrivals"]),
                 "n_nodes": ev["n_nodes"], "n_equations": ev["n_equations"],
                 "span_s": ev["span_s"], "source_class": cls, "model": model,
+                # ⚠️CARRIED, NOT RECOMPUTED. associate() admits on d/c + MARGIN_S; this is the
+                # zero-margin verdict. Three of the four events the live array delivered on
+                # 2026-09-11 were 2.81-9.01 m past any bound it has, and this emitter had no way
+                # to say so. A solution fitted to an impossible group is not a source.
+                "point_source_possible": ev["point_source_possible"],
+                "worst_pair_excess_s": ev["worst_pair_excess_s"],
                 "solution": sol, "solve_error": err, "published": None,
             }
             r["published"] = to_dama_event(r, self.array_id)
