@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 552176 B serialised; 552354 B of annotations against a 262144 B cap.
+# apply-mode server: 599906 B serialised; 600084 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: 'bec2e51'
+    dama-hear/commit: '090e57b'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '552176'
+    dama-hear/serialised-bytes: '599906'
 data:
   hear__init__.py: |
     
@@ -2397,6 +2397,21 @@ data:
         clock_admissible()      t_sigma_s within ARRIVAL_T_SIGMA_MAX_S
         capture_bias_bounded()  path_bias_s STATED and within ARRIVAL_PATH_BIAS_MAX_S
     
+    ⚠️THOSE TWO ARE THE CLASS DOOR. THE PER-DETECTION DOOR IS NOT THE SAME DOOR, AND THE CLASS FIGURE
+    IS NOT ITS CEILING. A producer that states `sync_sigma_ns` has MEASURED the quantity `t_sigma_s`
+    guesses at, so `stamp_admissible()` judges the statement -- RSS'd with the class's CAPTURE terms,
+    which the statement does not measure -- and NOT the class constant. It used to short-circuit on
+    `clock_admissible()`, which made the whole per-detection budget unreachable for every class whose
+    class figure is over the bound; since a class inside the bound needs no rescuing, that was all of
+    them. Measured cost of that short-circuit on the 2026-09-10 pool: 7,863 phone detections, 82.9% of
+    them stating a sigma INSIDE the 129.4 us bound, refused on a 5 ms constant describing a clock tier
+    none of them were running.
+    
+    ⚠️AND THE BIAS GATE DOES NOT MOVE WHEN THE CLOCK GATE OPENS. A stated sigma buys a receiver a
+    clock verdict and nothing else. `path_bias_s` is a systematic offset; weighting handles variance
+    and does not handle bias. `bias_refusal()` is the separate verdict, in separate words, so an
+    operator can see that a phone is one run of tools/hear_latency_cal.py away rather than unusable.
+    
     ⚠️THE SECOND PREDICATE IS WHY THE FIRST IS NOT A LOOPHOLE. A good clock is necessary and it is
     nowhere near sufficient. Between the wavefront reaching the diaphragm and the number the firmware
     writes down sits an analogue-to-digital path -- a decimation filter, a DMA block, an ALSA/USB
@@ -2484,7 +2499,15 @@ data:
                         rather than a measurement of a disciplined one, and no sigma it states can be
                         believed. That is a floor, not a label check.
         t_sigma_s       RANDOM timestamp uncertainty, seconds, 1-sigma: the part that averages down.
-                        This is the number a solver should propagate as noise.
+                        This is the number a solver should propagate as noise. It is the WHOLE
+                        budget -- clock terms and capture terms RSS'd together.
+        clock_sigma_s   How much of `t_sigma_s` is the CLOCK-to-UTC anchor, seconds, or None for
+                        "the split has never been apportioned". It exists because a producer's own
+                        per-detection `sync_sigma_ns` measures exactly this term and nothing else
+                        (firmware/hear_node/hear_node.ino:1281-1288, docs/timing.md:63-65), so it is
+                        the term a statement REPLACES -- see stamp_t_sigma_s. None keeps the
+                        conservative double-count, so adding a class can never loosen the gate by
+                        omission.
         path_bias_s     The part of the capture-path delay that is NOT corrected before the timestamp
                         is emitted, seconds, as a magnitude. `None` means NEVER MEASURED, which is a
                         REFUSAL and not a zero -- see the module docstring. Exactly 0.0 is rejected at
@@ -2505,7 +2528,8 @@ data:
         def __init__(self, name: str, time_source: str, t_sigma_s: float, mic_count: int,
                      fs_hz: float, band_hz: Sequence[float], env: Sequence[str] = (),
                      raw_retain_s: float = 0.0, notes: str = "",
-                     path_bias_s: Optional[float] = None) -> None:
+                     path_bias_s: Optional[float] = None,
+                     clock_sigma_s: Optional[float] = None) -> None:
             if time_source not in ("gps_pps", "ntp", "none"):
                 raise CapabilityError("unknown time_source %r" % (time_source,))
             if mic_count < 1:
@@ -2526,9 +2550,24 @@ data:
                         "means the capture-path delay was never measured, which is a refusal; %r "
                         "claims a capture path with no residual offset, which no hardware supports."
                         % (name, path_bias_s))
+            if clock_sigma_s is not None:
+                clock_sigma_s = float(clock_sigma_s)
+                if not math.isfinite(clock_sigma_s) or clock_sigma_s <= 0.0:
+                    raise CapabilityError(
+                        "%s: clock_sigma_s must be a positive finite number of seconds, or None. "
+                        "None means the clock/capture split has never been apportioned; %r claims a "
+                        "clock anchor with no error, which no hardware supports." % (name,
+                                                                                    clock_sigma_s))
+                if clock_sigma_s > float(t_sigma_s):
+                    raise CapabilityError(
+                        "%s: clock_sigma_s %.1f us is a PART of t_sigma_s %.1f us and cannot exceed "
+                        "it -- the whole budget is the RSS of that part and the capture terms, so a "
+                        "larger clock term would make the capture terms imaginary"
+                        % (name, clock_sigma_s * 1e6, float(t_sigma_s) * 1e6))
             self.name = name
             self.time_source = time_source
             self.t_sigma_s = float(t_sigma_s)
+            self.clock_sigma_s = clock_sigma_s
             self.path_bias_s = path_bias_s
             self.mic_count = int(mic_count)
             self.fs_hz = float(fs_hz)
@@ -2541,6 +2580,17 @@ data:
         @property
         def nyquist_hz(self) -> float:
             return self.fs_hz / 2.0
+    
+        @property
+        def capture_sigma_s(self) -> float:
+            """`t_sigma_s` with the clock term taken back out: the part a statement does NOT replace.
+    
+            `sqrt(t_sigma_s**2 - clock_sigma_s**2)`, because the class budget is an RSS. Undeclared
+            split -> the whole `t_sigma_s`, which is what this file did before the field existed.
+            """
+            if self.clock_sigma_s is None:
+                return self.t_sigma_s
+            return math.sqrt(max(0.0, self.t_sigma_s ** 2 - self.clock_sigma_s ** 2))
     
         def usable_band_hz(self):
             """(lo, hi, limit) -- the band this node can actually deliver, and WHICH ceiling bound it.
@@ -2607,7 +2657,9 @@ data:
             """Every reason this class is not an arrival source, as sentences with numbers in them.
     
             contributes_arrival() and require_arrival()'s message are both built from this one list,
-            so the gate and its explanation cannot drift apart.
+            so the gate and its explanation cannot drift apart. The bias half is `bias_refusal()`
+            verbatim, for the same reason: the class door and the per-detection door must refuse an
+            unmeasured capture path in the same words.
             """
             out: List[str] = []
             if self.time_source == "none":
@@ -2616,23 +2668,24 @@ data:
                     "t_sigma of %.3f ms is not a measurement of a synchronised clock"
                     % (self.t_sigma_s * 1e3,))
             elif self.t_sigma_s > ARRIVAL_T_SIGMA_MAX_S:
+                # ⚠️SAY THAT THIS IS THE no-statement FIGURE. This class-level verdict is what the
+                # class is worth when a detection says NOTHING about its clock; a detection that
+                # states its own sigma is judged on that instead (stamp_admissible). Without the
+                # second clause an operator reads a 5 ms constant and concludes the receiver's clock
+                # is hopeless, when every one of its rows is stating 106 us.
+                rescue = self.max_stated_clock_sigma_s()
                 out.append(
                     "clock t_sigma %.1f us = %.3f m of range exceeds the %.1f us per-node bound "
-                    "(%.0f us one-way budget / sqrt(2), because two independent clocks combine in RSS)"
+                    "(%.0f us one-way budget / sqrt(2), because two independent clocks combine in "
+                    "RSS)%s"
                     % (self.t_sigma_s * 1e6, self.range_sigma_m(c_mps),
-                       ARRIVAL_T_SIGMA_MAX_S * 1e6, ARRIVAL_ONE_WAY_BUDGET_S * 1e6))
-            if self.path_bias_s is None:
-                out.append(
-                    "its capture-path delay has NEVER BEEN MEASURED (path_bias_s is None). A bias "
-                    "does not average down and is invisible in a 3-node exactly-determined fit, "
-                    "whose residual is identically zero by construction, so it cannot be discovered "
-                    "later -- it has to be measured against an external reference first")
-            elif self.path_bias_s > ARRIVAL_PATH_BIAS_MAX_S:
-                out.append(
-                    "its uncorrected capture-path delay %.1f us = %.3f m of range exceeds the "
-                    "%.1f us per-node bound (%.0f us one-way budget / 2, because two biases can add)"
-                    % (self.path_bias_s * 1e6, self.path_bias_m(c_mps),
-                       ARRIVAL_PATH_BIAS_MAX_S * 1e6, ARRIVAL_ONE_WAY_BUDGET_S * 1e6))
+                       ARRIVAL_T_SIGMA_MAX_S * 1e6, ARRIVAL_ONE_WAY_BUDGET_S * 1e6,
+                       "" if rescue <= 0.0 else
+                       " -- that is the FALLBACK for a detection that states no clock sigma of its "
+                       "own; one stating <= %.1f us clears this gate per detection" % (rescue * 1e6,)))
+            bias = self.bias_refusal(c_mps)
+            if bias is not None:
+                out.append(bias)
             return out
     
         def contributes_arrival(self) -> bool:
@@ -2658,22 +2711,31 @@ data:
             """This class's random timestamp sigma for ONE detection, given the producer's own
             statement about its clock, seconds.
     
-            ⚠️RSS, AND DELIBERATELY DOUBLE-COUNTING THE CLOCK. `t_sigma_s` already contains a clock
-            term -- docs/timing.md's detection-path budget lists "esp_timer between anchors,
-            12.20 us" among the terms RSS'd into it -- so adding a stated clock sigma on top charges
-            the healthy case twice. That is the conservative direction and it costs almost nothing
-            where it is charged twice (100 us RSS 12 us is 100.7 us), which is the same trade
-            `path_bias_s` makes for the 62.47 us block quantisation. Subtracting the class's own
-            clock term instead would need that 12.20 us transplanted into this file as a fourth
-            constant nothing else reads, and it would move the answer in the optimistic direction.
+            ⚠️A STATEMENT REPLACES THE CLOCK TERM, IT DOES NOT ADD TO IT. `sync_sigma_ns` is the
+            1-sigma error of the producer's clock-to-UTC anchor and NOTHING ELSE -- the firmware says
+            so where it computes it ("⚠️CLOCK ONLY ... hear/nodeclass.py combines this with the
+            class's capture terms", firmware/hear_node/hear_node.ino:1284-1288) and docs/timing.md:63
+            repeats it for the phone side. So the honest combination is the statement RSS'd with the
+            class's CAPTURE terms, which `capture_sigma_s` is.
+    
+            ⚠️THIS USED TO RSS THE STATEMENT WITH THE WHOLE `t_sigma_s`, AND FOR A PHONE THAT ERASED
+            IT. Charging the clock twice costs a node almost nothing -- for xiao-s3-pps, whose
+            `clock_sigma_s` is undeclared and which therefore still gets exactly that arithmetic,
+            100 us RSS 25 us is 103.1 us. For `gotchi-phone` the class figure IS entirely clock, so
+            5000 us RSS the live fleet median of 106.4 us returned 5001.1 us: the statement moved the
+            answer by 0.023% and every one of 7,863 stated phone rows in the 2026-09-10 pool was
+            refused on a constant describing a tier none of them were running. Measured, both
+            numbers, on that corpus.
     
             A `None` statement returns the class figure unchanged: not stated is not zero, and it is
-            also not a refusal here -- see `stamp_admissible`.
+            also not a refusal here -- see `stamp_admissible`. An undeclared `clock_sigma_s` keeps
+            the old conservative double-count, so this change cannot loosen a class by omission.
             """
             if sync_sigma_ns is None:
                 return self.t_sigma_s
             s = float(sync_sigma_ns) / 1e9
-            return math.sqrt(self.t_sigma_s ** 2 + s * s)
+            cap = self.capture_sigma_s
+            return math.sqrt(cap * cap + s * s)
     
         def stamp_admissible(self, sync_sigma_ns: Optional[float]) -> Optional[bool]:
             """Is ONE detection's timestamp inside the per-node arrival budget?
@@ -2682,36 +2744,91 @@ data:
             state a clock sigma, which is every dets.csv row before generation G6 and every phone
             payload with no `sync_sigma_ns`. None is NOT a refusal -- `associate.arrival_is_usable`
             reads absent as usable by design, so a new field cannot retroactively delete history.
+    
+            ⚠️THE CLASS FIGURE IS A FALLBACK IN THE CLOCK DIMENSION AND A FLOOR IN THE CAPTURE ONE.
+            It is NOT a ceiling, and it used to be: this method short-circuited on
+            `clock_admissible()`, a test of the CLASS `t_sigma_s`, before it read the statement at
+            all. That made the whole per-detection budget unreachable for any class whose class
+            figure is over the bound -- which is every class the statement was built for, because a
+            class inside the bound does not need rescuing. `max_stated_clock_sigma_s` returned 0.0
+            for `gotchi-phone`: there was no number a phone could state that would have been read.
+    
+            The capture terms stay charged whatever is stated, because `sync_sigma_ns` does not
+            measure them. The one string test that survives is `time_source "none"`: with nothing
+            disciplining the clock to UTC there is no anchor for a stated anchor-error to describe,
+            so the statement is not a measurement and cannot be believed. That is a property of the
+            producer, not a threshold, which is why it is not a ceiling either.
             """
             if sync_sigma_ns is None:
                 return None
-            if not self.clock_admissible():
+            if self.time_source == "none":
                 return False
             return self.stamp_t_sigma_s(sync_sigma_ns) <= ARRIVAL_T_SIGMA_MAX_S
     
         def stamp_refusal(self, sync_sigma_ns: Optional[float],
                           c_mps: float = _C_NOMINAL_MPS) -> Optional[str]:
-            """Why this detection's stamp is not an arrival, with the numbers in it, or None."""
+            """Why this detection's stamp is not an arrival ON ITS CLOCK, with the numbers in it.
+    
+            ⚠️THE CLOCK VERDICT ONLY. A receiver refused here and a receiver refused by
+            `bias_refusal` need different people to fix different hardware, and the two must stay
+            legible as two -- see that method.
+            """
             if self.stamp_admissible(sync_sigma_ns) is not False:
                 return None
+            if self.time_source == "none":
+                return ("nothing disciplines its clock to UTC (time_source \"none\"), so the "
+                        "%.1f us it states is not a measurement of a synchronised clock"
+                        % (float(sync_sigma_ns) / 1e3,))
             tot = self.stamp_t_sigma_s(sync_sigma_ns)
             return ("the producer states a clock sigma of %.1f us, which against class %r's own "
-                    "%.1f us gives a per-detection t_sigma of %.1f us = %.3f m of range, over the "
-                    "%.1f us per-node bound"
-                    % (float(sync_sigma_ns) / 1e3, self.name, self.t_sigma_s * 1e6,
+                    "%.1f us of CAPTURE terms gives a per-detection t_sigma of %.1f us = %.3f m of "
+                    "range, over the %.1f us per-node bound"
+                    % (float(sync_sigma_ns) / 1e3, self.name, self.capture_sigma_s * 1e6,
                        tot * 1e6, tot * float(c_mps), ARRIVAL_T_SIGMA_MAX_S * 1e6))
+    
+        def bias_refusal(self, c_mps: float = _C_NOMINAL_MPS) -> Optional[str]:
+            """Why this class's CAPTURE PATH is not an arrival source, or None if it is fine.
+    
+            ⚠️SEPARATE FROM THE CLOCK VERDICT AND IT MUST STAY SEPARATE. Weighting handles variance;
+            it does not handle bias. A stated `sync_sigma_ns` says how much this receiver's stamps
+            SCATTER, and a solver can widen that receiver's contribution accordingly. An uncorrected
+            capture-path delay is not scatter: it moves that receiver's range by a fixed amount, in
+            one direction, on every event, and no weight removes it -- it relocates the fit instead
+            of widening it. So a phone can pass the clock verdict on its own stated sigma and must
+            still be refused here until tools/hear_latency_cal.py has measured its path against a
+            co-located PPS node. Two gates, two messages, and an operator who reads the second one
+            knows the receiver is one CALIBRATION away rather than unusable.
+            """
+            if self.path_bias_s is None:
+                return ("its capture-path delay has NEVER BEEN MEASURED (path_bias_s is None). A "
+                        "bias does not average down and is invisible in a 3-node exactly-determined "
+                        "fit, whose residual is identically zero by construction, so it cannot be "
+                        "discovered later -- it has to be measured against an external reference "
+                        "first")
+            if self.path_bias_s > ARRIVAL_PATH_BIAS_MAX_S:
+                return ("its uncorrected capture-path delay %.1f us = %.3f m of range exceeds the "
+                        "%.1f us per-node bound (%.0f us one-way budget / 2, because two biases can "
+                        "add). This is a BIAS, not scatter: no per-detection weight removes it"
+                        % (self.path_bias_s * 1e6, self.path_bias_m(c_mps),
+                           ARRIVAL_PATH_BIAS_MAX_S * 1e6, ARRIVAL_ONE_WAY_BUDGET_S * 1e6))
+            return None
     
         def max_stated_clock_sigma_s(self) -> float:
             """The largest `sync_sigma_ns` (as seconds) this class may state and still be admitted.
     
-            `sqrt(budget**2 - t_sigma_s**2)`, i.e. the inverse of `stamp_t_sigma_s`. 0.0 for a class
-            already over the bound on its class figure alone -- there is no statement that rescues
-            it. Exported so a firmware author can see what the wire number is being spent against
+            `sqrt(budget**2 - capture_sigma_s**2)`, i.e. the inverse of `stamp_t_sigma_s`. 0.0 for a
+            class whose CAPTURE terms alone are already over the bound -- there is no statement that
+            rescues that -- and 0.0 for `time_source "none"`, where no statement is believed at all.
+            Exported so a firmware author can see what the wire number is being spent against
             without re-deriving the algebra: 82.1 us for xiao-s3-pps today.
+    
+            ⚠️IT IS NO LONGER GATED ON `clock_admissible()`. That made it return 0.0 for exactly the
+            classes a statement exists to rescue, and a firmware author reading 0.0 would have
+            concluded, wrongly, that the field was not worth sending.
             """
-            if not self.clock_admissible():
+            if self.time_source == "none":
                 return 0.0
-            return math.sqrt(max(0.0, ARRIVAL_T_SIGMA_MAX_S ** 2 - self.t_sigma_s ** 2))
+            return math.sqrt(max(0.0, ARRIVAL_T_SIGMA_MAX_S ** 2 - self.capture_sigma_s ** 2))
     
         def __repr__(self) -> str:
             lo, hi, lim = self.usable_band_hz()
@@ -2765,6 +2882,16 @@ data:
         # falls back to the nominal rate below that, which is wrong identically on every node and
         # cancels in a TDoA. See docs/timing.md for the full budget and what is still open.
         t_sigma_s=100e-6,
+        # ⚠️`clock_sigma_s` IS DELIBERATELY NOT DECLARED HERE, AND THE OMISSION IS THE CONSERVATIVE
+        # ANSWER. The clock terms of the budget above are GPS tAcc 0.02 us, PPS spread/2 5.00 us and
+        # esp_timer between anchors 12.20 us -- 13.18 us RSS'd -- so declaring it would drop this
+        # class's capture figure from 100.0 us to 99.13 us and RAISE `max_stated_clock_sigma_s` from
+        # 82.1 us to 83.2 us. That is a 1.3% LOOSENING bought by transplanting three numbers out of
+        # docs/timing.md into this file, where nothing else reads them and nothing keeps them in step
+        # with it. The double-count it avoids is worth 0.8 us on a 100 us budget (100.0 RSS 25.0 is
+        # 103.08; 99.13 RSS 25.0 is 102.23). Nothing needs that 0.8 us, so the transplant is not
+        # bought. The phone entry below is a different case entirely: its class figure is 100% clock
+        # by its own comment, so declaring the split there is transcription, not transplant.
         # THE CAPTURE PATH IS CORRECTED, WHICH IS WHY THIS CLASS PASSES THE BIAS PREDICATE AND THE
         # OTHERS DO NOT. docs/timing.md, "The two paths, which are not the same path": the detection
         # timestamp is `utc = local_to_utc(esp_timer_get_time() - back_us)` with
@@ -2859,6 +2986,13 @@ data:
         # need its capture path measured before it produced an arrival. The old test refused this
         # class for its label. This one refuses it for its 3 ms.
         t_sigma_s=3e-3,
+        # ENTIRELY CLOCK: the 3 ms above is a cross-device SYNC figure and contains no capture term,
+        # so a PUC that ever states a `sync_sigma_ns` is judged on that statement and not on this
+        # constant. It changes nothing today -- the PUC's capture path is unmeasured, so
+        # `bias_refusal` refuses it whatever its clock says -- and it is written down because the
+        # alternative is a reader concluding from `max_stated_clock_sigma_s() == 0` that the field is
+        # not worth sending from a PUC.
+        clock_sigma_s=3e-3,
         path_bias_s=None,
         mic_count=2,
         fs_hz=48000.0,
@@ -2912,6 +3046,23 @@ data:
         # itself in sync_sigma_ns, so a phone that ever reports better is not held back by this
         # entry's history.
         t_sigma_s=5e-3,
+        # ⚠️ALL OF IT IS CLOCK, WHICH IS WHY THE 5 ms ABOVE IS A FALLBACK AND NOT A VERDICT. The
+        # comment above already says so -- "t_sigma_s is now the CLOCK term and only the clock term"
+        # -- and writing it into the model is what stops `stamp_t_sigma_s` RSSing a stated 106 us
+        # with it and handing back 5001 us. Measured on the 2026-09-10 pool: 7,863 phone rows state a
+        # sigma, median 106.4 us = 0.037 m, 82.9% of them inside the 129.4 us per-node bound, and
+        # under the old arithmetic every single one was refused. 8,800 of 9,480 rows are clock_tier
+        # "gnss"; the 5 ms is GPSTimingSync's "location" tier, which is not the tier these devices run.
+        #
+        # ⚠️THE CONSEQUENCE IS capture_sigma_s == 0, AND THAT IS A GAP, NOT A MEASUREMENT. It says the
+        # handset's audio path contributes no RANDOM jitter, which nobody has measured and which no
+        # hardware supports. It is not load-bearing today and must not be allowed to become so
+        # quietly: no phone arrival can reach a solver while `path_bias_s` below is over the bias
+        # bound, and the tool that lifts that -- tools/hear_latency_cal.py, against a co-located PPS
+        # node -- is the same tool that would produce the scatter. ⚠️WHOEVER FILLS IN path_bias_s
+        # FROM A CALIBRATION RUN MUST FILL IN THE SCATTER OF THAT RUN HERE IN THE SAME COMMIT, or the
+        # phone is admitted carrying an unmeasured capture term at weight zero.
+        clock_sigma_s=5e-3,
         # THE DISQUALIFYING TERM, AND THE ONE THIS FILE EXISTS TO NAME.
         # dama-gotchi/android/app/src/main/assets/acoustic_latency_calibration.json, read 2026-09-10:
         #     myasshurts-9669aa0e         13_122_000 ns = 13.122 ms
@@ -2940,10 +3091,12 @@ data:
         raw_retain_s=8.0,
         notes="dama-gotchi Android node. EXCELLENT sensor platform: a 48 kHz microphone wider than any "
               "XIAO node, an 8 s raw ring it will serve on request, a HAL-anchored frame axis and an "
-              "onset that reaches the pool. Refused for arrivals on TWO counts -- a 5 ms clock, and an "
-              "uncorrected 13.1 ms capture-path latency on the best of three devices. Fix the latency "
-              "table (tools/hear_latency_cal.py) and the bias goes; the clock needs GPSTimingSync on a "
-              "better tier than \"location\".",
+              "onset that reaches the pool. Refused for arrivals on ONE count now: the uncorrected "
+              "13.1 ms capture-path latency on the BEST of three devices, 4.50 m of pure bias that no "
+              "weight removes. The 5 ms clock above is the fallback for a detection that states "
+              "nothing, and the live devices state ~106 us per row on clock_tier \"gnss\" -- they "
+              "clear the clock gate on their own numbers. Run tools/hear_latency_cal.py against a "
+              "co-located PPS node and this class becomes an arrival source.",
     ))
     
     
@@ -2985,6 +3138,34 @@ data:
         """Why that stamp is not an arrival, with the numbers in it, or None."""
         cls = _stamp_class(class_name)
         why = cls.stamp_refusal(sync_sigma_ns, c_mps)
+        if why is None or class_name in CLASSES:
+            return why
+        return ("%s (the receiver's class is unstated, so the strictest arrival class is charged)"
+                % why)
+    
+    
+    def stamp_t_sigma_s(sync_sigma_ns: Optional[float],
+                        class_name: Optional[str] = None) -> float:
+        """ONE detection's total random timestamp sigma, SECONDS -- the number a solver weights on.
+    
+        ⚠️SECONDS, WHERE THE WIRE AND THE POOL CARRY NANOSECONDS. `sync_sigma_ns` is nanoseconds
+        everywhere it is produced (dets.csv, the phone sketch payload, hear/pool.py, corpus.Record);
+        the ns -> s conversion happens HERE and once, because this is also where the class's capture
+        terms -- which are already seconds -- are RSS'd in. A caller that converted first and RSS'd
+        later would have to know the split, which is exactly what this module owns.
+    
+        ⚠️THIS IS SCATTER AND NOT THE WHOLE COST. It says nothing about `path_bias_s`; see
+        `bias_refusal`. A solver handed this number is being told how much to WIDEN a receiver, which
+        is not a licence to admit one whose capture path was never measured.
+        """
+        return _stamp_class(class_name).stamp_t_sigma_s(sync_sigma_ns)
+    
+    
+    def bias_refusal(class_name: Optional[str] = None,
+                     c_mps: float = _C_NOMINAL_MPS) -> Optional[str]:
+        """Why this receiver's CAPTURE PATH is not an arrival source, or None. Never the clock."""
+        cls = _stamp_class(class_name)
+        why = cls.bias_refusal(c_mps)
         if why is None or class_name in CLASSES:
             return why
         return ("%s (the receiver's class is unstated, so the strictest arrival class is charged)"
@@ -4396,6 +4577,13 @@ data:
     #                 does, off the survey's class -- exactly as it already resolves `utc_trusted`
     #                 into a real boolean instead of passing the stored field down.
     #
+    #                 ⚠️THE BOOLEAN IS NOT THE ONLY THING THAT QUANTITY IS GOOD FOR. Spending a
+    #                 stated sigma entirely on a pass/fail throws away everything it says about
+    #                 receivers that PASS. The caller also resolves it into `t_sigma_s` (seconds),
+    #                 which this module carries into `event["arrival_sigma_s"]`, index-aligned with
+    #                 `arrivals`, for a solver to weight on. Carrying is all it does: the conversion
+    #                 needs the class, for the reason in the paragraph above.
+    #
     # ⚠️THE TIMESTAMP IS NOT MOVED. Rewriting arrival times that are already in a shipped pipeline
     # would change every historical answer silently, which is worse than the defect. This refuses the
     # detection instead, by the same discipline as nodeclass.require_arrival() and survey's load-time
@@ -4649,6 +4837,15 @@ data:
                 "t0_utc_s": arrivals[0],
                 "node_ids": [int(m["node_id"]) for m in group],
                 "arrivals": arrivals,
+                # ⚠️INDEX-ALIGNED WITH `arrivals`, SECONDS, AND None MEANS THE PRODUCER DID NOT STATE
+                # ONE. Carried, never computed: turning a stated `sync_sigma_ns` into a total sigma
+                # needs the receiver's CLASS, which this module has never known -- the same reason
+                # `stamp_admissible` arrives as a resolved boolean. tools/hear_tdoa.py resolves it
+                # through nodeclass and puts `t_sigma_s` on the detection; this carries it to the
+                # solver so a receiver that states what its stamp is worth can be weighted on that
+                # statement instead of voting at par with every other receiver.
+                "arrival_sigma_s": [(None if m.get("t_sigma_s") is None
+                                     else float(m["t_sigma_s"])) for m in group],
                 "detections": list(group),
                 "n_nodes": len(group),
                 "n_equations": len(group) - 1,      # t0 cancels in TDoA
@@ -5540,6 +5737,16 @@ data:
     This is why `solve()` returns an observability verdict and refuses to quote an offset when the
     nodes do not straddle. A solver that returns a confident number in a degenerate configuration is
     how this project twice produced a fit that disagreed with the operator's own eyes.
+    
+    ⚠️A SIGMA IS A VARIANCE AND NOT A BIAS, and the two gates that follow from that are separate.
+    `sigmas` lets a receiver that states a worse clock vote less; it does NOT remove a systematic
+    offset. An uncalibrated capture path MOVES the fit rather than widening it, and no weight
+    recovers that. Measured, from dama-gotchi's acoustic_latency_calibration.json (the same file
+    nodeclass.py:546 cites): myasshurts 13_122_000 ns = 13.122 ms = 4.51 m at 343.42 m/s, and
+    financialdistress 293_499_000 ns = 293.499 ms. Two of the three phones that detect are in that
+    file at all; fancyantsy is not in it. So a receiver may be weighted on its clock and must STILL
+    be refused on an unmeasured path delay. That refusal is an ADMISSION question, it does not live
+    here, and a sigma argument is not permission to skip it.
     """
     from __future__ import annotations
     
@@ -5560,6 +5767,71 @@ data:
         if m <= 1.0:
             return None
         return math.degrees(math.asin(1.0 / m))
+    
+    
+    def sigma_weights(sigmas: Optional[Sequence[float]], n: int):
+        """(sigma_s, relative_weight) from per-receiver ARRIVAL sigmas in SECONDS, or (None, None).
+    
+        Shared with point.py so the two solvers cannot disagree about what a stated sigma means.
+    
+        ⚠️NORMALISED TO THE SMALLEST STATED SIGMA, NOT THE MEAN, AND THAT IS LOAD-BEARING. x/x is
+        exactly 1.0 for every finite non-zero float, so equal sigmas give a weight vector of exactly
+        1.0 and `None` is returned in its place -- which is what lets the caller run the ORIGINAL
+        unweighted arithmetic and be bit-identical to the day before this argument existed. The mean
+        of N equal floats is not exactly that float (three copies of 0.1 sum to 0.30000000000000004),
+        so a mean-normalised weight would be 1.0 +/- an ulp and the equal-sigma result would drift.
+    
+        ⚠️ABSENT IS NOT ZERO AND IT IS NOT A CLASS DEFAULT. A partially-stated vector RAISES rather
+        than being filled in: filling it is precisely how nodeclass's worst-tier class constant came
+        to override what a detection said about itself. A caller that means "use the class figure for
+        this receiver" has to write the figure down.
+        """
+        if sigmas is None:
+            return None, None
+        if len(sigmas) != n:
+            raise ValueError("sigmas must have one entry per receiver: got %d for %d receivers"
+                             % (len(sigmas), n))
+        missing = [i for i, v in enumerate(sigmas) if v is None]
+        if missing:
+            raise ValueError(
+                "sigma stated for %d of %d receivers, absent at index %s: this solver will not "
+                "invent one. Absent is not zero and it is not a class figure -- state every sigma, "
+                "or pass sigmas=None and weight nothing" % (n - len(missing), n, missing))
+        s = np.asarray(sigmas, float)
+        if not (np.all(np.isfinite(s)) and np.all(s > 0.0)):
+            raise ValueError("every sigma must be finite and > 0 seconds: got %r" % (s.tolist(),))
+        w = s.min() / s
+        return s, (None if bool(np.all(w == 1.0)) else w)
+    
+    
+    # JUDGEMENT, not a measurement: a receiver counts toward DETERMINACY when its stated sigma is
+    # within 10x the best stated sigma in the group. Some floor is unavoidable -- a weight is
+    # continuous and determinacy is an integer -- and the alternatives were worse. Kish's effective
+    # count alone cannot carry the test: four 106 us receivers plus the corpus's own 3.23 s maximum
+    # score 4.000000002, so `n_eff - 1 > 3` is TRUE on float noise and the residual of a system whose
+    # fifth receiver contributes 3.3e-05 of a vote reads as evidence. Both the floor and every
+    # relative weight are published, so this judgement can be second-guessed from the result alone.
+    WEIGHT_FLOOR: float = 0.1
+    
+    
+    def effective_n(w, n: int) -> float:
+        """Kish effective count for relative weights `w` (None meaning all equal).
+    
+        (sum q)^2 / sum(q^2) over q = w^2. Equal weights give exactly `n`; one receiver carrying all
+        the weight gives 1. Continuous and threshold-free, which is why it is REPORTED -- but see
+        WEIGHT_FLOOR for why the determinacy boolean cannot be read off it.
+        """
+        if w is None:
+            return float(n)
+        q = np.asarray(w, float) ** 2
+        return float(q.sum() ** 2 / (q * q).sum())
+    
+    
+    def counting_n(w, n: int) -> int:
+        """How many receivers carry at least WEIGHT_FLOOR of a vote. Exactly `n` for equal sigmas."""
+        if w is None:
+            return int(n)
+        return int(np.count_nonzero(np.asarray(w, float) >= WEIGHT_FLOOR))
     
     
     def _axes(bearing_rad: float):
@@ -5587,11 +5859,16 @@ data:
     
     def solve(positions: Sequence, arrivals: Sequence[float], v_mps: float = 900.0,
               temp_c: float = 20.0, bearing_step_deg: float = 0.25,
-              offset_range_m: float = 150.0, offset_step_m: float = 0.25) -> Dict:
+              offset_range_m: float = 150.0, offset_step_m: float = 0.25,
+              sigmas: Optional[Sequence[float]] = None) -> Dict:
         """Fit bearing and offset to shock arrival times.
     
         `positions` are 2D east/north metres in a common local frame; `arrivals` are absolute seconds
         on a shared clock (PPS-disciplined per node -- the radio never carries time).
+    
+        `sigmas` is the OPTIONAL per-receiver arrival sigma in SECONDS -- one entry per receiver or
+        None for all of them, never a mixture. Given, the fit is a weighted least squares and
+        `chi2`/`chi2_reduced` report the residual against the uncertainties that produced it.
     
         Returns `offset_m: None` and `offset_observable: False` when the nodes do not straddle the
         fitted track, because in that geometry any offset fits equally well.
@@ -5603,7 +5880,29 @@ data:
             raise ValueError("v %.1f is subsonic at c %.1f: no shock exists" % (v_mps, c))
         P = [np.asarray(p, float)[:2] for p in positions]
         t = np.asarray(arrivals, float)
-        dt_obs = t[1:] - t[0]
+        sig, wrel = sigma_weights(sigmas, len(P))
+        # ⚠️THE REFERENCE RECEIVER IS THE BEST-STATED ONE, NOT LISTED-FIRST. This form differences
+        # against one receiver instead of marginalising t0 out (point.py:_residual does the latter),
+        # so the reference's clock error enters EVERY equation and no per-equation weight can remove
+        # it. Referencing on the worst clock in the group is how a 3.23 s phone sigma would poison a
+        # fit that the weights then report as clean. argmin returns 0 on ties and sigma_weights
+        # returns None for equal sigmas, so an unweighted call still differences against index 0.
+        ref = 0 if wrel is None else int(np.argmin(sig))
+        idx = [i for i in range(len(P)) if i != ref]
+        dt_obs = t[idx] - t[ref]
+        # Per-EQUATION sigma: a difference of two receivers has variance sigma_i^2 + sigma_ref^2.
+        # ⚠️DIAGONAL ONLY. The true covariance of the differenced system also carries sigma_ref^2 in
+        # every off-diagonal, because every equation shares the reference. Dropping it is an
+        # approximation, and it is taken deliberately: the exact GLS weight is (I + J)^-1 even when
+        # the sigmas are all equal, so an exact solver could not reproduce today's numbers and
+        # bit-identity at equal sigmas is the property this change is judged on. The approximation
+        # under-weights the reference's contribution to the correlated part; the clean fix is to
+        # marginalise t0 the way point.py does, which is a change to the unweighted answer too.
+        wp = None
+        if wrel is not None:
+            rho = sig / sig.min()
+            rho_pair = np.sqrt((rho[idx] ** 2 + rho[ref] ** 2) / 2.0)
+            wp = 1.0 / rho_pair
         # Vectorised over offset: the along-track term is INDEPENDENT of offset (the normal is
         # orthogonal to the track), so only the miss term moves. Scalar nesting took 8 minutes for
         # a handful of solves; this is the same arithmetic.
@@ -5615,23 +5914,43 @@ data:
             u, n = _axes(br)
             a = np.array([float(np.dot(p, u)) for p in P])          # along-track, fixed vs offset
             q = np.array([float(np.dot(p, n)) for p in P])          # signed distance to the track
-            t = a[:, None] / v_mps + np.abs(q[:, None] - offs[None, :]) * k
-            pred = t[1:, :] - t[0, :]
-            r = np.sum((pred - dt_obs[:, None]) ** 2, axis=0)
+            tt = a[:, None] / v_mps + np.abs(q[:, None] - offs[None, :]) * k
+            d = tt[idx, :] - tt[ref, :] - dt_obs[:, None]
+            if wp is not None:
+                d = d * wp[:, None]
+            r = np.sum(d ** 2, axis=0)
             i = int(np.argmin(r))
             if best is None or r[i] < best[0]:
                 best = (float(r[i]), br, float(offs[i]))
         r, br, off = best
         n_eq = len(P) - 1
+        n_unk = 2                                                   # bearing and offset; t0 cancels
         obs = straddles(P, br, off)
         rms_ms = math.sqrt(r / n_eq) * 1000.0
+        # r is already sum((d/rho_pair)^2) and rho_pair = sigma_pair/(sqrt(2)*sigma_min), so dividing
+        # by 2*sigma_min^2 recovers sum((d/sigma_pair)^2) -- the same expression on both branches.
+        chi2 = None if sig is None else float(r / (2.0 * float(sig.min()) ** 2))
+        dof = n_eq - n_unk
+        n_eff_eq = effective_n(wp, n_eq)
+        n_cnt_eq = counting_n(wp, n_eq)
         return {
             "bearing_deg": math.degrees(br) % 360.0,
             "offset_m": off if obs else None,
             "offset_observable": obs,
             "rms_residual_ms": rms_ms,
-            "residual_is_meaningful": n_eq > 2,
-            "n_nodes": len(P), "n_equations": n_eq,
+            # Counted over EQUATIONS here, not receivers: this form differences against `ref`, so a
+            # receiver contributes exactly one equation and the reference contributes to all of them.
+            "residual_is_meaningful": n_eq > n_unk and n_cnt_eq > n_unk,
+            "n_nodes": len(P), "n_equations": n_eq, "n_unknowns": n_unk,
+            "residual_dof": dof,
+            "chi2": chi2,
+            "chi2_reduced": None if (chi2 is None or dof <= 0) else chi2 / dof,
+            "n_effective_equations": n_eff_eq,
+            "n_counting_equations": n_cnt_eq,
+            "weight_floor": WEIGHT_FLOOR,
+            "reference_node_index": ref,
+            "sigma_s": None if sig is None else sig.tolist(),
+            "equation_weights": None if wp is None else wp.tolist(),
             "sound_speed_mps": c,
             "mach_angle_deg": mach_angle_deg(v_mps, c),
             "note": None if obs else
@@ -5685,6 +6004,24 @@ data:
     DIMENSION. Positions are (east, north, up) metres in one local frame; 2-vectors are read as up=0.
     Use hear.geodesy to get there from lat/lon/height, and pass the ELLIPSOID height -- hMSL carries
     the geoid undulation, which is not a distance. This module no longer slices [:2] anywhere.
+    
+    UNCERTAINTY. `sigmas` is optional and, given, makes the fit a weighted least squares: a receiver
+    that states a worse clock votes less, and `chi2_reduced` puts the residual on a scale where it
+    can be compared against the uncertainties that produced it instead of read as raw milliseconds.
+    Omitted, every arithmetic operation below is the one that was there before the argument existed.
+    
+    ⚠️chi2 HAS A NUMERICAL FLOOR AND PPS IS UNDER IT. This solver leaves ~5.07e-08 s rms (17 um of
+    range) on arrivals that are EXACT by construction -- that is least_squares converging, not the
+    data disagreeing, and it is unchanged from before this module took a sigma. Squared against a
+    stated sigma it stops being negligible: chi2 is 6.8e-07 at the corpus's 106 us phone median and
+    4.81 at a 40 ns PPS figure, on a fit with nothing wrong with it. Below about 88 ns of stated
+    sigma the chi-square is measuring this module and not the array. Pinned in
+    tests/test_point.py::test_chi2_has_a_numerical_floor so the number cannot rot quietly.
+    
+    ⚠️A SIGMA IS A VARIANCE AND NOT A BIAS -- see shockwave.py's header for the measured numbers.
+    Weighting widens a receiver's allowance; it does not move a systematic capture-path offset, which
+    displaces the fit rather than inflating its residual. A receiver may be weighted on its clock and
+    must STILL be refused on an unmeasured path delay. That is an ADMISSION gate and it is not here.
     """
     from __future__ import annotations
     
@@ -5712,18 +6049,30 @@ data:
         raise ValueError("unknown source class %r" % (source_class,))
     
     
-    def _residual(s: np.ndarray, P: np.ndarray, t: np.ndarray, c: float) -> np.ndarray:
+    def _residual(s: np.ndarray, P: np.ndarray, t: np.ndarray, c: float,
+                  w: Optional[np.ndarray] = None) -> np.ndarray:
         """TDoA residual with t0 marginalised out, not differenced against node 0.
     
         Subtracting the mean IS the marginalisation -- it removes the direction a common time shift
         moves, exactly as placement.dop()'s (I - 11'/N) does -- so the answer cannot depend on which
         node the caller listed first.
+    
+        `w` is the relative weight vector from shockwave.sigma_weights (1 at the best-stated receiver,
+        smaller elsewhere), or None. Weighted, the marginalised t0 is the WEIGHTED mean -- profiling
+        t0 out of sum q_i (r_i - t0)^2 gives sum(q r)/sum(q), and using the plain mean there would
+        leave a t0 the cost does not actually want. `w is None` takes the original expression
+        untouched rather than multiplying by a vector of ones, so the unweighted answer is identical
+        by construction and not by the grace of ddot rounding the same way as a pairwise sum.
         """
         r = t - np.linalg.norm(s[None, :] - P, axis=1) / c
-        return r - r.mean()
+        if w is None:
+            return r - r.mean()
+        q = w * w
+        return w * (r - float(q @ r) / float(q.sum()))
     
     
-    def _jacobian(s: np.ndarray, P: np.ndarray, t: np.ndarray, c: float) -> np.ndarray:
+    def _jacobian(s: np.ndarray, P: np.ndarray, t: np.ndarray, c: float,
+                  w: Optional[np.ndarray] = None) -> np.ndarray:
         """Exact derivative of _residual. Supplied rather than finite-differenced.
     
         least_squares' 2-point Jacobian perturbs a coordinate by ~1.5e-8*|x|, which at a few hundred
@@ -5739,11 +6088,15 @@ data:
         d = s[None, :] - P
         n = np.linalg.norm(d, axis=1)
         J = -d / (n[:, None] * c)
-        return J - J.mean(axis=0, keepdims=True)
+        if w is None:
+            return J - J.mean(axis=0, keepdims=True)
+        q = w * w
+        return w[:, None] * (J - (q @ J)[None, :] / float(q.sum()))
     
     
     def _grid_seed(P: np.ndarray, t: np.ndarray, c: float,
-                   margin_m: float, step_m: float, z_levels: int = 5) -> np.ndarray:
+                   margin_m: float, step_m: float, z_levels: int = 5,
+                   w: Optional[np.ndarray] = None) -> np.ndarray:
         """Coarse global scan. The TDoA cost is non-convex and a single Gauss-Newton from the centroid
         lands in a local minimum for sources outside the array -- shockwave.solve made the same call
         (shockwave.py:91-95).
@@ -5763,8 +6116,14 @@ data:
         S = np.column_stack([gx.ravel(), gy.ravel(), gz.ravel()])
         d = np.linalg.norm(S[:, None, :] - P[None, :, :], axis=2) / c
         r = t[None, :] - d
-        r = r - r.mean(axis=1, keepdims=True)
-        return S[int(np.argmin((r * r).sum(axis=1)))]
+        if w is None:
+            r = r - r.mean(axis=1, keepdims=True)
+            return S[int(np.argmin((r * r).sum(axis=1)))]
+        # The seed has to score cells with the same cost the refine minimises, or the coarse scan
+        # hands the optimiser a cell that is not the weighted minimum at all.
+        q = w * w
+        f = (r - (r @ q)[:, None] / float(q.sum())) * w
+        return S[int(np.argmin((f * f).sum(axis=1)))]
     
     
     def _mirror_through_plane(s: np.ndarray, P: np.ndarray, normal: Sequence[float]) -> np.ndarray:
@@ -5780,12 +6139,51 @@ data:
     
     
     def _report(s, P, t, c, n_eq, n_unk, rms_ms, t0, at_bound, source_class,
-                search_margin_m, fixed_up_m):
+                search_margin_m, fixed_up_m, res=None, sig=None, w=None):
         """Everything the solver says about a fit. One definition, shared by the 3-unknown and
         the declared-height paths, so the two cannot disagree about what a result means.
         """
         lin = PL.linearity(P)
         obs = lin >= PL.COLLINEAR_LINEARITY
+    
+        # CHI-SQUARE, not milliseconds. `res` is already (r - weighted mean)/rho with rho normalised
+        # to the smallest stated sigma, so dividing by that sigma turns it into (r - t0)/sigma_i on
+        # both the weighted and the equal-sigma branch -- one expression, no case analysis.
+        chi2 = chi2_red = n_eff = None
+        n_cnt = len(P)
+        dof = n_eq - n_unk
+        if sig is not None and res is not None:
+            ref = float(np.min(sig))
+            chi2 = float(res @ res) / (ref * ref)
+            chi2_red = chi2 / dof if dof > 0 else None
+            n_eff = SW.effective_n(w, len(P))
+            n_cnt = SW.counting_n(w, len(P))
+        # ⚠️THE POINT OF THE WHOLE CHANGE. An exactly-determined fit has a residual of ~0 BY
+        # CONSTRUCTION -- it is not evidence, and reading it as such is how a 3-node fit looked
+        # clean. n_eq > n_unk was already the right test on the RAW count; what it could not see is
+        # a receiver whose sigma is so large that it contributes nothing, which removes an equation
+        # without removing a node. n_cnt - 1 is that same count over the receivers still carrying a
+        # vote, and it equals n_eq exactly whenever the sigmas are equal or absent.
+        meaningful = n_eq > n_unk and n_cnt - 1 > n_unk
+    
+        # ⚠️A HUGE SIGMA DOES NOT WIDEN THIS RESULT, IT REMOVES THAT RECEIVER FROM IT. The weight is
+        # 1/rho, so sigma -> inf drives both the residual entry and its Jacobian row to zero: the
+        # receiver neither pulls the fit nor inflates chi2. That is correct weighted least squares
+        # and it is also how a 5-receiver event quietly becomes a 4-receiver one. It is reported
+        # rather than refused -- refusing is an admission decision and this module does not make any.
+        wnote = None
+        degen = None
+        if n_eff is not None:
+            degen = bool(n_cnt < n_unk + 1)
+            if n_cnt < len(P):
+                j = int(np.argmax(np.asarray(sig, float)))
+                wnote = ("%d of %d receivers carry less than %.2g of a vote and do not count toward "
+                         "determinacy (%.2f effective receivers): the worst is index %d at sigma "
+                         "%.6g s against a best of %.6g s, relative weight %.3g. A sigma that large "
+                         "does not widen this fit, it removes that receiver from it%s"
+                         % (len(P) - n_cnt, len(P), SW.WEIGHT_FLOOR, n_eff, j, float(sig[j]),
+                            float(np.min(sig)), 1.0 if w is None else float(w[j]),
+                            " -- and the position is now under-determined." if degen else "."))
     
         # Height observability is a SEPARATE question from horizontal observability, and for this
         # project it is usually the one that bites: nodes sitting on the ground are coplanar, and a
@@ -5822,11 +6220,25 @@ data:
             "t0_utc_s": t0 if obs else None,
             "range_m": float(np.linalg.norm(s - P.mean(axis=0))) if obs else None,
             "ground_range_m": float(np.linalg.norm(s[:2] - P.mean(axis=0)[:2])) if obs else None,
+            # ⚠️WEIGHTED milliseconds when sigmas are stated: the entries are divided by the
+            # per-receiver sigma relative to the best one, so this is "ms at the best receiver's
+            # precision" and not a plain time. chi2_reduced is the figure to compare across events.
             "rms_residual_ms": rms_ms,
             "at_search_bound": at_bound,
             # Three unknowns now, so four nodes give an exact fit whose residual is ~0 by
             # construction. Five is where it starts carrying information -- one more than before.
-            "residual_is_meaningful": n_eq > n_unk,
+            "residual_is_meaningful": meaningful,
+            "residual_dof": dof,
+            "chi2": chi2,
+            "chi2_reduced": chi2_red,
+            "n_effective_nodes": n_eff,
+            "n_counting_nodes": n_cnt,
+            "weight_floor": SW.WEIGHT_FLOOR,
+            "weights_degenerate": degen,
+            "weight_note": wnote,
+            "sigma_s": None if sig is None else np.asarray(sig, float).tolist(),
+            "relative_weights": (None if sig is None else
+                                 ([1.0] * len(P) if w is None else np.asarray(w, float).tolist())),
             "n_nodes": len(P), "n_equations": n_eq, "n_unknowns": n_unk,
             "up_assumed_m": float(fixed_up_m) if fixed_up_m is not None else None,
             "sound_speed_mps": c,
@@ -5862,11 +6274,15 @@ data:
     
     def solve(positions: Sequence, arrivals: Sequence[float], source_class: str,
               temp_c: float = 20.0, search_margin_m: float = 500.0,
-              grid_step_m: float = 10.0, fixed_up_m: Optional[float] = None) -> Dict:
+              grid_step_m: float = 10.0, fixed_up_m: Optional[float] = None,
+              sigmas: Optional[Sequence[float]] = None) -> Dict:
         """Fit a stationary source position to arrival times.
     
         `positions` are east/north/up metres in one local frame; 2-vectors are read as up=0.
         `arrivals` are absolute seconds on a shared clock.
+    
+        `sigmas` is the OPTIONAL per-receiver arrival sigma in SECONDS -- one entry per receiver or
+        None for all of them, never a mixture, and never invented for a receiver that states none.
     
         Raises on a caller error -- too few nodes, mismatched lengths, non-finite input, or a source
         class that radiates off a cone. Returns `east_m: None` and `position_observable: False` with
@@ -5889,6 +6305,7 @@ data:
         if len(positions) != len(arrivals):
             raise ValueError("positions and arrivals must be the same length: got %d and %d"
                              % (len(positions), len(arrivals)))
+        sig, w = SW.sigma_weights(sigmas, len(positions))
         if len(positions) < min_nodes:
             raise ValueError(
                 "need >= %d nodes for a %dD fit: t0 cancels, so N nodes give N-1 equations for %d "
@@ -5916,7 +6333,7 @@ data:
     
         c = SW.sound_speed(temp_c)
         n_eq = len(P) - 1
-        seed = _grid_seed(P, t, c, search_margin_m, grid_step_m)
+        seed = _grid_seed(P, t, c, search_margin_m, grid_step_m, w=w)
     
         # BOUND THE REFINE TO THE REGION THAT WAS SEARCHED. Unbounded, the third unknown gave the
         # optimiser a nearly-flat direction to slide along whenever the nodes are coplanar -- the
@@ -5956,24 +6373,24 @@ data:
             fit = least_squares(lambda s2, *a: _residual(_lift(s2), *a),
                                 np.clip(seed[:2], lo[:2], hi[:2]),
                                 jac=lambda s2, *a: _jacobian(_lift(s2), *a)[:, :2],
-                                args=(P, t, c), bounds=(lo[:2], hi[:2]),
+                                args=(P, t, c, w), bounds=(lo[:2], hi[:2]),
                                 xtol=1e-14, ftol=1e-14, gtol=1e-14)
             s = _lift(fit.x)
             _chk = slice(0, 2)
             at_bound = bool(np.any(np.isclose(s[:2], lo[:2], atol=1e-6))
                             or np.any(np.isclose(s[:2], hi[:2], atol=1e-6)))
-            res = _residual(s, P, t, c)
+            res = _residual(s, P, t, c, w)
             rms_ms = math.sqrt(float(res @ res) / n_eq) * 1000.0
             t0 = t_ref + float(np.mean(t - np.linalg.norm(s[None, :] - P, axis=1) / c))
             return _report(s, P, t, c, n_eq, n_unk, rms_ms, t0, at_bound, source_class,
-                           search_margin_m, fixed_up_m)
+                           search_margin_m, fixed_up_m, res, sig, w)
         nrm = np.asarray(PL.coplanarity(P)["plane_normal"], float)
         span = float(np.linalg.norm(P.max(axis=0) - P.min(axis=0)))
         nudge = max(0.05 * span, 1.0)
         cands = [seed, seed + nudge * nrm, seed - nudge * nrm]
         best = None
         for s0 in cands:
-            f = least_squares(_residual, np.clip(s0, lo, hi), jac=_jacobian, args=(P, t, c),
+            f = least_squares(_residual, np.clip(s0, lo, hi), jac=_jacobian, args=(P, t, c, w),
                               bounds=(lo, hi), xtol=1e-14, ftol=1e-14, gtol=1e-14)
             if best is None or f.cost < best.cost:
                 best = f
@@ -5985,11 +6402,11 @@ data:
         _chk = slice(0, 2) if fixed_up_m is not None else slice(0, 3)
         at_bound = bool(np.any(np.isclose(s[_chk], lo[_chk], atol=1e-6))
                         or np.any(np.isclose(s[_chk], hi[_chk], atol=1e-6)))
-        res = _residual(s, P, t, c)
+        res = _residual(s, P, t, c, w)
         rms_ms = math.sqrt(float(res @ res) / n_eq) * 1000.0
         t0 = t_ref + float(np.mean(t - np.linalg.norm(s[None, :] - P, axis=1) / c))
         return _report(s, P, t, c, n_eq, n_unk, rms_ms, t0, at_bound, source_class,
-                       search_margin_m, fixed_up_m)
+                       search_margin_m, fixed_up_m, res, sig, w)
     
   hear_solve_consistency.py: |
     #!/usr/bin/env python3
@@ -7373,6 +7790,7 @@ data:
     import argparse
     import datetime as _dt
     import hashlib
+    import inspect
     import json
     import math
     import os
@@ -7443,16 +7861,104 @@ data:
     D_CLOCK_UNTRUSTED = "clock_untrusted"
     D_SYNC_SIGMA = "sync_sigma_exceeds"
     D_STAMP_SIGMA = "stamp_sigma_over_class_budget"
+    #: ⚠️A SECOND, DIFFERENT REFUSAL ON THE SAME RECEIVER, AND IT MUST NOT BE FOLDED INTO THE FIRST.
+    #: D_STAMP_SIGMA says this detection's clock SCATTERS too much; this says the receiver's capture
+    #: path carries an uncorrected fixed OFFSET, or was never measured at all. Weighting handles the
+    #: first and cannot touch the second -- a bias moves the fit rather than widening it -- so a
+    #: receiver can clear its clock on its own stated sigma and still land here. Two reasons in the
+    #: ledger, so an operator reading it can tell "run tools/hear_latency_cal.py" from "fix a clock".
+    D_PATH_BIAS = "capture_path_bias"
     D_ONSET = "onset_not_found"
     D_ONSET_UNSTATED = "onset_unstated"
     D_LATENCY = "latency_uncorrected"
     D_UNPARSEABLE = "line_unparseable"
+    D_HETEROGENEOUS_CLASS = "heterogeneous_receiver_class"
     D_ADMITTED = "admitted"
     
     DROP_REASONS = (D_UNANCHORED, D_OUTSIDE_WINDOW, D_OUTSIDE_LOOKBACK_EMITTED,
                     D_OUTSIDE_LOOKBACK_UNASSOC, D_PENDING_SETTLE, D_UNSURVEYED, D_NOT_ARRIVAL,
-                    D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_SYNC_SIGMA, D_STAMP_SIGMA, D_ONSET,
-                    D_ONSET_UNSTATED, D_LATENCY, D_UNPARSEABLE)
+                    D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_SYNC_SIGMA, D_STAMP_SIGMA,
+                    D_PATH_BIAS, D_ONSET, D_ONSET_UNSTATED, D_LATENCY, D_HETEROGENEOUS_CLASS,
+                    D_UNPARSEABLE)
+    
+    # ---------------------------------------------------------------- heterogeneous receivers
+    # WEIGHTING HANDLES VARIANCE. IT DOES NOT HANDLE BIAS, AND THIS DOOR IS THE ONE THE WEIGHTS DO
+    # NOT OPEN. `hear/solve/point.py` now DOES take a per-receiver `sigmas` and down-weights a
+    # receiver that states a worse clock, and `nodeclass.stamp_admissible` now judges a detection on
+    # its own stated sigma -- so a phone stating 106 us clears the clock gates on its own numbers.
+    # ⚠️NONE OF THAT TOUCHES THIS QUESTION. A receiver's capture-path BIAS is a constant per-receiver
+    # offset: it does not average down over events, it is invisible in an exactly-determined fit
+    # (nodeclass.py's module docstring), and a weight WIDENS a receiver rather than moving it, so no
+    # sigma the solver is handed removes it. Two independent doors sit in front of the clock gates
+    # below: D_PATH_BIAS asks whether this receiver's OWN capture path was measured and is small,
+    # and this one asks whether that path cancels against the array's at all, so that an identical,
+    # uncancelled bias is at least the SAME uncancelled bias on every member. Closed by default.
+    #
+    # ⚠️THIS IS NOT A SECOND COPY OF nodeclass.contributes_arrival(), NOR OF D_PATH_BIAS. Those ask
+    # "is this receiver's clock and bias small enough, by itself". This one is "does this receiver's
+    # capture path cancel against the ones already in the array" -- nodeclass.py says outright that
+    # it does NOT model the answer ("⚠️WHAT THIS MODEL DOES NOT DO"): path_bias_s is carried as if it
+    # never cancels, which is conservative for a SAME-class pair (mach/rankine truly do share one PDM
+    # path and one firmware) and silent about a DIFFERENT-class pair, where it is the live risk. All
+    # the doors have to open before a mixed-class arrival is admitted.
+    REFERENCE_ARRIVAL_CLASS = "xiao-s3-pps"
+    
+    
+    def is_heterogeneous_receiver(source: Optional[str], stated_class: Optional[str]) -> bool:
+        """Does this row's receiver share no known capture path with REFERENCE_ARRIVAL_CLASS?
+    
+        `source == "phone"` is heterogeneous UNCONDITIONALLY, independent of anything survey.json
+        states. That is deliberate, not an approximation: `Survey.arrival_ids()` admits a node whose
+        `class` is UNSTATED "because every survey written before the field existed omits it"
+        (survey.py:94-96) -- so a phone surveyed for its position without also being given a `class`
+        key would sail through the nodeclass gate exactly as nyquist/mach/rankine do, and this
+        function is the one place that still catches it. The pool's own `source` field is not
+        optional and cannot be omitted by an incomplete survey entry the way `class` can.
+    
+        A `source == "node"` row is heterogeneous only if its class is BOTH stated and not the
+        reference: an unstated class today means the xiao-s3-pps fleet that wrote survey.json before
+        this field existed, not an unknown receiver -- refusing it here would refuse the array this
+        tool was built to solve.
+        """
+        if source == "phone":
+            return True
+        return bool(stated_class) and stated_class != REFERENCE_ARRIVAL_CLASS
+    
+    
+    #: The class a `source="phone"` row is charged when survey.json names none.
+    #:
+    #: ⚠️A SURVEY OMISSION MUST NOT BUY A RECEIVER A BETTER CLASS THAN IT HAS. `nodeclass` charges
+    #: the STRICTEST ARRIVAL class -- xiao-s3-pps -- to a receiver with no stated class, and that is
+    #: right for a node: it is the conservative choice among receivers that look like the array. It
+    #: is the OPPOSITE of conservative for a handset, because xiao-s3-pps's `path_bias_s` is the
+    #: MEASURED 62.5 us of ITS OWN capture path, and charging that to a phone carrying a measured
+    #: 13.122 ms = 4.50 m of uncorrected audio-path delay is a guess wearing a measurement's clothes.
+    #: `source` is not optional in the pool and cannot be omitted by an incomplete survey entry the
+    #: way `class` can, so it is the field that resolves this.
+    #:
+    #: ⚠️MEASURED, AND IT IS CLOSER THAN IT LOOKS. On the 2026-09-11 pool an unclassed phone row was
+    #: refused anyway -- but on its CLOCK, charged the XIAO's 100 us capture term: all 11,315 anchored
+    #: phone rows RSS over the 129.4 us bound. That refusal holds only while a phone states more than
+    #: `xiao-s3-pps.max_stated_clock_sigma_s()` = 82.1 us, and the lowest figure any of the three
+    #: handsets has ever stated is 100.0 us. A 22% margin, in a number the ANDROID APP reports and no
+    #: hardware fixes. Below it, an unclassed phone would clear the clock gate and then clear the bias
+    #: gate as a XIAO, and be admitted carrying 4.50 m of pure bias. This closes that, and it also
+    #: makes the refusal say the true thing: `capture_path_bias` ("run tools/hear_latency_cal.py"),
+    #: not `stamp_sigma_over_class_budget` ("fix a clock"), which is the whole point of the two gates
+    #: being two.
+    PHONE_FALLBACK_CLASS = "gotchi-phone"
+    
+    
+    def gate_class(source: Optional[str], stated_class: Optional[str]) -> Optional[str]:
+        """The class to charge this row's CLOCK and BIAS gates against.
+    
+        The survey's own word wins. Absent, a phone is charged `PHONE_FALLBACK_CLASS` and everything
+        else is left as `None`, which is nodeclass's "charge the strictest arrival class" and is the
+        behaviour every node row has always had.
+        """
+        if stated_class:
+            return stated_class
+        return PHONE_FALLBACK_CLASS if source == "phone" else None
     
     #: Why an admitted arrival's onset quality is UNSTATED, stated once so the ledger detail, the
     #: manifest and the CLI help cannot drift apart. Every clause was checked on 2026-09-10 against
@@ -7923,6 +8429,26 @@ data:
                                        "associate() would call int(%r)" % (name,)))
                 continue
             nid = name_to_id[name]
+            cname = sv.classes.get(nid)
+            # ⚠️UNREACHABLE ON THE SURVEY AND REGISTRY THIS REPO SHIPS TODAY, DELIBERATELY. Every
+            # `source="phone"` row is already gone above as D_UNSURVEYED (no phone has a survey
+            # entry), and the only class nodeclass.py admits an arrival from at all is
+            # `xiao-s3-pps` -- see is_heterogeneous_receiver's own docstring for what changes that.
+            # Kept ahead of the clock/sync/stamp gates below because it is a STRUCTURAL admission
+            # question (does this receiver's capture path cancel against the array's at all), not a
+            # per-detection quality one.
+            if (is_heterogeneous_receiver(row.get("source"), cname)
+                    and not policy.get("heterogeneous_receivers", False)):
+                _drop(day, row, D_HETEROGENEOUS_CLASS,
+                      _detail(row,
+                              "receiver class %r shares no known capture path with this array's "
+                              "reference class %r, so its bias does NOT cancel even once "
+                              "nodeclass.py calls the bias itself measured and small (nodeclass.py: "
+                              "'between DIFFERENT classes it does not cancel at all'). Pass "
+                              "--admit-heterogeneous-receivers to publish positions built from a "
+                              "mixed array once that receiver's own capture-path bias is measured"
+                              % (cname or ("phone:%s" % name), REFERENCE_ARRIVAL_CLASS)))
+                continue
             # (4) the DERIVED rung, and the third state resolved under an explicit policy.
             trusted = C.utc_trusted_of(row)
             if trusted is None and row.get("source") == "phone":
@@ -7964,11 +8490,38 @@ data:
             # field in which that is visible, and this is the door it is visible AT.
             # ⚠️THE CLASS IS UNSTATED ON EVERY NODE IN survey.json AND THIS STILL HAS TO BITE. A
             # gate keyed on a declared class would be dead code on the only survey that exists;
-            # nodeclass charges the strictest arrival class when none is named.
-            cname = sv.classes.get(nid)
-            stamp_ok = NC.stamp_admissible(ssig, cname)
+            # nodeclass charges the strictest arrival class when none is named. `cname` was read
+            # above, ahead of the heterogeneous-receiver gate; reused here unchanged.
+            # ⚠️`gcls`, NOT `cname`, FROM HERE DOWN. An unstated class charges the strictest ARRIVAL
+            # class, which is conservative for a node and the opposite of conservative for a handset;
+            # `gate_class` resolves that off the pool's own `source` field. `cname` stays the survey's
+            # literal word and is what the heterogeneous gate above reads.
+            gcls = gate_class(row.get("source"), cname)
+            stamp_ok = NC.stamp_admissible(ssig, gcls)
             if stamp_ok is False:
-                _drop(day, row, D_STAMP_SIGMA, _detail(row, NC.stamp_refusal(ssig, cname) or ""))
+                _drop(day, row, D_STAMP_SIGMA, _detail(row, NC.stamp_refusal(ssig, gcls) or ""))
+                continue
+            # ⚠️THE SECOND GATE, AND IT DOES NOT MOVE WHEN THE FIRST ONE OPENS. The line above judges
+            # this detection's stated clock sigma; this judges the receiver's CAPTURE PATH, which is
+            # a fixed offset and not scatter. Clearing the clock buys nothing here on purpose: a
+            # phone that states 106 us is inside its clock budget and still carries a MEASURED
+            # 13.122 ms = 4.50 m of uncorrected audio-path delay on the best of three handsets, which
+            # no weight the solver applies can remove -- it relocates the fit instead of widening it.
+            # ⚠️IT IS A CLASS PROPERTY, NOT A ROW PROPERTY, because that is what a per-device
+            # calibration is; nothing in the row could state it. The refusal is nodeclass's own words
+            # so the class door and this door say the same thing.
+            #
+            # ⚠️AN UNCLASSED *NODE* IS STILL CHARGED THE STRICTEST ARRIVAL CLASS'S BIAS, AND THAT
+            # IS DELIBERATE: every node in the shipped survey.json is unclassed, and refusing them
+            # here would empty the corpus -- the same call `Survey.arrival_ids()` documents ("State
+            # the class to be refused"). An unclassed *PHONE* is no longer charged that, because
+            # xiao-s3-pps's path_bias_s is the MEASURED 62.5 us of ITS OWN capture path and charging
+            # it to a handset carrying 13.122 ms is a guess wearing a measurement's clothes. See
+            # `gate_class`: the obligation to write `"class": "gotchi-phone"` into survey.json used
+            # to be a comment, and is now enforced off the pool's own `source` field.
+            bias_why = NC.bias_refusal(gcls)
+            if bias_why is not None:
+                _drop(day, row, D_PATH_BIAS, _detail(row, bias_why))
                 continue
             # ⚠️THREE-STATE, AND THE THIRD STATE IS THE ONE THAT ACTUALLY OCCURS. See the
             # `onset_quality` block returned below for what this pool is made of.
@@ -7988,10 +8541,18 @@ data:
                     onset_unstated.get(row.get("source") or "unknown", 0) + 1)
             lat_ms = None
             if row.get("source") == "phone":
-                # ⚠️REACHABLE ONLY ONCE A PHONE IS SURVEYED. Today no phone has a survey entry, so
-                # every phone row is already gone as unsurveyed_node above and this branch is dead.
-                # It is written anyway because adding a phone to survey.json is a one-line change,
-                # and the failure it would otherwise cause is silent: ~13 ms of uncorrected
+                # ⚠️THIS BRANCH IS NOW UNREACHABLE FOR EVERY PHONE, AND NOT ONLY BECAUSE NO PHONE IS
+                # SURVEYED. `capture_path_bias` above tests `gotchi-phone.path_bias_s`, a CLASS
+                # constant, and refuses before this runs -- so a handset WITH a measured
+                # --latency-cal entry is refused exactly as one without, and this correction never
+                # happens. Running tools/hear_latency_cal.py does not by itself make a phone an
+                # arrival source; somebody must also write the measured figure into nodeclass.py's
+                # `gotchi-phone` entry, which is what that entry's own comment demands. Pinned dead
+                # by tests/test_hear_tdoa.py::test_the_latency_cal_gate_is_unreachable_for_a_phone
+                # so it cannot be mistaken for a live gate. Which of the two should win -- the class
+                # constant or the per-device measurement -- is an operator's decision, not a merge's.
+                #
+                # Kept because the failure it guards against is silent: ~13 ms of uncorrected
                 # audio-path latency is 4.5 m, which alone exceeds the entire 34.4 ms
                 # nyquist-rankine budget. 2 of 3 handsets have no calibration entry at all.
                 off_ns = (cal.get("by_node_id") or {}).get(name)
@@ -8012,6 +8573,15 @@ data:
                 "retrigger": row.get("retrigger"), "layout": row.get("layout"),
                 "fs_hz": row.get("fs_hz"), "clock_tier": row.get("clock_tier"),
                 "sync_sigma_ns": ssig, "ts_utc_s_raw": float(row["ts_utc_s"]),
+                # THE SAME QUANTITY THE BOOLEAN BELOW WAS DERIVED FROM, KEPT AS A NUMBER. The gate
+                # spends `sync_sigma_ns` on a pass/fail and then throws away everything it says
+                # about the rows that PASS; this is that number resolved against the receiver's
+                # class -- stated sigma RSS the class's capture terms -- in SECONDS, which is the
+                # unit `arrivals` and the solvers are in. associate() carries it into
+                # `event["arrival_sigma_s"]` index-aligned with `arrivals`; solve_event() hands it
+                # to the solver. None when the producer stated nothing: that is the class figure and
+                # not a measurement, and a solver must be able to tell the two apart.
+                "t_sigma_s": (None if ssig is None else NC.stamp_t_sigma_s(ssig, gcls)),
                 # A REAL BOOLEAN for the same reason `utc_trusted` below is one: associate() cannot
                 # resolve it, because the budget is per CLASS and associate has never seen a class.
                 # None here means the producer stated no sigma, which that gate reads as usable.
@@ -8409,9 +8979,60 @@ data:
         return out
     
     
+    #: The name and unit `point.solve` takes a per-receiver arrival sigma under: a sequence of
+    #: SECONDS, one entry per receiver, in the order the receivers were passed.
+    SOLVER_SIGMA_KWARG = "sigmas"
+    #: ⚠️A SEAM BETWEEN TWO BRANCHES, AND THE TOLERANT HALF OF IT IS DELIBERATELY GONE. The carrying
+    #: side (pool -> detection -> event -> here) and the consuming side (point.solve's weighted fit)
+    #: landed on separate branches, and while they were separate this was a PROBE: falling back to an
+    #: unweighted fit on a `point.solve` without the parameter, so the carrying branch was correct on
+    #: a main that had not taken the solver yet. Both sides are composed now, so the fallback has
+    #: stopped being a courtesy and become a silencer -- a later rename of the solver's parameter
+    #: would leave every receiver voting at par with nothing in the report saying so, which is the
+    #: failure this file's gates exist to prevent. It is an import-time REFUSAL instead. It is still
+    #: measured rather than asserted: `solver_weighting.solver_accepts` carries the answer into the
+    #: run's own report, and it can only ever be written True because a False one cannot import.
+    SOLVER_TAKES_SIGMA = SOLVER_SIGMA_KWARG in inspect.signature(PT.solve).parameters
+    if not SOLVER_TAKES_SIGMA:                                          # pragma: no cover
+        raise ImportError(
+            "hear.solve.point.solve has no %r parameter: this driver resolves a per-detection "
+            "arrival sigma through nodeclass and has nowhere to put it, so every receiver would "
+            "vote at equal weight and no field in the report would say so. Restore the parameter "
+            "(a sequence of SECONDS, one entry per receiver) or remove the plumbing here."
+            % (SOLVER_SIGMA_KWARG,))
+    
+    
+    def _sigma_kwargs(sigmas: Optional[Sequence[Optional[float]]]) -> Dict[str, Any]:
+        """The solver keyword carrying per-receiver sigma, or nothing at all.
+    
+        Empty in two cases, and the second is the interesting one:
+    
+          * NO receiver in the group stated a sigma -- an all-`None` list is every receiver on its
+            class figure, which is equal weighting written out longhand, and passing it would make
+            the report claim a weighted fit that is not one;
+          * SOME did and some did not. ⚠️THE SOLVER'S CONTRACT REFUSES A MIXTURE ("one entry per
+            receiver or None for all of them, never a mixture, and never invented for a receiver that
+            states none"), and the only way to satisfy it on a mixed group would be to fill the gaps
+            with the quiet receivers' CLASS figures -- numbers nobody measured for those detections.
+            That is the invention the solver is refusing, so this refuses to do it and falls back to
+            equal weighting. ⚠️IT IS NOT FREE, AND THE COST IS COUNTED: a node array that has not
+            taken the G6 flash standing beside a phone that states 106 us per row is exactly a mixed
+            group, so `solver_weighting.attempts_mixed_statement` is the number to watch. Deciding
+            whether a class figure counts as a statement is a change to the SOLVER's contract and
+            belongs on that side of the seam, not smuggled through here.
+        """
+        if sigmas is None:
+            return {}
+        if any(s is None for s in sigmas):
+            return {}
+        return {SOLVER_SIGMA_KWARG: [float(s) for s in sigmas]}
+    
+    
     def solve_event(sv: SV.Survey, node_ids: Sequence[int], arrivals: Sequence[float],
                     source_class: str, temp_c: float, v_mps: float,
-                    fixed_up_m: Optional[float]) -> Tuple[str, Optional[Dict], Optional[str]]:
+                    fixed_up_m: Optional[float],
+                    arrival_sigma_s: Optional[Sequence[Optional[float]]] = None
+                    ) -> Tuple[str, Optional[Dict], Optional[str]]:
         """(model, solution, solver_error). ~15 lines mirrored from `pipeline.Backend.flush()`.
     
         ⚠️MIRRORED, NOT COPIED-AND-EMBELLISHED, and pinned equal by
@@ -8420,6 +9041,10 @@ data:
         every arrival. The cone lane gets the 2D projection explicitly and by name, because
         shockwave.py is still planar; the point lane gets full 3D positions, because point.py
         consumes node height as a real distance.
+    
+        `arrival_sigma_s` is per-arrival 1-sigma timestamp uncertainty in SECONDS, index-aligned with
+        `arrivals`, `None` per entry where the producer stated nothing. It reaches the point lane and
+        only the point lane -- see the cone branch.
     
         ⚠️`fixed_up_m is not None`, NEVER TRUTHINESS. point.solve tests `fixed_up_m is not None`
         (point.py:236), so `fixed_up_m = 0.0` -- the most likely declared height there is -- means
@@ -8430,9 +9055,14 @@ data:
         P = sv.positions(list(node_ids))
         try:
             if model == "cone":
+                # ⚠️THE CONE LANE IS NOT WEIGHTED AND THE SIGMA IS DROPPED HERE ON PURPOSE.
+                # shockwave.solve has no sigma parameter and fits a different model (a Mach cone, not
+                # a point), so quietly passing one would be inventing an interface. The sigma is
+                # still in the event for whoever adds it.
                 return model, SW.solve(P[:, :2], list(arrivals), v_mps=v_mps, temp_c=temp_c), None
             return model, PT.solve(P, list(arrivals), source_class, temp_c=temp_c,
-                                   fixed_up_m=fixed_up_m), None
+                                   fixed_up_m=fixed_up_m,
+                                   **_sigma_kwargs(arrival_sigma_s)), None
         except ValueError as exc:
             return model, None, str(exc)
     
@@ -8460,7 +9090,9 @@ data:
     
     def leave_one_out(sv: SV.Survey, node_ids: Sequence[int], arrivals: Sequence[float],
                       source_class: str, temp_c: float, v_mps: float,
-                      fixed_up_m: Optional[float], full: Optional[Dict]) -> Optional[Dict[str, Any]]:
+                      fixed_up_m: Optional[float], full: Optional[Dict],
+                      arrival_sigma_s: Optional[Sequence[Optional[float]]] = None
+                      ) -> Optional[Dict[str, Any]]:
         """Receiver-level attribution: drop each node in turn and report what moved.
     
         ⚠️SKIPPED, LOUDLY, BELOW `meaningful_n`. At the exactly-determined node count the residual is
@@ -8479,7 +9111,14 @@ data:
         for k in range(n):
             keep = [i for j, i in enumerate(node_ids) if j != k]
             ta = [t for j, t in enumerate(arrivals) if j != k]
-            _m, sol, err = solve_event(sv, keep, ta, source_class, temp_c, v_mps, fixed_up_m)
+            # ⚠️THE SIGMA LIST IS DROPPED AT THE SAME INDEX, not passed whole. It pairs with
+            # `arrivals` BY POSITION, so a full-length list against an n-1 arrival list would weight
+            # every remaining receiver by its neighbour's sigma -- and silently, because the lengths
+            # would only disagree by one and the solver would raise about `arrivals` instead.
+            sg = (None if arrival_sigma_s is None
+                  else [s for j, s in enumerate(arrival_sigma_s) if j != k])
+            _m, sol, err = solve_event(sv, keep, ta, source_class, temp_c, v_mps, fixed_up_m,
+                                       arrival_sigma_s=sg)
             dpos = None
             if sol and full and sol.get("east_m") is not None and full.get("east_m") is not None:
                 dpos = float(math.hypot(sol["east_m"] - full["east_m"],
@@ -8841,6 +9480,19 @@ data:
             "at": now,
             "pool": pool_root, "out": out, "survey": survey_path,
             "policy": {k: v for k, v in sorted(policy.items()) if k != "latency_cal"},
+            # ⚠️MEASURED, NOT ASSERTED. Whether a stated per-arrival sigma actually reached the
+            # solver is a fact about the code this run imported, and a report that only said the
+            # sigma was "carried" would be true while every receiver still voted at par. `delivered`
+            # counts the attempts that handed the solver a real weight.
+            "solver_weighting": {
+                "kwarg": SOLVER_SIGMA_KWARG,
+                "unit": "seconds, 1-sigma, index-aligned with arrivals, null = not stated",
+                "solver_accepts": bool(SOLVER_TAKES_SIGMA),
+                "attempts_with_any_stated_sigma": 0,
+                "attempts_all_receivers_stated": 0,
+                "attempts_mixed_statement": 0,
+                "attempts_delivered_to_solver": 0,
+            },
             "survey_block": {
                 "survey_ok": True,
                 "all_ids": list(sv.ids), "all_names": [sv.names[i] for i in sv.ids],
@@ -9008,6 +9660,9 @@ data:
             group = ev["detections"]
             ids = list(ev["node_ids"])
             arrivals = list(ev["arrivals"])
+            # `.get` because a caller may hand this driver an event dict built before associate()
+            # carried the field; a missing sigma is "nobody stated one", which is equal weighting.
+            sigmas = list(ev.get("arrival_sigma_s") or [None] * len(arrivals))
             pkeys = [d["pool_key"] for d in group]
             ek = event_key(pkeys)
             bc = bound_check(group, arr_sv, c, margin_s)
@@ -9021,9 +9676,19 @@ data:
             if not bc["admissible"]:
                 verdict = V_MARGIN_DEPENDENT if bc["margin_dependent"] else V_INADMISSIBLE
             else:
+                sw = report["solver_weighting"]
+                if any(s is not None for s in sigmas):
+                    sw["attempts_with_any_stated_sigma"] += 1
+                    if all(s is not None for s in sigmas):
+                        sw["attempts_all_receivers_stated"] += 1
+                    else:
+                        sw["attempts_mixed_statement"] += 1
+                if _sigma_kwargs(sigmas):
+                    sw["attempts_delivered_to_solver"] += 1
                 model, sol, err = solve_event(arr_sv, ids, arrivals,
                                               policy["source_class"], policy["temp_c"],
-                                              policy["v_mps"], fixed_up)
+                                              policy["v_mps"], fixed_up,
+                                              arrival_sigma_s=sigmas)
                 verdict = solver_verdict(model, sol, err)
                 if sol and sol.get("east_m") is not None:
                     geom_fit = geometry_report(
@@ -9032,10 +9697,12 @@ data:
                         policy["temp_c"], fixed_up)
                     loo = leave_one_out(arr_sv, ids, arrivals,
                                         policy["source_class"], policy["temp_c"], policy["v_mps"],
-                                        fixed_up, sol)
+                                        fixed_up, sol, arrival_sigma_s=sigmas)
             row = {
                 "schema": TDOA_SCHEMA, "candidate_id": gi, "event_key": ek, "verdict": verdict,
                 "t0_utc_s": arrivals[0], "node_ids": ids, "arrivals": arrivals,
+                # index-aligned with `arrivals`, seconds, null where the producer stated nothing
+                "arrival_sigma_s": sigmas,
                 "pool_keys": pkeys,
                 "node_names": [d["node_name"] for d in group],
                 "n_nodes": len(group), "n_equations": len(group) - 1,
@@ -9759,6 +10426,14 @@ data:
         ap.add_argument("--allow-phones", action="store_true",
                         help="also read the phone source. They are unsurveyed, so today every row "
                              "still lands in unsurveyed_node -- this makes that a counted number")
+        ap.add_argument("--admit-heterogeneous-receivers", action="store_true",
+                        help="publish positions built from a receiver whose capture path is NOT "
+                             "%r -- a phone, or any node of a declared different class. Default OFF: "
+                             "a receiver's capture-path BIAS does not cancel against a different "
+                             "class even once its own clock and bias pass nodeclass.py, so mixing "
+                             "classes must be an operator's deliberate choice, not a default. See "
+                             "tools/hear_latency_cal.py and docs/hear-latency-calibration-runbook.md"
+                             % (REFERENCE_ARRIVAL_CLASS,))
         ap.add_argument("--clock-unstated", choices=("admit", "refuse"), default="refuse")
         # ⚠️DEFAULT admit, WHERE --clock-unstated DEFAULTS refuse, AND THE ASYMMETRY IS THE POINT.
         # An unstated CLOCK is a producer that measures trust and did not say; refusing it costs a
@@ -9850,6 +10525,7 @@ data:
             "candidates": list(a.candidate), "site_box": a.site_box,
             "target_events": a.target_events, "array_id": a.array_id,
             "allow_phones": bool(a.allow_phones),
+            "heterogeneous_receivers": bool(a.admit_heterogeneous_receivers),
         }
     
         try:

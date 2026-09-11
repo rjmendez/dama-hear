@@ -133,6 +133,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -203,16 +204,104 @@ D_CLOCK_UNSTATED = "clock_unstated"
 D_CLOCK_UNTRUSTED = "clock_untrusted"
 D_SYNC_SIGMA = "sync_sigma_exceeds"
 D_STAMP_SIGMA = "stamp_sigma_over_class_budget"
+#: ⚠️A SECOND, DIFFERENT REFUSAL ON THE SAME RECEIVER, AND IT MUST NOT BE FOLDED INTO THE FIRST.
+#: D_STAMP_SIGMA says this detection's clock SCATTERS too much; this says the receiver's capture
+#: path carries an uncorrected fixed OFFSET, or was never measured at all. Weighting handles the
+#: first and cannot touch the second -- a bias moves the fit rather than widening it -- so a
+#: receiver can clear its clock on its own stated sigma and still land here. Two reasons in the
+#: ledger, so an operator reading it can tell "run tools/hear_latency_cal.py" from "fix a clock".
+D_PATH_BIAS = "capture_path_bias"
 D_ONSET = "onset_not_found"
 D_ONSET_UNSTATED = "onset_unstated"
 D_LATENCY = "latency_uncorrected"
 D_UNPARSEABLE = "line_unparseable"
+D_HETEROGENEOUS_CLASS = "heterogeneous_receiver_class"
 D_ADMITTED = "admitted"
 
 DROP_REASONS = (D_UNANCHORED, D_OUTSIDE_WINDOW, D_OUTSIDE_LOOKBACK_EMITTED,
                 D_OUTSIDE_LOOKBACK_UNASSOC, D_PENDING_SETTLE, D_UNSURVEYED, D_NOT_ARRIVAL,
-                D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_SYNC_SIGMA, D_STAMP_SIGMA, D_ONSET,
-                D_ONSET_UNSTATED, D_LATENCY, D_UNPARSEABLE)
+                D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_SYNC_SIGMA, D_STAMP_SIGMA,
+                D_PATH_BIAS, D_ONSET, D_ONSET_UNSTATED, D_LATENCY, D_HETEROGENEOUS_CLASS,
+                D_UNPARSEABLE)
+
+# ---------------------------------------------------------------- heterogeneous receivers
+# WEIGHTING HANDLES VARIANCE. IT DOES NOT HANDLE BIAS, AND THIS DOOR IS THE ONE THE WEIGHTS DO
+# NOT OPEN. `hear/solve/point.py` now DOES take a per-receiver `sigmas` and down-weights a
+# receiver that states a worse clock, and `nodeclass.stamp_admissible` now judges a detection on
+# its own stated sigma -- so a phone stating 106 us clears the clock gates on its own numbers.
+# ⚠️NONE OF THAT TOUCHES THIS QUESTION. A receiver's capture-path BIAS is a constant per-receiver
+# offset: it does not average down over events, it is invisible in an exactly-determined fit
+# (nodeclass.py's module docstring), and a weight WIDENS a receiver rather than moving it, so no
+# sigma the solver is handed removes it. Two independent doors sit in front of the clock gates
+# below: D_PATH_BIAS asks whether this receiver's OWN capture path was measured and is small,
+# and this one asks whether that path cancels against the array's at all, so that an identical,
+# uncancelled bias is at least the SAME uncancelled bias on every member. Closed by default.
+#
+# ⚠️THIS IS NOT A SECOND COPY OF nodeclass.contributes_arrival(), NOR OF D_PATH_BIAS. Those ask
+# "is this receiver's clock and bias small enough, by itself". This one is "does this receiver's
+# capture path cancel against the ones already in the array" -- nodeclass.py says outright that
+# it does NOT model the answer ("⚠️WHAT THIS MODEL DOES NOT DO"): path_bias_s is carried as if it
+# never cancels, which is conservative for a SAME-class pair (mach/rankine truly do share one PDM
+# path and one firmware) and silent about a DIFFERENT-class pair, where it is the live risk. All
+# the doors have to open before a mixed-class arrival is admitted.
+REFERENCE_ARRIVAL_CLASS = "xiao-s3-pps"
+
+
+def is_heterogeneous_receiver(source: Optional[str], stated_class: Optional[str]) -> bool:
+    """Does this row's receiver share no known capture path with REFERENCE_ARRIVAL_CLASS?
+
+    `source == "phone"` is heterogeneous UNCONDITIONALLY, independent of anything survey.json
+    states. That is deliberate, not an approximation: `Survey.arrival_ids()` admits a node whose
+    `class` is UNSTATED "because every survey written before the field existed omits it"
+    (survey.py:94-96) -- so a phone surveyed for its position without also being given a `class`
+    key would sail through the nodeclass gate exactly as nyquist/mach/rankine do, and this
+    function is the one place that still catches it. The pool's own `source` field is not
+    optional and cannot be omitted by an incomplete survey entry the way `class` can.
+
+    A `source == "node"` row is heterogeneous only if its class is BOTH stated and not the
+    reference: an unstated class today means the xiao-s3-pps fleet that wrote survey.json before
+    this field existed, not an unknown receiver -- refusing it here would refuse the array this
+    tool was built to solve.
+    """
+    if source == "phone":
+        return True
+    return bool(stated_class) and stated_class != REFERENCE_ARRIVAL_CLASS
+
+
+#: The class a `source="phone"` row is charged when survey.json names none.
+#:
+#: ⚠️A SURVEY OMISSION MUST NOT BUY A RECEIVER A BETTER CLASS THAN IT HAS. `nodeclass` charges
+#: the STRICTEST ARRIVAL class -- xiao-s3-pps -- to a receiver with no stated class, and that is
+#: right for a node: it is the conservative choice among receivers that look like the array. It
+#: is the OPPOSITE of conservative for a handset, because xiao-s3-pps's `path_bias_s` is the
+#: MEASURED 62.5 us of ITS OWN capture path, and charging that to a phone carrying a measured
+#: 13.122 ms = 4.50 m of uncorrected audio-path delay is a guess wearing a measurement's clothes.
+#: `source` is not optional in the pool and cannot be omitted by an incomplete survey entry the
+#: way `class` can, so it is the field that resolves this.
+#:
+#: ⚠️MEASURED, AND IT IS CLOSER THAN IT LOOKS. On the 2026-09-11 pool an unclassed phone row was
+#: refused anyway -- but on its CLOCK, charged the XIAO's 100 us capture term: all 11,315 anchored
+#: phone rows RSS over the 129.4 us bound. That refusal holds only while a phone states more than
+#: `xiao-s3-pps.max_stated_clock_sigma_s()` = 82.1 us, and the lowest figure any of the three
+#: handsets has ever stated is 100.0 us. A 22% margin, in a number the ANDROID APP reports and no
+#: hardware fixes. Below it, an unclassed phone would clear the clock gate and then clear the bias
+#: gate as a XIAO, and be admitted carrying 4.50 m of pure bias. This closes that, and it also
+#: makes the refusal say the true thing: `capture_path_bias` ("run tools/hear_latency_cal.py"),
+#: not `stamp_sigma_over_class_budget` ("fix a clock"), which is the whole point of the two gates
+#: being two.
+PHONE_FALLBACK_CLASS = "gotchi-phone"
+
+
+def gate_class(source: Optional[str], stated_class: Optional[str]) -> Optional[str]:
+    """The class to charge this row's CLOCK and BIAS gates against.
+
+    The survey's own word wins. Absent, a phone is charged `PHONE_FALLBACK_CLASS` and everything
+    else is left as `None`, which is nodeclass's "charge the strictest arrival class" and is the
+    behaviour every node row has always had.
+    """
+    if stated_class:
+        return stated_class
+    return PHONE_FALLBACK_CLASS if source == "phone" else None
 
 #: Why an admitted arrival's onset quality is UNSTATED, stated once so the ledger detail, the
 #: manifest and the CLI help cannot drift apart. Every clause was checked on 2026-09-10 against
@@ -683,6 +772,26 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
                                    "associate() would call int(%r)" % (name,)))
             continue
         nid = name_to_id[name]
+        cname = sv.classes.get(nid)
+        # ⚠️UNREACHABLE ON THE SURVEY AND REGISTRY THIS REPO SHIPS TODAY, DELIBERATELY. Every
+        # `source="phone"` row is already gone above as D_UNSURVEYED (no phone has a survey
+        # entry), and the only class nodeclass.py admits an arrival from at all is
+        # `xiao-s3-pps` -- see is_heterogeneous_receiver's own docstring for what changes that.
+        # Kept ahead of the clock/sync/stamp gates below because it is a STRUCTURAL admission
+        # question (does this receiver's capture path cancel against the array's at all), not a
+        # per-detection quality one.
+        if (is_heterogeneous_receiver(row.get("source"), cname)
+                and not policy.get("heterogeneous_receivers", False)):
+            _drop(day, row, D_HETEROGENEOUS_CLASS,
+                  _detail(row,
+                          "receiver class %r shares no known capture path with this array's "
+                          "reference class %r, so its bias does NOT cancel even once "
+                          "nodeclass.py calls the bias itself measured and small (nodeclass.py: "
+                          "'between DIFFERENT classes it does not cancel at all'). Pass "
+                          "--admit-heterogeneous-receivers to publish positions built from a "
+                          "mixed array once that receiver's own capture-path bias is measured"
+                          % (cname or ("phone:%s" % name), REFERENCE_ARRIVAL_CLASS)))
+            continue
         # (4) the DERIVED rung, and the third state resolved under an explicit policy.
         trusted = C.utc_trusted_of(row)
         if trusted is None and row.get("source") == "phone":
@@ -724,11 +833,38 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
         # field in which that is visible, and this is the door it is visible AT.
         # ⚠️THE CLASS IS UNSTATED ON EVERY NODE IN survey.json AND THIS STILL HAS TO BITE. A
         # gate keyed on a declared class would be dead code on the only survey that exists;
-        # nodeclass charges the strictest arrival class when none is named.
-        cname = sv.classes.get(nid)
-        stamp_ok = NC.stamp_admissible(ssig, cname)
+        # nodeclass charges the strictest arrival class when none is named. `cname` was read
+        # above, ahead of the heterogeneous-receiver gate; reused here unchanged.
+        # ⚠️`gcls`, NOT `cname`, FROM HERE DOWN. An unstated class charges the strictest ARRIVAL
+        # class, which is conservative for a node and the opposite of conservative for a handset;
+        # `gate_class` resolves that off the pool's own `source` field. `cname` stays the survey's
+        # literal word and is what the heterogeneous gate above reads.
+        gcls = gate_class(row.get("source"), cname)
+        stamp_ok = NC.stamp_admissible(ssig, gcls)
         if stamp_ok is False:
-            _drop(day, row, D_STAMP_SIGMA, _detail(row, NC.stamp_refusal(ssig, cname) or ""))
+            _drop(day, row, D_STAMP_SIGMA, _detail(row, NC.stamp_refusal(ssig, gcls) or ""))
+            continue
+        # ⚠️THE SECOND GATE, AND IT DOES NOT MOVE WHEN THE FIRST ONE OPENS. The line above judges
+        # this detection's stated clock sigma; this judges the receiver's CAPTURE PATH, which is
+        # a fixed offset and not scatter. Clearing the clock buys nothing here on purpose: a
+        # phone that states 106 us is inside its clock budget and still carries a MEASURED
+        # 13.122 ms = 4.50 m of uncorrected audio-path delay on the best of three handsets, which
+        # no weight the solver applies can remove -- it relocates the fit instead of widening it.
+        # ⚠️IT IS A CLASS PROPERTY, NOT A ROW PROPERTY, because that is what a per-device
+        # calibration is; nothing in the row could state it. The refusal is nodeclass's own words
+        # so the class door and this door say the same thing.
+        #
+        # ⚠️AN UNCLASSED *NODE* IS STILL CHARGED THE STRICTEST ARRIVAL CLASS'S BIAS, AND THAT
+        # IS DELIBERATE: every node in the shipped survey.json is unclassed, and refusing them
+        # here would empty the corpus -- the same call `Survey.arrival_ids()` documents ("State
+        # the class to be refused"). An unclassed *PHONE* is no longer charged that, because
+        # xiao-s3-pps's path_bias_s is the MEASURED 62.5 us of ITS OWN capture path and charging
+        # it to a handset carrying 13.122 ms is a guess wearing a measurement's clothes. See
+        # `gate_class`: the obligation to write `"class": "gotchi-phone"` into survey.json used
+        # to be a comment, and is now enforced off the pool's own `source` field.
+        bias_why = NC.bias_refusal(gcls)
+        if bias_why is not None:
+            _drop(day, row, D_PATH_BIAS, _detail(row, bias_why))
             continue
         # ⚠️THREE-STATE, AND THE THIRD STATE IS THE ONE THAT ACTUALLY OCCURS. See the
         # `onset_quality` block returned below for what this pool is made of.
@@ -748,10 +884,18 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
                 onset_unstated.get(row.get("source") or "unknown", 0) + 1)
         lat_ms = None
         if row.get("source") == "phone":
-            # ⚠️REACHABLE ONLY ONCE A PHONE IS SURVEYED. Today no phone has a survey entry, so
-            # every phone row is already gone as unsurveyed_node above and this branch is dead.
-            # It is written anyway because adding a phone to survey.json is a one-line change,
-            # and the failure it would otherwise cause is silent: ~13 ms of uncorrected
+            # ⚠️THIS BRANCH IS NOW UNREACHABLE FOR EVERY PHONE, AND NOT ONLY BECAUSE NO PHONE IS
+            # SURVEYED. `capture_path_bias` above tests `gotchi-phone.path_bias_s`, a CLASS
+            # constant, and refuses before this runs -- so a handset WITH a measured
+            # --latency-cal entry is refused exactly as one without, and this correction never
+            # happens. Running tools/hear_latency_cal.py does not by itself make a phone an
+            # arrival source; somebody must also write the measured figure into nodeclass.py's
+            # `gotchi-phone` entry, which is what that entry's own comment demands. Pinned dead
+            # by tests/test_hear_tdoa.py::test_the_latency_cal_gate_is_unreachable_for_a_phone
+            # so it cannot be mistaken for a live gate. Which of the two should win -- the class
+            # constant or the per-device measurement -- is an operator's decision, not a merge's.
+            #
+            # Kept because the failure it guards against is silent: ~13 ms of uncorrected
             # audio-path latency is 4.5 m, which alone exceeds the entire 34.4 ms
             # nyquist-rankine budget. 2 of 3 handsets have no calibration entry at all.
             off_ns = (cal.get("by_node_id") or {}).get(name)
@@ -772,6 +916,15 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
             "retrigger": row.get("retrigger"), "layout": row.get("layout"),
             "fs_hz": row.get("fs_hz"), "clock_tier": row.get("clock_tier"),
             "sync_sigma_ns": ssig, "ts_utc_s_raw": float(row["ts_utc_s"]),
+            # THE SAME QUANTITY THE BOOLEAN BELOW WAS DERIVED FROM, KEPT AS A NUMBER. The gate
+            # spends `sync_sigma_ns` on a pass/fail and then throws away everything it says
+            # about the rows that PASS; this is that number resolved against the receiver's
+            # class -- stated sigma RSS the class's capture terms -- in SECONDS, which is the
+            # unit `arrivals` and the solvers are in. associate() carries it into
+            # `event["arrival_sigma_s"]` index-aligned with `arrivals`; solve_event() hands it
+            # to the solver. None when the producer stated nothing: that is the class figure and
+            # not a measurement, and a solver must be able to tell the two apart.
+            "t_sigma_s": (None if ssig is None else NC.stamp_t_sigma_s(ssig, gcls)),
             # A REAL BOOLEAN for the same reason `utc_trusted` below is one: associate() cannot
             # resolve it, because the budget is per CLASS and associate has never seen a class.
             # None here means the producer stated no sigma, which that gate reads as usable.
@@ -1169,9 +1322,60 @@ def geometry_report(sv: SV.Survey, node_ids: Sequence[int], source: Sequence[flo
     return out
 
 
+#: The name and unit `point.solve` takes a per-receiver arrival sigma under: a sequence of
+#: SECONDS, one entry per receiver, in the order the receivers were passed.
+SOLVER_SIGMA_KWARG = "sigmas"
+#: ⚠️A SEAM BETWEEN TWO BRANCHES, AND THE TOLERANT HALF OF IT IS DELIBERATELY GONE. The carrying
+#: side (pool -> detection -> event -> here) and the consuming side (point.solve's weighted fit)
+#: landed on separate branches, and while they were separate this was a PROBE: falling back to an
+#: unweighted fit on a `point.solve` without the parameter, so the carrying branch was correct on
+#: a main that had not taken the solver yet. Both sides are composed now, so the fallback has
+#: stopped being a courtesy and become a silencer -- a later rename of the solver's parameter
+#: would leave every receiver voting at par with nothing in the report saying so, which is the
+#: failure this file's gates exist to prevent. It is an import-time REFUSAL instead. It is still
+#: measured rather than asserted: `solver_weighting.solver_accepts` carries the answer into the
+#: run's own report, and it can only ever be written True because a False one cannot import.
+SOLVER_TAKES_SIGMA = SOLVER_SIGMA_KWARG in inspect.signature(PT.solve).parameters
+if not SOLVER_TAKES_SIGMA:                                          # pragma: no cover
+    raise ImportError(
+        "hear.solve.point.solve has no %r parameter: this driver resolves a per-detection "
+        "arrival sigma through nodeclass and has nowhere to put it, so every receiver would "
+        "vote at equal weight and no field in the report would say so. Restore the parameter "
+        "(a sequence of SECONDS, one entry per receiver) or remove the plumbing here."
+        % (SOLVER_SIGMA_KWARG,))
+
+
+def _sigma_kwargs(sigmas: Optional[Sequence[Optional[float]]]) -> Dict[str, Any]:
+    """The solver keyword carrying per-receiver sigma, or nothing at all.
+
+    Empty in two cases, and the second is the interesting one:
+
+      * NO receiver in the group stated a sigma -- an all-`None` list is every receiver on its
+        class figure, which is equal weighting written out longhand, and passing it would make
+        the report claim a weighted fit that is not one;
+      * SOME did and some did not. ⚠️THE SOLVER'S CONTRACT REFUSES A MIXTURE ("one entry per
+        receiver or None for all of them, never a mixture, and never invented for a receiver that
+        states none"), and the only way to satisfy it on a mixed group would be to fill the gaps
+        with the quiet receivers' CLASS figures -- numbers nobody measured for those detections.
+        That is the invention the solver is refusing, so this refuses to do it and falls back to
+        equal weighting. ⚠️IT IS NOT FREE, AND THE COST IS COUNTED: a node array that has not
+        taken the G6 flash standing beside a phone that states 106 us per row is exactly a mixed
+        group, so `solver_weighting.attempts_mixed_statement` is the number to watch. Deciding
+        whether a class figure counts as a statement is a change to the SOLVER's contract and
+        belongs on that side of the seam, not smuggled through here.
+    """
+    if sigmas is None:
+        return {}
+    if any(s is None for s in sigmas):
+        return {}
+    return {SOLVER_SIGMA_KWARG: [float(s) for s in sigmas]}
+
+
 def solve_event(sv: SV.Survey, node_ids: Sequence[int], arrivals: Sequence[float],
                 source_class: str, temp_c: float, v_mps: float,
-                fixed_up_m: Optional[float]) -> Tuple[str, Optional[Dict], Optional[str]]:
+                fixed_up_m: Optional[float],
+                arrival_sigma_s: Optional[Sequence[Optional[float]]] = None
+                ) -> Tuple[str, Optional[Dict], Optional[str]]:
     """(model, solution, solver_error). ~15 lines mirrored from `pipeline.Backend.flush()`.
 
     ⚠️MIRRORED, NOT COPIED-AND-EMBELLISHED, and pinned equal by
@@ -1180,6 +1384,10 @@ def solve_event(sv: SV.Survey, node_ids: Sequence[int], arrivals: Sequence[float
     every arrival. The cone lane gets the 2D projection explicitly and by name, because
     shockwave.py is still planar; the point lane gets full 3D positions, because point.py
     consumes node height as a real distance.
+
+    `arrival_sigma_s` is per-arrival 1-sigma timestamp uncertainty in SECONDS, index-aligned with
+    `arrivals`, `None` per entry where the producer stated nothing. It reaches the point lane and
+    only the point lane -- see the cone branch.
 
     ⚠️`fixed_up_m is not None`, NEVER TRUTHINESS. point.solve tests `fixed_up_m is not None`
     (point.py:236), so `fixed_up_m = 0.0` -- the most likely declared height there is -- means
@@ -1190,9 +1398,14 @@ def solve_event(sv: SV.Survey, node_ids: Sequence[int], arrivals: Sequence[float
     P = sv.positions(list(node_ids))
     try:
         if model == "cone":
+            # ⚠️THE CONE LANE IS NOT WEIGHTED AND THE SIGMA IS DROPPED HERE ON PURPOSE.
+            # shockwave.solve has no sigma parameter and fits a different model (a Mach cone, not
+            # a point), so quietly passing one would be inventing an interface. The sigma is
+            # still in the event for whoever adds it.
             return model, SW.solve(P[:, :2], list(arrivals), v_mps=v_mps, temp_c=temp_c), None
         return model, PT.solve(P, list(arrivals), source_class, temp_c=temp_c,
-                               fixed_up_m=fixed_up_m), None
+                               fixed_up_m=fixed_up_m,
+                               **_sigma_kwargs(arrival_sigma_s)), None
     except ValueError as exc:
         return model, None, str(exc)
 
@@ -1220,7 +1433,9 @@ def solver_verdict(model: str, sol: Optional[Dict], err: Optional[str]) -> str:
 
 def leave_one_out(sv: SV.Survey, node_ids: Sequence[int], arrivals: Sequence[float],
                   source_class: str, temp_c: float, v_mps: float,
-                  fixed_up_m: Optional[float], full: Optional[Dict]) -> Optional[Dict[str, Any]]:
+                  fixed_up_m: Optional[float], full: Optional[Dict],
+                  arrival_sigma_s: Optional[Sequence[Optional[float]]] = None
+                  ) -> Optional[Dict[str, Any]]:
     """Receiver-level attribution: drop each node in turn and report what moved.
 
     ⚠️SKIPPED, LOUDLY, BELOW `meaningful_n`. At the exactly-determined node count the residual is
@@ -1239,7 +1454,14 @@ def leave_one_out(sv: SV.Survey, node_ids: Sequence[int], arrivals: Sequence[flo
     for k in range(n):
         keep = [i for j, i in enumerate(node_ids) if j != k]
         ta = [t for j, t in enumerate(arrivals) if j != k]
-        _m, sol, err = solve_event(sv, keep, ta, source_class, temp_c, v_mps, fixed_up_m)
+        # ⚠️THE SIGMA LIST IS DROPPED AT THE SAME INDEX, not passed whole. It pairs with
+        # `arrivals` BY POSITION, so a full-length list against an n-1 arrival list would weight
+        # every remaining receiver by its neighbour's sigma -- and silently, because the lengths
+        # would only disagree by one and the solver would raise about `arrivals` instead.
+        sg = (None if arrival_sigma_s is None
+              else [s for j, s in enumerate(arrival_sigma_s) if j != k])
+        _m, sol, err = solve_event(sv, keep, ta, source_class, temp_c, v_mps, fixed_up_m,
+                                   arrival_sigma_s=sg)
         dpos = None
         if sol and full and sol.get("east_m") is not None and full.get("east_m") is not None:
             dpos = float(math.hypot(sol["east_m"] - full["east_m"],
@@ -1601,6 +1823,19 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
         "at": now,
         "pool": pool_root, "out": out, "survey": survey_path,
         "policy": {k: v for k, v in sorted(policy.items()) if k != "latency_cal"},
+        # ⚠️MEASURED, NOT ASSERTED. Whether a stated per-arrival sigma actually reached the
+        # solver is a fact about the code this run imported, and a report that only said the
+        # sigma was "carried" would be true while every receiver still voted at par. `delivered`
+        # counts the attempts that handed the solver a real weight.
+        "solver_weighting": {
+            "kwarg": SOLVER_SIGMA_KWARG,
+            "unit": "seconds, 1-sigma, index-aligned with arrivals, null = not stated",
+            "solver_accepts": bool(SOLVER_TAKES_SIGMA),
+            "attempts_with_any_stated_sigma": 0,
+            "attempts_all_receivers_stated": 0,
+            "attempts_mixed_statement": 0,
+            "attempts_delivered_to_solver": 0,
+        },
         "survey_block": {
             "survey_ok": True,
             "all_ids": list(sv.ids), "all_names": [sv.names[i] for i in sv.ids],
@@ -1768,6 +2003,9 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
         group = ev["detections"]
         ids = list(ev["node_ids"])
         arrivals = list(ev["arrivals"])
+        # `.get` because a caller may hand this driver an event dict built before associate()
+        # carried the field; a missing sigma is "nobody stated one", which is equal weighting.
+        sigmas = list(ev.get("arrival_sigma_s") or [None] * len(arrivals))
         pkeys = [d["pool_key"] for d in group]
         ek = event_key(pkeys)
         bc = bound_check(group, arr_sv, c, margin_s)
@@ -1781,9 +2019,19 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
         if not bc["admissible"]:
             verdict = V_MARGIN_DEPENDENT if bc["margin_dependent"] else V_INADMISSIBLE
         else:
+            sw = report["solver_weighting"]
+            if any(s is not None for s in sigmas):
+                sw["attempts_with_any_stated_sigma"] += 1
+                if all(s is not None for s in sigmas):
+                    sw["attempts_all_receivers_stated"] += 1
+                else:
+                    sw["attempts_mixed_statement"] += 1
+            if _sigma_kwargs(sigmas):
+                sw["attempts_delivered_to_solver"] += 1
             model, sol, err = solve_event(arr_sv, ids, arrivals,
                                           policy["source_class"], policy["temp_c"],
-                                          policy["v_mps"], fixed_up)
+                                          policy["v_mps"], fixed_up,
+                                          arrival_sigma_s=sigmas)
             verdict = solver_verdict(model, sol, err)
             if sol and sol.get("east_m") is not None:
                 geom_fit = geometry_report(
@@ -1792,10 +2040,12 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
                     policy["temp_c"], fixed_up)
                 loo = leave_one_out(arr_sv, ids, arrivals,
                                     policy["source_class"], policy["temp_c"], policy["v_mps"],
-                                    fixed_up, sol)
+                                    fixed_up, sol, arrival_sigma_s=sigmas)
         row = {
             "schema": TDOA_SCHEMA, "candidate_id": gi, "event_key": ek, "verdict": verdict,
             "t0_utc_s": arrivals[0], "node_ids": ids, "arrivals": arrivals,
+            # index-aligned with `arrivals`, seconds, null where the producer stated nothing
+            "arrival_sigma_s": sigmas,
             "pool_keys": pkeys,
             "node_names": [d["node_name"] for d in group],
             "n_nodes": len(group), "n_equations": len(group) - 1,
@@ -2519,6 +2769,14 @@ def main(argv=None) -> int:
     ap.add_argument("--allow-phones", action="store_true",
                     help="also read the phone source. They are unsurveyed, so today every row "
                          "still lands in unsurveyed_node -- this makes that a counted number")
+    ap.add_argument("--admit-heterogeneous-receivers", action="store_true",
+                    help="publish positions built from a receiver whose capture path is NOT "
+                         "%r -- a phone, or any node of a declared different class. Default OFF: "
+                         "a receiver's capture-path BIAS does not cancel against a different "
+                         "class even once its own clock and bias pass nodeclass.py, so mixing "
+                         "classes must be an operator's deliberate choice, not a default. See "
+                         "tools/hear_latency_cal.py and docs/hear-latency-calibration-runbook.md"
+                         % (REFERENCE_ARRIVAL_CLASS,))
     ap.add_argument("--clock-unstated", choices=("admit", "refuse"), default="refuse")
     # ⚠️DEFAULT admit, WHERE --clock-unstated DEFAULTS refuse, AND THE ASYMMETRY IS THE POINT.
     # An unstated CLOCK is a producer that measures trust and did not say; refusing it costs a
@@ -2610,6 +2868,7 @@ def main(argv=None) -> int:
         "candidates": list(a.candidate), "site_box": a.site_box,
         "target_events": a.target_events, "array_id": a.array_id,
         "allow_phones": bool(a.allow_phones),
+        "heterogeneous_receivers": bool(a.admit_heterogeneous_receivers),
     }
 
     try:

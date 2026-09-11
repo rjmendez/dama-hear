@@ -148,7 +148,7 @@ def pol(**over):
         "clock_unstated": "refuse", "onset_unstated": "admit", "latency_cal": None,
         "null_trials": 0, "null_seed": 1, "calibrate": False, "known_source": None,
         "candidates": [], "site_box": None, "target_events": 20, "array_id": "hear",
-        "allow_phones": False,
+        "allow_phones": False, "heterogeneous_receivers": False,
     }
     p.update(over)
     return p
@@ -404,10 +404,17 @@ class TestAdmit:
     def test_a_phone_row_with_a_null_clock_tier_is_clock_unstated(self, tmp_path):
         """⚠️THE CASE `arrival_is_usable` CANNOT CATCH. utc_trusted is null on every phone row in
         the live pool and `d.get(k, True) is not False` admits None, so the gate written for the
-        phone audio path passes 100% of it. Resolved here instead."""
+        phone audio path passes 100% of it. Resolved here instead.
+
+        `heterogeneous_receivers=True`: this row is `source="phone"` under a surveyed node's
+        NAME purely so it clears membership without a real phone survey entry -- see
+        is_heterogeneous_receiver. Without the override it is gone as D_HETEROGENEOUS_CLASS
+        before the clock gate this test targets ever runs; TestHeterogeneousReceivers pins that
+        ordering."""
         rec = dict(P._record_from_node_row(node_row("nyquist", T0, seed=4)),
                    source="phone", node="nyquist", clock_tier=None, utc_trusted=None)
-        r, _ = self._reasons(tmp_path, [], extra=[rec], sources=["node", "phone"])
+        r, _ = self._reasons(tmp_path, [], extra=[rec], sources=["node", "phone"],
+                             heterogeneous_receivers=True)
         assert r.get(HT.D_CLOCK_UNSTATED) == 1
 
     def test_clock_unstated_admit_pins_todays_known_no_op(self, tmp_path):
@@ -415,15 +422,43 @@ class TestAdmit:
         null utc_trusted resolves trusted, and admitting an unstated one is the same answer."""
         rec = dict(P._record_from_node_row(node_row("nyquist", T0, seed=5)),
                    source="phone", node="nyquist", clock_tier="gnss", utc_trusted=None)
-        # a phone row still needs a latency entry once it clears the clock gate
+        # ⚠️THIS USED TO ASSERT D_LATENCY AND THE CHANGE IS THE FINDING, NOT A TEST REPAIR.
+        # A phone row now stops at `capture_path_bias` -- a CLASS property -- before the
+        # per-device --latency-cal gate below it is ever consulted, so admitting an unstated
+        # clock is still a no-op but for a different reason than it was. See
+        # test_the_latency_cal_gate_is_unreachable_for_a_phone for what that costs.
         r, _ = self._reasons(tmp_path, [], extra=[rec], sources=["node", "phone"],
-                             clock_unstated="admit")
-        assert r.get(HT.D_LATENCY) == 1, r
+                             clock_unstated="admit", heterogeneous_receivers=True)
+        assert r.get(HT.D_CLOCK_UNSTATED) is None, r
+        assert r.get(HT.D_PATH_BIAS) == 1, r
+
+    def test_the_latency_cal_gate_is_unreachable_for_a_phone(self, tmp_path):
+        """⚠️A DEAD GATE, PINNED AS DEAD SO IT IS NOT MISTAKEN FOR A LIVE ONE. `capture_path_bias`
+        tests `nodeclass.get("gotchi-phone").path_bias_s`, a CLASS constant, and refuses before
+        the `--latency-cal` branch that would correct this row's timestamp by its own measured
+        offset. So a handset with a MEASURED calibration entry is refused exactly as one without:
+        running tools/hear_latency_cal.py does not, by itself, make a phone an arrival source --
+        somebody must also write the measured figure into nodeclass.py's `gotchi-phone` entry,
+        which is what that entry's own comment demands ("WHOEVER FILLS IN path_bias_s FROM A
+        CALIBRATION RUN MUST FILL IN THE SCATTER OF THAT RUN HERE IN THE SAME COMMIT").
+
+        Pinned rather than fixed: which of the two should win is a design decision for the
+        operator, and a silently dead gate is the thing worth preventing."""
+        rec = dict(P._record_from_node_row(node_row("nyquist", T0, seed=5)),
+                   source="phone", node="nyquist", clock_tier="gnss", utc_trusted=None)
+        r, _ = self._reasons(tmp_path, [], extra=[rec], sources=["node", "phone"],
+                             clock_unstated="admit", heterogeneous_receivers=True,
+                             latency_cal={"by_node_id": {"nyquist": 13_122_000}})
+        assert r.get(HT.D_LATENCY) is None
+        assert r.get(HT.D_PATH_BIAS) == 1, (
+            "a measured per-handset offset does not reach the correction: the class-level bias "
+            "gate refuses first, and no --latency-cal entry moves a class constant")
 
     def test_an_untrusted_clock_tier_is_refused(self, tmp_path):
         rec = dict(P._record_from_node_row(node_row("nyquist", T0, seed=6)),
                    source="phone", node="nyquist", clock_tier="wall", utc_trusted=None)
-        r, _ = self._reasons(tmp_path, [], extra=[rec], sources=["node", "phone"])
+        r, _ = self._reasons(tmp_path, [], extra=[rec], sources=["node", "phone"],
+                             heterogeneous_receivers=True)
         assert r.get(HT.D_CLOCK_UNTRUSTED) == 1
 
     def test_an_explicit_onset_not_found_is_refused(self, tmp_path):
@@ -529,6 +564,94 @@ class TestAdmit:
                    out=str(tmp_path / "out"), now=T0 + 3600.0)
         assert t["funnel"]["by_reason"].get(HT.D_UNPARSEABLE) == 1
         assert t["conservation"]["ok"]
+
+
+class TestHeterogeneousReceivers:
+    """PART A. WEIGHTING HANDLES VARIANCE, NOT BIAS -- hear/solve/point.py has no sigma or weight
+    argument at all, so there is nowhere to put a declared clock sigma even once nodeclass.py
+    accepts one; a receiver's capture-path BIAS does not average down and is invisible in an
+    exactly-determined fit (hear/nodeclass.py's module docstring). `--admit-heterogeneous-
+    receivers` is the operator's deliberate override of a default that must otherwise refuse."""
+
+    @pytest.mark.parametrize("source,cls,want", [
+        ("phone", None, True),
+        ("phone", "gotchi-phone", True),
+        ("phone", HT.REFERENCE_ARRIVAL_CLASS, True),   # source ALONE decides a phone -- docstring
+        ("node", None, False),                          # unstated class IS today's live array
+        ("node", "", False),
+        ("node", HT.REFERENCE_ARRIVAL_CLASS, False),
+        ("node", "puc-ntp", True),
+        ("node", "puc-pps", True),
+        ("node", "xiao-s3-i2s", True),
+    ])
+    def test_the_pure_predicate(self, source, cls, want):
+        assert HT.is_heterogeneous_receiver(source, cls) is want
+
+    def test_todays_shipped_registry_makes_the_gate_unreachable(self):
+        """The gate is a no-op TODAY not because it is wired off, but because nothing in the
+        shipped nodeclass registry can ever reach it: every class but the reference already fails
+        nodeclass.py's own gates first (D_NOT_ARRIVAL, checked ahead of this one in admit()'s row
+        order), and a phone has no survey entry at all (D_UNSURVEYED, checked earlier still). If
+        this assertion ever fails, a class was added or recalibrated to pass
+        `contributes_arrival()` -- which is exactly the moment this flag exists to gate, and it
+        means live receivers can now reach `test_admitted_when_the_gate_is_open_and_nodeclass_
+        allows_it` for real, not only via its monkeypatched class."""
+        import hear.nodeclass as NC
+        passing_non_reference = [name for name, cls in NC.CLASSES.items()
+                                 if name != HT.REFERENCE_ARRIVAL_CLASS
+                                 and cls.contributes_arrival()]
+        assert passing_non_reference == []
+
+    def test_default_off_matches_todays_output_byte_for_byte(self, tmp_path):
+        """PART A'S OWN CLAIM, PROVEN. On an array of unstated-class node rows -- what
+        survey.json and the deployed fleet actually are -- the full run report is identical
+        whether --admit-heterogeneous-receivers is passed or not. `policy` is the only key
+        allowed to differ, because it is the one place the run records which flag it was given."""
+        sv3 = SV.Survey({1: (0.0, 0.0, 0.0), 2: (-16.602, -0.272, 3.0), 3: (-4.58, 10.48, 3.0)},
+                        names={1: "nyquist", 2: "mach", 3: "rankine"})
+        rows = planted(sv3, (40.0, 30.0, 0.0), T0)
+
+        def run_it(flag):
+            root = tmp_path / ("pool_%s" % flag)
+            build_pool(root, rows)
+            t = HT.run(str(root), write_survey(tmp_path, name="survey_%s.json" % flag),
+                      pol(heterogeneous_receivers=flag), out=str(tmp_path / ("out_%s" % flag)),
+                      now=T0 + 3600.0)
+            t["policy"] = dict(t["policy"])
+            t["policy"].pop("heterogeneous_receivers")
+            for k in ("out", "pool", "survey", "wall_s"):
+                t.pop(k)
+            return t
+
+        assert run_it(False) == run_it(True)
+
+    def test_admitted_when_the_gate_is_open_and_nodeclass_allows_it(self, tmp_path, monkeypatch):
+        """Proves the flag OPENS the door rather than merely sitting unused. A synthetic class
+        that passes nodeclass's own gates is registered under monkeypatch (never touching the
+        real registry any other test reads), so the ONLY thing left between the row and
+        admission is this gate."""
+        import hear.nodeclass as NC
+        synth = NC.NodeClass(name="test-only-synthetic-class", time_source="gps_pps",
+                             t_sigma_s=50e-6, path_bias_s=10e-6, mic_count=1, fs_hz=48000.0,
+                             band_hz=(50.0, 20000.0))
+        monkeypatch.setitem(NC.CLASSES, synth.name, synth)
+        assert synth.contributes_arrival(), "test fixture is broken: subject must pass nodeclass"
+
+        nodes = LIVE_NODES + [{"node_id": 4, "name": "fourth", "class": synth.name,
+                               "e_m": 5.0, "n_m": 5.0, "u_m": 0.0, "sigma_m": 0.5}]
+        pool_root = tmp_path / "pool"
+        build_pool(pool_root, [node_row("fourth", T0, seed=99)])
+
+        closed = HT.run(str(pool_root), write_survey(tmp_path, nodes, name="s1.json"),
+                        pol(heterogeneous_receivers=False), out=str(tmp_path / "out_closed"),
+                        now=T0 + 3600.0)
+        assert closed["funnel"]["by_reason"].get(HT.D_HETEROGENEOUS_CLASS) == 1
+
+        opened = HT.run(str(pool_root), write_survey(tmp_path, nodes, name="s2.json"),
+                        pol(heterogeneous_receivers=True), out=str(tmp_path / "out_open"),
+                        now=T0 + 3600.0)
+        assert not opened["funnel"]["by_reason"].get(HT.D_HETEROGENEOUS_CLASS)
+        assert opened["funnel"]["admitted"] == closed["funnel"]["admitted"] + 1
 
 
 class TestSeqSynthesis:

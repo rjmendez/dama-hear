@@ -35,6 +35,9 @@ from typing import Dict, List, Optional, Sequence
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import numpy as np
+
+from hear import nodeclass as NC                                  # noqa: E402
 from hear import pool as P                                        # noqa: E402
 from hear.backend import associate as A                           # noqa: E402
 from hear.backend import survey as SV                             # noqa: E402
@@ -115,6 +118,210 @@ def null_distribution(dets: Sequence[Dict], survey, node_id: int, draws: int = 2
     return out
 
 
+# ================================================================= PART B: the receiver census
+#
+# THE PAIR CENSUS ABOVE ANSWERS "how often do two SURVEYED nodes coincide". It is built on
+# `associate()`, which never sees a receiver that is not already in `survey.json` -- so it cannot
+# answer the question an operator actually has before soldering anything: what would admitting a
+# NEW receiver -- a phone, an unsurveyed node -- actually cost and buy. That question has three
+# independent parts, and this section keeps them separate on purpose:
+#
+#   THE CLOCK    a PER-DETECTION quantity. `sync_sigma_ns` is a number each row states for
+#                itself, so "how many arrivals pass" is a count, not a class-wide yes/no.
+#   THE BIAS     a PER-CLASS quantity. `hear/nodeclass.py`'s `path_bias_s` is one number for an
+#                entire hardware class -- there is no per-detection version, because nothing
+#                about this measurement changes row to row. It is one verdict per receiver.
+#   THE POSITION a PER-RECEIVER, OFTEN ABSENT quantity. `hear/solve/point.py` takes a position
+#                for every arrival it uses; a receiver survey.json has never surveyed (every
+#                phone, today) HAS NO POSITION, and no clock or bias number changes that. This is
+#                checked FIRST, because a receiver that fails it cannot contribute an arrival at
+#                all, and reporting its clock/bias numbers beside a geometry column of `null`
+#                would read as "everything but geometry is fine" when nothing downstream of a
+#                missing position can be fine.
+#
+# ⚠️"HOW MANY PASS THE CLOCK GATE" HAS TWO HONEST ANSWERS AND BOTH ARE REPORTED, NEVER JUST ONE.
+# `clock_pass_deployed_gate` is `nodeclass.stamp_admissible()`, the function the shipped pipeline
+# actually calls. `clock_pass_stated_sigma_only` tests the row's OWN `sync_sigma_ns` against the
+# per-node budget directly, with no class term at all. The gap between the two columns IS the
+# finding, not a bug in this tool -- but ⚠️THE GAP HAS CHANGED SIGN AND THE OLD READING IS
+# RETRACTED. This comment used to say `stamp_admissible` short-circuits on the receiver's
+# CLASS-LEVEL `clock_admissible()` before reading the detection's own sigma, so that every phone
+# row was refused whatever it stated and `clock_pass_deployed_gate` was 0 for every phone on this
+# pool. That short-circuit is gone (nodeclass.py, `stamp_admissible`), and `gotchi-phone` now
+# declares `clock_sigma_s` = its whole 5 ms, so its capture figure is 0 and a phone is judged on
+# exactly what it states: both columns agree for a phone.
+#
+# They still disagree, the other way round, wherever a class declares NO clock/capture split. The
+# deployed gate RSSes the stated sigma with the class's CAPTURE terms, which a `sync_sigma_ns`
+# does not measure; `xiao-s3-pps` has no declared split so its capture figure is the whole 100 us,
+# and a node row stating 106.038 us gives sqrt(100^2 + 106.038^2) = 145.75 us, over the 129.4 us
+# bound. It passes `clk_own` and fails the deployed gate. Reading either column alone is still
+# wrong; only which column flatters which receiver has moved.
+_PHONE_ONLY_CLASS = "gotchi-phone"          # the one phone class nodeclass.py registers
+#: The class every `source="node"` row in survey.json is, in HARDWARE, without saying so: none of
+#: nyquist/mach/rankine carries a `class` key (nodeclass.py's own registry notes "all three
+#: answered GET /status with this class 2026-09-10"). Used ONLY to describe a bias verdict for an
+#: unstated-class node row in this census; never fed back into an admission decision -- that
+#: stays tools/hear_tdoa.py's REFERENCE_ARRIVAL_CLASS, a separate constant so this file staying
+#: descriptive cannot silently change what gets published.
+_UNSTATED_NODE_CLASS = "xiao-s3-pps"
+
+
+def _geometry_if_admitted(survey: "SV.Survey", nid: int, c_mps: float) -> Dict:
+    """What baseline the array would gain by admitting node `nid`, against its CURRENT
+    arrival-class members (nid excluded even if already present, so re-running this on an
+    already-admitted node reports what it already contributes rather than double-counting it)."""
+    others = [i for i in survey.arrival_ids() if i != nid]
+    if not others:
+        return {"n_existing_arrival_receivers": 0,
+                "note": "no other arrival-class receiver exists to pair against yet"}
+    p = survey.position(nid)
+    d = {survey.names[i] or str(i): float(np.linalg.norm(p - survey.position(i))) for i in others}
+    dvals = list(d.values())
+    if len(others) < 2:
+        old_diam = 0.0                    # one point has no pair to be a diameter of
+    else:
+        P = survey.positions(others)
+        old_diam = float(np.linalg.norm(P[:, None, :] - P[None, :, :], axis=2).max())
+    return {
+        "n_existing_arrival_receivers": len(others),
+        "separation_m": d,
+        "min_separation_m": min(dvals), "max_separation_m": max(dvals),
+        "pair_bound_ms": {k: v / c_mps * 1e3 for k, v in d.items()},
+        "old_diameter_m": old_diam,
+        "new_diameter_m": max(old_diam, max(dvals)),
+    }
+
+
+def receiver_census(rows, survey: "SV.Survey", latency_cal: Optional[Dict] = None,
+                    phone_position_accuracy_m: Optional[Dict[str, float]] = None,
+                    c_mps: float = 343.0) -> Dict[str, Dict]:
+    """One entry per receiver NAME the pool rows carry -- surveyed or not, node or phone.
+
+    `rows` is any iterable of stored pool dicts (`hear.pool.Pool.raw()`); nothing here decodes a
+    sketch frame, so this is cheap even over a large pool. `latency_cal` is a loaded
+    `acoustic_latency_calibration.json` (schema `by_node_id: {name: offset_ns}`); if given, a
+    receiver with an entry there is judged on ITS OWN measured bias rather than on the single
+    class-wide `gotchi-phone` constant, which today blends three physically different handsets
+    into one number (see docs/hear-latency-calibration-runbook.md).
+    """
+    id_by_name = {n: i for i, n in survey.names.items() if n}
+    class_by_name = {n: (survey.classes.get(i) or None) for n, i in id_by_name.items()}
+    by_node_id_ns = (latency_cal or {}).get("by_node_id") or {}
+    budget_m = NC.ARRIVAL_ONE_WAY_BUDGET_S * float(c_mps)
+
+    acc: Dict[str, Dict] = {}
+    for row in rows:
+        name = row.get("node")
+        if not name:
+            continue
+        b = acc.setdefault(name, {"source": row.get("source"), "rows_total": 0,
+                                  "rows_anchored": 0, "sync_sigma_stated": 0,
+                                  "clock_pass_deployed_gate": 0, "clock_fail_deployed_gate": 0,
+                                  "clock_unstated_deployed_gate": 0,
+                                  "clock_pass_stated_sigma_only": 0,
+                                  "clock_fail_stated_sigma_only": 0})
+        b["rows_total"] += 1
+        if not row.get("anchored"):
+            continue
+        b["rows_anchored"] += 1
+        cname = class_by_name.get(name)
+        assumed = False
+        if cname is None:
+            cname = _PHONE_ONLY_CLASS if row.get("source") == "phone" else _UNSTATED_NODE_CLASS
+            assumed = True
+        b["_class_assumed"] = assumed
+        ssig = row.get("sync_sigma_ns")
+        if ssig is not None:
+            b["sync_sigma_stated"] += 1
+            if float(ssig) <= NC.ARRIVAL_T_SIGMA_MAX_S * 1e9:
+                b["clock_pass_stated_sigma_only"] += 1
+            else:
+                b["clock_fail_stated_sigma_only"] += 1
+        verdict = NC.stamp_admissible(ssig, cname)
+        if verdict is True:
+            b["clock_pass_deployed_gate"] += 1
+        elif verdict is False:
+            b["clock_fail_deployed_gate"] += 1
+        else:
+            b["clock_unstated_deployed_gate"] += 1
+
+    out: Dict[str, Dict] = {}
+    for name, b in acc.items():
+        nid = id_by_name.get(name)
+        assumed = b.pop("_class_assumed")
+        cname = class_by_name.get(name)
+        if cname is None:
+            cname = _PHONE_ONLY_CLASS if b["source"] == "phone" else _UNSTATED_NODE_CLASS
+        cls = NC.CLASSES.get(cname) if cname else None
+        row = dict(b)
+        row["node_id"] = nid
+        row["class"] = cname or "(unstated)"
+        row["class_assumed"] = assumed
+        row["class_clock_admissible"] = cls.clock_admissible() if cls else None
+        row["class_bias_bounded"] = cls.capture_bias_bounded() if cls else None
+        row["class_path_bias_m"] = cls.path_bias_m(c_mps) if cls else None
+        off_ns = by_node_id_ns.get(name)
+        row["device_latency_cal_ns"] = off_ns
+        row["device_bias_bounded"] = (None if off_ns is None else
+                                      abs(float(off_ns)) / 1e9 <= NC.ARRIVAL_PATH_BIAS_MAX_S)
+        row["device_bias_m"] = None if off_ns is None else abs(float(off_ns)) / 1e9 * c_mps
+        row["has_survey_position"] = nid is not None
+        if nid is not None:
+            row["geometry_if_admitted"] = _geometry_if_admitted(survey, nid, c_mps)
+            row["position_accuracy_m"] = None
+            row["position_note"] = None
+        else:
+            acc_m = (phone_position_accuracy_m or {}).get(name)
+            row["geometry_if_admitted"] = None
+            row["position_accuracy_m"] = acc_m
+            row["position_note"] = (
+                "no survey entry: this receiver CANNOT contribute a TDoA arrival at all, "
+                "whatever its clock or bias -- hear/solve/point.py takes a position for every "
+                "arrival it uses, and a device that moves and was never surveyed has none")
+            row["implied_baseline_error_budget_multiple"] = (
+                None if acc_m is None else acc_m / budget_m)
+        out[name] = row
+    return out
+
+
+def _parse_kv_floats(items: Sequence[str]) -> Dict[str, float]:
+    out = {}
+    for it in items:
+        if "=" not in it:
+            raise SystemExit("refused: expected NAME=METRES, got %r" % it)
+        k, _, v = it.partition("=")
+        out[k] = float(v)
+    return out
+
+
+def format_receiver_census(rep: Dict[str, Dict]) -> str:
+    lines = ["%-24s %-14s %6s %6s %-16s %-14s %6s %8s %8s %8s" % (
+        "receiver", "class", "offer", "anch", "clk_deployed(P/F/-)", "clk_own(P/F)", "bias",
+        "dev_bias", "has_pos", "acc_m")]
+    for name in sorted(rep, key=lambda n: -rep[n]["rows_anchored"]):
+        r = rep[name]
+        lines.append("%-24s %-14s %6d %6d %5d/%-5d/%-5d %5d/%-8d %6s %8s %8s %8s" % (
+            name[:24], r["class"] + ("*" if r["class_assumed"] else ""),
+            r["rows_total"], r["rows_anchored"],
+            r["clock_pass_deployed_gate"], r["clock_fail_deployed_gate"],
+            r["clock_unstated_deployed_gate"],
+            r["clock_pass_stated_sigma_only"], r["clock_fail_stated_sigma_only"],
+            "yes" if r["class_bias_bounded"] else ("no" if r["class_bias_bounded"] is not None
+                                                    else "?"),
+            ("n/a" if r["device_bias_bounded"] is None
+             else "yes" if r["device_bias_bounded"] else "no"),
+            "yes" if r["has_survey_position"] else "NO",
+            "-" if r["position_accuracy_m"] is None else "%.2f" % r["position_accuracy_m"]))
+    lines.append("* class assumed (no survey entry states one). clk_deployed = what "
+                 "nodeclass.stamp_admissible() (the SHIPPED gate) says pass/fail/unstated, out of "
+                 "rows_anchored -- it RSSes the stated sigma with the CLASS's capture terms, so a "
+                 "class that declares no clock/capture split can fail here while clk_own passes. "
+                 "clk_own = the row's OWN sync_sigma_ns tested directly against the 129.4 us "
+                 "per-node budget, pass/fail, out of sync_sigma_stated only.")
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -127,12 +334,38 @@ def main(argv=None) -> int:
     ap.add_argument("--since", type=float, default=None, help="unix seconds, inclusive")
     ap.add_argument("--until", type=float, default=None)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--receiver-census", action="store_true",
+                    help="PART B: per-receiver arrivals/clock/bias/geometry, for EVERY receiver "
+                         "the pool has seen -- surveyed or not, node or phone. Independent of "
+                         "the pair census above; runs instead of it")
+    ap.add_argument("--latency-cal", default=None,
+                    help="--receiver-census only: acoustic_latency_calibration.json, so a phone "
+                         "with a measured entry is judged on its OWN bias, not the blended "
+                         "class-wide gotchi-phone constant")
+    ap.add_argument("--phone-accuracy-m", action="append", default=[], metavar="NAME=METRES",
+                    help="--receiver-census only: a phone's OWN measured GPS horizontal accuracy "
+                         "(repeatable). Not read from anywhere automatically -- state where the "
+                         "number came from when you pass it")
     a = ap.parse_args(argv)
 
     sv = SV.load_survey(os.path.expanduser(a.survey))
     names = {n["name"]: int(n["node_id"]) for n in sv.to_dict()["nodes"] if n.get("name")}
     ids = {v: k for k, v in names.items()}
     pl = P.Pool(os.path.expanduser(a.pool))
+
+    if a.receiver_census:
+        cal = None
+        if a.latency_cal:
+            with open(os.path.expanduser(a.latency_cal)) as fh:
+                cal = json.load(fh)
+        rep = receiver_census(pl.raw(), sv, latency_cal=cal,
+                              phone_position_accuracy_m=_parse_kv_floats(a.phone_accuracy_m))
+        if a.json:
+            print(json.dumps(rep, sort_keys=True, indent=2))
+        else:
+            print(format_receiver_census(rep))
+        return 0
+
     dets = arrivals(pl, names, a.since, a.until)
     rep = census(dets, sv, temp_c=a.temp_c)
     rep["by_node"] = {}
