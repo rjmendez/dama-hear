@@ -59,7 +59,7 @@ def test_loaded_is_only_a_record_read_back_and_never_one_just_written():
 
 def test_wifi_joins_from_the_loaded_record_not_the_compiled_arrays():
     setup = _body(_code(), "void setup(")
-    assert "WiFi.begin(prov.ssid[k], prov.psk[k])" in setup
+    assert "hear_net_join(&prov," in setup
     assert "WIFI_SSIDS" not in setup and "WIFI_PASSES" not in setup
 
 

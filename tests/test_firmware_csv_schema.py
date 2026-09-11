@@ -175,16 +175,17 @@ def _call(src, start, end):
 
 
 def test_the_health_header_declares_exactly_what_its_writer_emits():
-    """⚠️FIVE HEADER LITERALS, SEVEN FORMAT LITERALS, 63 COLUMNS. Appending a column means touching
-    both, and getting one right is not getting it right. (58 until the ubx_pvt /
-    dets_unlabelled / first_label_s / ubx_silent_max append; the end anchor below moves with the
-    last column and is meant to.)"""
+    """⚠️SIX HEADER LITERALS, EIGHT FORMAT LITERALS, 69 COLUMNS. Appending a column means touching
+    both, and getting one right is not getting it right. (58, then 63 after the ubx_pvt /
+    dets_unlabelled / first_label_s / ubx_silent_max append, then 69 after the link and loop
+    columns; the end anchor below moves with the last column and is meant to.)"""
     src = _source()
     i = src.index("HEALTH_HDR[]")
     blk = _strip_comments(src[i:])
     k = blk.index("=")
     hdr = "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', blk[k:blk.index(";", k)])).split(",")
-    fmt, args = _call(src, 'f.printf("%s,%lld', "ubx_silent_max);")
+    fmt, args = _call(src, 'f.printf("%s,%lld', "(unsigned long)stream_stall_n);")
+    assert len(hdr) == 69, "the health header has %d columns" % len(hdr)
     assert len(hdr) == len(SPEC.findall(fmt)) == len(args), (
         "health.csv declares %d columns, its format has %d conversions and %d arguments"
         % (len(hdr), len(SPEC.findall(fmt)), len(args)))

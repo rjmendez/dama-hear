@@ -672,6 +672,36 @@ only when something *changes* — fix gained or lost, the first PPS edge, glitch
 the node going away or coming back. A log that prints every poll is a log nobody reads in the
 morning. It runs detached and does not depend on any terminal staying open.
 
+## Link and system instrumentation
+
+Added after mach's link fell from ~120 kB/s to ~10 kB/s with 5 % packet loss. Every drain came
+back truncated, and nothing the node exported could say whether it was the link, a reset or a
+stalled loop.
+
+- **Joining.** At boot the node scans and tries its configured networks strongest first. Within
+  a network, the driver takes the strongest access point (all-channel scan, sorted by signal) on
+  the join and on every automatic reconnect. The default fast scan takes the first match it hears.
+  Nothing is pinned, so losing one access point cannot strand the node. The boot log says how many
+  networks were heard, and the signal and channel of each try. It never names the network.
+- **`/status` `net`.**
+  - `rssi` is the signal now, `null` when not associated. `rssi_join`, `ch` and `bssid` describe
+    the join.
+  - `joined` is which configured network answered (1-based), and `seen` is how many the scan heard.
+  - `disc` and `reconn` are link drops and recoveries since the join, `reason` is the latest drop's
+    `wifi_err_reason_t`, and `disc_age_s` how long ago it happened.
+- **`/status` `sys`.**
+  - `reset` is why the chip last reset (`poweron`, `sw`, `panic`, `task_wdt`, `brownout`, ...).
+  - `heap_min` and `psram_min` are the lowest free memory since boot.
+  - `loop_max_ms` is the longest `loop()` pass in the current health row, and `loop_max_boot_ms`
+    the longest since boot. A download in progress shows up here, because the handler runs inside
+    `loop()`.
+  - `chip_c` is the chip temperature.
+  - `stream_stalls` and `stream_gone` count `/sd`, `/ls`, `/audio` and `/perf` sends given up,
+    either because the link stopped taking data for `STREAM_STALL_MS` (20 s) or because the client
+    left. Audio keeps being pumped while a send waits.
+- **`health.csv`** appends `rssi`, `wifi_disc`, `wifi_reason`, `loop_max_ms`, `heap_min` and
+  `stream_stalls` to every 30 s row. The next time a link degrades, the record shows when.
+
 ## Reaching it without the cable
 
 | | |
