@@ -260,6 +260,22 @@ class TestTheBiasVerdictStaysSeparate:
         assert a["by_reason"].get(TD.D_HETEROGENEOUS_CLASS) == 1
         assert a["by_reason"].get(TD.D_PATH_BIAS) is None
 
+    def test_the_outer_door_also_precedes_the_clock_gates(self, tmp_path):
+        """⚠️THE OTHER HALF OF THE ORDERING, AND IT WAS UNPINNED. The heterogeneous gate is
+        deliberately ahead of the clock/sync/stamp gates too -- it is a STRUCTURAL question about
+        whether this receiver's capture path cancels against the array's, not a per-detection
+        quality one -- and moving it below them changes the reason an operator reads without
+        changing any count. This row states 3.23 ms, far over the 129.4 us bound, so it would
+        land in stamp_sigma_over_class_budget the moment the outer door stopped coming first."""
+        root, sv, policy = self._phone_pool(tmp_path)
+        p = root / "records" / "2026-09-10" / "phone.jsonl"
+        row = json.loads(p.read_text())
+        row["sync_sigma_ns"] = 3_230_000.0
+        p.write_text(json.dumps(row) + "\n")
+        a = TD.admit(str(root), sv, sv, policy, now=1788998606.0)
+        assert a["by_reason"].get(TD.D_HETEROGENEOUS_CLASS) == 1
+        assert a["by_reason"].get(TD.D_STAMP_SIGMA) is None
+
     def test_the_bias_gate_refuses_a_phone_row_the_clock_gate_admitted(self, tmp_path):
         """End to end through `admit()` with the heterogeneous door OPEN: one phone row stating
         a clock sigma INSIDE the bound, surveyed and classed, lands in `capture_path_bias` and
