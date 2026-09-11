@@ -21,7 +21,8 @@ INO = pathlib.Path(__file__).resolve().parents[1] / "firmware" / "hear_node" / "
 
 #: (header constant, the literal that starts the row, trailing fields appended after the payload)
 CASES = [
-    ("DETS_HDR", '"%s,%lld,%lu,%lu,%lu,%ld,%d,%u,%.3f,%lu,"', 3),  # frame_hex + clip + clip_why
+    # frame_hex + clip + clip_why + sync_sigma_ns
+    ("DETS_HDR", '"%s,%lld,%lu,%lu,%lu,%ld,%d,%u,%.3f,%lu,"', 4),
     ("SCENE_HDR", '"%s,%lld,%lu,%lu,%d,%d,%d,%d,%d,%lu,"', 3),   # mel_hex + f_lo_hz + f_hi_hz
 ]
 
@@ -72,6 +73,37 @@ def test_the_dets_header_names_the_node_and_the_writer_supplies_it():
     assert "sketch_back" in fields, "a row must say where its own sketch window started"
 
 
+def test_a_row_states_what_its_own_stamp_is_worth():
+    """⚠️`time_valid` LATCHES TRUE AND IS NEVER CLEARED, so `utc_us > 0` is not evidence that the
+    GPS is still talking -- a node whose UART dies keeps stamping off a frozen anchor and
+    free-running on its crystal. `sync_sigma_ns` is the only field in which that is visible, and
+    it must be in the header AND supplied by the writer, which is the exact pair this file exists
+    to hold together."""
+    src = _source()
+    fields = _header_fields(src, "DETS_HDR")
+    assert fields[-1] == "sync_sigma_ns", (
+        "the declared uncertainty must be the LAST column: tools/hear_bridge.py documents "
+        "trailing columns as the supported growth path and hear/detsfile.py's identify() says "
+        "an inserted column is not safe")
+    # the writer's tail, parsed rather than grepped: the format literal and its arguments
+    src_nc = _strip_comments(src)
+    i = src_nc.index('",%s,%s,%s"')
+    call = src_nc[i:src_nc.index(";", i)]
+    assert "d.sync_sigma_ns" in call or "sg" in call, "the sigma column is declared but not written"
+
+
+def test_zero_is_not_a_value_the_sigma_column_may_carry():
+    """0 ns reads as a perfect clock, which hear/nodeclass.py refuses as a claim no hardware
+    supports. A row with no anchor must write an EMPTY cell instead."""
+    src = _strip_comments(_source())
+    i = src.index("char sg[")
+    blk = src[i:i + 400]
+    assert 'sg[24] = ""' in blk, "the sigma buffer must default to empty"
+    assert "if (d.sync_sigma_ns)" in blk, (
+        "the sigma must be written only when it is non-zero, so an unstamped row carries an "
+        "empty cell rather than a claim of zero uncertainty")
+
+
 def test_renaming_the_column_is_what_forces_the_roll():
     """csv_open() rolls a file aside only when the header STRING changes. Reverting the name to
     `node` would append 12-column rows under the same header as the 11-column ones already on
@@ -84,8 +116,8 @@ def test_renaming_the_column_is_what_forces_the_roll():
 # ---------------------------------------------------------------- health.csv + /status
 # The same defect class, in the two writers the earlier version of this file did not reach.
 # health.csv's format is split across five adjacent literals and its header across four, which is
-# exactly the shape that hid the dets.csv mismatch; /status is not a CSV but it is 121 conversions
-# against 121 arguments in one snprintf, and a shift there mislabels every field after it.
+# exactly the shape that hid the dets.csv mismatch; /status is not a CSV but it is 129 conversions
+# against 129 arguments in one snprintf, and a shift there mislabels every field after it.
 
 
 def _strip_comments(t):
@@ -175,7 +207,7 @@ def test_health_carries_the_acquisition_columns_that_say_whether_a_row_is_usable
 
 
 def test_status_json_has_one_argument_per_conversion():
-    """It is one snprintf with 121 fields. A shift here does not fail: it renames every field
+    """It is one snprintf with 129 fields. A shift here does not fail: it renames every field
     after the shift, and the JSON still parses."""
     src = _source()
     fmt, args = _call(src, '"{\\"node\\":\\"%s\\"', "i2c_found);")

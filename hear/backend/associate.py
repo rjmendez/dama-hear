@@ -81,6 +81,24 @@ REASONS: frozenset = frozenset({
 #                 GPS anchor was stale, so the stamp still carries the input-buffer and HAL
 #                 latency -- tens of milliseconds, constant per handset.
 #
+#   stamp_admissible
+#                 The producer's own `sync_sigma_ns` against that producer's CLASS budget,
+#                 resolved by `nodeclass.NodeClass.stamp_admissible`. False means the stamp was
+#                 made from an anchor old enough that the free-running crystal has eaten the
+#                 arrival budget: a XIAO node latches `time_valid` true at its first NAV-PVT and
+#                 NEVER clears it, so when the GPS UART dies it keeps stamping, drifting at a
+#                 MEASURED 4.2-11.7 ppm -- about 30 ms per hour, and invisible in every other
+#                 counter the node exports.
+#
+#                 ⚠️A BOOLEAN, NOT A THRESHOLD, AND THAT IS THE POINT. The comparison needs the
+#                 receiver's CLASS (the budget is `sqrt(class t_sigma**2 + stated sigma**2)`
+#                 against ARRIVAL_T_SIGMA_MAX_S) and this module has never known the class. A
+#                 raw `sync_sigma_ns > constant` test here would be a SECOND threshold on a
+#                 quantity nodeclass already owns, and two thresholds for one quantity is how
+#                 this repo has been wrong before. The caller resolves it -- tools/hear_tdoa.py
+#                 does, off the survey's class -- exactly as it already resolves `utc_trusted`
+#                 into a real boolean instead of passing the stored field down.
+#
 # ⚠️THE TIMESTAMP IS NOT MOVED. Rewriting arrival times that are already in a shipped pipeline
 # would change every historical answer silently, which is worse than the defect. This refuses the
 # detection instead, by the same discipline as nodeclass.require_arrival() and survey's load-time
@@ -90,7 +108,7 @@ REASONS: frozenset = frozenset({
 # ⚠️ABSENT MEANS USABLE. A producer that does not publish these fields is not thereby suspect --
 # most of them predate the fields. Only an EXPLICIT false is a refusal, so this is a strict no-op
 # on every detection recorded before the producers started emitting them.
-_QUALITY_FLAGS = ("onset_found", "utc_trusted")
+_QUALITY_FLAGS = ("onset_found", "utc_trusted", "stamp_admissible")
 
 
 def arrival_is_usable(d: Dict) -> bool:
@@ -106,6 +124,9 @@ def _unusable_reason(d: Dict) -> str:
                        "(~25 ms early, ~8.6 m)",
         "utc_trusted": "no HAL audio timestamp or no fresh GPS anchor, so the stamp still "
                        "carries the input-buffer and HAL latency",
+        "stamp_admissible": "the producer's own stated clock sigma puts this detection over its "
+                            "class's per-node arrival budget -- a stale time anchor free-running "
+                            "on the local crystal, not a bad detection",
     }
     return "node %d at %.6f s: %s" % (
         int(d["node_id"]), float(d["t_utc_s"]),

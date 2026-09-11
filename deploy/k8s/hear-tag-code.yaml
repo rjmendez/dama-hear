@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-tag-code.yaml
-# apply-mode client: 133071 B serialised against a 262144 B last-applied-configuration cap.
+# apply-mode client: 133077 B serialised against a 262144 B last-applied-configuration cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tag
   annotations:
-    dama-hear/commit: 'ed6c75a'
+    dama-hear/commit: 'ba7b4cc-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '133071'
+    dama-hear/serialised-bytes: '133077'
 data:
   hear__init__.py: |
     
