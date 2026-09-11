@@ -157,9 +157,11 @@ def _container(doc):
 
 class TestTheEmbedManifest:
 
-    def test_both_cronjobs_ship_suspended(self, edocs):
+    def test_both_cronjobs_ship_enabled(self, edocs):
+        """Suspended until the model was staged and the GPU path proven in-cluster (2026-09-11);
+        enabled in the repo so a later apply cannot quietly switch the lane off."""
         assert [d["metadata"]["name"] for d in edocs] == ["hear-embed", "hear-embed-check"]
-        assert all(d["spec"]["suspend"] is True for d in edocs)
+        assert all(d["spec"]["suspend"] is False for d in edocs)
 
     def test_the_embed_job_is_pinned_to_the_2080ti(self, edocs):
         c = _container(edocs[0])
