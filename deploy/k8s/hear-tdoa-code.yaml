@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 515819 B serialised against a 262144 B last-applied-configuration cap.
+# apply-mode server: 529137 B serialised against a 262144 B last-applied-configuration cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: 'ed6c75a'
+    dama-hear/commit: 'ba7b4cc-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '515819'
+    dama-hear/serialised-bytes: '529137'
 data:
   hear__init__.py: |
     
@@ -708,6 +708,7 @@ data:
         G3  12 cols DECLARED, 11 WRITTEN  ⚠️ header says `node,` and the writer never emits it
         G4  12 cols   node_id, ...                               fs/layout build, node_id populated
         G5  13 cols   + sketch_back before frame_hex             the window fix
+        G6  14 cols   + sync_sigma_ns appended                    the declared-uncertainty stamp
     
     ⚠️G3 IS THE WHOLE REASON THIS MODULE EXISTS. `csv.DictReader` on a G3 file silently shifts every
     value one column left of its name: `utc_us` gets the node name, `uptime_s` gets the timestamp,
@@ -764,9 +765,18 @@ data:
                     ("node_id",) + _BASE + ("frame_hex", "clip", "clip_why"))
     G5 = Generation("G5", ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why"),
                     ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why"))
+    # ⚠️`sync_sigma_ns` IS THE PHONE'S KEY AND THE PHONE'S UNIT, on purpose. hear/pool.py already
+    # reads `sync_sigma_ns` off an MQTT payload as the uncertainty of that producer's clock-to-UTC
+    # anchor, 1-sigma, NANOSECONDS. A node now states the same quantity in the same unit under the
+    # same name, so one measurement has one spelling across both sensors.
+    # ⚠️EMPTY IS "NOT STATED", AND 0 IS NOT A VALUE THIS COLUMN CAN CARRY. A row the node could not
+    # stamp at all (utc_us == 0) has no anchor to be uncertain about, and writing 0 there would read
+    # as a perfect clock -- which hear/nodeclass.py refuses as a claim no hardware supports.
+    _G6 = ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why", "sync_sigma_ns")
+    G6 = Generation("G6", _G6, _G6)
     
-    GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5)
-    LATEST = G5
+    GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5, G6)
+    LATEST = G6
     
     # One packed v1 sketch is 172 bytes; the column holds it as hex.
     FRAME_HEX_LEN = 344
@@ -865,6 +875,11 @@ data:
             # the pre-fix value -- the pre-fix builds took the window at a `back` this file cannot
             # know. None travels; nothing here invents 736.
             d.setdefault("sketch_back", None)
+            # G1-G5 never stated it, and an EMPTY G6 cell is the node saying it had no anchor. Both
+            # are None -- "not stated" -- and neither is 0. See hear/pool.py's record builder and
+            # hear/backend/associate.py, where absent means usable and a number is a claim.
+            if not d.get("sync_sigma_ns"):
+                d["sync_sigma_ns"] = None
             out.rows.append(d)
         return out
     
@@ -1475,6 +1490,24 @@ data:
         return None if node == expect else str(node)
     
     
+    def _sync_sigma_ns(v: Any) -> Optional[float]:
+        """A dets.csv G6 cell -> a stated clock sigma in nanoseconds, or None for "not stated".
+    
+        ⚠️NON-POSITIVE IS NOT STATED. The firmware writes an EMPTY cell for a row it could not stamp,
+        but a 0 that reached here from any source must not become a claim of a perfect clock --
+        hear/nodeclass.py refuses `t_sigma_s <= 0` at construction for exactly that reason, and this
+        value is fed to the same budget. Unparseable is None for the same reason: a producer this
+        version does not understand is not one to take a number from.
+        """
+        if v in (None, ""):
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if f > 0.0 else None
+    
+    
     def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
         frame = binascii.unhexlify(row["frame_hex"])
@@ -1514,6 +1547,15 @@ data:
             "no_context": bool(d["event_flags"] & SK.FLAG_NO_CONTEXT),
             "sketch_back": (int(row["sketch_back"]) if row.get("sketch_back") not in (None, "")
                             else None),
+            # ⚠️THE SAME KEY AND THE SAME UNIT AS THE PHONE PATH ABOVE (ingest_mqtt_jsonl), which is
+            # why it is not called anything else: 1-sigma uncertainty of the producer's clock-to-UTC
+            # anchor, NANOSECONDS. For a node it is `STAMP_ANCHOR_SIGMA_US + drift * anchor age`,
+            # written per detection since dets.csv G6 -- the column that makes a frozen anchor
+            # visible, because `time_valid` never goes false once it is set.
+            # None on every G1-G5 row and on any G6 row the node could not stamp. NOT 0: a stated 0
+            # would claim a perfect clock, and `hear.corpus.Record.sync_sigma_ns` is read by gates
+            # that treat absent and stated differently.
+            "sync_sigma_ns": _sync_sigma_ns(row.get("sync_sigma_ns")),
             "sample": row.get("sample"),
             "uptime_s": row.get("uptime_s"),
             # ⚠️THE INGEST USED TO DROP THESE TWO, WHICH IS WHY AN UNANCHORED ROW WAS UNRECOVERABLE
@@ -2582,6 +2624,75 @@ data:
             """
             return self.clock_admissible() and self.capture_bias_bounded()
     
+        # ---- the same budget, per DETECTION ------------------------------------------------------
+        # ⚠️WHY A CLASS-WIDE t_sigma_s IS NOT THE WHOLE ANSWER ANY MORE. `t_sigma_s` says what this
+        # hardware is worth when it is WORKING. A xiao-s3-pps whose GPS UART has died keeps stamping
+        # from a frozen PPS anchor -- `time_valid` latches true at the first NAV-PVT and the firmware
+        # never clears it -- and free-runs on the ESP crystal at a MEASURED 4.2 to 11.7 ppm
+        # (health.csv archives, three nodes, 461 windows of >= 300 s, 2026-09-10). That is ~30 ms per
+        # hour of silently wrong stamp on a class whose declared sigma is 100 us, and no class-wide
+        # constant can express it because it is a property of one detection's anchor age, not of the
+        # part number. The firmware now states it per row as dets.csv `sync_sigma_ns`; these three
+        # methods are where that statement meets this budget.
+        def stamp_t_sigma_s(self, sync_sigma_ns: Optional[float]) -> float:
+            """This class's random timestamp sigma for ONE detection, given the producer's own
+            statement about its clock, seconds.
+    
+            ⚠️RSS, AND DELIBERATELY DOUBLE-COUNTING THE CLOCK. `t_sigma_s` already contains a clock
+            term -- docs/timing.md's detection-path budget lists "esp_timer between anchors,
+            12.20 us" among the terms RSS'd into it -- so adding a stated clock sigma on top charges
+            the healthy case twice. That is the conservative direction and it costs almost nothing
+            where it is charged twice (100 us RSS 12 us is 100.7 us), which is the same trade
+            `path_bias_s` makes for the 62.47 us block quantisation. Subtracting the class's own
+            clock term instead would need that 12.20 us transplanted into this file as a fourth
+            constant nothing else reads, and it would move the answer in the optimistic direction.
+    
+            A `None` statement returns the class figure unchanged: not stated is not zero, and it is
+            also not a refusal here -- see `stamp_admissible`.
+            """
+            if sync_sigma_ns is None:
+                return self.t_sigma_s
+            s = float(sync_sigma_ns) / 1e9
+            return math.sqrt(self.t_sigma_s ** 2 + s * s)
+    
+        def stamp_admissible(self, sync_sigma_ns: Optional[float]) -> Optional[bool]:
+            """Is ONE detection's timestamp inside the per-node arrival budget?
+    
+            Three states, and the third is the one that occurs: None means the producer did not
+            state a clock sigma, which is every dets.csv row before generation G6 and every phone
+            payload with no `sync_sigma_ns`. None is NOT a refusal -- `associate.arrival_is_usable`
+            reads absent as usable by design, so a new field cannot retroactively delete history.
+            """
+            if sync_sigma_ns is None:
+                return None
+            if not self.clock_admissible():
+                return False
+            return self.stamp_t_sigma_s(sync_sigma_ns) <= ARRIVAL_T_SIGMA_MAX_S
+    
+        def stamp_refusal(self, sync_sigma_ns: Optional[float],
+                          c_mps: float = _C_NOMINAL_MPS) -> Optional[str]:
+            """Why this detection's stamp is not an arrival, with the numbers in it, or None."""
+            if self.stamp_admissible(sync_sigma_ns) is not False:
+                return None
+            tot = self.stamp_t_sigma_s(sync_sigma_ns)
+            return ("the producer states a clock sigma of %.1f us, which against class %r's own "
+                    "%.1f us gives a per-detection t_sigma of %.1f us = %.3f m of range, over the "
+                    "%.1f us per-node bound"
+                    % (float(sync_sigma_ns) / 1e3, self.name, self.t_sigma_s * 1e6,
+                       tot * 1e6, tot * float(c_mps), ARRIVAL_T_SIGMA_MAX_S * 1e6))
+    
+        def max_stated_clock_sigma_s(self) -> float:
+            """The largest `sync_sigma_ns` (as seconds) this class may state and still be admitted.
+    
+            `sqrt(budget**2 - t_sigma_s**2)`, i.e. the inverse of `stamp_t_sigma_s`. 0.0 for a class
+            already over the bound on its class figure alone -- there is no statement that rescues
+            it. Exported so a firmware author can see what the wire number is being spent against
+            without re-deriving the algebra: 82.1 us for xiao-s3-pps today.
+            """
+            if not self.clock_admissible():
+                return 0.0
+            return math.sqrt(max(0.0, ARRIVAL_T_SIGMA_MAX_S ** 2 - self.t_sigma_s ** 2))
+    
         def __repr__(self) -> str:
             lo, hi, lim = self.usable_band_hz()
             bias = ("bias unmeasured" if self.path_bias_s is None
@@ -2814,6 +2925,50 @@ data:
               "table (tools/hear_latency_cal.py) and the bias goes; the clock needs GPSTimingSync on a "
               "better tier than \"location\".",
     ))
+    
+    
+    def strictest_arrival_class() -> NodeClass:
+        """The admissible class with the LEAST room for a stated clock sigma.
+    
+        Used where a receiver's class is not stated, which on this array is every receiver: the
+        shipped survey.json names no `class` on any node, and `Survey.arrival_ids()` admits an
+        unstated class by design. A gate that needed the class to be declared would therefore be
+        dead code in production -- that is how the per-detection budget below would have shipped
+        doing nothing at all.
+    
+        `min` over `max_stated_clock_sigma_s`, so adding a class can only ever TIGHTEN the fallback.
+        Classes that are not arrival sources at all are excluded: their headroom is 0 and using them
+        would refuse every stated sigma on every unclassed node.
+        """
+        adm = [c for c in CLASSES.values() if c.contributes_arrival()]
+        if not adm:
+            raise CapabilityError("no registered class is an arrival source, so there is no budget "
+                                  "an unclassed receiver could be held to")
+        return min(adm, key=lambda c: c.max_stated_clock_sigma_s())
+    
+    
+    def _stamp_class(class_name: Optional[str]) -> NodeClass:
+        """The class to charge a stated sigma against. Unstated or unrecognised -> the strictest."""
+        c = CLASSES.get(class_name or "")
+        return c if c is not None else strictest_arrival_class()
+    
+    
+    def stamp_admissible(sync_sigma_ns: Optional[float],
+                         class_name: Optional[str] = None) -> Optional[bool]:
+        """Is ONE detection's stamp inside the per-node arrival budget? None = the producer did not
+        state a sigma, which every dets.csv row before generation G6 does not."""
+        return _stamp_class(class_name).stamp_admissible(sync_sigma_ns)
+    
+    
+    def stamp_refusal(sync_sigma_ns: Optional[float], class_name: Optional[str] = None,
+                      c_mps: float = _C_NOMINAL_MPS) -> Optional[str]:
+        """Why that stamp is not an arrival, with the numbers in it, or None."""
+        cls = _stamp_class(class_name)
+        why = cls.stamp_refusal(sync_sigma_ns, c_mps)
+        if why is None or class_name in CLASSES:
+            return why
+        return ("%s (the receiver's class is unstated, so the strictest arrival class is charged)"
+                % why)
     
     
     def get(name: str) -> NodeClass:
@@ -4126,6 +4281,24 @@ data:
     #                 GPS anchor was stale, so the stamp still carries the input-buffer and HAL
     #                 latency -- tens of milliseconds, constant per handset.
     #
+    #   stamp_admissible
+    #                 The producer's own `sync_sigma_ns` against that producer's CLASS budget,
+    #                 resolved by `nodeclass.NodeClass.stamp_admissible`. False means the stamp was
+    #                 made from an anchor old enough that the free-running crystal has eaten the
+    #                 arrival budget: a XIAO node latches `time_valid` true at its first NAV-PVT and
+    #                 NEVER clears it, so when the GPS UART dies it keeps stamping, drifting at a
+    #                 MEASURED 4.2-11.7 ppm -- about 30 ms per hour, and invisible in every other
+    #                 counter the node exports.
+    #
+    #                 ⚠️A BOOLEAN, NOT A THRESHOLD, AND THAT IS THE POINT. The comparison needs the
+    #                 receiver's CLASS (the budget is `sqrt(class t_sigma**2 + stated sigma**2)`
+    #                 against ARRIVAL_T_SIGMA_MAX_S) and this module has never known the class. A
+    #                 raw `sync_sigma_ns > constant` test here would be a SECOND threshold on a
+    #                 quantity nodeclass already owns, and two thresholds for one quantity is how
+    #                 this repo has been wrong before. The caller resolves it -- tools/hear_tdoa.py
+    #                 does, off the survey's class -- exactly as it already resolves `utc_trusted`
+    #                 into a real boolean instead of passing the stored field down.
+    #
     # ⚠️THE TIMESTAMP IS NOT MOVED. Rewriting arrival times that are already in a shipped pipeline
     # would change every historical answer silently, which is worse than the defect. This refuses the
     # detection instead, by the same discipline as nodeclass.require_arrival() and survey's load-time
@@ -4135,7 +4308,7 @@ data:
     # ⚠️ABSENT MEANS USABLE. A producer that does not publish these fields is not thereby suspect --
     # most of them predate the fields. Only an EXPLICIT false is a refusal, so this is a strict no-op
     # on every detection recorded before the producers started emitting them.
-    _QUALITY_FLAGS = ("onset_found", "utc_trusted")
+    _QUALITY_FLAGS = ("onset_found", "utc_trusted", "stamp_admissible")
     
     
     def arrival_is_usable(d: Dict) -> bool:
@@ -4151,6 +4324,9 @@ data:
                            "(~25 ms early, ~8.6 m)",
             "utc_trusted": "no HAL audio timestamp or no fresh GPS anchor, so the stamp still "
                            "carries the input-buffer and HAL latency",
+            "stamp_admissible": "the producer's own stated clock sigma puts this detection over its "
+                                "class's per-node arrival budget -- a stale time anchor free-running "
+                                "on the local crystal, not a bad detection",
         }
         return "node %d at %.6f s: %s" % (
             int(d["node_id"]), float(d["t_utc_s"]),
@@ -7070,6 +7246,7 @@ data:
     D_CLOCK_UNSTATED = "clock_unstated"
     D_CLOCK_UNTRUSTED = "clock_untrusted"
     D_SYNC_SIGMA = "sync_sigma_exceeds"
+    D_STAMP_SIGMA = "stamp_sigma_over_class_budget"
     D_ONSET = "onset_not_found"
     D_ONSET_UNSTATED = "onset_unstated"
     D_LATENCY = "latency_uncorrected"
@@ -7078,8 +7255,8 @@ data:
     
     DROP_REASONS = (D_UNANCHORED, D_OUTSIDE_WINDOW, D_OUTSIDE_LOOKBACK_EMITTED,
                     D_OUTSIDE_LOOKBACK_UNASSOC, D_PENDING_SETTLE, D_UNSURVEYED, D_NOT_ARRIVAL,
-                    D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_SYNC_SIGMA, D_ONSET, D_ONSET_UNSTATED,
-                    D_LATENCY, D_UNPARSEABLE)
+                    D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_SYNC_SIGMA, D_STAMP_SIGMA, D_ONSET,
+                    D_ONSET_UNSTATED, D_LATENCY, D_UNPARSEABLE)
     
     #: Why an admitted arrival's onset quality is UNSTATED, stated once so the ledger detail, the
     #: manifest and the CLI help cannot drift apart. Every clause was checked on 2026-09-10 against
@@ -7560,10 +7737,29 @@ data:
                               % (row.get("clock_tier"), sorted(C.TRUSTED_CLOCK_TIERS))))
                 continue
             ssig = row.get("sync_sigma_ns")
+            # ⚠️TWO GATES ON ONE QUANTITY, AND THEY ASK DIFFERENT QUESTIONS. --max-sync-sigma-ns is
+            # APERTURE-relative (DEFAULT_SYNC_SIGMA_FRAC of the tightest pair bound: "is this
+            # receiver contributing information to that pair at all"), and it moves when the array
+            # moves. The one below is HARDWARE-relative: the class's own arrival budget, which does
+            # not. On this array the hardware gate is ~27x tighter (82.1 us of stated sigma against
+            # 3.45 ms), so it binds and the operator knob only ever loosens -- which is the right way
+            # round for a knob. Keep them separate; collapsing them would put site geometry back
+            # inside a hardware admissibility test, which nodeclass.py's own header argues against.
             if max_sync_ns is not None and ssig is not None and float(ssig) > float(max_sync_ns):
                 _drop(day, row, D_SYNC_SIGMA,
                       _detail(row, "stated sync_sigma %.0f ns exceeds --max-sync-sigma-ns %.0f"
                               % (float(ssig), float(max_sync_ns))))
+                continue
+            # The per-detection form of the class gate. A node that latched `time_valid` true and
+            # then lost its GPS UART keeps stamping off a frozen anchor; `sync_sigma_ns` is the only
+            # field in which that is visible, and this is the door it is visible AT.
+            # ⚠️THE CLASS IS UNSTATED ON EVERY NODE IN survey.json AND THIS STILL HAS TO BITE. A
+            # gate keyed on a declared class would be dead code on the only survey that exists;
+            # nodeclass charges the strictest arrival class when none is named.
+            cname = sv.classes.get(nid)
+            stamp_ok = NC.stamp_admissible(ssig, cname)
+            if stamp_ok is False:
+                _drop(day, row, D_STAMP_SIGMA, _detail(row, NC.stamp_refusal(ssig, cname) or ""))
                 continue
             # ⚠️THREE-STATE, AND THE THIRD STATE IS THE ONE THAT ACTUALLY OCCURS. See the
             # `onset_quality` block returned below for what this pool is made of.
@@ -7607,6 +7803,10 @@ data:
                 "retrigger": row.get("retrigger"), "layout": row.get("layout"),
                 "fs_hz": row.get("fs_hz"), "clock_tier": row.get("clock_tier"),
                 "sync_sigma_ns": ssig, "ts_utc_s_raw": float(row["ts_utc_s"]),
+                # A REAL BOOLEAN for the same reason `utc_trusted` below is one: associate() cannot
+                # resolve it, because the budget is per CLASS and associate has never seen a class.
+                # None here means the producer stated no sigma, which that gate reads as usable.
+                "stamp_admissible": stamp_ok,
                 "latency_applied_ms": lat_ms,
                 # ⚠️REAL BOOLEANS, not the stored fields. None here means "not stated and admitted
                 # under policy", which associate()'s `is not False` reads as usable -- the same

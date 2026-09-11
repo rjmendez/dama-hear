@@ -478,6 +478,37 @@ class TestAdmit:
         r, _ = self._reasons(tmp_path, [], extra=[rec])
         assert r.get(HT.D_SYNC_SIGMA) == 1
 
+    def test_a_stale_time_anchor_is_refused_by_the_class_budget_not_the_aperture_knob(
+            self, tmp_path):
+        """⚠️THE GAP THE APERTURE KNOB LEAVES OPEN. --max-sync-sigma-ns defaults to a tenth of
+        the tightest pair bound -- 3.45 ms on this array -- while `xiao-s3-pps` may state at most
+        82.1 us before its own arrival budget is spent. A node whose GPS UART died 30 s ago
+        declares ~625 us: forty times the hardware bound, and a fifth of the operator knob, so
+        the knob passes it and the class gate is the only thing that does not."""
+        sigma = 625_000.0
+        assert sigma < HT.DEFAULT_SYNC_SIGMA_FRAC * (11.82 / 343.0) * 1e9
+        rec = dict(P._record_from_node_row(node_row("nyquist", T0, seed=81)),
+                   sync_sigma_ns=sigma)
+        r, _ = self._reasons(tmp_path, [], extra=[rec])
+        assert r.get(HT.D_SYNC_SIGMA) is None
+        assert r.get(HT.D_STAMP_SIGMA) == 1
+
+    def test_a_healthy_stated_sigma_is_admitted_and_carried_as_a_real_boolean(self, tmp_path):
+        """A working node's declared sigma must pass, and the decision must travel: associate()
+        cannot resolve it for itself, because the budget is per CLASS."""
+        rec = dict(P._record_from_node_row(node_row("nyquist", T0, seed=82)),
+                   sync_sigma_ns=37_000.0)
+        r, t = self._reasons(tmp_path, [], extra=[rec])
+        assert r.get(HT.D_STAMP_SIGMA) is None
+        assert t["funnel"]["admitted"] == 1
+
+    def test_a_row_with_no_stated_sigma_is_unaffected(self, tmp_path):
+        """Every dets.csv row before generation G6 has no sigma, and the gate must be a strict
+        no-op on all of them."""
+        r, t = self._reasons(tmp_path, planted_rows_for_admit())
+        assert r.get(HT.D_STAMP_SIGMA) is None
+        assert t["funnel"]["admitted"] == 3
+
     def test_a_row_newer_than_the_settle_window_waits(self, tmp_path):
         r, _ = self._reasons(tmp_path, [node_row("nyquist", T0 + 3599.0, seed=9)],
                              settle_s=600.0)

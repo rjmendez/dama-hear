@@ -1153,6 +1153,9 @@ static int gate(int16_t s) {
 enum { CLIP_PENDING = 0, CLIP_OK, CLIP_CARDFULL, CLIP_DEDUPE, CLIP_RING,
        CLIP_NOCARD, CLIP_FAIL, CLIP_STALLED };
 struct Det { uint32_t sample; uint32_t pps_n; int32_t us_since_pps; int64_t utc_us;
+              // What utc_us is worth, 1-sigma, nanoseconds -- see stamp_sigma_ns(). 0 = no
+              // stamp, and dets.csv then carries an EMPTY column rather than a zero.
+              uint64_t sync_sigma_ns;
               int16_t trigger; uint16_t flags; uint32_t uptime_s; double fs_at;
               uint8_t clip_st;
               uint32_t cseq;          // clip_seq the clip was named with, valid when clip_st == CLIP_OK
@@ -1225,10 +1228,86 @@ static float env_peak_seen = 0;
 // between edges; whatever it actually does is the crystal error, and every I2S rate on this part
 // is derived from that same crystal. Works with no microphone attached.
 // Local esp_timer microseconds -> UTC microseconds. Returns false when the anchor is not trusted.
+//
+// ⚠️THE ANCHOR IS NEVER INVALIDATED AND THAT IS DELIBERATE. time_valid latches true at the
+// first NAV-PVT that names an edge and nothing clears it, so when the UART dies this keeps
+// stamping from a frozen (edge_local_us, edge_unix_us) pair and free-runs on the ESP crystal.
+// Refusing after N silent seconds was considered and REJECTED: a detection with no stamp cannot
+// be placed at all, and the operator's call is that a stamp WITH A DECLARED UNCERTAINTY beside it
+// is worth more than no stamp. stamp_sigma_ns() below is that number, and it is what makes the
+// silence visible instead of invisible.
 static bool local_to_utc(uint64_t local_us, int64_t *utc_us) {
   if (!time_valid || !edge_unix_us) return false;
   *utc_us = edge_unix_us + (int64_t)(local_us - edge_local_us);
   return true;
+}
+
+// ---- what a stamp is worth ---------------------------------------------------------------
+// The 1-sigma uncertainty of this node's CLOCK-to-UTC anchor, in nanoseconds, for a stamp taken
+// at `local_us`. Published per detection as dets.csv `sync_sigma_ns`, which is the same quantity
+// and the same unit dama-gotchi's GPSTimingSync publishes under that name.
+//
+// ⚠️CLOCK ONLY. It deliberately EXCLUDES the capture path -- the 62.47 us I2S block
+// quantisation and the fs_clean back-date differential -- because on the phone side
+// sync_sigma_ns is the clock anchor's error and the audio path is a separate, separately
+// measured number. hear/nodeclass.py combines this with the class's capture terms; charging them
+// here as well would make one column mean two different things on two producers.
+//
+// Two terms, ADDED and not RSS'd. The drift term is a one-signed ramp, not scatter, and this
+// repo already treats a deterministic offset as adding where a random term would RSS
+// (hear/nodeclass.py, ARRIVAL_PATH_BIAS_MAX_S).
+//
+//   STAMP_ANCHOR_SIGMA_US  what the anchor is worth the instant it is set.
+//     GPS tAcc is 25-38 ns live on all three nodes and 21-31 ns in docs/timing.md -- under
+//     0.04 us, negligible here. The term that matters is the PPS edge latch, for which
+//     docs/timing.md already uses HALF THE MEASURED INTERVAL SPREAD as a 1-sigma proxy.
+//     MEASURED over 4558 health.csv rows pulled from all three nodes 2026-09-10: spread maxima
+//     17 us (nyquist), 46 us (rankine), 33 us at p99 (mach). Half of the 46 us envelope is
+//     23 us; 25 rounds it up.
+//     ⚠️A CONSTANT, NOT THE NODE'S LIVE pps_int_max - pps_int_min. That envelope is
+//     boot-cumulative and one bring-up probe poisons it for good: the same mach archive holds a
+//     1145 us row, and gps_bringup() resets the pair to nothing, so a live read would swing
+//     between "0.5 ms of error" and "no term at all" for reasons that are diagnostics rather
+//     than clock quality. docs/timing.md's own budget row (5.00 us) is this same formula against
+//     nyquist's 8-10 us spread of the day; 25 us is it against the fleet's worst.
+//
+//   STAMP_DRIFT_PPM_MAX    free run since that anchor, as parts per million of the age.
+//     MEASURED 2026-09-10/11 by differentiating the esp_ppm column of health.csv and
+//     health-prev.csv from nyquist, rankine and mach (esp_ppm is a cumulative mean over `pps`
+//     intervals, so the rate over a window is
+//     (n1*(1e6+p1) - n0*(1e6+p0)) / (n1-n0) - 1e6):
+//         windows >= 900 s, n=148, no pps_gaps inside any of them:  4.359 .. 10.566 ppm
+//         windows >= 300 s, n=461:                                  4.194 .. 11.671 ppm
+//         windows >= 120 s, n=1149:                                -4.770 .. 12.450 ppm
+//     The single negative is 120 s of PPS jitter and not a rate. Every other window is POSITIVE:
+//     esp_timer runs FAST on all three nodes at every temperature seen, so an unrefreshed anchor
+//     stamps LATE, about 30 ms per hour, exactly as the field reports.
+//     The rate is a function of the node's own board temperature and the fit is clean:
+//         ppm = 15.920 - 0.2690 * T_C   (n=148, residual sd 0.585 ppm, max residual 2.35 ppm)
+//     over the 21.61 - 44.65 C the archives actually cover.
+//     20 ppm is the ENVELOPE and not any sample: above every measured window, and above the
+//     extrapolation of that fit past the cold end nothing has measured -- 15.92 ppm at 0 C,
+//     17.67 at fit + 3 sd. ⚠️The extrapolation is an INFERENCE; no node in this archive
+//     has been below 21.61 C.
+//     ⚠️NOT THE NODE'S OWN esp_clock_ppm, for three reasons: during the outage this
+//     sigma is for, that figure is itself frozen; it moves ~6 ppm across the temperature range
+//     within one boot; and the firmware does not CORRECT for it, so the whole rate is error and
+//     not a residual. Correcting at the fleet median and declaring the +-3.8 ppm residual would
+//     be about 3x tighter and was rejected -- it would move timestamps that are already in a
+//     shipped pipeline, which this repo refuses to do (hear/backend/associate.py).
+#define STAMP_ANCHOR_SIGMA_US 25u
+#define STAMP_DRIFT_PPM_MAX   20.0
+
+// 0 means NO STAMP: the caller writes an empty column rather than a number, because 0 ns of
+// uncertainty is a claim no hardware supports and hear/nodeclass.py refuses it as one.
+static uint64_t stamp_sigma_ns(uint64_t local_us) {
+  if (!time_valid || !edge_unix_us) return 0;
+  uint64_t anchor = (uint64_t)edge_local_us;
+  // A back-dated capture can precede the anchor edge; the magnitude of the interpolation is what
+  // carries the drift either way.
+  uint64_t age_us = local_us >= anchor ? local_us - anchor : anchor - local_us;
+  double drift_ns = (double)age_us * STAMP_DRIFT_PPM_MAX / 1000.0;
+  return (uint64_t)STAMP_ANCHOR_SIGMA_US * 1000ULL + (uint64_t)(drift_ns + 0.5);
 }
 
 // ⚠️THIS USED TO DIVIDE THE WHOLE FIRST-TO-LAST SPAN BY pps_count-1, which counts EDGES SEEN and
@@ -2101,9 +2180,11 @@ static String status_json() {
   // SIZED FROM THE FORMAT, not from a sample. snprintf truncates silently, and a truncated
   // /status is not a short answer -- it is invalid JSON, which every consumer reads as an
   // unreachable node. tests/test_firmware_csv_schema.py bounds it: the literal text plus every
-  // conversion at the widest value it can carry (a %s at i2c_found's 256, a %.Nf at 24) is 5463
+  // conversion at the widest value it can carry (a %s at i2c_found's 256, a %.Nf at 24) is 4303
   // bytes, so 5632 cannot truncate. Live output measured 2113 chars, which is exactly the sample
-  // a buffer must not be sized from -- the old 3072 was already inside the bound.
+  // a buffer must not be sized from -- the old 3072 was already inside the bound. (The 5463 this
+  // comment used to state no longer reproduces from the test that computes it; recomputed
+  // 2026-09-10 at 129 conversions.)
   static char b[5632];
   // JSON has no NaN. A node that does not know its temperature emits null, which every parser
   // reads as absent -- printing nan would be invalid JSON, and a downstream coercion of it to 0.0
@@ -2151,7 +2232,11 @@ static String status_json() {
     // ⚠️label_rejects IS ONE BRANCH, NOT THE LOSS. See the counters beside time_glitch: the
     // four fields after it are the ones that describe an unlabelled node, and they are here
     // because reading label_rejects as the loss ranked the worst node in the fleet best.
-    "\"time\":{\"valid\":%s,\"utc_us\":%lld,\"since_edge_us\":%llu,\"navpvt_nano\":%ld,\"label_rejects\":%lu,"
+    // sync_sigma_ns is what a stamp taken RIGHT NOW would carry, the same number dets.csv writes
+    // per detection, so "is this node lying about its clock" is answerable from /status alone --
+    // it is `valid` that never goes false, and this that grows.
+    "\"time\":{\"valid\":%s,\"utc_us\":%lld,\"since_edge_us\":%llu,\"sync_sigma_ns\":%llu,"
+      "\"navpvt_nano\":%ld,\"label_rejects\":%lu,"
       "\"dets_unlabelled\":%lu,\"first_label_s\":%lu,\"ubx_silent_s\":%lu,\"ubx_silent_max_s\":%lu},"
     // acq_slip: g_acq (what pass 1 really wrote to the sketch ring) minus the g_samples*DECIM rule
     // praw and clip_pump address by. It is 0 unless an I2S read was not a multiple of DECIM, and it
@@ -2210,6 +2295,7 @@ static String status_json() {
     (unsigned long)drop_samples, (unsigned long)over_seconds, (unsigned long)samp_sec_last,
     esp_ppm, (unsigned long)esp_n,
     time_valid ? "true" : "false", (long long)utc_now, (unsigned long long)since_edge,
+    (unsigned long long)stamp_sigma_ns(nowl),
     (long)last_nano, (unsigned long)time_glitch,
     (unsigned long)dets_unlabelled, (unsigned long)first_label_s,
     (unsigned long)ubx_silent_s, (unsigned long)ubx_silent_max,
@@ -3396,9 +3482,18 @@ void setup() {
 // the ambiguity csv_open's roll exists to prevent, and a changed header string is what triggers
 // it. Recording the value rather than bumping a version number also makes the NEXT window change
 // visible in the data instead of only in the firmware.
+// ⚠️`sync_sigma_ns` IS APPENDED, AND IT IS THE PHONE'S KEY AND THE PHONE'S UNIT. dama-gotchi
+// publishes the uncertainty of its own clock-to-UTC anchor as `sync_sigma_ns` and hear/pool.py
+// already reads that name off the MQTT payload into the pool record; a node inventing a second
+// name (or stating microseconds) for the same quantity would give one measurement two spellings.
+// Appended AFTER clip_why for the reason the clip columns were: tools/hear_bridge.py treats
+// trailing columns as the supported way to grow this header, and hear/detsfile.py's identify()
+// says in as many words that an APPENDED column is the safe direction and an inserted one is not.
+// A changed header string is also what rolls the file aside, which is what stops G6 rows landing
+// under a G5 header.
 static const char DETS_HDR[] =
   "node_id,utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,sketch_back,frame_hex,"
-  "clip,clip_why";
+  "clip,clip_why,sync_sigma_ns";
 
 // ⚠️THE SKETCH IS TAKEN HERE, NOT AT THE GATE EDGE, BECAUSE THE AUDIO DOES NOT EXIST YET.
 // The window runs forward from one hop before the trigger, so it needs SKETCH_SPAN - SKETCH_BACK
@@ -3494,7 +3589,10 @@ static void det_flush() {
     }
     char cp[80] = "";
     if (d.clip_st == CLIP_OK) clip_name(cp, sizeof cp, d.cseq, d.sample);
-    int add = snprintf(line + m, sizeof line - m, ",%s,%s", cp, clip_why(d.clip_st));
+    // EMPTY, not 0, when the row has no stamp: 0 ns would read as a perfect clock.
+    char sg[24] = "";
+    if (d.sync_sigma_ns) snprintf(sg, sizeof sg, "%llu", (unsigned long long)d.sync_sigma_ns);
+    int add = snprintf(line + m, sizeof line - m, ",%s,%s,%s", cp, clip_why(d.clip_st), sg);
     if (add > 0) m += (add < (int)sizeof line - m) ? add : ((int)sizeof line - m - 1);
     line[m++] = '\n';
     if (detf.write((const uint8_t *)line, m) != (size_t)m) {
@@ -3663,6 +3761,10 @@ static void audio_pump() {
           dets[idx].pps_n = pn;
           dets[idx].us_since_pps = (int32_t)off;
           dets[idx].utc_us = tok ? t : 0;       // 0 = the anchor was not trusted at that instant
+          // ⚠️SAMPLED AT cap_us, NOT AT FLUSH. The row can wait up to CLIP_WAIT_MAX_S for its
+          // clip and sketch, and the anchor can be refreshed in that window -- a sigma read then
+          // would describe a different instant than the stamp beside it.
+          dets[idx].sync_sigma_ns = tok ? stamp_sigma_ns(cap_us) : 0;
           if (!tok) dets_unlabelled++;          // the loss itself, counted where it happens
           dets[idx].trigger = sac;
           dets[idx].fs_at = fsu;

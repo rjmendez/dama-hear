@@ -38,6 +38,68 @@ The PPS ISR's own interpolation (`since = (now - blk_end_us) * 2 / 125`) assumes
 16000 Hz. Clamped to one block, its worst error is 6.6 us = 2.3 mm, and it is **common-mode**
 across nodes, so it cancels in a TDoA.
 
+⚠️**That budget is for a node whose GPS is still talking, and the node cannot tell you whether
+it is.** `time_valid` is set at one site -- the first NAV-PVT that names a PPS edge -- and is
+never cleared, so `local_to_utc()` keeps converting from a frozen `(edge_local_us, edge_unix_us)`
+pair after the UART dies. The "esp_timer between anchors" row above is that term with the anchor
+one second old; with the anchor an hour old it is the same term times 3600. See below.
+
+## Free run: what a stamp is worth when the anchor stops moving
+
+The firmware now states it per detection, as `dets.csv` `sync_sigma_ns` (G6) and in `/status`
+under `time.sync_sigma_ns` -- the same key and the same unit dama-gotchi publishes for the same
+quantity, the 1-sigma uncertainty of a producer's clock-to-UTC anchor:
+
+    sync_sigma_ns = STAMP_ANCHOR_SIGMA_US * 1000 + anchor_age_us * STAMP_DRIFT_PPM_MAX / 1000
+
+`STAMP_ANCHOR_SIGMA_US = 25`. GPS tAcc is 25-38 ns live and negligible; the term is the PPS edge
+latch, taken as half the measured interval spread exactly as the budget row above does. Spread
+maxima over 4558 `health.csv` rows from all three nodes, 2026-09-10: **17 us** (nyquist),
+**46 us** (rankine), **33 us at p99** (mach, one boot poisoned to 1145 us by a bring-up probe).
+Half of 46 is 23; 25 rounds up. It is a **constant, not the node's live `pps_int_max -
+pps_int_min`**, because that envelope is boot-cumulative, poisoned by one probe, and reset to
+nothing by `gps_bringup()`.
+
+⚠️It is the **clock anchor only**. The 62.47 us I2S block quantisation and the `fs_clean`
+back-date differential are CAPTURE-path terms; they live in `nodeclass`'s `t_sigma_s` and
+`path_bias_s`, and `sync_sigma_ns` means the clock on the phone side too. One column, one meaning.
+
+`STAMP_DRIFT_PPM_MAX = 20`. MEASURED 2026-09-10/11 by differentiating the cumulative `esp_ppm`
+column of `health.csv` and `health-prev.csv` from all three nodes -- `esp_ppm` is a running mean
+over `pps` intervals, so `sum = n*(1e6+ppm)` and the rate over a window is
+`(n1*(1e6+p1) - n0*(1e6+p0))/(n1-n0) - 1e6`. Windows containing a `pps_gaps` change discarded:
+
+| window | n | min | max |
+|---|---|---|---|
+| >= 900 s | 148 | 4.359 ppm | 10.566 ppm |
+| >= 300 s | 461 | 4.194 ppm | 11.671 ppm |
+| >= 120 s | 1149 | -4.770 ppm | 12.450 ppm |
+
+The single negative is 120 s of PPS jitter, not a rate. **Every other window is positive**, on
+every node, at every temperature seen: `esp_timer` runs fast, so an unrefreshed anchor stamps
+**late** -- about 30 ms per hour, which is the field figure. The rate is a clean function of the
+node's own board temperature over the 21.61-44.65 C the archives cover:
+
+    ppm = 15.920 - 0.2690 * T_C      n=148, residual sd 0.585 ppm, max residual 2.35 ppm
+
+20 ppm is the **envelope**: above every measured window, and above the extrapolation of that fit
+past the cold end -- 15.92 ppm at 0 C, 17.67 at fit + 3 sd. ⚠️That extrapolation is an
+**inference**; nothing in this archive has been below 21.61 C.
+
+⚠️**Not the node's own `esp_clock.ppm_vs_gps`.** During the outage this number exists for, that
+figure is itself frozen; it moves ~6 ppm across the temperature range within one boot; and the
+firmware does not CORRECT for it, so the whole rate is error rather than a residual. Correcting
+at the fleet median and declaring the +-3.8 ppm residual would be about 3x tighter, and was
+rejected: it would move timestamps already in a shipped pipeline.
+
+**What it costs at the gate.** `hear/nodeclass.py` combines a stated sigma with the class's own
+figure in RSS -- `sqrt(100**2 + sigma**2) <= 129.4 us` -- so a `xiao-s3-pps` may state at most
+**82.1 us**. Minus the 25 us base, at 20 ppm, that is an anchor age of **2.86 s**. A healthy node
+stamps at an anchor age of 0.57-0.66 s (`time.since_edge_us`, all three nodes, 2026-09-10), so it
+passes with room; mach's 1016 s and 1317 s NAV-PVT-silent windows do not, and are refused **as
+arrivals** within seconds of the link going quiet. The rows are still ingested -- they are real
+acoustic events for classification and scene -- they just stop being arrival times.
+
 ## Why `fs_clean` is not a clock measurement
 
 Its numerator advances only in whole 256-sample I2S reads, so every value it can take is exactly
