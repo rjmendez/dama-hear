@@ -182,12 +182,11 @@ Proven against a live node. `fetch_clip()` exists for this and nothing else.
 ⚠️**200 is not proof of a file.** `/sd?file=/clips` returns 200 with a zero-byte body (measured), so
 length and the `RIFF` magic are checked, never assumed.
 
-**Fetch order is by eviction risk, never priority.** Oldest-first by `(boot, sample)`. On the flashed
-fleet eviction is plain FIFO oldest-by-name — a prefix histogram over 370 live names is `{'ny': 370}`,
-i.e. no `%02u-` field at all — so oldest-first is most-at-risk-first. On the checkout firmware
-eviction is lowest-priority-first, where the high-priority clip is the one that *survives*, so
-fetching by priority would spend the cap on what is least likely to disappear. `prio` is recorded
-when the name carries it and is never read for ordering.
+**Fetch order is by eviction risk, never priority.** Oldest-first in `hear.clips.eviction_key` order,
+which is the order the firmware evicts in (`firmware/hear_node/clip_order.h`, run against the Python
+mirror by `tests/test_clip_eviction.py`): older-format names first, then boot sequence, then sample.
+The fleet flashed before FIFO eviction writes a `%02u-` priority prefix and evicts lowest-priority-first;
+`prio` is recorded when a name carries it and is never read for ordering.
 
 ### `/ls?dir=` — compiled, not flashed
 
@@ -195,9 +194,9 @@ when the name carries it and is never read for ordering.
 `..`-rejecting, 404 on a non-directory, capped at `LS_MAX_ENTRIES 256` with an explicit
 `! truncated at <n> entries` marker. **It compiles and stops there. No node has been flashed.**
 
-The cap is not sized to 49, because `clip_budget_left` is a RAM counter reset full every boot with
-**no startup rescan of `CLIP_DIR`** — eviction only binds once *this boot's* counter is spent, so the
-real ceiling is free SD space (~155 files on a ~19 MiB-free card), not 49.
+The cap is not sized to 49: a card that ran the priority-eviction firmware can hold ~155 older clips
+(~19 MiB free), and `clip_rescan()` reads `CLIP_DIR` in one pass of at most `LS_MAX_ENTRIES` at boot
+before evicting down to the budget.
 
 `dir` is deliberately **not** restricted to `/clips`. `/sd?file=` already opens any absolute path
 with no authentication, as do `/reboot`, `/update` and `/log`. Filename-guessing was accidental
@@ -330,7 +329,7 @@ Never a silent match. A 64000-sample clip spans `64000/16384 = 3.906` scene rows
 
 **Draining must precede any budget increase.** The node is not the archive; the pool is. Until
 something collects, every byte of budget is a byte of delay before the same loss — and a larger
-`CLIP_BUDGET_B` also consumes SD space and lengthens `clip_evict_worse_than`'s directory scan.
+`CLIP_BUDGET_B` also consumes SD space.
 
 1. Land collection. Clips flow into `clips/index.jsonl`.
 2. Observe **≥ 7 days** of `clips_deferred_by_cap == 0` and `clips_cap_hit == false` across all three

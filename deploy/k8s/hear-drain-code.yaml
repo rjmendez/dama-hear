@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-drain-code.yaml
-# apply-mode client: 249384 B serialised against a 262144 B last-applied-configuration cap.
+# apply-mode client: 249805 B serialised against a 262144 B last-applied-configuration cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'f833965-dirty'
+    dama-hear/commit: '0db0b4e-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '249384'
+    dama-hear/serialised-bytes: '249805'
 data:
   hear__init__.py: |
     
@@ -2175,7 +2175,7 @@ data:
     import os
     import re
     import shutil
-    from typing import Any, Dict, Iterable, List, Optional
+    from typing import Any, Dict, Iterable, List, Optional, Tuple
     
     #: 3 drops `header_rate_suspect`: one clip geometry, and old clips roll off.
     CLIP_SCHEMA_VERSION = 3
@@ -2202,7 +2202,7 @@ data:
     #: ⚠️`probed_404` IS DELIBERATELY NOT HERE. hear_node.ino:2436 answers 404 for ANY failed
     #: SD.open, not only for a missing file: max_files is 8 and the long-lived set reaches 6
     #: (dets.csv + scene.csv + the open clip + /ls's directory and entry + health.csv) with
-    #: clip_evict_worse_than() taking 2 more during an eviction (hear_node.ino:1725-1731). One
+    #: the pre-FIFO firmware's clip_evict_worse_than() taking 2 more during an eviction. One
     #: descriptor-exhausted moment must not retire a clip that is still on the card.
     TERMINAL_OUTCOMES = ("stored", "evicted_before_fetch")
     
@@ -2210,9 +2210,9 @@ data:
     #: confirming the 321 already-dead nyquist names costs one extra ~32 s pass, once.
     CONFIRM_404 = 2
     
-    #: ⚠️BOTH SHIPPED SHAPES. The flashed fleet writes `<node>-<boot>-<sample>.wav`; the checkout's
-    #: clip_name() prepends `%02u-` priority. A parser that knew only one would refuse the entire
-    #: live fleet or the entire next reflash.
+    #: ⚠️EVERY SHIPPED SHAPE. The oldest firmware wrote `<node>-<8 hex boot>-<sample>.wav`, the
+    #: priority-eviction firmware prepended `%02u-`, and the FIFO firmware writes a 12 hex boot
+    #: (6 hex boot sequence + 6 random). Older names stay on a card until they are evicted.
     _NAME_RE = re.compile(r"^(?:(\d{2})-)?([A-Za-z0-9_]+)-([0-9a-fA-F]+)-(\d+)\.wav$")
     _MAX_BASENAME = 64
     
@@ -2246,6 +2246,21 @@ data:
         prio, node, boot, sample = m.groups()
         return {"raw": raw, "basename": basename, "node": node, "boot": boot,
                 "sample": int(sample), "prio": None if prio is None else int(prio)}
+    
+    
+    _FIFO_TAIL_RE = re.compile(r"-([0-9a-fA-F]{12})-(\d{10})\.wav$")
+    
+    
+    def eviction_key(basename: str) -> Tuple[Any, ...]:
+        """Sort key that orders clips the way the node evicts them, oldest first.
+    
+        Mirrors firmware/hear_node/clip_order.h (tests/test_clip_eviction.py runs both on the same
+        names): any name not of the FIFO shape first, by name; then by (boot sequence, sample).
+        """
+        m = _FIFO_TAIL_RE.search(basename)
+        if m is None or m.start() == 0 or int(m.group(2)) > 0xFFFFFFFF:
+            return (0, basename)
+        return (1, int(m.group(1)[:6], 16), int(m.group(2)), basename)
     
     
     def clip_key(node: str, boot: str, sample: int) -> str:
@@ -3318,13 +3333,11 @@ data:
         reads the CLIP PATH out of `frame_hex`. That is not hypothetical -- it returned 0 usable rows
         from 730 detections once already.
     
-        ⚠️ORDER IS BY EVICTION RISK, NOT BY PRIORITY. The flashed fleet evicts plain FIFO
-        oldest-by-name (measured: no node writes the `%02u-` prefix; the prefix histogram over 370
-        live names is {'ny': 370}), so oldest-first IS most-at-risk-first. The checkout firmware
-        evicts lowest-priority-first, where a high-priority clip is the one that survives many
-        windows -- so fetching by priority would spend the cap on what is least likely to disappear.
-        Oldest-first is correct under FIFO, harmless under the priority gate, and needs no reflash to
-        be right. `prio` is RECORDED when the name carries it and is never read for ordering.
+        ⚠️ORDER IS BY EVICTION RISK, NOT BY PRIORITY. The checkout firmware evicts oldest-first in
+        `CL.eviction_key` order (older-format names, then boot sequence, then sample), so that order
+        IS most-at-risk-first. The fleet flashed before it writes the `%02u-` prefix and evicts
+        lowest-priority-first; oldest-first is harmless there. `prio` is RECORDED when the name
+        carries it and is never read for ordering.
     
         A cell that does not parse as a clip path is kept as a candidate with `parts: None` rather
         than dropped. A name firmware wrote and this parser refuses is a disagreement between the two,
@@ -3375,8 +3388,8 @@ data:
                 })
         # A name that would not parse has no (boot, sample) to sort on, so it sorts LAST rather than
         # under an invented zero -- it costs no request and must not displace one that does.
-        out.sort(key=lambda c: ((0, c["parts"]["boot"], c["parts"]["sample"]) if c["parts"]
-                                else (1, "", 0)))
+        out.sort(key=lambda c: ((0,) + CL.eviction_key(c["parts"]["basename"]) if c["parts"]
+                                else (1,)))
         return out
     
     
@@ -3422,7 +3435,7 @@ data:
                 "dets_origin": "%s:/ls?dir=%s" % (node, CL.CLIP_DIR),
                 "ls_bytes": sizes[name] if sizes else None,
             })
-        out.sort(key=lambda c: (c["parts"]["boot"], c["parts"]["sample"]))
+        out.sort(key=lambda c: CL.eviction_key(c["parts"]["basename"]))
         return out
     
     

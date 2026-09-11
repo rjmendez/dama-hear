@@ -688,13 +688,11 @@ def clip_candidates(bodies: Sequence[Tuple[str, bytes]], node: str) -> List[Dict
     reads the CLIP PATH out of `frame_hex`. That is not hypothetical -- it returned 0 usable rows
     from 730 detections once already.
 
-    ⚠️ORDER IS BY EVICTION RISK, NOT BY PRIORITY. The flashed fleet evicts plain FIFO
-    oldest-by-name (measured: no node writes the `%02u-` prefix; the prefix histogram over 370
-    live names is {'ny': 370}), so oldest-first IS most-at-risk-first. The checkout firmware
-    evicts lowest-priority-first, where a high-priority clip is the one that survives many
-    windows -- so fetching by priority would spend the cap on what is least likely to disappear.
-    Oldest-first is correct under FIFO, harmless under the priority gate, and needs no reflash to
-    be right. `prio` is RECORDED when the name carries it and is never read for ordering.
+    ⚠️ORDER IS BY EVICTION RISK, NOT BY PRIORITY. The checkout firmware evicts oldest-first in
+    `CL.eviction_key` order (older-format names, then boot sequence, then sample), so that order
+    IS most-at-risk-first. The fleet flashed before it writes the `%02u-` prefix and evicts
+    lowest-priority-first; oldest-first is harmless there. `prio` is RECORDED when the name
+    carries it and is never read for ordering.
 
     A cell that does not parse as a clip path is kept as a candidate with `parts: None` rather
     than dropped. A name firmware wrote and this parser refuses is a disagreement between the two,
@@ -745,8 +743,8 @@ def clip_candidates(bodies: Sequence[Tuple[str, bytes]], node: str) -> List[Dict
             })
     # A name that would not parse has no (boot, sample) to sort on, so it sorts LAST rather than
     # under an invented zero -- it costs no request and must not displace one that does.
-    out.sort(key=lambda c: ((0, c["parts"]["boot"], c["parts"]["sample"]) if c["parts"]
-                            else (1, "", 0)))
+    out.sort(key=lambda c: ((0,) + CL.eviction_key(c["parts"]["basename"]) if c["parts"]
+                            else (1,)))
     return out
 
 
@@ -792,7 +790,7 @@ def ls_candidates(sizes: Optional[Dict[str, int]], node: str) -> List[Dict[str, 
             "dets_origin": "%s:/ls?dir=%s" % (node, CL.CLIP_DIR),
             "ls_bytes": sizes[name] if sizes else None,
         })
-    out.sort(key=lambda c: (c["parts"]["boot"], c["parts"]["sample"]))
+    out.sort(key=lambda c: CL.eviction_key(c["parts"]["basename"]))
     return out
 
 
