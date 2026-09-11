@@ -7,6 +7,7 @@
 RTC_NOINIT_ATTR static uint32_t boot_magic;
 RTC_NOINIT_ATTR static uint32_t boot_try_n;
 RTC_NOINIT_ATTR static uint32_t proven_ok;
+RTC_NOINIT_ATTR static uint32_t proven_addr;   // the app partition proven_ok was earned on
 static bool marked_healthy = false;
 static uint32_t boot_ms = 0;
 
@@ -14,9 +15,17 @@ uint32_t hear_boot_try()    { return boot_try_n; }
 bool     hear_boot_proven() { return proven_ok != 0; }
 bool     hear_boot_marked() { return marked_healthy; }
 
+static uint32_t running_addr() {
+  const esp_partition_t *run = esp_ota_get_running_partition();
+  return run ? run->address : 0;
+}
+
 void hear_boot_guard() {
   boot_ms = millis();
-  if (boot_magic != HEAR_BOOT_MAGIC) { boot_magic = HEAR_BOOT_MAGIC; boot_try_n = 0; proven_ok = 0; }
+  if (boot_magic != HEAR_BOOT_MAGIC) {
+    boot_magic = HEAR_BOOT_MAGIC; boot_try_n = 0; proven_ok = 0; proven_addr = 0;
+  }
+  if (proven_ok && proven_addr != running_addr()) { proven_ok = 0; boot_try_n = 0; }
   boot_try_n++;
   if (proven_ok) { boot_try_n = 0; return; }
   if (boot_try_n > HEAR_BOOT_MAX_TRIES) {
@@ -47,7 +56,7 @@ void hear_boot_tick(bool reachable) {
   // this parameter exists so that the omission is not expressible.
   if (!reachable) return;
   marked_healthy = true;
-  boot_try_n = 0; proven_ok = 1;
+  boot_try_n = 0; proven_ok = 1; proven_addr = running_addr();
   esp_ota_mark_app_valid_cancel_rollback();   // harmless if the bootloader ignores it
   hear_logln("boot  marked healthy; failback counter cleared");
 }
