@@ -100,3 +100,43 @@ class TestTheDeadHeaderDoesNotContradictIt:
         assert "puc_node.ino" in src, (
             "puc.h must name the file that actually compiles, or a reader takes its own PPS_PIN "
             "as authoritative -- which is how GPIO18 survived for two months")
+
+
+def _define_list(path, name):
+    """The int members of a brace-initialised #define, e.g. {15, 16, 17}. None if absent."""
+    with open(path) as fh:
+        src = fh.read()
+    hits = re.findall(r"^\s*#define\s+%s\s+\{([^}]*)\}" % re.escape(name), src, re.M)
+    if not hits:
+        return None
+    return [int(x) for x in re.findall(r"-?\d+", hits[-1])]
+
+
+class TestTheDeadHeaderDoesNotOfferAPinTheScanDisqualified:
+    """⚠️THE PPS_PIN GUARD ABOVE WAS BLIND TO THE LIST THREE LINES BELOW IT.
+
+    puc.h's FREE_PADS read {15, 16, 17, 18, 21, 38, 39} while this module's own docstring
+    recorded 18 and 39 as HELD LOW and 38 as carrying the DS3231's 1 Hz SQW. A guard aimed at one
+    occurrence of a defect does not see the next one, so this parses the list too.
+
+    21 is absent from the scan entirely: UNMEASURED is not FREE, and a header that cannot tell
+    those apart is how a pad gets soldered on a guess.
+    """
+
+    def test_free_pads_offers_nothing_measured_as_driven(self):
+        free = _define_list(HDR, "FREE_PADS")
+        assert free is not None, "puc.h has no FREE_PADS"
+        bad = sorted(set(free) & DRIVEN_PINS)
+        assert not bad, (
+            "puc.h offers GPIO %s as free; /scanpu measured them HELD LOW against an internal "
+            "pullup, so something external drives the net" % bad)
+
+    def test_free_pads_offers_nothing_carrying_a_clock(self):
+        # 38 showed 8 edges at 50% duty in the same scan -- the DS3231 1 Hz. It is an output.
+        assert 38 not in (_define_list(HDR, "FREE_PADS") or []), (
+            "GPIO38 carries the DS3231's 1 Hz square wave; the scan saw it toggling")
+
+    def test_free_pads_is_exactly_what_the_scan_cleared(self):
+        assert set(_define_list(HDR, "FREE_PADS") or []) == FREE_PINS, (
+            "FREE_PADS must be the pins the scan actually cleared (%s). Anything the scan did "
+            "not reach is UNMEASURED and does not belong in a list called FREE." % sorted(FREE_PINS))

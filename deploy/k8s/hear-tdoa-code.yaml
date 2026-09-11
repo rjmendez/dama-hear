@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 536082 B serialised against a 262144 B last-applied-configuration cap.
+# apply-mode server: 538629 B serialised against a 262144 B last-applied-configuration cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '12bc9c4-dirty'
+    dama-hear/commit: 'eead259-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '536082'
+    dama-hear/serialised-bytes: '538629'
 data:
   hear__init__.py: |
     
@@ -4280,11 +4280,14 @@ data:
     """
     from __future__ import annotations
     
+    import itertools
+    
     from typing import Dict, List, Optional, Sequence
     
     import numpy as np
     
     from ..solve import shockwave as SW
+    from ..solve.consistency import physically_possible
     
     # Slop beyond pure propagation. The gate reports the argmax over a 25 ms guard
     # (hear/node/detect.py:22 GUARD_S), plus a few metres of survey error and temperature spread.
@@ -4405,6 +4408,35 @@ data:
         904 ms, and a single number cannot be right for both.
         """
         return float(survey.diameter_m()) / SW.sound_speed(temp_c) + float(margin_s)
+    
+    
+    
+    def _point_source_excess_s(group, p_of, c: float) -> float:
+        """How far the worst pair in `group` sits OUTSIDE |dt| <= d/c. 0.0 means inside it.
+    
+        ⚠️THIS IS THE ZERO-MARGIN BOUND, AND IT IS NOT THE ONE THE GROUPER ADMITS ON. The grouper
+        adds MARGIN_S to every pair because onset picking and the survey both carry error. That slop
+        is 30 ms = 10.3 m against an array 16.87 m across, so a group can clear the admission test
+        and still describe arrivals no single point source anywhere could have produced.
+    
+        MEASURED on the live pool 2026-09-11, 7,073 anchored arrivals over 74 h: of the four
+        three-node events delivered, THREE span 55.85, 70.37 and 74.70 ms against a largest pair
+        bound of 48.7 ms. Not marginal -- past the widest bound the array has. Only the 39.88 ms
+        event at 2026-09-09T11:08:41.341Z is possible at zero margin.
+    
+        Reported, not refused: whether 30 ms of slop is right is a survey-and-onset question, and
+        dropping three quarters of the deliveries is not a decision this function gets to make. It
+        makes the number visible so the decision can be taken on evidence.
+    
+        `physically_possible` is imported rather than re-derived -- one bound, one definition.
+        """
+        worst = 0.0
+        for a, b in itertools.combinations(group, 2):
+            dt = abs(float(a["t_utc_s"]) - float(b["t_utc_s"]))
+            d_m = float(np.linalg.norm(p_of(int(a["node_id"])) - p_of(int(b["node_id"]))))
+            if not physically_possible(dt, d_m, c, tol_s=0.0):
+                worst = max(worst, dt - d_m / c)
+        return worst
     
     
     def associate(detections: Sequence[Dict], survey, temp_c: float = 20.0,
@@ -4562,6 +4594,7 @@ data:
                                             "" if why is None else "; last refused: " + why), seed))
                 continue
             arrivals = [float(m["t_utc_s"]) for m in group]
+            excess = _point_source_excess_s(group, _p, c)
             events.append({
                 "event_id": len(events),
                 "t0_utc_s": arrivals[0],
@@ -4571,6 +4604,8 @@ data:
                 "n_nodes": len(group),
                 "n_equations": len(group) - 1,      # t0 cancels in TDoA
                 "span_s": arrivals[-1] - arrivals[0],
+                "point_source_possible": excess <= 0.0,
+                "worst_pair_excess_s": excess,
             })
     
         return {
@@ -4586,6 +4621,7 @@ data:
             "reporting_nodes": reporting_nodes,
             "scan_seeds": scan_seeds,
             "scan_candidate_visits": scan_visits,
+            "events_point_source_possible": sum(1 for e in events if e["point_source_possible"]),
         }
     
   hear_backend_pipeline.py: |
@@ -8990,6 +9026,13 @@ data:
             "associate": {
                 "n_events": len(grouped["events"]), "n_rejected": len(grouped["rejected"]),
                 "n_duplicates": len(grouped["duplicates"]),
+                # ⚠️HOW MANY OF n_events COULD BE A POINT SOURCE AT ALL. associate() admits on
+                # d/c + MARGIN_S; this counts against d/c with NO margin. Measured on the live pool
+                # 2026-09-11: 1 of 4, the other three 2.81 m, 7.51 m and 9.01 m past any bound the
+                # array has. A run that solves an impossible group has not found a source.
+                "n_point_source_possible": grouped["events_point_source_possible"],
+                "worst_pair_excess_ms": sorted(
+                    round(e["worst_pair_excess_s"] * 1e3, 3) for e in grouped["events"]),
                 "by_reason": {r: sum(1 for x in grouped["rejected"] if x["reason"] == r)
                               for r in sorted(AS.REASONS)},
             },
