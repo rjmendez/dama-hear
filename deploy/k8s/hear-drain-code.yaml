@@ -1,5 +1,5 @@
-# kubectl apply -f deploy/k8s/hear-drain-code.yaml
-# apply-mode client: 253559 B serialised against a 262144 B last-applied-configuration cap.
+# kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
+# apply-mode server: 255532 B serialised; 255710 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: '838c4da'
+    dama-hear/commit: 'f9f6b8f'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
-    dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '253559'
+    dama-hear/apply-mode: server
+    dama-hear/serialised-bytes: '255532'
 data:
   hear__init__.py: |
     
@@ -829,6 +829,28 @@ data:
                             % (list(h), ", ".join(g.name for g in GENERATIONS)))
     
     
+    def stated_sigma_ns(cell: Any) -> Optional[float]:
+        """A G6 `sync_sigma_ns` cell as a positive number of nanoseconds, or None for "not stated".
+    
+        ⚠️A LITERAL "0" IS NOT STATED, AND THE TRUTHINESS TEST THIS REPLACES MISSED IT. The reader
+        used `if not d.get("sync_sigma_ns")`, and "0" is a non-empty string: a firmware that ever
+        wrote 0 into that column produced the row `nodeclass.stamp_admissible` reads as a PERFECT
+        clock -- sqrt(100 us^2 + 0) = 100 us, inside the 129.4 us per-node bound -- which is the one
+        reading every comment in this module says must be impossible. It was invisible because
+        hear/pool.py, the only consumer, re-checked and compensated.
+    
+        Unparseable is None for the same reason as non-positive: a producer this version does not
+        understand is not one to take a number from.
+        """
+        if cell is None or (isinstance(cell, str) and not cell.strip()):
+            return None
+        try:
+            f = float(cell)
+        except (TypeError, ValueError):
+            return None
+        return f if f > 0.0 else None
+    
+    
     def read_text(text: str, default_node: Optional[str] = None) -> DetsRead:
         """Parse a dets.csv's text. Never returns [] for a file that had no header.
     
@@ -878,8 +900,7 @@ data:
             # G1-G5 never stated it, and an EMPTY G6 cell is the node saying it had no anchor. Both
             # are None -- "not stated" -- and neither is 0. See hear/pool.py's record builder and
             # hear/backend/associate.py, where absent means usable and a number is a claim.
-            if not d.get("sync_sigma_ns"):
-                d["sync_sigma_ns"] = None
+            d["sync_sigma_ns"] = stated_sigma_ns(d.get("sync_sigma_ns"))
             out.rows.append(d)
         return out
     
@@ -1491,21 +1512,20 @@ data:
     
     
     def _sync_sigma_ns(v: Any) -> Optional[float]:
-        """A dets.csv G6 cell -> a stated clock sigma in nanoseconds, or None for "not stated".
+        """A stated clock sigma in nanoseconds, or None for "not stated".
     
         ⚠️NON-POSITIVE IS NOT STATED. The firmware writes an EMPTY cell for a row it could not stamp,
         but a 0 that reached here from any source must not become a claim of a perfect clock --
         hear/nodeclass.py refuses `t_sigma_s <= 0` at construction for exactly that reason, and this
-        value is fed to the same budget. Unparseable is None for the same reason: a producer this
-        version does not understand is not one to take a number from.
+        value is fed to the same budget.
+    
+        ⚠️ONE COPY OF THE RULE, IN `hear.detsfile`. This used to be a second implementation, and the
+        reader's own version had a hole -- it tested truthiness, so the string "0" survived it. The
+        duplicate is what hid that: this function compensated, so the suite stayed green while the
+        reader's docstring and the reader's behaviour disagreed. This path is still needed because it
+        also normalises MQTT payload values, which never pass through the CSV reader.
         """
-        if v in (None, ""):
-            return None
-        try:
-            f = float(v)
-        except (TypeError, ValueError):
-            return None
-        return f if f > 0.0 else None
+        return DF.stated_sigma_ns(v)
     
     
     def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
