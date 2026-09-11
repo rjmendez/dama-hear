@@ -95,10 +95,48 @@ rejected: it would move timestamps already in a shipped pipeline.
 **What it costs at the gate.** `hear/nodeclass.py` combines a stated sigma with the class's own
 figure in RSS -- `sqrt(100**2 + sigma**2) <= 129.4 us` -- so a `xiao-s3-pps` may state at most
 **82.1 us**. Minus the 25 us base, at 20 ppm, that is an anchor age of **2.86 s**. A healthy node
-stamps at an anchor age of 0.57-0.66 s (`time.since_edge_us`, all three nodes, 2026-09-10), so it
-passes with room; mach's 1016 s and 1317 s NAV-PVT-silent windows do not, and are refused **as
-arrivals** within seconds of the link going quiet. The rows are still ingested -- they are real
-acoustic events for classification and scene -- they just stop being arrival times.
+stamps at an anchor age of 0.57-0.66 s (`time.since_edge_us`, all three nodes, 2026-09-10), so the
+MEDIAN passes with room; mach's 1016 s and 1317 s NAV-PVT-silent windows do not, and are refused
+**as arrivals** within seconds of the link going quiet. The rows are still ingested -- they are
+real acoustic events for classification and scene -- they just stop being arrival times.
+
+⚠️**THE MEDIAN IS NOT THE COST -- THE TAIL IS, AND IT DARKS THE WHOLE ARRAY.** `survey.json`
+names three nodes and no `class` for any of them, so all three fall back to this one class and
+`arrival_ids()` is exactly `[nyquist, mach, rankine]`; with `min_nodes` also 3, ONE node over the
+2.86 s cutoff is zero events, with no redundant node to fall back on. Measured twice, independently,
+by polling live `GET /status` (`time.since_edge_us`, `time.sync_sigma_ns`, evaluated through the
+real `hear.nodeclass` gate, not re-derived) rather than reading `health.csv`'s `ubx_silent_max`
+-- that column is a boot-cumulative HIGH-WATER MARK (`hear_node.ino:313-315`, "longest run this
+boot -- reporting only"), so it bounds the worst single stretch a boot has seen but cannot give a
+wall-time fraction:
+
+| poll | span | rankine max | nyquist max | mach max | array-dark |
+|---|---|---|---|---|---|
+| 2026-09-10 ~23:47 (prior audit) | 929 s | 23.945 s | 54.393 s | 23.803 s | 3.75% (continuous union, 5 episodes, longest 20 s) |
+| 2026-09-10/11 (this pass) | 1198 s | 63.778 s | 68.651 s | 28.926 s | 11.3% (18 of 159 samples, ~3-8 s apart, where all three nodes answered) |
+
+array-dark = the fraction of the poll where at least one arrival-eligible node's stated stamp
+sigma exceeded the cutoff at that instant -- enough, at `min_nodes=3` with exactly three eligible
+nodes, to hold the whole array. The two passes disagree on the SIZE of the tail by about 3x and on
+WHICH node has the worst excursion (mach in the first, rankine and nyquist in the second) -- which
+is itself the finding: this is not "mach is the flaky one", it is that any of the three can carry
+a multi-second (20-70 s observed) anchor-age excursion, night to night, and zero redundancy means
+the array goes dark every time one does. ⚠️Neither percentage should be read as THE rate: both are
+short, few-episode samples, and this pass's own discrete ~3 s polling interval both risks missing
+an episode shorter than the gap between samples and risks a coarse tick over-counting one that
+straddles it -- the 130 polls (of 289) where at least one node failed to answer `GET /status` at
+all in this pass were excluded from the denominator rather than counted as dark, since a timed-out
+poll is a property of the node's one-client-at-a-time HTTP server (see `tools/fleet.py`'s
+`RETRY_BACKOFF_S`), not of the stamp gate.
+
+This is the repo's own "threshold from envelope, not median" rule applied in reverse: the CUTOFF
+(2.86 s) came from the envelope (20 ppm STAMP_DRIFT_PPM_MAX), correctly, but the ACCEPTANCE
+ARGUMENT ("passes with room") came from the median alone. Two honest paths from here, and this
+pass takes neither: accept the measured loss as the price of refusing a genuinely stale stamp, or
+stop spending the declared `sync_sigma_ns` entirely on a boolean pass/fail and feed it into the
+solver's per-arrival weighting instead -- nothing downstream currently reads `stamp_t_sigma_s()`
+as anything but a gate (see that method's own docstring). That is an architecture decision for the
+operator to take on this evidence, not a threshold for a fix to retune.
 
 ## Why `fs_clean` is not a clock measurement
 
