@@ -67,7 +67,11 @@ CONFIRM_404 = 2
 #: ⚠️EVERY SHIPPED SHAPE. The oldest firmware wrote `<node>-<8 hex boot>-<sample>.wav`, the
 #: priority-eviction firmware prepended `%02u-`, and the FIFO firmware writes a 12 hex boot
 #: (6 hex boot sequence + 6 random). Older names stay on a card until they are evicted.
-_NAME_RE = re.compile(r"^(?:(\d{2})-)?([A-Za-z0-9_]+)-([0-9a-fA-F]+)-(\d+)\.wav$")
+#: A node id may contain dashes: gen_secrets.py allows them and a build without NODE_ID names
+#: itself `hear-<mac tail>` (rankine's 30 `hear-5c4c94` clips were refused as bad_name).
+_NODE = r"[A-Za-z0-9_][A-Za-z0-9_-]*"
+_FIFO_RE = re.compile(r"^(%s)-([0-9a-f]{12})-(\d{10})\.wav$" % _NODE)
+_NAME_RE = re.compile(r"^(?:(\d{2})-)?(%s)-([0-9a-fA-F]+)-(\d+)\.wav$" % _NODE)
 _MAX_BASENAME = 64
 
 
@@ -94,10 +98,14 @@ def parse_clip_name(name: str) -> Dict[str, Any]:
     if len(basename) > _MAX_BASENAME:
         raise ValueError("clip basename is %d chars, over the %d cap" % (len(basename),
                                                                         _MAX_BASENAME))
-    m = _NAME_RE.match(basename)
-    if not m:
-        raise ValueError("clip basename %r is not <prio->?<node>-<boot>-<sample>.wav" % basename)
-    prio, node, boot, sample = m.groups()
+    m = _FIFO_RE.match(basename)
+    if m:
+        prio, (node, boot, sample) = None, m.groups()
+    else:
+        m = _NAME_RE.match(basename)
+        if not m:
+            raise ValueError("clip basename %r is not <prio->?<node>-<boot>-<sample>.wav" % basename)
+        prio, node, boot, sample = m.groups()
     return {"raw": raw, "basename": basename, "node": node, "boot": boot,
             "sample": int(sample), "prio": None if prio is None else int(prio)}
 
