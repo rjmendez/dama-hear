@@ -1,6 +1,6 @@
 """The BirdNET V2.4 lane: registry, the site from the environment only, the week, the species
-claim, the range filter recorded on each row, 48 kHz in untouched, pinned files, and the
-manifest. LiteRT is never imported here."""
+claim, the range filter recorded on each row, 48 kHz passed through untouched, pinned files, and
+the manifest. LiteRT is never imported here."""
 import calendar
 import hashlib
 import os
@@ -32,7 +32,7 @@ class StubBird:
                 "max_unstored_score": 0.005, "n_classes_scored": 154, "n_passes": 3,
                 "embedding": None, "embedding_dim": None,
                 "extra": {"location_filter": {"lat": 40.3, "lon": -76.1, "week": week,
-                                              "threshold": 0.03, "species_kept": 154},
+                                              "threshold": 0.03, "classes_kept": 154},
                           "max_out_of_range_score": 0.4}}
 
 
@@ -113,6 +113,7 @@ class TestTheWeekAndTheGroup:
 
     def test_the_group_is_the_common_name_or_below_the_report_score(self):
         assert HT.birdnet_group({"Cyanocitta cristata_Blue Jay": 0.7, "Dog_Dog": 0.1}) == "Blue Jay"
+        assert HT.birdnet_group({"Dog_Dog": 0.9, "Cyanocitta cristata_Blue Jay": 0.1}) == "Dog"
         assert HT.birdnet_group({"Cyanocitta cristata_Blue Jay": 0.2}) == "below 0.5"
         assert HT.birdnet_group({}) == "none"
 
@@ -172,6 +173,10 @@ class TestTheBirdnetManifest:
         assert c["image"] == "python:3.13-slim"
         assert re.search(r"ai-edge-litert==\d", c["args"][0])
         assert "--lane birdnet_v24" in c["args"][0]
+
+    def test_the_check_never_reads_the_dir_the_job_installs_into(self, bdocs):
+        script = _container(bdocs[1])["args"][0]
+        assert "/pool/pylib-birdnet" not in script and "PYTHONPATH=/pool/pylib-tag:/app" in script
 
     def test_every_bundle_key_is_mounted(self, bdocs):
         keys = {k for k, _rel in GC.BUNDLES["hear-tag-code"][1]}
