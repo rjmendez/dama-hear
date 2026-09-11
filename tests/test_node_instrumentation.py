@@ -38,7 +38,18 @@ def test_the_join_ranks_configured_networks_by_what_the_scan_heard():
     b = _body(_code(NET), "int hear_net_join(")
     assert "WiFi.scanNetworks(" in b and "WiFi.scanDelete()" in b
     assert re.search(r"best\[order\[b\]\]\s*>\s*best\[order\[b\s*-\s*1\]\]", b), "not sorted strongest first"
-    assert "WiFi.begin(p->ssid[k], p->psk[k], ch[k], bs[k])" in b, "the strongest access point is not pinned"
+
+
+def test_within_a_network_the_driver_takes_the_strongest_access_point_and_nothing_is_pinned():
+    """The default WIFI_FAST_SCAN joins the first matching access point heard, and sort-by-signal
+    only applies to an all-channel scan. A BSSID pin would do the join's job once and then strand
+    the node on that one access point for every automatic reconnect."""
+    b = _body(_code(NET), "int hear_net_join(")
+    assert "WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN)" in b
+    assert "WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL)" in b
+    assert b.index("setScanMethod") < b.index("WiFi.begin(")
+    for m in re.finditer(r"WiFi\.begin\(([^;]*)\);", b):
+        assert m.group(1).replace(" ", "") == "p->ssid[k],p->psk[k]", "WiFi.begin is pinned: %s" % m.group(0)
 
 
 def test_failed_attempts_during_the_join_are_not_counted_as_drops():

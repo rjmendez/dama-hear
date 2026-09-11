@@ -2728,8 +2728,8 @@ void setup() {
        prov_src, prov_nvs ? ", in NVS" : "");
   logf("boot  reset reason %s\n", reset_reason_name());
 
-  // Strongest configured network first, pinned to the strongest access point heard for it. An
-  // outdoor node may reach several, and the first to answer is not the one it hears best.
+  // Strongest configured network first, and the strongest access point within it. An outdoor node
+  // may reach several, and the first to answer is not the one it hears best.
   hear_net_watch();
   int joined_idx = prov.n > 0 ? hear_net_join(&prov, 12000, &net_join) : 0;
   sta_ok = joined_idx > 0;

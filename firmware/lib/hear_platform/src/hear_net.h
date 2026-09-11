@@ -12,8 +12,10 @@ typedef struct {
   uint32_t join_ms;     // scan + association + DHCP
 } hear_net_join_t;
 
-// Scan, then try the configured networks strongest first, each pinned to the strongest access
-// point heard for it. Networks the scan missed are tried last, unpinned. Returns `joined`.
+// Scan to rank the configured networks, then try them strongest first; networks the scan missed
+// go last. Within a network the driver takes the strongest access point (all-channel scan, sorted
+// by signal) on this join and on every automatic reconnect -- nothing is pinned, so losing one
+// access point cannot strand the node on it. Returns `joined`.
 int hear_net_join(const hear_prov_t *p, uint32_t per_try_ms, hear_net_join_t *out);
 
 // Counts link events from the Wi-Fi event task. Call once before hear_net_join(); the counters
