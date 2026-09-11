@@ -30,8 +30,8 @@ buffer. Checked against the original AugmentMelSTFT on real-shaped audio at ever
 max abs error 8.4e-05, and the export ABORTS if it exceeds 2e-3.
 
 ⚠️torch.stft IS REPLACED BY A DFT conv1d. Not an optimisation: torch.onnx refuses to export
-Unfold when the time axis is dynamic, and the clip length is exactly what is dynamic -- clips are
-4.0 s at 16 kHz and 5.0 s at 48 kHz. The conv1d form is the same arithmetic on any opset.
+Unfold when the time axis is dynamic, and the clip length is exactly what is dynamic. The conv1d
+form is the same arithmetic on any opset.
 
 ⚠️THE `pretrained_name` LOOKUP PULLS FROM UPSTREAM'S RELEASE. Point it at a local copy and hash it
 first if you care which of the eleven assets called `mn10_as` you got: they differ only in mel
@@ -50,15 +50,21 @@ import torchaudio
 #: than vendored into this repo: it is MIT but it is 40-odd files of training code, and copying it
 #: here would make the next upstream fix a merge instead of a `git pull`.
 #:
-#:     git clone --depth 1 -b v0.0.1 https://github.com/fschmid56/EfficientAT
+#: The v0.0.1 TAG predates models/mn/; only its release asset (the .pt) is pinned. The code is
+#: this commit of main, which reproduced the pinned .onnx digest on 2026-09-11:
+#:
+#:     git clone https://github.com/fschmid56/EfficientAT
+#:     git -C EfficientAT checkout a425fdce92572e602a1d5634799bd9f1f2efa806
 #:     EFFICIENTAT=./EfficientAT python tools/export_mn10_onnx.py --out mn10_as.onnx
+EFFICIENTAT_COMMIT = "a425fdce92572e602a1d5634799bd9f1f2efa806"
 EFFICIENTAT = os.environ.get("EFFICIENTAT", "./EfficientAT")
 if not os.path.isdir(os.path.join(EFFICIENTAT, "models", "mn")):
     raise SystemExit(
         "no EfficientAT checkout at %r. Clone it and point EFFICIENTAT at it:\n"
-        "  git clone --depth 1 -b v0.0.1 https://github.com/fschmid56/EfficientAT\n"
+        "  git clone https://github.com/fschmid56/EfficientAT\n"
+        "  git -C EfficientAT checkout %s\n"
         "  EFFICIENTAT=./EfficientAT python tools/export_mn10_onnx.py --out mn10_as.onnx"
-        % EFFICIENTAT)
+        % (EFFICIENTAT, EFFICIENTAT_COMMIT))
 sys.path.insert(0, os.path.abspath(EFFICIENTAT))
 
 from models.mn.model import get_model as get_mobilenet          # noqa: E402

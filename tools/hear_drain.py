@@ -114,6 +114,7 @@ sys.path.insert(0, __file__.rsplit("/tools/", 1)[0])
 from hear import clips as CL                                        # noqa: E402
 from hear import detsfile as DF                                     # noqa: E402
 from hear import pool as P                                          # noqa: E402
+from hear import identity as ID                                     # noqa: E402
 
 # The card files worth pulling every run. `dets.csv` and its rolled predecessor carry the
 # sketches; `health.csv` carries the PPS/fs context a later reader needs to judge them and is
@@ -908,6 +909,13 @@ def drain_clips(pl: "P.Pool", node: str, ip: str, candidates: List[Dict[str, Any
             refuse("bad_name")
             emit(clip=cand["clip"], parts=None, body=None, probe=None, dets=cand, path=None,
                  outcome="refused_name", reason=cand["bad_name"])
+            continue
+        named = parts["node"]
+        if named != node and ID.alias_of(named) != node:
+            refuse("node_mismatch")
+            emit(clip=cand["clip"], parts=parts, body=None, probe=None, dets=cand, path=None,
+                 outcome="refused_node",
+                 reason="clip name says node %r, fetched from %r" % (named, node))
             continue
         # The cap is tested BEFORE the request is spent, so `deferred_by_cap` means "still on the
         # card, not asked for", never "asked for and lost".
