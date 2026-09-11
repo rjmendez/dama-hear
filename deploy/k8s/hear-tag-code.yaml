@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-tag-code.yaml
-# apply-mode client: 153698 B serialised; 153876 B of annotations against a 262144 B cap.
+# apply-mode client: 165726 B serialised; 165904 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tag
   annotations:
-    dama-hear/commit: 'fd0db86'
+    dama-hear/commit: '8221466'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '153698'
+    dama-hear/serialised-bytes: '165726'
 data:
   hear__init__.py: |
     
@@ -1517,6 +1517,8 @@ data:
         "mn10": {"model": "mn10", "store": None, "variant": None, "pad_to_s": None},
         "mn10_pad10": {"model": "mn10", "store": "mn10_pad10", "variant": "pad10", "pad_to_s": 10.0},
         "perch_v2": {"model": "perch_v2", "store": "perch_v2", "variant": None, "pad_to_s": None},
+        "birdnet_v24": {"model": "birdnet_v24", "store": "birdnet_v24", "variant": None,
+                        "pad_to_s": None},
     }
     DEFAULT_LANE = "mn10"
     
@@ -1544,6 +1546,31 @@ data:
     PERCH_WINDOW = 160000
     #: perch_hoplite.zoo.taxonomy_model_tf peak-normalises every window to this before inference.
     PERCH_TARGET_PEAK = 0.25
+    
+    #: BirdNET V2.4, the species tier. ⚠️ITS WEIGHTS ARE CC BY-NC-SA 4.0: staged on the PVC for this
+    #: site's own non-commercial use, never committed to this repo and never shipped in the APK.
+    BIRDNET_NAME = "birdnet_v24"
+    BIRDNET_VERSION = "zenodo-15050749-fp32"
+    BIRDNET_ARCHIVE_URL = "https://zenodo.org/records/15050749/files/BirdNET_v2.4_tflite.zip"
+    BIRDNET_ARCHIVE_SHA256 = "31377e128d86fe7b65fa91b206b8804bad1cd934e624bbe6e7c1788170c95e57"
+    BIRDNET_FILES: Tuple[Tuple[str, str, int], ...] = (
+        ("audio-model.tflite",
+         "55f3e4055b1a13bfa9a2452731d0d34f6a02d6b775a334362665892794165e4c", 51726412),
+        ("meta-model.tflite",
+         "33aea6d21cc887d2414e9596d2531a480a3e5f4770c22aa257f217fb757d4653", 29526096),
+        ("labels/en_us.txt", "b50b77b7c3dfe40cd637e8cccdca0173a0a4ddee8867b830ff3c1a566f477f16", 259740),
+    )
+    BIRDNET_CLASSES = 6522
+    BIRDNET_FS_HZ = 48000
+    #: 3.0 s, the model's input. Windows at 0, 1 and 2 s cover the whole 5.0 s clip.
+    BIRDNET_WINDOW = 144000
+    BIRDNET_HOP = 48000
+    #: BirdNET-Analyzer's default cut on the range model's output.
+    BIRDNET_LOCATION_THRESHOLD = 0.03
+    #: A species enters the heard summary at this score. OBSERVATION only.
+    BIRDNET_REPORT = 0.5
+    #: "lat,lon". From a Secret, never from this public repo.
+    SITE_ENV = "HEAR_SITE_LATLON"
     
     #: FS_ACQ / FS_NOMINAL. The clip-writer bug stamped the nominal rate over acquisition-rate audio.
     HEADER_RATE_FACTOR = 3
@@ -1787,13 +1814,25 @@ data:
         return normalise_peak(fit_length(pcm, PERCH_WINDOW), PERCH_TARGET_PEAK)
     
     
-    def to_model_rate(pcm: "Any", header_fs: int, csv_fs: Optional[float] = None) -> Dict[str, Any]:
+    def prepare_birdnet(pcm: "Any", fs_hz: float, pad_to_s: Optional[float] = None) -> "Any":
+        """The recording as it is. BirdNET measured level-invariant on the 69 heard clips (raw and
+        peak-normalised gave identical scores), so nothing is scaled; digital silence is still
+        refused."""
+        import numpy as np
+        x = np.asarray(pcm, dtype=np.float32)
+        if not len(x) or not np.any(x):
+            raise ValueError("digital silence: every sample is zero")
+        return x
+    
+    
+    def to_model_rate(pcm: "Any", header_fs: int, csv_fs: Optional[float] = None,
+                      fs_out: float = MODEL_FS_HZ) -> Dict[str, Any]:
         """Resample a clip to the model's rate, or refuse it. -> hear.resample.resample()'s dict.
     
         The header is authoritative, not the CSV: the CSV value rides beside it on the row.
         """
         try:
-            return RESAMPLE.resample(pcm, float(header_fs), float(MODEL_FS_HZ))
+            return RESAMPLE.resample(pcm, float(header_fs), float(fs_out))
         except RESAMPLE.RateRefused as e:
             raise RateRefused("%s The dets CSV said %s Hz." % (e, csv_fs))
     
@@ -1987,15 +2026,25 @@ data:
     
     
     def verify_perch(model_dir: str) -> Dict[str, Any]:
-        """Every pinned SavedModel file present, right size, right sha256. Never raises."""
+        return verify_pinned(model_dir, PERCH_FILES, PERCH_ARCHIVE_URL, PERCH_ARCHIVE_SHA256)
+    
+    
+    def verify_birdnet(model_dir: str) -> Dict[str, Any]:
+        return verify_pinned(model_dir, BIRDNET_FILES, BIRDNET_ARCHIVE_URL, BIRDNET_ARCHIVE_SHA256)
+    
+    
+    def verify_pinned(model_dir: str, files: Tuple[Tuple[str, str, int], ...], archive_url: str,
+                      archive_sha256: str) -> Dict[str, Any]:
+        """Every pinned file present, right size, right sha256. Never raises. The model's identity
+        (`model_sha256`) is the digest over the pinned list, set only when all of it verified."""
         d = os.path.expanduser(model_dir)
         out: Dict[str, Any] = {"ok": False, "problems": [], "files": {}, "model_sha256": None,
                                "model_bytes": 0}
-        for rel, want_sha, want_n in PERCH_FILES:
+        for rel, want_sha, want_n in files:
             p = os.path.join(d, rel)
             if not os.path.exists(p):
                 out["problems"].append("%s is absent. Stage the archive from %s (sha256 %s)"
-                                       % (p, PERCH_ARCHIVE_URL, PERCH_ARCHIVE_SHA256))
+                                       % (p, archive_url, archive_sha256))
                 continue
             try:
                 n = os.path.getsize(p)
@@ -2013,7 +2062,7 @@ data:
         out["ok"] = not out["problems"]
         if out["ok"]:
             h = hashlib.sha256()
-            for rel, sha, _n in PERCH_FILES:
+            for rel, sha, _n in files:
                 h.update(("%s  %s\n" % (sha, rel)).encode())
             out["model_sha256"] = h.hexdigest()
         return out
@@ -2053,6 +2102,151 @@ data:
         }
     
     
+    def site_latlon() -> Tuple[float, float]:
+        """(lat, lon) from SITE_ENV, rounded to 0.1 deg, which is all a range model needs."""
+        raw = os.environ.get(SITE_ENV, "")
+        try:
+            lat, lon = (float(v) for v in raw.split(","))
+        except ValueError:
+            raise WeightsRefused("%s is %r. BirdNET needs 'lat,lon' for its range filter; without one "
+                                 "it names birds from other continents" % (SITE_ENV, raw))
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            raise WeightsRefused("%s=%r is not a latitude,longitude" % (SITE_ENV, raw))
+        return round(lat, 1), round(lon, 1)
+    
+    
+    def birdnet_week(ts_utc_s: Optional[float]) -> int:
+        """BirdNET's 48-week year: four per month, days 1-7 -> 1 ... 22-31 -> 4. -1 is any week."""
+        if ts_utc_s is None:
+            return -1
+        t = time.gmtime(float(ts_utc_s))
+        return (t.tm_mon - 1) * 4 + min(4, (t.tm_mday - 1) // 7 + 1)
+    
+    
+    def birdnet_group(scores: Dict[str, float]) -> str:
+        """The top class's common name once it reaches BIRDNET_REPORT, else "below 0.5". The class is
+        a species or one of BirdNET's non-species classes (Dog, Engine, ...), which the range filter
+        never removes; both are what the clip was heard as."""
+        if not scores:
+            return "none"
+        top = max(scores, key=scores.get)
+        return top.split("_")[-1] if scores[top] >= BIRDNET_REPORT else "below %g" % BIRDNET_REPORT
+    
+    
+    class BirdNETTagger:
+        """BirdNET V2.4 under LiteRT on the CPU, with its range model applied per clip week.
+    
+        ⚠️THE RANGE FILTER IS NOT OPTIONAL. The first run without it put Eurasian Magpie, Indian
+        Scops-Owl and Spotted Crake at the top of Pennsylvania clips. The site comes from SITE_ENV and
+        the tagger refuses to load without it; a clip with no UTC anchor is filtered for any week.
+        Non-species classes ("Dog_Dog", "Engine_Engine", ...) are not ranged and always kept.
+        """
+    
+        wants_time = True
+    
+        def __init__(self, model_dir: str):
+            import numpy as np
+            from ai_edge_litert.interpreter import Interpreter           # lazy: absent in tests
+            d = os.path.expanduser(model_dir)
+            self.lat, self.lon = site_latlon()
+            with open(os.path.join(d, "labels/en_us.txt"), encoding="utf-8") as fh:
+                self.labels = [l.strip() for l in fh if l.strip()]
+            if len(self.labels) != BIRDNET_CLASSES:
+                raise WeightsRefused("labels/en_us.txt holds %d names, expected %d"
+                                     % (len(self.labels), BIRDNET_CLASSES))
+            self._a = Interpreter(model_path=os.path.join(d, "audio-model.tflite"), num_threads=1)
+            self._a.allocate_tensors()
+            self._ai, self._ao = self._a.get_input_details()[0], self._a.get_output_details()[0]
+            self._m = Interpreter(model_path=os.path.join(d, "meta-model.tflite"), num_threads=1)
+            self._m.allocate_tensors()
+            self._mi, self._mo = self._m.get_input_details()[0], self._m.get_output_details()[0]
+            for what, got, want in (("audio input", self._ai["shape"], [1, BIRDNET_WINDOW]),
+                                    ("audio output", self._ao["shape"], [1, BIRDNET_CLASSES]),
+                                    ("range input", self._mi["shape"], [1, 3]),
+                                    ("range output", self._mo["shape"], [1, BIRDNET_CLASSES])):
+                if [int(v) for v in got] != want:
+                    raise WeightsRefused("BirdNET %s is %s, expected %s" % (what, list(got), want))
+            self._always = np.array([l.split("_")[0] == l.split("_")[-1] for l in self.labels])
+            self._np, self._keep = np, {}
+    
+        def _in_range(self, week: int) -> "Any":
+            if week not in self._keep:
+                np = self._np
+                self._m.set_tensor(self._mi["index"],
+                                   np.array([[self.lat, self.lon, week]], dtype=np.float32))
+                self._m.invoke()
+                loc = self._m.get_tensor(self._mo["index"])[0]
+                self._keep[week] = (loc >= BIRDNET_LOCATION_THRESHOLD) | self._always
+            return self._keep[week]
+    
+        def tag(self, pcm: "Any", floor: float = SCORE_FLOOR, week: int = -1) -> Dict[str, Any]:
+            np = self._np
+            x = np.asarray(pcm, dtype=np.float32)
+            starts = list(range(0, max(1, len(x) - BIRDNET_WINDOW + 1), BIRDNET_HOP)) or [0]
+            probs = []
+            for s in starts:
+                w = fit_length(x[s:s + BIRDNET_WINDOW], BIRDNET_WINDOW)
+                self._a.set_tensor(self._ai["index"], w[None, :])
+                self._a.invoke()
+                z = self._a.get_tensor(self._ao["index"])[0].astype(np.float64)
+                probs.append(1.0 / (1.0 + np.exp(-np.clip(z, -15.0, 15.0))))
+            p = np.max(probs, axis=0)
+            keep = self._in_range(week)
+            scores = {self.labels[i]: float(p[i]) for i in np.flatnonzero(keep) if p[i] >= floor}
+            below = p[keep & (p < floor)]
+            return {"scores": scores,
+                    "max_unstored_score": float(below.max()) if below.size else 0.0,
+                    "n_classes_scored": int(keep.sum()), "n_passes": len(starts),
+                    "embedding": None, "embedding_dim": None,
+                    "extra": {"location_filter": {"lat": self.lat, "lon": self.lon, "week": week,
+                                                  "threshold": BIRDNET_LOCATION_THRESHOLD,
+                                                  "classes_kept": int(keep.sum())},
+                              "max_out_of_range_score": float(p[~keep].max()) if (~keep).any()
+                              else 0.0}}
+    
+    
+    def birdnet_block(verified: Dict[str, Any]) -> Dict[str, Any]:
+        return {"name": BIRDNET_NAME, "version": BIRDNET_VERSION, "file": "audio-model.tflite",
+                "sha256": verified.get("model_sha256"), "archive_sha256": BIRDNET_ARCHIVE_SHA256,
+                "runtime": "ai-edge-litert", "input_fs_hz": BIRDNET_FS_HZ,
+                "window_samples": BIRDNET_WINDOW, "hop_samples": BIRDNET_HOP,
+                "n_classes": BIRDNET_CLASSES, "location_threshold": BIRDNET_LOCATION_THRESHOLD,
+                "score_floor": SCORE_FLOOR, "licence": "CC BY-NC-SA 4.0",
+                "card": "tag_model_card-birdnet_v24.json"}
+    
+    
+    def birdnet_card(verified: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "model_name": BIRDNET_NAME,
+            "model_version": BIRDNET_VERSION,
+            "model_sha256": verified.get("model_sha256"),
+            "model_bytes": verified.get("model_bytes"),
+            "files": verified.get("files"),
+            "archive_url": BIRDNET_ARCHIVE_URL,
+            "archive_sha256": BIRDNET_ARCHIVE_SHA256,
+            "licence": ("CC BY-NC-SA 4.0 (the weights). Run server-side for this site's own "
+                        "non-commercial use; never committed to the repo, never shipped in the APK."),
+            "decision": ("docs/acoustic-stack.md S6.3 refused BirdNET's weights on licence and took "
+                         "its answers through puc's BirdWeather feed instead. The operator asked for "
+                         "it to run beside EfficientAT and Perch on 2026-09-11, with the weights kept "
+                         "off every distributed artifact."),
+            "what_a_score_is": (
+                "the per-class sigmoid of BirdNET V2.4's logits (clipped to +-15), maximised over "
+                "three 3.0 s windows at 0, 1 and 2 s of the 48 kHz clip. Only classes the range model "
+                "keeps for the site and the clip's week (threshold %g) are stored; the largest score "
+                "it removed is `max_out_of_range_score`. It is a species HYPOTHESIS, not confirmed by "
+                "any human." % BIRDNET_LOCATION_THRESHOLD),
+            "measured": (
+                "on the 69 human-heard clips (evenings, insects and dogs): no bird at >= 0.25 with "
+                "the range filter on; Dog >= 0.25 on 8 of 15 dog clips. Without the filter it ranked "
+                "Eurasian Magpie, Indian Scops-Owl and Spotted Crake first. Raw and peak-normalised "
+                "input gave identical scores."),
+            "provenance": "model",
+            "human_verified": False,
+            "usable_as_training_label": False,
+        }
+    
+    
     def load_class_map(path: str) -> List[str]:
         """index,mid,display_name -> the display names, in index order."""
         names: List[str] = []
@@ -2084,13 +2278,15 @@ data:
                 "card": "tag_model_card.json"}
     
     
-    def claim_block() -> Dict[str, bool]:
+    def claim_block(species: bool = False) -> Dict[str, bool]:
         """The five things a reader must not miss, as booleans, on every row.
     
         A field named `scores` next to a field named `node` will be read as "what was heard". Each of
         these says what it is not, in a form a query can filter on rather than prose in a card.
+        `species` is True for a model whose classes are species (BirdNET): a hypothesis, still not
+        human-verified.
         """
-        return {"is_species_id": False,
+        return {"is_species_id": bool(species),
                 "human_verified": False,
                 "calibrated_to_this_site": False,
                 "trained_on_this_corpus": False,
@@ -2182,10 +2378,16 @@ data:
     MODELS: Dict[str, Dict[str, Any]] = {
         "mn10": {"verify": verify_weights, "load": lambda d: Tagger(*weights_paths(d)),
                  "block": model_block, "card": model_card, "card_file": "tag_model_card.json",
-                 "prepare": prepare_rms, "embed_only": False},
+                 "prepare": prepare_rms, "embed_only": False, "fs_hz": MODEL_FS_HZ,
+                 "group": coarse, "species": False},
         "perch_v2": {"verify": verify_perch, "load": PerchEmbedder, "block": perch_block,
                      "card": perch_card, "card_file": "tag_model_card-perch_v2.json",
-                     "prepare": prepare_perch, "embed_only": True},
+                     "prepare": prepare_perch, "embed_only": True, "fs_hz": MODEL_FS_HZ,
+                     "group": None, "species": False},
+        "birdnet_v24": {"verify": verify_birdnet, "load": BirdNETTagger, "block": birdnet_block,
+                        "card": birdnet_card, "card_file": "tag_model_card-birdnet_v24.json",
+                        "prepare": prepare_birdnet, "embed_only": False, "fs_hz": BIRDNET_FS_HZ,
+                        "group": birdnet_group, "species": True},
     }
     
     
@@ -2276,7 +2478,8 @@ data:
     
     
     def tally(t: Dict[str, Any], node: str, day: str, outcome: str,
-              reason: Optional[str] = None, row: Optional[Dict[str, Any]] = None) -> None:
+              reason: Optional[str] = None, row: Optional[Dict[str, Any]] = None,
+              group: Any = coarse) -> None:
         n = t["by_node"].setdefault(node or "?", {"tagged": 0, "refused": 0, "already_tagged": 0,
                                                   "deferred": 0, "silence_top": 0})
         if outcome == "tagged":
@@ -2292,9 +2495,9 @@ data:
                     n["silence_top"] += 1
                 if top is not None:
                     t["top_scores"].append(float(scores[top]))
-                if row.get("scores") is not None:
+                if row.get("scores") is not None and group is not None:
                     h = t["heard"].setdefault(node or "?", {})
-                    g = coarse(scores)
+                    g = group(scores)
                     h[g] = h.get(g, 0) + 1
                 if row.get("pre_norm_dbfs") is not None:
                     t["dbfs"].append(float(row["pre_norm_dbfs"]))
@@ -2363,7 +2566,8 @@ data:
                               % (len(pcm), fs_read, dur_s, CLIPS.CLIP_TOTAL_S, CLIPS.CLIP_PRE_S,
                                  CLIPS.CLIP_POST_S)}
         try:
-            rs = to_model_rate(pcm, fs_read, row.get("fs_hz"))
+            rs = to_model_rate(pcm, fs_read, row.get("fs_hz"),
+                               MODELS[LANES[lane]["model"]]["fs_hz"])
         except RateRefused as exc:
             return {"ok": False, "reason": R_RATE_REFUSED, "detail": str(exc)}
         # The level recorded is the RECORDING's, taken before the 48 -> 32 kHz decimation removes the
@@ -2376,7 +2580,9 @@ data:
         except ValueError as exc:
             return {"ok": False, "reason": R_DIGITAL_SILENCE, "detail": str(exc)}
         try:
-            got = tagger.tag(pcm, floor=floor)
+            when = ({"week": birdnet_week(row.get("ts_utc_s") if row.get("anchored") else None)}
+                    if getattr(tagger, "wants_time", False) else {})
+            got = tagger.tag(pcm, floor=floor, **when)
         except Exception as exc:
             return {"ok": False, "reason": R_MODEL_ERROR,
                     "detail": "%s: %s" % (type(exc).__name__, exc)}
@@ -2392,7 +2598,7 @@ data:
             "node": row.get("node"),
             "day": _row_day(row),
             "model": mb,
-            "claim": claim_block(),
+            "claim": claim_block(MODELS[LANES[lane]["model"]]["species"]),
             "scores": got["scores"],
             "max_unstored_score": got["max_unstored_score"],
             "n_classes_scored": got["n_classes_scored"],
@@ -2416,6 +2622,7 @@ data:
             "provenance": "model",
             "created_utc_s": now,
         }
+        out.update(got.get("extra") or {})
         return {"ok": True, "row": out}
     
     
@@ -2489,7 +2696,7 @@ data:
             got = tag_one(tagger, row, root, mb, floor=floor, now=now, lane=lane)
             if got["ok"]:
                 out_rows.append(got["row"])
-                tally(t, node, day, "tagged", row=got["row"])
+                tally(t, node, day, "tagged", row=got["row"], group=model["group"])
             else:
                 tally(t, node, day, "refused", reason=got["reason"])
     

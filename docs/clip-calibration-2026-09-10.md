@@ -190,3 +190,32 @@ table, and the difference is not investigated further.
 Padded, the broken arm scores higher than the healthy one on the full set, so
 `--min-mean-top-score` cannot gate a padded lane. Hence two lanes: `mn10` keeps the whole-clip
 pass and its calibrated floor, and `mn10_pad10` runs beside it with the floor reported, not gated.
+
+---
+
+## 5. Cleaning the input makes it worse; BirdNET needs its range filter (added 2026-09-11)
+
+Input cleaning ahead of `mn10` padded to 10 s, paired against no cleaning, same 69 clips and
+table as §2:
+
+| input | top-1 | top-5 | top-1 on the 28 insect clips |
+|---|---|---|---|
+| as recorded | 30 | 54 | 23 |
+| high-pass, 60→120 Hz ramp | 20 (+2/−12, p=0.013) | 54 | 15 (p=0.008) |
+| spectral gating (20th-percentile noise floor, +6 dB, −12 dB floor) | 21 (p=0.035) | 49 | 13 (p=0.002) |
+| both | 25 | 46 | 13 (p=0.002) |
+
+Stationary noise reduction treats crickets and katydids as noise, and they are this site's most
+common sound. The model was trained on unfiltered audio and reads the background as information.
+No cleaning ships.
+
+BirdNET V2.4 on the same clips, three 3 s windows at 0, 1 and 2 s, per-class maximum:
+
+- With its range filter (0.1° site, week 34: 154 species kept), no bird reached 0.25 on any clip,
+  the one the listener marked `bird` included. Dog reached 0.25 on 8 of 15 dog clips (0.5 on 3),
+  and Engine on 1 of 3 vehicle clips.
+- Without the filter it put Eurasian Magpie, Indian Scops-Owl and Spotted Crake first.
+- Raw and peak-normalised input gave identical scores.
+
+These are evening clips of insects and dogs, so they test BirdNET's false alarms, not its recall
+of birds. That needs daytime clips someone has heard.
