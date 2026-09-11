@@ -115,24 +115,25 @@ def _code_mounts(text):
     "containers" that mount nothing -- and a guard that then required every container to mount
     every key would fail on them, while one that skipped empty ones would stop noticing a
     container whose mounts were dropped wholesale. Both failures are avoided by only ever
-    treating something under a `containers:` key as a container.
+    treating something under a `containers:` key as a container -- and only at the container
+    items' own indent, because `env:` entries inside a container spell `- name:` too.
     """
     out, name = {}, None
-    depth = None
+    depth = item = None
     for line in text.splitlines():
         if not line.strip():
             continue
         indent = len(line) - len(line.lstrip())
         if depth is not None and indent <= depth and not line.lstrip().startswith("-"):
-            depth, name = None, None
+            depth = item = name = None
         if re.match(r"\s*containers:\s*$", line):
-            depth, name = indent, None
+            depth, item, name = indent, None, None
             continue
         if depth is None:
             continue
         m = re.match(r"\s*- name: (\S+)\s*$", line)
-        if m and indent > depth:
-            name = m.group(1)
+        if m and indent > depth and item in (None, indent):
+            item, name = indent, m.group(1)
             out.setdefault(name, set())
             continue
         m = re.search(r"name: code,.*subPath: (\S+?)\s*\}", line)

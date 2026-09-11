@@ -3,9 +3,10 @@
   "units": "m",
   "origin": {
     "lat_deg": 40.292522149999996,
-    "lon_deg": -76.1221604,
+    "lon_deg": -79.1221604,
     "h_ell_m": 0.0,
-    "source": "median of nyquist; height datum is the --heights argument, NOT GNSS (storey = 3.0 m nominal US residential floor-to-floor, NOT measured) (storey = 3.0 m nominal US residential floor-to-floor, NOT measured)"
+    "fictional": true,
+    "source": "FICTIONAL, NOT THE SITE: this repo is public, so the longitude here is deliberately wrong. The real origin comes from the environment at runtime (HEAR_SITE_ORIGIN='lat,lon,h_ell_m'; in the cluster Secret hear-site, key origin) and hear-tdoa refuses to run without it. The e/n/u below are relative to that real origin: median of nyquist; height datum is the --heights argument, NOT GNSS (storey = 3.0 m nominal US residential floor-to-floor, NOT measured)"
   },
   "nodes": [
     {

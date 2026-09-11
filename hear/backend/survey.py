@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -56,6 +58,36 @@ _MAX_NODE_ID = 0xFFFF          # the v2 wire field is uint16; an id that does no
 class SurveyError(ValueError):
     """Every refusal in this module. ValueError subclass so a caller that catches the repo's
     precondition errors catches these too."""
+
+
+class SiteOriginError(SurveyError):
+    """HEAR_SITE_ORIGIN is malformed, or a real origin is required and the survey's is fictional."""
+
+
+SITE_ORIGIN_ENV = "HEAR_SITE_ORIGIN"
+_SITE_FIELD = re.compile(r"-?\d+(?:\.\d+)?")
+_H_ELL_RANGE_M = (-1000.0, 10000.0)
+
+
+def site_origin(environ=None) -> Optional[Dict]:
+    """The origin HEAR_SITE_ORIGIN names as 'lat,lon,h_ell_m', or None when it is unset.
+    Refusals never echo the value: it is the site."""
+    env = os.environ if environ is None else environ
+    if SITE_ORIGIN_ENV not in env:
+        return None
+    fields = [f.strip() for f in env[SITE_ORIGIN_ENV].split(",")]
+    if len(fields) != 3 or not all(_SITE_FIELD.fullmatch(f) for f in fields):
+        raise SiteOriginError("%s must be three plain decimals 'lat,lon,h_ell_m'; got %d field(s)"
+                              % (SITE_ORIGIN_ENV, len(fields)))
+    lat, lon, h = (float(f) for f in fields)
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0) or (lat == 0.0 and lon == 0.0):
+        raise SiteOriginError("%s is not a latitude,longitude on the earth (or is 0,0)"
+                              % SITE_ORIGIN_ENV)
+    if not (_H_ELL_RANGE_M[0] <= h <= _H_ELL_RANGE_M[1]):
+        raise SiteOriginError("%s height is outside %g..%g m above the ellipsoid"
+                              % (SITE_ORIGIN_ENV, _H_ELL_RANGE_M[0], _H_ELL_RANGE_M[1]))
+    return {"lat_deg": lat, "lon_deg": lon, "h_ell_m": h,
+            "source": "environment %s" % SITE_ORIGIN_ENV}
 
 
 def _is_number(v) -> bool:
@@ -179,6 +211,12 @@ class Survey:
         except (KeyError, TypeError, ValueError):
             raise SurveyError("survey origin needs numeric lat_deg, lon_deg and h_ell_m; got %r"
                               % (o,))
+
+    def origin_is_fictional(self) -> bool:
+        """Fails closed: a `fictional` key with any value but an explicit false counts."""
+        if not isinstance(self.origin, dict) or "fictional" not in self.origin:
+            return False
+        return self.origin["fictional"] is not False
 
     def diameter_m(self) -> float:
         """Largest pairwise 3D distance, metres. 3D and not horizontal because it bounds
@@ -351,7 +389,21 @@ def from_wgs84_nodes(entries: Sequence[Dict], origin: Optional[Dict] = None,
                      min_nodes=min_nodes)
 
 
-def load_survey(path: str, min_nodes: int = 3) -> Survey:
-    """Read JSON from `path` and validate it. Does not search, cache or default a path."""
+def load_survey(path: str, min_nodes: int = 3, require_real_origin: bool = False) -> Survey:
+    """Read JSON from `path` and validate it. Does not search, cache or default a path.
+
+    HEAR_SITE_ORIGIN, when set, replaces the file's origin. `require_real_origin` refuses a survey
+    whose origin is still marked fictional, which is what the public repo ships."""
+    site = site_origin()
     with open(path, "r") as fh:
-        return from_dict(json.load(fh), min_nodes=min_nodes)
+        d = json.load(fh)
+    if site is not None and isinstance(d, dict):
+        d = dict(d, origin=site)
+    sv = from_dict(d, min_nodes=min_nodes)
+    if require_real_origin and sv.origin_is_fictional():
+        raise SiteOriginError(
+            "the origin in %s is marked fictional (the public repo does not carry the site) and "
+            "%s is unset; every lat/lon converted against it would be misplaced. Set %s="
+            "'lat,lon,h_ell_m' to the real frame origin (cluster: Secret hear-site, key origin)"
+            % (path, SITE_ORIGIN_ENV, SITE_ORIGIN_ENV))
+    return sv

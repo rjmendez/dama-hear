@@ -1784,7 +1784,7 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
     # ---------------------------------------------------------- startup refusals, pre-I/O
     _refuse_out_dir_inside_checkout(out)
     try:
-        sv = SV.load_survey(survey_path, min_nodes=3)
+        sv = SV.load_survey(survey_path, min_nodes=3, require_real_origin=True)
     except SV.SurveyError as exc:
         raise Refusal("survey %s did not load: %s" % (survey_path, exc))
     except OSError as exc:
@@ -2814,11 +2814,15 @@ def main(argv=None) -> int:
     if a.check:
         expect = None
         try:
-            sv = SV.load_survey(os.path.expanduser(a.survey), min_nodes=3)
+            sv = SV.load_survey(os.path.expanduser(a.survey), min_nodes=3,
+                                require_real_origin=True)
             expect = AS.max_window_s(
                 arrival_survey(sv), a.temp_c,
                 derive_margin_s(pair_bounds(arrival_survey(sv), SW.sound_speed(a.temp_c)),
                                 a.margin_frac, a.margin_s, a.force_margin)["margin_s"])
+        except SV.SiteOriginError as exc:
+            print("refused: %s" % exc, file=sys.stderr)
+            return 1
         except Exception:
             expect = None            # the survey gate below is what reports a bad survey
         code, lines = check(out, a.max_stale_s, window_s=a.window_s, expect_window_s=expect)
