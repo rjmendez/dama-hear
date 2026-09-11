@@ -1,0 +1,87 @@
+name: firmware
+
+on:
+  workflow_call:
+    inputs:
+      retention-days:
+        type: number
+        default: 14
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ARDUINO_CLI_VERSION: "1.5.1"
+  ESP32_CORE: "3.3.11"
+  ESP32_INDEX: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+jobs:
+  build:
+    name: build ${{ matrix.sketch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { sketch: hear_node,     fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: true }
+          - { sketch: puc_node,      fqbn: "esp32:esp32:esp32s3:PSRAM=opi",      guarded: true }
+          - { sketch: hear_poc,      fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false }
+          - { sketch: path_test,     fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false }
+          - { sketch: sense_bringup, fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: arduino/setup-arduino-cli@v2
+        with:
+          version: ${{ env.ARDUINO_CLI_VERSION }}
+
+      - uses: actions/cache@v6
+        with:
+          path: ~/.arduino15
+          key: arduino15-esp32-${{ env.ESP32_CORE }}-cli-${{ env.ARDUINO_CLI_VERSION }}
+
+      - name: esp32 core ${{ env.ESP32_CORE }}
+        run: |
+          arduino-cli core update-index --additional-urls "$ESP32_INDEX"
+          arduino-cli core install "esp32:esp32@$ESP32_CORE" --additional-urls "$ESP32_INDEX"
+
+      - name: compile (no Wi-Fi credentials, -DHEAR_ALLOW_NO_WIFI)
+        run: |
+          arduino-cli compile --fqbn "${{ matrix.fqbn }}" --libraries firmware/lib \
+            --build-property "compiler.cpp.extra_flags=-DHEAR_ALLOW_NO_WIFI" \
+            --output-dir "out/${{ matrix.sketch }}" "firmware/${{ matrix.sketch }}" | tee build.log
+          {
+            echo "### ${{ matrix.sketch }} (${{ matrix.fqbn }})"
+            grep -E "Sketch uses|Global variables" build.log
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: a build with no Wi-Fi configuration must fail on the guard
+        if: matrix.guarded
+        run: |
+          set +e
+          arduino-cli compile --fqbn "${{ matrix.fqbn }}" --libraries firmware/lib \
+            "firmware/${{ matrix.sketch }}" > guard.log 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::${{ matrix.sketch }} built with no secrets.h and no -DHEAR_ALLOW_NO_WIFI"
+            exit 1
+          fi
+          if ! grep -q "HEAR_ALLOW_NO_WIFI" guard.log; then
+            echo "::error::${{ matrix.sketch }} failed, but not on the Wi-Fi guard"
+            tail -40 guard.log
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fw-${{ matrix.sketch }}
+          path: |
+            out/${{ matrix.sketch }}/*.bin
+            out/${{ matrix.sketch }}/*.elf
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}
