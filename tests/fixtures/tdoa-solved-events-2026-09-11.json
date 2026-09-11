@@ -1,0 +1,231 @@
+{
+ "what": "The only two events the live corpus solves, and what origin/main's unweighted solver returns for them. Captured from the hear-tdoa CronJob's own output so the referent is the configuration that actually runs, not a synthetic array.",
+ "provenance": {
+  "run_id": "20260911T021122Z",
+  "pool": "hear pool snapshot 2026-09-11: 7,758 node rows, 9,356 phone rows",
+  "margin_s": 0.00860753054387325,
+  "margin_source": "derived",
+  "margin_note": "\u26a0\ufe0f8.608 ms, DERIVED from this array's own pair bounds at margin_frac 0.25. NOT associate.MARGIN_S, which is 0.030 s = 87.1% of the tightest pair bound. The CronJob runs the derived one; measuring at the library default measures a configuration nothing runs.",
+  "survey": "survey.json nodes 1/2/3 (nyquist, mach, rankine); node 4 puc is refused",
+  "origin_main_commit": "ce232af3400f3273f22baca3bc245eb47bd7d04b"
+ },
+ "how_to_read": {
+  "solution_origin_main": "THE BIT-FOR-BIT REFERENT. Produced by running origin/main's hear/solve/point.py, in this repo's test environment, on the arrivals below. An unweighted call, or a call whose sigmas are all equal, must reproduce every one of these floats exactly.",
+  "solution_cronjob": "What the CronJob itself published, kept as provenance and NOT as a bit referent. \u26a0\ufe0fevent 1's north_m differs from solution_origin_main by one ulp (-0.10293995289100526 vs -0.10293995289100531) although point.py and placement.py were both already at this commit when that run executed. The difference is the machine, not the code: a least_squares fit is reproducible within an environment and not across BLAS builds. Any 'bit-identical' claim about this solver is a within-environment claim, and a test that pinned these numbers would fail on the cluster for a reason that is not a regression.",
+  "non_finite": "A non-finite float is stored as the STRING \"inf\"/\"-inf\"/\"nan\" -- hdop/vdop/pdop are inf at three receivers. Bare Infinity is what json.dump writes and it is not valid JSON (RFC 8259), so anything but Python choked on this file."
+ },
+ "events": [
+  {
+   "event_key": "baa6c4c305df1334f1329a5c61372d78",
+   "t0_utc_s": 1788952121.333769,
+   "node_ids": [
+    1,
+    3,
+    2
+   ],
+   "node_names": [
+    "nyquist",
+    "rankine",
+    "mach"
+   ],
+   "survey_sigma_m": [
+    0.717,
+    0.49,
+    0.521
+   ],
+   "positions_enu_m": [
+    [
+     -0.0,
+     0.0,
+     0.0
+    ],
+    [
+     -4.58,
+     10.48,
+     3.0
+    ],
+    [
+     -16.602,
+     -0.272,
+     3.0
+    ]
+   ],
+   "arrivals_utc_s": [
+    1788952121.333769,
+    1788952121.340823,
+    1788952121.380704
+   ],
+   "source_class": "blast",
+   "temp_c": 20.0,
+   "fixed_up_m": 0.0,
+   "solution_cronjob": {
+    "at_search_bound": false,
+    "dop": 247.45166345291761,
+    "dop_dof": 0,
+    "dop_singular": true,
+    "east_m": 49.16760405491832,
+    "ground_range_m": 57.60707029094425,
+    "hdop": null,
+    "linearity": 0.6442804494206098,
+    "n_equations": 2,
+    "n_nodes": 3,
+    "n_unknowns": 2,
+    "north_m": 15.930879594532325,
+    "note": "source height was DECLARED as 0.00 m, not measured: two unknowns, so three nodes suffice. Every reported coordinate is conditional on that height being right -- if the source is 10 m up and this said 0, the horizontal answer absorbs the error.",
+    "pdop": null,
+    "planarity_rms_m": 5.049285410677126e-16,
+    "position_observable": true,
+    "range_m": 57.6417777961939,
+    "residual_is_meaningful": false,
+    "rms_residual_ms": 0.0,
+    "sound_speed_mps": 343.42,
+    "source_class": "blast",
+    "t0_utc_s": 1788952121.183271,
+    "up_assumed_m": 0.0,
+    "up_m": 0.0,
+    "up_mirror_m": null,
+    "up_observable": false,
+    "up_preferred_reason": null,
+    "vdop": null,
+    "vertical_spread_m": 3.0
+   },
+   "solution_origin_main": {
+    "east_m": 49.16760405491832,
+    "north_m": 15.930879594532325,
+    "up_m": 0.0,
+    "position_observable": true,
+    "up_observable": false,
+    "up_mirror_m": null,
+    "up_preferred_reason": null,
+    "t0_utc_s": 1788952121.183271,
+    "range_m": 57.6417777961939,
+    "ground_range_m": 57.60707029094425,
+    "rms_residual_ms": 0.0,
+    "at_search_bound": false,
+    "residual_is_meaningful": false,
+    "n_nodes": 3,
+    "n_equations": 2,
+    "n_unknowns": 2,
+    "up_assumed_m": 0.0,
+    "sound_speed_mps": 343.42,
+    "dop": 247.45166345291761,
+    "hdop": "inf",
+    "vdop": "inf",
+    "pdop": "inf",
+    "dop_dof": 0,
+    "dop_singular": true,
+    "linearity": 0.6442804494206098,
+    "planarity_rms_m": 5.049285410677126e-16,
+    "vertical_spread_m": 3.0,
+    "source_class": "blast",
+    "note": "source height was DECLARED as 0.00 m, not measured: two unknowns, so three nodes suffice. Every reported coordinate is conditional on that height being right -- if the source is 10 m up and this said 0, the horizontal answer absorbs the error."
+   }
+  },
+  {
+   "event_key": "9108b0ac622a09e14bbb5f210f127703",
+   "t0_utc_s": 1789063974.2992,
+   "node_ids": [
+    1,
+    2,
+    3
+   ],
+   "node_names": [
+    "nyquist",
+    "mach",
+    "rankine"
+   ],
+   "survey_sigma_m": [
+    0.717,
+    0.521,
+    0.49
+   ],
+   "positions_enu_m": [
+    [
+     -0.0,
+     0.0,
+     0.0
+    ],
+    [
+     -16.602,
+     -0.272,
+     3.0
+    ],
+    [
+     -4.58,
+     10.48,
+     3.0
+    ]
+   ],
+   "arrivals_utc_s": [
+    1789063974.2992,
+    1789063974.301368,
+    1789063974.309064
+   ],
+   "source_class": "blast",
+   "temp_c": 20.0,
+   "fixed_up_m": 0.0,
+   "solution_cronjob": {
+    "at_search_bound": false,
+    "dop": 1.4980866265667894,
+    "dop_dof": 0,
+    "dop_singular": true,
+    "east_m": -8.188651740320859,
+    "ground_range_m": 3.6826115865609856,
+    "hdop": null,
+    "linearity": 0.6442804494206098,
+    "n_equations": 2,
+    "n_nodes": 3,
+    "n_unknowns": 2,
+    "north_m": -0.10293995289100526,
+    "note": "source height was DECLARED as 0.00 m, not measured: two unknowns, so three nodes suffice. Every reported coordinate is conditional on that height being right -- if the source is 10 m up and this said 0, the horizontal answer absorbs the error.",
+    "pdop": null,
+    "planarity_rms_m": 0.0,
+    "position_observable": true,
+    "range_m": 4.1906596255808255,
+    "residual_is_meaningful": false,
+    "rms_residual_ms": 7.757919228897728e-15,
+    "sound_speed_mps": 343.42,
+    "source_class": "blast",
+    "t0_utc_s": 1789063974.2753537,
+    "up_assumed_m": 0.0,
+    "up_m": 0.0,
+    "up_mirror_m": null,
+    "up_observable": false,
+    "up_preferred_reason": null,
+    "vdop": null,
+    "vertical_spread_m": 3.0
+   },
+   "solution_origin_main": {
+    "east_m": -8.188651740320859,
+    "north_m": -0.10293995289100531,
+    "up_m": 0.0,
+    "position_observable": true,
+    "up_observable": false,
+    "up_mirror_m": null,
+    "up_preferred_reason": null,
+    "t0_utc_s": 1789063974.2753537,
+    "range_m": 4.1906596255808255,
+    "ground_range_m": 3.6826115865609856,
+    "rms_residual_ms": 7.757919228897728e-15,
+    "at_search_bound": false,
+    "residual_is_meaningful": false,
+    "n_nodes": 3,
+    "n_equations": 2,
+    "n_unknowns": 2,
+    "up_assumed_m": 0.0,
+    "sound_speed_mps": 343.42,
+    "dop": 1.4980866265667894,
+    "hdop": "inf",
+    "vdop": "inf",
+    "pdop": "inf",
+    "dop_dof": 0,
+    "dop_singular": true,
+    "linearity": 0.6442804494206098,
+    "planarity_rms_m": 0.0,
+    "vertical_spread_m": 3.0,
+    "source_class": "blast",
+    "note": "source height was DECLARED as 0.00 m, not measured: two unknowns, so three nodes suffice. Every reported coordinate is conditional on that height being right -- if the source is 10 m up and this said 0, the horizontal answer absorbs the error."
+   }
+  }
+ ]
+}
