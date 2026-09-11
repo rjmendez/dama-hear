@@ -110,7 +110,19 @@
 // ---- reserved ------------------------------------------------------------------------------
 // 19,20 USB D-/D+ -- reconfiguring these killed the console once already and cost a replug caught
 // inside a four-second window. 26-32 SPI flash. 33-37 octal PSRAM. Never touch any of them.
-#define FREE_PADS      {15, 16, 17, 18, 21, 38, 39}
+//
+// ⚠️THIS LIST WAS WRONG AND OFFERED FOUR PADS THE SCAN HAD ALREADY DISQUALIFIED. It read
+// {15, 16, 17, 18, 21, 38, 39}. Against /scanpu + /scanpd on the live board, 2026-09-10:
+//
+//     18  HELD LOW against an internal pullup -- something external drives this net
+//     39  HELD LOW likewise
+//     38  8 edges at 50% duty -- the DS3231's 1 Hz SQW, i.e. a driven output, not a free pad
+//     21  never appeared in the scan at all, so it is UNMEASURED, not free
+//
+// Landing the L86's push-pull 1PPS on 18 is what this header's own PPS_PIN history is about;
+// offering it again three lines from that fix is the same mistake with a different name.
+// tests/test_puc_pps_pin.py now parses this list, so it cannot drift back silently.
+#define FREE_PADS      {15, 16, 17}
 
 // ---- I2C ------------------------------------------------------------------------------------
 // Found 2026-09-08 by /i2c. /scan alone never could: an idle bus does not toggle. The narrowing is
