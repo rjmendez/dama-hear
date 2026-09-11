@@ -176,6 +176,13 @@ REASONS: frozenset = frozenset({
 #                 does, off the survey's class -- exactly as it already resolves `utc_trusted`
 #                 into a real boolean instead of passing the stored field down.
 #
+#                 ⚠️THE BOOLEAN IS NOT THE ONLY THING THAT QUANTITY IS GOOD FOR. Spending a
+#                 stated sigma entirely on a pass/fail throws away everything it says about
+#                 receivers that PASS. The caller also resolves it into `t_sigma_s` (seconds),
+#                 which this module carries into `event["arrival_sigma_s"]`, index-aligned with
+#                 `arrivals`, for a solver to weight on. Carrying is all it does: the conversion
+#                 needs the class, for the reason in the paragraph above.
+#
 # ⚠️THE TIMESTAMP IS NOT MOVED. Rewriting arrival times that are already in a shipped pipeline
 # would change every historical answer silently, which is worse than the defect. This refuses the
 # detection instead, by the same discipline as nodeclass.require_arrival() and survey's load-time
@@ -429,6 +436,15 @@ def associate(detections: Sequence[Dict], survey, temp_c: float = 20.0,
             "t0_utc_s": arrivals[0],
             "node_ids": [int(m["node_id"]) for m in group],
             "arrivals": arrivals,
+            # ⚠️INDEX-ALIGNED WITH `arrivals`, SECONDS, AND None MEANS THE PRODUCER DID NOT STATE
+            # ONE. Carried, never computed: turning a stated `sync_sigma_ns` into a total sigma
+            # needs the receiver's CLASS, which this module has never known -- the same reason
+            # `stamp_admissible` arrives as a resolved boolean. tools/hear_tdoa.py resolves it
+            # through nodeclass and puts `t_sigma_s` on the detection; this carries it to the
+            # solver so a receiver that states what its stamp is worth can be weighted on that
+            # statement instead of voting at par with every other receiver.
+            "arrival_sigma_s": [(None if m.get("t_sigma_s") is None
+                                 else float(m["t_sigma_s"])) for m in group],
             "detections": list(group),
             "n_nodes": len(group),
             "n_equations": len(group) - 1,      # t0 cancels in TDoA
