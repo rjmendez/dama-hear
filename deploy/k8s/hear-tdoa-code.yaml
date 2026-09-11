@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 590173 B serialised; 590351 B of annotations against a 262144 B cap.
+# apply-mode server: 595878 B serialised; 596056 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '0b15e74'
+    dama-hear/commit: 'ff9e616'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '590173'
+    dama-hear/serialised-bytes: '595878'
 data:
   hear__init__.py: |
     
@@ -7872,12 +7872,57 @@ data:
     D_ONSET_UNSTATED = "onset_unstated"
     D_LATENCY = "latency_uncorrected"
     D_UNPARSEABLE = "line_unparseable"
+    D_HETEROGENEOUS_CLASS = "heterogeneous_receiver_class"
     D_ADMITTED = "admitted"
     
     DROP_REASONS = (D_UNANCHORED, D_OUTSIDE_WINDOW, D_OUTSIDE_LOOKBACK_EMITTED,
                     D_OUTSIDE_LOOKBACK_UNASSOC, D_PENDING_SETTLE, D_UNSURVEYED, D_NOT_ARRIVAL,
                     D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_SYNC_SIGMA, D_STAMP_SIGMA,
-                    D_PATH_BIAS, D_ONSET, D_ONSET_UNSTATED, D_LATENCY, D_UNPARSEABLE)
+                    D_PATH_BIAS, D_ONSET, D_ONSET_UNSTATED, D_LATENCY, D_HETEROGENEOUS_CLASS,
+                    D_UNPARSEABLE)
+    
+    # ---------------------------------------------------------------- heterogeneous receivers
+    # WEIGHTING HANDLES VARIANCE. IT DOES NOT HANDLE BIAS, AND THIS DOOR IS THE ONE THE WEIGHTS DO
+    # NOT OPEN. `hear/solve/point.py` now DOES take a per-receiver `sigmas` and down-weights a
+    # receiver that states a worse clock, and `nodeclass.stamp_admissible` now judges a detection on
+    # its own stated sigma -- so a phone stating 106 us clears the clock gates on its own numbers.
+    # ⚠️NONE OF THAT TOUCHES THIS QUESTION. A receiver's capture-path BIAS is a constant per-receiver
+    # offset: it does not average down over events, it is invisible in an exactly-determined fit
+    # (nodeclass.py's module docstring), and a weight WIDENS a receiver rather than moving it, so no
+    # sigma the solver is handed removes it. Two independent doors sit in front of the clock gates
+    # below: D_PATH_BIAS asks whether this receiver's OWN capture path was measured and is small,
+    # and this one asks whether that path cancels against the array's at all, so that an identical,
+    # uncancelled bias is at least the SAME uncancelled bias on every member. Closed by default.
+    #
+    # ⚠️THIS IS NOT A SECOND COPY OF nodeclass.contributes_arrival(), NOR OF D_PATH_BIAS. Those ask
+    # "is this receiver's clock and bias small enough, by itself". This one is "does this receiver's
+    # capture path cancel against the ones already in the array" -- nodeclass.py says outright that
+    # it does NOT model the answer ("⚠️WHAT THIS MODEL DOES NOT DO"): path_bias_s is carried as if it
+    # never cancels, which is conservative for a SAME-class pair (mach/rankine truly do share one PDM
+    # path and one firmware) and silent about a DIFFERENT-class pair, where it is the live risk. All
+    # the doors have to open before a mixed-class arrival is admitted.
+    REFERENCE_ARRIVAL_CLASS = "xiao-s3-pps"
+    
+    
+    def is_heterogeneous_receiver(source: Optional[str], stated_class: Optional[str]) -> bool:
+        """Does this row's receiver share no known capture path with REFERENCE_ARRIVAL_CLASS?
+    
+        `source == "phone"` is heterogeneous UNCONDITIONALLY, independent of anything survey.json
+        states. That is deliberate, not an approximation: `Survey.arrival_ids()` admits a node whose
+        `class` is UNSTATED "because every survey written before the field existed omits it"
+        (survey.py:94-96) -- so a phone surveyed for its position without also being given a `class`
+        key would sail through the nodeclass gate exactly as nyquist/mach/rankine do, and this
+        function is the one place that still catches it. The pool's own `source` field is not
+        optional and cannot be omitted by an incomplete survey entry the way `class` can.
+    
+        A `source == "node"` row is heterogeneous only if its class is BOTH stated and not the
+        reference: an unstated class today means the xiao-s3-pps fleet that wrote survey.json before
+        this field existed, not an unknown receiver -- refusing it here would refuse the array this
+        tool was built to solve.
+        """
+        if source == "phone":
+            return True
+        return bool(stated_class) and stated_class != REFERENCE_ARRIVAL_CLASS
     
     #: Why an admitted arrival's onset quality is UNSTATED, stated once so the ledger detail, the
     #: manifest and the CLI help cannot drift apart. Every clause was checked on 2026-09-10 against
@@ -8348,6 +8393,26 @@ data:
                                        "associate() would call int(%r)" % (name,)))
                 continue
             nid = name_to_id[name]
+            cname = sv.classes.get(nid)
+            # ⚠️UNREACHABLE ON THE SURVEY AND REGISTRY THIS REPO SHIPS TODAY, DELIBERATELY. Every
+            # `source="phone"` row is already gone above as D_UNSURVEYED (no phone has a survey
+            # entry), and the only class nodeclass.py admits an arrival from at all is
+            # `xiao-s3-pps` -- see is_heterogeneous_receiver's own docstring for what changes that.
+            # Kept ahead of the clock/sync/stamp gates below because it is a STRUCTURAL admission
+            # question (does this receiver's capture path cancel against the array's at all), not a
+            # per-detection quality one.
+            if (is_heterogeneous_receiver(row.get("source"), cname)
+                    and not policy.get("heterogeneous_receivers", False)):
+                _drop(day, row, D_HETEROGENEOUS_CLASS,
+                      _detail(row,
+                              "receiver class %r shares no known capture path with this array's "
+                              "reference class %r, so its bias does NOT cancel even once "
+                              "nodeclass.py calls the bias itself measured and small (nodeclass.py: "
+                              "'between DIFFERENT classes it does not cancel at all'). Pass "
+                              "--admit-heterogeneous-receivers to publish positions built from a "
+                              "mixed array once that receiver's own capture-path bias is measured"
+                              % (cname or ("phone:%s" % name), REFERENCE_ARRIVAL_CLASS)))
+                continue
             # (4) the DERIVED rung, and the third state resolved under an explicit policy.
             trusted = C.utc_trusted_of(row)
             if trusted is None and row.get("source") == "phone":
@@ -8389,8 +8454,8 @@ data:
             # field in which that is visible, and this is the door it is visible AT.
             # ⚠️THE CLASS IS UNSTATED ON EVERY NODE IN survey.json AND THIS STILL HAS TO BITE. A
             # gate keyed on a declared class would be dead code on the only survey that exists;
-            # nodeclass charges the strictest arrival class when none is named.
-            cname = sv.classes.get(nid)
+            # nodeclass charges the strictest arrival class when none is named. `cname` was read
+            # above, ahead of the heterogeneous-receiver gate; reused here unchanged.
             stamp_ok = NC.stamp_admissible(ssig, cname)
             if stamp_ok is False:
                 _drop(day, row, D_STAMP_SIGMA, _detail(row, NC.stamp_refusal(ssig, cname) or ""))
@@ -10304,6 +10369,14 @@ data:
         ap.add_argument("--allow-phones", action="store_true",
                         help="also read the phone source. They are unsurveyed, so today every row "
                              "still lands in unsurveyed_node -- this makes that a counted number")
+        ap.add_argument("--admit-heterogeneous-receivers", action="store_true",
+                        help="publish positions built from a receiver whose capture path is NOT "
+                             "%r -- a phone, or any node of a declared different class. Default OFF: "
+                             "a receiver's capture-path BIAS does not cancel against a different "
+                             "class even once its own clock and bias pass nodeclass.py, so mixing "
+                             "classes must be an operator's deliberate choice, not a default. See "
+                             "tools/hear_latency_cal.py and docs/hear-latency-calibration-runbook.md"
+                             % (REFERENCE_ARRIVAL_CLASS,))
         ap.add_argument("--clock-unstated", choices=("admit", "refuse"), default="refuse")
         # ⚠️DEFAULT admit, WHERE --clock-unstated DEFAULTS refuse, AND THE ASYMMETRY IS THE POINT.
         # An unstated CLOCK is a producer that measures trust and did not say; refusing it costs a
@@ -10395,6 +10468,7 @@ data:
             "candidates": list(a.candidate), "site_box": a.site_box,
             "target_events": a.target_events, "array_id": a.array_id,
             "allow_phones": bool(a.allow_phones),
+            "heterogeneous_receivers": bool(a.admit_heterogeneous_receivers),
         }
     
         try:
