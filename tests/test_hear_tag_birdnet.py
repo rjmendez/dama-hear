@@ -31,7 +31,7 @@ class StubBird:
         return {"scores": {"Cardinalis cardinalis_Northern Cardinal": 0.81, "Dog_Dog": 0.2},
                 "max_unstored_score": 0.005, "n_classes_scored": 154, "n_passes": 3,
                 "embedding": None, "embedding_dim": None,
-                "extra": {"location_filter": {"lat": 40.3, "lon": -76.1, "week": week,
+                "extra": {"location_filter": {"lat": 12.3, "lon": -45.7, "week": week,
                                               "threshold": 0.03, "classes_kept": 154},
                           "max_out_of_range_score": 0.4}}
 
@@ -91,8 +91,8 @@ class TestTheSiteNeverComesFromTheRepo:
             HT.site_latlon()
 
     def test_a_site_is_rounded_to_a_tenth_of_a_degree(self, monkeypatch):
-        monkeypatch.setenv(HT.SITE_ENV, "40.2925,-76.1221")
-        assert HT.site_latlon() == (40.3, -76.1)
+        monkeypatch.setenv(HT.SITE_ENV, "12.3456,-45.6789")
+        assert HT.site_latlon() == (12.3, -45.7)
 
     @pytest.mark.parametrize("bad", ["40.3", "north,west", "91,0", "0,181"])
     def test_a_bad_site_refuses(self, monkeypatch, bad):

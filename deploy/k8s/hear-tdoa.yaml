@@ -7,6 +7,10 @@
 #     kubectl apply -f deploy/k8s/hear-tdoa-code.yaml -f deploy/k8s/hear-tdoa.yaml
 # NEVER `kubectl apply -f deploy/k8s/`. A ConfigMap and a CronJob are both written WHOLE, so a
 # directory apply would also push whatever state the other manifests are in on this branch.
+#
+# ⚠️THE SITE ORIGIN COMES FROM A SECRET. survey.json's origin is FICTIONAL (this repo is public)
+# and hear_tdoa.py refuses to run on it. Both containers read HEAR_SITE_ORIGIN ("lat,lon,h_ell_m",
+# the real frame origin) from Secret hear-site, key origin, which must exist BEFORE this applies.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -106,6 +110,10 @@ spec:
                     --fixed-up-m 0.0 \
                     --lookback-h 168 \
                     --null-trials 200
+              env:
+                - name: HEAR_SITE_ORIGIN
+                  valueFrom:
+                    secretKeyRef: { name: hear-site, key: origin }
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
                 - { name: code, mountPath: /app/hear/sketch.py, subPath: hear_sketch.py }
@@ -216,6 +224,10 @@ spec:
                     --survey /app/survey.json --out /pool/corpus/tdoa --census \
                     --source-class blast || true
                   exit "$rc"
+              env:
+                - name: HEAR_SITE_ORIGIN
+                  valueFrom:
+                    secretKeyRef: { name: hear-site, key: origin }
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
                 - { name: code, mountPath: /app/hear/sketch.py, subPath: hear_sketch.py }

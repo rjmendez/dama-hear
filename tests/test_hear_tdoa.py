@@ -90,7 +90,7 @@ PUC = {"node_id": 4, "name": "puc", "class": "puc-ntp", "e_m": -22.16, "n_m": 8.
 
 def survey_dict(nodes=None):
     return {"frame": "enu_local", "units": "m",
-            "origin": {"lat_deg": 40.29, "lon_deg": -76.12, "h_ell_m": 0.0},
+            "origin": {"lat_deg": 40.29, "lon_deg": -79.12, "h_ell_m": 0.0},
             "nodes": [dict(n) for n in (LIVE_NODES if nodes is None else nodes)]}
 
 
