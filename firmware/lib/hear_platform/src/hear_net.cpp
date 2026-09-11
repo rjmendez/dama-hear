@@ -5,6 +5,7 @@
 static volatile uint32_t disc_n = 0, reconn_n = 0, last_disc_ms = 0;
 static volatile int last_reason = 0;
 static volatile bool joined_once = false;
+static volatile bool link_down = false;   // a disconnect not yet followed by an address
 
 uint32_t hear_net_disconnects()  { return disc_n; }
 uint32_t hear_net_reconnects()   { return reconn_n; }
@@ -17,8 +18,12 @@ void hear_net_watch() {
       disc_n = disc_n + 1;
       last_reason = info.wifi_sta_disconnected.reason;
       last_disc_ms = millis();
+      link_down = true;
     } else if (e == ARDUINO_EVENT_WIFI_STA_GOT_IP && joined_once) {
-      reconn_n = reconn_n + 1;
+      if (link_down) {
+        reconn_n = reconn_n + 1;
+        link_down = false;
+      }
     }
   });
 }
@@ -73,6 +78,7 @@ int hear_net_join(const hear_prov_t *p, uint32_t per_try_ms, hear_net_join_t *ou
       if (b) memcpy(out->bssid, b, 6);
       out->join_ms = millis() - t0;
       disc_n = 0; reconn_n = 0; last_reason = 0; last_disc_ms = 0;
+      link_down = false;
       joined_once = true;
       return out->joined;
     }

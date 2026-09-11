@@ -65,6 +65,20 @@ def test_a_disconnect_is_counted_with_its_reason():
     assert "info.wifi_sta_disconnected.reason" in b
 
 
+def test_a_reconnect_is_only_an_address_that_follows_a_disconnect():
+    """GOT_IP also fires for the join's own first address, which can land after the join has
+    returned, and for DHCP renewals. Counting every one made reconn exceed disc (Copilot, #51)."""
+    b = _body(_code(NET), "void hear_net_watch(")
+    down = b[b.index("ARDUINO_EVENT_WIFI_STA_DISCONNECTED"):b.index("ARDUINO_EVENT_WIFI_STA_GOT_IP")]
+    up = b[b.index("ARDUINO_EVENT_WIFI_STA_GOT_IP"):]
+    assert re.search(r"link_down\s*=\s*true", down)
+    assert re.search(r"if\s*\(\s*link_down\s*\)", up) and re.search(r"link_down\s*=\s*false", up)
+    assert up.index("if (link_down)") < up.index("reconn_n = reconn_n + 1")
+    j = _body(_code(NET), "int hear_net_join(")
+    assert re.search(r"link_down\s*=\s*false", j[j.index("WL_CONNECTED) {"):]), (
+        "the join's own failed attempts would leave link_down set and count the first address")
+
+
 def test_setup_joins_through_the_ranked_join_after_watching():
     setup = _body(_code(INO), "void setup(")
     assert setup.index("hear_net_watch()") < setup.index("hear_net_join(&prov")
