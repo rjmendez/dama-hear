@@ -194,7 +194,6 @@ static void node_identity() {
 #define SD_MOSI   SD_MOSI_PIN
 
 #define BLOCK      256                // finer block -> finer sample-count granularity per PPS
-#define MAXDET     128               // ring, not a cap: the 65th detection used to vanish
 
 // ---------------------------------------------------------------- two rates, on purpose
 // ⚠️FS_NOMINAL IS THE RATE EVERYTHING DOWNSTREAM OF THE DECIMATOR RUNS AT, and every existing use
@@ -1255,8 +1254,15 @@ struct Det { uint32_t sample; uint32_t pps_n; int32_t us_since_pps; int64_t utc_
               uint8_t frame[MELIMP_FRAME_BYTES]; };
 // A RING. dets[] used to be a hard cap -- past the 64th, a detection incremented the counter and
 // stored nothing, so a windy spell reported hundreds of events and kept the first 64. det_n is
-// the monotonic total; the slot is det_n % MAXDET.
-static Det dets[MAXDET];
+// the monotonic total; the slot is det_n % det_cap. setup() moves it to PSRAM after the raw ring.
+#define DET_RING_MAX  1024        // slots, PSRAM
+#define DET_RING_MIN  512         // smallest PSRAM ring taken; below it, DET_RING_INT internal
+#define DET_RING_INT  128
+#define DET_RING_BOOT 8           // until setup() allocates, and the last resort
+#define DETS_HTTP_MAX 128         // newest rows /detections serves
+static Det det_boot[DET_RING_BOOT];
+static Det *dets = det_boot;
+static uint32_t det_cap = DET_RING_BOOT;
 static uint32_t det_n = 0;        // total ever detected
 static uint32_t det_flushed = 0;  // total written to the card
 static uint32_t det_lost = 0;     // overwritten in the ring before they could be written
@@ -1432,6 +1438,7 @@ static double esp_clock_ppm(uint32_t *secs_out) {
 // a missing feature rather than an error: praw == NULL disables /audio and changes nothing else.
 static int16_t  *praw = NULL;
 static uint32_t  praw_cap = 0;              // samples the ring holds; 0 = not allocated
+#define PSRAM_KEEP_B 262144u                // PSRAM left for WiFi and the web server
 static uint32_t  praw_want_s = 0;           // the span that actually got allocated, for the log
 
 // The ring is contiguous in WRITE order, not in time. A lost block leaves no hole in it, and the
@@ -1961,6 +1968,12 @@ static void wav_header(uint8_t *h, uint32_t data_bytes, uint32_t fs) {
 // than the audio, that must not be possible. 10 s is well past the 3 s post-roll and well short
 // of the 30 s health interval.
 #define CLIP_WAIT_MAX_S 10
+#define DET_BURST_HZ 30
+static_assert(DET_RING_MIN >= DET_BURST_HZ * CLIP_WAIT_MAX_S,
+              "a burst must fit in the ring for as long as its head can wait for a clip");
+static_assert((0x100000000ULL % DET_RING_MAX) == 0 && (0x100000000ULL % DET_RING_MIN) == 0 &&
+              (0x100000000ULL % DET_RING_INT) == 0 && (0x100000000ULL % DET_RING_BOOT) == 0,
+              "det_n % det_cap must not jump when det_n wraps");
 
 static uint32_t clip_written = 0;        // advances ONLY after the full CLIP_BYTES landed
 static uint32_t clip_evicted = 0;        // oldest clips deleted to make room
@@ -2104,9 +2117,9 @@ static void clip_pump() {
     if (!ok || !clip_left) {
       clipf.close();
       clip_busy = false;
-      Det &d = dets[clip_k % MAXDET];
-      // The slot could in principle have been recycled under us -- 128 detections inside the half
-      // second a clip takes. Check rather than stamp a state onto somebody else's detection.
+      Det &d = dets[clip_k % det_cap];
+      // The slot could in principle have been recycled under us -- det_cap detections inside the
+      // time a clip takes. Check rather than stamp a state onto somebody else's detection.
       bool mine = (d.sample == clip_at_sample);
       if (ok) {
         clip_written++;                       // only here: the full CLIP_BYTES is on the card
@@ -2126,11 +2139,11 @@ static void clip_pump() {
   // Oldest unresolved detection still in the ring. Anything older than that has been overwritten
   // and det_flush counts it in det_lost; there is nothing left to clip.
   uint32_t first = det_flushed;
-  if (det_n > MAXDET && det_n - MAXDET > first) first = det_n - MAXDET;
+  if (det_n > det_cap && det_n - det_cap > first) first = det_n - det_cap;
   uint32_t k = first;
-  while (k < det_n && dets[k % MAXDET].clip_st != CLIP_PENDING) k++;
+  while (k < det_n && dets[k % det_cap].clip_st != CLIP_PENDING) k++;
   if (k >= det_n) return;
-  Det &d = dets[k % MAXDET];
+  Det &d = dets[k % det_cap];
 
   if (!sd_ok)                        { d.clip_st = CLIP_NOCARD; clip_nocard++; return; }
   if (!praw || !praw_cap)            { d.clip_st = CLIP_RING;   clip_skip_ring++; return; }
@@ -2464,12 +2477,13 @@ static void h_root() {
 static void h_status() { http.send(200, "application/json", status_json()); }
 static void h_dets() {
   uint32_t total = det_n;
-  uint32_t n = total < MAXDET ? total : MAXDET;
+  uint32_t n = total < det_cap ? total : det_cap;
+  if (n > DETS_HTTP_MAX) n = DETS_HTTP_MAX;
   uint32_t first = total - n;                 // ring: the newest n, oldest first
   String o = "[";
   o.reserve(n * (MELIMP_FRAME_BYTES * 2 + 280) + 64);
   for (uint32_t k = first; k < total; k++) {
-    const Det &d = dets[k % MAXDET];
+    const Det &d = dets[k % det_cap];
     char b[240];
     snprintf(b, sizeof b, "%s{\"i\":%lu,\"utc_us\":%lld,\"uptime_s\":%lu,\"sample\":%lu,\"pps_n\":%lu,"
                           "\"us_since_pps\":%ld,\"trigger\":%d,\"flags\":%u,\"fs_hz\":%.3f,"
@@ -3538,7 +3552,7 @@ void setup() {
       size_t want = (size_t)want_s[k] * FS_ACQ * sizeof(int16_t);
       // Leave 256 kB of PSRAM behind: WiFi buffers and the web server allocate from it too, and a
       // ring that takes the last byte would trade audio for a node that cannot be reached.
-      if (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) < want + 262144) continue;
+      if (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) < want + PSRAM_KEEP_B) continue;
       praw = (int16_t *)ps_malloc(want);
       if (praw) { praw_cap = want_s[k] * FS_ACQ; praw_want_s = want_s[k]; }
     }
@@ -3549,11 +3563,27 @@ void setup() {
     else
       logln("praw  NO PSRAM ring -- /audio is disabled; capture, gate and logging are unaffected");
   }
+  {
+    static const uint32_t want_n[] = {DET_RING_MAX, DET_RING_MIN};
+    const char *where = "static fallback";
+    for (unsigned k = 0; k < sizeof(want_n) / sizeof(want_n[0]) && dets == det_boot; k++) {
+      size_t want = (size_t)want_n[k] * sizeof(Det);
+      if (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) < want + PSRAM_KEEP_B) continue;
+      Det *p = (Det *)heap_caps_calloc(want_n[k], sizeof(Det), MALLOC_CAP_SPIRAM);
+      if (p) { dets = p; det_cap = want_n[k]; where = "PSRAM"; }
+    }
+    if (dets == det_boot) {
+      Det *p = (Det *)heap_caps_calloc(DET_RING_INT, sizeof(Det), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      if (p) { dets = p; det_cap = DET_RING_INT; where = "internal RAM"; }
+    }
+    logf("dets  ring %lu detections, %lu kB in %s\n", (unsigned long)det_cap,
+         (unsigned long)(det_cap * sizeof(Det) / 1024UL), where);
+  }
   boot_wdt_disarm();
 }
 
 // ---------------------------------------------------------------- detections -> card
-// The ring is 128 deep and the card is the only thing that survives the timer cutting power, so
+// The ring is det_cap deep and the card is the only thing that survives the timer cutting power, so
 // the ring is a staging area, not the record. The file is held OPEN and flushed in batches:
 // open/write/close per detection costs 20-50 ms inside loop(), which stalls the I2S reader and
 // drops the very audio we are here to capture. Whatever that flush still costs now shows up in
@@ -3599,12 +3629,12 @@ static const char DETS_HDR[] =
 // flushed in order and det_flush refuses to write a row whose sketch is still pending, so
 // skipping ahead would stall the queue behind a row that can never complete.
 static void sketch_pump() {
-  // Slots recycle at MAXDET. Anything older than that is already gone; walking to it would
+  // Slots recycle at det_cap. Anything older than that is already gone; walking to it would
   // sketch whatever occupies the slot now -- the same guard det_flush keeps.
   uint32_t k0 = det_flushed;
-  if (det_n - det_flushed > MAXDET) k0 = det_n - MAXDET;
+  if (det_n - det_flushed > det_cap) k0 = det_n - det_cap;
   for (uint32_t k = k0; k < det_n; k++) {
-    Det &d = dets[k % MAXDET];
+    Det &d = dets[k % det_cap];
     if (d.sk_st) continue;
     // ⚠️EVERY QUANTITY BELOW IS IN THE ACQUISITION DOMAIN, because aring is fed from acblk and
     // MELIMP_* was generated for FS_ACQ. d.sample and g_samples are DECIMATED and deliberately do
@@ -3651,22 +3681,22 @@ static void det_flush() {
   // clip resolves, and reaching csv_open only to break out of the write loop would pay a 20-50 ms
   // open once a second for as long as that lasts.
   { uint32_t f0 = det_flushed;
-    if (det_n > MAXDET && det_n - MAXDET > f0) f0 = det_n - MAXDET;
-    if (dets[f0 % MAXDET].clip_st == CLIP_PENDING || !dets[f0 % MAXDET].sk_st) return; }
+    if (det_n > det_cap && det_n - det_cap > f0) f0 = det_n - det_cap;
+    if (dets[f0 % det_cap].clip_st == CLIP_PENDING || !dets[f0 % det_cap].sk_st) return; }
   if (!detf) {
     // The old det_hdr_done latch is gone: it was set even when the header had NOT been written,
     // so a card swapped mid-run could never get one.
     detf = csv_open("/dets.csv", "/dets-prev.csv", DETS_HDR);
     if (!detf) return;
   }
-  // If more than MAXDET landed since the last flush, the oldest slots have already been
+  // If more than det_cap landed since the last flush, the oldest slots have already been
   // overwritten. Count them as lost instead of writing whatever occupies the slot now.
   uint32_t first = det_flushed;
-  if (det_n - det_flushed > MAXDET) { first = det_n - MAXDET; det_lost += first - det_flushed; }
+  if (det_n - det_flushed > det_cap) { first = det_n - det_cap; det_lost += first - det_flushed; }
   uint32_t wrote = 0;
   static const char hx[] = "0123456789abcdef";
   for (uint32_t k = first; k < det_n && wrote < 16; k++, wrote++) {
-    const Det &d = dets[k % MAXDET];
+    const Det &d = dets[k % det_cap];
     // A row whose clip has not resolved yet WAITS -- writing it now would either name a file that
     // may never appear or record "no clip" for one that is about to. Bounded by CLIP_WAIT_MAX_S,
     // so the delay a detection can suffer is ~10 s against the 1 s it used to be; the cost is
@@ -3829,7 +3859,7 @@ static void audio_pump() {
         int16_t sac = dcblk[i];
         int fired = gate(sac);                    // stateful: exactly one call per sample
         if (fired) {
-        uint32_t idx = (det_n++) % MAXDET;
+        uint32_t idx = (det_n++) % det_cap;
         {
           // The block arrives as a unit, so reading the clock here stamps every sample in it
           // with the moment the block FINISHED. At BLOCK=256 that is up to 15.9 ms late -- 87x
@@ -3865,7 +3895,7 @@ static void audio_pump() {
           dets[idx].fs_at = fsu;
           dets[idx].uptime_s = (millis() - boot_ms) / 1000;
           // The slot is recycled, so this must be set here and not left over from whatever
-          // detection used it 128 events ago -- a stale CLIP_OK would name a file for the wrong
+          // detection used it det_cap events ago -- a stale CLIP_OK would name a file for the wrong
           // event. Nothing is written from audio_pump(); clip_pump() picks it up from loop().
           dets[idx].clip_st = CLIP_PENDING;
           // ⚠️THE SKETCH IS QUEUED, NOT TAKEN HERE. The window has to run FORWARD from the
@@ -3888,7 +3918,7 @@ static void audio_pump() {
           // hear/node/detect.py has always packed it (RETRIGGER_S = 0.060 s).
           uint16_t fl = MELIMP_FLAG_BITS;
           if (det_n >= 2) {
-            const Det &prev = dets[(det_n - 2) % MAXDET];
+            const Det &prev = dets[(det_n - 2) % det_cap];
             if ((uint32_t)(dets[idx].sample - prev.sample) < RETRIGGER_SAMPLES) fl |= 0x0001;
           }
           dets[idx].flags = fl;
