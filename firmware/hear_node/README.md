@@ -10,12 +10,20 @@ averages out to well under a ppm.
 
 ## Before you flash
 
-    cp firmware/hear_node/secrets.h.example firmware/hear_node/secrets.h   # then edit
-    arduino-cli compile -u -p /dev/ttyACM0 \
-      --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi firmware/hear_node
+A new board is enrolled once, over USB. This writes a release image, then stores the node's name
+and Wi-Fi in its NVS partition, which OTA never writes:
 
-`secrets.h` is gitignored. Without it the node starts its own AP (`dama-hear-node` / `damahear`,
-http://192.168.4.1/) — fine for a bench check, useless in the garden.
+    python3 firmware/hear_node/enroll.py <node> /dev/ttyACM0 --release <tag>
+
+After that, every update is the same public image for every node:
+
+    python3 firmware/hear_node/flash.py <node> <ip> --release <tag>
+
+`flash.py <node> <ip>` without `--release` still builds this tree with `secrets.h` compiled in.
+That build copies its credentials into NVS at boot, which is how a node flashed before enrollment
+existed becomes enrolled without the cable. A board with neither starts its own AP
+(`dama-hear-node-<id>` / `damahear`, http://192.168.4.1/) and reports `"prov":{"src":"none"}` in
+`/status`.
 
 ## Wiring
 
@@ -602,6 +610,11 @@ survives a reset; three boots without reaching healthy and it sets the other par
 Healthy means **WiFi joined** as well as running, because an image that boots happily but cannot be
 reached is unrecoverable over the air. That case also cannot reboot itself, so an image that has not
 become reachable within 90 s restarts deliberately, which advances the counter.
+
+⚠️**An image that arrives over the air has to earn healthy itself.** The proven flag survives
+`esp_restart()`, and `/update` restarts straight into the new image. Until 2026-09-11 an image OTA'd
+from a healthy one therefore booted already "proven", so the revert never applied to it. The flag
+now counts only on the app partition that earned it, and an OTA always lands in the other one.
 
 ⚠️**What it cannot save you from:** a build that faults before `setup()` runs -- a bad global
 constructor, say -- since nothing then increments the counter. That still needs USB. The counter is
