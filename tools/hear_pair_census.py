@@ -140,16 +140,23 @@ def null_distribution(dets: Sequence[Dict], survey, node_id: int, draws: int = 2
 #                missing position can be fine.
 #
 # ⚠️"HOW MANY PASS THE CLOCK GATE" HAS TWO HONEST ANSWERS AND BOTH ARE REPORTED, NEVER JUST ONE.
-# `nodeclass.stamp_admissible()` -- the function the shipped pipeline actually calls -- short-
-# circuits on the RECEIVER'S CLASS-LEVEL `clock_admissible()` before it ever reads the
-# detection's own stated sigma (nodeclass.py: `if not self.clock_admissible(): return False`).
-# `gotchi-phone`'s class t_sigma_s is 5 ms -- GPSTimingSync's "location" tier, not the "gnss" tier
-# the fleet is actually running -- so every phone row is refused there regardless of what it
-# states. `clock_pass_deployed_gate` is that number (0, on this pool, for every phone). Beside it,
-# `clock_pass_stated_sigma_only` tests the row's OWN `sync_sigma_ns` against the per-node budget
-# directly, with no class term at all: the number the per-detection machinery was built to
-# produce, and the one a fixed class constant would unblock. The gap between the two columns IS
-# the finding, not a bug in this tool.
+# `clock_pass_deployed_gate` is `nodeclass.stamp_admissible()`, the function the shipped pipeline
+# actually calls. `clock_pass_stated_sigma_only` tests the row's OWN `sync_sigma_ns` against the
+# per-node budget directly, with no class term at all. The gap between the two columns IS the
+# finding, not a bug in this tool -- but ⚠️THE GAP HAS CHANGED SIGN AND THE OLD READING IS
+# RETRACTED. This comment used to say `stamp_admissible` short-circuits on the receiver's
+# CLASS-LEVEL `clock_admissible()` before reading the detection's own sigma, so that every phone
+# row was refused whatever it stated and `clock_pass_deployed_gate` was 0 for every phone on this
+# pool. That short-circuit is gone (nodeclass.py, `stamp_admissible`), and `gotchi-phone` now
+# declares `clock_sigma_s` = its whole 5 ms, so its capture figure is 0 and a phone is judged on
+# exactly what it states: both columns agree for a phone.
+#
+# They still disagree, the other way round, wherever a class declares NO clock/capture split. The
+# deployed gate RSSes the stated sigma with the class's CAPTURE terms, which a `sync_sigma_ns`
+# does not measure; `xiao-s3-pps` has no declared split so its capture figure is the whole 100 us,
+# and a node row stating 106.038 us gives sqrt(100^2 + 106.038^2) = 145.75 us, over the 129.4 us
+# bound. It passes `clk_own` and fails the deployed gate. Reading either column alone is still
+# wrong; only which column flatters which receiver has moved.
 _PHONE_ONLY_CLASS = "gotchi-phone"          # the one phone class nodeclass.py registers
 #: The class every `source="node"` row in survey.json is, in HARDWARE, without saying so: none of
 #: nyquist/mach/rankine carries a `class` key (nodeclass.py's own registry notes "all three
@@ -308,9 +315,10 @@ def format_receiver_census(rep: Dict[str, Dict]) -> str:
             "-" if r["position_accuracy_m"] is None else "%.2f" % r["position_accuracy_m"]))
     lines.append("* class assumed (no survey entry states one). clk_deployed = what "
                  "nodeclass.stamp_admissible() (the SHIPPED gate) says pass/fail/unstated, out of "
-                 "rows_anchored -- its class-level short-circuit can make this 0 pass even when "
-                 "clk_own is mostly pass. clk_own = the row's OWN sync_sigma_ns tested directly "
-                 "against the 129.4 us per-node budget, pass/fail, out of sync_sigma_stated only.")
+                 "rows_anchored -- it RSSes the stated sigma with the CLASS's capture terms, so a "
+                 "class that declares no clock/capture split can fail here while clk_own passes. "
+                 "clk_own = the row's OWN sync_sigma_ns tested directly against the 129.4 us "
+                 "per-node budget, pass/fail, out of sync_sigma_stated only.")
     return "\n".join(lines)
 
 
