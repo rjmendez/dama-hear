@@ -1,0 +1,7 @@
+# The workstation's versions, on its Python 3.12. CI job: tests (py3.12, dev).
+numpy==2.4.4
+scipy==1.17.1
+scikit-learn==1.8.0
+PyYAML==6.0.2
+soundfile==0.14.0
+pytest==9.1.0

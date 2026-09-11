@@ -1,6 +1,6 @@
 """A node's stamp must carry what it is worth, and the number must be worth having.
 
-⚠️THE DEFECT THIS PINS. `time_valid` is set at exactly one site in night_node.ino -- the first
+⚠️THE DEFECT THIS PINS. `time_valid` is set at exactly one site in hear_node.ino -- the first
 NAV-PVT that names a PPS edge -- and NOTHING ever clears it. `local_to_utc()` then keeps
 converting from the frozen `(edge_local_us, edge_unix_us)` pair for as long as the node runs. So
 when the GPS UART dies mid-boot, which mach demonstrably does (PR #37), the node does NOT emit
@@ -39,7 +39,7 @@ from hear import pool as POOL
 from hear import sketch as SK
 from hear.backend import associate as AS
 
-INO = pathlib.Path(__file__).resolve().parents[1] / "firmware" / "night_node" / "night_node.ino"
+INO = pathlib.Path(__file__).resolve().parents[1] / "firmware" / "hear_node" / "hear_node.ino"
 
 # ---------------------------------------------------------------------------------------------
 # THE MEASURED DRIFT DISTRIBUTION, 2026-09-10/11. `health.csv` and `health-prev.csv` were pulled
@@ -67,7 +67,7 @@ LIVE_ANCHOR_AGE_US = (567359, 607331, 664057)
 
 def _src():
     if not INO.exists():
-        pytest.skip("night_node.ino not in this checkout")
+        pytest.skip("hear_node.ino not in this checkout")
     t = INO.read_text()
     t = re.sub(r"/\*.*?\*/", "", t, flags=re.S)
     return re.sub(r"//[^\n]*", "", t)
@@ -75,7 +75,7 @@ def _src():
 
 def _define(name):
     m = re.search(r"^#define\s+%s\s+([0-9.]+)u?\s*$" % re.escape(name), _src(), re.M)
-    assert m, "%s is not defined in night_node.ino" % name
+    assert m, "%s is not defined in hear_node.ino" % name
     return float(m.group(1))
 
 
