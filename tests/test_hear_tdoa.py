@@ -1460,6 +1460,51 @@ def _embedded_from_text(text):
     return out
 
 
+# ================================================================= scan_coincidences docstring
+
+class TestScanCoincidencesNoLongerMatchesAssociate:
+    """Pins scan_coincidences()'s own ⚠️: it used to claim "Same scan, minus one gate" and that
+    a consumed candidate is terminal, which stopped being true when #42 gave associate() two
+    NON-terminal refusals (duplicate_node_in_group release, and every pairwise_dt_exceeds_geometry
+    refusal). This scan still marks every visited candidate used unconditionally, so it can seed
+    -- or fail to seed -- differently from associate() on the same detections.
+
+    Same node positions and arrivals as tests/test_associate.py's TestReseedingARefusedCandidate
+    (the live 2026-09-09T11:08:41 episode): nyquist@.271272 seeds a group, is refused against
+    rankine@.340823 by the geometry gate, and -- since #42 -- is released rather than consumed.
+    associate() reseeds cleanly at rankine and delivers [rankine, nyquist, mach]. This scan has no
+    release: nyquist@.271272 stays consumed as soon as it is visited, so the very group associate
+    delivers never gets a chance to seed here at all.
+    """
+
+    LIVE_T = 1788952121.0
+    LIVE_ARRIVALS = [
+        (2, 0.164822), (2, 0.168846), (2, 0.173107), (2, 0.181276), (2, 0.185542),
+        (1, 0.271272), (1, 0.321229), (1, 0.333769), (1, 0.338348), (1, 0.359180),
+        (3, 0.340823), (3, 0.343133), (3, 0.345298),
+        (2, 0.380704), (2, 0.383722),
+    ]
+
+    def _dets(self):
+        return [{"node_id": n, "seq": i, "t_utc_s": self.LIVE_T + off, "iface": "lora0"}
+                for i, (n, off) in enumerate(self.LIVE_ARRIVALS)]
+
+    def _survey(self):
+        return SV.from_dict(survey_dict(LIVE_NODES))
+
+    def test_associate_delivers_the_episode_scan_coincidences_cannot_see(self):
+        dets = self._dets()
+        sv = self._survey()
+        got = AS.associate(dets, sv, temp_c=25.0)
+        assert [e["node_ids"] for e in got["events"]] == [[3, 1, 2]], (
+            "if this drifts, re-derive window_s below from got['window_s'] instead of assuming it")
+        window_s = got["window_s"]
+        scanned = HT.scan_coincidences(dets, window_s=window_s, min_nodes=3)
+        assert scanned == [], (
+            "scan_coincidences found a group here -- the docstring's claim may have been fixed; "
+            "update it (and this test) rather than deleting the assertion")
+
+
 # ================================================================= the one real-file read
 
 def test_the_repo_survey_admits_exactly_three_arrival_nodes():
