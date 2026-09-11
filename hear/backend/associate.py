@@ -56,6 +56,35 @@ arrivals that the 55.85 ms and 12.94 ms groups later needed. Minimising spread o
 AT THE SEED is not minimising spread: the seed is the floor, so the search buys width at the far
 end to buy membership. Earliest-wins stays.
 
+⚠️IT ALSO REFUSES POSSIBLE-FIRST TWO-PASS FORMING, AND NOT ON TERMINATION GROUNDS. The proposal
+was to form only groups that stay point_source_possible at zero margin, then run this rule over
+what is left, on the argument that a two-pass form "can only convert impossible deliveries into
+possible ones". MEASURED on the live pool 2026-09-11 (7,067 admitted arrivals, 74 h), at the
+margin the DRIVER derives from the array's own pair bounds -- which is what runs in production --
+and again at this module's 30 ms default:
+
+  margin 8.608 ms, window 57.740 ms   one-pass  3 events / 3 possible / 3,111 candidate visits
+                                      two-pass  5 events / 5 possible / 6,260 candidate visits
+  margin 30 ms,    window 79.132 ms   one-pass  5 events / 2 possible / 3,396 candidate visits
+                                      two-pass  5 events / 2 possible / 6,863 candidate visits
+
+At 30 ms the two deliveries are IDENTICAL, spread for spread -- and 30 ms is the only setting
+measured here that has impossible groups in it. It converts nothing because those groups are
+impossible from the SEED PAIR onward: pass one forms two nodes, fails min_nodes, hands every
+member back, and pass two re-forms the same group. The 128.1 m and 169.7 m round fixtures are
+unchanged at all three measured cadences (85 / 328 / 522 ms), so it buys nothing at the scale the
+array is going to either. What it does do at the derived margin is MANUFACTURE two extra triples
+out of arrivals pass one released, on a corpus whose shuffle null puts the observed triple count
+at 0.63 +- 0.72 (p_emp 0.11) -- deliveries indistinguishable from chance -- for 2.0x the scan
+work. The claim fails in both directions: it converts nothing and it is not free.
+
+⚠️point_source_possible IS PAIRWISE AND THEREFORE NECESSARY, NEVER SUFFICIENT. It says no PAIR
+in the group violates |dt| <= d/c; it does not say one point exists that fits all of them at
+once. Measured on the same pool: the group seeded at 1789063974.287743 is possible at excess
+0.0 ms and its three-node fit still runs to the search bound at 10.4 ms residual. So "prefer the
+possible group" cannot discriminate between two groups that are both possible, which is exactly
+the case this corpus presents. The joint question belongs to the solver, and the driver asks it.
+
 ⚠️WHAT THE DUPLICATE RELEASE COSTS, STATED RATHER THAN DISCOVERED LATER. It changes WHICH group
 one episode delivers, and the one it picks is wider. Episode 3 of the live pool delivers twice
 either way; its second delivery is rankine@1789063974.347535 + mach@.349619 + nyquist@.360475,
