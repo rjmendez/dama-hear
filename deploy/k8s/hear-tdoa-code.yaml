@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 539584 B serialised against a 262144 B last-applied-configuration cap.
+# apply-mode server: 540857 B serialised against a 262144 B last-applied-configuration cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '838c4da'
+    dama-hear/commit: 'fc7c48c'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '539584'
+    dama-hear/serialised-bytes: '540857'
 data:
   hear__init__.py: |
     
@@ -8086,8 +8086,24 @@ data:
         impossible". Those need opposite field responses -- the first is an uptime and threshold
         problem, the second is a siting or clock problem -- so both are counted.
     
-        Semantics are otherwise associate()'s exactly: one detection per node per group, earliest
-        wins with no replacement, a consumed candidate is terminal. Same scan, minus one gate.
+        ⚠️NO LONGER "SAME SCAN, MINUS ONE GATE" -- THAT CLAIM WENT FALSE UNDER #42 AND WAS NEVER
+        UPDATED. `associate()` now has two NON-terminal refusals that return a candidate to ITS OWN
+        pool for a later group to pick up as a fresh seed (hear/backend/associate.py: the
+        `duplicate_node_in_group` release, and every `pairwise_dt_exceeds_geometry` refusal, which
+        never sets `used[j]`). This scan still marks every visited candidate `used[j] = True`
+        unconditionally, so the two functions can and do seed different groups from the same
+        detections -- measured on the live pool 2026-09-11: associate() seeds one event at
+        node3@1789063974.287743, this scan seeds the corresponding group eight ms later at
+        node1@.299200. Anything that reads this scan's groups alongside associate()'s own events by
+        matching on the seed (run()'s `ev_by_seed` lookup) can therefore miss an admissible group
+        silently. See
+        tests/test_hear_tdoa.py::test_scan_coincidences_can_disagree_with_associate_on_the_seed
+        for the reproduction; fixing the mismatch itself (mirror the release rule here, or stop
+        matching by seed) is a bigger, separate change and not this docstring's job.
+    
+        What is still true: one detection per node per group, earliest wins with no replacement
+        WITHIN one scan, and this scan carries NO geometry gate at all -- see the module docstring
+        above for why that absence is deliberate.
         """
         pool = sorted(dets, key=lambda d: (float(d["t_utc_s"]), int(d["node_id"]), int(d["seq"])))
         used = [False] * len(pool)
