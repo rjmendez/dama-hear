@@ -79,8 +79,9 @@ def test_the_watchdog_panics_rather_than_only_warning(body):
 
 
 def test_the_wifi_join_is_not_inside_the_watchdog_window(body):
-    """The join deliberately spends up to 12 s retrying and must not be killed for it."""
-    assert _pos(body, "WiFi.begin(") < _pos(body, "boot_wdt_arm("), (
+    """The join deliberately spends a scan plus up to 12 s per network and must not be killed for
+    it. It runs through hear_net_join() now, which does the scan and every WiFi.begin()."""
+    assert _pos(body, "hear_net_join(") < _pos(body, "boot_wdt_arm("), (
         "the WiFi join is inside the watchdog window and will be shot for being slow")
 
 
