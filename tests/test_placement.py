@@ -373,3 +373,81 @@ def test_cli_prints_the_vertical_block_for_3d_nodes(capsys):
     out = capsys.readouterr().out
     assert "median DOP" in out, "the 2D block must survive untouched"
     assert "vertical spread" in out and "VDOP" in out and "3D costs" in out
+
+
+class TestPlacementForTheFleetPair:
+    """nyquist/mach as surveyed. The weekend question is where receiver THREE goes, and the tool
+    used to raise on it."""
+
+    NYQ = (0.0, 0.0)
+    MACH = (-16.602, -0.272)
+    MID = (-8.301, -0.136)
+    BOX = (-68.301, -60.136, 51.699, 59.864)
+
+    def test_best_addition_answers_the_two_node_question(self):
+        r = PL.best_addition([self.NYQ, self.MACH], [(-8.86, 33.86)], self.BOX, step=20.0)
+        assert len(r) == 1
+        assert r[0]["dof"] == 0                       # 3 nodes: exact fit, residual proves nothing
+        assert r[0]["dop_gain"] is None, "a pair has no DOP, so there is no gain to quote"
+        assert r[0]["worst_span_gain_m"] is None
+
+    def test_the_baseline_extension_ranks_first_on_dop_and_is_unsolvable(self):
+        """⚠️The measured trap. dop() is local and cannot see the mirror twin a collinear array
+        has, so the extension site wins on median DOP while point.solve refuses it outright."""
+        ext = (-42.3, -0.7)                           # 34 m past mach, on the axis
+        perp = (-8.86, 33.86)                         # 34 m perpendicular of the midpoint
+        ranked = PL.best_addition([self.NYQ, self.MACH], [ext, perp], self.BOX, step=20.0)
+        by_pos = {r["position"]: r for r in ranked}
+        assert by_pos[ext]["median_dop"] < by_pos[perp]["median_dop"], \
+            "the unsolvable site really does score better on DOP -- that is the whole problem"
+        assert by_pos[ext]["collinear"] is True and by_pos[perp]["collinear"] is False
+        assert ranked[0]["position"] == perp, "collinear must sort last whatever its DOP says"
+
+    def test_the_extension_collapses_the_observable_band(self):
+        ext = PL.worst_bearing([self.NYQ, self.MACH, (-42.3, -0.7)])
+        perp = PL.worst_bearing([self.NYQ, self.MACH, (-8.86, 33.86)])
+        assert ext["span_m"] < 1.0
+        assert perp["span_m"] > 15.0
+
+    def test_cli_two_nodes_without_candidates_refuses(self, capsys):
+        assert PL.main(["--nodes", "0,0;-16.602,-0.272"]) == 2
+        out = capsys.readouterr().out
+        assert "TWO NODES GIVE ONE TDoA" in out
+        assert "pass --candidates" in out
+
+    def test_cli_two_nodes_with_candidates_ranks_them(self, capsys):
+        rc = PL.main(["--nodes", "0,0;-16.602,-0.272",
+                      "--candidates=-42.3,-0.7;-8.86,33.86", "--step", "20"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "baseline" in out
+        assert "COLLINEAR: unsolvable" in out, "the axis extension must still sort last"
+
+
+class TestWorstBearingSwingIsNotAVerdict:
+    """⚠️`observable` at the band midpoint is true by construction: the probe track straddles
+    whatever the layout is, so the swing is a property of the cone and the shift. Pinning it so
+    nobody reads it as a test of the array again."""
+
+    def test_the_midband_swing_cannot_fail_for_any_layout(self):
+        import numpy as _np
+        rng = _np.random.default_rng(3)
+        for _ in range(40):
+            P = rng.uniform(-80.0, 80.0, size=(int(rng.integers(3, 7)), 2))
+            w = PL.worst_bearing(P.tolist())
+            assert w["observable"] is True
+            assert w["max_tdoa_swing_ms"] > 4.0, \
+                "never within two orders of the 0.05 ms floor -- a gate that cannot fail"
+
+    def test_the_out_of_band_probe_is_the_one_that_discriminates(self):
+        same_side = TestOffsetObservability.SAME_SIDE
+        w = PL.worst_bearing(same_side)
+        assert w["swing_outside_band_ms"] == pytest.approx(0.0, abs=1e-9)
+        assert w["discriminating"] is True
+
+    def test_the_swing_ceiling_is_the_cone_not_the_geometry(self):
+        """2*delta*cos(theta_Mach)/c, reached by any layout whose extremes straddle squarely."""
+        c = PL.SW.sound_speed(20.0)
+        ceiling = 2.0 * 6.0 * math.cos(math.asin(c / 900.0)) / c * 1000.0
+        w = PL.worst_bearing([(-30.0, -30.0), (30.0, -30.0), (30.0, 30.0), (-30.0, 30.0)])
+        assert w["max_tdoa_swing_ms"] == pytest.approx(ceiling, rel=1e-9)
