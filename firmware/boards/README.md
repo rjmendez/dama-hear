@@ -14,6 +14,14 @@ longest to get right and would be the worst to have three slightly-different ver
 
 Roughly 2000 of those 2702 lines are platform. About 700 are board. This is the seam.
 
+## The profiles
+
+| file | board | state |
+|---|---|---|
+| `xiao_s3_sense.h` | Seeed XIAO ESP32-S3 Sense | built — nyquist, mach, rankine. Compiled by `night_node.ino`. |
+| `puc.h` | BirdWeather PUC | built — but ⚠️**compiled by nothing**; `puc_node.ino` carries its own copy of the pins, and that divergence let a wrong PPS pin survive two months. `tests/test_puc_pps_pin.py` is the comparison that now holds them together. |
+| `esp32s3_lora.h` | full-size ESP32-S3 + RFM95W (Meshtastic) | ⚠️**not built, and no pin in it is measured.** Every value is derived from the ESP-IDF headers, a datasheet or another board's convention. `docs/esp32s3-lora-node.md` is the build procedure and step 1 is a whole-bank pin scan, not a soldering iron. `tests/test_esp32s3_lora_board.py` checks it against what the silicon forbids. |
+
 ## What a profile must state, and how it must state it
 
 Every field is **measured or datasheet, never assumed**, and carries how it is known. A profile is

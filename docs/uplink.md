@@ -109,22 +109,74 @@ without its reference would discard the single strongest cue this project has me
 
 ## Airtime
 
-172 B plus Meshtastic framing, at the spreading factors that stay inside the FCC Part 15.247
-400 ms dwell limit:
+### ⚠️The table that was here was BW125, and BW125 is not a Meshtastic preset for this fleet
 
-| SF | bitrate | airtime |
+Kept, struck, because the reasoning that produced it will otherwise be produced again:
+
+> | SF | bitrate | airtime |
+> |---|---|---|
+> | ~~7~~ | ~~5470 bps~~ | ~~\~250 ms~~ |
+> | ~~8~~ | ~~3125 bps~~ | ~~\~440 ms — marginal~~ |
+> | ~~9~~ | ~~1760 bps~~ | ~~\~780 ms — **exceeds dwell**~~ |
+
+Two things are wrong with it and they compound.
+
+**It is `payload_bits / bitrate`, not LoRa airtime.** 5470/3125/1760 bps are `SF·BW/2^SF · 4/5`
+at **BW 125 kHz**, and 172·8 divided by each gives exactly 251.6 / 440.3 / 782.8 ms. That
+arithmetic omits the preamble, the explicit header, the CRC and the fact that payload symbols
+come in whole `(CR+4)`-sized groups. It therefore **under-reports by 10–17 %**. Recomputed with
+the real formula, 172 B, CR 4/5, 16-symbol preamble:
+
+| SF at BW125 | the old row | actually |
 |---|---|---|
-| 7 | 5470 bps | ~250 ms |
-| 8 | 3125 bps | ~440 ms — marginal |
-| 9 | 1760 bps | ~780 ms — **exceeds dwell** |
+| 7 | ~250 ms | **284.9 ms** |
+| 8 | ~440 ms | **508.4 ms** |
+| 9 | ~780 ms | **914.4 ms** |
 
-⚠️One sketch per **event** at SF9+ will not fit the dwell limit. Options: send one sketch per
-*string* (the loudest round) plus bare timestamps for the rest; drop to SF7; or split the sketch
-across two packets and accept the reassembly.
+**And no US Meshtastic preset uses BW 125 with CR 4/5 at those SFs at all.** From
+`src/mesh/MeshRadio.h:216-300`, the presets offered in the standard region set are BW 250 or
+500 kHz except `LongModerate`/`LongSlow`, which are BW 125 **at CR 4/8**. So the table above
+answers a question the fleet never asks. Naming an "SF" without its bandwidth and coding rate is
+the whole defect: **SF alone does not determine airtime.**
 
-The bare-timestamp fallback is ~8 B per extra round, so a 10-round string is one sketch plus
-~72 B — which is the shape the trajectory solver actually needs anyway, since it wants arrival
-times from many nodes and spectra from only one.
+### The preset table, which is the one that maps onto the radio
+
+Computed at **193 B on-air** — the 173 B v2 frame (`hear/wire.py`) plus Meshtastic's 16 B header
+(`src/mesh/RadioInterface.h:21`) and the protobuf `Data` wrapper — with the 16-symbol preamble
+Meshtastic actually ships (`src/mesh/RadioInterface.h:106-107`; **8 is the LoRa default and
+Meshtastic does not use it**), low-data-rate optimise engaged where `Tsym > 16 ms`:
+
+| preset | SF | BW kHz | CR | airtime | vs. 400 ms dwell |
+|---|---:|---:|---|---:|---|
+| **ShortTurbo** | 7 | 500 | 4/5 | **78.9 ms** | fits |
+| ShortFast | 7 | 250 | 4/5 | 157.8 ms | fits |
+| MediumTurbo | 9 | 500 | 4/5 | 254.2 ms | fits |
+| ShortSlow | 8 | 250 | 4/5 | 279.8 ms | fits |
+| MediumFast | 9 | 250 | 4/5 | 508.4 ms | over |
+| MediumSlow | 10 | 250 | 4/5 | 914.4 ms | over |
+| LongTurbo | 11 | 500 | 4/8 | 1.30 s | over |
+| LongFast *(Meshtastic default)* | 11 | 250 | 4/5 | 1.71 s | over |
+| LongModerate | 11 | 125 | 4/8 | 6.10 s | over |
+| LongSlow | 12 | 125 | 4/8 | 11.15 s | over |
+
+⚠️The dwell column carries forward the 400 ms FCC Part 15.247 figure this page already used.
+Whether a 500 kHz LoRa carrier is regulated as a hopping system or as digital modulation is
+**not settled here** and must not be decided from this table.
+
+### What it means
+
+The original conclusion stands and is now much safer: **one sketch per event fits, on
+ShortTurbo, with an order of magnitude to spare.** At the operator's 3.5-acre site the longest
+baseline is ~170 m and the link margin at SF7/BW500 is ~64 dB, so nothing forces a slower preset
+— see `docs/esp32s3-lora-node.md` §7 for the link budget and the duty-cycle arithmetic.
+
+⚠️The default preset is the trap, not the SF. `LongFast` is what a Meshtastic node boots on and
+it is **1.71 s per sketch**, 21× ShortTurbo. A node left on defaults will not carry this traffic.
+
+If a slower preset is ever forced (range, not payload): send one sketch per *string* — the
+loudest round — plus bare timestamps for the rest. That is ~8 B per extra round, so a 10-round
+string is one sketch plus ~72 B, which is the shape the trajectory solver wants anyway, since it
+needs arrival times from many nodes and spectra from only one.
 
 ## Node compute
 

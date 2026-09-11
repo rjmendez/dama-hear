@@ -90,9 +90,13 @@ No mic, no GPS, no BME280 — these still work:
    `_xtal` variant to get wrong any more -- it was removed, because `_tcxo` now defines
    `TCXO_OPTIONAL` and tries DIO3 at 1.8 V and then XTAL at 0.0 V on every boot. Older guides
    (including the fakeTec README) still link to `_xtal`; that link is dead.
-2. **Measure the airtime claim.** `docs/uplink.md` asserts 172 B is ~250 ms at SF7 and exceeds
-   the 400 ms FCC dwell at SF9. Two boards and a 172 B payload on a private portnum settles it
-   by measurement instead of a table.
+2. **Measure the airtime claim.** ⚠️The claim this item was written against — "172 B is ~250 ms
+   at SF7 and exceeds the 400 ms FCC dwell at SF9" — has since been **withdrawn**: it was
+   `payload_bits / bitrate` at BW 125, which omits preamble, header and symbol quantisation and
+   under-reports by 10–17 %, and no US Meshtastic preset uses that bandwidth at those SFs
+   anyway. See `docs/uplink.md`'s Airtime section for the preset-mapped replacement. The
+   measurement is still worth doing: two boards and a 173 B payload on a private portnum settles
+   it against the radio instead of against a formula.
 3. **Confirm the four free pads exist** on the actual SuperMini, with a meter. This is the one
    finding above that is documentation rather than measurement, and it gates the mic purchase.
 4. **Golden vectors.** Freeze `Gate` → `sketch` → `pack` outputs for a fixed input as byte-exact
