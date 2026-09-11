@@ -213,7 +213,10 @@ class Survey:
                               % (o,))
 
     def origin_is_fictional(self) -> bool:
-        return isinstance(self.origin, dict) and self.origin.get("fictional") is True
+        """Fails closed: a `fictional` key with any value but an explicit false counts."""
+        if not isinstance(self.origin, dict) or "fictional" not in self.origin:
+            return False
+        return self.origin["fictional"] is not False
 
     def diameter_m(self) -> float:
         """Largest pairwise 3D distance, metres. 3D and not horizontal because it bounds
