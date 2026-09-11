@@ -1277,6 +1277,7 @@ static uint32_t det_write_fail = 0;
 
 // ---------------------------------------------------------------- state
 static I2SClass i2s;
+static bool i2s_up = false;
 static WebServer http(80);
 static bool sd_ok = false, sta_ok = false;
 static int sd_cs = 0;
@@ -1861,6 +1862,17 @@ static void stream_pump(uint64_t *due) {
   }
   if ((int64_t)((uint64_t)esp_timer_get_time() - *due) > (int64_t)I2S_DMA_US)
     *due = blk_read_us + BLOCK_US;
+}
+
+// Audio only, never HTTP: gps_bringup() runs inside the /gpspins handler, and other handlers open,
+// close and read Serial1 under the sweep. Before i2s.begin() -- setup()'s bring-up -- a plain wait.
+static void gps_pump(uint64_t *due) { if (i2s_up) stream_pump(due); }
+
+static void gps_wait_ms(uint32_t ms) {
+  if (!i2s_up) { delay(ms); return; }
+  uint64_t due = stream_start();
+  uint32_t t0 = millis();
+  while (millis() - t0 < ms) { stream_pump(&due); delay(1); }
 }
 
 // Pumps until the socket can take STREAM_CHUNK_B without blocking. false: gone or stalled.
@@ -2538,9 +2550,11 @@ static File detf;
 // in *ub. Extracted from the sweep so the WINNER can be re-listened to for longer -- see
 // GPS_DECODE_QUORUM below -- rather than the confirmation being a second copy of this loop.
 static void gps_listen(uint32_t window_ms, int *nm_out, int *ub_out) {
-  delay(60); while (Serial1.available()) Serial1.read();
-  int nm = 0, ub = 0, i = 0; char ln[100]; uint8_t prev = 0; uint32_t t0 = millis();
+  gps_wait_ms(60); while (Serial1.available()) Serial1.read();
+  int nm = 0, ub = 0, i = 0; char ln[100]; uint8_t prev = 0;
+  uint64_t due = stream_start(); uint32_t t0 = millis();
   while (millis() - t0 < window_ms) {
+    gps_pump(&due);
     while (Serial1.available()) {
       uint8_t c = (uint8_t)Serial1.read();
       if (prev == 0xB5 && c == 0x62) ub++;            // UBX sync word
@@ -2660,6 +2674,9 @@ static int gps_pins_hint() {                             // -1 none, 0 documente
   return (v == 0 || v == 1) ? v : -1;
 }
 
+static uint32_t gps_bringup_ms = 0;   // when the last bring-up FINISHED; the watchdog counts from it
+// Holds what arrives during one audio pump in gps_listen at the fleet's fastest link (230400).
+#define GPS_RX_BUF 1024
 static void gps_bringup() {
   // DETACH THE UART FIRST. gps_pick_pins() reads both pins with digitalRead, and on a RETRY the
   // UART peripheral still owns them -- so the probe measured a pin it did not control, saw nothing
@@ -2672,6 +2689,7 @@ static void gps_bringup() {
   // it calls end() first -- found 230400 on the first try. At boot the bug is invisible because no
   // UART is open yet, which is exactly why it survived until the fleet started retrying.
   Serial1.end();
+  Serial1.setRxBufferSize(GPS_RX_BUF);
   gps_pick_pins();
   // A proven order from a previous boot beats a probe that cannot see a transmitter on the pin it
   // is driving. Tried first, never trusted: if it does not decode, the search below runs unchanged.
@@ -2723,8 +2741,9 @@ static void gps_bringup() {
     }
   }
 
-  delay(300);
+  gps_wait_ms(300);
   gps_configure();
+  gps_bringup_ms = millis();
 }
 
 void setup() {
@@ -3537,10 +3556,13 @@ void setup() {
   // taken.
   boot_wdt_arm(15000);
   i2s.setPinsPdmRx(PDM_CLK, PDM_DIN);
-  if (!i2s.begin(I2S_MODE_PDM_RX, FS_ACQ, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO))
+  if (!i2s.begin(I2S_MODE_PDM_RX, FS_ACQ, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
     logln("i2s   FAILED");
-  else logf("i2s   PDM %d Hz on CLK=%d DIN=%d -> /%d -> %d Hz\n",
-            FS_ACQ, PDM_CLK, PDM_DIN, DECIM, FS_NOMINAL);
+  } else {
+    i2s_up = true;
+    logf("i2s   PDM %d Hz on CLK=%d DIN=%d -> /%d -> %d Hz\n",
+         FS_ACQ, PDM_CLK, PDM_DIN, DECIM, FS_NOMINAL);
+  }
 
   // Raw ring. Ask for 80 s (7.68 MB of the 8.34 MB free) and step down rather than fail: what
   // matters is largest CONTIGUOUS free block, which total-free does not report. Log the span that
@@ -4023,14 +4045,13 @@ void loop() {
   // again. ubx_silent_max is now measured, so the "went quiet after working" case can be driven
   // by evidence: 60 s with the timepulse advancing and not one NAV-PVT is not sky, it is the
   // link. NAV-PVT arrives with or without a fix, so this cannot fire on a node waiting for sky.
-  { static uint32_t last_try_ms = 0, gps_retries = 0;
+  { static uint32_t gps_retries = 0;
     static const uint32_t GPS_RETRY_MS[] = {20000UL, 30000UL, 60000UL, 120000UL};
     uint32_t up_ms = millis() - boot_ms;
     uint32_t wait = GPS_RETRY_MS[gps_retries < 4 ? gps_retries : 3];
     bool never = (nmea_valid == 0 && ubx_pvt == 0);
     bool went_quiet = (ubx_pvt != 0 && ubx_silent_run >= 60);
-    if ((never || went_quiet) && up_ms > 20000UL &&
-        (last_try_ms == 0 ? up_ms > wait : millis() - last_try_ms > wait)) {
+    if ((never || went_quiet) && millis() - gps_bringup_ms > wait) {
       // The RUN is the trigger and gets cleared so one outage cannot fire every pass;
       // ubx_silent_max is the record of what happened and is never reset here.
       ubx_silent_run = 0;
@@ -4045,12 +4066,6 @@ void loop() {
       pps_resync = true; pps_resyncs++; fs_clean_secs = 0;
       pps_int_min = 0xFFFFFFFF; pps_int_max = 0;
       gps_bringup();
-      // ⚠️STAMPED AFTER, NOT BEFORE. A bring-up that has to sweep both pin orders and then
-      // restore takes tens of seconds, so a start-stamped clock has already spent the whole
-      // 20 s wait by the time it returns and the next two attempts fire back to back -- the
-      // backoff table is consumed before it can back anything off. The interval that matters is
-      // between the END of one attempt and the start of the next.
-      last_try_ms = millis();
       logf("gps   bring-up retry done: %s, RX=GPIO%d, %lu baud\n",
            gps_pin_src, gps_rx_pin, (unsigned long)gps_baud);
     }
