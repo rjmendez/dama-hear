@@ -130,6 +130,16 @@ class TestThePinnedFiles:
         v = HT.verify_perch(str(tmp_path))
         assert not v["ok"] and HT.PERCH_ARCHIVE_SHA256 in v["problems"][0]
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+    def test_an_unreadable_file_is_a_problem_not_a_crash(self, tmp_path, monkeypatch):
+        self._stage(tmp_path, monkeypatch)
+        (tmp_path / "saved_model.pb").chmod(0)
+        try:
+            v = HT.verify_perch(str(tmp_path))
+        finally:
+            (tmp_path / "saved_model.pb").chmod(0o644)
+        assert not v["ok"] and "could not be read" in v["problems"][0]
+
     def test_the_pins_cover_the_whole_measured_savedmodel(self):
         assert len(HT.PERCH_FILES) == 6
         assert sum(n for _r, _s, n in HT.PERCH_FILES) == 410275841
