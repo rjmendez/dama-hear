@@ -917,14 +917,24 @@ def scan_coincidences(dets: Sequence[Dict[str, Any]], window_s: float,
     problem, the second is a siting or clock problem -- so both are counted.
 
     ⚠️IT IS NOT associate() MINUS ONE GATE, AND NOTHING MAY ASSUME THE TWO AGREE. It was, until
-    #42 stopped consuming a geometry refusal: here a candidate is still consumed either way
-    (`used[j] = True` below), so a refused arrival that associate() hands back to seed a group of
-    its own is swallowed here by whatever reached it first. Seed AND membership can therefore
-    differ, measured on the live pool 2026-09-11: the 1789063974 episode seeds at .287743 in
-    associate() and at .299200 here. Mirroring the release rule into this scan would destroy what
-    it is for -- an UNGATED census cannot re-seed on a gate it does not have. So nothing is
-    solved off this scan; see the solve loop, which runs off associate()'s events and matches
-    back to these by MEMBER SET.
+    #42: associate() now has two NON-terminal refusals that return a candidate to ITS OWN pool
+    for a later group to pick up as a fresh seed (hear/backend/associate.py: the
+    `duplicate_node_in_group` release, and every `pairwise_dt_exceeds_geometry` refusal, which
+    never sets `used[j]`). This scan still marks every visited candidate `used[j] = True`
+    unconditionally, so a refused arrival that associate() hands back to seed a group of its own
+    is swallowed here by whatever reached it first. Seed AND membership can therefore differ,
+    measured on the live pool 2026-09-11: the 1789063974 episode seeds at node3@.287743 in
+    associate() and at node1@.299200 here, eight ms later. Mirroring the release rule into this
+    scan would destroy what it is for -- an UNGATED census cannot re-seed on a gate it does not
+    have. So nothing is solved off this scan; see the solve loop, which runs off associate()'s
+    events and matches back to these by MEMBER SET. Matching by SEED, which is what it did until
+    that was fixed, silently lost an admissible episode. Reproductions:
+    tests/test_hear_tdoa.py::TestScanCoincidencesNoLongerMatchesAssociate and
+    ::TestTheSolveLoopRunsOffAssociatedEvents.
+
+    What is still true: one detection per node per group, earliest wins with no replacement
+    WITHIN one scan, and this scan carries NO geometry gate at all -- see the module docstring
+    above for why that absence is deliberate.
     """
     pool = sorted(dets, key=lambda d: (float(d["t_utc_s"]), int(d["node_id"]), int(d["seq"])))
     used = [False] * len(pool)

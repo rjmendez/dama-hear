@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hear import detsfile as DF        # noqa: E402
 from hear import sketch as SK          # noqa: E402
 from hear import wire as WR            # noqa: E402
 from tools import hear_bridge as BR    # noqa: E402
@@ -101,6 +102,42 @@ class TestDetsCsv:
         line = "%d,12,2222,11,189911,818,0,16000.169,%s,%s" % (UTC_US, r["frame_hex"], "42")
         rows = BR.parse_dets_csv(hdr + "\n" + line)
         assert rows[0]["some_future_column"] == "42"
+
+    def test_reads_every_header_hear_detsfile_knows_about(self):
+        # Built from hear.detsfile.GENERATIONS directly rather than retyped here, so the two
+        # tables cannot drift apart again the way DETS_COLUMNS (G1 only) drifted from the real,
+        # node_id-first header every node has written since G4.
+        r = _row()
+        for gen in DF.GENERATIONS:
+            if gen.broken_header:
+                continue  # G3: covered separately below, its declared header is not its rows
+            values = {
+                "node_id": "3", "sketch_back": "192", "clip": "", "clip_why": "",
+                "sync_sigma_ns": "35000",
+            }
+            values.update({k: str(r[k]) for k in
+                          ("utc_us", "uptime_s", "sample", "pps_n", "us_since_pps",
+                           "trigger", "flags", "fs_hz", "frame_hex")})
+            hdr = ",".join(gen.declared)
+            line = ",".join(values[c] for c in gen.declared)
+            rows = BR.parse_dets_csv(hdr + "\n" + line)
+            assert len(rows) == 1, gen.name
+            assert int(rows[0]["utc_us"]) == UTC_US, gen.name
+            assert rows[0]["frame_hex"] == r["frame_hex"], gen.name
+
+    def test_g3s_lying_header_is_read_by_position_not_by_name(self):
+        # G3's declared header says `node,utc_us,...`; the firmware never wrote that column, so
+        # every real row is one field narrower than its own header. A straight DictReader (keyed
+        # off the header's names) shifts utc_us into the `node` slot; parse_dets_csv must not.
+        r = _row()
+        hdr = ",".join(DF.G3.declared)
+        line = ",".join(str(r[k]) for k in
+                        ("utc_us", "uptime_s", "sample", "pps_n", "us_since_pps",
+                         "trigger", "flags", "fs_hz", "frame_hex")) + ",,"
+        rows = BR.parse_dets_csv(hdr + "\n" + line)
+        assert len(rows) == 1
+        assert int(rows[0]["utc_us"]) == UTC_US
+        assert "node" not in rows[0]
 
 
 class TestSceneCsv:
