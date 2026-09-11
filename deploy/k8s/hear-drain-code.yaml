@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 255532 B serialised; 255710 B of annotations against a 262144 B cap.
+# apply-mode server: 257102 B serialised; 257280 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'a83ccd9'
+    dama-hear/commit: 'bec2e51'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '255532'
+    dama-hear/serialised-bytes: '257102'
 data:
   hear__init__.py: |
     
@@ -4531,6 +4531,7 @@ data:
     import argparse
     import json
     import sys
+    import time
     import urllib.request
     from typing import Dict, List, Optional, Sequence
     
@@ -4540,6 +4541,15 @@ data:
     # a capture can run.
     TIMEOUT_S = 15.0
     RETRIES = 2
+    
+    # ⚠️A CONNECTION REFUSED IS NOT NECESSARILY A DEAD NODE. tools/hear_drain.py:346-349 measured it
+    # directly: "the ESP32 core serves one client at a time and resets the rest rather than queueing
+    # them" -- reproduced live 2026-09-10, rankine answering ICMP while refusing TCP:80 outright for
+    # the seconds another client held it. A same-instant retry can land on the very connection that
+    # is still holding the node, so the retries here back off -- same 1.5 s as
+    # tools/hear_drain.py's LS_RETRY_BACKOFF_S, the other place this exact collision is measured and
+    # waited out, so a future change to that number is one place to make, not two.
+    RETRY_BACKOFF_S = 1.5
     
     # MEASURED, not assumed: nyquist wrote 2,689,167 B of scene.csv across 8,018 rows = 335 B/row, at
     # one row per 1.024 s. Everything else on the card is bounded or negligible -- the clip budget is a
@@ -4579,12 +4589,14 @@ data:
     def fetch(node: str) -> Dict:
         _, url = split_target(node)
         last: Optional[Exception] = None
-        for _ in range(RETRIES):
+        for attempt in range(RETRIES):
             try:
                 with urllib.request.urlopen(url, timeout=TIMEOUT_S) as r:
                     return json.load(r)
             except Exception as e:      # noqa: BLE001 -- one retry, then report the last reason
                 last = e
+                if attempt < RETRIES - 1:
+                    time.sleep(RETRY_BACKOFF_S)
         raise last if last else RuntimeError("unreachable")
     
     
@@ -4605,14 +4617,24 @@ data:
     def main(argv: Optional[Sequence[str]] = None) -> int:
         ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
         ap.add_argument("nodes", nargs="+")
-        # ⚠️OPT-IN, AND ONLY FOR THE SPLIT. This tool's default is to report and not gate, because a
-        # node with no sky yet is not a failure and a tool that cries wolf teaches its
-        # operator to ignore it. A SPLIT FLEET is different in kind: it is never transient, never
-        # self-healing, and it silently invalidates the capture -- arrivals from different builds are
-        # not comparable. So a scheduled caller can ask for that one condition to be an error, and
-        # gets nothing else. Unreachability still only affects the exit code as it always did.
+        # ⚠️OPT-IN, AND ONLY FOR THE SPLIT -- UNREACHABILITY DOES NOT COUNT. This tool's default is to
+        # report and not gate, because a node with no sky yet is not a failure and a tool that cries
+        # wolf teaches its operator to ignore it. A SPLIT FLEET is different in kind: it is never
+        # transient, never self-healing, and it silently invalidates the capture -- arrivals from
+        # different builds are not comparable. So a scheduled caller can ask for that one condition to
+        # be an error, and gets nothing else: with this flag, the exit code is 2 for a split and 0
+        # otherwise, full stop -- a node that did not answer is neither.
+        #
+        # ⚠️IT USED TO FALL THROUGH TO `0 if not dead else 1` even with this flag set, so
+        # deploy/k8s/hear-drain.yaml's hear-drain-check (the only caller) went red on an unreachable
+        # node -- transient (a reboot, or the ESP32 refusing a second concurrent client, see
+        # RETRY_BACKOFF_S) or not -- even though its own comment already says "gates on the SPLIT
+        # ALONE. A node with no fix yet is not a failure". Reachability has its own, better check
+        # already: tools/hear_drain.py --check's per-sensor last-success staleness gate. This flag is
+        # not a second one.
         ap.add_argument("--require-one-build", action="store_true",
-                        help="exit non-zero if the nodes that ANSWERED are not all on one build")
+                        help="exit 2 if the nodes that ANSWERED are not all on one build, 0 "
+                             "otherwise -- unreachability is not gated by this flag at all")
         a = ap.parse_args(argv)
     
         got: Dict[str, Dict] = {}
@@ -4665,8 +4687,8 @@ data:
                                    % (d["sd_free_mb"], hours))
                 if why:
                     print("  %-9s %s" % (n, "; ".join(why)))
-        if a.require_one_build and len({d.get("fw", "?") for d in got.values()}) > 1:
-            return 2
+        if a.require_one_build:
+            return 2 if len({d.get("fw", "?") for d in got.values()}) > 1 else 0
         return 0 if not dead else 1
     
     
