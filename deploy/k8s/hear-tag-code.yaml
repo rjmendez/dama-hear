@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-tag-code.yaml
-# apply-mode client: 165558 B serialised; 165736 B of annotations against a 262144 B cap.
+# apply-mode client: 165726 B serialised; 165904 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tag
   annotations:
-    dama-hear/commit: '675f1ee'
+    dama-hear/commit: '8221466'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '165558'
+    dama-hear/serialised-bytes: '165726'
 data:
   hear__init__.py: |
     
@@ -2124,7 +2124,9 @@ data:
     
     
     def birdnet_group(scores: Dict[str, float]) -> str:
-        """The top label's common name when it reaches BIRDNET_REPORT, else "below 0.5"."""
+        """The top class's common name once it reaches BIRDNET_REPORT, else "below 0.5". The class is
+        a species or one of BirdNET's non-species classes (Dog, Engine, ...), which the range filter
+        never removes; both are what the clip was heard as."""
         if not scores:
             return "none"
         top = max(scores, key=scores.get)
@@ -2198,7 +2200,7 @@ data:
                     "embedding": None, "embedding_dim": None,
                     "extra": {"location_filter": {"lat": self.lat, "lon": self.lon, "week": week,
                                                   "threshold": BIRDNET_LOCATION_THRESHOLD,
-                                                  "species_kept": int(keep.sum())},
+                                                  "classes_kept": int(keep.sum())},
                               "max_out_of_range_score": float(p[~keep].max()) if (~keep).any()
                               else 0.0}}
     
