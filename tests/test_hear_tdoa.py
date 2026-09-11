@@ -1001,6 +1001,62 @@ class TestTheSolveLoopRunsOffAssociatedEvents:
             assert r["member_event_keys"] or r["associate_reason"] in AS.REASONS
         assert t["conservation"]["every_candidate_explained"] is True
 
+    def test_a_shared_seed_with_different_members_is_NOT_a_match(self, tmp_path, monkeypatch):
+        """⚠️MUTATION-CHECKED, AND THE OTHER FIXTURES IN THIS CLASS DO NOT COVER IT. Reverting
+        this join from the member SET back to the SEED left the whole suite green: in every
+        natural fixture here the two scans disagree on the seed AND on the membership, so both
+        rules answer the same. Only a candidate that shares its EARLIEST arrival with an event of
+        different membership tells them apart -- which is what associate() produces whenever its
+        geometry gate refuses a node the ungated scan keeps, from the same seed.
+
+        Injected rather than planted: a natural fixture for this shape exists (it is the live
+        corpus's own), but it needs a geometry that refuses exactly one node of a group the scan
+        keeps, and pinning the join should not depend on re-finding that geometry.
+        """
+        real = HT.AS.associate
+        dropped = {}
+
+        def drop_last_member(*a, **kw):
+            got = real(*a, **kw)
+            for ev in got["events"]:
+                if len(ev["detections"]) <= 3:
+                    continue
+                d = sorted(ev["detections"], key=lambda m: float(m["t_utc_s"]))
+                keep = d[:-1]                       # same earliest arrival, one member short
+                dropped[ev["t0_utc_s"]] = d[-1]["pool_key"]
+                # conservation is asserted on associate()'s own return, so the member this
+                # injection removes has to land somewhere: refused, as the real gate would.
+                got["rejected"].append(AS._row(d[-1], "pairwise_dt_exceeds_geometry",
+                                               "injected by the test"))
+                ev["detections"] = keep
+                ev["node_ids"] = [int(m["node_id"]) for m in keep]
+                ev["arrivals"] = [float(m["t_utc_s"]) for m in keep]
+                ev["n_nodes"] = len(keep)
+                ev["n_equations"] = len(keep) - 1
+                ev["span_s"] = ev["arrivals"][-1] - ev["arrivals"][0]
+            return got
+
+        monkeypatch.setattr(HT.AS, "associate", drop_last_member)
+        nodes = LIVE_NODES + [{"node_id": 5, "name": "extra", "e_m": 8.0, "n_m": -9.0,
+                               "u_m": 0.0, "sigma_m": 0.5}]
+        sv = SV.from_dict(survey_dict(nodes))
+        t = go(tmp_path, planted(sv, (40.0, 30.0, 0.0), T0),
+               survey=write_survey(tmp_path, nodes))
+        assert dropped, "the injection did not fire, so this asserts nothing"
+        run = pathlib.Path(t["out"]) / "runs" / t["run_id"]
+        cand = [json.loads(l) for l in (run / "candidates.jsonl").read_text().splitlines()]
+        att = [json.loads(l) for l in (run / "attempts.jsonl").read_text().splitlines()]
+        assert len(cand) == 1 and len(att) == 1
+        assert cand[0]["pool_keys"][0] == att[0]["pool_keys"][0], (
+            "fixture void: the candidate and the event no longer share a seed, so a seed match "
+            "and a set match would answer the same here")
+        assert set(cand[0]["pool_keys"]) != set(att[0]["pool_keys"]), "fixture void: same members"
+        assert cand[0]["reached_associate"] is False, (
+            "a candidate whose members are NOT an event matched it anyway -- the join has gone "
+            "back to comparing seeds, which is the 2026-09-11 regression's mechanism")
+        assert cand[0]["associate_reason"], "and it must still name why"
+        assert t["conservation"]["every_candidate_explained"] is True
+
     def test_the_membership_match_is_the_set_not_the_seed(self, tmp_path):
         """A candidate whose members ARE an event, in a different order, still reaches it."""
         sv = SV.from_dict(survey_dict())
