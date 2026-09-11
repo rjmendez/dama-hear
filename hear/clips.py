@@ -49,7 +49,7 @@ INDEX_NAME = "index.jsonl"
 #: this whole lane exists to prevent.
 OUTCOMES = ("stored", "already_held", "evicted_before_fetch", "refused_bad_body",
             "refused_short", "refused_http", "deferred_by_cap", "refused_name",
-            "probed_404", "refused_store")
+            "refused_node", "probed_404", "refused_store")
 
 #: Once an index row reaches one of these, the name is never probed again. Without it the drain
 #: re-probes 321 already-dead nyquist names every 15 minutes forever (measured 2026-09-09).

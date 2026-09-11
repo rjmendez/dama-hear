@@ -964,3 +964,36 @@ class TestADashedNodeIdIsAName:
         assert "bad_name" not in r["clips_refused"], r["clips_refused"]
         assert _clip_paths(n) == [raw]
         assert r["clips_fetched"] == 1
+
+
+class TestAClipNamedForAnotherNodeIsNotFiled:
+    """A clip lands under the node it was fetched from, so a name claiming a different node is
+    either a known alias of that node or a mis-flash, and a mis-flash is refused, not filed."""
+
+    NYQUIST_RAW = "/clips/nyquist-00002a9f13c0-0240479148.wav"
+
+    def test_another_nodes_clip_on_this_card_is_refused_unfetched(self, tmp_path, wired):
+        raw = self.NYQUIST_RAW
+        n = wired(node="mach", clips={raw: _wav()},
+                  dets_rows=[_dets_row(raw, node="mach", sample=240479148)])
+        r = HD.drain_node(_pool(tmp_path), "mach", "10.0.0.2")
+        assert r["clips_refused"].get("node_mismatch") == 1, r["clips_refused"]
+        assert _clip_paths(n) == []
+        assert r["clips_fetched"] == 0
+
+    def test_an_alias_is_only_an_alias_of_its_own_node(self, tmp_path, wired):
+        raw = TestADashedNodeIdIsAName.RANKINE_RAW
+        n = wired(node="mach", clips={raw: _wav()},
+                  dets_rows=[_dets_row(raw, node="mach", sample=487893711)])
+        r = HD.drain_node(_pool(tmp_path), "mach", "10.0.0.2")
+        assert r["clips_refused"].get("node_mismatch") == 1, r["clips_refused"]
+        assert _clip_paths(n) == []
+
+    def test_the_refusal_is_booked_in_the_index(self, tmp_path, wired):
+        raw = self.NYQUIST_RAW
+        wired(node="mach", clips={raw: _wav()},
+              dets_rows=[_dets_row(raw, node="mach", sample=240479148)])
+        pl = _pool(tmp_path)
+        HD.drain_node(pl, "mach", "10.0.0.2")
+        rows = list(CL.read_outcomes(pl.root).values())
+        assert [r["outcome"] for r in rows] == ["refused_node"], rows
