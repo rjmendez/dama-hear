@@ -1285,6 +1285,9 @@ static uint32_t praw_mark_n = 0;            // total ever recorded; slot is n % 
 // mixing the two is a silent factor-of-DECIM error in a time span, so the conversion lives here
 // rather than being open-coded at each site.
 static uint32_t praw_cap_d() { return praw_cap / DECIM; }
+// praw is written, read and floor-checked in one 64-bit acquisition domain.
+static uint64_t g_samples64 = 0;            // g_samples without the wrap; loop task only
+static uint64_t samp64(uint32_t s) { return g_samples64 - (uint32_t)(g_samples - s); }
 // Acquisition-sample offset of a decimated sample index. The FIR is linear phase, so the sound in
 // decimated output J was centred DECIM_DELAY acquisition samples before that output's newest
 // input -- which is why a clip cut at J*DECIM alone would start 4.667 ms late (DECIM_DELAY 224
@@ -1293,15 +1296,16 @@ static uint32_t praw_cap_d() { return praw_cap / DECIM; }
 // boot the unsigned arithmetic would underflow to ~4e9, and every caller compares the result
 // against a window bound -- so a detection in the first 4 ms would have passed a "is the pre-roll
 // in the ring" test it should have failed, and cut a clip from wherever that wrapped index landed.
-static uint32_t acq_of(uint32_t d_samp) {
-  uint64_t a = (uint64_t)d_samp * DECIM + (DECIM - 1);
-  return a > (uint64_t)DECIM_DELAY ? (uint32_t)(a - DECIM_DELAY) : 0;
+static uint64_t acq_of(uint32_t d_samp) {
+  uint64_t a = samp64(d_samp) * DECIM + (DECIM - 1);
+  return a > (uint64_t)DECIM_DELAY ? a - DECIM_DELAY : 0;
 }
 
-static uint32_t praw_oldest() {             // oldest sample index the ring still holds
-  uint32_t now = g_samples;
-  return (praw_cap && now > praw_cap_d()) ? now - praw_cap_d() : 0;
+static uint64_t praw_oldest64() {
+  return (praw_cap && g_samples64 > praw_cap_d()) ? g_samples64 - praw_cap_d() : 0;
 }
+static uint32_t praw_oldest() { return (uint32_t)praw_oldest64(); }   // oldest sample the ring holds
+static uint64_t praw_floor() { return praw_oldest64() * DECIM; }      // the same, as a praw index
 static uint32_t praw_mark_first() { return praw_mark_n > PRAW_MARKS ? praw_mark_n - PRAW_MARKS : 0; }
 
 // What a mark is worth. Its sample index is interpolated from the last completed block to the
@@ -1812,7 +1816,8 @@ static uint32_t sd_free_mb_last = 0;     // sampled on the 30 s health tick, not
                                          // cost on this card has not been measured.
 static File     clipf;
 static bool     clip_busy = false;
-static uint32_t clip_k = 0, clip_at_sample = 0, clip_at_seq = 0, clip_s = 0, clip_left = 0;
+static uint32_t clip_k = 0, clip_at_sample = 0, clip_at_seq = 0, clip_left = 0;
+static uint64_t clip_s = 0;
 static uint32_t clip_last_sample = 0;
 static bool     clip_have_last = false;
 static char clip_rand[CLIP_RAND_HEX + 1] = "000000";
@@ -1920,13 +1925,16 @@ static void clip_pump() {
   if (clip_busy) {
     uint32_t nsamp = clip_left > CLIP_CHUNK_B / 2 ? CLIP_CHUNK_B / 2 : clip_left;
     static uint8_t cbuf[CLIP_CHUNK_B];
-    // The ring wraps mid-chunk; this is the same two-memcpy the /audio handler uses, and it is
-    // the only place in this file that knows how praw wraps.
-    uint32_t idx = clip_s % praw_cap;          // clip_s is an ACQUISITION cursor
-    uint32_t run = praw_cap - idx; if (run > nsamp) run = nsamp;
-    memcpy(cbuf, praw + idx, (size_t)run * 2);
-    if (run < nsamp) memcpy(cbuf + run * 2, praw, (size_t)(nsamp - run) * 2);
-    bool ok = clipf.write(cbuf, (size_t)nsamp * 2) == (size_t)nsamp * 2;
+    bool lapped = clip_s < praw_floor();
+    bool ok = false;
+    if (!lapped) {
+      // The ring wraps mid-chunk; this is the same two-memcpy the /audio handler uses.
+      uint32_t idx = (uint32_t)(clip_s % praw_cap);   // clip_s is an ACQUISITION cursor
+      uint32_t run = praw_cap - idx; if (run > nsamp) run = nsamp;
+      memcpy(cbuf, praw + idx, (size_t)run * 2);
+      if (run < nsamp) memcpy(cbuf + run * 2, praw, (size_t)(nsamp - run) * 2);
+      ok = clipf.write(cbuf, (size_t)nsamp * 2) == (size_t)nsamp * 2;
+    }
     clip_s += nsamp; clip_left -= nsamp;
     if (!ok || !clip_left) {
       clipf.close();
@@ -1941,10 +1949,10 @@ static void clip_pump() {
         clip_last_sample = clip_at_sample; clip_have_last = true;
         if (mine) d.clip_st = CLIP_OK;
       } else {
-        clip_fail++;
+        if (lapped) clip_skip_ring++; else clip_fail++;
         char p[80]; clip_name(p, sizeof p, clip_at_seq, clip_at_sample);
         SD.remove(p);                         // a truncated WAV is worse than no WAV
-        if (mine) d.clip_st = CLIP_FAIL;
+        if (mine) d.clip_st = lapped ? CLIP_RING : CLIP_FAIL;
       }
     }
     return;
@@ -1977,13 +1985,13 @@ static void clip_pump() {
     if (up - d.uptime_s > CLIP_WAIT_MAX_S) { d.clip_st = CLIP_STALLED; clip_skip_ring++; }
     return;                                   // otherwise: not an error, just not yet
   }
-  uint32_t start = acq_of(d.sample) - CLIP_PRE_SAMPLES;   // acquisition domain
-  // ⚠️THE RING FLOOR IS praw_oldest()*DECIM, NOT acq_of(praw_oldest()). acq_of() converts a
+  uint64_t start = acq_of(d.sample) - CLIP_PRE_SAMPLES;   // acquisition domain
+  // ⚠️THE RING FLOOR IS praw_floor(), NOT acq_of(praw_oldest()). acq_of() converts a
   // DETECTION index and subtracts the FIR group delay to name the instant the sound arrived. A ring
   // floor is not an instant, it is the oldest sample the buffer still holds -- and subtracting the
   // delay from it makes the bound EARLIER than what is really there, so a clip could be cut from
   // samples already overwritten. Two different conversions; I used one for both. (Copilot, PR #15.)
-  if ((int32_t)(start - praw_oldest() * DECIM) < 0) { d.clip_st = CLIP_RING; clip_skip_ring++; return; }
+  if (start < praw_floor()) { d.clip_st = CLIP_RING; clip_skip_ring++; return; }
 
   if (clip_have_last && d.sample < clip_last_sample) clip_seq = (clip_seq + 1u) & CLIP_SEQ_MASK;
   if (!clip_make_room())             { d.clip_st = CLIP_FAIL; clip_fail++; return; }
@@ -3306,11 +3314,12 @@ void setup() {
     wav_header(hdr, nout * DECIM * 2, (uint32_t)lrint(fsu * DECIM));   // praw is acquisition-rate
     c.write(hdr, sizeof hdr);
     uint64_t due = stream_start();
-    uint32_t s = acq_of((uint32_t)got0), left = nout * DECIM;   // acquisition domain
+    uint64_t s = acq_of((uint32_t)got0);                        // acquisition domain
+    uint32_t left = nout * DECIM;
     while (left && stream_ready(c, &due)) {
-      if ((int32_t)(s - praw_oldest() * DECIM) < 0) break;
+      if (s < praw_floor()) break;
       uint32_t nsamp = left > STREAM_CHUNK_B / 2 ? STREAM_CHUNK_B / 2 : left;
-      uint32_t idx = s % praw_cap;
+      uint32_t idx = (uint32_t)(s % praw_cap);
       uint32_t run = praw_cap - idx; if (run > nsamp) run = nsamp;
       memcpy(stream_buf, praw + idx, (size_t)run * 2);
       if (run < nsamp) memcpy(stream_buf + run * 2, praw, (size_t)(nsamp - run) * 2);
@@ -3698,15 +3707,14 @@ static void audio_pump() {
     // sig_dc is in health.csv if the pedestal is ever wanted back.
     if (praw && n > 0) {
       // ⚠️praw IS AT FS_ACQ AND INDEXED IN ACQUISITION SAMPLES. g_samples counts DECIMATED samples --
-      // the unit every timestamp and dets row is in -- so the offset is g_samples * DECIM. Exactly
-      // proportional by construction: integer decimation cannot lose sync with itself, which is why
-      // there is no second counter here to drift.
-      uint32_t w = (uint32_t)(((uint64_t)g_samples * DECIM) % praw_cap);
+      // the unit every timestamp and dets row is in -- so the offset is g_samples64 * DECIM, the
+      // same count without the 32-bit wrap: praw_cap does not divide 2^32.
+      uint32_t w = (uint32_t)((g_samples64 * DECIM) % praw_cap);
       uint32_t run = praw_cap - w; if (run > (uint32_t)n) run = (uint32_t)n;
       memcpy(praw + w, acblk, (size_t)run * 2);
       if ((uint32_t)n > run) memcpy(praw, acblk + run, (size_t)((uint32_t)n - run) * 2);
     }
-    g_samples += nd;
+    g_samples += nd; g_samples64 += nd;
     blk_end_samp = g_samples; blk_end_us = (uint64_t)esp_timer_get_time();
     // One block IS one scene frame (BLOCK == MELS_NFFT), so the 1.024 s descriptor is built
     // 16 ms at a time. A short read cannot be a frame; count it rather than pad it with silence.

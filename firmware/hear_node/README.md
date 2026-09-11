@@ -292,13 +292,19 @@ that span. Each
 detection now also gets a fixed-length WAV on the card, so the audio is still there when
 the drain comes to identify it.
 
-    /clips/<8 hex boot id>-<10 digit sample>.wav      e.g. /clips/1a2b3c4d-0004192768.wav
+    /clips/<node>-<6 hex seq><6 hex random>-<10 digit sample>.wav
+                                            e.g. /clips/nyquist-00002ac91f3e-0004192768.wav
 
-The boot id is `esp_random()` at startup — **not** derived from `utc_us` (three of the capture's 62
+The boot field is a sequence (one past the highest on the card) plus `esp_random()` at startup — **not** derived from `utc_us` (three of the capture's 62
 rows have `utc_us == 0`, and zeros collide) and not from `sample` or `det_n` alone, both of which
 restart at 0 every boot and would have a second boot overwrite the first. The sample index is the
 join key back to `dets.csv`. Clips live in a subdirectory because FAT root directory entries are
 finite and long filenames burn several each.
+
+The ring is written, read and floor-checked in one 64-bit acquisition index (`g_samples64 × 3`).
+A 32-bit one stops matching the write position once `g_samples × 3` passes 2³², which is 24.86 h of
+uptime, not the 74.6 h at which `g_samples` itself wraps: the 80 s ring does not divide 2³², so from
+then on every clip and `/audio` read came from 38.49 s away (18.49 s with the 60 s ring).
 
 The writer addresses the ring **by sample, not by UTC**. `dets[].sample` is a direct `praw` index —
 both are counted in `g_samples` — so unlike `/audio`, which refuses outright with *"the ring cannot
@@ -306,14 +312,16 @@ be addressed by time"*, a clip still works for a detection stamped `utc_us == 0`
 
 ### Length, and why the post-roll is the long half
 
-**1 s before the trigger, 3 s after: 64 000 samples, 128 044 B with the header.** The events are
+**1 s before the trigger, 4 s after, at 48 kHz: 240 000 samples, 480 044 B with the header.** The events are
 longer than the descriptor — across the 8 frames of each in-run sketch the median energy varies
 only ~4 dB and the peak frame is spread over all 8 positions, so whatever fired the gate has not
 finished inside the sketch window. Post-roll is where the content is. That was measured on the
 44 ms window; the window is now 33.3 ms, so it holds a fortiori.
 
-Every written clip is **exactly** 128 044 B. A window that has fallen off either end of the ring is
-refused rather than shortened, which is what makes the budget arithmetic exact rather than an
+Every written clip is **exactly** 480 044 B. A window that has fallen off either end of the ring is
+refused rather than shortened, and so is a clip the ring overtakes while it is being written (the
+ring keeps advancing inside `/sd`, `/ls`, `/audio` and `/perf`, and the clip writer only runs
+between requests): the partial file is deleted and the row says `ring`. That is what makes the budget arithmetic exact rather than an
 estimate — and what stops a caller believing it has audio it does not have, the same reason
 `/audio` sends `X-Audio-Clipped`.
 
@@ -324,6 +332,9 @@ and the second clip would be a 4 s window overlapping the first by 3 s. A detect
 way still gets its row, with `clip_why = dedupe`.
 
 ### The budget, and the arithmetic behind it
+
+⚠️The 12 h arithmetic below was measured on the 2026-09-07 capture, under the 16 kHz firmware whose
+clips were 128 044 B; it is kept as that record. The current budget is the last two paragraphs.
 
 Free space measured on this card is **19 MiB** (`sd_free_mb` is a floor — `(total − used)/1048576`
 — and it read 19 for most of the run). Over 12 h the CSVs take, from row sizes measured on
@@ -337,12 +348,14 @@ the capture's own files:
 | | | | **9 816 691 B = 9.36 MiB** |
 
 That leaves **9.64 MiB**. At the measured event rate — 33 events in 11.33 h = 2.91/h = 35 over
-12 h — clips cost 35 × 128 044 = 4 481 540 B = **4.27 MiB**, a 2.26× margin.
+12 h — those 16 kHz clips cost 35 × 128 044 = 4 481 540 B = 4.27 MiB. At 480 044 B the same 35
+would be 16.02 MiB, more than the 9.64 MiB, so clips no longer accumulate over a run.
 
-`CLIP_BUDGET_B` is set **above** that rather than at it, at **6 MiB = 49 clips**, because the events
-are not spread evenly: **34 of the 48 triggers fall in the two hours 09:00–10:59**. A byte budget is
-the bound: 6 MiB holds 13 clips of 480,044 B as a rolling window and still leaves 3.64 MiB of the remainder
-for the CSVs to overrun into.
+`CLIP_BUDGET_B` is **6 MiB = 13 clips** of 480 044 B, a rolling window: the drain fetches every
+15 min and the oldest clip is evicted for each new one. The events are not spread evenly — **34 of
+the 48 triggers fell in the two hours 09:00–10:59** — and 13 is the most that can arrive between
+two drains without one being evicted unfetched. 6 MiB still leaves 3.64 MiB of the 9.64 MiB for
+the CSVs to overrun into.
 
 ⚠️**There is no 24 h budget, because there is no spare day.** `scene.csv` alone consumes the whole
 19 MiB in 24.96 h and the three CSVs together in 24.36 h.
@@ -388,8 +401,8 @@ with no nested pump inside a card write. A whole clip is 118 chunks, so at the ~
 takes it lands in about 1.9 s.
 
 ⚠️**A clip costs about two dropped seconds, measured on hardware.** Forcing one detection with
-`POST /gate?floor=100` on a quiet evening took `drop_s` from 5 to 7 while the single 128 044 B clip
-was written; a second run over the same window took it 7 → 12 alongside the `/sd` fetches of the
+`POST /gate?floor=100` on a quiet evening took `drop_s` from 5 to 7 while a single 128 044 B clip
+of the 16 kHz firmware was written (a 480 044 B clip is 3.75× the chunks; its cost is not yet measured); a second run over the same window took it 7 → 12 alongside the `/sd` fetches of the
 clip itself. So the cost is real and it is not hidden — it lands in `drop_s`, which is the
 instrument for exactly this.
 
@@ -465,8 +478,8 @@ indistinguishable from a dead microphone — the exact failure `env_e_max_win` e
 ⚠️**Neither bound protects the card, and it would be a lie to imply one does.** Floor 100 gives 27×
 the crossing rate of floor 800 on the measured capture. What bounds the card is downstream:
 `det_flush` writes at most 16 rows per second (16 × 437 B = 6992 B/s, so 19 MiB in **47 min** at
-the absolute cap), and the clip writer — which at 128 044 B a clip would fill the card in about
-three minutes at that rate — is held by `CLIP_BUDGET_B`. **The clip byte budget is what makes the
+the absolute cap), and the clip writer — at 480 044 B a clip, 19 MiB is only 41 clips — is held
+by `CLIP_BUDGET_B`. **The clip byte budget is what makes the
 floor route safe, not the other way round.** Lower this floor on an unattended node only with that
 budget in place.
 

@@ -123,7 +123,43 @@ def test_a_dropped_scene_row_is_counted_where_it_can_be_read():
 
 
 def test_audio_stops_rather_than_serve_a_lapped_ring():
-    assert "if ((int32_t)(s - praw_oldest() * DECIM) < 0) break;" in _handler("/audio")
+    assert "if (s < praw_floor()) break;" in _handler("/audio")
+
+
+def test_a_clip_the_ring_laps_mid_write_is_dropped_not_labelled_ok():
+    """The ring advances inside every long handler and clip_pump runs only from loop(), so a clip
+    in flight can be overtaken; its remaining chunks would be later audio under clip_why=ok."""
+    b = _fn("clip_pump")
+    busy = _block(b, b.index("if (clip_busy)"))
+    assert busy.index("bool lapped = clip_s < praw_floor();") < busy.index("memcpy(cbuf, praw + idx")
+    assert "bool ok = false;" in busy and "if (!lapped) {" in busy
+    assert "if (lapped) clip_skip_ring++; else clip_fail++;" in busy
+    assert "d.clip_st = lapped ? CLIP_RING : CLIP_FAIL;" in busy
+
+
+def test_praw_is_written_and_read_in_one_64_bit_domain():
+    """praw_cap does not divide 2^32, so a uint32 acquisition cursor stops matching the write
+    position once g_samples * DECIM passes 2^32: 24.86 h at 16 kHz."""
+    assert "uint32_t w = (uint32_t)((g_samples64 * DECIM) % praw_cap);" in _fn("audio_pump")
+    assert "g_samples += nd; g_samples64 += nd;" in _fn("audio_pump")
+    assert re.search(r"^static uint64_t acq_of\(uint32_t d_samp\)", CODE, flags=re.M)
+    assert re.search(r"^static uint64_t clip_s = 0;", CODE, flags=re.M)
+    assert "uint64_t s = acq_of((uint32_t)got0);" in _handler("/audio")
+    assert sorted(re.findall(r"\(([^()]*(?:\([^()]*\))?[^()]*) % praw_cap\)", CODE)) == \
+        ["(g_samples64 * DECIM)", "clip_s", "s"]
+
+
+def test_the_uint32_cursor_was_off_by_2_32_mod_the_ring_and_the_64_bit_one_is_not():
+    wrap_d = -(-2 ** 32 // 3)
+    for span_s, off in ((60, 887296), (80, 1847296)):
+        cap = span_s * 48000
+        g32 = g64 = wrap_d + 10 * 16000
+        write = (g64 * 3) % cap
+        assert ((g32 * 3) & 0xFFFFFFFF) % cap == (write - off) % cap
+        widened = g64 - ((g32 - (g32 - 5)) & 0xFFFFFFFF)
+        assert (widened * 3) % cap == ((g64 - 5) * 3) % cap
+    g32, g64 = 3, 2 ** 32 + 3
+    assert g64 - ((g32 - (2 ** 32 - 2)) & 0xFFFFFFFF) == 2 ** 32 - 2
 
 
 def test_the_headroom_is_the_configured_dma_at_the_acquisition_rate():
