@@ -1,0 +1,154 @@
+---
+# ⚠️SHIPPED SUSPENDED. The Perch 2.0 lane: a 1536-d embedding of every pooled clip, computed on
+# the RTX 2080 Ti. It runs the same tools/hear_tag.py as hear-tag, from the same hear-tag-code
+# ConfigMap, with `--lane perch_v2`, and writes clips/tags-perch_v2.jsonl and
+# state/tag_heartbeat-perch_v2.json. It stores the embedding only; PerchEmbedder in
+# tools/hear_tag.py has the measurement behind dropping the label head.
+#
+# Before unsuspending both CronJobs:
+#   1. Stage the model. It is 392 MB and cannot ride in a ConfigMap:
+#        curl -L -o perch_v2.tar.gz \
+#          https://www.kaggle.com/api/v1/models/google/bird-vocalization-classifier/tensorFlow2/perch_v2/2/download
+#        sha256sum perch_v2.tar.gz      # c04211da33038176efd299519c398b9486d64a2c1e63fafa4df331600552e556
+#        mkdir perch_v2 && tar -xzf perch_v2.tar.gz -C perch_v2
+#        kubectl -n dama cp perch_v2 <a pod mounting hear-pool>:/pool/models/perch_v2
+#      Every file is hashed against PERCH_FILES before each run, and the run is refused otherwise.
+#   2. The node needs a free pod slot and a working GPU device plugin.
+#   3. kubectl -n dama patch cronjob hear-embed hear-embed-check -p '{"spec":{"suspend":false}}'
+#
+# ⚠️PINNED TO THE 2080 Ti. Time slicing gives no VRAM isolation (docs/acoustic-stack.md S5, gate
+# 3): a pod asking for nvidia.com/gpu can land on the 4070 Ti, where vLLM holds ~9 GB. Device 0 in
+# PCI bus order is the 2080 Ti, the pinning the qdrant and vLLM pods already use. Measured peak
+# 2.35 GB, 13 ms per clip after a 14 s compile.
+#
+# ⚠️IT TOUCHES THE PVC AND NEVER A NODE.
+#
+# ⚠️APPLY ONLY THIS FILE, plus deploy/k8s/hear-tag-code.yaml, which it shares with hear-tag.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-embed
+  namespace: dama
+  labels:
+    app: hear-embed
+spec:
+  suspend: true
+  # Clear of the drain (:00/:15/:30/:45) and hear-tag (:12/:42).
+  schedule: "4,34 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 1500
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: hear-embed
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: embed
+              image: tensorflow/tensorflow:2.20.0-gpu
+              command: ["/bin/sh", "-lc"]
+              args:
+                - |
+                  set -e
+                  export PYTHONPATH=/app
+                  MODELS=/pool/models/perch_v2
+                  if ! python /app/tools/hear_tag.py --lane perch_v2 --model-dir "$MODELS" --verify-weights; then
+                    echo "perch_v2 is missing or is not the pinned SavedModel. See the header of"
+                    echo "deploy/k8s/hear-embed.yaml for staging."
+                    exit 1
+                  fi
+                  exec python /app/tools/hear_tag.py \
+                    --pool /pool/corpus \
+                    --model-dir "$MODELS" \
+                    --lane perch_v2 \
+                    --limit 400 \
+                    --deadline-s 600
+              env:
+                - { name: CUDA_VISIBLE_DEVICES, value: "0" }
+                - { name: CUDA_DEVICE_ORDER, value: PCI_BUS_ID }
+                - { name: TF_FORCE_GPU_ALLOW_GROWTH, value: "true" }
+                - { name: TF_CPP_MIN_LOG_LEVEL, value: "2" }
+              volumeMounts:
+                - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/sketch.py,   subPath: hear_sketch.py }
+                - { name: code, mountPath: /app/hear/clips.py,    subPath: hear_clips.py }
+                - { name: code, mountPath: /app/hear/tags.py,     subPath: hear_tags.py }
+                - { name: code, mountPath: /app/hear/resample.py, subPath: hear_resample.py }
+                - { name: code, mountPath: /app/tools/hear_tag.py, subPath: tools_hear_tag.py }
+                - { name: pool, mountPath: /pool }
+              resources:
+                requests: { cpu: 500m, memory: 2Gi }
+                limits:   { cpu: "2", memory: 6Gi, nvidia.com/gpu: "1" }
+          volumes:
+            - name: code
+              configMap:
+                name: hear-tag-code
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool
+---
+# The same gates as hear-tag-check, on the perch_v2 heartbeat. The lane has no scores, so the
+# score floor and the silence fraction report; staleness, weights, throughput, refusal buckets and
+# the accounting invariant gate. No GPU: the check reads JSON and hashes files.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-embed-check
+  namespace: dama
+  labels:
+    app: hear-embed
+spec:
+  suspend: true
+  schedule: "38 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: hear-embed
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: check
+              image: python:3.13-slim
+              command: ["/bin/sh", "-lc"]
+              args:
+                # `set +e` and the gate's rc captured first, as in hear-tag-check.
+                - |
+                  set +e
+                  export PYTHONPATH=/pool/pylib-tag:/app
+                  python /app/tools/hear_tag.py --pool /pool/corpus --check --lane perch_v2 \
+                    --window-s 7200 --max-stale-s 14400 --max-silence-frac -1 \
+                    --min-mean-top-score -1
+                  rc=$?
+                  echo "--- weights ---"
+                  python /app/tools/hear_tag.py --lane perch_v2 --model-dir /pool/models/perch_v2 --verify-weights || true
+                  exit "$rc"
+              volumeMounts:
+                - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/sketch.py,   subPath: hear_sketch.py }
+                - { name: code, mountPath: /app/hear/clips.py,    subPath: hear_clips.py }
+                - { name: code, mountPath: /app/hear/tags.py,     subPath: hear_tags.py }
+                - { name: code, mountPath: /app/hear/resample.py, subPath: hear_resample.py }
+                - { name: code, mountPath: /app/tools/hear_tag.py, subPath: tools_hear_tag.py }
+                - { name: pool, mountPath: /pool }
+              resources:
+                requests: { cpu: 100m, memory: 128Mi }
+                limits:   { cpu: "1",  memory: 512Mi }
+          volumes:
+            - name: code
+              configMap:
+                name: hear-tag-code
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool
