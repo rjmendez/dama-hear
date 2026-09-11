@@ -309,24 +309,107 @@ def _block(path):
     return text if text.endswith("\n") else text + "\n"
 
 
+#: The annotation `kubectl apply` writes the submitted object into. Its key counts against the
+#: same cap its value does, which is why it is spelled out here rather than assumed to be free.
+LAST_APPLIED_KEY = "kubectl.kubernetes.io/last-applied-configuration"
+
+
+def _go_string(s):
+    """One JSON string the way Go's `encoding/json` writes it. NOT what `json.dumps` writes.
+
+    ⚠️THIS IS THE WHOLE DEFECT THIS FUNCTION EXISTS TO FIX. `kubectl` is Go, and Go's
+    encoding/json is not Python's:
+
+      * it HTML-escapes `<`, `>` and `&` to `\\u003c` / `\\u003e` / `\\u0026` -- +5 B each, and
+        this repo's sources are full of `->`, `<=` and `&`: 331 of them in hear-drain-code alone
+      * it emits non-ASCII as RAW UTF-8, where `json.dumps` defaults to `ensure_ascii=True` and
+        writes `\\uXXXX` -- 6 B for a `⚠️` that is 3 B on the wire, so this direction OVER-counts
+      * it has no short escape for 0x08/0x0c: `\\u0008` / `\\u000c` where Python writes `\\b` / `\\f`
+
+    The two errors do not cancel. Measured against the live objects on 2026-09-11 the Python
+    number was 696 B / 561 B / 238 B UNDER the bytes the API server had actually stored for
+    hear-drain-code / hear-tag-code / hear-score-code.
+
+    Written out per character rather than post-processing `json.dumps` output, because a
+    post-pass cannot tell a `<` inside a string from a `<` this encoder already escaped.
+    """
+    out = ['"']
+    for ch in s:
+        o = ord(ch)
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif o < 0x20 or ch in "<>&" or o in (0x2028, 0x2029):
+            out.append("\\u%04x" % o)
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def kubectl_json(obj):
+    """The object as kubectl hands it to the API server, as a str. Encode it to get the bytes.
+
+    Strings and dicts only -- a ConfigMap is nothing else, and refusing the rest keeps this from
+    silently becoming a second, worse JSON encoder. Go marshals a map with its keys SORTED, and
+    `json.Encoder.Encode` (which the k8s json serializer uses) appends a trailing newline: both
+    are in the bytes kubectl stores, so both are here.
+
+    Verified byte-identical -- not merely equal in length -- against the
+    `last-applied-configuration` of all three client-applied live objects on 2026-09-11.
+    """
+    return _go_value(obj) + "\n"
+
+
+def _go_value(v):
+    if isinstance(v, str):
+        return _go_string(v)
+    if isinstance(v, dict):
+        return "{%s}" % ",".join("%s:%s" % (_go_string(k), _go_value(x))
+                                 for k, x in sorted(v.items()))
+    raise TypeError("kubectl_json models a ConfigMap: strings and dicts, not %r" % type(v))
+
+
 def size_of(name, app, code, data, sha):
-    """Serialised bytes of the real object, resolved against its own self-reference.
+    """Bytes of the real object as kubectl serialises it -- what lands in last-applied.
 
     The size is written into the object, so it is a fixed point: iterate until it stops moving.
     Two passes settle it unless a digit is gained, three always.
     """
     n = 0
     for _ in range(4):
-        got = len(json.dumps(_object(name, app, code, data, sha, "client", n),
-                             separators=(",", ":")))
+        got = len(kubectl_json(_object(name, app, code, data, sha, "client", n)).encode("utf-8"))
         if got == n:
             break
         n = got
     return n
 
 
+def annotation_bytes(name, app, code, data, sha, n_serialised):
+    """What `metadata.annotations` costs AFTER a client-side apply, which is what the cap is on.
+
+    ⚠️THE CAP IS ON THE WHOLE MAP, NOT ON last-applied-configuration ALONE. The API server sums
+    `len(key) + len(value)` over every annotation and refuses past
+    `TotalAnnotationSizeLimitB` (k8s apimachinery objectmeta validation). So the four
+    `dama-hear/*` annotations and the 48-character last-applied KEY are all charged too --
+    measured at 178 B for this generator's own annotation block on 2026-09-11, and confirmed
+    exactly against three live objects (total minus stored last-applied = 178, 178, 177; the 177
+    is hear-score-code, whose serialised-bytes value is five digits rather than six).
+    """
+    ann = _object(name, app, code, data, sha, "client", n_serialised)["metadata"]["annotations"]
+    return (sum(len(k.encode("utf-8")) + len(v.encode("utf-8")) for k, v in ann.items())
+            + len(LAST_APPLIED_KEY) + n_serialised)
+
+
 def apply_mode(code, data, name="x", sha="0000000", app="x"):
-    """"client" or "server": how this bundle has to be applied, and the two numbers behind it.
+    """"client" or "server", the object's serialised bytes, and what it charges the cap.
 
     ⚠️MEASURED ON THE SERIALISED OBJECT, NOT ON THE RENDERED YAML. What counts against the
     annotation cap is the JSON `kubectl` puts in last-applied-configuration, which is the object
@@ -338,9 +421,17 @@ def apply_mode(code, data, name="x", sha="0000000", app="x"):
     `"name": "x"` and no annotations at all, which under-measured the real file by ~220 B. With
     15 B of headroom that is the difference between "client" and a redeploy that fails, so the
     caller passes the real name and the byte cost of the real annotation block.
+
+    ⚠️AND THE MODE IS CHOSEN FROM THE THIRD NUMBER, NOT THE SECOND. The second is what the
+    annotation declares and what a live object can be checked against; the cap is charged the
+    whole annotations map. Choosing from the second is how hear-drain-code came to declare
+    253,559 B with 393 B of headroom while the server was holding 254,433 B of annotations --
+    481 B PAST the threshold the margin exists to keep it clear of.
     """
     n = size_of(name, app, code, data, sha)
-    return ("server" if n > CLIENT_APPLY_ANNOTATION_CAP - CLIENT_APPLY_MARGIN else "client"), n
+    n_ann = annotation_bytes(name, app, code, data, sha, n)
+    mode = "server" if n_ann > CLIENT_APPLY_ANNOTATION_CAP - CLIENT_APPLY_MARGIN else "client"
+    return mode, n, n_ann
 
 
 def apply_command(name, mode):
@@ -364,13 +455,13 @@ def apply_command(name, mode):
 
 
 def render(name, app, code, data, sha):
-    mode, n_bytes = apply_mode(code, data, name=name, sha=sha, app=app)
+    mode, n_bytes, n_ann = apply_mode(code, data, name=name, sha=sha, app=app)
     if n_bytes > OBJECT_CAP:
         sys.exit("%s serialises to %d B, past the %d B object cap. Server-side apply does not "
                  "lift this one -- the bundle has to be split." % (name, n_bytes, OBJECT_CAP))
     out = ["# %s" % apply_command(name, mode),
-           "# apply-mode %s: %d B serialised against a %d B last-applied-configuration cap."
-           % (mode, n_bytes, CLIENT_APPLY_ANNOTATION_CAP),
+           "# apply-mode %s: %d B serialised; %d B of annotations against a %d B cap."
+           % (mode, n_bytes, n_ann, CLIENT_APPLY_ANNOTATION_CAP),
            "apiVersion: v1", "kind: ConfigMap", "metadata:",
            "  name: %s" % name, "  namespace: dama",
            "  labels:", "    app: %s" % app,
@@ -411,11 +502,11 @@ def main(argv=None):
     dirty = [ln for ln in porcelain if ln[3:].strip().strip('"') not in generated]
     stamp = sha + ("-dirty" if dirty else "")
     text = render(name, app, code, data, stamp)
-    mode, n_bytes = apply_mode(code, data, name=name, sha=stamp, app=app)
+    mode, n_bytes, n_ann = apply_mode(code, data, name=name, sha=stamp, app=app)
     # stderr, because stdout is redirected into the .yaml by the documented command and an
     # operator who never opens the file would otherwise never see which apply works.
-    sys.stderr.write("%s: %d B serialised, apply-mode %s\n  %s\n"
-                     % (name, n_bytes, mode, apply_command(name, mode)))
+    sys.stderr.write("%s: %d B serialised, %d B of annotations, apply-mode %s\n  %s\n"
+                     % (name, n_bytes, n_ann, mode, apply_command(name, mode)))
     print(text)
 
 

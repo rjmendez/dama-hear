@@ -200,6 +200,96 @@ ANNOTATION_CAP = 256 * 1024
 OBJECT_CAP = 1024 * 1024
 
 
+def _charged(doc):
+    """(serialised bytes, annotation bytes charged) for a document read out of a bundle .yaml.
+
+    ⚠️NOT `len(json.dumps(doc, separators=(",", ":")))`. That is what this file used to compute,
+    and it is the SAME Python-native formula gen_configmap.py used -- so the guard checked the
+    generator against itself and could not see that both were wrong. kubectl is Go: it
+    HTML-escapes `< > &` and emits raw UTF-8, and the API server charges the whole annotations
+    map, not last-applied alone. Measured on the live objects 2026-09-11, the Python number was
+    874 B / 739 B / 415 B under what hear-drain-code / hear-tag-code / hear-score-code were
+    actually charged.
+
+    This still calls the generator's own encoder, so on its own it is a consistency check.
+    `test_the_declared_size_matches_what_the_api_server_stored` below is what anchors it to an
+    external oracle -- kubectl's own bytes, read off the live cluster.
+    """
+    gen = _gen()
+    n = len(gen["kubectl_json"](doc).encode("utf-8"))
+    ann = doc.get("metadata", {}).get("annotations", {}) or {}
+    charged = (sum(len(k.encode("utf-8")) + len(v.encode("utf-8")) for k, v in ann.items())
+               + len(gen["LAST_APPLIED_KEY"]) + n)
+    return n, charged
+
+
+def _live(bundle):
+    """The live object, or a skip. Read-only: `kubectl get`, never apply, never dry-run."""
+    import shutil
+    import subprocess
+    if not shutil.which("kubectl"):
+        pytest.skip("no kubectl on this host")
+    p = subprocess.run(["kubectl", "get", "cm", bundle, "-n", "dama", "-o", "json"],
+                       capture_output=True, text=True, timeout=120)
+    if p.returncode != 0:
+        pytest.skip("no live %s: %s" % (bundle, p.stderr.strip()[:120]))
+    return json.loads(p.stdout)
+
+
+def test_the_serialiser_models_go_and_not_python():
+    """The four rules `kubectl_json` exists for, each stated as a byte count Python gets wrong.
+
+    ⚠️A GREEN RUN HERE IS NOT PROOF THE MODEL IS RIGHT -- it is proof it has not silently gone
+    back to being Python's. `test_the_declared_size_matches_what_the_api_server_stored` is the
+    one that checks it against kubectl's own bytes; this one runs with no cluster.
+    """
+    gen = _gen()
+    j = gen["kubectl_json"]
+    assert j({}) == "{}\n", "Go's json.Encoder.Encode appends a newline; json.dumps does not"
+    # HTML escaping: Go turns each of < > & into a six-character escape, Python leaves them
+    assert j({"k": "a<b>c&d"}) == '{"k":"a\\u003cb\\u003ec\\u0026d"}\n'
+    assert len(j({"k": "<"})) - len(j({"k": ""})) == 6
+    # non-ASCII goes out as raw UTF-8, so it costs its UTF-8 length and not \uXXXX
+    assert j({"k": "⚠"}) == '{"k":"⚠"}\n'
+    assert len(j({"k": "⚠"}).encode("utf-8")) - len(j({"k": ""}).encode("utf-8")) == 3
+    assert len(json.dumps({"k": "⚠"})) - len(json.dumps({"k": ""})) == 6, (
+        "the Python encoder this replaced; if this ever stops being true the +3/-6 arithmetic "
+        "in gen_configmap.py's docstring needs revisiting")
+    # Go has no short escape for 0x08/0x0c, and does have one for 0x0a/0x0d/0x09
+    assert j({"k": "\b\f"}) == '{"k":"\\u0008\\u000c"}\n'
+    assert j({"k": "\n\r\t"}) == '{"k":"\\n\\r\\t"}\n'
+    # a map is marshalled with sorted keys, and the encoder refuses anything a ConfigMap is not
+    assert j({"b": "1", "a": "2"}) == '{"a":"2","b":"1"}\n'
+    with pytest.raises(TypeError):
+        j({"n": 1})
+
+
+def test_the_mode_is_chosen_from_the_annotations_total_not_from_last_applied_alone():
+    """⚠️NO REAL BUNDLE SEPARATES THE TWO NUMBERS TODAY, WHICH IS WHY THIS TEST IS SYNTHETIC.
+
+    All four bundles currently sit far enough from the threshold that choosing the mode from
+    `n_bytes` or from `n_ann` gives the same answer, so every other test in this file passes
+    either way -- exactly the blindness that let the wrong quantity ship. This walks the cap down
+    until the threshold falls strictly BETWEEN the two, where the answers differ, and pins which
+    one decides.
+    """
+    gen = _gen()
+    app, code, data = gen["BUNDLES"]["hear-score-code"]
+    mode, n_bytes, n_ann = gen["apply_mode"](code, data, name="hear-score-code",
+                                             sha="0000000", app=app)
+    assert mode == "client" and n_ann - n_bytes > 2, (n_bytes, n_ann)
+    # a cap whose threshold lands between them: last-applied fits, the annotations map does not
+    gen["CLIENT_APPLY_MARGIN"] = 0
+    gen["CLIENT_APPLY_ANNOTATION_CAP"] = (n_bytes + n_ann) // 2
+    again, n2, n_ann2 = gen["apply_mode"](code, data, name="hear-score-code",
+                                          sha="0000000", app=app)
+    assert (n2, n_ann2) == (n_bytes, n_ann), "the cap must not move the measurement"
+    assert again == "server", (
+        "with the threshold at %d B the object's %d B of last-applied fits and its %d B of "
+        "annotations does not; a generator sizing only last-applied calls this 'client' and the "
+        "API server refuses the apply." % (gen["CLIENT_APPLY_ANNOTATION_CAP"], n2, n_ann2))
+
+
 @pytest.mark.parametrize("bundle", sorted(_gen()["BUNDLES"]))
 def test_the_declared_size_is_the_size_of_the_real_object(bundle):
     """`dama-hear/serialised-bytes` must be what the object actually serialises to.
@@ -213,6 +303,12 @@ def test_the_declared_size_is_the_size_of_the_real_object(bundle):
          three supersonic model JSONs do not have                          -6 B
       3. then added that newline to hear/__init__.py, which is EMPTY and
          round-trips as "" rather than "\n"                               +2 B
+      4. sized with Python's json where kubectl's is Go's                -696 B
+
+    (4) is the one that also fooled this test, which computed the identical Python expression and
+    so checked the generator against itself. Measured against the live object 2026-09-11:
+    declared 253,559 B, stored last-applied 254,255 B, annotations charged 254,433 B -- past the
+    threshold while the generator still reported "client with room to spare".
 
     The size also appears inside the object it measures, so it is a fixed point; size_of()
     iterates until it settles. This test is what proves it settled on the truth.
@@ -223,12 +319,70 @@ def test_the_declared_size_is_the_size_of_the_real_object(bundle):
     doc = yaml.safe_load(path.read_text())
     declared = (doc.get("metadata", {}).get("annotations", {}) or {}).get(
         "dama-hear/serialised-bytes")
-    actual = len(json.dumps(doc, separators=(",", ":")))
+    actual, _charged_b = _charged(doc)
     assert declared is not None, "%s declares no serialised-bytes" % path.name
     assert int(declared) == actual, (
         "%s declares %s B but serialises to %d B (off by %d). The apply mode is chosen from the "
         "declared number, so an under-count is a redeploy that fails. Regenerate it."
         % (path.name, declared, actual, actual - int(declared)))
+
+
+@pytest.mark.parametrize("bundle", sorted(_gen()["BUNDLES"]))
+def test_the_declared_size_matches_what_the_api_server_stored(bundle):
+    """THE EXTERNAL ORACLE. Everything else in this file sizes the object with our own code.
+
+    ⚠️THIS COMPARES THE LIVE OBJECT AGAINST ITSELF, so it is valid however stale the deployed
+    bundle is: the annotation the object carries was written by the same generator run that
+    produced the bytes kubectl then stored beside it. A live object from an older commit is
+    still a correct test of the sizing rule.
+
+    The stored `last-applied-configuration` is kubectl's own Go `encoding/json` output, so
+    reproducing it BYTE FOR BYTE is the only proof that gen_configmap.py models the right
+    serialiser -- a length match could still be two errors cancelling.
+
+    ⚠️READ-ONLY, AND IT MUST STAY READ-ONLY. `kubectl get`. Never `apply`, not even
+    `--dry-run`: a test that can reach the cluster must not be one edit away from writing to it.
+    """
+    obj = _live(bundle)
+    gen = _gen()
+    ann = obj.get("metadata", {}).get("annotations", {}) or {}
+    declared = ann.get("dama-hear/serialised-bytes")
+    assert declared is not None, "live %s carries no dama-hear/serialised-bytes" % bundle
+    charged = sum(len(k.encode("utf-8")) + len(v.encode("utf-8")) for k, v in ann.items())
+    la = ann.get(gen["LAST_APPLIED_KEY"])
+    if la is None:
+        # server-side applied: managed fields instead of the annotation, nothing to compare to
+        assert ann.get("dama-hear/apply-mode") == "server", (
+            "live %s has no last-applied-configuration but declares apply-mode %r"
+            % (bundle, ann.get("dama-hear/apply-mode")))
+        pytest.skip("%s is server-side applied: no last-applied-configuration to size" % bundle)
+    stored = len(la.encode("utf-8"))
+    assert gen["kubectl_json"](json.loads(la)) == la, (
+        "gen_configmap.kubectl_json does not reproduce kubectl's own bytes for %s. The declared "
+        "size is computed with it, so the number in every bundle is wrong by whatever this "
+        "differs by." % bundle)
+    assert charged <= ANNOTATION_CAP, (
+        "live %s is holding %d B of annotations against a %d B cap -- it is past it NOW, and the "
+        "next apply is what finds out." % (bundle, charged, ANNOTATION_CAP))
+
+    # ⚠️THE DEPLOYED OBJECT IS ALLOWED TO BE OLDER THAN THE CHECKOUT, so a mismatch is only a
+    # defect if the cluster is running THIS bundle. When it is not, the numbers are reported
+    # rather than swallowed: an operator reading the skip gets the live under-count.
+    path = ROOT / "deploy" / "k8s" / (bundle + ".yaml")
+    here = None
+    if path.exists():
+        here = (yaml.safe_load(path.read_text()).get("metadata", {})
+                .get("annotations", {}) or {}).get("dama-hear/commit")
+    if int(declared) != stored and ann.get("dama-hear/commit") != here:
+        pytest.skip("live %s is stamped %r against the checkout's %r, and declares %s B where "
+                    "the server stored %d B (%+d). Regenerated bundles have not been applied."
+                    % (bundle, ann.get("dama-hear/commit"), here, declared, stored,
+                       stored - int(declared)))
+    assert int(declared) == stored, (
+        "live %s declares %s B but the API server stored %d B of last-applied-configuration "
+        "(off by %d), and it is stamped with the commit this checkout ships -- so this is the "
+        "sizer being wrong, not a stale deploy."
+        % (bundle, declared, stored, stored - int(declared)))
 
 
 @pytest.mark.parametrize("bundle", sorted(_gen()["BUNDLES"]))
@@ -254,12 +408,17 @@ def test_a_bundle_still_fits_the_way_it_declares_it_is_applied(bundle):
 
     THE FIX FOR AN OVERSIZE BUNDLE IS NOT `--validate=false`: it is `--server-side`, which is
     what `dama-hear/apply-mode` records, or splitting the bundle. Past OBJECT_CAP neither helps.
+
+    ⚠️AND THE ANNOTATION CAP IS CHARGED THE WHOLE ANNOTATIONS MAP, not last-applied alone: the
+    API server sums len(key)+len(value) over every one of them. The last-applied KEY is itself 48
+    characters and the four dama-hear annotations another 130 -- 178 B that used to be counted as
+    free, on top of the ~700 B the Python serialiser was under by.
     """
     path = ROOT / "deploy" / "k8s" / (bundle + ".yaml")
     if not path.exists():
         pytest.skip("no ConfigMap at %s" % path)
     doc = yaml.safe_load(path.read_text())
-    size = len(json.dumps(doc, separators=(",", ":")))
+    size, charged = _charged(doc)
     mode = (doc.get("metadata", {}).get("annotations", {}) or {}).get("dama-hear/apply-mode")
     assert mode in ("client", "server"), (
         "%s declares apply-mode %r; gen_configmap.py writes it and the caller needs it to pick "
@@ -267,19 +426,22 @@ def test_a_bundle_still_fits_the_way_it_declares_it_is_applied(bundle):
 
     # the load-bearing half: a bundle that has outgrown client-side apply must SAY so, or the
     # next redeploy is the thing that finds out
-    if size > ANNOTATION_CAP:
+    if charged > ANNOTATION_CAP:
         assert mode == "server", (
-            "%s serialises to %d B, over the %d B annotation cap, but declares apply-mode "
-            "'client' -- `kubectl apply` will refuse it with metadata.annotations: Too long. "
-            "Regenerate it: gen_configmap.py picks the mode from this same number."
-            % (path.name, size, ANNOTATION_CAP))
+            "%s would put %d B into metadata.annotations, over the %d B cap, but declares "
+            "apply-mode 'client' -- `kubectl apply` will refuse it with metadata.annotations: "
+            "Too long. Regenerate it: gen_configmap.py picks the mode from this same number."
+            % (path.name, charged, ANNOTATION_CAP))
 
-    cap = OBJECT_CAP if mode == "server" else ANNOTATION_CAP
-    assert size < cap, (
-        "%s serialises to %d B, over the %d B cap for apply-mode '%s'.%s"
-        % (path.name, size, cap, mode,
-           "" if mode == "client" else
-           " --server-side does NOT lift the object cap -- the bundle has to be split."))
+    if mode == "server":
+        # no last-applied annotation is written at all, so only the object cap applies
+        assert size < OBJECT_CAP, (
+            "%s serialises to %d B, over the %d B object cap. --server-side does NOT lift that "
+            "one -- the bundle has to be split." % (path.name, size, OBJECT_CAP))
+    else:
+        assert charged < ANNOTATION_CAP, (
+            "%s charges %d B of annotations, over the %d B cap for apply-mode 'client'."
+            % (path.name, charged, ANNOTATION_CAP))
 
 
 def _exclusion_set(src):
