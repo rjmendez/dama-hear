@@ -286,7 +286,7 @@ class TestTheUncertaintyReachesTheWire:
     def test_a_stated_sigma_survives_the_reader(self):
         got = DF.read_text(self._row())
         assert got.generation is DF.G6
-        assert got.rows and got.rows[0]["sync_sigma_ns"] == "41000"
+        assert got.rows and got.rows[0]["sync_sigma_ns"] == 41000.0
 
     def test_an_empty_cell_is_not_stated_and_is_not_zero(self):
         """⚠️0 WOULD READ AS A PERFECT CLOCK. A row the node could not stamp has no anchor to be
@@ -297,6 +297,22 @@ class TestTheUncertaintyReachesTheWire:
         # and a literal 0, which the firmware never writes, must not survive the pool either
         zero = DF.read_text(self._row(sigma="0"))
         assert POOL._record_from_node_row(zero.rows[0])["sync_sigma_ns"] is None
+
+    @pytest.mark.parametrize("cell", ["0", "0.0", "-1", "  ", "nonsense"])
+    def test_the_READER_refuses_a_non_positive_cell_and_not_only_the_pool(self, cell):
+        """⚠️THE LAYER THE ASSERTION IS MADE AT IS THE POINT. Every zero-sigma test above went
+        through `POOL._record_from_node_row`, which has its own non-positive guard -- so the
+        reader could (and did) leave the string "0" in the row while the suite stayed green. A
+        public field documented as "not stated or a number" was handing out "0", and
+        `nodeclass.stamp_admissible("0")` returns True: a perfect clock.
+
+        The rule has one implementation now, `detsfile.stated_sigma_ns`; the pool calls it.
+        """
+        got = DF.read_text(self._row(sigma=cell))
+        assert got.rows[0]["sync_sigma_ns"] is None, (
+            "the reader left %r in a field its own docstring says can only be a positive number "
+            "or None" % (got.rows[0]["sync_sigma_ns"],))
+        assert POOL._sync_sigma_ns(cell) is DF.stated_sigma_ns(cell), "one rule, one copy"
 
     def test_a_g5_width_row_under_a_g6_header_is_a_counted_refusal(self):
         """The whole reason hear/detsfile.py exists: a writer that disagrees with its own header

@@ -742,6 +742,12 @@ class TestRefusalsAreAttributable:
         assert rows and json.loads(rows[0])["model"] == "cone"
 
     def test_geometry_is_populated_even_though_nothing_solved(self, tmp_path):
+        """⚠️THE ROW MOVED FROM attempts.jsonl TO candidates.jsonl AND THE DIAGNOSTIC DID NOT.
+
+        attempts.jsonl is now one row per ASSOCIATED EVENT, so a group association refuses has no
+        attempt row at all -- there is no event to judge. Everything that used to hang off its
+        `lost_to_gate` attempt (DOP, bound_check, the violating pair) hangs off the candidate row.
+        """
         arr = HT.arrival_survey(SV.from_dict(survey_dict()))
         b = HT.pair_bounds(arr, C)
         (_i, j), info = min(b.items(), key=lambda kv: kv[1]["bound_s"])
@@ -752,12 +758,15 @@ class TestRefusalsAreAttributable:
         rows = [node_row(arr.names[n], base[n], seed=k, sample=k)
                 for k, n in enumerate(arr.ids)]
         t = go(tmp_path, rows)
-        att = [json.loads(l) for l in (pathlib.Path(t["out"]) / "runs" / t["run_id"]
-                                       / "attempts.jsonl").read_text().splitlines()]
-        assert att and att[0]["verdict"] in (HT.V_INADMISSIBLE, HT.V_LOST_TO_GATE)
-        assert att[0]["geometry_at_centroid"]["dop"] is not None
-        assert att[0]["bound_check"]["violating_pairs"]
-        assert att[0]["bound_check"]["worst_excess_m"] > 0.0
+        run = pathlib.Path(t["out"]) / "runs" / t["run_id"]
+        assert (run / "attempts.jsonl").read_text() == "", "no event formed, nothing to judge"
+        cand = [json.loads(l) for l in (run / "candidates.jsonl").read_text().splitlines()]
+        assert cand and cand[0]["reached_associate"] is False
+        assert cand[0]["associate_reason"], "a lost candidate must always name its reason"
+        assert cand[0]["geometry_at_centroid"]["dop"] is not None
+        assert cand[0]["bound_check"]["violating_pairs"]
+        assert cand[0]["bound_check"]["worst_excess_m"] > 0.0
+        assert t["conservation"]["by_terminal"].get(HT.V_LOST_TO_GATE) == 3
 
     def test_a_collinear_arrival_array_is_refused_at_load_not_decorated(self, tmp_path):
         nodes = [{"node_id": 1, "name": "a", "e_m": 0.0, "n_m": 0.0, "u_m": 0.0, "sigma_m": 0.1},
@@ -869,6 +878,268 @@ class TestSoundSpeedIsAssumed:
         assert att["solution"]["at_search_bound"] is True
         assert "not a measurement" in att["solution"]["note"]
 
+
+
+# ================================================================= the solve loop's population
+
+#: A four-node square whose diagonal is 169.7 m -- the 3.5 acre array the operator is building,
+#: where max_window_s goes from today's 57.7 ms to roughly 520 ms. Nothing here is a guess about
+#: that array's shape; it is the stated size expressed as a square, the same fixture
+#: tests/test_associate.py calls VAST.
+VAST_NODES = [{"node_id": 1, "name": "v1", "e_m": 0.0, "n_m": 0.0, "u_m": 0.0, "sigma_m": 0.5},
+              {"node_id": 2, "name": "v2", "e_m": 120.0, "n_m": 0.0, "u_m": 0.0, "sigma_m": 0.5},
+              {"node_id": 3, "name": "v3", "e_m": 120.0, "n_m": 120.0, "u_m": 0.0,
+               "sigma_m": 0.5},
+              {"node_id": 4, "name": "v4", "e_m": 0.0, "n_m": 120.0, "u_m": 0.0, "sigma_m": 0.5}]
+
+
+def _released_seed_pool(nodes, source):
+    """Rows in which #42's released refusal seeds the event and the ungated scan seeds elsewhere.
+
+    Every number is DERIVED from the survey the caller passes -- the pair bounds, the derived
+    margin and the scan window all come from the driver's own functions, so this fixture means
+    the same thing on a 16.9 m array and on a 169.7 m one.
+
+    Shape, and it is the live 1789063974 episode's shape:
+      * one stale arrival on a node that is NOT the round's first, at T0;
+      * the round, offset by `gap` so the round's FIRST arrival is inside the stale seed's window
+        and PAST that pair's own geometry bound -- so associate() refuses it and, since #42,
+        hands it back, where it seeds the real event;
+      * a late retrigger on that same node, outside the event's reach as a member but inside the
+        ungated scan's, so the ungated scan still forms a candidate -- with a different earliest
+        member and a different member set.
+    """
+    sv = SV.from_dict(survey_dict(nodes))
+    arr = HT.arrival_survey(sv)
+    margin = HT.derive_margin_s(HT.pair_bounds(arr, C), HT.DEFAULT_MARGIN_FRAC)["margin_s"]
+    window = AS.max_window_s(arr, TEMP_C, margin)
+    delay = {n: float(np.linalg.norm(np.asarray(source, float) - arr.position(n))) / C
+             for n in arr.ids}
+    first = min(delay, key=delay.get)
+    second = sorted(delay, key=delay.get)[1]
+    # the stale arrival sits on the node whose pair bound with `first` is the TIGHTEST, so the
+    # gate has the most to object to; anything it can refuse, it refuses here.
+    stale = min((n for n in arr.ids if n != first),
+                key=lambda n: float(np.linalg.norm(arr.position(n) - arr.position(first))))
+    bound = float(np.linalg.norm(arr.position(stale) - arr.position(first))) / C + margin
+    lead = delay[second] - delay[first]
+    # inside the stale seed's window, past that pair's bound, and far enough in that the round's
+    # SECOND arrival is out of the stale seed's reach. Midway between the two, which exists only
+    # if the round is not tighter than the bound it has to clear.
+    gap = 0.5 * (bound + window)
+    assert bound < gap < window, (bound, gap, window)
+    assert gap + lead > window, "the round's second arrival must escape the stale seed"
+    rows = [node_row(arr.names[stale], T0, seed=90, sample=90)]
+    rows += [node_row(arr.names[n], T0 + gap - delay[first] + delay[n], seed=k, sample=k)
+             for k, n in enumerate(arr.ids)]
+    # the retrigger that keeps the ungated scan supplied with a candidate
+    rows += [node_row(arr.names[first], T0 + gap + window, seed=91, sample=91)]
+    return sv, arr, margin, window, first, rows
+
+
+class TestTheSolveLoopRunsOffAssociatedEvents:
+    """⚠️THE DEPLOYED REGRESSION OF 2026-09-11, AND WHY MATCHING BY SEED CANNOT WORK.
+
+    attempts.jsonl used to be one row per UNGATED candidate, with the associated event looked up
+    by the candidate's EARLIEST member. That silently required associate() and scan_coincidences
+    to pick the same earliest member. #42 stopped consuming a geometry refusal -- the refused
+    arrival goes back to the pool and can seed a group of its own -- while the ungated scan still
+    consumes every candidate it reaches. The two seeds diverged, the lookup missed, and a
+    strictly admissible event that ed6c75a solved came back `lost_to_gate` with `associate_reason`
+    null. MEASURED on the live corpus (7,067 admitted arrivals, 74 h, derived margin 8.608 ms,
+    window 57.740 ms): ed6c75a events_solved 2, main 1 with lost_to_gate 1, this 2 -- and
+    associate's own three events go from 1 reaching the driver to 3.
+
+    An event and a candidate may legitimately differ in MEMBERSHIP as well as in seed, so the
+    fix is not a better join: the solve loop runs off associate()'s events and the ungated scan
+    goes back to being only what its docstring says it is.
+    """
+
+    @pytest.mark.parametrize("label,nodes,source", [
+        ("16.9 m array", None, (-4.58, 20.0, 0.0)),
+        ("169.7 m array", VAST_NODES, (30.0, 200.0, 0.0)),
+    ])
+    def test_an_event_the_ungated_scan_seeds_elsewhere_is_still_solved(
+            self, tmp_path, label, nodes, source):
+        sv, arr, margin, window, first, rows = _released_seed_pool(nodes, source)
+        t = go(tmp_path, rows, survey=write_survey(tmp_path, nodes))
+        run = pathlib.Path(t["out"]) / "runs" / t["run_id"]
+        att = [json.loads(l) for l in (run / "attempts.jsonl").read_text().splitlines()]
+        cand = [json.loads(l) for l in (run / "candidates.jsonl").read_text().splitlines()]
+
+        # the headline number first: this is the 2 -> 1 the deploy showed, at one event
+        assert t["events_solved"] == 1 and t["events_emitted"] == 1
+        # the released refusal really did seed the event, which is the whole precondition
+        assert t["associate"]["n_events"] == 1, "fixture void: %d" % t["associate"]["n_events"]
+        ev = att[0]
+        assert ev["node_ids"][0] == first and ev["n_nodes"] == len(arr.ids)
+        assert ev["verdict"] == HT.V_SOLVED
+
+        # ...and the ungated scan seeded its candidate somewhere else, which is what used to
+        # lose the event. If this stops being true the fixture has stopped testing the defect.
+        assert cand, "fixture void: the ungated scan formed no candidate"
+        assert cand[0]["pool_keys"][0] != ev["pool_keys"][0], "fixture void: same seed"
+        assert set(cand[0]["pool_keys"]) != set(ev["pool_keys"]), "fixture void: same members"
+        assert t["conservation"]["ok"]
+
+    @pytest.mark.parametrize("nodes,source", [(None, (-4.58, 20.0, 0.0)),
+                                              (VAST_NODES, (30.0, 200.0, 0.0))])
+    def test_a_candidate_with_no_event_of_its_own_membership_always_names_why(
+            self, tmp_path, nodes, source):
+        """⚠️`lost_to_gate` WITH `associate_reason: null` IS THE VERDICT THIS TOOL EXISTS TO NOT
+        EMIT. Before the fix the reason was looked up in associate's `rejected` rows only, so an
+        arrival that was a member of a DIFFERENT event was in neither place and resolved to null.
+        """
+        _sv, _arr, _m, _w, _f, rows = _released_seed_pool(nodes, source)
+        t = go(tmp_path, rows, survey=write_survey(tmp_path, nodes))
+        run = pathlib.Path(t["out"]) / "runs" / t["run_id"]
+        cand = [json.loads(l) for l in (run / "candidates.jsonl").read_text().splitlines()]
+        lost = [r for r in cand if not r["reached_associate"]]
+        assert lost, "fixture void: every candidate reached an event"
+        for r in lost:
+            assert r["associate_reason"], r
+            assert r["member_event_keys"] or r["associate_reason"] in AS.REASONS
+        assert t["conservation"]["every_candidate_explained"] is True
+
+    def test_a_shared_seed_with_different_members_is_NOT_a_match(self, tmp_path, monkeypatch):
+        """⚠️MUTATION-CHECKED, AND THE OTHER FIXTURES IN THIS CLASS DO NOT COVER IT. Reverting
+        this join from the member SET back to the SEED left the whole suite green: in every
+        natural fixture here the two scans disagree on the seed AND on the membership, so both
+        rules answer the same. Only a candidate that shares its EARLIEST arrival with an event of
+        different membership tells them apart -- which is what associate() produces whenever its
+        geometry gate refuses a node the ungated scan keeps, from the same seed.
+
+        Injected rather than planted: a natural fixture for this shape exists (it is the live
+        corpus's own), but it needs a geometry that refuses exactly one node of a group the scan
+        keeps, and pinning the join should not depend on re-finding that geometry.
+        """
+        real = HT.AS.associate
+        dropped = {}
+
+        def drop_last_member(*a, **kw):
+            got = real(*a, **kw)
+            for ev in got["events"]:
+                if len(ev["detections"]) <= 3:
+                    continue
+                d = sorted(ev["detections"], key=lambda m: float(m["t_utc_s"]))
+                keep = d[:-1]                       # same earliest arrival, one member short
+                dropped[ev["t0_utc_s"]] = d[-1]["pool_key"]
+                # conservation is asserted on associate()'s own return, so the member this
+                # injection removes has to land somewhere: refused, as the real gate would.
+                got["rejected"].append(AS._row(d[-1], "pairwise_dt_exceeds_geometry",
+                                               "injected by the test"))
+                ev["detections"] = keep
+                ev["node_ids"] = [int(m["node_id"]) for m in keep]
+                ev["arrivals"] = [float(m["t_utc_s"]) for m in keep]
+                ev["n_nodes"] = len(keep)
+                ev["n_equations"] = len(keep) - 1
+                ev["span_s"] = ev["arrivals"][-1] - ev["arrivals"][0]
+            return got
+
+        monkeypatch.setattr(HT.AS, "associate", drop_last_member)
+        nodes = LIVE_NODES + [{"node_id": 5, "name": "extra", "e_m": 8.0, "n_m": -9.0,
+                               "u_m": 0.0, "sigma_m": 0.5}]
+        sv = SV.from_dict(survey_dict(nodes))
+        t = go(tmp_path, planted(sv, (40.0, 30.0, 0.0), T0),
+               survey=write_survey(tmp_path, nodes))
+        assert dropped, "the injection did not fire, so this asserts nothing"
+        run = pathlib.Path(t["out"]) / "runs" / t["run_id"]
+        cand = [json.loads(l) for l in (run / "candidates.jsonl").read_text().splitlines()]
+        att = [json.loads(l) for l in (run / "attempts.jsonl").read_text().splitlines()]
+        assert len(cand) == 1 and len(att) == 1
+        assert cand[0]["pool_keys"][0] == att[0]["pool_keys"][0], (
+            "fixture void: the candidate and the event no longer share a seed, so a seed match "
+            "and a set match would answer the same here")
+        assert set(cand[0]["pool_keys"]) != set(att[0]["pool_keys"]), "fixture void: same members"
+        assert cand[0]["reached_associate"] is False, (
+            "a candidate whose members are NOT an event matched it anyway -- the join has gone "
+            "back to comparing seeds, which is the 2026-09-11 regression's mechanism")
+        assert cand[0]["associate_reason"], "and it must still name why"
+        assert t["conservation"]["every_candidate_explained"] is True
+
+    def test_the_membership_match_is_the_set_not_the_seed(self, tmp_path):
+        """A candidate whose members ARE an event, in a different order, still reaches it."""
+        sv = SV.from_dict(survey_dict())
+        t = go(tmp_path, planted(sv, (40.0, 30.0, 0.0), T0))
+        run = pathlib.Path(t["out"]) / "runs" / t["run_id"]
+        cand = [json.loads(l) for l in (run / "candidates.jsonl").read_text().splitlines()]
+        att = [json.loads(l) for l in (run / "attempts.jsonl").read_text().splitlines()]
+        assert len(cand) == 1 and len(att) == 1
+        assert cand[0]["reached_associate"] is True
+        assert cand[0]["associate_reason"] is None
+        assert set(cand[0]["pool_keys"]) == set(att[0]["pool_keys"])
+        assert cand[0]["event_key"] == att[0]["event_key"]
+
+    def test_every_associated_event_gets_exactly_one_verdict(self, tmp_path):
+        """⚠️main SOLVED ONE OF ITS THREE ASSOCIATED EVENTS AND CONSERVATION STILL SAID OK,
+        because conservation counted verdicts against CANDIDATES. Two events were neither solved
+        nor bound-checked nor reported, and their arrivals were logged `singleton_unpaired`.
+        """
+        sv = SV.from_dict(survey_dict())
+        rows = (planted(sv, (40.0, 30.0, 0.0), T0, seed0=0)
+                + planted(sv, (-30.0, 25.0, 0.0), T0 + 600.0, seed0=10))
+        t = go(tmp_path, rows)
+        run = pathlib.Path(t["out"]) / "runs" / t["run_id"]
+        att = [json.loads(l) for l in (run / "attempts.jsonl").read_text().splitlines()]
+        assert t["associate"]["n_events"] == 2 and len(att) == 2
+        assert t["conservation"]["one_verdict_per_event"] is True
+        assert t["conservation"]["n_attempts"] == t["associate"]["n_events"]
+        # no member of a delivered event is ever logged as having reached nothing
+        member = {k for r in att for k in r["pool_keys"]}
+        assert member and t["conservation"]["by_terminal"].get("singleton_unpaired") is None
+
+    def test_no_arrival_is_judged_twice_and_the_work_is_bounded(self, tmp_path):
+        """⚠️THE TERMINATION ARGUMENT FOR THE SOLVE LOOP, AS A COUNT.
+
+        Both loops are bounded `for`s over finite lists -- one pass over `grouped["events"]`, then
+        one pass over `candidates` that only fills terminal states no event claimed. Nothing is
+        re-queued and nothing revisits an arrival, so the bound is structural rather than a
+        property of any flag. Asserted as EQUALITIES, not ceilings: a former that revisits without
+        looping fails here too. The pool is built so every kind of group is present at once.
+        """
+        sv = SV.from_dict(survey_dict())
+        rows = []
+        for k in range(6):
+            rows += planted(sv, (40.0 - 6.0 * k, 30.0 + 4.0 * k, 0.0), T0 + 600.0 * k,
+                            seed0=10 * k)
+        rows += [node_row("nyquist", T0 + 300.0, seed=99, sample=99)]      # a lone singleton
+        t = go(tmp_path, rows)
+        run = pathlib.Path(t["out"]) / "runs" / t["run_id"]
+        att = [json.loads(l) for l in (run / "attempts.jsonl").read_text().splitlines()]
+        seen = [k for r in att for k in r["pool_keys"]]
+        assert len(seen) == len(set(seen)), "an arrival was judged twice"
+        assert len(att) == t["associate"]["n_events"] == 6
+        assert t["conservation"]["by_terminal"]["singleton_unpaired"] == 1
+        assert sum(t["conservation"]["by_terminal"].values()) == t["conservation"]["admitted"]
+
+    def test_two_runs_over_the_same_pool_give_the_same_verdicts(self, tmp_path):
+        """Idempotence of the loop itself, separately from the store's resume dedupe."""
+        sv = SV.from_dict(survey_dict())
+        rows = (planted(sv, (40.0, 30.0, 0.0), T0, seed0=0)
+                + planted(sv, (-30.0, 25.0, 0.0), T0 + 600.0, seed0=10))
+        shape = []
+        for leg in ("a", "b"):
+            t = go(tmp_path / leg, rows)
+            run = pathlib.Path(t["out"]) / "runs" / t["run_id"]
+            shape.append([{k: r[k] for k in ("event_key", "verdict", "node_ids", "arrivals",
+                                             "point_source_possible")}
+                          for r in map(json.loads,
+                                       (run / "attempts.jsonl").read_text().splitlines())])
+        assert shape[0] == shape[1] and shape[0]
+
+    def test_the_published_payload_carries_point_source_possible(self, tmp_path):
+        """⚠️#44 SHIPPED THE FIELD AND THE ONLY DEPLOYED PATH PUBLISHED IT AS null. The driver
+        hand-builds the dict it hands to pipeline.to_dama_event, which reads the field with
+        .get, so a consumer that treats null as "not stated" got exactly the silence #44 was
+        written to end. Backend.flush(), which does set it, has no production caller.
+        """
+        sv = SV.from_dict(survey_dict())
+        t = go(tmp_path, planted(sv, (40.0, 30.0, 0.0), T0))
+        run = pathlib.Path(t["out"]) / "runs" / t["run_id"]
+        ev = json.loads((run / "events.jsonl").read_text().splitlines()[0])
+        assert ev["published_payload"]["event"]["point_source_possible"] is True
+        assert ev["point_source_possible"] is True
+        assert ev["worst_pair_excess_s"] == 0.0
 
 # ================================================================= accounting
 
@@ -1244,6 +1515,198 @@ class TestTheModelChoiceMatchesPipeline:
             "read a missing model as a failed solve")
 
 
+class TestNoTerminalVerdictGoesOutWithoutAReason:
+    """⚠️"THE PRODUCT IS THE FUNNEL", AND A FUNNEL THAT LOSES A ROW WITHOUT SAYING WHY IS NOT ONE.
+
+    `lost_to_gate` used to be emitted with `associate_reason: null` whenever a candidate's
+    members were all members of a DIFFERENT associate event: they are in neither `rejected` nor
+    `ev_by_seed`, so the reason lookup resolved nothing. The two scans stopped consuming
+    identically when associate() began releasing a pairwise-refused candidate instead of
+    consuming it, and the driver's ungated scan still consumes.
+
+    ⚠️THE ROW THAT CARRIES THIS VERDICT IS candidates.jsonl, NOT attempts.jsonl, AND THE MOVE IS
+    NOT COSMETIC. attempts.jsonl is now one row per ASSOCIATED EVENT -- an event that exists was
+    never lost to the gate -- so `lost_to_gate` survives only as a terminal state of the ARRIVALS
+    in an ungated candidate that no event matches, on the candidate row and in the ledger. This
+    test asserted it off attempts.jsonl when it was written against the old solve loop, passed
+    against that loop, and went vacuous the moment the loop changed: the fixture guard below and
+    the "no attempt is lost_to_gate" assertion are what stop it silently testing nothing again.
+    """
+
+    #: Five arrival-class receivers and fifteen arrivals, taken from a search of random draws
+    #: through the real `HT.run`: the driver's scan seeds a candidate whose members are all held
+    #: by an associate event seeded elsewhere, so they appear in no rejection row and in no event
+    #: keyed by their own seed. 11 of 400 uniform draws produced the shape -- it is the ordinary
+    #: consequence of the two scans consuming differently, not a contrived arrangement.
+    NODES = LIVE_NODES + [
+        {"node_id": 5, "name": "extra", "e_m": 8.0, "n_m": -9.0, "u_m": 0.0, "sigma_m": 0.5},
+        {"node_id": 6, "name": "extra2", "e_m": -9.0, "n_m": -12.0, "u_m": 0.0, "sigma_m": 0.5},
+    ]
+    OFFSETS = [(1, 0.12441), (2, 0.29387), (3, 0.290092), (5, 0.095853), (6, 0.034964),
+               (1, 0.250722), (2, 0.282218), (3, 0.194747), (5, 0.289317), (6, 0.143261),
+               (1, 0.157143), (2, 0.022227), (3, 0.110994), (5, 0.277384), (6, 0.030985)]
+
+    def _run(self, tmp_path):
+        sv = SV.from_dict(survey_dict(self.NODES))
+        rows = [node_row(sv.names[nid], T0 + off, seed=k, sample=k)
+                for k, (nid, off) in enumerate(self.OFFSETS)]
+        build_pool(tmp_path / "pool", rows)
+        return HT.run(str(tmp_path / "pool"), write_survey(tmp_path, self.NODES), pol(),
+                      out=str(tmp_path / "out"), now=T0 + 3600.0)
+
+    def test_the_arrangement_still_produces_a_candidate_associate_did_not_seed(self, tmp_path):
+        """The fixture has to keep reproducing the shape, or the test below passes vacuously."""
+        t = self._run(tmp_path)
+        rows = [json.loads(l) for l in
+                (pathlib.Path(t["out"]) / "runs" / t["run_id"]
+                 / "candidates.jsonl").read_text().splitlines()]
+        assert any(not r["reached_associate"] for r in rows), (
+            "no candidate missed association in this fixture, so it no longer covers the bug")
+        assert t["associate"]["n_events"] >= 2
+
+    def test_every_lost_to_gate_row_names_why(self, tmp_path):
+        t = self._run(tmp_path)
+        run = pathlib.Path(t["out"]) / "runs" / t["run_id"]
+        cand = [json.loads(l) for l in (run / "candidates.jsonl").read_text().splitlines()]
+        lost = [c for c in cand if not c["reached_associate"]]
+        assert lost, "this fixture must produce one, or it is not testing the reason lookup"
+        for c in lost:
+            assert c["associate_reason"], (
+                "candidate %s reached no event with associate_reason %r: the tool's charter is "
+                "that every refusal names its reason" % (c["candidate_id"],
+                                                         c["associate_reason"]))
+        assert any(c["associate_reason"].startswith("member_of_event") for c in lost), (
+            "the reason has to NAME the event that took the arrivals; a bare "
+            "'regrouped' is not followable to anything")
+        assert t["conservation"]["every_candidate_explained"] is True
+
+        attempts = [json.loads(l) for l in (run / "attempts.jsonl").read_text().splitlines()]
+        assert not [a for a in attempts if a["verdict"] == HT.V_LOST_TO_GATE], (
+            "attempts.jsonl is one row per associated event; an event that exists cannot be "
+            "lost to the gate, so this verdict must not appear there")
+        assert len(attempts) == t["associate"]["n_events"]
+
+        # and the arrivals themselves still carry the terminal state, so nothing vanishes
+        term = {}
+        for f in (pathlib.Path(t["out"]) / "arrivals").rglob("*.jsonl"):
+            for line in f.read_text().splitlines():
+                r = json.loads(line)
+                term[r["key"]] = r["terminal"]
+        assert any(term.get(k) == HT.V_LOST_TO_GATE for c in lost for k in c["pool_keys"]), (
+            "a candidate no event matched left no lost_to_gate arrival in the ledger")
+
+
+class TestTheTwoSigmaGatesAreQuotedAgainstTheirOwnNumbers:
+    """⚠️THE NUMBERS, NOT THE PROSE. A test that grepped admit()'s comment for "42x" would pass
+    on the comment quoting itself; these are the two quantities the comment compares, computed
+    from the array and from nodeclass.py, so the claim is what is held and not the sentence.
+
+    The comment shipped saying "~27x tighter (82.1 us of stated sigma against 3.45 ms)". 3.44 ms
+    over 82.1 us is 41.9; the 27 is 3.44 ms over ARRIVAL_T_SIGMA_MAX_S (129.4 us), which is the
+    per-node total budget and not a threshold on `sync_sigma_ns` at all.
+    """
+
+    def test_the_aperture_knob_and_the_hardware_gate_are_42x_apart(self):
+        import hear.nodeclass as NC
+        arr = HT.arrival_survey(SV.from_dict(survey_dict()))
+        bounds = HT.pair_bounds(arr, C)
+        tightest = min(v["bound_s"] for v in bounds.values())
+        assert tightest == pytest.approx(0.034430122, abs=5e-9)
+        knob_ns = HT.DEFAULT_SYNC_SIGMA_FRAC * tightest * 1e9
+        assert knob_ns / 1e6 == pytest.approx(3.443, abs=5e-4), "3.44 ms, not 3.45"
+
+        hardware_ns = NC.CLASSES["xiao-s3-pps"].max_stated_clock_sigma_s() * 1e9
+        assert hardware_ns / 1e3 == pytest.approx(82.1, abs=0.05)
+        assert knob_ns / hardware_ns == pytest.approx(41.9, abs=0.1)
+
+        # the number the "~27x" actually belongs to: a different quantity, not a threshold on
+        # the stated sigma, which is why quoting it beside "82.1 us" was self-inconsistent
+        assert knob_ns / (NC.ARRIVAL_T_SIGMA_MAX_S * 1e9) == pytest.approx(26.6, abs=0.1)
+
+
+class TestThePublishedPointSourceVerdictIsTheRealOne:
+    """⚠️THE FIELD SHIPPED AND THE DEPLOYED PATH LEFT IT null. `Backend.flush()` sets
+    `point_source_possible`, and `Backend` has NO caller: the CronJob runs THIS driver, which
+    hand-builds the dict it hands to `to_dama_event`. The key was absent, `to_dama_event` read it
+    with `.get`, and every payload the cluster published carried null while associate() had
+    computed the verdict for that same event. Null is worse than absent -- it reads as "not
+    stated, probably fine", which is the silence the field was added to end.
+
+    The class-of-bug fix is in `to_dama_event`: the key is SUBSCRIPTED, so the next hand-built
+    caller that forgets it raises here instead of publishing a null.
+    """
+
+    def test_the_deployed_path_publishes_the_verdict_and_its_magnitude(self, tmp_path):
+        sv = SV.from_dict(survey_dict())
+        t = go(tmp_path, planted(sv, (40.0, 30.0, 0.0), T0))
+        ev = json.loads((pathlib.Path(t["out"]) / "runs" / t["run_id"]
+                         / "events.jsonl").read_text().splitlines()[0])
+        pub = ev["published_payload"]["event"]
+        assert pub["point_source_possible"] is True, (
+            "the driver hand-builds this dict; a missing key used to publish null here")
+        # not a constant: it is associate()'s own number for this event, as the manifest reports it
+        assert pub["worst_pair_excess_s"] * 1e3 == pytest.approx(
+            t["associate"]["worst_pair_excess_ms"][0], abs=5e-4)
+        assert t["associate"]["n_point_source_possible"] == t["associate"]["n_events"]
+
+    def test_the_published_verdict_is_carried_from_associate_not_recomputed(self, tmp_path,
+                                                                            monkeypatch):
+        """⚠️NO NATURAL FIXTURE CAN CATCH A HARDCODED `True` HERE, WHICH IS WHY THIS INJECTS.
+
+        The driver only publishes when `bound_check` says the candidate is admissible at ZERO
+        margin, and that is the same physics associate() measured -- so on every publishable row
+        point_source_possible is True and worst_pair_excess_s is 0.0 by construction. Measured:
+        replacing both with the constants `True` and `0.0` passed every other test in this class.
+
+        `bound_check` runs over the driver's own `group` and the flag comes from `ev`, so forcing
+        associate's verdict False leaves the row publishable and the two disagree -- which is
+        exactly the case a consumer needs the flag for, and exactly what the two scans diverging
+        produces in the field.
+        """
+        real = HT.AS.associate
+
+        def forced(*a, **kw):
+            got = real(*a, **kw)
+            for ev in got["events"]:
+                ev["point_source_possible"] = False
+                ev["worst_pair_excess_s"] = 0.004
+            return got
+
+        monkeypatch.setattr(HT.AS, "associate", forced)
+        sv = SV.from_dict(survey_dict())
+        t = go(tmp_path, planted(sv, (40.0, 30.0, 0.0), T0))
+        assert t["events_solved"] == 1, "the row must still be published, not dropped"
+        ev = json.loads((pathlib.Path(t["out"]) / "runs" / t["run_id"]
+                         / "events.jsonl").read_text().splitlines()[0])
+        pub = ev["published_payload"]["event"]
+        assert pub["point_source_possible"] is False, "carried, not recomputed"
+        assert pub["worst_pair_excess_s"] == 0.004
+        assert ev["bound_check"]["admissible"] is True, (
+            "and the driver's own zero-margin check still says admissible -- the two really are "
+            "different questions, which is why the payload has to carry associate's answer")
+
+    @pytest.mark.parametrize("missing", ["point_source_possible", "worst_pair_excess_s"])
+    def test_a_caller_that_omits_the_verdict_raises_rather_than_publishing_null(self, missing):
+        """⚠️THE KeyError MUST NAME THE OMITTED KEY. Asserting only `pytest.raises(KeyError)`
+        passes while ONE of the two is still read with `.get` -- the other key raises and the
+        mutation survives. Measured: reverting point_source_possible to `.get` left this test
+        green until it started checking which key the error names.
+        """
+        ok = {"event_id": 0, "model": "point", "source_class": "blast", "n_nodes": 3,
+              "n_equations": 2, "node_ids": [1, 2, 3], "t0_utc_s": T0, "solution": {},
+              "point_source_possible": False, "worst_pair_excess_s": 0.004}
+        short = {k: v for k, v in ok.items() if k != missing}
+        with pytest.raises(KeyError) as e:
+            BP.to_dama_event(short, array_id="hear")
+        assert e.value.args[0] == missing, (
+            "to_dama_event raised for %r, not for the key the caller omitted (%r): the omitted "
+            "one is still being read with .get and would publish null"
+            % (e.value.args[0], missing))
+        body = BP.to_dama_event(dict(ok), array_id="hear")["event"]
+        assert body["point_source_possible"] is False
+        assert body["worst_pair_excess_s"] == 0.004
+
+
 # ================================================================= deploy
 
 BUNDLE = "hear-tdoa-code"
@@ -1328,9 +1791,9 @@ class TestTheDeployBundle:
         matching its own explanation. The annotation is a field with one value.
         """
         _app, code, data = GC.BUNDLES[BUNDLE]
-        mode, n_bytes = GC.apply_mode(code, data)
+        mode, n_bytes, n_ann = GC.apply_mode(code, data)
         assert mode == "server"
-        assert n_bytes > GC.CLIENT_APPLY_ANNOTATION_CAP
+        assert n_ann > GC.CLIENT_APPLY_ANNOTATION_CAP
         assert n_bytes < GC.OBJECT_CAP, (
             "server-side apply does NOT lift the 1 MiB object cap; past it the bundle has to "
             "be split and no flag saves it")
@@ -1353,11 +1816,17 @@ class TestTheDeployBundle:
         `server`, which always works.
         """
         _app, code, data = GC.BUNDLES[bundle]
-        mode, n_bytes = GC.apply_mode(code, data)
+        # ⚠️THE MODE IS CHOSEN FROM THE THIRD NUMBER. n_bytes is what lands in last-applied;
+        # n_ann is what the API server charges -- the whole annotations map, which also carries
+        # the 48-character last-applied key and the four dama-hear ones. Asserting against
+        # n_bytes is how hear-drain-code read as "client with 393 B spare" while the live object
+        # held 254,433 B of annotations against a 253,952 B threshold.
+        mode, n_bytes, n_ann = GC.apply_mode(code, data)
         limit = GC.CLIENT_APPLY_ANNOTATION_CAP - GC.CLIENT_APPLY_MARGIN
-        assert mode == ("server" if n_bytes > limit else "client")
+        assert mode == ("server" if n_ann > limit else "client")
+        assert n_ann > n_bytes, "the annotations map cannot cost less than last-applied alone"
         # whatever the margin is, a bundle past the real cap must never be called client
-        if n_bytes > GC.CLIENT_APPLY_ANNOTATION_CAP:
+        if n_ann > GC.CLIENT_APPLY_ANNOTATION_CAP:
             assert mode == "server"
         f = REPO / "deploy" / "k8s" / ("%s.yaml" % bundle)
         if not f.exists():
@@ -1458,6 +1927,51 @@ def _embedded_from_text(text):
     if key:
         out[key] = "\n".join(buf)
     return out
+
+
+# ================================================================= scan_coincidences docstring
+
+class TestScanCoincidencesNoLongerMatchesAssociate:
+    """Pins scan_coincidences()'s own ⚠️: it used to claim "Same scan, minus one gate" and that
+    a consumed candidate is terminal, which stopped being true when #42 gave associate() two
+    NON-terminal refusals (duplicate_node_in_group release, and every pairwise_dt_exceeds_geometry
+    refusal). This scan still marks every visited candidate used unconditionally, so it can seed
+    -- or fail to seed -- differently from associate() on the same detections.
+
+    Same node positions and arrivals as tests/test_associate.py's TestReseedingARefusedCandidate
+    (the live 2026-09-09T11:08:41 episode): nyquist@.271272 seeds a group, is refused against
+    rankine@.340823 by the geometry gate, and -- since #42 -- is released rather than consumed.
+    associate() reseeds cleanly at rankine and delivers [rankine, nyquist, mach]. This scan has no
+    release: nyquist@.271272 stays consumed as soon as it is visited, so the very group associate
+    delivers never gets a chance to seed here at all.
+    """
+
+    LIVE_T = 1788952121.0
+    LIVE_ARRIVALS = [
+        (2, 0.164822), (2, 0.168846), (2, 0.173107), (2, 0.181276), (2, 0.185542),
+        (1, 0.271272), (1, 0.321229), (1, 0.333769), (1, 0.338348), (1, 0.359180),
+        (3, 0.340823), (3, 0.343133), (3, 0.345298),
+        (2, 0.380704), (2, 0.383722),
+    ]
+
+    def _dets(self):
+        return [{"node_id": n, "seq": i, "t_utc_s": self.LIVE_T + off, "iface": "lora0"}
+                for i, (n, off) in enumerate(self.LIVE_ARRIVALS)]
+
+    def _survey(self):
+        return SV.from_dict(survey_dict(LIVE_NODES))
+
+    def test_associate_delivers_the_episode_scan_coincidences_cannot_see(self):
+        dets = self._dets()
+        sv = self._survey()
+        got = AS.associate(dets, sv, temp_c=25.0)
+        assert [e["node_ids"] for e in got["events"]] == [[3, 1, 2]], (
+            "if this drifts, re-derive window_s below from got['window_s'] instead of assuming it")
+        window_s = got["window_s"]
+        scanned = HT.scan_coincidences(dets, window_s=window_s, min_nodes=3)
+        assert scanned == [], (
+            "scan_coincidences found a group here -- the docstring's claim may have been fixed; "
+            "update it (and this test) rather than deleting the assertion")
 
 
 # ================================================================= the one real-file read

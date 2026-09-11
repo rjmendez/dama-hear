@@ -81,7 +81,7 @@ WHAT IT WRITES, all under `--out` (default `<pool>/tdoa`) and NEVER inside the c
                                           conservation, not_composed, could_not_do, timings
     <out>/runs/<run_id>/coactivity.json
     <out>/runs/<run_id>/candidates.jsonl  ungated scan + bound_check + reached_associate
-    <out>/runs/<run_id>/attempts.jsonl    one row per candidate, ALWAYS a verdict
+    <out>/runs/<run_id>/attempts.jsonl    one row per ASSOCIATED EVENT, ALWAYS a verdict
     <out>/runs/<run_id>/events.jsonl      solved AND strictly admissible only
     <out>/runs/<run_id>/null.json
     <out>/runs/<run_id>/plan.json
@@ -263,6 +263,13 @@ V_LOST_TO_GATE = "lost_to_gate"
 
 VERDICTS = (V_SOLVED, V_SOLVER_REFUSED, V_POSITION_UNOBSERVABLE, V_AT_SEARCH_BOUND,
             V_MARGIN_DEPENDENT, V_INADMISSIBLE, V_LOST_TO_GATE)
+
+# ⚠️`associate_reason` IS NEVER null WHEN `reached_associate` IS False. These are the reasons
+# that are not in associate()'s own `rejected` list, because the arrival was never refused: it
+# went into a DIFFERENT event, or (defensively) no event and no refusal claims it at all. A
+# terminal state with no reason is the failure mode this module exists to prevent.
+R_MEMBER_OF_OTHER_EVENT = "member_of_event %s seeded at %.6f"
+R_UNACCOUNTED = "unaccounted_by_associate"
 
 # ---------------------------------------------------------------- binding constraint
 B_NO_RECORDS = "no_records"
@@ -697,9 +704,15 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
         # APERTURE-relative (DEFAULT_SYNC_SIGMA_FRAC of the tightest pair bound: "is this
         # receiver contributing information to that pair at all"), and it moves when the array
         # moves. The one below is HARDWARE-relative: the class's own arrival budget, which does
-        # not. On this array the hardware gate is ~27x tighter (82.1 us of stated sigma against
-        # 3.45 ms), so it binds and the operator knob only ever loosens -- which is the right way
-        # round for a knob. Keep them separate; collapsing them would put site geometry back
+        # not. On this array the hardware gate is ~42x tighter: the largest stated sigma it
+        # admits for xiao-s3-pps is 82.1 us against this knob's 3.44 ms (both measured 2026-09-11
+        # from survey.json and nodeclass.py: tightest pair bound 34.430 ms x 0.10, and
+        # max_stated_clock_sigma_s). ⚠️NOT "~27x": 27 is 3.44 ms over ARRIVAL_T_SIGMA_MAX_S
+        # (129.4 us), which is the per-node TOTAL budget and not a threshold on this quantity --
+        # quoting one gate's ratio against the other gate's number is how the comment read for
+        # two deploys. Either way the hardware gate binds and the operator knob only ever
+        # loosens, which is the right way round for a knob.
+        # Keep them separate; collapsing them would put site geometry back
         # inside a hardware admissibility test, which nodeclass.py's own header argues against.
         if max_sync_ns is not None and ssig is not None and float(ssig) > float(max_sync_ns):
             _drop(day, row, D_SYNC_SIGMA,
@@ -903,8 +916,25 @@ def scan_coincidences(dets: Sequence[Dict[str, Any]], window_s: float,
     impossible". Those need opposite field responses -- the first is an uptime and threshold
     problem, the second is a siting or clock problem -- so both are counted.
 
-    Semantics are otherwise associate()'s exactly: one detection per node per group, earliest
-    wins with no replacement, a consumed candidate is terminal. Same scan, minus one gate.
+    ⚠️IT IS NOT associate() MINUS ONE GATE, AND NOTHING MAY ASSUME THE TWO AGREE. It was, until
+    #42: associate() now has two NON-terminal refusals that return a candidate to ITS OWN pool
+    for a later group to pick up as a fresh seed (hear/backend/associate.py: the
+    `duplicate_node_in_group` release, and every `pairwise_dt_exceeds_geometry` refusal, which
+    never sets `used[j]`). This scan still marks every visited candidate `used[j] = True`
+    unconditionally, so a refused arrival that associate() hands back to seed a group of its own
+    is swallowed here by whatever reached it first. Seed AND membership can therefore differ,
+    measured on the live pool 2026-09-11: the 1789063974 episode seeds at node3@.287743 in
+    associate() and at node1@.299200 here, eight ms later. Mirroring the release rule into this
+    scan would destroy what it is for -- an UNGATED census cannot re-seed on a gate it does not
+    have. So nothing is solved off this scan; see the solve loop, which runs off associate()'s
+    events and matches back to these by MEMBER SET. Matching by SEED, which is what it did until
+    that was fixed, silently lost an admissible episode. Reproductions:
+    tests/test_hear_tdoa.py::TestScanCoincidencesNoLongerMatchesAssociate and
+    ::TestTheSolveLoopRunsOffAssociatedEvents.
+
+    What is still true: one detection per node per group, earliest wins with no replacement
+    WITHIN one scan, and this scan carries NO geometry gate at all -- see the module docstring
+    above for why that absence is deliberate.
     """
     pool = sorted(dets, key=lambda d: (float(d["t_utc_s"]), int(d["node_id"]), int(d["seq"])))
     used = [False] * len(pool)
@@ -1656,15 +1686,33 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
             % (len(dets), assoc_accounted))
 
     # ---------------------------------------------------------- the two scans
+    # ⚠️THE SOLVE LOOP RUNS OFF associate()'s EVENTS. THE UNGATED SCAN IS A CENSUS AND SOLVES
+    # NOTHING. They are two groupings of the same arrivals and they do not agree member for
+    # member: the ungated scan has no geometry gate and consumes every candidate it reaches, so
+    # both its seed and its membership can differ. This loop used to run off `candidates` and
+    # look the event up by the SEED's pool_key, which silently required the two to pick the same
+    # earliest member. #42 stopped consuming a geometry refusal, the refused arrival started
+    # seeding groups of its own, and on 2026-09-11 a strictly admissible episode went from solved
+    # to `lost_to_gate` with no reason attached -- the event existed, the join missed it.
     candidates = scan_coincidences(dets, window_s, min_nodes)
-    by_key = {d["pool_key"]: d for d in dets}
-    ev_by_seed = {}
-    for ev in grouped["events"]:
-        seed = min(ev["detections"], key=lambda d: (float(d["t_utc_s"]), int(d["node_id"])))
-        ev_by_seed[seed["pool_key"]] = ev
     rej_by_key = {}
-    for r in grouped["rejected"]:
+    for r in grouped["rejected"] + grouped["duplicates"]:
         rej_by_key.setdefault((r["node_id"], r["seq"]), r)
+    # ⚠️MEMBERSHIP, NOT SEED. The two scans no longer consume identically -- associate()
+    # releases a candidate its pairwise gate refused, the ungated scan still consumes it -- so a
+    # candidate's members can all belong to an event seeded elsewhere. Indexing by member is what
+    # lets a candidate be matched to its event by SET, and what lets an unmatched one name the
+    # event that actually holds its arrivals instead of going out with a null reason.
+    ev_of_member: Dict[str, Dict[str, Any]] = {}
+    ev_key_of_member: Dict[str, str] = {}
+    ev_members: set = set()
+    for ev in grouped["events"]:
+        pk = [d["pool_key"] for d in ev["detections"]]
+        ek = event_key(pk)
+        ev_members.add(frozenset(pk))
+        for k in pk:
+            ev_of_member[k] = ev
+            ev_key_of_member[k] = ek
 
     cand_rows: List[Dict[str, Any]] = []
     attempts: List[Dict[str, Any]] = []
@@ -1674,35 +1722,57 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
     solved_for_cal: List[Dict[str, Any]] = []
 
     for gi, group in enumerate(candidates):
-        seed = group[0]
         ids = [int(d["node_id"]) for d in group]
         arrivals = [float(d["t_utc_s"]) for d in group]
         pkeys = [d["pool_key"] for d in group]
-        ek = event_key(pkeys)
         bc = bound_check(group, arr_sv, c, margin_s)
-        ev = ev_by_seed.get(seed["pool_key"])
-        reached = ev is not None
+        # ⚠️MEMBER SET, NOT SEED. An event and a candidate may legitimately differ in membership
+        # and in which arrival is earliest; identity is the set of arrivals, which is exactly
+        # what event_key() hashes.
+        reached = frozenset(pkeys) in ev_members
+        # ⚠️NEVER null WHEN reached IS False. Every arrival ends in an event, a rejection or a
+        # duplicate -- conservation above asserts it -- so an unexplained candidate is a bug in
+        # this lookup, not a fact about the data.
         lost_reason = None
         if not reached:
-            for d in group:
-                r = rej_by_key.get((int(d["node_id"]), int(d["seq"])))
-                if r is not None:
-                    lost_reason = r["reason"]
-                    break
+            loose = [d for d in group if d["pool_key"] not in ev_of_member]
+            if loose:
+                r = rej_by_key.get((int(loose[0]["node_id"]), int(loose[0]["seq"])))
+                lost_reason = R_UNACCOUNTED if r is None else r["reason"]
+            else:
+                # every member IS associated, in another combination: name that event rather
+                # than say "regrouped", so the row is followable to the event that took them.
+                other = ev_of_member[pkeys[0]]
+                lost_reason = R_MEMBER_OF_OTHER_EVENT % (ev_key_of_member[pkeys[0]],
+                                                         float(other["t0_utc_s"]))
         cand_rows.append({
-            "schema": TDOA_SCHEMA, "candidate_id": gi, "event_key": ek,
+            "schema": TDOA_SCHEMA, "candidate_id": gi, "event_key": event_key(pkeys),
             "t0_utc_s": arrivals[0], "span_s": arrivals[-1] - arrivals[0],
             "node_ids": ids, "node_names": [d["node_name"] for d in group],
             "arrivals": arrivals, "pool_keys": pkeys,
             "n_nodes": len(group), "n_equations": len(group) - 1,
             "bound_check": bc, "reached_associate": reached,
             "associate_reason": lost_reason,
+            "member_event_keys": sorted({ev_key_of_member[k] for k in pkeys
+                                         if k in ev_key_of_member}),
+            # ⚠️A CANDIDATE WITH NO EVENT IS NOW THE ONLY ROW THAT EXISTS FOR IT, so the geometry
+            # that used to ride on its `lost_to_gate` attempt row rides here instead.
+            "geometry_at_centroid": geometry_report(
+                arr_sv, ids, arr_sv.positions(ids).mean(axis=0), policy["temp_c"], fixed_up),
             "retrigger": [bool(d.get("retrigger")) for d in group],
             "layout": [d.get("layout") for d in group],
             "fs_hz": [d.get("fs_hz") for d in group],
         })
 
-        # exactly one verdict per candidate, in this order and no other
+    for gi, ev in enumerate(grouped["events"]):
+        group = ev["detections"]
+        ids = list(ev["node_ids"])
+        arrivals = list(ev["arrivals"])
+        pkeys = [d["pool_key"] for d in group]
+        ek = event_key(pkeys)
+        bc = bound_check(group, arr_sv, c, margin_s)
+
+        # exactly one verdict per associated event, in this order and no other
         sol = err = model = None
         geom_centroid = geometry_report(
             arr_sv, ids, arr_sv.positions(ids).mean(axis=0), policy["temp_c"], fixed_up)
@@ -1710,19 +1780,17 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
         loo = None
         if not bc["admissible"]:
             verdict = V_MARGIN_DEPENDENT if bc["margin_dependent"] else V_INADMISSIBLE
-        elif not reached:
-            verdict = V_LOST_TO_GATE
         else:
-            model, sol, err = solve_event(arr_sv, ev["node_ids"], ev["arrivals"],
+            model, sol, err = solve_event(arr_sv, ids, arrivals,
                                           policy["source_class"], policy["temp_c"],
                                           policy["v_mps"], fixed_up)
             verdict = solver_verdict(model, sol, err)
             if sol and sol.get("east_m") is not None:
                 geom_fit = geometry_report(
-                    arr_sv, ev["node_ids"],
+                    arr_sv, ids,
                     (sol["east_m"], sol["north_m"], sol.get("up_m") or 0.0),
                     policy["temp_c"], fixed_up)
-                loo = leave_one_out(arr_sv, ev["node_ids"], ev["arrivals"],
+                loo = leave_one_out(arr_sv, ids, arrivals,
                                     policy["source_class"], policy["temp_c"], policy["v_mps"],
                                     fixed_up, sol)
         row = {
@@ -1733,7 +1801,9 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
             "n_nodes": len(group), "n_equations": len(group) - 1,
             "model": model, "source_class": policy["source_class"],
             "solution": sol, "solver_error": err,
-            "associate_reason": lost_reason,
+            "associate_reason": None,
+            "point_source_possible": bool(ev["point_source_possible"]),
+            "worst_pair_excess_s": float(ev["worst_pair_excess_s"]),
             "bound_check": bc,
             "geometry_at_centroid": geom_centroid,
             "geometry_at_fit": geom_fit,
@@ -1755,14 +1825,31 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
             key_of_det[d["pool_key"]] = verdict
             ev_key_of_det[d["pool_key"]] = ek
         if verdict == V_SOLVED and bc["admissible"]:
+            # ⚠️THE VERDICT COMES FROM `ev`, NOT FROM `bc`. The solution above was fitted to
+            # ev["node_ids"]/ev["arrivals"]; bound_check ran over `group`, and the two scans do
+            # not always hold the same members. The flag beside a solution has to be the one
+            # computed over the arrivals that solution was fitted to.
             pub = BP.to_dama_event(
                 {"event_id": gi, "model": model, "source_class": policy["source_class"],
-                 "n_nodes": len(ev["node_ids"]), "n_equations": len(ev["node_ids"]) - 1,
-                 "node_ids": list(ev["node_ids"]), "t0_utc_s": ev["t0_utc_s"],
+                 "n_nodes": len(ids), "n_equations": len(ids) - 1,
+                 "node_ids": list(ids), "t0_utc_s": ev["t0_utc_s"],
+                 # ⚠️#44's whole point, and it was null on this path: the hand-built dict never
+                 # carried either key and pipeline.to_dama_event read them with .get. It
+                 # subscripts them now, so an omission here is a KeyError, not a published null.
+                 "point_source_possible": bool(ev["point_source_possible"]),
+                 "worst_pair_excess_s": float(ev["worst_pair_excess_s"]),
                  "solution": sol}, array_id=policy.get("array_id") or "hear")
             events_out.append(dict(row, published_payload=pub))
-            solved_for_cal.append({"node_ids": list(ev["node_ids"]),
-                                   "arrivals": list(ev["arrivals"])})
+            solved_for_cal.append({"node_ids": list(ids), "arrivals": list(arrivals)})
+
+    # ⚠️AN ARRIVAL THE UNGATED SCAN PAIRED AND ASSOCIATION DID NOT IS `lost_to_gate`, WHICH IS
+    # THE ONLY PLACE THAT VERDICT NOW APPEARS. It is a terminal state of the arrival, not a
+    # verdict on an event: there is no event to judge.
+    for group in candidates:
+        for d in group:
+            if d["pool_key"] not in key_of_det:
+                key_of_det[d["pool_key"]] = V_LOST_TO_GATE
+                ev_key_of_det[d["pool_key"]] = event_key([m["pool_key"] for m in group])
 
     # ---------------------------------------------------------- finalise the arrival ledger
     # ⚠️ONE TERMINAL STATE PER ADMITTED ROW, from the DRIVER's own scan and not from associate's
@@ -1800,9 +1887,9 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
 
     # ---------------------------------------------------------- null control
     if not co["bins_with_all"]:
-        # ⚠️NO RATE OVER ZERO OPPORTUNITY. The scan above still ran -- refusing to run it would
-        # hide candidates that straddle a bin edge, and conservation needs one verdict per
-        # candidate either way -- but a coincidence RATE and its null are not reported, because
+        # ⚠️NO RATE OVER ZERO OPPORTUNITY. The scans above still ran -- refusing to run them
+        # would hide candidates that straddle a bin edge, and conservation needs every candidate
+        # explained either way -- but a coincidence RATE and its null are not reported, because
         # the denominator does not exist.
         null = {"skipped": True, "reason": "no bin had every arrival node detecting: a "
                                            "coincidence rate over zero opportunity is a number "
@@ -1830,12 +1917,20 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
         "admitted": a["n_admitted"], "by_terminal": by_terminal,
         # I2b -- associate's own invariant, re-asserted on its return rather than trusted.
         "associate_conserved": assoc_accounted == len(dets),
-        # I3 -- one verdict per candidate, no candidate silently dropped.
-        "one_verdict_per_candidate": len(candidates) == len(attempts),
+        # I3 -- one verdict per ASSOCIATED EVENT, no event silently dropped. It used to be one
+        # per ungated candidate, which is what let two associated events be neither solved nor
+        # reported while the manifest's conservation still said ok.
+        "one_verdict_per_event": len(grouped["events"]) == len(attempts),
         "n_candidates": len(candidates), "n_attempts": len(attempts),
+        # I3b -- every ungated candidate is explained: an event of the same membership, or a
+        # named reason. `lost_to_gate` with no reason is what made the regression unreadable.
+        "every_candidate_explained": all(r["reached_associate"] or r["associate_reason"]
+                                         for r in cand_rows),
+        "candidates_lost_to_gate": sum(1 for r in cand_rows if not r["reached_associate"]),
     }
     cons["ok"] = all(bool(cons[k]) for k in ("one_terminal_state_per_row", "admitted_accounted",
-                                             "associate_conserved", "one_verdict_per_candidate"))
+                                             "associate_conserved", "one_verdict_per_event",
+                                             "every_candidate_explained"))
 
     report.update({
         "mode": "run",
@@ -1888,8 +1983,8 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
         raise NotInterpretable(
             "conservation broke: %s. Nothing written."
             % json.dumps({k: cons[k] for k in ("one_terminal_state_per_row", "admitted_accounted",
-                                               "associate_conserved",
-                                               "one_verdict_per_candidate")}, sort_keys=True))
+                                               "associate_conserved", "one_verdict_per_event",
+                                               "every_candidate_explained")}, sort_keys=True))
 
     if policy.get("known_source") is not None:
         report["sound_speed_recovery"] = _recover_c(arr_sv, attempts, policy, c)
@@ -2330,11 +2425,12 @@ def format_report(t: Dict[str, Any]) -> str:
                   (t.get("policy") or {}).get("temp_c") or 0.0, d.get("reason")))
     cons = t.get("conservation") or {}
     out.append("conservation %s  (read %s == accounted %s; admitted %s in %s terminal state(s); "
-               "%s candidate(s) == %s verdict(s))"
+               "%s event(s) == %s verdict(s); %s ungated candidate(s), %s lost to the gate)"
                % ("OK" if cons.get("ok") else "BROKEN", cons.get("lines_read"),
                   cons.get("accounted"), cons.get("admitted"),
-                  len(cons.get("by_terminal") or {}), cons.get("n_candidates"),
-                  cons.get("n_attempts")))
+                  len(cons.get("by_terminal") or {}), (t.get("associate") or {}).get("n_events"),
+                  cons.get("n_attempts"), cons.get("n_candidates"),
+                  cons.get("candidates_lost_to_gate")))
     out.append("terminal states: " + json.dumps(cons.get("by_terminal") or {}, sort_keys=True))
     out.append("")
     out.append("BINDING CONSTRAINT: %s" % t.get("binding_constraint"))
