@@ -133,6 +133,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -203,6 +204,13 @@ D_CLOCK_UNSTATED = "clock_unstated"
 D_CLOCK_UNTRUSTED = "clock_untrusted"
 D_SYNC_SIGMA = "sync_sigma_exceeds"
 D_STAMP_SIGMA = "stamp_sigma_over_class_budget"
+#: ⚠️A SECOND, DIFFERENT REFUSAL ON THE SAME RECEIVER, AND IT MUST NOT BE FOLDED INTO THE FIRST.
+#: D_STAMP_SIGMA says this detection's clock SCATTERS too much; this says the receiver's capture
+#: path carries an uncorrected fixed OFFSET, or was never measured at all. Weighting handles the
+#: first and cannot touch the second -- a bias moves the fit rather than widening it -- so a
+#: receiver can clear its clock on its own stated sigma and still land here. Two reasons in the
+#: ledger, so an operator reading it can tell "run tools/hear_latency_cal.py" from "fix a clock".
+D_PATH_BIAS = "capture_path_bias"
 D_ONSET = "onset_not_found"
 D_ONSET_UNSTATED = "onset_unstated"
 D_LATENCY = "latency_uncorrected"
@@ -211,8 +219,8 @@ D_ADMITTED = "admitted"
 
 DROP_REASONS = (D_UNANCHORED, D_OUTSIDE_WINDOW, D_OUTSIDE_LOOKBACK_EMITTED,
                 D_OUTSIDE_LOOKBACK_UNASSOC, D_PENDING_SETTLE, D_UNSURVEYED, D_NOT_ARRIVAL,
-                D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_SYNC_SIGMA, D_STAMP_SIGMA, D_ONSET,
-                D_ONSET_UNSTATED, D_LATENCY, D_UNPARSEABLE)
+                D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_SYNC_SIGMA, D_STAMP_SIGMA,
+                D_PATH_BIAS, D_ONSET, D_ONSET_UNSTATED, D_LATENCY, D_UNPARSEABLE)
 
 #: Why an admitted arrival's onset quality is UNSTATED, stated once so the ledger detail, the
 #: manifest and the CLI help cannot drift apart. Every clause was checked on 2026-09-10 against
@@ -730,6 +738,29 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
         if stamp_ok is False:
             _drop(day, row, D_STAMP_SIGMA, _detail(row, NC.stamp_refusal(ssig, cname) or ""))
             continue
+        # ⚠️THE SECOND GATE, AND IT DOES NOT MOVE WHEN THE FIRST ONE OPENS. The line above judges
+        # this detection's stated clock sigma; this judges the receiver's CAPTURE PATH, which is
+        # a fixed offset and not scatter. Clearing the clock buys nothing here on purpose: a
+        # phone that states 106 us is inside its clock budget and still carries a MEASURED
+        # 13.122 ms = 4.50 m of uncorrected audio-path delay on the best of three handsets, which
+        # no weight the solver applies can remove -- it relocates the fit instead of widening it.
+        # ⚠️IT IS A CLASS PROPERTY, NOT A ROW PROPERTY, because that is what a per-device
+        # calibration is; nothing in the row could state it. The refusal is nodeclass's own words
+        # so the class door and this door say the same thing.
+        #
+        # ⚠️AN UNCLASSED RECEIVER IS CHARGED THE STRICTEST ARRIVAL CLASS'S BIAS, AND THAT IS A
+        # GUESS WEARING A MEASUREMENT'S CLOTHES. `nodeclass._stamp_class(None)` resolves to
+        # xiao-s3-pps, whose path_bias_s is the MEASURED 62.5 us of ITS capture path. Charge that
+        # to an unclassed handset and this gate admits a receiver carrying 13.122 ms. It is that
+        # way round on purpose -- every node in the shipped survey.json is unclassed, and refusing
+        # unclassed receivers here would refuse all three and empty the corpus, the same call
+        # `Survey.arrival_ids()` documents ("State the class to be refused"). ⚠️SO THE MOMENT A
+        # PHONE IS ADDED TO survey.json IT MUST CARRY `"class": "gotchi-phone"`. Without it the
+        # class door lets it past and this one charges it a XIAO's audio path.
+        bias_why = NC.bias_refusal(cname)
+        if bias_why is not None:
+            _drop(day, row, D_PATH_BIAS, _detail(row, bias_why))
+            continue
         # ⚠️THREE-STATE, AND THE THIRD STATE IS THE ONE THAT ACTUALLY OCCURS. See the
         # `onset_quality` block returned below for what this pool is made of.
         onset = row.get("onset_found")
@@ -772,6 +803,15 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
             "retrigger": row.get("retrigger"), "layout": row.get("layout"),
             "fs_hz": row.get("fs_hz"), "clock_tier": row.get("clock_tier"),
             "sync_sigma_ns": ssig, "ts_utc_s_raw": float(row["ts_utc_s"]),
+            # THE SAME QUANTITY THE BOOLEAN BELOW WAS DERIVED FROM, KEPT AS A NUMBER. The gate
+            # spends `sync_sigma_ns` on a pass/fail and then throws away everything it says
+            # about the rows that PASS; this is that number resolved against the receiver's
+            # class -- stated sigma RSS the class's capture terms -- in SECONDS, which is the
+            # unit `arrivals` and the solvers are in. associate() carries it into
+            # `event["arrival_sigma_s"]` index-aligned with `arrivals`; solve_event() hands it
+            # to the solver. None when the producer stated nothing: that is the class figure and
+            # not a measurement, and a solver must be able to tell the two apart.
+            "t_sigma_s": (None if ssig is None else NC.stamp_t_sigma_s(ssig, cname)),
             # A REAL BOOLEAN for the same reason `utc_trusted` below is one: associate() cannot
             # resolve it, because the budget is per CLASS and associate has never seen a class.
             # None here means the producer stated no sigma, which that gate reads as usable.
@@ -1169,9 +1209,51 @@ def geometry_report(sv: SV.Survey, node_ids: Sequence[int], source: Sequence[flo
     return out
 
 
+#: The name and unit `point.solve` takes a per-receiver arrival sigma under: a sequence of
+#: SECONDS, one entry per receiver, in the order the receivers were passed.
+SOLVER_SIGMA_KWARG = "sigmas"
+#: ⚠️A SEAM BETWEEN TWO BRANCHES, WRITTEN DOWN RATHER THAN ASSUMED. The carrying side (pool ->
+#: detection -> event -> here) and the consuming side (point.solve's weighted fit) landed
+#: separately. Probing the signature is what lets this branch be correct on a main where the
+#: parameter does not exist yet, instead of raising TypeError on every event; `solver_weighting`
+#: puts the answer in the run's own report, so "the sigma reached the solver" is a MEASURED field
+#: and not a claim. ⚠️DELETE THE PROBE once both sides are on main -- keeping it means a later
+#: rename of the solver parameter degrades silently to unweighted instead of failing.
+SOLVER_TAKES_SIGMA = SOLVER_SIGMA_KWARG in inspect.signature(PT.solve).parameters
+
+
+def _sigma_kwargs(sigmas: Optional[Sequence[Optional[float]]]) -> Dict[str, Any]:
+    """The solver keyword carrying per-receiver sigma, or nothing at all.
+
+    Empty in three cases, and the third is the interesting one:
+
+      * the solver does not take the parameter (this branch running on a main without it);
+      * NO receiver in the group stated a sigma -- an all-`None` list is every receiver on its
+        class figure, which is equal weighting written out longhand, and passing it would make
+        the report claim a weighted fit that is not one;
+      * SOME did and some did not. ⚠️THE SOLVER'S CONTRACT REFUSES A MIXTURE ("one entry per
+        receiver or None for all of them, never a mixture, and never invented for a receiver that
+        states none"), and the only way to satisfy it on a mixed group would be to fill the gaps
+        with the quiet receivers' CLASS figures -- numbers nobody measured for those detections.
+        That is the invention the solver is refusing, so this refuses to do it and falls back to
+        equal weighting. ⚠️IT IS NOT FREE, AND THE COST IS COUNTED: a node array that has not
+        taken the G6 flash standing beside a phone that states 106 us per row is exactly a mixed
+        group, so `solver_weighting.attempts_mixed_statement` is the number to watch. Deciding
+        whether a class figure counts as a statement is a change to the SOLVER's contract and
+        belongs on that side of the seam, not smuggled through here.
+    """
+    if not SOLVER_TAKES_SIGMA or sigmas is None:
+        return {}
+    if any(s is None for s in sigmas):
+        return {}
+    return {SOLVER_SIGMA_KWARG: [float(s) for s in sigmas]}
+
+
 def solve_event(sv: SV.Survey, node_ids: Sequence[int], arrivals: Sequence[float],
                 source_class: str, temp_c: float, v_mps: float,
-                fixed_up_m: Optional[float]) -> Tuple[str, Optional[Dict], Optional[str]]:
+                fixed_up_m: Optional[float],
+                arrival_sigma_s: Optional[Sequence[Optional[float]]] = None
+                ) -> Tuple[str, Optional[Dict], Optional[str]]:
     """(model, solution, solver_error). ~15 lines mirrored from `pipeline.Backend.flush()`.
 
     ⚠️MIRRORED, NOT COPIED-AND-EMBELLISHED, and pinned equal by
@@ -1180,6 +1262,10 @@ def solve_event(sv: SV.Survey, node_ids: Sequence[int], arrivals: Sequence[float
     every arrival. The cone lane gets the 2D projection explicitly and by name, because
     shockwave.py is still planar; the point lane gets full 3D positions, because point.py
     consumes node height as a real distance.
+
+    `arrival_sigma_s` is per-arrival 1-sigma timestamp uncertainty in SECONDS, index-aligned with
+    `arrivals`, `None` per entry where the producer stated nothing. It reaches the point lane and
+    only the point lane -- see the cone branch.
 
     ⚠️`fixed_up_m is not None`, NEVER TRUTHINESS. point.solve tests `fixed_up_m is not None`
     (point.py:236), so `fixed_up_m = 0.0` -- the most likely declared height there is -- means
@@ -1190,9 +1276,14 @@ def solve_event(sv: SV.Survey, node_ids: Sequence[int], arrivals: Sequence[float
     P = sv.positions(list(node_ids))
     try:
         if model == "cone":
+            # ⚠️THE CONE LANE IS NOT WEIGHTED AND THE SIGMA IS DROPPED HERE ON PURPOSE.
+            # shockwave.solve has no sigma parameter and fits a different model (a Mach cone, not
+            # a point), so quietly passing one would be inventing an interface. The sigma is
+            # still in the event for whoever adds it.
             return model, SW.solve(P[:, :2], list(arrivals), v_mps=v_mps, temp_c=temp_c), None
         return model, PT.solve(P, list(arrivals), source_class, temp_c=temp_c,
-                               fixed_up_m=fixed_up_m), None
+                               fixed_up_m=fixed_up_m,
+                               **_sigma_kwargs(arrival_sigma_s)), None
     except ValueError as exc:
         return model, None, str(exc)
 
@@ -1220,7 +1311,9 @@ def solver_verdict(model: str, sol: Optional[Dict], err: Optional[str]) -> str:
 
 def leave_one_out(sv: SV.Survey, node_ids: Sequence[int], arrivals: Sequence[float],
                   source_class: str, temp_c: float, v_mps: float,
-                  fixed_up_m: Optional[float], full: Optional[Dict]) -> Optional[Dict[str, Any]]:
+                  fixed_up_m: Optional[float], full: Optional[Dict],
+                  arrival_sigma_s: Optional[Sequence[Optional[float]]] = None
+                  ) -> Optional[Dict[str, Any]]:
     """Receiver-level attribution: drop each node in turn and report what moved.
 
     ⚠️SKIPPED, LOUDLY, BELOW `meaningful_n`. At the exactly-determined node count the residual is
@@ -1239,7 +1332,14 @@ def leave_one_out(sv: SV.Survey, node_ids: Sequence[int], arrivals: Sequence[flo
     for k in range(n):
         keep = [i for j, i in enumerate(node_ids) if j != k]
         ta = [t for j, t in enumerate(arrivals) if j != k]
-        _m, sol, err = solve_event(sv, keep, ta, source_class, temp_c, v_mps, fixed_up_m)
+        # ⚠️THE SIGMA LIST IS DROPPED AT THE SAME INDEX, not passed whole. It pairs with
+        # `arrivals` BY POSITION, so a full-length list against an n-1 arrival list would weight
+        # every remaining receiver by its neighbour's sigma -- and silently, because the lengths
+        # would only disagree by one and the solver would raise about `arrivals` instead.
+        sg = (None if arrival_sigma_s is None
+              else [s for j, s in enumerate(arrival_sigma_s) if j != k])
+        _m, sol, err = solve_event(sv, keep, ta, source_class, temp_c, v_mps, fixed_up_m,
+                                   arrival_sigma_s=sg)
         dpos = None
         if sol and full and sol.get("east_m") is not None and full.get("east_m") is not None:
             dpos = float(math.hypot(sol["east_m"] - full["east_m"],
@@ -1601,6 +1701,19 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
         "at": now,
         "pool": pool_root, "out": out, "survey": survey_path,
         "policy": {k: v for k, v in sorted(policy.items()) if k != "latency_cal"},
+        # ⚠️MEASURED, NOT ASSERTED. Whether a stated per-arrival sigma actually reached the
+        # solver is a fact about the code this run imported, and a report that only said the
+        # sigma was "carried" would be true while every receiver still voted at par. `delivered`
+        # counts the attempts that handed the solver a real weight.
+        "solver_weighting": {
+            "kwarg": SOLVER_SIGMA_KWARG,
+            "unit": "seconds, 1-sigma, index-aligned with arrivals, null = not stated",
+            "solver_accepts": bool(SOLVER_TAKES_SIGMA),
+            "attempts_with_any_stated_sigma": 0,
+            "attempts_all_receivers_stated": 0,
+            "attempts_mixed_statement": 0,
+            "attempts_delivered_to_solver": 0,
+        },
         "survey_block": {
             "survey_ok": True,
             "all_ids": list(sv.ids), "all_names": [sv.names[i] for i in sv.ids],
@@ -1768,6 +1881,9 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
         group = ev["detections"]
         ids = list(ev["node_ids"])
         arrivals = list(ev["arrivals"])
+        # `.get` because a caller may hand this driver an event dict built before associate()
+        # carried the field; a missing sigma is "nobody stated one", which is equal weighting.
+        sigmas = list(ev.get("arrival_sigma_s") or [None] * len(arrivals))
         pkeys = [d["pool_key"] for d in group]
         ek = event_key(pkeys)
         bc = bound_check(group, arr_sv, c, margin_s)
@@ -1781,9 +1897,19 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
         if not bc["admissible"]:
             verdict = V_MARGIN_DEPENDENT if bc["margin_dependent"] else V_INADMISSIBLE
         else:
+            sw = report["solver_weighting"]
+            if any(s is not None for s in sigmas):
+                sw["attempts_with_any_stated_sigma"] += 1
+                if all(s is not None for s in sigmas):
+                    sw["attempts_all_receivers_stated"] += 1
+                else:
+                    sw["attempts_mixed_statement"] += 1
+            if _sigma_kwargs(sigmas):
+                sw["attempts_delivered_to_solver"] += 1
             model, sol, err = solve_event(arr_sv, ids, arrivals,
                                           policy["source_class"], policy["temp_c"],
-                                          policy["v_mps"], fixed_up)
+                                          policy["v_mps"], fixed_up,
+                                          arrival_sigma_s=sigmas)
             verdict = solver_verdict(model, sol, err)
             if sol and sol.get("east_m") is not None:
                 geom_fit = geometry_report(
@@ -1792,10 +1918,12 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
                     policy["temp_c"], fixed_up)
                 loo = leave_one_out(arr_sv, ids, arrivals,
                                     policy["source_class"], policy["temp_c"], policy["v_mps"],
-                                    fixed_up, sol)
+                                    fixed_up, sol, arrival_sigma_s=sigmas)
         row = {
             "schema": TDOA_SCHEMA, "candidate_id": gi, "event_key": ek, "verdict": verdict,
             "t0_utc_s": arrivals[0], "node_ids": ids, "arrivals": arrivals,
+            # index-aligned with `arrivals`, seconds, null where the producer stated nothing
+            "arrival_sigma_s": sigmas,
             "pool_keys": pkeys,
             "node_names": [d["node_name"] for d in group],
             "n_nodes": len(group), "n_equations": len(group) - 1,

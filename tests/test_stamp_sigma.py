@@ -209,12 +209,80 @@ class TestTheClassBudgetAppliedPerDetection:
         assert cls.stamp_admissible(head_ns * 1.01) is False
         assert math.isclose(cls.stamp_t_sigma_s(head_ns), NC.ARRIVAL_T_SIGMA_MAX_S, rel_tol=1e-9)
 
-    def test_a_class_already_over_the_bound_cannot_be_rescued_by_a_good_statement(self):
-        """gotchi-phone declares 5 ms on its clock alone. A payload claiming 1 us of sync does
-        not make it an arrival source; the class figure is the floor."""
+    def test_a_class_over_the_bound_IS_rescued_by_its_own_stated_sigma(self):
+        """⚠️THIS TEST PINNED THE DEFECT, IN THE OPPOSITE DIRECTION, AND IT WAS WRONG.
+
+        It used to read "gotchi-phone declares 5 ms on its clock alone. A payload claiming 1 us
+        of sync does not make it an arrival source; the class figure is the floor" -- and it
+        asserted `max_stated_clock_sigma_s() == 0.0`. That is a CEILING, not a floor, and it made
+        the entire per-detection budget unreachable for the one class it was built for. MEASURED
+        on the 2026-09-10 pool: 7,863 phone detections state a sigma, 82.9% of them inside the
+        129.4 us bound at a median 106.4 us = 0.037 m, and every one was refused on a 5 ms
+        constant that is GPSTimingSync's "location" tier while 8,800 of 9,480 rows are on
+        clock_tier "gnss".
+
+        The class figure is a FALLBACK in the clock dimension: used when nothing is stated,
+        replaced when something is. The floor that survives is the CAPTURE half -- see
+        test_a_statement_does_not_delete_the_capture_terms -- and the refusal that survives for
+        this class is its BIAS, which is a different gate and stays shut.
+        """
         cls = NC.get("gotchi-phone")
-        assert cls.max_stated_clock_sigma_s() == 0.0
-        assert cls.stamp_admissible(1000.0) is False
+        assert cls.max_stated_clock_sigma_s() > 0.0
+        assert cls.stamp_admissible(1000.0) is True
+        assert cls.stamp_admissible(NC.ARRIVAL_T_SIGMA_MAX_S * 1e9 * 1.01) is False
+        # the fleet median, measured: inside the bound, and no longer erased by the class figure
+        assert cls.stamp_admissible(106434.0) is True
+        assert math.isclose(cls.stamp_t_sigma_s(106434.0), 106434.0e-9, rel_tol=1e-12), (
+            "the class figure is 100%% clock for this class, so a statement must REPLACE it; "
+            "RSSing with the whole 5 ms returned 5001.1 us and moved the answer by 0.023%%")
+        # ...and the receiver is still refused, for the reason weighting cannot fix
+        assert cls.contributes_arrival() is False
+        assert cls.bias_refusal() is not None
+
+    def test_a_statement_does_not_delete_the_capture_terms(self):
+        """The class figure stays a FLOOR in the dimension `sync_sigma_ns` does not measure.
+
+        The firmware is explicit that the quantity is the clock anchor and NOT the audio path
+        (hear_node.ino "⚠️CLOCK ONLY"), so a class whose `t_sigma_s` is mostly capture keeps
+        charging that part however good the stated clock is. xiao-s3-pps declares no split, which
+        is the conservative case: its whole 100 us is charged as capture.
+        """
+        cls = NC.get("xiao-s3-pps")
+        assert cls.clock_sigma_s is None
+        assert cls.capture_sigma_s == cls.t_sigma_s
+        assert cls.stamp_t_sigma_s(1.0) > cls.t_sigma_s * 0.999, (
+            "a near-perfect stated clock must not drive the total below the capture terms")
+        assert cls.stamp_admissible(0.0) is True
+
+    def test_the_only_string_test_that_survives_is_time_source_none(self):
+        """`clock_admissible()`'s threshold half no longer gates a stated sigma; its string half
+        does, and that is the half the module docstring calls load-bearing. With nothing
+        disciplining the clock to UTC there is no anchor for a stated anchor-error to describe."""
+        free = NC.NodeClass(name="test-free-running", time_source="none", t_sigma_s=1e-6,
+                            clock_sigma_s=1e-6, path_bias_s=1e-6, mic_count=1, fs_hz=16000.0,
+                            band_hz=(50.0, 8000.0))
+        assert free.stamp_admissible(1.0) is False
+        assert free.max_stated_clock_sigma_s() == 0.0
+        why = free.stamp_refusal(1.0)
+        assert why and "none" in why
+        # and an UNSTATED sigma is still the third state, not a refusal
+        assert free.stamp_admissible(None) is None
+
+    def test_clock_sigma_s_cannot_exceed_the_budget_it_is_a_part_of(self):
+        with pytest.raises(NC.CapabilityError) as e:
+            NC.NodeClass(name="test-bad-split", time_source="gps_pps", t_sigma_s=100e-6,
+                         clock_sigma_s=200e-6, path_bias_s=1e-6, mic_count=1, fs_hz=16000.0,
+                         band_hz=(50.0, 8000.0))
+        assert "cannot exceed" in str(e.value)
+
+    def test_no_node_path_number_moved(self):
+        """⚠️THE REGRESSION GUARD FOR THE WHOLE CHANGE. Every figure the three live XIAO nodes
+        are judged on must be byte-for-byte what it was before the split existed, because none of
+        them declares `clock_sigma_s`. These constants are the pre-change values, measured."""
+        cls = NC.get("xiao-s3-pps")
+        assert math.isclose(cls.max_stated_clock_sigma_s(), 82.1249e-6, rel_tol=1e-4)
+        assert math.isclose(cls.stamp_t_sigma_s(25000.0), 103.0776e-6, rel_tol=1e-4)
+        assert NC.strictest_arrival_class() is cls
 
     def test_the_gate_is_live_on_a_survey_that_names_no_class(self):
         """⚠️THE SEAM THIS WOULD HAVE SHIPPED WITH. The shipped survey.json declares `class` on
