@@ -330,6 +330,11 @@ SIGMA_PPS_S = 40e-9                         # hear_tdoa.py:71, PPS is 25-40 ns
 CORPUS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
                       "tdoa-solved-events-2026-09-11.json")
 
+# The keys this change ADDS. They are None without sigmas and populated with them, so they are
+# the one thing that legitimately differs between an unweighted call and an equal-sigma one.
+NEW_KEYS = frozenset({"chi2", "chi2_reduced", "n_effective_nodes", "n_counting_nodes",
+                      "weights_degenerate", "weight_note", "sigma_s", "relative_weights"})
+
 
 def _corpus():
     with open(CORPUS) as fh:
@@ -375,18 +380,46 @@ class TestEqualSigmasChangeNothing:
             assert set(ev["node_names"]) == {"nyquist", "mach", "rankine"}
 
     @pytest.mark.parametrize("sigma", [None, SIGMA_PPS_S, SIGMA_PHONE_MEDIAN_S, 1.0])
-    def test_bit_for_bit_against_origin_main(self, sigma):
-        """Omitted, and at three equal sigmas spanning eight orders of magnitude. Compared by
-        float.hex(), so a one-ulp drift fails -- pytest.approx would not have seen the ulp this
-        very fixture records between the CronJob's machine and this one."""
+    def test_equal_sigmas_are_bit_for_bit_the_unweighted_call(self, sigma):
+        """THE requirement, at three equal sigmas spanning eight orders of magnitude. Compared by
+        float.hex(), so one ulp fails.
+
+        ⚠️BOTH SIDES ARE COMPUTED HERE, deliberately, rather than against the stored referent.
+        A least_squares fit is bit-reproducible within an environment and NOT across BLAS
+        builds -- this fixture records a one-ulp north_m difference between the machine that ran
+        the CronJob and this one, on identical code -- and CI runs a second python/numpy pin set.
+        A stored-bits assertion would fail there for a reason that is not a regression. What is
+        environment-independent, and what this change is actually judged on, is that stating
+        equal sigmas costs nothing relative to stating none in the SAME interpreter."""
         for ev in _corpus()["events"]:
+            P = np.array(ev["positions_enu_m"], float)
+            base = PT.solve(P, ev["arrivals_utc_s"], ev["source_class"],
+                            temp_c=ev["temp_c"], fixed_up_m=ev["fixed_up_m"])
             kw = {} if sigma is None else {"sigmas": [sigma] * 3}
+            got = PT.solve(P, ev["arrivals_utc_s"], ev["source_class"],
+                           temp_c=ev["temp_c"], fixed_up_m=ev["fixed_up_m"], **kw)
+            bad = [(k, got[k], v) for k, v in base.items()
+                   if k not in NEW_KEYS and not _same_bits(got[k], v)]
+            assert not bad, "%s drifted at sigma %r: %r" % (ev["event_key"], sigma, bad)
+
+    def test_the_unweighted_answer_is_still_what_origin_main_published(self):
+        """The other half: the arithmetic above could be self-consistently WRONG. This one checks
+        the stored origin/main output -- but at a tolerance, for the BLAS reason in the test
+        above. A real regression in this solver is metres (the grid step alone is 10 m); the
+        cross-machine noise it must tolerate is an ulp, which is 1.4e-14 m here. Ten orders of
+        magnitude separate the two, so there is no tolerance worth arguing about."""
+        for ev in _corpus()["events"]:
             got = PT.solve(np.array(ev["positions_enu_m"], float), ev["arrivals_utc_s"],
                            ev["source_class"], temp_c=ev["temp_c"],
-                           fixed_up_m=ev["fixed_up_m"], **kw)
-            bad = [(k, got[k], v) for k, v in ev["solution_origin_main"].items()
-                   if not _same_bits(got[k], v)]
-            assert not bad, "%s drifted from origin/main: %r" % (ev["event_key"], bad)
+                           fixed_up_m=ev["fixed_up_m"])
+            want = ev["solution_origin_main"]
+            for k, v in want.items():
+                a, b = got[k], _unfloat(v)
+                if isinstance(b, float) and math.isfinite(b):
+                    assert a == pytest.approx(b, rel=1e-9, abs=1e-9), "%s: %r vs %r" % (k, a, b)
+                else:
+                    # bools, counts, notes and the inf DOPs are exact or they are broken
+                    assert _same_bits(a, v), "%s: %r vs %r" % (k, a, v)
 
     def test_the_new_keys_are_additive_and_never_replace_one(self):
         """A caller reading the old keys must not find one missing or renamed."""
