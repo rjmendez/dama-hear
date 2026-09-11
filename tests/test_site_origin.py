@@ -1,10 +1,10 @@
 """HEAR_SITE_ORIGIN: the one door the real site origin comes through, and the refusal without it."""
 import json
 import pathlib
-import re
 import sys
 
 import pytest
+import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -87,6 +87,23 @@ class TestTheProductionRefusal:
     def test_a_survey_not_marked_fictional_needs_no_site(self, tmp_path):
         SV.load_survey(write_survey(tmp_path, fictional=False), require_real_origin=True)
 
+    def _flagged(self, tmp_path, flag):
+        p = tmp_path / "survey.json"
+        p.write_text(json.dumps({"frame": "enu_local", "units": "m", "nodes": NODES,
+                                 "origin": {"lat_deg": 12.3456, "lon_deg": -45.6789,
+                                            "h_ell_m": 0.0, "fictional": flag}}))
+        return str(p)
+
+    @pytest.mark.parametrize("flag", ["true", "false", 1, 0, None, "yes"])
+    def test_a_mistyped_fictional_flag_fails_closed(self, tmp_path, flag):
+        """Only an explicit JSON false counts as real (Copilot, #58)."""
+        with pytest.raises(SV.SiteOriginError):
+            SV.load_survey(self._flagged(tmp_path, flag), require_real_origin=True)
+
+    def test_an_explicit_false_is_real(self, tmp_path):
+        s = SV.load_survey(self._flagged(tmp_path, False), require_real_origin=True)
+        assert not s.origin_is_fictional()
+
     def _plan(self, tmp_path):
         return HT.main(["--pool", str(tmp_path / "pool"), "--out", str(tmp_path / "out"),
                         "--survey", write_survey(tmp_path), "--plan-only"])
@@ -110,18 +127,32 @@ class TestTheProductionRefusal:
         assert SV.load_survey(str(ROOT / "survey.json")).origin_is_fictional()
 
 
-_ENV = re.compile(r"- name: HEAR_SITE_ORIGIN\s+valueFrom:\s+"
-                  r"secretKeyRef: \{ name: hear-site, key: origin \}")
+def _containers(node):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in ("containers", "initContainers") and isinstance(v, list):
+                yield from (c for c in v if isinstance(c, dict))
+            else:
+                yield from _containers(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _containers(v)
 
 
-def test_every_manifest_that_mounts_the_survey_sets_the_site_from_the_secret():
+def test_every_container_that_mounts_the_survey_sets_the_site_from_the_secret():
+    """Parsed, not pattern-matched: formatting and key order must not decide it (Copilot, #58)."""
     seen = 0
     for f in sorted((ROOT / "deploy" / "k8s").glob("*.yaml")):
         if f.name.endswith("-code.yaml"):
             continue
-        for doc in re.split(r"(?m)^---\s*$", f.read_text()):
-            n_mounts = doc.count("subPath: survey.json")
-            if n_mounts:
+        for doc in yaml.safe_load_all(f.read_text()):
+            for c in _containers(doc):
+                if not any(m.get("subPath") == "survey.json" for m in c.get("volumeMounts") or []):
+                    continue
                 seen += 1
-                assert len(_ENV.findall(doc)) == n_mounts, f.name
+                env = {e.get("name"): e for e in c.get("env") or []}
+                ref = ((env.get(SV.SITE_ORIGIN_ENV) or {}).get("valueFrom") or {}).get(
+                    "secretKeyRef") or {}
+                assert (ref.get("name"), ref.get("key")) == ("hear-site", "origin"), (
+                    f.name, c.get("name"))
     assert seen >= 2
