@@ -94,6 +94,52 @@ static hear_prov_t prov;
 static const char *prov_src = "none";
 static bool prov_nvs = false;       // NVS holds the record this boot runs on
 static bool prov_loaded = false;    // ...and it was read back from NVS, not only written this boot
+
+#include <hear_net.h>
+static hear_net_join_t net_join;
+static uint32_t loop_max_us = 0, loop_max_boot_us = 0;   // longest loop() pass: this health row, and boot
+static uint32_t stream_stall_n = 0, stream_gone_n = 0;    // sends that gave up: stalled, client gone
+static const char *reset_reason_name() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "poweron";
+    case ESP_RST_EXT:       return "ext";
+    case ESP_RST_SW:        return "sw";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "int_wdt";
+    case ESP_RST_TASK_WDT:  return "task_wdt";
+    case ESP_RST_WDT:       return "wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_SDIO:      return "sdio";
+    default:                return "unknown";
+  }
+}
+// JSON and CSV spellings of "not associated": null and an empty field, never a number.
+static const char *rssi_json() {
+  static char rj[8];
+  if (!WiFi.isConnected()) return "null";
+  snprintf(rj, sizeof rj, "%d", (int)WiFi.RSSI());
+  return rj;
+}
+static const char *rssi_csv() {
+  static char rc[8];
+  if (!WiFi.isConnected()) return "";
+  snprintf(rc, sizeof rc, "%d", (int)WiFi.RSSI());
+  return rc;
+}
+static const char *disc_age_json() {
+  static char da[12];
+  uint32_t t = hear_net_last_disc_ms();
+  if (!t) return "null";
+  snprintf(da, sizeof da, "%lu", (unsigned long)((millis() - t) / 1000));
+  return da;
+}
+static const char *bssid_str() {
+  static char bs[18];
+  const uint8_t *m = net_join.bssid;
+  snprintf(bs, sizeof bs, "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+  return bs;
+}
 static void node_identity() {
   hear_prov_t nv;
   bool have_nv = hear_prov_load(&nv);
@@ -253,7 +299,13 @@ static const char HEALTH_HDR[] =
   //                measurable without waiting for a detection to happen to fall in the window.
   // ubx_silent_max longest run of seconds with the timepulse advancing and no NAV-PVT at all
   "clean_s,fs_used_hz,fs_step_ppm,over_s,pps_gaps,"
-  "ubx_pvt,dets_unlabelled,first_label_s,ubx_silent_max";
+  "ubx_pvt,dets_unlabelled,first_label_s,ubx_silent_max,"
+  // rssi         dBm now; EMPTY when not associated
+  // wifi_disc    disconnects since the join, and wifi_reason the latest one's code
+  // loop_max_ms  the longest loop() pass in this row, i.e. what a stalled handler cost
+  // heap_min     the lowest free heap since boot
+  // stream_stalls /sd, /ls, /audio, /perf sends given up because the link stopped taking data
+  "rssi,wifi_disc,wifi_reason,loop_max_ms,heap_min,stream_stalls";
 static double   fs_clean      = (double)FS_NOMINAL;
 static uint32_t fs_clean_secs = 0;    // length of the current unbroken window, in GPS seconds
 // The window behind the value fs_clean currently HOLDS, which is not fs_clean_secs: that one is
@@ -1783,7 +1835,7 @@ static void scene_frame(const int16_t *s) {
 #define STREAM_PUMP_MAX ((I2S_DMA_SAMPLES + ABLOCK - 1) / ABLOCK)
 #define STREAM_CHUNK_B  2048
 #define STREAM_CARD_US  4000u     // allowance for one chunk's card read; not measured
-#define STREAM_STALL_MS 5000u
+#define STREAM_STALL_MS 20000u
 static_assert(I2S_DMA_SAMPLES >= ABLOCK, "the DMA must hold one whole block");
 static_assert(STREAM_CHUNK_B <= CONFIG_LWIP_TCP_SND_BUF_DEFAULT / 2,
               "a socket that selects writable must take a whole chunk without blocking");
@@ -1810,11 +1862,11 @@ static bool stream_ready(WiFiClient &c, uint64_t *due) {
   for (;;) {
     stream_pump(due);
     int fd = c.fd();
-    if (fd < 0 || !c.connected()) return false;
+    if (fd < 0 || !c.connected()) { stream_gone_n++; return false; }
     fd_set w; FD_ZERO(&w); FD_SET(fd, &w);
     struct timeval tv = {0, 0};
     if (select(fd + 1, NULL, &w, NULL, &tv) > 0) return true;
-    if (millis() - t0 > STREAM_STALL_MS) return false;
+    if (millis() - t0 > STREAM_STALL_MS) { stream_stall_n++; return false; }
     delay(1);
   }
 }
@@ -2238,6 +2290,10 @@ static String status_json() {
     // ever be its own AP. prov says where they came from; nvs:true is what a release image needs.
     "{\"node\":\"%s\",\"class\":\"%s\",\"fw\":\"%s\",\"wifi_configured\":%s,"
     "\"prov\":{\"src\":\"%s\",\"nets\":%d,\"nvs\":%s,\"loaded\":%s},"
+    "\"net\":{\"connected\":%s,\"rssi\":%s,\"rssi_join\":%d,\"ch\":%d,\"bssid\":\"%s\",\"joined\":%d,"
+      "\"seen\":%d,\"join_ms\":%lu,\"disc\":%lu,\"reconn\":%lu,\"reason\":%d,\"disc_age_s\":%s},"
+    "\"sys\":{\"reset\":\"%s\",\"heap_min\":%lu,\"psram_min\":%lu,\"loop_max_ms\":%lu,"
+      "\"loop_max_boot_ms\":%lu,\"chip_c\":%.1f,\"stream_stalls\":%lu,\"stream_gone\":%lu},"
     "\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
@@ -2306,6 +2362,13 @@ static String status_json() {
     "\"sd\":%s,\"sd_free_mb\":%lu,\"sd_total_mb\":%lu,\"i2c\":\"%s\"}",
     node_id, node_class, FW_BUILD, prov.n > 0 ? "true" : "false",
     prov_src, prov.n, prov_nvs ? "true" : "false", prov_loaded ? "true" : "false",
+    WiFi.isConnected() ? "true" : "false", rssi_json(), net_join.rssi_join, net_join.channel,
+    bssid_str(), net_join.joined, net_join.seen, (unsigned long)net_join.join_ms,
+    (unsigned long)hear_net_disconnects(), (unsigned long)hear_net_reconnects(),
+    hear_net_last_reason(), disc_age_json(),
+    reset_reason_name(), (unsigned long)ESP.getMinFreeHeap(), (unsigned long)ESP.getMinFreePsram(),
+    (unsigned long)(loop_max_us / 1000), (unsigned long)(loop_max_boot_us / 1000), temperatureRead(),
+    (unsigned long)stream_stall_n, (unsigned long)stream_gone_n,
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
     gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences,
@@ -2663,27 +2726,19 @@ void setup() {
   node_identity();          // before anything logs or joins: the id names the log and the AP
   logf("\n=== dama-hear node %s (%s) fw %s, credentials %s%s ===\n", node_id, node_class, FW_BUILD,
        prov_src, prov_nvs ? ", in NVS" : "");
+  logf("boot  reset reason %s\n", reset_reason_name());
 
-  // Try each configured network in turn. An outdoor node may only reach one of them, and which
-  // one is not knowable from indoors.
-  int joined_idx = 0;
-  if (prov.n > 0) {
-    WiFi.mode(WIFI_STA); WiFi.setSleep(false);
-    for (int k = 0; k < prov.n && !sta_ok; k++) {
-      logf("wifi  trying network %d/%d", k + 1, prov.n);
-      WiFi.begin(prov.ssid[k], prov.psk[k]);
-      for (int i = 0; i < 24 && WiFi.status() != WL_CONNECTED; i++) { delay(500); Serial.print("."); }
-      sta_ok = WiFi.status() == WL_CONNECTED;
-      if (sta_ok) joined_idx = k + 1;
-      logln(sta_ok ? " joined" : " no");
-      if (!sta_ok) WiFi.disconnect();
-    }
-  }
+  // Strongest configured network first, and the strongest access point within it. An outdoor node
+  // may reach several, and the first to answer is not the one it hears best.
+  hear_net_watch();
+  int joined_idx = prov.n > 0 ? hear_net_join(&prov, 12000, &net_join) : 0;
+  sta_ok = joined_idx > 0;
   if (sta_ok) {
     // Network NAME deliberately not logged: /log is unauthenticated and this node is meant to sit
     // outdoors. The index is enough to tell which of the configured networks answered.
-    logf("wifi  STA  network %d/%d  http://%s/\n", joined_idx, prov.n,
-         WiFi.localIP().toString().c_str());
+    logf("wifi  STA  network %d/%d  http://%s/  rssi %d ch %d  %lu ms\n", joined_idx, prov.n,
+         WiFi.localIP().toString().c_str(), net_join.rssi_join, net_join.channel,
+         (unsigned long)net_join.join_ms);
   }
   else {
     char ap[40]; snprintf(ap, sizeof ap, "%s-%s", AP_SSID, node_id);
@@ -3906,6 +3961,14 @@ static void prov_serial_poll() {
 }
 
 void loop() {
+  { static uint32_t last_us = 0;
+    uint32_t now = micros();
+    if (last_us) {
+      uint32_t d = now - last_us;
+      if (d > loop_max_us) loop_max_us = d;
+      if (d > loop_max_boot_us) loop_max_boot_us = d;
+    }
+    last_us = now; }
   http.handleClient();
   audio_pump();
   prov_serial_poll();
@@ -4191,7 +4254,8 @@ void loop() {
                  "%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
                  "%.7f,%.7f,%.3f,%.3f,%.2f,%.2f,%lu,%s,%s,%s,%s,"
                  "%lu,%.4f,%.1f,%lu,%lu,"
-                 "%lu,%lu,%lu,%lu\n",
+                 "%lu,%lu,%lu,%lu,"
+                 "%s,%lu,%d,%lu,%lu,%lu\n",
                  node_id, (long long)tnow, tok ? 1 : 0,
                  (unsigned long)up, gps_fix, gps_sats, (unsigned long)gps_tacc_ns,
                  (unsigned long)pps_count, (unsigned long)pps_glitch,
@@ -4216,7 +4280,10 @@ void loop() {
                  (unsigned long)clean_seconds, fs_timebase(), fs_step_ppm(),
                  (unsigned long)over_seconds, (unsigned long)pps_gaps,
                  (unsigned long)ubx_pvt, (unsigned long)dets_unlabelled,
-                 (unsigned long)first_label_s, (unsigned long)ubx_silent_max);
+                 (unsigned long)first_label_s, (unsigned long)ubx_silent_max,
+                 rssi_csv(), (unsigned long)hear_net_disconnects(), hear_net_last_reason(),
+                 (unsigned long)(loop_max_us / 1000), (unsigned long)ESP.getMinFreeHeap(),
+                 (unsigned long)stream_stall_n);
         f.close();
       }
       // scene.csv is held open and written every 1.024 s; committing it costs the same 20-50 ms
@@ -4225,6 +4292,7 @@ void loop() {
       if (scenef) scenef.flush();
       env_peak_win = 0.0f;      // per-row peak, so a single loud event does not flatten the run
       env_e_max_win = 0.0f;
+      loop_max_us = 0;
       det_flush();              // never let the card lag the ring by more than a health interval
     }
   }

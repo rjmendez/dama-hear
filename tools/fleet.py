@@ -96,12 +96,16 @@ def row(name: str, d: Dict) -> str:
     # spread is a cumulative high-water mark, not a live figure: one long interval near boot pins
     # it for the life of the run. Shown with the edge count so a big number on a young node reads
     # as what it usually is.
+    # rssi and disc are absent on firmware before v0.1.1, and rssi is null when not associated.
+    n = d.get("net") or {}
+    rssi = n.get("rssi")
     return ("%-9s %-14s up %6ds  fix %d/%-2d tAcc %5s ns  pps %6d sp %5s us g%-3d  "
-            "utc %-5s rej %-4s  dets %4d floor %-5s amb %-5s  sd %-5s %s"
+            "utc %-5s rej %-4s  dets %4d floor %-5s amb %-5s  rssi %4s disc %-3s  sd %-5s %s"
             % (name, d.get("fw", "?")[:14], d["uptime_s"], g["fix"], g["sats"], g["tacc_ns"],
                p["edges"], p["spread_us"], p["glitches"],
                "yes" if t["valid"] else "NO", t["label_rejects"],
                a["detections"], d["gate"]["floor"], a["ambient"],
+               "?" if rssi is None else rssi, n.get("disc", "?"),
                d.get("sd_free_mb", "?"), "" if d["sd"] else "NO CARD"))
 
 
