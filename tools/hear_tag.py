@@ -152,11 +152,38 @@ MODEL_PASSES = 1
 #: and heartbeat. `mn10` is the original whole-clip pass and keeps clips/tags.jsonl and
 #: state/tag_heartbeat.json as they were. `mn10_pad10` zero-pads the normalised clip to the
 #: model's 10 s training length (docs/clip-calibration-2026-09-10.md S4).
+#: `perch_v2` runs Perch 2.0 on the GPU and stores embeddings only (see PerchEmbedder).
 LANES: Dict[str, Dict[str, Any]] = {
-    "mn10": {"store": None, "variant": None, "pad_to_s": None},
-    "mn10_pad10": {"store": "mn10_pad10", "variant": "pad10", "pad_to_s": 10.0},
+    "mn10": {"model": "mn10", "store": None, "variant": None, "pad_to_s": None},
+    "mn10_pad10": {"model": "mn10", "store": "mn10_pad10", "variant": "pad10", "pad_to_s": 10.0},
+    "perch_v2": {"model": "perch_v2", "store": "perch_v2", "variant": None, "pad_to_s": None},
 }
 DEFAULT_LANE = "mn10"
+
+#: Perch 2.0, the bioacoustic embedding tier of docs/acoustic-stack.md S6.3. Apache-2.0. The
+#: Kaggle SavedModel is staged by hand like mn10_as.onnx; every file is pinned, and the model's
+#: identity on a row is the digest over all of them.
+PERCH_NAME = "perch_v2"
+PERCH_VERSION = "kaggle-tf2-v2"
+PERCH_ARCHIVE_URL = ("https://www.kaggle.com/api/v1/models/google/bird-vocalization-classifier/"
+                     "tensorFlow2/perch_v2/2/download")
+PERCH_ARCHIVE_SHA256 = "c04211da33038176efd299519c398b9486d64a2c1e63fafa4df331600552e556"
+PERCH_FILES: Tuple[Tuple[str, str, int], ...] = (
+    ("saved_model.pb", "d28faa13aa61eb369b9d8d66d483186da65b15d9220bb051c0003553ecae2766", 2701811),
+    ("fingerprint.pb", "20274176be0d4f7009c4f5e6b2103519f5b961906218c6bf0f29fd465cf3d88d", 96),
+    ("variables/variables.data-00000-of-00001",
+     "69571ece6a9229bd339af37f935821b9e3f53869298bd9ad97135a0c87efcea1", 407104092),
+    ("variables/variables.index",
+     "29c49db4f95727b8c4c22522cf8bb8c77e2eb930ce5b5b43e3a00317d479da1d", 9236),
+    ("assets/labels.csv", "e4d5c0397d8fb08bf90c6b13a34810af53504faad927e472fcc567793c9de057", 312716),
+    ("assets/perch_v2_ebird_classes.csv",
+     "861aef71b679d8dcf07c0c71375188c46b680bd808c61a539f254dc21319bcc9", 147890),
+)
+PERCH_EMBED_DIM = 1536
+#: 5.0 s at 32 kHz, the signature's fixed input width; a 48 kHz clip decimates to exactly this.
+PERCH_WINDOW = 160000
+#: perch_hoplite.zoo.taxonomy_model_tf peak-normalises every window to this before inference.
+PERCH_TARGET_PEAK = 0.25
 
 #: FS_ACQ / FS_NOMINAL. The clip-writer bug stamped the nominal rate over acquisition-rate audio.
 HEADER_RATE_FACTOR = 3
@@ -373,6 +400,33 @@ def normalise(x: "Any", target_dbfs: float = TARGET_DBFS) -> Tuple["Any", float]
     return y.astype(np.float32), pre
 
 
+def normalise_peak(x: "Any", target: float = PERCH_TARGET_PEAK) -> "Any":
+    """Scale so the largest |sample| is `target`. Raises on digital silence, like normalise()."""
+    import numpy as np
+    peak = float(np.max(np.abs(x))) if len(x) else 0.0
+    if peak <= 0.0:
+        raise ValueError("digital silence: every sample is zero, so no gain reaches peak %g"
+                         % target)
+    return (np.asarray(x, dtype=np.float64) * (target / peak)).astype(np.float32)
+
+
+def fit_length(x: "Any", n: int, trim: bool = True) -> "Any":
+    """Zero-pad to n samples; cut to n as well when `trim`."""
+    import numpy as np
+    if len(x) < n:
+        return np.concatenate([x, np.zeros(n - len(x), dtype=x.dtype)])
+    return x[:n] if trim else x
+
+
+def prepare_rms(pcm: "Any", fs_hz: float, pad_to_s: Optional[float] = None) -> "Any":
+    y, _ = normalise(pcm)
+    return fit_length(y, int(round(pad_to_s * fs_hz)), trim=False) if pad_to_s else y
+
+
+def prepare_perch(pcm: "Any", fs_hz: float, pad_to_s: Optional[float] = None) -> "Any":
+    return normalise_peak(fit_length(pcm, PERCH_WINDOW), PERCH_TARGET_PEAK)
+
+
 def to_model_rate(pcm: "Any", header_fs: int, csv_fs: Optional[float] = None) -> Dict[str, Any]:
     """Resample a clip to the model's rate, or refuse it. -> hear.resample.resample()'s dict.
 
@@ -525,6 +579,120 @@ class Tagger:
                 "embedding_dim": int(len(embed))}
 
 
+class PerchEmbedder:
+    """Perch 2.0 under TensorFlow on the GPU. Embeddings only; the label head is not stored.
+
+    ⚠️THE HEAD IS DROPPED ON A MEASUREMENT. On the 69 human-heard clips its top-1 agreed 11 times
+    (peak-normalised; 6 with the insect head excluded, as S6.3 requires), against 30 for the
+    padded mn10 lane, and it put owls on top of clips the listener called empty. The 1536-d
+    embedding is the payload S6.4 names; a classifier over it needs labels this site does not
+    have yet.
+
+    ⚠️THE KAGGLE EXPORT IS CUDA-ONLY. On a CPU it refuses at the first call ("platform CPU is not
+    among the platforms required: [CUDA]"), so this refuses at load instead of after staging.
+    """
+
+    def __init__(self, model_dir: str):
+        import numpy as np
+        import tensorflow as tf                                   # lazy: absent in the test env
+        gpus = tf.config.list_physical_devices("GPU")
+        if not gpus:
+            raise WeightsRefused("no GPU is visible, and the perch_v2 export runs only on CUDA. "
+                                 "Pin the pod to the 2080 Ti (CUDA_VISIBLE_DEVICES=0)")
+        for g in gpus:
+            tf.config.experimental.set_memory_growth(g, True)
+        sig = tf.saved_model.load(os.path.expanduser(model_dir)).signatures["serving_default"]
+        emb = sig.structured_outputs.get("embedding")
+        if emb is None or int(emb.shape[-1]) != PERCH_EMBED_DIM:
+            raise WeightsRefused("the SavedModel has no %d-wide `embedding` output; outputs are %r"
+                                 % (PERCH_EMBED_DIM, sorted(sig.structured_outputs)))
+        inputs = sig.structured_input_signature[1]
+        if len(inputs) != 1:
+            raise WeightsRefused("the SavedModel signature takes %d inputs %r, expected one "
+                                 "waveform" % (len(inputs), sorted(inputs)))
+        (self._in, spec), = inputs.items()
+        if spec.shape.rank != 2 or spec.shape[-1] not in (None, PERCH_WINDOW):
+            raise WeightsRefused("input %r is %s, expected (N, %d)"
+                                 % (self._in, spec.shape, PERCH_WINDOW))
+        self._f, self._tf, self._np = sig, tf, np
+
+    def tag(self, pcm: "Any", floor: float = SCORE_FLOOR) -> Dict[str, Any]:
+        np, tf = self._np, self._tf
+        x = np.asarray(pcm, dtype=np.float32).reshape(1, -1)
+        if x.shape[1] != PERCH_WINDOW:
+            raise ValueError("perch_v2 takes exactly %d samples, got %d" % (PERCH_WINDOW, x.shape[1]))
+        e = self._f(**{self._in: tf.constant(x)})["embedding"].numpy().reshape(-1)
+        return {"scores": None, "max_unstored_score": None, "n_classes_scored": 0,
+                "n_passes": 1, "embedding": [float(v) for v in e], "embedding_dim": int(len(e))}
+
+
+def verify_perch(model_dir: str) -> Dict[str, Any]:
+    """Every pinned SavedModel file present, right size, right sha256. Never raises."""
+    d = os.path.expanduser(model_dir)
+    out: Dict[str, Any] = {"ok": False, "problems": [], "files": {}, "model_sha256": None,
+                           "model_bytes": 0}
+    for rel, want_sha, want_n in PERCH_FILES:
+        p = os.path.join(d, rel)
+        if not os.path.exists(p):
+            out["problems"].append("%s is absent. Stage the archive from %s (sha256 %s)"
+                                   % (p, PERCH_ARCHIVE_URL, PERCH_ARCHIVE_SHA256))
+            continue
+        try:
+            n = os.path.getsize(p)
+            got = sha256_file(p) if n == want_n else None
+        except OSError as exc:
+            out["problems"].append("%s could not be read: %s" % (p, exc))
+            continue
+        if n != want_n:
+            out["problems"].append("%s is %d B, expected %d B" % (p, n, want_n))
+            continue
+        out["files"][rel] = got
+        out["model_bytes"] += n
+        if got != want_sha:
+            out["problems"].append("%s sha256 is %s, expected %s" % (p, got, want_sha))
+    out["ok"] = not out["problems"]
+    if out["ok"]:
+        h = hashlib.sha256()
+        for rel, sha, _n in PERCH_FILES:
+            h.update(("%s  %s\n" % (sha, rel)).encode())
+        out["model_sha256"] = h.hexdigest()
+    return out
+
+
+def perch_block(verified: Dict[str, Any]) -> Dict[str, Any]:
+    return {"name": PERCH_NAME, "version": PERCH_VERSION, "file": "saved_model",
+            "sha256": verified.get("model_sha256"), "archive_sha256": PERCH_ARCHIVE_SHA256,
+            "runtime": "tensorflow", "input_fs_hz": MODEL_FS_HZ, "input_samples": PERCH_WINDOW,
+            "target_peak": PERCH_TARGET_PEAK, "embed_dim": PERCH_EMBED_DIM, "n_classes": 0,
+            "head_stored": False, "card": "tag_model_card-perch_v2.json"}
+
+
+def perch_card(verified: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "model_name": PERCH_NAME,
+        "model_version": PERCH_VERSION,
+        "model_sha256": verified.get("model_sha256"),
+        "model_bytes": verified.get("model_bytes"),
+        "files": verified.get("files"),
+        "archive_url": PERCH_ARCHIVE_URL,
+        "archive_sha256": PERCH_ARCHIVE_SHA256,
+        "licence": "Apache-2.0",
+        "runtime": "tensorflow 2.20 on CUDA; the export refuses a CPU",
+        "what_a_row_is": (
+            "a %d-d embedding of one 5.0 s clip, decimated 48 -> 32 kHz and peak-normalised to "
+            "%g as perch_hoplite does. There are no scores: the label head is not stored."
+            % (PERCH_EMBED_DIM, PERCH_TARGET_PEAK)),
+        "why_no_head": (
+            "on the 69 human-heard clips of docs/clip-calibration-2026-09-10.md the head's top-1 "
+            "agreed 11/69 (6/69 with the insect head excluded, which acoustic-stack S6.3 "
+            "requires), against 30/69 for mn10 padded to 10 s, and it ranked owls first on clips "
+            "the listener called empty."),
+        "provenance": "model",
+        "human_verified": False,
+        "usable_as_training_label": False,
+    }
+
+
 def load_class_map(path: str) -> List[str]:
     """index,mid,display_name -> the display names, in index order."""
     names: List[str] = []
@@ -650,6 +818,17 @@ def model_card(verified: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+#: model -> how it is verified, loaded, identified on a row, described, and fed.
+MODELS: Dict[str, Dict[str, Any]] = {
+    "mn10": {"verify": verify_weights, "load": lambda d: Tagger(*weights_paths(d)),
+             "block": model_block, "card": model_card, "card_file": "tag_model_card.json",
+             "prepare": prepare_rms, "embed_only": False},
+    "perch_v2": {"verify": verify_perch, "load": PerchEmbedder, "block": perch_block,
+                 "card": perch_card, "card_file": "tag_model_card-perch_v2.json",
+                 "prepare": prepare_perch, "embed_only": True},
+}
+
+
 # ----------------------------------------------------------------- I/O
 
 def state_dir(root: str) -> str:
@@ -661,8 +840,8 @@ def heartbeat_path(root: str, lane: str = DEFAULT_LANE) -> str:
     return os.path.join(state_dir(root), name)
 
 
-def card_path(root: str) -> str:
-    return os.path.join(root, "clips", "tag_model_card.json")
+def card_path(root: str, name: str = "tag_model_card.json") -> str:
+    return os.path.join(root, "clips", name)
 
 
 def index_census(root: str) -> Dict[str, int]:
@@ -753,9 +932,10 @@ def tally(t: Dict[str, Any], node: str, day: str, outcome: str,
                 n["silence_top"] += 1
             if top is not None:
                 t["top_scores"].append(float(scores[top]))
-            h = t["heard"].setdefault(node or "?", {})
-            g = coarse(scores)
-            h[g] = h.get(g, 0) + 1
+            if row.get("scores") is not None:
+                h = t["heard"].setdefault(node or "?", {})
+                g = coarse(scores)
+                h[g] = h.get(g, 0) + 1
             if row.get("pre_norm_dbfs") is not None:
                 t["dbfs"].append(float(row["pre_norm_dbfs"]))
             if row.get("max_unstored_score") is not None:
@@ -830,16 +1010,11 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
     # band above 16 kHz (measured: -1.8 dB on wideband noise). Normalisation runs after it, so the
     # model sees the target level regardless.
     pre_db = dbfs(pcm)
+    pad_to_s = LANES[lane]["pad_to_s"]
     try:
-        pcm, _ = normalise(rs["pcm"])
+        pcm = MODELS[LANES[lane]["model"]]["prepare"](rs["pcm"], rs["fs_hz"], pad_to_s)
     except ValueError as exc:
         return {"ok": False, "reason": R_DIGITAL_SILENCE, "detail": str(exc)}
-    pad_to_s = LANES[lane]["pad_to_s"]
-    if pad_to_s:
-        import numpy as np
-        short = int(round(pad_to_s * rs["fs_hz"])) - len(pcm)
-        if short > 0:
-            pcm = np.concatenate([pcm, np.zeros(short, dtype=pcm.dtype)])
     try:
         got = tagger.tag(pcm, floor=floor)
     except Exception as exc:
@@ -849,7 +1024,7 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
     out = {
         "tag_schema_version": TAGS.TAG_SCHEMA_VERSION,
         "schema": TAG_SCHEMA,
-        "tag_key": TAGS.tag_key(ck, MODEL_NAME, MODEL_VERSION, mb.get("sha256"),
+        "tag_key": TAGS.tag_key(ck, mb.get("name"), mb.get("version"), mb.get("sha256"),
                                 LANES[lane]["variant"]),
         "lane": lane,
         "clip_key": ck,
@@ -913,14 +1088,14 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
     if lane not in LANES:
         raise ValueError("unknown lane %r; known: %s" % (lane, ", ".join(sorted(LANES))))
     spec = LANES[lane]
+    model = MODELS[spec["model"]]
     if verified is None:
-        verified = verify_weights(model_dir)
+        verified = model["verify"](model_dir)
     if tagger is None:
         if not verified["ok"]:
             raise WeightsRefused("; ".join(verified["problems"]))
-        mp, cp = weights_paths(model_dir)
-        tagger = Tagger(mp, cp)
-    mb = model_block(verified)
+        tagger = model["load"](model_dir)
+    mb = model["block"](verified)
 
     t = empty_tally()
     census = index_census(root)                         # independent walk, before any dispatch
@@ -939,8 +1114,8 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
     for row in work_order(index):
         node, day = row.get("node") or "?", _row_day(row)
         ck = row.get("clip_key")
-        if isinstance(ck, str) and TAGS.tag_key(ck, MODEL_NAME, MODEL_VERSION, mb.get("sha256"),
-                                                spec["variant"]) in held:
+        if isinstance(ck, str) and TAGS.tag_key(ck, mb.get("name"), mb.get("version"),
+                                                mb.get("sha256"), spec["variant"]) in held:
             tally(t, node, day, "already_tagged")
             continue
         if stop_reason is None:
@@ -976,6 +1151,10 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
     _tops = t.pop("top_scores")
     t["mean_top_score"] = (sum(_tops) / len(_tops)) if _tops else None
     t["n_top_scores"] = len(_tops)
+    if model["embed_only"]:
+        # No scores exist to gate on. None, not 0: check_tags reads 0 scored clips as a model
+        # that produced no output.
+        t["scored_any"] = t["silence_frac"] = t["mean_top_score"] = None
     t["observation_not_health"] = {
         "level_dbfs": _distribution(t.pop("dbfs")),
         # ⚠️AGGREGATED, NOT ONLY PER ROW. `max_unstored_score` made the discarded tail a number on
@@ -998,7 +1177,7 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
     if write:
         if out_rows:
             TAGS.append_tags(root, out_rows, spec["store"])
-        _write_json_atomic(card_path(root), model_card(verified))
+        _write_json_atomic(card_path(root, model["card_file"]), model["card"](verified))
         write_heartbeat(root, t, now=now, lane=lane)
     return t
 
@@ -1328,15 +1507,23 @@ def main(argv=None) -> int:
                          "--check reads exactly one. Default %s" % DEFAULT_LANE)
     a = ap.parse_args(argv)
     lanes = a.lane or [DEFAULT_LANE]
+    models = sorted({LANES[lane]["model"] for lane in lanes})
+    if len(models) != 1 and not a.check:
+        print("one invocation runs one model; lanes %s use %s" % (lanes, models), file=sys.stderr)
+        return 2
+    model = MODELS[models[0]]
 
     root = os.path.expanduser(a.pool)
 
     if a.verify_weights:
-        v = verify_weights(a.model_dir)
-        if v["ok"]:
+        v = model["verify"](a.model_dir)
+        if v["ok"] and models[0] == "mn10":
             print("weights OK  %s %s  %s %s"
                   % (MODEL_FILE, v["model_sha256"][:16], CLASSMAP_FILE,
                      v["class_map_sha256"][:16]))
+            return 0
+        if v["ok"]:
+            print("weights OK  %s  tree sha256 %s" % (models[0], v["model_sha256"][:16]))
             return 0
         for p in v["problems"]:
             print("weights REFUSED: %s" % p, file=sys.stderr)
@@ -1353,19 +1540,18 @@ def main(argv=None) -> int:
         return code
 
     try:
-        verified = verify_weights(a.model_dir)
+        verified = model["verify"](a.model_dir)
         if not verified["ok"]:
             raise WeightsRefused("; ".join(verified["problems"]))
-        mp, cp = weights_paths(a.model_dir)
-        tagger = Tagger(mp, cp)
+        tagger = model["load"](a.model_dir)
         reports = [run(root, model_dir=a.model_dir, limit=a.limit, deadline_s=a.deadline_s,
                        floor=a.score_floor, write=not a.census, tagger=tagger,
                        verified=verified, lane=lane) for lane in lanes]
     except WeightsRefused as exc:
         # ⚠️LOUD, AND EXIT 2 RATHER THAN 1, so a monitor can tell "the model is not what it says"
         # apart from "tagging is behind". A tagger that cannot name its weights must not run.
-        print("REFUSED: the pinned weights did not verify, so nothing was tagged.\n  %s" % exc,
-              file=sys.stderr)
+        print("REFUSED: the model did not verify or would not load, so nothing was tagged.\n  %s"
+              % exc, file=sys.stderr)
         return 2
     for t in reports:
         print(json.dumps(t, indent=2, sort_keys=True) if a.json else format_report(t))
