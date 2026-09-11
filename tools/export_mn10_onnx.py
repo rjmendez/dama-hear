@@ -39,6 +39,7 @@ bins and hop, all load, and only one has mAP 0.471.
 """
 
 import os
+import shlex
 import sys
 
 import numpy as np
@@ -59,12 +60,13 @@ import torchaudio
 EFFICIENTAT_COMMIT = "a425fdce92572e602a1d5634799bd9f1f2efa806"
 EFFICIENTAT = os.environ.get("EFFICIENTAT", "./EfficientAT")
 if not os.path.isdir(os.path.join(EFFICIENTAT, "models", "mn")):
+    _q = shlex.quote(EFFICIENTAT)
     raise SystemExit(
-        "no EfficientAT checkout at %r. Clone it and point EFFICIENTAT at it:\n"
-        "  git clone https://github.com/fschmid56/EfficientAT\n"
-        "  git -C EfficientAT checkout %s\n"
-        "  EFFICIENTAT=./EfficientAT python tools/export_mn10_onnx.py --out mn10_as.onnx"
-        % (EFFICIENTAT, EFFICIENTAT_COMMIT))
+        "no EfficientAT checkout at %r. Clone it there (or set EFFICIENTAT to one):\n"
+        "  git clone https://github.com/fschmid56/EfficientAT %s\n"
+        "  git -C %s checkout %s\n"
+        "  EFFICIENTAT=%s python tools/export_mn10_onnx.py --out mn10_as.onnx"
+        % (EFFICIENTAT, _q, _q, EFFICIENTAT_COMMIT, _q))
 sys.path.insert(0, os.path.abspath(EFFICIENTAT))
 
 from models.mn.model import get_model as get_mobilenet          # noqa: E402
