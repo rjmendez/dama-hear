@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-drain-code.yaml
-# apply-mode client: 250224 B serialised against a 262144 B last-applied-configuration cap.
+# apply-mode client: 253086 B serialised against a 262144 B last-applied-configuration cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'ed6c75a'
+    dama-hear/commit: 'ba7b4cc-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '250224'
+    dama-hear/serialised-bytes: '253086'
 data:
   hear__init__.py: |
     
@@ -708,6 +708,7 @@ data:
         G3  12 cols DECLARED, 11 WRITTEN  ⚠️ header says `node,` and the writer never emits it
         G4  12 cols   node_id, ...                               fs/layout build, node_id populated
         G5  13 cols   + sketch_back before frame_hex             the window fix
+        G6  14 cols   + sync_sigma_ns appended                    the declared-uncertainty stamp
     
     ⚠️G3 IS THE WHOLE REASON THIS MODULE EXISTS. `csv.DictReader` on a G3 file silently shifts every
     value one column left of its name: `utc_us` gets the node name, `uptime_s` gets the timestamp,
@@ -764,9 +765,18 @@ data:
                     ("node_id",) + _BASE + ("frame_hex", "clip", "clip_why"))
     G5 = Generation("G5", ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why"),
                     ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why"))
+    # ⚠️`sync_sigma_ns` IS THE PHONE'S KEY AND THE PHONE'S UNIT, on purpose. hear/pool.py already
+    # reads `sync_sigma_ns` off an MQTT payload as the uncertainty of that producer's clock-to-UTC
+    # anchor, 1-sigma, NANOSECONDS. A node now states the same quantity in the same unit under the
+    # same name, so one measurement has one spelling across both sensors.
+    # ⚠️EMPTY IS "NOT STATED", AND 0 IS NOT A VALUE THIS COLUMN CAN CARRY. A row the node could not
+    # stamp at all (utc_us == 0) has no anchor to be uncertain about, and writing 0 there would read
+    # as a perfect clock -- which hear/nodeclass.py refuses as a claim no hardware supports.
+    _G6 = ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why", "sync_sigma_ns")
+    G6 = Generation("G6", _G6, _G6)
     
-    GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5)
-    LATEST = G5
+    GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5, G6)
+    LATEST = G6
     
     # One packed v1 sketch is 172 bytes; the column holds it as hex.
     FRAME_HEX_LEN = 344
@@ -865,6 +875,11 @@ data:
             # the pre-fix value -- the pre-fix builds took the window at a `back` this file cannot
             # know. None travels; nothing here invents 736.
             d.setdefault("sketch_back", None)
+            # G1-G5 never stated it, and an EMPTY G6 cell is the node saying it had no anchor. Both
+            # are None -- "not stated" -- and neither is 0. See hear/pool.py's record builder and
+            # hear/backend/associate.py, where absent means usable and a number is a claim.
+            if not d.get("sync_sigma_ns"):
+                d["sync_sigma_ns"] = None
             out.rows.append(d)
         return out
     
@@ -1475,6 +1490,24 @@ data:
         return None if node == expect else str(node)
     
     
+    def _sync_sigma_ns(v: Any) -> Optional[float]:
+        """A dets.csv G6 cell -> a stated clock sigma in nanoseconds, or None for "not stated".
+    
+        ⚠️NON-POSITIVE IS NOT STATED. The firmware writes an EMPTY cell for a row it could not stamp,
+        but a 0 that reached here from any source must not become a claim of a perfect clock --
+        hear/nodeclass.py refuses `t_sigma_s <= 0` at construction for exactly that reason, and this
+        value is fed to the same budget. Unparseable is None for the same reason: a producer this
+        version does not understand is not one to take a number from.
+        """
+        if v in (None, ""):
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if f > 0.0 else None
+    
+    
     def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
         frame = binascii.unhexlify(row["frame_hex"])
@@ -1514,6 +1547,15 @@ data:
             "no_context": bool(d["event_flags"] & SK.FLAG_NO_CONTEXT),
             "sketch_back": (int(row["sketch_back"]) if row.get("sketch_back") not in (None, "")
                             else None),
+            # ⚠️THE SAME KEY AND THE SAME UNIT AS THE PHONE PATH ABOVE (ingest_mqtt_jsonl), which is
+            # why it is not called anything else: 1-sigma uncertainty of the producer's clock-to-UTC
+            # anchor, NANOSECONDS. For a node it is `STAMP_ANCHOR_SIGMA_US + drift * anchor age`,
+            # written per detection since dets.csv G6 -- the column that makes a frozen anchor
+            # visible, because `time_valid` never goes false once it is set.
+            # None on every G1-G5 row and on any G6 row the node could not stamp. NOT 0: a stated 0
+            # would claim a perfect clock, and `hear.corpus.Record.sync_sigma_ns` is read by gates
+            # that treat absent and stated differently.
+            "sync_sigma_ns": _sync_sigma_ns(row.get("sync_sigma_ns")),
             "sample": row.get("sample"),
             "uptime_s": row.get("uptime_s"),
             # ⚠️THE INGEST USED TO DROP THESE TWO, WHICH IS WHY AN UNANCHORED ROW WAS UNRECOVERABLE
