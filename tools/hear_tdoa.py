@@ -267,6 +267,42 @@ def is_heterogeneous_receiver(source: Optional[str], stated_class: Optional[str]
         return True
     return bool(stated_class) and stated_class != REFERENCE_ARRIVAL_CLASS
 
+
+#: The class a `source="phone"` row is charged when survey.json names none.
+#:
+#: ⚠️A SURVEY OMISSION MUST NOT BUY A RECEIVER A BETTER CLASS THAN IT HAS. `nodeclass` charges
+#: the STRICTEST ARRIVAL class -- xiao-s3-pps -- to a receiver with no stated class, and that is
+#: right for a node: it is the conservative choice among receivers that look like the array. It
+#: is the OPPOSITE of conservative for a handset, because xiao-s3-pps's `path_bias_s` is the
+#: MEASURED 62.5 us of ITS OWN capture path, and charging that to a phone carrying a measured
+#: 13.122 ms = 4.50 m of uncorrected audio-path delay is a guess wearing a measurement's clothes.
+#: `source` is not optional in the pool and cannot be omitted by an incomplete survey entry the
+#: way `class` can, so it is the field that resolves this.
+#:
+#: ⚠️MEASURED, AND IT IS CLOSER THAN IT LOOKS. On the 2026-09-11 pool an unclassed phone row was
+#: refused anyway -- but on its CLOCK, charged the XIAO's 100 us capture term: all 11,315 anchored
+#: phone rows RSS over the 129.4 us bound. That refusal holds only while a phone states more than
+#: `xiao-s3-pps.max_stated_clock_sigma_s()` = 82.1 us, and the lowest figure any of the three
+#: handsets has ever stated is 100.0 us. A 22% margin, in a number the ANDROID APP reports and no
+#: hardware fixes. Below it, an unclassed phone would clear the clock gate and then clear the bias
+#: gate as a XIAO, and be admitted carrying 4.50 m of pure bias. This closes that, and it also
+#: makes the refusal say the true thing: `capture_path_bias` ("run tools/hear_latency_cal.py"),
+#: not `stamp_sigma_over_class_budget` ("fix a clock"), which is the whole point of the two gates
+#: being two.
+PHONE_FALLBACK_CLASS = "gotchi-phone"
+
+
+def gate_class(source: Optional[str], stated_class: Optional[str]) -> Optional[str]:
+    """The class to charge this row's CLOCK and BIAS gates against.
+
+    The survey's own word wins. Absent, a phone is charged `PHONE_FALLBACK_CLASS` and everything
+    else is left as `None`, which is nodeclass's "charge the strictest arrival class" and is the
+    behaviour every node row has always had.
+    """
+    if stated_class:
+        return stated_class
+    return PHONE_FALLBACK_CLASS if source == "phone" else None
+
 #: Why an admitted arrival's onset quality is UNSTATED, stated once so the ledger detail, the
 #: manifest and the CLI help cannot drift apart. Every clause was checked on 2026-09-10 against
 #: the running system, not read off a comment:
@@ -799,9 +835,14 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
         # gate keyed on a declared class would be dead code on the only survey that exists;
         # nodeclass charges the strictest arrival class when none is named. `cname` was read
         # above, ahead of the heterogeneous-receiver gate; reused here unchanged.
-        stamp_ok = NC.stamp_admissible(ssig, cname)
+        # ⚠️`gcls`, NOT `cname`, FROM HERE DOWN. An unstated class charges the strictest ARRIVAL
+        # class, which is conservative for a node and the opposite of conservative for a handset;
+        # `gate_class` resolves that off the pool's own `source` field. `cname` stays the survey's
+        # literal word and is what the heterogeneous gate above reads.
+        gcls = gate_class(row.get("source"), cname)
+        stamp_ok = NC.stamp_admissible(ssig, gcls)
         if stamp_ok is False:
-            _drop(day, row, D_STAMP_SIGMA, _detail(row, NC.stamp_refusal(ssig, cname) or ""))
+            _drop(day, row, D_STAMP_SIGMA, _detail(row, NC.stamp_refusal(ssig, gcls) or ""))
             continue
         # ⚠️THE SECOND GATE, AND IT DOES NOT MOVE WHEN THE FIRST ONE OPENS. The line above judges
         # this detection's stated clock sigma; this judges the receiver's CAPTURE PATH, which is
@@ -813,16 +854,15 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
         # calibration is; nothing in the row could state it. The refusal is nodeclass's own words
         # so the class door and this door say the same thing.
         #
-        # ⚠️AN UNCLASSED RECEIVER IS CHARGED THE STRICTEST ARRIVAL CLASS'S BIAS, AND THAT IS A
-        # GUESS WEARING A MEASUREMENT'S CLOTHES. `nodeclass._stamp_class(None)` resolves to
-        # xiao-s3-pps, whose path_bias_s is the MEASURED 62.5 us of ITS capture path. Charge that
-        # to an unclassed handset and this gate admits a receiver carrying 13.122 ms. It is that
-        # way round on purpose -- every node in the shipped survey.json is unclassed, and refusing
-        # unclassed receivers here would refuse all three and empty the corpus, the same call
-        # `Survey.arrival_ids()` documents ("State the class to be refused"). ⚠️SO THE MOMENT A
-        # PHONE IS ADDED TO survey.json IT MUST CARRY `"class": "gotchi-phone"`. Without it the
-        # class door lets it past and this one charges it a XIAO's audio path.
-        bias_why = NC.bias_refusal(cname)
+        # ⚠️AN UNCLASSED *NODE* IS STILL CHARGED THE STRICTEST ARRIVAL CLASS'S BIAS, AND THAT
+        # IS DELIBERATE: every node in the shipped survey.json is unclassed, and refusing them
+        # here would empty the corpus -- the same call `Survey.arrival_ids()` documents ("State
+        # the class to be refused"). An unclassed *PHONE* is no longer charged that, because
+        # xiao-s3-pps's path_bias_s is the MEASURED 62.5 us of ITS OWN capture path and charging
+        # it to a handset carrying 13.122 ms is a guess wearing a measurement's clothes. See
+        # `gate_class`: the obligation to write `"class": "gotchi-phone"` into survey.json used
+        # to be a comment, and is now enforced off the pool's own `source` field.
+        bias_why = NC.bias_refusal(gcls)
         if bias_why is not None:
             _drop(day, row, D_PATH_BIAS, _detail(row, bias_why))
             continue
@@ -844,10 +884,18 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
                 onset_unstated.get(row.get("source") or "unknown", 0) + 1)
         lat_ms = None
         if row.get("source") == "phone":
-            # ⚠️REACHABLE ONLY ONCE A PHONE IS SURVEYED. Today no phone has a survey entry, so
-            # every phone row is already gone as unsurveyed_node above and this branch is dead.
-            # It is written anyway because adding a phone to survey.json is a one-line change,
-            # and the failure it would otherwise cause is silent: ~13 ms of uncorrected
+            # ⚠️THIS BRANCH IS NOW UNREACHABLE FOR EVERY PHONE, AND NOT ONLY BECAUSE NO PHONE IS
+            # SURVEYED. `capture_path_bias` above tests `gotchi-phone.path_bias_s`, a CLASS
+            # constant, and refuses before this runs -- so a handset WITH a measured
+            # --latency-cal entry is refused exactly as one without, and this correction never
+            # happens. Running tools/hear_latency_cal.py does not by itself make a phone an
+            # arrival source; somebody must also write the measured figure into nodeclass.py's
+            # `gotchi-phone` entry, which is what that entry's own comment demands. Pinned dead
+            # by tests/test_hear_tdoa.py::test_the_latency_cal_gate_is_unreachable_for_a_phone
+            # so it cannot be mistaken for a live gate. Which of the two should win -- the class
+            # constant or the per-device measurement -- is an operator's decision, not a merge's.
+            #
+            # Kept because the failure it guards against is silent: ~13 ms of uncorrected
             # audio-path latency is 4.5 m, which alone exceeds the entire 34.4 ms
             # nyquist-rankine budget. 2 of 3 handsets have no calibration entry at all.
             off_ns = (cal.get("by_node_id") or {}).get(name)
@@ -876,7 +924,7 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
             # `event["arrival_sigma_s"]` index-aligned with `arrivals`; solve_event() hands it
             # to the solver. None when the producer stated nothing: that is the class figure and
             # not a measurement, and a solver must be able to tell the two apart.
-            "t_sigma_s": (None if ssig is None else NC.stamp_t_sigma_s(ssig, cname)),
+            "t_sigma_s": (None if ssig is None else NC.stamp_t_sigma_s(ssig, gcls)),
             # A REAL BOOLEAN for the same reason `utc_trusted` below is one: associate() cannot
             # resolve it, because the budget is per CLASS and associate has never seen a class.
             # None here means the producer stated no sigma, which that gate reads as usable.
