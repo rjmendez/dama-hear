@@ -1671,9 +1671,12 @@ def format_report(t: Dict[str, Any]) -> str:
     out.append("observation (NOT a health input): "
                + json.dumps(t["observation_not_health"]["level_dbfs"], sort_keys=True)
                + "  silence-top frac %s" % t["silence_frac"])
-    out.append("⚠️a tag is a MODEL's opinion, not a label: no human has heard these clips, the "
-               "scores are not species IDs, and clips/tag_model_card.json says why they must not "
-               "be used as training targets.")
+    model = MODELS[LANES.get(t.get("lane", DEFAULT_LANE), LANES[DEFAULT_LANE])["model"]]
+    what = ("the scores are species hypotheses nobody has confirmed" if model["species"]
+            else "the scores are not species IDs")
+    out.append("⚠️a tag is a MODEL's opinion, not a label: no human has heard these clips, %s, "
+               "and the lane's model card says why they must not be used as training targets."
+               % what)
     return "\n".join(out)
 
 
