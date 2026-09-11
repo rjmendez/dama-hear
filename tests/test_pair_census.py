@@ -125,16 +125,35 @@ class TestReceiverCensus:
         # 183 us one-way budget * 343 m/s = 0.0628 m; 5.4 m is ~86x that
         assert 80.0 < r["implied_baseline_error_budget_multiple"] < 90.0
 
-    def test_the_deployed_gate_and_the_stated_sigma_gate_can_disagree(self):
-        """THE FINDING THIS TABLE EXISTS TO SHOW. A phone stating a sigma comfortably inside the
-        129.4 us per-node budget is STILL refused by the deployed gate, because
-        nodeclass.stamp_admissible short-circuits on the phone CLASS's clock_admissible() before
-        it ever reads the row's own number."""
+    def test_the_phone_the_deployed_gate_used_to_refuse_now_passes_it(self):
+        """⚠️RETRACTION, PINNED. This test used to assert `clock_pass_deployed_gate == 0` and
+        called that "THE FINDING THIS TABLE EXISTS TO SHOW": nodeclass.stamp_admissible
+        short-circuited on the phone CLASS's `clock_admissible()` before it read the row's own
+        number, so all 10 rows were refused on a 5 ms constant. That short-circuit is GONE, and
+        `gotchi-phone` now declares `clock_sigma_s = 5 ms` -- its class figure is entirely clock,
+        so `capture_sigma_s` is 0 and a stated 106.038 us is judged as 106.038 us. Both columns
+        now agree at 10, and the census's job here is to show that they do."""
         rows = [_row("myasshurts", source="phone", sync_sigma_ns=106_038.0) for _ in range(10)]
         rep = PC.receiver_census(rows, SURVEY)
         r = rep["myasshurts"]
         assert r["clock_pass_stated_sigma_only"] == 10   # 106 us < 129.4 us: passes on its own
-        assert r["clock_pass_deployed_gate"] == 0        # class short-circuit refuses all 10
+        assert r["clock_pass_deployed_gate"] == 10       # and the shipped gate now agrees
+        assert r["clock_fail_deployed_gate"] == 0
+
+    def test_the_two_clock_columns_still_disagree_and_now_in_the_OTHER_direction(self):
+        """⚠️THE TWO COLUMNS ARE STILL TWO DIFFERENT QUESTIONS -- DO NOT COLLAPSE THEM TO ONE.
+        `clk_own` tests the stated sigma against the bound with NO class term. The deployed gate
+        RSSes it with the class's CAPTURE terms, which a `sync_sigma_ns` does not measure.
+        `xiao-s3-pps` declares no clock/capture split, so its capture figure is the whole 100 us:
+        a node stating the same 106.038 us gives sqrt(100^2 + 106.038^2) = 145.75 us, over the
+        129.4 us bound. It passes `clk_own` and fails the deployed gate -- the same gap as
+        before, with the sign reversed, which is why reading either column alone is still wrong."""
+        rows = [_row("nyquist", sync_sigma_ns=106_038.0) for _ in range(10)]
+        rep = PC.receiver_census(rows, SURVEY)
+        r = rep["nyquist"]
+        assert r["class"] == "xiao-s3-pps" and r["class_assumed"]
+        assert r["clock_pass_stated_sigma_only"] == 10
+        assert r["clock_pass_deployed_gate"] == 0
         assert r["clock_fail_deployed_gate"] == 10
 
     def test_a_latency_cal_entry_overrides_the_blended_class_wide_bias_number(self):

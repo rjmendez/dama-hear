@@ -1277,22 +1277,31 @@ def geometry_report(sv: SV.Survey, node_ids: Sequence[int], source: Sequence[flo
 #: The name and unit `point.solve` takes a per-receiver arrival sigma under: a sequence of
 #: SECONDS, one entry per receiver, in the order the receivers were passed.
 SOLVER_SIGMA_KWARG = "sigmas"
-#: ⚠️A SEAM BETWEEN TWO BRANCHES, WRITTEN DOWN RATHER THAN ASSUMED. The carrying side (pool ->
-#: detection -> event -> here) and the consuming side (point.solve's weighted fit) landed
-#: separately. Probing the signature is what lets this branch be correct on a main where the
-#: parameter does not exist yet, instead of raising TypeError on every event; `solver_weighting`
-#: puts the answer in the run's own report, so "the sigma reached the solver" is a MEASURED field
-#: and not a claim. ⚠️DELETE THE PROBE once both sides are on main -- keeping it means a later
-#: rename of the solver parameter degrades silently to unweighted instead of failing.
+#: ⚠️A SEAM BETWEEN TWO BRANCHES, AND THE TOLERANT HALF OF IT IS DELIBERATELY GONE. The carrying
+#: side (pool -> detection -> event -> here) and the consuming side (point.solve's weighted fit)
+#: landed on separate branches, and while they were separate this was a PROBE: falling back to an
+#: unweighted fit on a `point.solve` without the parameter, so the carrying branch was correct on
+#: a main that had not taken the solver yet. Both sides are composed now, so the fallback has
+#: stopped being a courtesy and become a silencer -- a later rename of the solver's parameter
+#: would leave every receiver voting at par with nothing in the report saying so, which is the
+#: failure this file's gates exist to prevent. It is an import-time REFUSAL instead. It is still
+#: measured rather than asserted: `solver_weighting.solver_accepts` carries the answer into the
+#: run's own report, and it can only ever be written True because a False one cannot import.
 SOLVER_TAKES_SIGMA = SOLVER_SIGMA_KWARG in inspect.signature(PT.solve).parameters
+if not SOLVER_TAKES_SIGMA:                                          # pragma: no cover
+    raise ImportError(
+        "hear.solve.point.solve has no %r parameter: this driver resolves a per-detection "
+        "arrival sigma through nodeclass and has nowhere to put it, so every receiver would "
+        "vote at equal weight and no field in the report would say so. Restore the parameter "
+        "(a sequence of SECONDS, one entry per receiver) or remove the plumbing here."
+        % (SOLVER_SIGMA_KWARG,))
 
 
 def _sigma_kwargs(sigmas: Optional[Sequence[Optional[float]]]) -> Dict[str, Any]:
     """The solver keyword carrying per-receiver sigma, or nothing at all.
 
-    Empty in three cases, and the third is the interesting one:
+    Empty in two cases, and the second is the interesting one:
 
-      * the solver does not take the parameter (this branch running on a main without it);
       * NO receiver in the group stated a sigma -- an all-`None` list is every receiver on its
         class figure, which is equal weighting written out longhand, and passing it would make
         the report claim a weighted fit that is not one;
@@ -1307,7 +1316,7 @@ def _sigma_kwargs(sigmas: Optional[Sequence[Optional[float]]]) -> Dict[str, Any]
         whether a class figure counts as a statement is a change to the SOLVER's contract and
         belongs on that side of the seam, not smuggled through here.
     """
-    if not SOLVER_TAKES_SIGMA or sigmas is None:
+    if sigmas is None:
         return {}
     if any(s is None for s in sigmas):
         return {}

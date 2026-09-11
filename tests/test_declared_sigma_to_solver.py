@@ -115,7 +115,6 @@ class TestTheSigmaReachesTheSolver:
                     "rms_residual_ms": 0.0, "at_search_bound": False}
 
         monkeypatch.setattr(TD.PT, "solve", fake_solve)
-        monkeypatch.setattr(TD, "SOLVER_TAKES_SIGMA", True)
         sv = _survey()
         TD.solve_event(sv, [1, 2, 3], [100.0, 100.01, 100.005], "blast", 20.0, 340.0, 0.0,
                        arrival_sigma_s=[100e-6, 106.4e-6, 120e-6])
@@ -138,7 +137,6 @@ class TestTheSigmaReachesTheSolver:
                     "rms_residual_ms": 0.0, "at_search_bound": False}
 
         monkeypatch.setattr(TD.PT, "solve", fake_solve)
-        monkeypatch.setattr(TD, "SOLVER_TAKES_SIGMA", True)
         TD.solve_event(_survey(), [1, 2, 3], [100.0, 100.01, 100.005], "blast", 20.0, 340.0, 0.0,
                        arrival_sigma_s=[100e-6, None, 120e-6])
         assert seen["sigmas"] is None
@@ -159,7 +157,6 @@ class TestTheSigmaReachesTheSolver:
                     "residual_is_meaningful": True}
 
         monkeypatch.setattr(TD.PT, "solve", fake_solve)
-        monkeypatch.setattr(TD, "SOLVER_TAKES_SIGMA", True)
         sv = _survey()
         ids = [1, 2, 3, 4]
         arr = [100.0, 100.01, 100.005, 100.02]
@@ -176,18 +173,42 @@ class TestTheSigmaReachesTheSolver:
             assert [s for _a, s in kept] == got_sig
 
     def test_the_solver_kwarg_name_and_unit_are_pinned(self):
-        """⚠️THE PROBE DEGRADES SILENTLY IF THE SOLVER RENAMES ITS PARAMETER. It falls back to an
-        unweighted fit rather than raising, which is the right behaviour while the two branches
-        are separate and the wrong one afterwards. This is the alarm: if `point.solve` grows the
-        parameter under any other name, this fails and the probe gets deleted with it."""
+        """⚠️A RENAME OF THE SOLVER'S PARAMETER MUST FAIL, NOT DEGRADE. While the carrying and
+        consuming sides were separate branches this driver PROBED the signature and fell back to
+        an unweighted fit -- right then, wrong now that both are composed, because an unweighted
+        fallback is indistinguishable in the output from a weighted fit on equal sigmas."""
         import inspect
         from hear.solve import point as PT
         params = inspect.signature(PT.solve).parameters
         assert TD.SOLVER_SIGMA_KWARG == "sigmas"
-        assert TD.SOLVER_TAKES_SIGMA == (TD.SOLVER_SIGMA_KWARG in params)
+        assert TD.SOLVER_TAKES_SIGMA is True, "a False one cannot import; see the raise below it"
+        assert TD.SOLVER_SIGMA_KWARG in params
         assert not (set(params) & {"sigma_s", "arrival_sigma_s", "weights", "sigma"}), (
             "point.solve took a per-receiver uncertainty under a name this driver does not "
             "pass; the two branches agreed on `sigmas`, seconds")
+
+    def test_the_driver_refuses_to_import_against_a_solver_with_no_sigma(self):
+        """The import-time refusal that replaced the probe, exercised without re-importing: the
+        source must RAISE on a missing parameter and must not fall back anywhere."""
+        src = (ROOT / "tools" / "hear_tdoa.py").read_text()
+        i = src.index("SOLVER_TAKES_SIGMA = ")
+        block = src[i:i + 700]
+        assert "raise ImportError" in block, (
+            "the probe's silent fallback must be an import-time refusal now that both sides of "
+            "the seam are composed")
+        assert "not SOLVER_TAKES_SIGMA or sigmas is None" not in src, (
+            "_sigma_kwargs must not keep a branch that silently returns no weighting when the "
+            "solver lacks the parameter -- that branch is the silencer")
+
+    def test_the_unit_is_seconds_end_to_end_from_the_nanoseconds_on_the_wire(self):
+        """⚠️ns ON THE WIRE, s AT THE SOLVER, AND ONE PLACE CONVERTS. A driver that converted and
+        a nodeclass that also converted would divide by 1e9 twice and weight every receiver at
+        1e-9 of its real sigma, which no assertion downstream would catch."""
+        ns = 106_038.0
+        s = NC.stamp_t_sigma_s(ns, "gotchi-phone")
+        assert s == pytest.approx(ns / 1e9, rel=1e-12), "gotchi-phone's capture term is 0"
+        assert 1e-5 < s < 1e-3, "seconds, not nanoseconds and not milliseconds"
+        assert TD._sigma_kwargs([s, s]) == {"sigmas": [s, s]}
 
 
 class TestTheBiasVerdictStaysSeparate:
@@ -212,9 +233,7 @@ class TestTheBiasVerdictStaysSeparate:
         assert TD.D_PATH_BIAS in TD.DROP_REASONS
         assert TD.D_PATH_BIAS != TD.D_STAMP_SIGMA
 
-    def test_the_bias_gate_refuses_a_phone_row_the_clock_gate_admitted(self, tmp_path):
-        """End to end through `admit()`: one phone row stating a clock sigma INSIDE the bound,
-        surveyed and classed, lands in `capture_path_bias` and not in `stamp_sigma_...`."""
+    def _phone_pool(self, tmp_path):
         root = tmp_path / "pool"
         (root / "records" / "2026-09-10").mkdir(parents=True)
         row = {"anchored": True, "ts_utc_s": 1788998406.636, "node": "handset",
@@ -227,9 +246,34 @@ class TestTheBiasVerdictStaysSeparate:
         policy = {"sources": ["phone"], "days": [], "since": None, "until": None,
                   "lookback_h": 10000.0, "settle_s": 0.0, "clock_unstated": "admit",
                   "onset_unstated": "admit", "max_sync_sigma_ns": None, "latency_cal": {}}
+        return root, sv, policy
+
+    def test_the_outer_door_refuses_the_phone_before_the_bias_gate_is_reached(self, tmp_path):
+        """⚠️COMPOSED ORDERING, PINNED. `heterogeneous_receiver_class` sits AHEAD of the clock
+        and bias gates and catches `source == "phone"` unconditionally, so with the default
+        policy this row never reaches `capture_path_bias` at all. Pinned because the two gates
+        were written on separate branches that did not conflict textually: whichever runs first
+        is the reason an operator reads in the ledger, and that ordering is a decision, not an
+        accident of merge order."""
+        root, sv, policy = self._phone_pool(tmp_path)
+        a = TD.admit(str(root), sv, sv, policy, now=1788998606.0)
+        assert a["by_reason"].get(TD.D_HETEROGENEOUS_CLASS) == 1
+        assert a["by_reason"].get(TD.D_PATH_BIAS) is None
+
+    def test_the_bias_gate_refuses_a_phone_row_the_clock_gate_admitted(self, tmp_path):
+        """End to end through `admit()` with the heterogeneous door OPEN: one phone row stating
+        a clock sigma INSIDE the bound, surveyed and classed, lands in `capture_path_bias` and
+        not in `stamp_sigma_...`.
+
+        ⚠️THE OPT-IN IS SET HERE SO THE GATE UNDER TEST IS THE ONE REACHED. Opening the outer
+        door does NOT open this one -- that is the property being pinned, and it is the whole
+        reason the bias verdict is a separate terminal reason."""
+        root, sv, policy = self._phone_pool(tmp_path)
+        policy["heterogeneous_receivers"] = True
         # the ARRIVAL sub-survey is what admit() maps names through; pass the same survey so the
         # row gets past `unsurveyed_node` and the CLOCK/BIAS gates are the ones under test.
         a = TD.admit(str(root), sv, sv, policy, now=1788998606.0)
+        assert a["by_reason"].get(TD.D_HETEROGENEOUS_CLASS) is None
         assert a["by_reason"].get(TD.D_STAMP_SIGMA) is None, (
             "its stated 106.4 us is inside the 129.4 us bound; refusing it on the clock is the "
             "defect this change removed")
