@@ -606,7 +606,14 @@ class PerchEmbedder:
         if emb is None or int(emb.shape[-1]) != PERCH_EMBED_DIM:
             raise WeightsRefused("the SavedModel has no %d-wide `embedding` output; outputs are %r"
                                  % (PERCH_EMBED_DIM, sorted(sig.structured_outputs)))
-        self._in = list(sig.structured_input_signature[1].keys())[0]
+        inputs = sig.structured_input_signature[1]
+        if len(inputs) != 1:
+            raise WeightsRefused("the SavedModel signature takes %d inputs %r, expected one "
+                                 "waveform" % (len(inputs), sorted(inputs)))
+        (self._in, spec), = inputs.items()
+        if spec.shape.rank != 2 or spec.shape[-1] not in (None, PERCH_WINDOW):
+            raise WeightsRefused("input %r is %s, expected (N, %d)"
+                                 % (self._in, spec.shape, PERCH_WINDOW))
         self._f, self._tf, self._np = sig, tf, np
 
     def tag(self, pcm: "Any", floor: float = SCORE_FLOOR) -> Dict[str, Any]:
@@ -630,11 +637,15 @@ def verify_perch(model_dir: str) -> Dict[str, Any]:
             out["problems"].append("%s is absent. Stage the archive from %s (sha256 %s)"
                                    % (p, PERCH_ARCHIVE_URL, PERCH_ARCHIVE_SHA256))
             continue
-        n = os.path.getsize(p)
+        try:
+            n = os.path.getsize(p)
+            got = sha256_file(p) if n == want_n else None
+        except OSError as exc:
+            out["problems"].append("%s could not be read: %s" % (p, exc))
+            continue
         if n != want_n:
             out["problems"].append("%s is %d B, expected %d B" % (p, n, want_n))
             continue
-        got = sha256_file(p)
         out["files"][rel] = got
         out["model_bytes"] += n
         if got != want_sha:
