@@ -1,0 +1,153 @@
+---
+# BirdNET V2.4, the species tier, running beside EfficientAT (hear-tag) and Perch (hear-embed).
+# CPU only. The same tools/hear_tag.py and hear-tag-code ConfigMap, with `--lane birdnet_v24`;
+# writes clips/tags-birdnet_v24.jsonl and state/tag_heartbeat-birdnet_v24.json.
+#
+# ⚠️THE WEIGHTS ARE CC BY-NC-SA 4.0. They live on the PVC at /pool/models/birdnet_v24, staged by
+# hand from the Zenodo archive (sha256 31377e128d86fe7b65fa91b206b8804bad1cd934e624bbe6e7c1788170c95e57),
+# for this site's own non-commercial use. They must never be committed here or shipped in the
+# APK. Every file is hashed against BIRDNET_FILES before each run and the run is refused
+# otherwise.
+#
+# ⚠️THE SITE LOCATION COMES FROM A SECRET, NOT FROM THIS FILE. BirdNET's range filter needs
+# latitude, longitude and week; without it the first run put Eurasian Magpie and Indian
+# Scops-Owl at the top of Pennsylvania clips. This repo is public, so the location lives in the
+# Secret hear-site (key latlon, "lat,lon"; the tagger rounds it to 0.1 deg) and the lane refuses
+# to start without it:
+#     kubectl -n dama create secret generic hear-site --from-literal=latlon=<lat>,<lon>
+#
+# ⚠️IT TOUCHES THE PVC AND NEVER A NODE.
+#
+# ⚠️APPLY ONLY THIS FILE, plus deploy/k8s/hear-tag-code.yaml, which it shares with hear-tag.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-birdnet
+  namespace: dama
+  labels:
+    app: hear-birdnet
+spec:
+  suspend: false
+  # Clear of the drain (:00/:15/:30/:45), hear-tag (:12/:42) and hear-embed (:04/:34).
+  schedule: "19,49 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 1500
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: hear-birdnet
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: birdnet
+              image: python:3.13-slim
+              command: ["/bin/sh", "-lc"]
+              args:
+                - |
+                  set -e
+                  # Its own target dir: LiteRT's pins must not reach the tag lane's onnxruntime.
+                  LIB=/pool/pylib-birdnet
+                  MODELS=/pool/models/birdnet_v24
+                  export PYTHONPATH="$LIB:/app"
+                  if ! python -c 'import ai_edge_litert,sys; from importlib.metadata import version; sys.exit(0 if version("ai-edge-litert")=="2.2.0" else 1)' 2>/dev/null; then
+                    echo "installing ai-edge-litert==2.2.0 into $LIB"
+                    pip install --no-cache-dir --upgrade --target "$LIB" 'ai-edge-litert==2.2.0' 'numpy==2.2.6' >/dev/null 2>&1
+                  fi
+                  if ! python /app/tools/hear_tag.py --lane birdnet_v24 --model-dir "$MODELS" --verify-weights; then
+                    echo "birdnet_v24 is missing or is not the pinned archive. See the header of"
+                    echo "deploy/k8s/hear-birdnet.yaml for staging."
+                    exit 1
+                  fi
+                  exec python /app/tools/hear_tag.py \
+                    --pool /pool/corpus \
+                    --model-dir "$MODELS" \
+                    --lane birdnet_v24 \
+                    --limit 400 \
+                    --deadline-s 600
+              env:
+                - name: HEAR_SITE_LATLON
+                  valueFrom:
+                    secretKeyRef: { name: hear-site, key: latlon }
+              volumeMounts:
+                - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/sketch.py,   subPath: hear_sketch.py }
+                - { name: code, mountPath: /app/hear/clips.py,    subPath: hear_clips.py }
+                - { name: code, mountPath: /app/hear/tags.py,     subPath: hear_tags.py }
+                - { name: code, mountPath: /app/hear/resample.py, subPath: hear_resample.py }
+                - { name: code, mountPath: /app/tools/hear_tag.py, subPath: tools_hear_tag.py }
+                - { name: pool, mountPath: /pool }
+              resources:
+                requests: { cpu: 100m, memory: 256Mi }
+                limits:   { cpu: "1",  memory: 1Gi }
+          volumes:
+            - name: code
+              configMap:
+                name: hear-tag-code
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool
+---
+# The same gates as hear-tag-check, on the birdnet_v24 heartbeat. The mean-top-score floor was
+# calibrated on EfficientAT and says nothing about BirdNET, so here it reports.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-birdnet-check
+  namespace: dama
+  labels:
+    app: hear-birdnet
+spec:
+  suspend: false
+  schedule: "58 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: hear-birdnet
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: check
+              image: python:3.13-slim
+              command: ["/bin/sh", "-lc"]
+              args:
+                # `set +e` and the gate's rc captured first, as in hear-tag-check.
+                - |
+                  set +e
+                  export PYTHONPATH=/pool/pylib-birdnet:/app
+                  python /app/tools/hear_tag.py --pool /pool/corpus --check --lane birdnet_v24 \
+                    --window-s 7200 --max-stale-s 14400 --max-silence-frac -1 \
+                    --min-mean-top-score -1
+                  rc=$?
+                  echo "--- weights ---"
+                  python /app/tools/hear_tag.py --lane birdnet_v24 --model-dir /pool/models/birdnet_v24 --verify-weights || true
+                  exit "$rc"
+              volumeMounts:
+                - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/sketch.py,   subPath: hear_sketch.py }
+                - { name: code, mountPath: /app/hear/clips.py,    subPath: hear_clips.py }
+                - { name: code, mountPath: /app/hear/tags.py,     subPath: hear_tags.py }
+                - { name: code, mountPath: /app/hear/resample.py, subPath: hear_resample.py }
+                - { name: code, mountPath: /app/tools/hear_tag.py, subPath: tools_hear_tag.py }
+                - { name: pool, mountPath: /pool }
+              resources:
+                requests: { cpu: 100m, memory: 128Mi }
+                limits:   { cpu: "1",  memory: 512Mi }
+          volumes:
+            - name: code
+              configMap:
+                name: hear-tag-code
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool
