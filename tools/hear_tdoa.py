@@ -233,7 +233,7 @@ DROP_REASONS = (D_UNANCHORED, D_OUTSIDE_WINDOW, D_OUTSIDE_LOOKBACK_EMITTED,
 #:     `onset_index_checked` returns it and the gate puts it in the detection dict -- and it
 #:     dies at the wire boundary, a 172-byte format shared byte-for-byte with the Android
 #:     producer.
-#:   * The node firmware never computes it at all: firmware/night_node/night_node.ino derives
+#:   * The node firmware never computes it at all: firmware/hear_node/hear_node.ino derives
 #:     the stamp with `sk_onset_acq_at(acq_base, i, DECIM, DECIM_DELAY)`, index arithmetic on
 #:     the gate-crossing sample back-dated by the decimator group delay. There is no
 #:     constant-fraction search on the node, so there is no verdict to carry.

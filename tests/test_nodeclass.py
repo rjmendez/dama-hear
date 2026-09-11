@@ -9,6 +9,8 @@ import math
 
 import pytest
 
+from hear.tags import FS_NOMINAL_HZ
+
 from hear import nodeclass as nc
 
 
@@ -274,8 +276,8 @@ def test_the_admitted_class_has_margin_rather_than_scraping_through():
     x = nc.get("xiao-s3-pps")
     assert x.t_sigma_s / nc.ARRIVAL_T_SIGMA_MAX_S < 0.85
     assert x.path_bias_s / nc.ARRIVAL_PATH_BIAS_MAX_S < 0.85
-    assert x.path_bias_s == pytest.approx(1.0 / x.fs_hz), \
-        "its bias IS one sample of its own rate -- the residual of the firmware's back-date"
+    assert x.path_bias_s == pytest.approx(1.0 / FS_NOMINAL_HZ), \
+        "its bias IS one decimated sample -- detections are stamped on the FS_NOMINAL counter"
 
 
 def test_arrival_budget_reports_both_halves_and_the_verdict():
