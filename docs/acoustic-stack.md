@@ -112,7 +112,7 @@ file that named it.
 `CLIP_BUDGET_B` without collection just evicts faster.* Today the card holds 49 and the node
 destroys the 50th; raising the budget to 196 without a drain does not save a single clip. It
 changes *which* 478 are destroyed and how long each survives before it is destroyed anyway, while
-consuming SD space and lengthening `clip_evict_worse_than`'s directory scan. **The node is not
+consuming SD space. **The node is not
 the archive; the pool is.** Until something collects, every byte of budget is a byte of delay
 before the same loss. The permitted sequence: land collection → observe ≥ 7 days of
 `clips_deferred_by_cap == 0` and `clips_cap_hit == false` across all three nodes, read off the
@@ -124,10 +124,10 @@ margin *is* the schedule margin.
 Fetch is **strictly sequential**. The ESP32 serves one client at a time and refuses the rest
 rather than queueing — `/ls` answers in 35–118 ms idle, degrades to 7.3 s during a large transfer,
 and is refused outright mid-request — so a second CronJob or a thread pool would convert a slow
-run into a refused one. Order is oldest-first by `(boot, sample)`, which is by **eviction risk**:
-the flashed fleet evicts plain FIFO (prefix histogram over 370 live names is `{'ny': 370}` — no
-node writes the `%02u-` priority prefix), so oldest-first is most-at-risk-first. `prio` is
-recorded when the name carries it and is never read for ordering.
+run into a refused one. Order is oldest-first in `hear.clips.eviction_key` order, which is by **eviction risk**: the
+firmware evicts in exactly that order (`firmware/hear_node/clip_order.h`: older-format names first,
+then boot sequence, then sample), so oldest-first is most-at-risk-first. `prio` is recorded when an
+older name carries it and is never read for ordering.
 
 The index (`clips/index.jsonl`) is the durable record and the audio is a cache: `prune()` deletes
 WAVs and never index lines. Each row is appended **as its clip resolves**, never buffered to the

@@ -352,18 +352,22 @@ Under the budget sits a live floor: clips stop when `sd_free_mb` drops below **2
 the audio stops. Free space is sampled on the existing 30 s health tick, **not per clip** —
 `SD.usedBytes()` is a free-cluster walk on FATFS and its cost on this card has not been measured.
 
-**Nothing is pruned.** Oldest-first deletion would risk removing a clip a `dets.csv` row already
-names, and a row naming a file that is not there is worse than a row that says it never got one.
+**The oldest clip makes room for the next.** At boot `clip_rescan()` reads `/clips`, sorts it into
+eviction order (`clip_order.h`: older-format names, then boot sequence, then sample) and evicts down
+to `CLIP_BUDGET_B`; after that each new clip evicts from the head of that queue. A clip is never
+refused for budget. The boot sequence is one past the highest on the card and advances again when
+the 32-bit sample counter wraps (every 74.6 h at 16 kHz), so `(sequence, sample)` stays
+chronological across boots and within a long one. A `dets.csv` row can therefore name a clip that has since been evicted; the drain
+books that as `evicted_before_fetch`.
 
 ### Exhaustion is visible, and a full card does not read as a quiet period
 
-`clip_written` advances **only** after the full 128 044 B has landed. Every refusal has its own
+`clip_written` advances **only** after the full 480 044 B has landed. Every refusal has its own
 counter and its own token in the `clip_why` column of `dets.csv`:
 
 | `clip_why` | counter | means |
 |---|---|---|
 | `ok` | `clip_written` | the file named in `clip` is on the card |
-| `budget` | `clip_skip_budget` | `CLIP_BUDGET_B` spent. Working as designed |
 | `cardfull` | `clip_skip_cardfull` | the **card** is nearly out. `health.csv` and `dets.csv` are next |
 | `dedupe` | `clip_skip_dedupe` | within 1 s of a clip that was written |
 | `ring` | `clip_skip_ring` | window not in the ring, or no PSRAM ring at all |
@@ -371,9 +375,9 @@ counter and its own token in the `clip_why` column of `dets.csv`:
 | `nocard` | — | no card mounted |
 | `fail` | `clip_fail` | short write or failed open; the partial file is deleted |
 
-`budget` and `cardfull` are deliberately **not** the same token: one says the firmware is rationing
-itself, the other says go and swap the card. All of these are columns in `health.csv` and fields
-under `clips` in `/status`, alongside `budget_left_b` and `budget_left_clips`.
+`cardfull` says go and swap the card. All of these are columns in `health.csv` and fields under
+`clips` in `/status`, alongside `evicted`, `held`, `budget_left_b` and `budget_left_clips`. Rows
+written by the priority-eviction firmware can still carry `budget`.
 
 ### What it costs the audio, and the one regression
 

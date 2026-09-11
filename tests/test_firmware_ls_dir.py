@@ -11,7 +11,7 @@ two meet at the line format `- <name>  <N> B`.
 it scanned the file. The same is true in reverse for the positive ones -- the prose above the
 handler discusses `dir`, `..` and the entry cap.
 
-Comments are stripped as well, following tests/test_clip_priority.py. That part is currently
+Comments are stripped as well, following tests/test_clip_eviction.py. That part is currently
 defence-in-depth and not load-bearing: no assertion below changes truth value with comments left
 in, checked. It stays because the handler's own comment block names every construct these tests
 look for, so one reworded line is all it would take -- and this repo has shipped that bug twice.
@@ -35,7 +35,7 @@ ROOT_CAPTURE = Path(__file__).resolve().parent / "fixtures" / "ls_nyquist.txt"
 def _handler(path):
     """The braces-balanced body of the `http.on("<path>", ...)` registration, comments removed.
 
-    `_body()` in test_clip_priority.py finds a named C function; these handlers are lambdas, so
+    `_body()` in test_clip_eviction.py finds a named C function; these handlers are lambdas, so
     the anchor is the registration string instead. Everything else is the same discipline.
     """
     src = INO.read_text()
@@ -93,9 +93,9 @@ class TestTheHandlerTakesADirectory:
             "partial census that reads as a complete one")
 
     def test_the_cap_is_not_sized_to_the_49_clip_budget(self):
-        # clip_budget_left is a RAM counter reset full every boot with no startup rescan of
-        # CLIP_DIR, so eviction only binds once THIS boot's counter is spent. The real ceiling is
-        # free SD space (~155 files on a ~19 MiB-free card), not 49.
+        # A card flashed from priority-eviction firmware can hold ~155 older clips (~19 MiB free);
+        # clip_rescan() reads them in one LS_MAX_ENTRIES pass and evicts down to the budget, and
+        # 6 MiB of 128044 B clips is 49 of them.
         m = re.search(r"#define\s+LS_MAX_ENTRIES\s+(\d+)", INO.read_text())
         assert m, "LS_MAX_ENTRIES must be a defined constant"
         assert int(m.group(1)) > 49, (

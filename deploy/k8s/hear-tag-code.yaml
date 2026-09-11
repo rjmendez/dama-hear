@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-tag-code.yaml
-# apply-mode client: 131984 B serialised against a 262144 B last-applied-configuration cap.
+# apply-mode client: 132652 B serialised against a 262144 B last-applied-configuration cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tag
   annotations:
-    dama-hear/commit: 'f833965-dirty'
+    dama-hear/commit: '0db0b4e-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '131984'
+    dama-hear/serialised-bytes: '132652'
 data:
   hear__init__.py: |
     
@@ -291,7 +291,7 @@ data:
     import os
     import re
     import shutil
-    from typing import Any, Dict, Iterable, List, Optional
+    from typing import Any, Dict, Iterable, List, Optional, Tuple
     
     #: 3 drops `header_rate_suspect`: one clip geometry, and old clips roll off.
     CLIP_SCHEMA_VERSION = 3
@@ -318,7 +318,7 @@ data:
     #: ⚠️`probed_404` IS DELIBERATELY NOT HERE. hear_node.ino:2436 answers 404 for ANY failed
     #: SD.open, not only for a missing file: max_files is 8 and the long-lived set reaches 6
     #: (dets.csv + scene.csv + the open clip + /ls's directory and entry + health.csv) with
-    #: clip_evict_worse_than() taking 2 more during an eviction (hear_node.ino:1725-1731). One
+    #: the pre-FIFO firmware's clip_evict_worse_than() taking 2 more during an eviction. One
     #: descriptor-exhausted moment must not retire a clip that is still on the card.
     TERMINAL_OUTCOMES = ("stored", "evicted_before_fetch")
     
@@ -326,9 +326,9 @@ data:
     #: confirming the 321 already-dead nyquist names costs one extra ~32 s pass, once.
     CONFIRM_404 = 2
     
-    #: ⚠️BOTH SHIPPED SHAPES. The flashed fleet writes `<node>-<boot>-<sample>.wav`; the checkout's
-    #: clip_name() prepends `%02u-` priority. A parser that knew only one would refuse the entire
-    #: live fleet or the entire next reflash.
+    #: ⚠️EVERY SHIPPED SHAPE. The oldest firmware wrote `<node>-<8 hex boot>-<sample>.wav`, the
+    #: priority-eviction firmware prepended `%02u-`, and the FIFO firmware writes a 12 hex boot
+    #: (6 hex boot sequence + 6 random). Older names stay on a card until they are evicted.
     _NAME_RE = re.compile(r"^(?:(\d{2})-)?([A-Za-z0-9_]+)-([0-9a-fA-F]+)-(\d+)\.wav$")
     _MAX_BASENAME = 64
     
@@ -362,6 +362,21 @@ data:
         prio, node, boot, sample = m.groups()
         return {"raw": raw, "basename": basename, "node": node, "boot": boot,
                 "sample": int(sample), "prio": None if prio is None else int(prio)}
+    
+    
+    _FIFO_TAIL_RE = re.compile(r"-([0-9a-fA-F]{12})-(\d{10})\.wav$")
+    
+    
+    def eviction_key(basename: str) -> Tuple[Any, ...]:
+        """Sort key that orders clips the way the node evicts them, oldest first.
+    
+        Mirrors firmware/hear_node/clip_order.h (tests/test_clip_eviction.py runs both on the same
+        names): any name not of the FIFO shape first, by name; then by (boot sequence, sample).
+        """
+        m = _FIFO_TAIL_RE.search(basename)
+        if m is None or m.start() == 0 or int(m.group(2)) > 0xFFFFFFFF:
+            return (0, basename)
+        return (1, int(m.group(1)[:6], 16), int(m.group(2)), basename)
     
     
     def clip_key(node: str, boot: str, sample: int) -> str:
