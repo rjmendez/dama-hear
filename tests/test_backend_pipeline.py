@@ -240,9 +240,15 @@ class TestTheWindowGuard:
         return fr
 
     def test_the_late_node_is_rejected_by_geometry_and_the_rest_solve(self):
-        # measured for this layout: 88-100 ms of disagreement against bounds of 41-49 ms
+        # measured for this layout: 88-100 ms of disagreement against bounds of 41-49 ms.
+        # The gate still refuses it; since associate() stopped CONSUMING its refusals the late
+        # node goes on to seed a group of one, so its terminal reason is `too_few_nodes` and the
+        # geometry numbers ride in that row's detail. What matters here is unchanged: it is not
+        # in the event and the bearing is not wrecked.
         got = BP.Backend(_survey(TIGHT), temp_c=T, v_mps=V).run(self._burst_frames())
-        assert [r["reason"] for r in got["rejected"]] == ["pairwise_dt_exceeds_geometry"]
+        assert [r["reason"] for r in got["rejected"]] == ["too_few_nodes"]
+        assert "exceeds" not in got["rejected"][0]["detail"]
+        assert " ms > " in got["rejected"][0]["detail"], "the refusing numbers must survive"
         ev = got["events"][0]
         assert ev["n_nodes"] == 3
         assert _bearing_error(ev["solution"]["bearing_deg"], 0.0) < 1.0
