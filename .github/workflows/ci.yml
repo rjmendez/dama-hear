@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tests:
+    name: tests (py${{ matrix.python }}, ${{ matrix.pins }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { python: "3.12", pins: dev }
+          - { python: "3.13", pins: pods }
+    env:
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements/ci-${{ matrix.pins }}.txt
+      - run: python -m pip install -r requirements/ci-${{ matrix.pins }}.txt
+      - run: python -m pytest -q -rs --color=yes
+
+  generated-headers:
+    name: generated headers are current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/ci-dev.txt
+      - run: python -m pip install -r requirements/ci-dev.txt
+      - name: regenerate
+        run: |
+          python firmware/gen_decim.py > firmware/hear_node/decim.h
+          python firmware/gen_mel.py
+          python firmware/gen_mel_scene.py
+          python firmware/gen_golden.py
+      - name: nothing changed
+        run: |
+          if ! git diff --quiet; then
+            git diff --stat
+            echo "::error::a generated header differs from its generator; rerun the generators and commit"
+            exit 1
+          fi
+
+  firmware:
+    uses: ./.github/workflows/firmware.yml
