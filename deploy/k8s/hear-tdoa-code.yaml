@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 599906 B serialised; 600084 B of annotations against a 262144 B cap.
+# apply-mode server: 602936 B serialised; 603114 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '090e57b'
+    dama-hear/commit: '75de387'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '599906'
+    dama-hear/serialised-bytes: '602936'
 data:
   hear__init__.py: |
     
@@ -4071,6 +4071,8 @@ data:
     
     import json
     import math
+    import os
+    import re
     from typing import Dict, List, Optional, Sequence
     
     import numpy as np
@@ -4098,6 +4100,36 @@ data:
     class SurveyError(ValueError):
         """Every refusal in this module. ValueError subclass so a caller that catches the repo's
         precondition errors catches these too."""
+    
+    
+    class SiteOriginError(SurveyError):
+        """HEAR_SITE_ORIGIN is malformed, or a real origin is required and the survey's is fictional."""
+    
+    
+    SITE_ORIGIN_ENV = "HEAR_SITE_ORIGIN"
+    _SITE_FIELD = re.compile(r"-?\d+(?:\.\d+)?")
+    _H_ELL_RANGE_M = (-1000.0, 10000.0)
+    
+    
+    def site_origin(environ=None) -> Optional[Dict]:
+        """The origin HEAR_SITE_ORIGIN names as 'lat,lon,h_ell_m', or None when it is unset.
+        Refusals never echo the value: it is the site."""
+        env = os.environ if environ is None else environ
+        if SITE_ORIGIN_ENV not in env:
+            return None
+        fields = [f.strip() for f in env[SITE_ORIGIN_ENV].split(",")]
+        if len(fields) != 3 or not all(_SITE_FIELD.fullmatch(f) for f in fields):
+            raise SiteOriginError("%s must be three plain decimals 'lat,lon,h_ell_m'; got %d field(s)"
+                                  % (SITE_ORIGIN_ENV, len(fields)))
+        lat, lon, h = (float(f) for f in fields)
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0) or (lat == 0.0 and lon == 0.0):
+            raise SiteOriginError("%s is not a latitude,longitude on the earth (or is 0,0)"
+                                  % SITE_ORIGIN_ENV)
+        if not (_H_ELL_RANGE_M[0] <= h <= _H_ELL_RANGE_M[1]):
+            raise SiteOriginError("%s height is outside %g..%g m above the ellipsoid"
+                                  % (SITE_ORIGIN_ENV, _H_ELL_RANGE_M[0], _H_ELL_RANGE_M[1]))
+        return {"lat_deg": lat, "lon_deg": lon, "h_ell_m": h,
+                "source": "environment %s" % SITE_ORIGIN_ENV}
     
     
     def _is_number(v) -> bool:
@@ -4221,6 +4253,9 @@ data:
             except (KeyError, TypeError, ValueError):
                 raise SurveyError("survey origin needs numeric lat_deg, lon_deg and h_ell_m; got %r"
                                   % (o,))
+    
+        def origin_is_fictional(self) -> bool:
+            return isinstance(self.origin, dict) and self.origin.get("fictional") is True
     
         def diameter_m(self) -> float:
             """Largest pairwise 3D distance, metres. 3D and not horizontal because it bounds
@@ -4393,10 +4428,24 @@ data:
                          min_nodes=min_nodes)
     
     
-    def load_survey(path: str, min_nodes: int = 3) -> Survey:
-        """Read JSON from `path` and validate it. Does not search, cache or default a path."""
+    def load_survey(path: str, min_nodes: int = 3, require_real_origin: bool = False) -> Survey:
+        """Read JSON from `path` and validate it. Does not search, cache or default a path.
+    
+        HEAR_SITE_ORIGIN, when set, replaces the file's origin. `require_real_origin` refuses a survey
+        whose origin is still marked fictional, which is what the public repo ships."""
+        site = site_origin()
         with open(path, "r") as fh:
-            return from_dict(json.load(fh), min_nodes=min_nodes)
+            d = json.load(fh)
+        if site is not None and isinstance(d, dict):
+            d = dict(d, origin=site)
+        sv = from_dict(d, min_nodes=min_nodes)
+        if require_real_origin and sv.origin_is_fictional():
+            raise SiteOriginError(
+                "the origin in %s is marked fictional (the public repo does not carry the site) and "
+                "%s is unset; every lat/lon converted against it would be misplaced. Set %s="
+                "'lat,lon,h_ell_m' to the real frame origin (cluster: Secret hear-site, key origin)"
+                % (path, SITE_ORIGIN_ENV, SITE_ORIGIN_ENV))
+        return sv
     
   hear_backend_associate.py: |
     #!/usr/bin/env python3
@@ -9441,7 +9490,7 @@ data:
         # ---------------------------------------------------------- startup refusals, pre-I/O
         _refuse_out_dir_inside_checkout(out)
         try:
-            sv = SV.load_survey(survey_path, min_nodes=3)
+            sv = SV.load_survey(survey_path, min_nodes=3, require_real_origin=True)
         except SV.SurveyError as exc:
             raise Refusal("survey %s did not load: %s" % (survey_path, exc))
         except OSError as exc:
@@ -10471,11 +10520,15 @@ data:
         if a.check:
             expect = None
             try:
-                sv = SV.load_survey(os.path.expanduser(a.survey), min_nodes=3)
+                sv = SV.load_survey(os.path.expanduser(a.survey), min_nodes=3,
+                                    require_real_origin=True)
                 expect = AS.max_window_s(
                     arrival_survey(sv), a.temp_c,
                     derive_margin_s(pair_bounds(arrival_survey(sv), SW.sound_speed(a.temp_c)),
                                     a.margin_frac, a.margin_s, a.force_margin)["margin_s"])
+            except SV.SiteOriginError as exc:
+                print("refused: %s" % exc, file=sys.stderr)
+                return 1
             except Exception:
                 expect = None            # the survey gate below is what reports a bad survey
             code, lines = check(out, a.max_stale_s, window_s=a.window_s, expect_window_s=expect)
@@ -10553,9 +10606,10 @@ data:
       "units": "m",
       "origin": {
         "lat_deg": 40.292522149999996,
-        "lon_deg": -76.1221604,
+        "lon_deg": -79.1221604,
         "h_ell_m": 0.0,
-        "source": "median of nyquist; height datum is the --heights argument, NOT GNSS (storey = 3.0 m nominal US residential floor-to-floor, NOT measured) (storey = 3.0 m nominal US residential floor-to-floor, NOT measured)"
+        "fictional": true,
+        "source": "FICTIONAL, NOT THE SITE: this repo is public, so the longitude here is deliberately wrong. The real origin comes from the environment at runtime (HEAR_SITE_ORIGIN='lat,lon,h_ell_m'; in the cluster Secret hear-site, key origin) and hear-tdoa refuses to run without it. The e/n/u below are relative to that real origin: median of nyquist; height datum is the --heights argument, NOT GNSS (storey = 3.0 m nominal US residential floor-to-floor, NOT measured)"
       },
       "nodes": [
         {
