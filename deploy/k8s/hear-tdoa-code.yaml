@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 552176 B serialised; 552354 B of annotations against a 262144 B cap.
+# apply-mode server: 566269 B serialised; 566447 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: 'bec2e51'
+    dama-hear/commit: 'dd82c5a'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '552176'
+    dama-hear/serialised-bytes: '566269'
 data:
   hear__init__.py: |
     
@@ -5540,6 +5540,16 @@ data:
     This is why `solve()` returns an observability verdict and refuses to quote an offset when the
     nodes do not straddle. A solver that returns a confident number in a degenerate configuration is
     how this project twice produced a fit that disagreed with the operator's own eyes.
+    
+    ⚠️A SIGMA IS A VARIANCE AND NOT A BIAS, and the two gates that follow from that are separate.
+    `sigmas` lets a receiver that states a worse clock vote less; it does NOT remove a systematic
+    offset. An uncalibrated capture path MOVES the fit rather than widening it, and no weight
+    recovers that. Measured, from dama-gotchi's acoustic_latency_calibration.json (the same file
+    nodeclass.py:546 cites): myasshurts 13_122_000 ns = 13.122 ms = 4.51 m at 343.42 m/s, and
+    financialdistress 293_499_000 ns = 293.499 ms. Two of the three phones that detect are in that
+    file at all; fancyantsy is not in it. So a receiver may be weighted on its clock and must STILL
+    be refused on an unmeasured path delay. That refusal is an ADMISSION question, it does not live
+    here, and a sigma argument is not permission to skip it.
     """
     from __future__ import annotations
     
@@ -5560,6 +5570,71 @@ data:
         if m <= 1.0:
             return None
         return math.degrees(math.asin(1.0 / m))
+    
+    
+    def sigma_weights(sigmas: Optional[Sequence[float]], n: int):
+        """(sigma_s, relative_weight) from per-receiver ARRIVAL sigmas in SECONDS, or (None, None).
+    
+        Shared with point.py so the two solvers cannot disagree about what a stated sigma means.
+    
+        ⚠️NORMALISED TO THE SMALLEST STATED SIGMA, NOT THE MEAN, AND THAT IS LOAD-BEARING. x/x is
+        exactly 1.0 for every finite non-zero float, so equal sigmas give a weight vector of exactly
+        1.0 and `None` is returned in its place -- which is what lets the caller run the ORIGINAL
+        unweighted arithmetic and be bit-identical to the day before this argument existed. The mean
+        of N equal floats is not exactly that float (three copies of 0.1 sum to 0.30000000000000004),
+        so a mean-normalised weight would be 1.0 +/- an ulp and the equal-sigma result would drift.
+    
+        ⚠️ABSENT IS NOT ZERO AND IT IS NOT A CLASS DEFAULT. A partially-stated vector RAISES rather
+        than being filled in: filling it is precisely how nodeclass's worst-tier class constant came
+        to override what a detection said about itself. A caller that means "use the class figure for
+        this receiver" has to write the figure down.
+        """
+        if sigmas is None:
+            return None, None
+        if len(sigmas) != n:
+            raise ValueError("sigmas must have one entry per receiver: got %d for %d receivers"
+                             % (len(sigmas), n))
+        missing = [i for i, v in enumerate(sigmas) if v is None]
+        if missing:
+            raise ValueError(
+                "sigma stated for %d of %d receivers, absent at index %s: this solver will not "
+                "invent one. Absent is not zero and it is not a class figure -- state every sigma, "
+                "or pass sigmas=None and weight nothing" % (n - len(missing), n, missing))
+        s = np.asarray(sigmas, float)
+        if not (np.all(np.isfinite(s)) and np.all(s > 0.0)):
+            raise ValueError("every sigma must be finite and > 0 seconds: got %r" % (s.tolist(),))
+        w = s.min() / s
+        return s, (None if bool(np.all(w == 1.0)) else w)
+    
+    
+    # JUDGEMENT, not a measurement: a receiver counts toward DETERMINACY when its stated sigma is
+    # within 10x the best stated sigma in the group. Some floor is unavoidable -- a weight is
+    # continuous and determinacy is an integer -- and the alternatives were worse. Kish's effective
+    # count alone cannot carry the test: four 106 us receivers plus the corpus's own 3.23 s maximum
+    # score 4.000000002, so `n_eff - 1 > 3` is TRUE on float noise and the residual of a system whose
+    # fifth receiver contributes 3.3e-05 of a vote reads as evidence. Both the floor and every
+    # relative weight are published, so this judgement can be second-guessed from the result alone.
+    WEIGHT_FLOOR: float = 0.1
+    
+    
+    def effective_n(w, n: int) -> float:
+        """Kish effective count for relative weights `w` (None meaning all equal).
+    
+        (sum q)^2 / sum(q^2) over q = w^2. Equal weights give exactly `n`; one receiver carrying all
+        the weight gives 1. Continuous and threshold-free, which is why it is REPORTED -- but see
+        WEIGHT_FLOOR for why the determinacy boolean cannot be read off it.
+        """
+        if w is None:
+            return float(n)
+        q = np.asarray(w, float) ** 2
+        return float(q.sum() ** 2 / (q * q).sum())
+    
+    
+    def counting_n(w, n: int) -> int:
+        """How many receivers carry at least WEIGHT_FLOOR of a vote. Exactly `n` for equal sigmas."""
+        if w is None:
+            return int(n)
+        return int(np.count_nonzero(np.asarray(w, float) >= WEIGHT_FLOOR))
     
     
     def _axes(bearing_rad: float):
@@ -5587,11 +5662,16 @@ data:
     
     def solve(positions: Sequence, arrivals: Sequence[float], v_mps: float = 900.0,
               temp_c: float = 20.0, bearing_step_deg: float = 0.25,
-              offset_range_m: float = 150.0, offset_step_m: float = 0.25) -> Dict:
+              offset_range_m: float = 150.0, offset_step_m: float = 0.25,
+              sigmas: Optional[Sequence[float]] = None) -> Dict:
         """Fit bearing and offset to shock arrival times.
     
         `positions` are 2D east/north metres in a common local frame; `arrivals` are absolute seconds
         on a shared clock (PPS-disciplined per node -- the radio never carries time).
+    
+        `sigmas` is the OPTIONAL per-receiver arrival sigma in SECONDS -- one entry per receiver or
+        None for all of them, never a mixture. Given, the fit is a weighted least squares and
+        `chi2`/`chi2_reduced` report the residual against the uncertainties that produced it.
     
         Returns `offset_m: None` and `offset_observable: False` when the nodes do not straddle the
         fitted track, because in that geometry any offset fits equally well.
@@ -5603,7 +5683,29 @@ data:
             raise ValueError("v %.1f is subsonic at c %.1f: no shock exists" % (v_mps, c))
         P = [np.asarray(p, float)[:2] for p in positions]
         t = np.asarray(arrivals, float)
-        dt_obs = t[1:] - t[0]
+        sig, wrel = sigma_weights(sigmas, len(P))
+        # ⚠️THE REFERENCE RECEIVER IS THE BEST-STATED ONE, NOT LISTED-FIRST. This form differences
+        # against one receiver instead of marginalising t0 out (point.py:_residual does the latter),
+        # so the reference's clock error enters EVERY equation and no per-equation weight can remove
+        # it. Referencing on the worst clock in the group is how a 3.23 s phone sigma would poison a
+        # fit that the weights then report as clean. argmin returns 0 on ties and sigma_weights
+        # returns None for equal sigmas, so an unweighted call still differences against index 0.
+        ref = 0 if wrel is None else int(np.argmin(sig))
+        idx = [i for i in range(len(P)) if i != ref]
+        dt_obs = t[idx] - t[ref]
+        # Per-EQUATION sigma: a difference of two receivers has variance sigma_i^2 + sigma_ref^2.
+        # ⚠️DIAGONAL ONLY. The true covariance of the differenced system also carries sigma_ref^2 in
+        # every off-diagonal, because every equation shares the reference. Dropping it is an
+        # approximation, and it is taken deliberately: the exact GLS weight is (I + J)^-1 even when
+        # the sigmas are all equal, so an exact solver could not reproduce today's numbers and
+        # bit-identity at equal sigmas is the property this change is judged on. The approximation
+        # under-weights the reference's contribution to the correlated part; the clean fix is to
+        # marginalise t0 the way point.py does, which is a change to the unweighted answer too.
+        wp = None
+        if wrel is not None:
+            rho = sig / sig.min()
+            rho_pair = np.sqrt((rho[idx] ** 2 + rho[ref] ** 2) / 2.0)
+            wp = 1.0 / rho_pair
         # Vectorised over offset: the along-track term is INDEPENDENT of offset (the normal is
         # orthogonal to the track), so only the miss term moves. Scalar nesting took 8 minutes for
         # a handful of solves; this is the same arithmetic.
@@ -5615,23 +5717,43 @@ data:
             u, n = _axes(br)
             a = np.array([float(np.dot(p, u)) for p in P])          # along-track, fixed vs offset
             q = np.array([float(np.dot(p, n)) for p in P])          # signed distance to the track
-            t = a[:, None] / v_mps + np.abs(q[:, None] - offs[None, :]) * k
-            pred = t[1:, :] - t[0, :]
-            r = np.sum((pred - dt_obs[:, None]) ** 2, axis=0)
+            tt = a[:, None] / v_mps + np.abs(q[:, None] - offs[None, :]) * k
+            d = tt[idx, :] - tt[ref, :] - dt_obs[:, None]
+            if wp is not None:
+                d = d * wp[:, None]
+            r = np.sum(d ** 2, axis=0)
             i = int(np.argmin(r))
             if best is None or r[i] < best[0]:
                 best = (float(r[i]), br, float(offs[i]))
         r, br, off = best
         n_eq = len(P) - 1
+        n_unk = 2                                                   # bearing and offset; t0 cancels
         obs = straddles(P, br, off)
         rms_ms = math.sqrt(r / n_eq) * 1000.0
+        # r is already sum((d/rho_pair)^2) and rho_pair = sigma_pair/(sqrt(2)*sigma_min), so dividing
+        # by 2*sigma_min^2 recovers sum((d/sigma_pair)^2) -- the same expression on both branches.
+        chi2 = None if sig is None else float(r / (2.0 * float(sig.min()) ** 2))
+        dof = n_eq - n_unk
+        n_eff_eq = effective_n(wp, n_eq)
+        n_cnt_eq = counting_n(wp, n_eq)
         return {
             "bearing_deg": math.degrees(br) % 360.0,
             "offset_m": off if obs else None,
             "offset_observable": obs,
             "rms_residual_ms": rms_ms,
-            "residual_is_meaningful": n_eq > 2,
-            "n_nodes": len(P), "n_equations": n_eq,
+            # Counted over EQUATIONS here, not receivers: this form differences against `ref`, so a
+            # receiver contributes exactly one equation and the reference contributes to all of them.
+            "residual_is_meaningful": n_eq > n_unk and n_cnt_eq > n_unk,
+            "n_nodes": len(P), "n_equations": n_eq, "n_unknowns": n_unk,
+            "residual_dof": dof,
+            "chi2": chi2,
+            "chi2_reduced": None if (chi2 is None or dof <= 0) else chi2 / dof,
+            "n_effective_equations": n_eff_eq,
+            "n_counting_equations": n_cnt_eq,
+            "weight_floor": WEIGHT_FLOOR,
+            "reference_node_index": ref,
+            "sigma_s": None if sig is None else sig.tolist(),
+            "equation_weights": None if wp is None else wp.tolist(),
             "sound_speed_mps": c,
             "mach_angle_deg": mach_angle_deg(v_mps, c),
             "note": None if obs else
@@ -5685,6 +5807,24 @@ data:
     DIMENSION. Positions are (east, north, up) metres in one local frame; 2-vectors are read as up=0.
     Use hear.geodesy to get there from lat/lon/height, and pass the ELLIPSOID height -- hMSL carries
     the geoid undulation, which is not a distance. This module no longer slices [:2] anywhere.
+    
+    UNCERTAINTY. `sigmas` is optional and, given, makes the fit a weighted least squares: a receiver
+    that states a worse clock votes less, and `chi2_reduced` puts the residual on a scale where it
+    can be compared against the uncertainties that produced it instead of read as raw milliseconds.
+    Omitted, every arithmetic operation below is the one that was there before the argument existed.
+    
+    ⚠️chi2 HAS A NUMERICAL FLOOR AND PPS IS UNDER IT. This solver leaves ~5.07e-08 s rms (17 um of
+    range) on arrivals that are EXACT by construction -- that is least_squares converging, not the
+    data disagreeing, and it is unchanged from before this module took a sigma. Squared against a
+    stated sigma it stops being negligible: chi2 is 6.8e-07 at the corpus's 106 us phone median and
+    4.81 at a 40 ns PPS figure, on a fit with nothing wrong with it. Below about 88 ns of stated
+    sigma the chi-square is measuring this module and not the array. Pinned in
+    tests/test_point.py::test_chi2_has_a_numerical_floor so the number cannot rot quietly.
+    
+    ⚠️A SIGMA IS A VARIANCE AND NOT A BIAS -- see shockwave.py's header for the measured numbers.
+    Weighting widens a receiver's allowance; it does not move a systematic capture-path offset, which
+    displaces the fit rather than inflating its residual. A receiver may be weighted on its clock and
+    must STILL be refused on an unmeasured path delay. That is an ADMISSION gate and it is not here.
     """
     from __future__ import annotations
     
@@ -5712,18 +5852,30 @@ data:
         raise ValueError("unknown source class %r" % (source_class,))
     
     
-    def _residual(s: np.ndarray, P: np.ndarray, t: np.ndarray, c: float) -> np.ndarray:
+    def _residual(s: np.ndarray, P: np.ndarray, t: np.ndarray, c: float,
+                  w: Optional[np.ndarray] = None) -> np.ndarray:
         """TDoA residual with t0 marginalised out, not differenced against node 0.
     
         Subtracting the mean IS the marginalisation -- it removes the direction a common time shift
         moves, exactly as placement.dop()'s (I - 11'/N) does -- so the answer cannot depend on which
         node the caller listed first.
+    
+        `w` is the relative weight vector from shockwave.sigma_weights (1 at the best-stated receiver,
+        smaller elsewhere), or None. Weighted, the marginalised t0 is the WEIGHTED mean -- profiling
+        t0 out of sum q_i (r_i - t0)^2 gives sum(q r)/sum(q), and using the plain mean there would
+        leave a t0 the cost does not actually want. `w is None` takes the original expression
+        untouched rather than multiplying by a vector of ones, so the unweighted answer is identical
+        by construction and not by the grace of ddot rounding the same way as a pairwise sum.
         """
         r = t - np.linalg.norm(s[None, :] - P, axis=1) / c
-        return r - r.mean()
+        if w is None:
+            return r - r.mean()
+        q = w * w
+        return w * (r - float(q @ r) / float(q.sum()))
     
     
-    def _jacobian(s: np.ndarray, P: np.ndarray, t: np.ndarray, c: float) -> np.ndarray:
+    def _jacobian(s: np.ndarray, P: np.ndarray, t: np.ndarray, c: float,
+                  w: Optional[np.ndarray] = None) -> np.ndarray:
         """Exact derivative of _residual. Supplied rather than finite-differenced.
     
         least_squares' 2-point Jacobian perturbs a coordinate by ~1.5e-8*|x|, which at a few hundred
@@ -5739,11 +5891,15 @@ data:
         d = s[None, :] - P
         n = np.linalg.norm(d, axis=1)
         J = -d / (n[:, None] * c)
-        return J - J.mean(axis=0, keepdims=True)
+        if w is None:
+            return J - J.mean(axis=0, keepdims=True)
+        q = w * w
+        return w[:, None] * (J - (q @ J)[None, :] / float(q.sum()))
     
     
     def _grid_seed(P: np.ndarray, t: np.ndarray, c: float,
-                   margin_m: float, step_m: float, z_levels: int = 5) -> np.ndarray:
+                   margin_m: float, step_m: float, z_levels: int = 5,
+                   w: Optional[np.ndarray] = None) -> np.ndarray:
         """Coarse global scan. The TDoA cost is non-convex and a single Gauss-Newton from the centroid
         lands in a local minimum for sources outside the array -- shockwave.solve made the same call
         (shockwave.py:91-95).
@@ -5763,8 +5919,14 @@ data:
         S = np.column_stack([gx.ravel(), gy.ravel(), gz.ravel()])
         d = np.linalg.norm(S[:, None, :] - P[None, :, :], axis=2) / c
         r = t[None, :] - d
-        r = r - r.mean(axis=1, keepdims=True)
-        return S[int(np.argmin((r * r).sum(axis=1)))]
+        if w is None:
+            r = r - r.mean(axis=1, keepdims=True)
+            return S[int(np.argmin((r * r).sum(axis=1)))]
+        # The seed has to score cells with the same cost the refine minimises, or the coarse scan
+        # hands the optimiser a cell that is not the weighted minimum at all.
+        q = w * w
+        f = (r - (r @ q)[:, None] / float(q.sum())) * w
+        return S[int(np.argmin((f * f).sum(axis=1)))]
     
     
     def _mirror_through_plane(s: np.ndarray, P: np.ndarray, normal: Sequence[float]) -> np.ndarray:
@@ -5780,12 +5942,51 @@ data:
     
     
     def _report(s, P, t, c, n_eq, n_unk, rms_ms, t0, at_bound, source_class,
-                search_margin_m, fixed_up_m):
+                search_margin_m, fixed_up_m, res=None, sig=None, w=None):
         """Everything the solver says about a fit. One definition, shared by the 3-unknown and
         the declared-height paths, so the two cannot disagree about what a result means.
         """
         lin = PL.linearity(P)
         obs = lin >= PL.COLLINEAR_LINEARITY
+    
+        # CHI-SQUARE, not milliseconds. `res` is already (r - weighted mean)/rho with rho normalised
+        # to the smallest stated sigma, so dividing by that sigma turns it into (r - t0)/sigma_i on
+        # both the weighted and the equal-sigma branch -- one expression, no case analysis.
+        chi2 = chi2_red = n_eff = None
+        n_cnt = len(P)
+        dof = n_eq - n_unk
+        if sig is not None and res is not None:
+            ref = float(np.min(sig))
+            chi2 = float(res @ res) / (ref * ref)
+            chi2_red = chi2 / dof if dof > 0 else None
+            n_eff = SW.effective_n(w, len(P))
+            n_cnt = SW.counting_n(w, len(P))
+        # ⚠️THE POINT OF THE WHOLE CHANGE. An exactly-determined fit has a residual of ~0 BY
+        # CONSTRUCTION -- it is not evidence, and reading it as such is how a 3-node fit looked
+        # clean. n_eq > n_unk was already the right test on the RAW count; what it could not see is
+        # a receiver whose sigma is so large that it contributes nothing, which removes an equation
+        # without removing a node. n_cnt - 1 is that same count over the receivers still carrying a
+        # vote, and it equals n_eq exactly whenever the sigmas are equal or absent.
+        meaningful = n_eq > n_unk and n_cnt - 1 > n_unk
+    
+        # ⚠️A HUGE SIGMA DOES NOT WIDEN THIS RESULT, IT REMOVES THAT RECEIVER FROM IT. The weight is
+        # 1/rho, so sigma -> inf drives both the residual entry and its Jacobian row to zero: the
+        # receiver neither pulls the fit nor inflates chi2. That is correct weighted least squares
+        # and it is also how a 5-receiver event quietly becomes a 4-receiver one. It is reported
+        # rather than refused -- refusing is an admission decision and this module does not make any.
+        wnote = None
+        degen = None
+        if n_eff is not None:
+            degen = bool(n_cnt < n_unk + 1)
+            if n_cnt < len(P):
+                j = int(np.argmax(np.asarray(sig, float)))
+                wnote = ("%d of %d receivers carry less than %.2g of a vote and do not count toward "
+                         "determinacy (%.2f effective receivers): the worst is index %d at sigma "
+                         "%.6g s against a best of %.6g s, relative weight %.3g. A sigma that large "
+                         "does not widen this fit, it removes that receiver from it%s"
+                         % (len(P) - n_cnt, len(P), SW.WEIGHT_FLOOR, n_eff, j, float(sig[j]),
+                            float(np.min(sig)), 1.0 if w is None else float(w[j]),
+                            " -- and the position is now under-determined." if degen else "."))
     
         # Height observability is a SEPARATE question from horizontal observability, and for this
         # project it is usually the one that bites: nodes sitting on the ground are coplanar, and a
@@ -5822,11 +6023,25 @@ data:
             "t0_utc_s": t0 if obs else None,
             "range_m": float(np.linalg.norm(s - P.mean(axis=0))) if obs else None,
             "ground_range_m": float(np.linalg.norm(s[:2] - P.mean(axis=0)[:2])) if obs else None,
+            # ⚠️WEIGHTED milliseconds when sigmas are stated: the entries are divided by the
+            # per-receiver sigma relative to the best one, so this is "ms at the best receiver's
+            # precision" and not a plain time. chi2_reduced is the figure to compare across events.
             "rms_residual_ms": rms_ms,
             "at_search_bound": at_bound,
             # Three unknowns now, so four nodes give an exact fit whose residual is ~0 by
             # construction. Five is where it starts carrying information -- one more than before.
-            "residual_is_meaningful": n_eq > n_unk,
+            "residual_is_meaningful": meaningful,
+            "residual_dof": dof,
+            "chi2": chi2,
+            "chi2_reduced": chi2_red,
+            "n_effective_nodes": n_eff,
+            "n_counting_nodes": n_cnt,
+            "weight_floor": SW.WEIGHT_FLOOR,
+            "weights_degenerate": degen,
+            "weight_note": wnote,
+            "sigma_s": None if sig is None else np.asarray(sig, float).tolist(),
+            "relative_weights": (None if sig is None else
+                                 ([1.0] * len(P) if w is None else np.asarray(w, float).tolist())),
             "n_nodes": len(P), "n_equations": n_eq, "n_unknowns": n_unk,
             "up_assumed_m": float(fixed_up_m) if fixed_up_m is not None else None,
             "sound_speed_mps": c,
@@ -5862,11 +6077,15 @@ data:
     
     def solve(positions: Sequence, arrivals: Sequence[float], source_class: str,
               temp_c: float = 20.0, search_margin_m: float = 500.0,
-              grid_step_m: float = 10.0, fixed_up_m: Optional[float] = None) -> Dict:
+              grid_step_m: float = 10.0, fixed_up_m: Optional[float] = None,
+              sigmas: Optional[Sequence[float]] = None) -> Dict:
         """Fit a stationary source position to arrival times.
     
         `positions` are east/north/up metres in one local frame; 2-vectors are read as up=0.
         `arrivals` are absolute seconds on a shared clock.
+    
+        `sigmas` is the OPTIONAL per-receiver arrival sigma in SECONDS -- one entry per receiver or
+        None for all of them, never a mixture, and never invented for a receiver that states none.
     
         Raises on a caller error -- too few nodes, mismatched lengths, non-finite input, or a source
         class that radiates off a cone. Returns `east_m: None` and `position_observable: False` with
@@ -5889,6 +6108,7 @@ data:
         if len(positions) != len(arrivals):
             raise ValueError("positions and arrivals must be the same length: got %d and %d"
                              % (len(positions), len(arrivals)))
+        sig, w = SW.sigma_weights(sigmas, len(positions))
         if len(positions) < min_nodes:
             raise ValueError(
                 "need >= %d nodes for a %dD fit: t0 cancels, so N nodes give N-1 equations for %d "
@@ -5916,7 +6136,7 @@ data:
     
         c = SW.sound_speed(temp_c)
         n_eq = len(P) - 1
-        seed = _grid_seed(P, t, c, search_margin_m, grid_step_m)
+        seed = _grid_seed(P, t, c, search_margin_m, grid_step_m, w=w)
     
         # BOUND THE REFINE TO THE REGION THAT WAS SEARCHED. Unbounded, the third unknown gave the
         # optimiser a nearly-flat direction to slide along whenever the nodes are coplanar -- the
@@ -5956,24 +6176,24 @@ data:
             fit = least_squares(lambda s2, *a: _residual(_lift(s2), *a),
                                 np.clip(seed[:2], lo[:2], hi[:2]),
                                 jac=lambda s2, *a: _jacobian(_lift(s2), *a)[:, :2],
-                                args=(P, t, c), bounds=(lo[:2], hi[:2]),
+                                args=(P, t, c, w), bounds=(lo[:2], hi[:2]),
                                 xtol=1e-14, ftol=1e-14, gtol=1e-14)
             s = _lift(fit.x)
             _chk = slice(0, 2)
             at_bound = bool(np.any(np.isclose(s[:2], lo[:2], atol=1e-6))
                             or np.any(np.isclose(s[:2], hi[:2], atol=1e-6)))
-            res = _residual(s, P, t, c)
+            res = _residual(s, P, t, c, w)
             rms_ms = math.sqrt(float(res @ res) / n_eq) * 1000.0
             t0 = t_ref + float(np.mean(t - np.linalg.norm(s[None, :] - P, axis=1) / c))
             return _report(s, P, t, c, n_eq, n_unk, rms_ms, t0, at_bound, source_class,
-                           search_margin_m, fixed_up_m)
+                           search_margin_m, fixed_up_m, res, sig, w)
         nrm = np.asarray(PL.coplanarity(P)["plane_normal"], float)
         span = float(np.linalg.norm(P.max(axis=0) - P.min(axis=0)))
         nudge = max(0.05 * span, 1.0)
         cands = [seed, seed + nudge * nrm, seed - nudge * nrm]
         best = None
         for s0 in cands:
-            f = least_squares(_residual, np.clip(s0, lo, hi), jac=_jacobian, args=(P, t, c),
+            f = least_squares(_residual, np.clip(s0, lo, hi), jac=_jacobian, args=(P, t, c, w),
                               bounds=(lo, hi), xtol=1e-14, ftol=1e-14, gtol=1e-14)
             if best is None or f.cost < best.cost:
                 best = f
@@ -5985,11 +6205,11 @@ data:
         _chk = slice(0, 2) if fixed_up_m is not None else slice(0, 3)
         at_bound = bool(np.any(np.isclose(s[_chk], lo[_chk], atol=1e-6))
                         or np.any(np.isclose(s[_chk], hi[_chk], atol=1e-6)))
-        res = _residual(s, P, t, c)
+        res = _residual(s, P, t, c, w)
         rms_ms = math.sqrt(float(res @ res) / n_eq) * 1000.0
         t0 = t_ref + float(np.mean(t - np.linalg.norm(s[None, :] - P, axis=1) / c))
         return _report(s, P, t, c, n_eq, n_unk, rms_ms, t0, at_bound, source_class,
-                       search_margin_m, fixed_up_m)
+                       search_margin_m, fixed_up_m, res, sig, w)
     
   hear_solve_consistency.py: |
     #!/usr/bin/env python3
