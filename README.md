@@ -62,10 +62,10 @@ runners:
   kept as workflow artifacts for 14 days.
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the `hear_node` images,
-their `.elf`, `build-info.json` and `SHA256SUMS` as a GitHub release. This repo is public, so
-those images carry no Wi-Fi credentials and no node name, and a node booted from one comes up as
-its own access point. Field nodes are still flashed from the tag with
-`firmware/hear_node/flash.py`, which compiles their credentials in.
+their `.elf`, `build-info.json` and `SHA256SUMS` as a GitHub release. This repo is public, so the
+images carry no Wi-Fi credentials and no node name. Each node keeps its own in NVS, written once
+over USB by `firmware/hear_node/enroll.py`, so the same image goes to every node:
+`firmware/hear_node/flash.py <node> <ip> --release <tag>`. See `firmware/hear_node/README.md`.
 
 ## Licence
 
