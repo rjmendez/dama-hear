@@ -4,9 +4,9 @@
 `MEL16_*` -> firmware/path_test/mel16.h, 16 kHz -- path_test.ino:143 feeds MEL16_FS straight into
 i2s.begin as the PDM mic's OWN capture rate, so this bank must never move to follow the other one.
 
-`MELIMP_*` -> firmware/night_node/mel_impulse.h, 48 kHz -- night_node's FS_ACQ, the rate the
+`MELIMP_*` -> firmware/hear_node/mel_impulse.h, 48 kHz -- hear_node's FS_ACQ, the rate the
 sketch ring is fed at. Two names because a shared prefix would let regenerating one silently
-change the other's baked-in rate the moment they disagreed; see night_node.ino's static_asserts.
+change the other's baked-in rate the moment they disagreed; see hear_node.ino's static_asserts.
 
 The filterbank depends on fs; the Hann window does not. golden.h carries the 48 kHz bank for the
 byte-exactness check, this carries the two live-capture banks.
@@ -37,7 +37,7 @@ LAYOUT = SK.LAYOUT_FIXED
 # third rate is one more row here, not a second script.
 TARGETS = [
     (16000.0, "MEL16", os.path.join("path_test", "mel16.h")),
-    (48000.0, "MELIMP", os.path.join("night_node", "mel_impulse.h")),
+    (48000.0, "MELIMP", os.path.join("hear_node", "mel_impulse.h")),
 ]
 
 

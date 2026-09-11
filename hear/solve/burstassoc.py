@@ -45,8 +45,8 @@ instead of counting as silence. `decided_by` records which rule settled it.
 ⚠️VALIDATED ON SYNTHETIC GROUND TRUTH ONLY. The field data cannot test it: over a 15.0 h overlap
 those two nodes shared only 3 bursts with 3+ events on both sides, and 30% of one node's events
 sit in a burst the other never heard at all -- its two largest bursts (12 and 23 events) drew
-zero co-activity. Two nodes 16.9 m apart hear mostly different near-field sources at night. What
-would settle it is a loud impulsive source both nodes hear; ambient night sound is not that.
+zero co-activity. Two nodes 16.9 m apart hear mostly different near-field sources. What
+would settle it is a loud impulsive source both nodes hear; ambient sound is not that.
 """
 from __future__ import annotations
 

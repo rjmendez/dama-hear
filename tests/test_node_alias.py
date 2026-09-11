@@ -2,7 +2,7 @@
 
 ⚠️THIS TEST EXISTS BECAUSE 233 ANCHORED RANKINE ARRIVALS WERE REFUSED 23 TIMES. rankine's card
 carries 242 rows (233 with a PPS stamp, 2026-09-10 12:58:03Z-15:57:32Z) written by a firmware
-build with no NODE_ID compiled in, so night_node.ino:88's fallback named them `hear-5c4c94` --
+build with no NODE_ID compiled in, so hear_node.ino:88's fallback named them `hear-5c4c94` --
 the last three bytes of that board's own MAC. `pool._node_mismatch` compared that against the
 fetch's `rankine` and refused every one of them, on every drain: /pool/corpus/ledger.jsonl held
 5,566 dets and 41,352 scene `node_mismatch` skips for the id, all of them the same rows re-read.

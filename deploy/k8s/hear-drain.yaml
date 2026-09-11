@@ -38,14 +38,12 @@ spec:
   # only for scene.csv, every run reporting `ok` over a 3.27 h hole -- is fixed in the drain, not
   # in this file: tools/hear_drain.py now DISCOVERS the names from /ls. See
   # docs/acoustic-stack.md section 0.1.
-  # ⚠️THE CLIP LANE, AND ITS ORDERING CONSTRAINT. Measured 2026-09-09: 625 clips written across
-  # the fleet, ~478 already destroyed, and NOT ONE CLIP HAD EVER LEFT A NODE. `--clip-max-per-node
-  # 49` is the card's own ceiling (6291456/128044 = 49 exactly, and all three nodes report
-  # `budget_left_clips 0`), so a backlog is BOUNDED at 49 per node however long this was down --
-  # the crucial difference from scene.csv, which grows without bound.
+  # THE CLIP LANE. `--clip-max-per-node 13` is the card's own rolling window (6291456 // 480044),
+  # so a backlog is bounded at 13 per node however long this was down -- the difference from
+  # scene.csv, which grows without bound.
   #
-  # ⚠️DRAINING PRECEDES ANY BUDGET INCREASE. Raising CLIP_BUDGET_B on the node without collection
-  # does not save one clip; it changes WHICH clips are destroyed and how long each survives first.
+  # Raising CLIP_BUDGET_B changes how long a clip stays on the card, not whether the drain fetches
+  # it: the card is a rolling window either way.
   # Raise the node budget and this cap in the SAME change, and only after >= 7 days of
   # `clips_deferred_by_cap == 0` read off the heartbeat ring rather than off one run.
   #
@@ -92,7 +90,7 @@ spec:
                     --node mach=172.16.100.116 \
                     --phone-corpus /pool/sketch_corpus \
                     --node rankine=172.16.100.50 \
-                    --clip-max-per-node 49 \
+                    --clip-max-per-node 13 \
                     --clip-deadline-s 120
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py,  subPath: hear__init__.py }

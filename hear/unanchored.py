@@ -23,7 +23,7 @@ card file ran from uptime 34 s to 988 s of one boot and swallowed 135 detections
 ⚠️AND IT IS NOT A GPS ACQUISITION PROBLEM. The archived health.csv for those windows shows the
 timepulse working perfectly throughout -- pps advancing 1:1 with uptime, pps_bad 0, pps_gaps 0,
 interval spread 2-6 us -- while `tacc_ns` stayed 0. tacc_ns is assigned from EVERY NAV-PVT with a
-payload of 24 B or more, outside the fix guard (night_node.ino, right before `ubx_pvt++`), so
+payload of 24 B or more, outside the fix guard (hear_node.ino, right before `ubx_pvt++`), so
 tacc_ns == 0 across 1016 consecutive seconds means no NAV-PVT was decoded at all. A u-blox that
 is searching for sky still sends NAV-PVT, and still reports a large tAcc; it does not report 0.
 Then the node went from 0 satellites to 19 with tAcc 25 ns inside a single 30 s health interval,

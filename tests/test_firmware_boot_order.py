@@ -22,7 +22,7 @@ import re
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-INO = ROOT / "firmware" / "night_node" / "night_node.ino"
+INO = ROOT / "firmware" / "hear_node" / "hear_node.ino"
 
 
 def _setup_body():

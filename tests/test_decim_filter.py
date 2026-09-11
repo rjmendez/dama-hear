@@ -23,7 +23,7 @@ import pytest
 scipy_signal = pytest.importorskip("scipy.signal")
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-HDR = ROOT / "firmware" / "night_node" / "decim.h"
+HDR = ROOT / "firmware" / "hear_node" / "decim.h"
 GEN = ROOT / "firmware" / "gen_decim.py"
 
 #: The band the scene mel bank actually uses.
@@ -33,7 +33,7 @@ FS_DEC = 16000.0
 
 
 def _strip_c_comments(src):
-    """A source-scanning guard that does not strip comments matches its own prose: night_node.ino's
+    """A source-scanning guard that does not strip comments matches its own prose: hear_node.ino's
     prose names both banks and both rates in the paragraphs that explain the asserts."""
     return re.sub(r"//.*", "", re.sub(r"/\*.*?\*/", " ", src, flags=re.S))
 
@@ -57,7 +57,7 @@ def test_the_header_is_what_the_generator_produces():
     assert out.returncode == 0, out.stderr
     assert out.stdout == HDR.read_text(), (
         "decim.h has drifted from gen_decim.py. Regenerate:\n"
-        "    python3 firmware/gen_decim.py > firmware/night_node/decim.h")
+        "    python3 firmware/gen_decim.py > firmware/hear_node/decim.h")
 
 
 def test_the_taps_sum_to_unity_so_the_band_levels_do_not_drift():
@@ -122,7 +122,7 @@ def test_the_firmware_derives_the_acquisition_rate_and_never_hardcodes_it():
     have passed just as happily if the SCENE assert had been the one repointed. So: every mel bank
     the sketch includes is pinned by a static_assert to a rate SYMBOL, and that symbol's value must
     equal the rate baked into that bank's own generated header."""
-    ino = _strip_c_comments((ROOT / "firmware" / "night_node" / "night_node.ino").read_text())
+    ino = _strip_c_comments((ROOT / "firmware" / "hear_node" / "hear_node.ino").read_text())
     assert "#define FS_ACQ     (FS_NOMINAL * DECIM)" in ino
     nominal = float(re.search(r"#define\s+FS_NOMINAL\s+(\d+)",
                              (ROOT / "firmware" / "boards" / "xiao_s3_sense.h").read_text()).group(1))
@@ -131,7 +131,7 @@ def test_the_firmware_derives_the_acquisition_rate_and_never_hardcodes_it():
 
     banks = {}
     for inc in re.findall(r'#include\s+"([a-z_0-9]+\.h)"', ino):
-        h = ROOT / "firmware" / "night_node" / inc
+        h = ROOT / "firmware" / "hear_node" / inc
         if not h.exists():
             continue
         m = re.search(r"#define\s+(MEL[A-Z0-9]*)_FS\s+([0-9.]+)f", h.read_text())
@@ -203,7 +203,7 @@ def test_the_taps_are_symmetric_which_is_what_licenses_folding():
     _d, taps = _defines()
     n = len(taps)
     assert all(taps[t] == taps[n - 1 - t] for t in range(n // 2)), (
-        "the filter is not symmetric, so night_node's folded decimate() is computing something else")
+        "the filter is not symmetric, so hear_node's folded decimate() is computing something else")
     assert n % 2 == 1, "an even-length filter has no centre tap for the folded loop to add"
 
 
@@ -255,7 +255,7 @@ def test_the_contiguous_loop_is_the_same_filter_to_the_bit():
 def test_the_shipped_decimator_has_no_per_tap_conditional():
     """It cost 12 cycles per multiply, which is a third of the filter. Comments stripped first."""
     import re as _re
-    src = _re.sub(r"//[^\n]*", "", (ROOT / "firmware" / "night_node" / "night_node.ino").read_text())
+    src = _re.sub(r"//[^\n]*", "", (ROOT / "firmware" / "hear_node" / "hear_node.ino").read_text())
     i = src.index("static int decimate(const int16_t *in")
     body = src[i:src.index("\n}", i)]
     assert "dscratch" in body, "decimate() no longer uses the contiguous scratch span"

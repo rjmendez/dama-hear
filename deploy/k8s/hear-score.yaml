@@ -113,7 +113,7 @@ spec:
 # broken scorer forever. It also exits 0 on a run that read an EMPTY directory. This job is what
 # a monitor keys on.
 #
-# ⚠️IT MUST NOT KEY ON THE SCORES. A normal night is P at the floor everywhere: one measured
+# ⚠️IT MUST NOT KEY ON THE SCORES. A normal period is P at the floor everywhere: one measured
 # population scored 437 of 437 non-zero with exactly 1 above 0.5, another had a maximum of 1.2e-5
 # across 83 rows. A gate asking "did anything score high" fires on a correct result and stays
 # silent on a broken one. The gates are throughput, refusals, torn lines, the accounting

@@ -80,7 +80,7 @@ and `hear-drain --phone-corpus` ingests it into the same pool — so it degrades
 construction, and `by_source` reports `phone: 0` as a number rather than as an absence.
 
 ⚠️**Refusals are the product, not an error path.** `score_sketch` refuses rather than pads, and a
-scorer that swallowed those would report a quiet night from a corpus it could not read. Measured
+scorer that swallowed those would report a quiet period from a corpus it could not read. Measured
 on one real 1038-record pool: **955 refused (92.0 %), every one on the legacy `nyquist` layout** —
 and split by day, 0 % scorable in one partition and 100 % in the next. Refusals are therefore
 counted by reason, by node **and by day partition**; a scalar describes neither of those.
@@ -90,7 +90,7 @@ to fs 13678 Hz and is 14 below it — 0 % refused right up to 100 % refused. `--
 `node|day|reason` bucket that has **never been seen before**, not on a percentage. The first run
 is exempt: it establishes the census.
 
-⚠️**Health does not look at the scores.** A normal night is P at the floor: one measured
+⚠️**Health does not look at the scores.** A normal period is P at the floor: one measured
 population scored 437/437 non-zero with exactly 1 above 0.5, another peaked at 1.2e-5 over 83
 rows. A gate asking "did anything score high" fires on a correct result. The gates are throughput,
 refusals, torn lines, the accounting invariant and staleness; the class distribution is printed
@@ -120,7 +120,7 @@ Every row, **scored or refused**, carries the model's identity and its AUC — n
 | `claim.level_calibrated: false` | `ref_db` is not SPL; a float-vs-int16 producer is 90.31 dB = 53.8 logits out |
 | `claim.comparable_across_nodes: false` | measured 28.4 dB between two identical nodes = 16.9 logits, vs a 7.37 dB p0.1–p0.9 range |
 | `claim.prior_applied: false` | the corpus is 43.9 % shots; the card carries the offset to correct it |
-| `claim.evidence_of_absence: false` | no true positive has ever been scored on the night population, so there is **no measured detection rate** for it |
+| `claim.evidence_of_absence: false` | no true positive has ever been scored on the field population, so there is **no measured detection rate** for it |
 
 ## Two stores, on purpose
 

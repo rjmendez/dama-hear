@@ -1,18 +1,18 @@
-# Night node
+# node
 
-A XIAO ESP32-S3 Sense left outside overnight, reporting over WiFi. It exists for **one
+A XIAO ESP32-S3 Sense left outside, reporting over WiFi. It exists for **one
 measurement**: the true I²S sample rate, disciplined against a real GPS PPS.
 
 `firmware/path_test` could never make it — its pulse and `esp_timer` came off the same crystal, so
 the interval was that oscillator against itself. A GPS PPS is an independent reference, so counting
-samples between edges gives the rate in Hz to GPS accuracy. Over a night the per-block granularity
+samples between edges gives the rate in Hz to GPS accuracy. Over a long run the per-block granularity
 averages out to well under a ppm.
 
 ## Before you flash
 
-    cp firmware/night_node/secrets.h.example firmware/night_node/secrets.h   # then edit
+    cp firmware/hear_node/secrets.h.example firmware/hear_node/secrets.h   # then edit
     arduino-cli compile -u -p /dev/ttyACM0 \
-      --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi firmware/night_node
+      --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi firmware/hear_node
 
 `secrets.h` is gitignored. Without it the node starts its own AP (`dama-hear-node` / `damahear`,
 http://192.168.4.1/) — fine for a bench check, useless in the garden.
@@ -51,7 +51,7 @@ LED swings: through an LED and series resistor only one side is a usable edge.
 `http://damahear.local/` or the printed IP. The page refreshes every 2 s; `/status` is JSON,
 `/detections` lists what the gate fired on.
 
-The SD card is the actual record. WiFi is a convenience and an overnight run must not depend on
+The SD card is the actual record. WiFi is a convenience and a run must not depend on
 it. Everything below is fetchable over the same link with `/sd?file=/dets.csv&tail=20000`:
 
 | file | written | holds |
@@ -67,8 +67,8 @@ it. Everything below is fetchable over the same link with `/sd?file=/dets.csv&ta
 *first*, so an existing `-prev.csv` is destroyed rather than chained. **Pull the card's files before
 you flash this.**
 
-`night.csv` is the older, narrower health schema and is no longer written. If the health schema
-changes again the node rolls the old file to `health-prev.csv` rather than appending wider rows
+If the health schema
+changes the node rolls the old file to `health-prev.csv` rather than appending wider rows
 under a narrower header, which would make every row in it ambiguous.
 
 ### The header row was missing for 11.33 h, and it was not the CSV code
@@ -103,7 +103,7 @@ detections** and, until this build, no way to listen to a single one.
 
 ⚠️**48 is the in-run count.** Recipe, on `dets.csv` from the 2026-09-07 capture: 62 data rows, 14
 of them at `uptime_s == 12` — the first 12 s of a boot, before the mic has settled — and 48 with
-`uptime_s > 12`, all of which also carry a valid `utc_us`. This README and `night_node.ino` used
+`uptime_s > 12`, all of which also carry a valid `utc_us`. This README and `hear_node.ino` used
 to say 45 and "the counter ends on 47"; **neither reproduces and both are gone.**
 
 The file and the counter reconcile exactly once you remember that **`dets.csv` persists across
@@ -115,20 +115,20 @@ landing on the same index — both pairs carry different `trigger` values, and t
 byte-identical rows in the file. An earlier draft of this section recorded the mismatch as an
 unexplained discrepancy; it is neither unexplained nor a discrepancy.
 
-`praw` is a rolling raw-PCM ring in PSRAM. 240 s × 16000 Hz × 2 B = **7.68 MB** against the 8.34 MB
+`praw` is a rolling raw-PCM ring in PSRAM. 80 s × 48000 Hz × 2 B = **7.68 MB** against the 8.34 MB
 the board reports free. `ps_malloc` needs one *contiguous* block and total-free is not
-largest-free, so boot asks for 240 s and steps down through 180/120/60/30 rather than failing, and
+largest-free, so boot asks for 80 s and steps down through 60/45/30 rather than failing, and
 keeps 256 kB of PSRAM back for WiFi. **A failed allocation is not an error** — `/audio` goes away
 and capture, gating and logging are untouched. The boot log says which span was obtained, because a
-silent failure here would look exactly like a quiet night.
+silent failure here would look exactly like a quiet period.
 
 It holds the **DC-blocked** samples, not the raw ones: the pedestal drifted 1093.9 → 1439.6 over
-the night, so raw audio carries a moving offset a consumer would only have to remove again, and the
+the capture, so raw audio carries a moving offset a consumer would only have to remove again, and the
 ring would not match what the gate and the sketch saw. `gate.dc` / `sig_dc` recovers the pedestal if
 it is ever wanted.
 
 The ring is contiguous in **write order, not in time**. A lost block leaves no hole in it, and the
-night lost 18 seconds of 40791 (42749 samples), so reading it back at a flat rate would be wrong by
+capture lost 18 seconds of 40791 (42749 samples), so reading it back at a flat rate would be wrong by
 up to that much. So it is anchored the way everything else here is: one `(UTC, sample)` pair per GPS
 second, 300 of them, recorded for the *previous* edge, because `local_to_utc` will only name an
 edge whose NAV-PVT has arrived — and if it has not, the pair is skipped rather than guessed. There
@@ -146,10 +146,10 @@ to check it with: these are bounds on the arithmetic, not a measured accuracy.
     GET /audio?from=<utc_us>&dur=<seconds>  that window as a playable mono 16-bit WAV
 
 `dur` is capped at 30 s. Serving the whole ring would be 7.68 MB, which at the 335 kB/s measured on
-this node is ~23 s inside one handler, and the I2S DMA holds 6 × 240 frames = **90 ms** — a handler
-that does not drain it would throw away more audio than the whole night lost. So the loop's own
-audio path is pumped between 4 kB chunks, the same reason `/tp` pumps `Serial1` rather than
-`delay()`ing.
+this node is ~23 s inside one handler, and the I2S DMA holds 6 × 240 frames = **30 ms** at 48 kHz —
+a handler that does not drain it would throw away more audio than the whole capture lost. So every
+long handler (`/audio`, `/sd`, `/ls`, `/perf`) goes through `stream_ready()`: it pumps each due
+block and writes a 2 KiB chunk only once the socket can take it without blocking.
 
 The writer does not stop while the response is sent, so the oldest ~16 s of the ring is not served
 (capped at a third of the ring, so a 30 s fallback ring still gives 20 s). If the requested window
@@ -172,8 +172,7 @@ header plus exactly the samples being sent — the `/sd` tail bug (`streamFile()
 
 The sketch is an **impulse** descriptor: 8 frames at hop 192 = 1600 acquisition samples =
 33.3 ms, and it only exists when the gate fires. (The hop scales with the rate and `NFFT` does
-not, so moving the bank from 16 kHz to 48 kHz made the window cover *less time*, not more — 44 ms
-→ 33.3 ms. That is what the phones do and what the 20-band model was trained on.) Nothing in 11.33 h described the **background**, which is what separates
+not, which is what the phones do and what the 20-band model was trained on.) Nothing in 11.33 h described the **background**, which is what separates
 a chorus from a road.
 
 `scene.csv` is the scene-scale counterpart, the node's analogue of the 0.96 s patch hugbot's YAMNet
@@ -203,13 +202,9 @@ climbing where the filterbank stops — not that it has found the peak.
 | 2–4 kHz | −27.8 |
 | 4–8 kHz | −26.3 |
 
-62–312 Hz carries **+8.2 dB more than the whole 312–8000 Hz span the sketch could then see**. And
-the detection bank's band 0 started at FFT bin 5 = 312.5 Hz: all of that low energy is captured,
-survives the 1.6 Hz DC block, reaches the PSRAM ring, and is thrown away before the filterbank.
-
-Both numbers were measured while the detection bank ran at 16 kHz. It now runs at 48 kHz, where
-its band 0 starts at **375.0 Hz** — so it discards *more* of that low energy, not less, and the
-argument for a separate scene bank is stronger than when it was made.
+62–312 Hz carries **+8.2 dB more than the whole 312–8000 Hz span**. All of that low energy is captured, survives
+the 1.6 Hz DC block and reaches the PSRAM ring, then is thrown away by the detection bank, whose
+band 0 starts at **375.0 Hz** at 48 kHz.
 
 So the scene descriptor gets its own bank, `mel_scene.h`, generated by `firmware/gen_mel_scene.py`:
 
@@ -259,7 +254,7 @@ boot rolls the old `scene.csv` aside — that machinery exists for exactly this.
 
 `BLOCK` is 256 and `MELIMP_NFFT` is 256, so **one I2S block is one FFT frame** — enforced by a
 `static_assert`. That is the whole design: the descriptor is built 16 ms at a time at a steady
-62.5 FFT/s, instead of a 64-FFT burst once a second that would have to fit inside the DMA's 90 ms
+62.5 FFT/s, instead of a 64-FFT burst once a second that would have to fit inside the DMA's 30 ms
 of headroom or drop audio. The measured +10.6 ppm rate error is far inside one 62.5 Hz bin of a
 256-point FFT, so tables built for the nominal rates stay correct for both banks.
 
@@ -292,18 +287,24 @@ and reporting that unsigned would put the event 999 ms — 343 m — from where 
 
 ## A WAV per detection
 
-The PSRAM ring holds 240 s and `/audio` can serve any window of it. What it cannot do is outlive
-those 240 s: an event heard at 03:00 is gone by 03:04 unless somebody was awake and fetching. Each
-detection now also gets a fixed-length WAV on the card, so the audio survives the night the way
-`dets.csv` does.
+The PSRAM ring holds the last 60–80 s, whichever allocated, and `/audio` can serve any window of it. What it cannot do is outlive
+that span. Each
+detection now also gets a fixed-length WAV on the card, so the audio is still there when
+the drain comes to identify it.
 
-    /clips/<8 hex boot id>-<10 digit sample>.wav      e.g. /clips/1a2b3c4d-0004192768.wav
+    /clips/<node>-<6 hex seq><6 hex random>-<10 digit sample>.wav
+                                            e.g. /clips/nyquist-00002ac91f3e-0004192768.wav
 
-The boot id is `esp_random()` at startup — **not** derived from `utc_us` (three of the capture's 62
+The boot field is a sequence (one past the highest on the card) plus `esp_random()` at startup — **not** derived from `utc_us` (three of the capture's 62
 rows have `utc_us == 0`, and zeros collide) and not from `sample` or `det_n` alone, both of which
-restart at 0 every boot and would have a second night overwrite the first. The sample index is the
+restart at 0 every boot and would have a second boot overwrite the first. The sample index is the
 join key back to `dets.csv`. Clips live in a subdirectory because FAT root directory entries are
 finite and long filenames burn several each.
+
+The ring is written, read and floor-checked in one 64-bit acquisition index (`g_samples64 × 3`).
+A 32-bit one stops matching the write position once `g_samples × 3` passes 2³², which is 24.86 h of
+uptime, not the 74.6 h at which `g_samples` itself wraps: the 80 s ring does not divide 2³², so from
+then on every clip and `/audio` read came from 38.49 s away (18.49 s with the 60 s ring).
 
 The writer addresses the ring **by sample, not by UTC**. `dets[].sample` is a direct `praw` index —
 both are counted in `g_samples` — so unlike `/audio`, which refuses outright with *"the ring cannot
@@ -311,14 +312,16 @@ be addressed by time"*, a clip still works for a detection stamped `utc_us == 0`
 
 ### Length, and why the post-roll is the long half
 
-**1 s before the trigger, 3 s after: 64 000 samples, 128 044 B with the header.** The events are
+**1 s before the trigger, 4 s after, at 48 kHz: 240 000 samples, 480 044 B with the header.** The events are
 longer than the descriptor — across the 8 frames of each in-run sketch the median energy varies
 only ~4 dB and the peak frame is spread over all 8 positions, so whatever fired the gate has not
 finished inside the sketch window. Post-roll is where the content is. That was measured on the
 44 ms window; the window is now 33.3 ms, so it holds a fortiori.
 
-Every written clip is **exactly** 128 044 B. A window that has fallen off either end of the ring is
-refused rather than shortened, which is what makes the budget arithmetic exact rather than an
+Every written clip is **exactly** 480 044 B. A window that has fallen off either end of the ring is
+refused rather than shortened, and so is a clip the ring overtakes while it is being written (the
+ring keeps advancing inside `/sd`, `/ls`, `/audio` and `/perf`, and the clip writer only runs
+between requests): the partial file is deleted and the row says `ring`. That is what makes the budget arithmetic exact rather than an
 estimate — and what stops a caller believing it has audio it does not have, the same reason
 `/audio` sends `X-Audio-Clipped`.
 
@@ -330,8 +333,11 @@ way still gets its row, with `clip_why = dedupe`.
 
 ### The budget, and the arithmetic behind it
 
+⚠️The 12 h arithmetic below was measured on the 2026-09-07 capture, under the 16 kHz firmware whose
+clips were 128 044 B; it is kept as that record. The current budget is the last two paragraphs.
+
 Free space measured on this card is **19 MiB** (`sd_free_mb` is a floor — `(total − used)/1048576`
-— and it read 19 for most of the run). Over a 12 h night the CSVs take, from row sizes measured on
+— and it read 19 for most of the run). Over 12 h the CSVs take, from row sizes measured on
 the capture's own files:
 
 | file | rows in 12 h | B/row | total |
@@ -342,34 +348,39 @@ the capture's own files:
 | | | | **9 816 691 B = 9.36 MiB** |
 
 That leaves **9.64 MiB**. At the measured event rate — 33 events in 11.33 h = 2.91/h = 35 over
-12 h — clips cost 35 × 128 044 = 4 481 540 B = **4.27 MiB**, a 2.26× margin.
+12 h — those 16 kHz clips cost 35 × 128 044 = 4 481 540 B = 4.27 MiB. At 480 044 B the same 35
+would be 16.02 MiB, more than the 9.64 MiB, so clips no longer accumulate over a run.
 
-`CLIP_BUDGET_B` is set **above** that rather than at it, at **6 MiB = 49 clips**, because the events
-are not spread evenly: **34 of the 48 triggers fall in the two hours 09:00–10:59**, which is
-4.15 MiB of 4 s clips inside two hours. A per-night average protects nothing against that; a byte
-budget does. 6 MiB is 1.4× the measured 12 h event count and still leaves 3.64 MiB of the remainder
-for the CSVs to overrun into.
+`CLIP_BUDGET_B` is **6 MiB = 13 clips** of 480 044 B, a rolling window: the drain fetches every
+15 min and the oldest clip is evicted for each new one. The events are not spread evenly — **34 of
+the 48 triggers fell in the two hours 09:00–10:59** — and 13 is the most that can arrive between
+two drains without one being evicted unfetched. 6 MiB still leaves 3.64 MiB of the 9.64 MiB for
+the CSVs to overrun into.
 
 ⚠️**There is no 24 h budget, because there is no spare day.** `scene.csv` alone consumes the whole
-19 MiB in 24.96 h and the three CSVs together in 24.36 h. This is a night-length node.
+19 MiB in 24.96 h and the three CSVs together in 24.36 h.
 
 Under the budget sits a live floor: clips stop when `sd_free_mb` drops below **2 MiB**, which is
 ~2.6 h of scene rows (227 B per 1.024 s = 221.7 B/s), so the record keeps running for hours after
 the audio stops. Free space is sampled on the existing 30 s health tick, **not per clip** —
 `SD.usedBytes()` is a free-cluster walk on FATFS and its cost on this card has not been measured.
 
-**Nothing is pruned.** Oldest-first deletion would risk removing a clip a `dets.csv` row already
-names, and a row naming a file that is not there is worse than a row that says it never got one.
+**The oldest clip makes room for the next.** At boot `clip_rescan()` reads `/clips`, sorts it into
+eviction order (`clip_order.h`: older-format names, then boot sequence, then sample) and evicts down
+to `CLIP_BUDGET_B`; after that each new clip evicts from the head of that queue. A clip is never
+refused for budget. The boot sequence is one past the highest on the card and advances again when
+the 32-bit sample counter wraps (every 74.6 h at 16 kHz), so `(sequence, sample)` stays
+chronological across boots and within a long one. A `dets.csv` row can therefore name a clip that has since been evicted; the drain
+books that as `evicted_before_fetch`.
 
-### Exhaustion is visible, and a full card does not read as a quiet night
+### Exhaustion is visible, and a full card does not read as a quiet period
 
-`clip_written` advances **only** after the full 128 044 B has landed. Every refusal has its own
+`clip_written` advances **only** after the full 480 044 B has landed. Every refusal has its own
 counter and its own token in the `clip_why` column of `dets.csv`:
 
 | `clip_why` | counter | means |
 |---|---|---|
 | `ok` | `clip_written` | the file named in `clip` is on the card |
-| `budget` | `clip_skip_budget` | `CLIP_BUDGET_B` spent. Working as designed |
 | `cardfull` | `clip_skip_cardfull` | the **card** is nearly out. `health.csv` and `dets.csv` are next |
 | `dedupe` | `clip_skip_dedupe` | within 1 s of a clip that was written |
 | `ring` | `clip_skip_ring` | window not in the ring, or no PSRAM ring at all |
@@ -377,21 +388,21 @@ counter and its own token in the `clip_why` column of `dets.csv`:
 | `nocard` | — | no card mounted |
 | `fail` | `clip_fail` | short write or failed open; the partial file is deleted |
 
-`budget` and `cardfull` are deliberately **not** the same token: one says the firmware is rationing
-itself, the other says go and swap the card. All of these are columns in `health.csv` and fields
-under `clips` in `/status`, alongside `budget_left_b` and `budget_left_clips`.
+`cardfull` says go and swap the card. All of these are columns in `health.csv` and fields under
+`clips` in `/status`, alongside `evicted`, `held`, `budget_left_b` and `budget_left_clips`. Rows
+written by the priority-eviction firmware can still carry `budget`.
 
 ### What it costs the audio, and the one regression
 
-The clip is written **one 4096 B chunk per `loop()` pass**, not in a single 128 kB write that would
-stall the I2S reader far past the DMA's 6 × 240 frames = 90 ms. `loop()` already calls
+The clip is written **one 4096 B chunk per `loop()` pass**, not in a single 480 kB write that would
+stall the I2S reader far past the DMA's 6 × 240 frames = 30 ms. `loop()` already calls
 `audio_pump()` every pass, so the DMA is drained between chunks by the code that already does it,
-with no nested pump inside a card write. A whole clip is 32 chunks, so at the ~16 ms an I2S block
-takes it lands in about half a second.
+with no nested pump inside a card write. A whole clip is 118 chunks, so at the ~16 ms an I2S block
+takes it lands in about 1.9 s.
 
 ⚠️**A clip costs about two dropped seconds, measured on hardware.** Forcing one detection with
-`POST /gate?floor=100` on a quiet evening took `drop_s` from 5 to 7 while the single 128 044 B clip
-was written; a second run over the same window took it 7 → 12 alongside the `/sd` fetches of the
+`POST /gate?floor=100` on a quiet evening took `drop_s` from 5 to 7 while a single 128 044 B clip
+of the 16 kHz firmware was written (a 480 044 B clip is 3.75× the chunks; its cost is not yet measured); a second run over the same window took it 7 → 12 alongside the `/sd` fetches of the
 clip itself. So the cost is real and it is not hidden — it lands in `drop_s`, which is the
 instrument for exactly this.
 
@@ -423,7 +434,7 @@ identifiable exactly that way: **a file in `/clips` that no row names was interr
 The floor was a compile-time `800`, and over the capture it — not the adaptive `8 × ambient` limb —
 was what the gate actually ran on: `gate_thr` was exactly 800.0 in **1418 of 1450** `health.csv`
 rows (**97.8%**), maximum 1715. Median ambient over those rows is **28.9**, so `8 × ambient` is
-~231 and the floor sat ~3.5× above it all night. 800 was chosen for gunshots; retuning it for
+~231 and the floor sat ~3.5× above it throughout. 800 was chosen for gunshots; retuning it for
 anything quieter meant a reflash and a walk outside, which is why it never got retuned.
 
     GET  /gate                                  the active floor, its source, and the live evidence
@@ -465,10 +476,10 @@ by construction; a floor at or above that is a gate that can never fire, which i
 indistinguishable from a dead microphone — the exact failure `env_e_max_win` exists to rule out.
 
 ⚠️**Neither bound protects the card, and it would be a lie to imply one does.** Floor 100 gives 27×
-the crossing rate of floor 800 on the measured night. What bounds the card is downstream:
+the crossing rate of floor 800 on the measured capture. What bounds the card is downstream:
 `det_flush` writes at most 16 rows per second (16 × 437 B = 6992 B/s, so 19 MiB in **47 min** at
-the absolute cap), and the clip writer — which at 128 044 B a clip would fill the card in about
-three minutes at that rate — is held by `CLIP_BUDGET_B`. **The clip byte budget is what makes the
+the absolute cap), and the clip writer — at 480 044 B a clip, 19 MiB is only 41 clips — is held
+by `CLIP_BUDGET_B`. **The clip byte budget is what makes the
 floor route safe, not the other way round.** Lower this floor on an unattended node only with that
 budget in place.
 
@@ -489,7 +500,7 @@ Each was invisible from outside, and each is now a field you can read.
 **The gate could go deaf and look quiet.** Ambient was only learned while armed, so a noise floor
 that rose above the threshold could never be learned, so it could never fall back below
 `thr * REARM`, so the gate never re-armed. Measured outdoors: 156 s solid disarmed, ambient frozen
-at 73.2, two detections all night, both from before it locked. The floor is now tracked whether
+at 73.2, two detections in the whole run, both from before it locked. The floor is now tracked whether
 armed or not — fast below threshold, ~12.5 s above it — with a 30 s forced re-arm under that.
 `gate.armed` and `gate.forced_rearms` say so.
 
@@ -501,7 +512,7 @@ before anything sees them; the true acoustic floor turns out to be 15–70. `gat
 pedestal being subtracted.
 
 **A full card fails by returning a short write, not by raising anything.** The counter used to
-advance regardless, so a card that filled at 03:00 looked exactly like a night that went quiet at
+advance regardless, so a card that filled at 03:00 looked exactly like a gate that went quiet at
 03:00. `write_fail` and `sd_free_mb` make the difference visible.
 
 ## What the GPS actually was
@@ -555,7 +566,7 @@ second it was from the NAV-PVT that follows, then
 
     utc_us = edge_unix_us + (local_us - edge_local_us)
 
-`night.csv` now leads with `utc_us` and a `time_valid` column. Measured against an NTP-synced host:
+`health.csv` leads with `utc_us` and a `time_valid` column. Measured against an NTP-synced host:
 **within 20-30 ms**, which confirms the SECOND is right. It says nothing about microsecond accuracy
 -- the host clock is not a reference -- but the second is the part that costs 343 m.
 
@@ -573,8 +584,8 @@ that must be named, not "the most recent edge", or a late report renames the wro
 ## OTA, and what happens when a bad image lands
 
     arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi \
-      --output-dir .otabuild/out firmware/night_node
-    curl -F firmware=@.otabuild/out/night_node.ino.bin http://<ip>/update
+      --output-dir .otabuild/out firmware/hear_node
+    curl -F firmware=@.otabuild/out/hear_node.ino.bin http://<ip>/update
 
 `/ota` shows the running partition, the boot counter, and whether this image has been accepted.
 
@@ -596,7 +607,7 @@ become reachable within 90 s restarts deliberately, which advances the counter.
 constructor, say -- since nothing then increments the counter. That still needs USB. The counter is
 the first statement of `setup()` to make that window as small as possible.
 
-## What a good night looks like
+## What a healthy run looks like
 
 `fix` 3+ with 6+ sats, `pps` climbing by 1 per second with `glitches` at 0, spread of tens of µs,
 and `acq.fs_clean_hz` settling. **That figure is the deliverable** — if it is not 16000.000, every
@@ -619,26 +630,26 @@ and up. The number that bounds the small stuff is `fs_clean_hz` over a long wind
 Polling the node does **not** measurably cost audio, though `loop()` does read I2S, serve HTTP and
 parse GPS in one thread. Measured over 10.5 minutes at 15-30 s intervals with two concurrent
 pollers: three dropped seconds, two of them the I2S start, one at ~8 minutes. That rate is roughly
-70 over a night, each losing at least 32 ms -- call it 2 s of audio in 12 hours, 0.005%.
+70 over 12 h, each losing at least 32 ms -- call it 2 s of audio in 12 hours, 0.005%.
 `fs_clean_hz` reconverged to 16000.00 afterwards. An earlier build appeared
 to lose 14% under polling, but that reading came from `i2s.measured_hz`, which is cumulative and
 was still carrying the boot-second loss — the poller was not the cause.
 
 Also worth a glance: `gate.armed` should be 1, and `gate.headroom` (`e_max_win / thr`) says how
-close the night came to triggering. Sustained headroom far below 1 means the threshold is above
+close the run came to triggering. Sustained headroom far below 1 means the threshold is above
 everything that happens out there — a distinguishable outcome from silence, which is the point.
 
 ## Credentials and watching it
 
-    python3 firmware/night_node/gen_secrets.py     # reads ~/.wifi, writes gitignored secrets.h
+    python3 firmware/hear_node/gen_secrets.py     # reads ~/.wifi, writes gitignored secrets.h
 
 Takes every `WIFI_<n>_SSID`/`WIFI_<n>_PSK` pair and tries each in turn, because an outdoor node may
 only reach one of them and which one is not knowable from indoors. It prints a count and masked
 names, never the credentials. `secrets.h` is written 0600 and is gitignored.
 
-    nohup python3 firmware/night_node/watch.py http://<ip> 30 >> ~/dama-hear-night.log 2>&1 &
+    nohup python3 firmware/hear_node/watch.py http://<ip> 30 >> ~/dama-hear-watch.log 2>&1 &
 
-`watch.py` polls `/status`, appends every sample to `~/dama-hear-night.jsonl`, and prints a line
+`watch.py` polls `/status`, appends every sample to `~/dama-hear-watch.jsonl`, and prints a line
 only when something *changes* — fix gained or lost, the first PPS edge, glitches climbing, a reboot,
 the node going away or coming back. A log that prints every poll is a log nobody reads in the
 morning. It runs detached and does not depend on any terminal staying open.

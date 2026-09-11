@@ -6,12 +6,12 @@ producer is checked by reading its source and the consumer by feeding it a golde
 two meet at the line format `- <name>  <N> B`.
 
 ⚠️THESE READ ONE HANDLER BODY, NEVER THE WHOLE FILE, AND THAT SCOPING IS LOAD-BEARING. Measured:
-`SD.open("/")` appears once MORE in this file, at night_node.ino:1379, so
+`SD.open("/")` appears once MORE in this file, at hear_node.ino:1379, so
 `test_ls_takes_a_directory_argument`'s negative assertion would fail against a correct handler if
 it scanned the file. The same is true in reverse for the positive ones -- the prose above the
 handler discusses `dir`, `..` and the entry cap.
 
-Comments are stripped as well, following tests/test_clip_priority.py. That part is currently
+Comments are stripped as well, following tests/test_clip_eviction.py. That part is currently
 defence-in-depth and not load-bearing: no assertion below changes truth value with comments left
 in, checked. It stays because the handler's own comment block names every construct these tests
 look for, so one reworded line is all it would take -- and this repo has shipped that bug twice.
@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT))
 
 from tools import hear_drain as D  # noqa: E402
 
-INO = ROOT / "firmware" / "night_node" / "night_node.ino"
+INO = ROOT / "firmware" / "hear_node" / "hear_node.ino"
 GOLDEN = Path(__file__).resolve().parent / "fixtures" / "ls-clips-nyquist.txt"
 ROOT_CAPTURE = Path(__file__).resolve().parent / "fixtures" / "ls_nyquist.txt"
 
@@ -35,7 +35,7 @@ ROOT_CAPTURE = Path(__file__).resolve().parent / "fixtures" / "ls_nyquist.txt"
 def _handler(path):
     """The braces-balanced body of the `http.on("<path>", ...)` registration, comments removed.
 
-    `_body()` in test_clip_priority.py finds a named C function; these handlers are lambdas, so
+    `_body()` in test_clip_eviction.py finds a named C function; these handlers are lambdas, so
     the anchor is the registration string instead. Everything else is the same discipline.
     """
     src = INO.read_text()
@@ -93,9 +93,9 @@ class TestTheHandlerTakesADirectory:
             "partial census that reads as a complete one")
 
     def test_the_cap_is_not_sized_to_the_49_clip_budget(self):
-        # clip_budget_left is a RAM counter reset full every boot with no startup rescan of
-        # CLIP_DIR, so eviction only binds once THIS boot's counter is spent. The real ceiling is
-        # free SD space (~155 files on a ~19 MiB-free card), not 49.
+        # A card flashed from priority-eviction firmware can hold ~155 older clips (~19 MiB free);
+        # clip_rescan() reads them in one LS_MAX_ENTRIES pass and evicts down to the budget, and
+        # 6 MiB of 128044 B clips is 49 of them.
         m = re.search(r"#define\s+LS_MAX_ENTRIES\s+(\d+)", INO.read_text())
         assert m, "LS_MAX_ENTRIES must be a defined constant"
         assert int(m.group(1)) > 49, (
@@ -138,17 +138,17 @@ class TestTheListingParsesThroughTheDrainsOwnParser:
     def test_the_listing_parses_through_the_drains_own_parser(self):
         got = D._ls_parse(GOLDEN.read_text())
         assert got == {
-            "clips/nyquist-db21acd5-1016781646.wav": 128044,
-            "clips/nyquist-db21acd5-1016849331.wav": 128044,
-            "clips/nyquist-db21acd5-1082421378.wav": 128044,
-            "clips/nyquist-db21acd5-1082530195.wav": 128044,
-            "clips/07-nyquist-4f0c9b12-0000149504.wav": 128044,
-            "clips/23-nyquist-4f0c9b12-0000216064.wav": 128044,
+            "clips/nyquist-db21acd5-1016781646.wav": 480044,
+            "clips/nyquist-db21acd5-1016849331.wav": 480044,
+            "clips/nyquist-db21acd5-1082421378.wav": 480044,
+            "clips/nyquist-db21acd5-1082530195.wav": 480044,
+            "clips/07-nyquist-4f0c9b12-0000149504.wav": 480044,
+            "clips/23-nyquist-4f0c9b12-0000216064.wav": 480044,
         }
 
     def test_every_golden_name_is_the_measured_clip_size(self):
         got = D._ls_parse(GOLDEN.read_text())
-        assert set(got.values()) == {D.CL.CLIP_BYTES_16K_4S}
+        assert set(got.values()) == {44 + int(D.CL.CLIP_TOTAL_S * 48000) * 2}
 
     def test_a_truncation_marker_is_carried_not_dropped(self):
         # ⚠️THE REGRESSION THIS EXISTS FOR. `! truncated ...` starts with `!`, so the `- ` parse
@@ -225,7 +225,7 @@ class TestTheListingBecomesAWorkList:
         "clips/.wav", "dets.csv", "scene.csv",
     ])
     def test_a_name_that_is_not_a_clip_never_becomes_a_candidate(self, name):
-        assert D.ls_candidates({name: 128044}, self.NODE) == []
+        assert D.ls_candidates({name: 480044}, self.NODE) == []
 
     def test_a_listing_records_the_size_the_node_reported(self):
         got = D.ls_candidates({"clips/nyquist-db21acd5-1016781646.wav": 40960}, self.NODE)
@@ -239,7 +239,7 @@ class TestTheTwoDiscoverySourcesUnion:
         k = D.CL.clip_key("nyquist", "db21acd5", 1016781646)
         dets = [{"clip_key": k, "clip": "/clips/nyquist-db21acd5-1016781646.wav",
                  "anchored": True, "utc_us": 1757459321000000}]
-        ls = D.ls_candidates({"clips/nyquist-db21acd5-1016781646.wav": 128044}, "nyquist")
+        ls = D.ls_candidates({"clips/nyquist-db21acd5-1016781646.wav": 480044}, "nyquist")
         got = D.merge_candidates(dets, ls)
         assert len(got) == 1, "the same clip from both sources is one fetch, not two"
         assert got[0]["anchored"] is True, (
@@ -257,7 +257,7 @@ class TestTheTwoDiscoverySourcesUnion:
         a = D.CL.clip_key("nyquist", "aaaaaaaa", 1)
         b = D.CL.clip_key("nyquist", "aaaaaaaa", 2)
         dets = [{"clip_key": a}, {"clip_key": b}]
-        ls = D.ls_candidates({"clips/nyquist-bbbbbbbb-0000000003.wav": 128044}, "nyquist")
+        ls = D.ls_candidates({"clips/nyquist-bbbbbbbb-0000000003.wav": 480044}, "nyquist")
         got = D.merge_candidates(dets, ls)
         assert [c["clip_key"] for c in got[:2]] == [a, b]
         assert len(got) == 3

@@ -77,7 +77,7 @@ So the drain MEASURES the reach-back instead of assuming it, and does not try to
 
 ⚠️A CATCH-UP REFETCH IS DELIBERATELY ABSENT, AND THIS IS THE SECOND TIME THAT HAS BEEN DECIDED.
 The node has no offset argument and no Range header, so the only reach-back control is a bigger
-`tail=` -- and `/sd` seeks against the size AT REFETCH TIME (night_node.ino:1985-1986,
+`tail=` -- and `/sd` seeks against the size AT REFETCH TIME (hear_node.ino:1985-1986,
 `size_t remain = f.size(); if (tail > 0 && remain > (size_t)tail) f.seek(remain - tail)`). The
 file grows underneath for the whole of the first fetch (2 MB at the measured 40-135 KB/s is
 15-50 s, ~3.5-12 KB at ~235 B/s), so a tail sized against the pre-fetch `size_now` lands FORWARD
@@ -199,25 +199,20 @@ UNFETCHED_RING = 64
 BOOT_AUDIT_MAX_DAYS = 3
 
 DEFAULT_TIMEOUT_S = 30.0
-# A node reporting detections at the measured night rate goes quiet for hours in daylight, so
+# A node reporting detections at the measured field rate goes quiet for hours in daylight, so
 # staleness is measured on the FETCH, not on new rows. 2 h is comfortably longer than any timer
-# interval and short enough to catch a node that fell off the wifi before a night is lost.
+# interval and short enough to catch a node that fell off the wifi before its buffer rolls over.
 DEFAULT_MAX_STALE_S = 7200.0
 
 # ---------------------------------------------------------------- clip lane budget
 #
-# ⚠️THE ORDERING CONSTRAINT: DRAINING PRECEDES ANY BUDGET INCREASE. Raising CLIP_BUDGET_B on the
-# node without collection does not save one clip; it changes WHICH clips are destroyed and how
-# long each survives first. The node is not the archive, the pool is. See docs/acoustic-stack.md.
-#
-# 6291456 / 128044 = 49 exactly, and all three nodes report `budget_left_b 17300`,
-# `budget_left_clips 0` -- 6291456 - 17300 = 6274156 = 49 x 128044. So a backlog is BOUNDED at 49
-# per node however long the drain was down, which is the crucial difference from scene.csv.
-CLIP_MAX_PER_NODE_DEFAULT = 49
-# 3 x 49 clips is 18.8 MB: 112 s at the measured 168 KB/s, 470 s at the 40 KB/s contended floor.
+# The card holds a rolling window of clips: 6291456 // 480044 = 13. A backlog is therefore bounded
+# at 13 per node however long the drain was down -- the difference from scene.csv -- and a clip
+# that rolls off before it is fetched is the design working, not a loss.
+CLIP_MAX_PER_NODE_DEFAULT = 13
+# 3 x 13 clips is 18.7 MB: 112 s at the measured 168 KB/s, 470 s at the 40 KB/s contended floor.
 # 307 + 470 = 777 s of a 900 s interval is too tight, so the per-node deadline binds instead of
-# the schedule. At 40 KB/s this buys 37 clips and nyquist's worst 15-minute burst was 43 -- the
-# cap CAN bind below a burst, which is exactly why `clips_cap_hit` reaches the heartbeat ring.
+# the schedule; at 40 KB/s it buys about 10 clips. `clips_cap_hit` reaches the heartbeat ring.
 CLIP_DEADLINE_S_DEFAULT = 120.0
 # 142 MB/day fleet-wide; 2 GiB is ~14 days of rolling audio on a PVC shared with scene/ and raw/.
 CLIP_STORE_MAX_BYTES_DEFAULT = 2 * 1024 ** 3
@@ -322,7 +317,7 @@ def _ls_sizes(ip: str, timeout: float = DEFAULT_TIMEOUT_S,
     """`GET /ls` -> {filename: bytes}. Raises on a transport failure; never returns a guess.
 
     The node prints one line per card entry, `- <name>  <N> B` for a file and `d ` for a
-    directory (night_node.ino, the /ls handler). Only files are returned, and the name is
+    directory (hear_node.ino, the /ls handler). Only files are returned, and the name is
     normalised without its leading slash because the core has served it both ways.
 
     ⚠️AN UNPARSEABLE LINE IS DROPPED, WHICH MAKES ITS FILE ABSENT FROM THE RESULT, WHICH THE
@@ -512,7 +507,7 @@ def scene_gap(size_now: Optional[int], fetched_bytes: int, prev_size: Optional[i
 def status_audit(st: Dict[str, Any]) -> Dict[str, Any]:
     """The node's own production counters, so the ledger can be checked against the source.
 
-    ⚠️THE KEY NAMES ARE THE FIRMWARE'S, verified against night_node.ino's /status writer and
+    ⚠️THE KEY NAMES ARE THE FIRMWARE'S, verified against hear_node.ino's /status writer and
     against both live nodes: `acq.drop_s` (not drop_seconds) and `acq.fs_clean_hz` (not fs_clean).
     A wrong name here reads as None and an audit full of Nones looks like a node with nothing to
     report rather than like a reader with the wrong spelling.
@@ -644,7 +639,7 @@ def fetch_clip(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S
     """One clip WAV off the card: `(body, None)` on a real clip, `(None, reason)` otherwise.
 
     ⚠️THIS CANNOT BE `fetch_sd`. `fetch_sd` requires the body to start with `b"node"` or
-    `b"utc_us"` -- a header sniff that is right for a CSV and reports a present 128044 B WAV as
+    `b"utc_us"` -- a header sniff that is right for a CSV and reports a present WAV as
     ABSENT, because a WAV starts with `b"RIFF"`. Proven against a live node 2026-09-09.
 
     ⚠️200 IS NOT PROOF OF A FILE. `/sd?file=/clips` answers 200 with a 0-byte body (measured), so
@@ -693,13 +688,11 @@ def clip_candidates(bodies: Sequence[Tuple[str, bytes]], node: str) -> List[Dict
     reads the CLIP PATH out of `frame_hex`. That is not hypothetical -- it returned 0 usable rows
     from 730 detections once already.
 
-    ⚠️ORDER IS BY EVICTION RISK, NOT BY PRIORITY. The flashed fleet evicts plain FIFO
-    oldest-by-name (measured: no node writes the `%02u-` prefix; the prefix histogram over 370
-    live names is {'ny': 370}), so oldest-first IS most-at-risk-first. The checkout firmware
-    evicts lowest-priority-first, where a high-priority clip is the one that survives many
-    windows -- so fetching by priority would spend the cap on what is least likely to disappear.
-    Oldest-first is correct under FIFO, harmless under the priority gate, and needs no reflash to
-    be right. `prio` is RECORDED when the name carries it and is never read for ordering.
+    ⚠️ORDER IS BY EVICTION RISK, NOT BY PRIORITY. The checkout firmware evicts oldest-first in
+    `CL.eviction_key` order (older-format names, then boot sequence, then sample), so that order
+    IS most-at-risk-first. The fleet flashed before it writes the `%02u-` prefix and evicts
+    lowest-priority-first; oldest-first is harmless there. `prio` is RECORDED when the name
+    carries it and is never read for ordering.
 
     A cell that does not parse as a clip path is kept as a candidate with `parts: None` rather
     than dropped. A name firmware wrote and this parser refuses is a disagreement between the two,
@@ -750,8 +743,8 @@ def clip_candidates(bodies: Sequence[Tuple[str, bytes]], node: str) -> List[Dict
             })
     # A name that would not parse has no (boot, sample) to sort on, so it sorts LAST rather than
     # under an invented zero -- it costs no request and must not displace one that does.
-    out.sort(key=lambda c: ((0, c["parts"]["boot"], c["parts"]["sample"]) if c["parts"]
-                            else (1, "", 0)))
+    out.sort(key=lambda c: ((0,) + CL.eviction_key(c["parts"]["basename"]) if c["parts"]
+                            else (1,)))
     return out
 
 
@@ -797,7 +790,7 @@ def ls_candidates(sizes: Optional[Dict[str, int]], node: str) -> List[Dict[str, 
             "dets_origin": "%s:/ls?dir=%s" % (node, CL.CLIP_DIR),
             "ls_bytes": sizes[name] if sizes else None,
         })
-    out.sort(key=lambda c: (c["parts"]["boot"], c["parts"]["sample"]))
+    out.sort(key=lambda c: CL.eviction_key(c["parts"]["basename"]))
     return out
 
 
@@ -938,7 +931,7 @@ def drain_clips(pl: "P.Pool", node: str, ip: str, candidates: List[Dict[str, Any
 
         body, reason = fetch_clip(ip, cand["clip"], timeout)
         if reason == "http_404":
-            # ⚠️ONE 404 IS NOT PROOF OF AN EVICTION. night_node.ino:2436 answers 404 for ANY
+            # ⚠️ONE 404 IS NOT PROOF OF AN EVICTION. hear_node.ino:2436 answers 404 for ANY
             # failed SD.open -- the no-card case is a 503 at :2435, but descriptor exhaustion,
             # which the firmware's own comment at :2340-2344 says is reachable with max_files 8,
             # collapses to 404 as well. Calling that terminal on first sight writes "the node
@@ -1185,7 +1178,7 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
         write_watermarks(pl.root, wm)
 
     # ⚠️THE DETS BODIES ARE KEPT. dets.csv is where clip names come from -- `det_flush` refuses to
-    # write a detection's row until its clip has resolved (night_node.ino), so a name in this file
+    # write a detection's row until its clip has resolved (hear_node.ino), so a name in this file
     # is a clip that already landed on the card. Discovery via /ls?dir= needs a reflash and this
     # does not, which is why this is the shipping path.
     dets_bodies: List[Tuple[str, bytes]] = []
@@ -1631,7 +1624,7 @@ def main(argv=None) -> int:
                          "the measurements in between are never looked at")
     ap.add_argument("--clip-max-per-node", type=int, default=CLIP_MAX_PER_NODE_DEFAULT,
                     help="most clips to fetch from one node in one run. The card physically "
-                         "holds 6291456/128044 = 49, so a backlog is bounded at 49 however long "
+                         "holds 6291456 // 480044 = 13, so a backlog is bounded at 13 however long "
                          "the drain was down. 0 disables the clip lane entirely")
     ap.add_argument("--clip-deadline-s", type=float, default=CLIP_DEADLINE_S_DEFAULT,
                     help="stop fetching clips from one node after this much wall clock. The "
