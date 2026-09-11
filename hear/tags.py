@@ -49,17 +49,18 @@ BASIS_SAMPLE = "sample"
 BASIS_NONE = "none"
 
 
-def tags_path(root: str, lane: Optional[str] = None) -> str:
-    """`clips/tags.jsonl` for the original lane, `clips/tags-<lane>.jsonl` for every other one.
+def tags_path(root: str, store: Optional[str] = None) -> str:
+    """`clips/tags.jsonl` when `store` is None, `clips/tags-<store>.jsonl` otherwise.
 
-    One file per lane so lanes that run in separate pods never append to the same file, and a
-    lane that is dropped is one file to delete rather than rows to filter out of a shared one.
+    A store is a file name, not a lane name: the tagger maps its original lane to None, so no
+    lane name can be passed here and quietly move that lane's rows to a new file. One file per
+    store keeps lanes in separate pods from appending to the same file.
     """
-    if lane is None:
+    if store is None:
         return os.path.join(root, "clips", TAGS_NAME)
-    if not lane or not all(c.isalnum() or c == "_" for c in lane):
-        raise ValueError("lane %r: letters, digits and underscore only" % (lane,))
-    return os.path.join(root, "clips", "tags-%s.jsonl" % lane)
+    if not store or not all(c.isalnum() or c == "_" for c in store):
+        raise ValueError("store %r: letters, digits and underscore only" % (store,))
+    return os.path.join(root, "clips", "tags-%s.jsonl" % store)
 
 
 def tag_key(clip_key: str, model_name: str, model_version: str,
@@ -90,10 +91,10 @@ def tag_key(clip_key: str, model_name: str, model_version: str,
     return h.hexdigest()[:32]
 
 
-def read_tags(root: str, lane: Optional[str] = None) -> Iterator[Dict[str, Any]]:
+def read_tags(root: str, store: Optional[str] = None) -> Iterator[Dict[str, Any]]:
     """Every stored tag row. An unparseable line is skipped, not fatal: the store is append-only
     and a torn tail from a killed pod must not make the whole resume set unreadable."""
-    p = tags_path(root, lane)
+    p = tags_path(root, store)
     if not os.path.exists(p):
         return
     with open(p, "r", errors="replace") as fh:
@@ -107,7 +108,7 @@ def read_tags(root: str, lane: Optional[str] = None) -> Iterator[Dict[str, Any]]
                 continue
 
 
-def read_resume(root: str, lane: Optional[str] = None) -> Tuple[Set[str], Dict[str, int]]:
+def read_resume(root: str, store: Optional[str] = None) -> Tuple[Set[str], Dict[str, int]]:
     """ONE pass over the tag store -> (every tag_key held, `name/version/sha256` -> row count).
 
     One pass because `run()` needs both and the store is the only thing either can be read from;
@@ -117,7 +118,7 @@ def read_resume(root: str, lane: Optional[str] = None) -> Tuple[Set[str], Dict[s
     """
     keys: Set[str] = set()
     versions: Dict[str, int] = {}
-    for r in read_tags(root, lane):
+    for r in read_tags(root, store):
         k = r.get("tag_key")
         if isinstance(k, str):
             keys.add(k)
@@ -127,13 +128,13 @@ def read_resume(root: str, lane: Optional[str] = None) -> Tuple[Set[str], Dict[s
     return keys, versions
 
 
-def read_tagged(root: str, lane: Optional[str] = None) -> Set[str]:
+def read_tagged(root: str, store: Optional[str] = None) -> Set[str]:
     """Every tag_key already held. THE resume token, the same shape as hear_score's key rescan --
     no watermark, so there is nothing to tear and no second source of truth to disagree with."""
-    return read_resume(root, lane)[0]
+    return read_resume(root, store)[0]
 
 
-def versions_held(root: str, lane: Optional[str] = None) -> Dict[str, int]:
+def versions_held(root: str, store: Optional[str] = None) -> Dict[str, int]:
     """`name/version/sha256` -> row count. ⚠️VERSION MIXING IS REPORTED, NEVER MERGED. Two model
     versions scoring the same clip produce two rows by construction (both the version and the
     weights digest are in the key), and a consumer that averaged or de-duplicated across them
@@ -143,11 +144,11 @@ def versions_held(root: str, lane: Optional[str] = None) -> Dict[str, int]:
     returned ONE entry for two different weight files scored under one version string -- the
     exact mixing the docstring claims is reported.
     """
-    return read_resume(root, lane)[1]
+    return read_resume(root, store)[1]
 
 
-def append_tags(root: str, rows, lane: Optional[str] = None) -> int:
-    p = tags_path(root, lane)
+def append_tags(root: str, rows, store: Optional[str] = None) -> int:
+    p = tags_path(root, store)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     n = 0
     with open(p, "a") as fh:

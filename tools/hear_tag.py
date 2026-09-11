@@ -414,7 +414,8 @@ def settle_rate(n_samples: int, header_fs: int) -> Tuple[float, Optional[Dict[st
 
 
 def coarse(scores: Dict[str, float]) -> str:
-    """The clip's coarse group: the first class in score order that maps to one."""
+    """The coarse group of the top class that is not a bare parent (COARSE_SKIP). That class
+    decides: an unmapped one gives "other" rather than falling through to a weaker class."""
     for name, _s in sorted(scores.items(), key=lambda kv: -kv[1]):
         if name in COARSE_SKIP:
             continue

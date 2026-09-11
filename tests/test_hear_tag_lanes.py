@@ -46,6 +46,11 @@ class TestLanesLeaveTheOriginalStoreAlone:
         again = run(tmp_path, StubTagger(), lane="mn10_pad10")
         assert (again["tagged"], again["already_tagged"]) == (0, 1)
 
+    def test_only_the_default_lane_maps_to_the_original_store(self):
+        stores = [s["store"] for s in HT.LANES.values()]
+        assert HT.LANES[HT.DEFAULT_LANE]["store"] is None
+        assert stores.count(None) == 1 and len(set(stores)) == len(stores)
+
     def test_an_unknown_lane_is_refused(self, tmp_path):
         with pytest.raises(ValueError):
             run(tmp_path, StubTagger(), lane="nope")
