@@ -264,9 +264,11 @@ V_LOST_TO_GATE = "lost_to_gate"
 VERDICTS = (V_SOLVED, V_SOLVER_REFUSED, V_POSITION_UNOBSERVABLE, V_AT_SEARCH_BOUND,
             V_MARGIN_DEPENDENT, V_INADMISSIBLE, V_LOST_TO_GATE)
 
-# Why an ungated candidate has no associated event of the same membership, beyond AS.REASONS.
-# `regrouped` is not a refusal: every member IS associated, in another combination.
-R_REGROUPED = "regrouped_into_other_events"
+# ⚠️`associate_reason` IS NEVER null WHEN `reached_associate` IS False. These are the reasons
+# that are not in associate()'s own `rejected` list, because the arrival was never refused: it
+# went into a DIFFERENT event, or (defensively) no event and no refusal claims it at all. A
+# terminal state with no reason is the failure mode this module exists to prevent.
+R_MEMBER_OF_OTHER_EVENT = "member_of_event %s seeded at %.6f"
 R_UNACCOUNTED = "unaccounted_by_associate"
 
 # ---------------------------------------------------------------- binding constraint
@@ -702,9 +704,15 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
         # APERTURE-relative (DEFAULT_SYNC_SIGMA_FRAC of the tightest pair bound: "is this
         # receiver contributing information to that pair at all"), and it moves when the array
         # moves. The one below is HARDWARE-relative: the class's own arrival budget, which does
-        # not. On this array the hardware gate is ~27x tighter (82.1 us of stated sigma against
-        # 3.45 ms), so it binds and the operator knob only ever loosens -- which is the right way
-        # round for a knob. Keep them separate; collapsing them would put site geometry back
+        # not. On this array the hardware gate is ~42x tighter: the largest stated sigma it
+        # admits for xiao-s3-pps is 82.1 us against this knob's 3.44 ms (both measured 2026-09-11
+        # from survey.json and nodeclass.py: tightest pair bound 34.430 ms x 0.10, and
+        # max_stated_clock_sigma_s). ⚠️NOT "~27x": 27 is 3.44 ms over ARRIVAL_T_SIGMA_MAX_S
+        # (129.4 us), which is the per-node TOTAL budget and not a threshold on this quantity --
+        # quoting one gate's ratio against the other gate's number is how the comment read for
+        # two deploys. Either way the hardware gate binds and the operator knob only ever
+        # loosens, which is the right way round for a knob.
+        # Keep them separate; collapsing them would put site geometry back
         # inside a hardware admissibility test, which nodeclass.py's own header argues against.
         if max_sync_ns is not None and ssig is not None and float(ssig) > float(max_sync_ns):
             _drop(day, row, D_SYNC_SIGMA,
@@ -1680,13 +1688,21 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
     rej_by_key = {}
     for r in grouped["rejected"] + grouped["duplicates"]:
         rej_by_key.setdefault((r["node_id"], r["seq"]), r)
-    ev_of_member: Dict[str, str] = {}
+    # ⚠️MEMBERSHIP, NOT SEED. The two scans no longer consume identically -- associate()
+    # releases a candidate its pairwise gate refused, the ungated scan still consumes it -- so a
+    # candidate's members can all belong to an event seeded elsewhere. Indexing by member is what
+    # lets a candidate be matched to its event by SET, and what lets an unmatched one name the
+    # event that actually holds its arrivals instead of going out with a null reason.
+    ev_of_member: Dict[str, Dict[str, Any]] = {}
+    ev_key_of_member: Dict[str, str] = {}
     ev_members: set = set()
     for ev in grouped["events"]:
         pk = [d["pool_key"] for d in ev["detections"]]
+        ek = event_key(pk)
         ev_members.add(frozenset(pk))
         for k in pk:
-            ev_of_member[k] = event_key(pk)
+            ev_of_member[k] = ev
+            ev_key_of_member[k] = ek
 
     cand_rows: List[Dict[str, Any]] = []
     attempts: List[Dict[str, Any]] = []
@@ -1714,7 +1730,11 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
                 r = rej_by_key.get((int(loose[0]["node_id"]), int(loose[0]["seq"])))
                 lost_reason = R_UNACCOUNTED if r is None else r["reason"]
             else:
-                lost_reason = R_REGROUPED
+                # every member IS associated, in another combination: name that event rather
+                # than say "regrouped", so the row is followable to the event that took them.
+                other = ev_of_member[pkeys[0]]
+                lost_reason = R_MEMBER_OF_OTHER_EVENT % (ev_key_of_member[pkeys[0]],
+                                                         float(other["t0_utc_s"]))
         cand_rows.append({
             "schema": TDOA_SCHEMA, "candidate_id": gi, "event_key": event_key(pkeys),
             "t0_utc_s": arrivals[0], "span_s": arrivals[-1] - arrivals[0],
@@ -1723,7 +1743,8 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
             "n_nodes": len(group), "n_equations": len(group) - 1,
             "bound_check": bc, "reached_associate": reached,
             "associate_reason": lost_reason,
-            "member_event_keys": sorted({ev_of_member[k] for k in pkeys if k in ev_of_member}),
+            "member_event_keys": sorted({ev_key_of_member[k] for k in pkeys
+                                         if k in ev_key_of_member}),
             # ⚠️A CANDIDATE WITH NO EVENT IS NOW THE ONLY ROW THAT EXISTS FOR IT, so the geometry
             # that used to ride on its `lost_to_gate` attempt row rides here instead.
             "geometry_at_centroid": geometry_report(
@@ -1794,13 +1815,19 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
             key_of_det[d["pool_key"]] = verdict
             ev_key_of_det[d["pool_key"]] = ek
         if verdict == V_SOLVED and bc["admissible"]:
+            # ⚠️THE VERDICT COMES FROM `ev`, NOT FROM `bc`. The solution above was fitted to
+            # ev["node_ids"]/ev["arrivals"]; bound_check ran over `group`, and the two scans do
+            # not always hold the same members. The flag beside a solution has to be the one
+            # computed over the arrivals that solution was fitted to.
             pub = BP.to_dama_event(
                 {"event_id": gi, "model": model, "source_class": policy["source_class"],
                  "n_nodes": len(ids), "n_equations": len(ids) - 1,
                  "node_ids": list(ids), "t0_utc_s": ev["t0_utc_s"],
                  # ⚠️#44's whole point, and it was null on this path: the hand-built dict never
-                 # carried it and pipeline.to_dama_event reads it with .get.
+                 # carried either key and pipeline.to_dama_event read them with .get. It
+                 # subscripts them now, so an omission here is a KeyError, not a published null.
                  "point_source_possible": bool(ev["point_source_possible"]),
+                 "worst_pair_excess_s": float(ev["worst_pair_excess_s"]),
                  "solution": sol}, array_id=policy.get("array_id") or "hear")
             events_out.append(dict(row, published_payload=pub))
             solved_for_cal.append({"node_ids": list(ids), "arrivals": list(arrivals)})
