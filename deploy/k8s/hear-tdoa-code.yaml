@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 546570 B serialised against a 262144 B last-applied-configuration cap.
+# apply-mode server: 551402 B serialised; 551580 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: 'c2ace97'
+    dama-hear/commit: 'a83ccd9'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '546570'
+    dama-hear/serialised-bytes: '551402'
 data:
   hear__init__.py: |
     
@@ -829,6 +829,28 @@ data:
                             % (list(h), ", ".join(g.name for g in GENERATIONS)))
     
     
+    def stated_sigma_ns(cell: Any) -> Optional[float]:
+        """A G6 `sync_sigma_ns` cell as a positive number of nanoseconds, or None for "not stated".
+    
+        ⚠️A LITERAL "0" IS NOT STATED, AND THE TRUTHINESS TEST THIS REPLACES MISSED IT. The reader
+        used `if not d.get("sync_sigma_ns")`, and "0" is a non-empty string: a firmware that ever
+        wrote 0 into that column produced the row `nodeclass.stamp_admissible` reads as a PERFECT
+        clock -- sqrt(100 us^2 + 0) = 100 us, inside the 129.4 us per-node bound -- which is the one
+        reading every comment in this module says must be impossible. It was invisible because
+        hear/pool.py, the only consumer, re-checked and compensated.
+    
+        Unparseable is None for the same reason as non-positive: a producer this version does not
+        understand is not one to take a number from.
+        """
+        if cell is None or (isinstance(cell, str) and not cell.strip()):
+            return None
+        try:
+            f = float(cell)
+        except (TypeError, ValueError):
+            return None
+        return f if f > 0.0 else None
+    
+    
     def read_text(text: str, default_node: Optional[str] = None) -> DetsRead:
         """Parse a dets.csv's text. Never returns [] for a file that had no header.
     
@@ -878,8 +900,7 @@ data:
             # G1-G5 never stated it, and an EMPTY G6 cell is the node saying it had no anchor. Both
             # are None -- "not stated" -- and neither is 0. See hear/pool.py's record builder and
             # hear/backend/associate.py, where absent means usable and a number is a claim.
-            if not d.get("sync_sigma_ns"):
-                d["sync_sigma_ns"] = None
+            d["sync_sigma_ns"] = stated_sigma_ns(d.get("sync_sigma_ns"))
             out.rows.append(d)
         return out
     
@@ -1491,21 +1512,20 @@ data:
     
     
     def _sync_sigma_ns(v: Any) -> Optional[float]:
-        """A dets.csv G6 cell -> a stated clock sigma in nanoseconds, or None for "not stated".
+        """A stated clock sigma in nanoseconds, or None for "not stated".
     
         ⚠️NON-POSITIVE IS NOT STATED. The firmware writes an EMPTY cell for a row it could not stamp,
         but a 0 that reached here from any source must not become a claim of a perfect clock --
         hear/nodeclass.py refuses `t_sigma_s <= 0` at construction for exactly that reason, and this
-        value is fed to the same budget. Unparseable is None for the same reason: a producer this
-        version does not understand is not one to take a number from.
+        value is fed to the same budget.
+    
+        ⚠️ONE COPY OF THE RULE, IN `hear.detsfile`. This used to be a second implementation, and the
+        reader's own version had a hole -- it tested truthiness, so the string "0" survived it. The
+        duplicate is what hid that: this function compensated, so the suite stayed green while the
+        reader's docstring and the reader's behaviour disagreed. This path is still needed because it
+        also normalises MQTT payload values, which never pass through the CSV reader.
         """
-        if v in (None, ""):
-            return None
-        try:
-            f = float(v)
-        except (TypeError, ValueError):
-            return None
-        return f if f > 0.0 else None
+        return DF.stated_sigma_ns(v)
     
     
     def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -4714,7 +4734,15 @@ data:
             # residual cannot falsify the fit at this node count; this one says the arrivals could
             # not have come from one point source at all, whatever the fit. A consumer that reads
             # only the residual sees nothing wrong with either.
-            "point_source_possible": ev.get("point_source_possible"),
+            # ⚠️SUBSCRIPTED, NOT `.get`. It shipped as `.get` and the one caller that actually runs
+            # in the cluster -- tools/hear_tdoa.py, which hand-builds this dict -- did not put the
+            # key in, so every published payload carried `point_source_possible: null` while
+            # associate() had computed True or False for that same event. A field that is always
+            # null is worse than an absent one: it reads as "not stated / probably fine". A caller
+            # that omits it is now a KeyError here rather than a silent null downstream.
+            "point_source_possible": ev["point_source_possible"],
+            # The magnitude behind the flag, so False is actionable rather than only alarming.
+            "worst_pair_excess_s": ev["worst_pair_excess_s"],
             "sound_speed_mps": sol.get("sound_speed_mps"),
             "note": sol.get("note"),
         }
@@ -7476,9 +7504,11 @@ data:
     VERDICTS = (V_SOLVED, V_SOLVER_REFUSED, V_POSITION_UNOBSERVABLE, V_AT_SEARCH_BOUND,
                 V_MARGIN_DEPENDENT, V_INADMISSIBLE, V_LOST_TO_GATE)
     
-    # Why an ungated candidate has no associated event of the same membership, beyond AS.REASONS.
-    # `regrouped` is not a refusal: every member IS associated, in another combination.
-    R_REGROUPED = "regrouped_into_other_events"
+    # ⚠️`associate_reason` IS NEVER null WHEN `reached_associate` IS False. These are the reasons
+    # that are not in associate()'s own `rejected` list, because the arrival was never refused: it
+    # went into a DIFFERENT event, or (defensively) no event and no refusal claims it at all. A
+    # terminal state with no reason is the failure mode this module exists to prevent.
+    R_MEMBER_OF_OTHER_EVENT = "member_of_event %s seeded at %.6f"
     R_UNACCOUNTED = "unaccounted_by_associate"
     
     # ---------------------------------------------------------------- binding constraint
@@ -7914,9 +7944,15 @@ data:
             # APERTURE-relative (DEFAULT_SYNC_SIGMA_FRAC of the tightest pair bound: "is this
             # receiver contributing information to that pair at all"), and it moves when the array
             # moves. The one below is HARDWARE-relative: the class's own arrival budget, which does
-            # not. On this array the hardware gate is ~27x tighter (82.1 us of stated sigma against
-            # 3.45 ms), so it binds and the operator knob only ever loosens -- which is the right way
-            # round for a knob. Keep them separate; collapsing them would put site geometry back
+            # not. On this array the hardware gate is ~42x tighter: the largest stated sigma it
+            # admits for xiao-s3-pps is 82.1 us against this knob's 3.44 ms (both measured 2026-09-11
+            # from survey.json and nodeclass.py: tightest pair bound 34.430 ms x 0.10, and
+            # max_stated_clock_sigma_s). ⚠️NOT "~27x": 27 is 3.44 ms over ARRIVAL_T_SIGMA_MAX_S
+            # (129.4 us), which is the per-node TOTAL budget and not a threshold on this quantity --
+            # quoting one gate's ratio against the other gate's number is how the comment read for
+            # two deploys. Either way the hardware gate binds and the operator knob only ever
+            # loosens, which is the right way round for a knob.
+            # Keep them separate; collapsing them would put site geometry back
             # inside a hardware admissibility test, which nodeclass.py's own header argues against.
             if max_sync_ns is not None and ssig is not None and float(ssig) > float(max_sync_ns):
                 _drop(day, row, D_SYNC_SIGMA,
@@ -8892,13 +8928,21 @@ data:
         rej_by_key = {}
         for r in grouped["rejected"] + grouped["duplicates"]:
             rej_by_key.setdefault((r["node_id"], r["seq"]), r)
-        ev_of_member: Dict[str, str] = {}
+        # ⚠️MEMBERSHIP, NOT SEED. The two scans no longer consume identically -- associate()
+        # releases a candidate its pairwise gate refused, the ungated scan still consumes it -- so a
+        # candidate's members can all belong to an event seeded elsewhere. Indexing by member is what
+        # lets a candidate be matched to its event by SET, and what lets an unmatched one name the
+        # event that actually holds its arrivals instead of going out with a null reason.
+        ev_of_member: Dict[str, Dict[str, Any]] = {}
+        ev_key_of_member: Dict[str, str] = {}
         ev_members: set = set()
         for ev in grouped["events"]:
             pk = [d["pool_key"] for d in ev["detections"]]
+            ek = event_key(pk)
             ev_members.add(frozenset(pk))
             for k in pk:
-                ev_of_member[k] = event_key(pk)
+                ev_of_member[k] = ev
+                ev_key_of_member[k] = ek
     
         cand_rows: List[Dict[str, Any]] = []
         attempts: List[Dict[str, Any]] = []
@@ -8926,7 +8970,11 @@ data:
                     r = rej_by_key.get((int(loose[0]["node_id"]), int(loose[0]["seq"])))
                     lost_reason = R_UNACCOUNTED if r is None else r["reason"]
                 else:
-                    lost_reason = R_REGROUPED
+                    # every member IS associated, in another combination: name that event rather
+                    # than say "regrouped", so the row is followable to the event that took them.
+                    other = ev_of_member[pkeys[0]]
+                    lost_reason = R_MEMBER_OF_OTHER_EVENT % (ev_key_of_member[pkeys[0]],
+                                                             float(other["t0_utc_s"]))
             cand_rows.append({
                 "schema": TDOA_SCHEMA, "candidate_id": gi, "event_key": event_key(pkeys),
                 "t0_utc_s": arrivals[0], "span_s": arrivals[-1] - arrivals[0],
@@ -8935,7 +8983,8 @@ data:
                 "n_nodes": len(group), "n_equations": len(group) - 1,
                 "bound_check": bc, "reached_associate": reached,
                 "associate_reason": lost_reason,
-                "member_event_keys": sorted({ev_of_member[k] for k in pkeys if k in ev_of_member}),
+                "member_event_keys": sorted({ev_key_of_member[k] for k in pkeys
+                                             if k in ev_key_of_member}),
                 # ⚠️A CANDIDATE WITH NO EVENT IS NOW THE ONLY ROW THAT EXISTS FOR IT, so the geometry
                 # that used to ride on its `lost_to_gate` attempt row rides here instead.
                 "geometry_at_centroid": geometry_report(
@@ -9006,13 +9055,19 @@ data:
                 key_of_det[d["pool_key"]] = verdict
                 ev_key_of_det[d["pool_key"]] = ek
             if verdict == V_SOLVED and bc["admissible"]:
+                # ⚠️THE VERDICT COMES FROM `ev`, NOT FROM `bc`. The solution above was fitted to
+                # ev["node_ids"]/ev["arrivals"]; bound_check ran over `group`, and the two scans do
+                # not always hold the same members. The flag beside a solution has to be the one
+                # computed over the arrivals that solution was fitted to.
                 pub = BP.to_dama_event(
                     {"event_id": gi, "model": model, "source_class": policy["source_class"],
                      "n_nodes": len(ids), "n_equations": len(ids) - 1,
                      "node_ids": list(ids), "t0_utc_s": ev["t0_utc_s"],
                      # ⚠️#44's whole point, and it was null on this path: the hand-built dict never
-                     # carried it and pipeline.to_dama_event reads it with .get.
+                     # carried either key and pipeline.to_dama_event read them with .get. It
+                     # subscripts them now, so an omission here is a KeyError, not a published null.
                      "point_source_possible": bool(ev["point_source_possible"]),
+                     "worst_pair_excess_s": float(ev["worst_pair_excess_s"]),
                      "solution": sol}, array_id=policy.get("array_id") or "hear")
                 events_out.append(dict(row, published_payload=pub))
                 solved_for_cal.append({"node_ids": list(ids), "arrivals": list(arrivals)})
