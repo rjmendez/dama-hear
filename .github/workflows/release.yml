@@ -1,0 +1,78 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  firmware:
+    uses: ./.github/workflows/firmware.yml
+    with:
+      retention-days: 30
+
+  release:
+    needs: firmware
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: fw-hear_node
+          path: build
+
+      - name: assemble
+        run: |
+          mkdir dist
+          cp build/hear_node.ino.bin        "dist/hear_node-$TAG.bin"
+          cp build/hear_node.ino.merged.bin "dist/hear_node-$TAG-merged.bin"
+          cp build/hear_node.ino.elf        "dist/hear_node-$TAG.elf"
+          python3 - <<'PY'
+          import json, os
+          tag = os.environ["TAG"]
+          json.dump({
+              "tag": tag,
+              "commit": os.environ["GITHUB_SHA"],
+              "sketch": "firmware/hear_node",
+              "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
+              "esp32_core": "3.3.11",
+              "arduino_cli": "1.5.1",
+              "build_flags": ["-DHEAR_ALLOW_NO_WIFI"],
+              "wifi_credentials": False,
+              "node_id": None,
+          }, open("dist/build-info.json", "w"), indent=2)
+          PY
+          (cd dist && sha256sum * > SHA256SUMS)
+          cat > notes.md <<EOF
+          Firmware for \`firmware/hear_node\` at \`$GITHUB_SHA\`.
+
+          ⚠️ These images carry **no Wi-Fi credentials and no node name**. They were built with \`-DHEAR_ALLOW_NO_WIFI\`, so a node booted from one comes up as its own access point, not on the LAN. Use them for bench flashing, for checking a build, or with the \`.elf\` to decode a crash backtrace.
+
+          A field node is flashed from this tag with its credentials compiled in:
+
+              git checkout $TAG
+              python3 firmware/hear_node/flash.py <node> <ip>
+
+          | file | what it is |
+          |---|---|
+          | \`hear_node-$TAG.bin\` | app image (what \`/update\` takes) |
+          | \`hear_node-$TAG-merged.bin\` | bootloader + partitions + app, to write at 0x0 over USB |
+          | \`hear_node-$TAG.elf\` | symbols, for backtraces |
+          | \`build-info.json\` | toolchain and flags |
+          | \`SHA256SUMS\` | checksums of all of the above |
+          EOF
+
+      - name: publish
+        run: gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes-file notes.md
