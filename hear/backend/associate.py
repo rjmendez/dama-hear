@@ -19,14 +19,59 @@ arrival that already joined.
 Nothing is dropped silently: n_input == sum(event n_nodes) + len(rejected) + len(duplicates), and
 every rejection names its reason and carries the numbers that produced it.
 
-⚠️AN ARRAY WIDER THAN THE CADENCE LOSES EVERY ROUND BUT THE FIRST. A rejected candidate is
-terminal: it is not returned to the pool, so it can never seed a group of its own. Once the window
-(d/c + margin) exceeds the round spacing, round 2 lands inside round 1's scan, every node of it is
-`duplicate_node_in_group`, and the round is gone. Run on a 128.1 m array (window 0.403 s) with
-three rounds 85 ms apart that all four nodes heard: 1 event, 8 rejections, rounds 2 and 3 vanish.
-Conservation still holds -- they are reported, not dropped -- but they are never solved. Re-seeding
-rejected candidates would satisfy conservation too and is the open alternative; it is not what this
-does. tests/test_associate.py TestWideArray pins the loss, so the choice cannot change by accident.
+⚠️A REFUSED CANDIDATE IS RETURNED TO THE POOL, AND THAT IS NOT THE SAME AS WIDENING ANYTHING.
+A candidate the pairwise gate refuses is not consumed: it stays in the pool, so it can seed a
+group of its own. Nothing about the gate moves. Measured on the live pool (74 h, 6,792 node
+arrivals, 16.87 m arrival survey, window 78.7 ms): the ground truth is 191 admissible triples
+forming 4 three-node episodes, of which 2 survive at zero margin. Consuming the refusal delivered
+3 of the 4 and 1 of the 2; returning it delivers 4 of 4 and 2 of 2, and the median delivered
+spread falls from 70.37 ms to 55.85 ms. Recovering an episode by widening the window would have
+done the opposite: of the 162 distinct within-triple pairs those episodes contain, 64 (39.5%)
+already exceed d/c and are admitted only by the margin.
+
+⚠️A DUPLICATE IS NOT A REFUSAL, AND RELEASING IT WHOLESALE COSTS MORE THAN IT PAYS. A second
+arrival from a node already in the group is released ONLY when the group can no longer use it at
+all -- it already holds every node this batch heard from -- AND it is further from the arrival
+holding that slot than that node's own bound (one node, so d = 0 and the bound is the margin).
+Both clauses are derived, neither is tuned. Releasing every duplicate instead was measured on the
+same pool: 7 deliveries instead of 5, NONE of them admissible at zero margin where the guarded
+rule delivers 2, the median spread back up at 70.87 ms, and one episode delivered three times.
+It also costs: 11,668 candidate visits against 3,180 for the guarded rule and 3,173 for consuming
+every duplicate, so the guard buys the recovery for 0.2% more scan work where releasing
+everything costs 3.7x. On the 169.7 m survey the same three numbers are 43,622 / 4,238 / 4,161.
+
+⚠️THE GUARD IS WHAT MAKES A WIDE ARRAY WORK, AND WITHOUT IT A WIDE ARRAY LOSES EVERY ROUND BUT
+THE FIRST. On a 169.7 m array (window 520 ms) with three rounds 85 ms apart that all four nodes
+heard, consuming the duplicate delivers 1 event of 3 and releasing it delivers 3 of 3. The array
+is going from 16.9 m to roughly 170 m, where the window goes 78.7 ms -> 520 ms, so this is the
+scale the rule has to survive and tests/test_associate.py TestWideArray now pins the recovery.
+
+⚠️THE SAME MEASUREMENT REFUSES BEST-SPREAD-WINS. Replacing earliest-wins with an exhaustive
+search for the tightest admissible set inside the seed window was tried at all three consumption
+policies and lost at every one: 0 deliveries admissible at zero margin in each case, against 1
+for the shipped scan and 2 for this one. The mechanism is measured, not assumed: at
+1789063974.230299 the incremental gate refuses every candidate and forms nothing, while the
+exhaustive search finds a jointly admissible three-node set spanning 71.07 ms and consumes the
+arrivals that the 55.85 ms and 12.94 ms groups later needed. Minimising spread over sets ANCHORED
+AT THE SEED is not minimising spread: the seed is the floor, so the search buys width at the far
+end to buy membership. Earliest-wins stays.
+
+⚠️WHAT THE DUPLICATE RELEASE COSTS, STATED RATHER THAN DISCOVERED LATER. It changes WHICH group
+one episode delivers, and the one it picks is wider. Episode 3 of the live pool delivers twice
+either way; its second delivery is rankine@1789063974.347535 + mach@.349619 + nyquist@.360475,
+spread 12.94 ms, when the duplicate is consumed, and nyquist@.312460 + rankine@.323195 +
+mach@.349619, spread 37.16 ms, when it is released -- the released nyquist@.312460 seeds first
+and takes mach@.349619. Both are admissible at zero margin; the cost is 24.22 ms = 8.39 m of
+spread on one of five deliveries. It is bought with 1 event of 3 -> 3 of 3 at 169.7 m, which is
+where the array is going. RETURNING THE GEOMETRY REFUSAL ALONE IS STRICTLY BETTER AT TODAY'S
+16.87 m and STRICTLY WORSE AT 169.7 m, and there is no third rule in between that is derived
+from anything rather than tuned -- so the wide scale decides it.
+
+⚠️refusals IS A COUNT, NOT ROWS, AND THAT IS DELIBERATE. A returned candidate can be refused by
+every seed whose window it falls in, so a per-refusal row list is quadratic in the number of
+arrivals one window holds -- on a 520 ms window and a node retriggering every 5 ms that is 4,950
+rows per window per node. The per-detection story is still exactly-once and still carries its
+numbers: it is in `rejected`, which no candidate reaches twice.
 
 What this refuses to do: it does not classify, does not solve, and does not say whether a residual
 is meaningful -- that depends on the model and the dimension and belongs to the solver. It also
@@ -175,6 +220,12 @@ def associate(detections: Sequence[Dict], survey, temp_c: float = 20.0,
     `duplicates`. Refuses to admit a second detection from a node already in a group, and refuses
     any candidate whose separation-in-time from a member exceeds their separation-in-space over c.
     Refuses to treat a repeated (node_id, seq) as a duplicate once it is a window away: seq wraps.
+
+    A refused candidate is NOT consumed and can seed a group of its own; a duplicate is consumed
+    unless the group already holds every node this batch heard from AND the duplicate is further
+    from the arrival holding its slot than that node's own bound. `refusals` counts the
+    non-terminal ones by reason and `scan_seeds` / `scan_candidate_visits` are the scan's own
+    work, which is what a revisiting implementation would blow out.
     """
     c = SW.sound_speed(temp_c)
     diameter_m = float(survey.diameter_m())
@@ -221,12 +272,31 @@ def associate(detections: Sequence[Dict], survey, temp_c: float = 20.0,
         return pos[node_id]
 
     events: List[Dict] = []
+    refusals: Dict[str, int] = {r: 0 for r in REASONS}
+    # Every node this batch heard from. `survey` is duck-typed on membership and cannot be
+    # enumerated, and a surveyed node that reported nothing can never complete a group anyway.
+    reporting_nodes = len({int(d["node_id"]) for d in pool})
+    scan_seeds = 0
+    scan_visits = 0
+    # ⚠️A NON-TERMINAL REFUSAL MUST NOT COST THE DIAGNOSIS. A candidate the geometry gate refuses
+    # now goes back to the pool and usually ends as `too_few_nodes` around itself, so the numbers
+    # that refused it would otherwise never be printed anywhere. They ride along in the detail.
+    last_refusal: Dict[int, str] = {}
+    # ⚠️THE SEED IS COMMITTED BEFORE ANY CANDIDATE CAN BE RELEASED, AND `used` ONLY EVER GOES
+    # False -> True. That is the termination argument, and mutation says it is the WHOLE of it:
+    # replacing this pass with a worklist, scanning from index 0 instead of i + 1, or pushing a
+    # released index back on the queue all leave every answer and every counter unchanged,
+    # because a released index is already `used` by the time anything reaches it again. Move
+    # `used[i] = True` below the release and the same worklist never terminates -- measured, the
+    # test file hangs. So this line is not bookkeeping.
     used = [False] * len(pool)
     for i, seed in enumerate(pool):
         if used[i]:
             continue
+        scan_seeds += 1
         used[i] = True
         group = [seed]
+        group_ix = [i]
         members = {int(seed["node_id"])}
         limit = float(seed["t_utc_s"]) + window_s
         for j in range(i + 1, len(pool)):
@@ -236,15 +306,31 @@ def associate(detections: Sequence[Dict], survey, temp_c: float = 20.0,
             t_c = float(cand["t_utc_s"])
             if t_c > limit:
                 break
+            scan_visits += 1
             nid = int(cand["node_id"])
             if nid in members:
                 held = next(m for m in group if int(m["node_id"]) == nid)
+                gap = t_c - float(held["t_utc_s"])
+                # Same node, so d = 0 and the pair's own bound is 0/c + margin. Inside it this is
+                # a second reading of the arrival already held -- the retrigger the whole
+                # earliest-wins rule exists for -- and it stays terminal. Outside it, AND only
+                # once the group holds every reporting node so it can never use the arrival
+                # anyway, it goes back to the pool.
+                release = (len(members) >= reporting_nodes
+                           and abs(gap) > 0.0 / c + float(margin_s))
+                if release:
+                    refusals["duplicate_node_in_group"] += 1
+                    last_refusal[j] = ("node %d was already in the group seeded at %.6f s, "
+                                       "%.1f ms earlier, and that group held all %d reporting "
+                                       "nodes: returned to the pool"
+                                       % (nid, float(seed["t_utc_s"]), gap * 1e3,
+                                          reporting_nodes))
+                    continue
                 used[j] = True
                 rejected.append(_row(cand, "duplicate_node_in_group",
                                      "node %d already in event at %.6f s, %.1f ms earlier: "
                                      "earliest wins, no replacement"
-                                     % (nid, float(held["t_utc_s"]),
-                                        (t_c - float(held["t_utc_s"])) * 1e3), seed))
+                                     % (nid, float(held["t_utc_s"]), gap * 1e3), seed))
                 continue
             bad = None
             for m in group:
@@ -255,23 +341,25 @@ def associate(detections: Sequence[Dict], survey, temp_c: float = 20.0,
                     bad = (int(m["node_id"]), dt, bound, d_m)
                     break
             if bad is not None:
-                used[j] = True
-                rejected.append(_row(cand, "pairwise_dt_exceeds_geometry",
-                                     "node %d vs node %d: dt %.1f ms > %.1f ms "
-                                     "(d %.1f m / c %.1f + %.0f ms)"
-                                     % (nid, bad[0], bad[1] * 1e3, bad[2] * 1e3, bad[3], c,
-                                        float(margin_s) * 1e3), seed))
+                refusals["pairwise_dt_exceeds_geometry"] += 1
+                last_refusal[j] = ("node %d vs node %d: dt %.1f ms > %.1f ms "
+                                   "(d %.1f m / c %.1f + %.0f ms)"
+                                   % (nid, bad[0], bad[1] * 1e3, bad[2] * 1e3, bad[3], c,
+                                      float(margin_s) * 1e3))
                 continue
             used[j] = True
             members.add(nid)
             group.append(cand)
+            group_ix.append(j)
 
         if len(group) < min_nodes:
-            for m in group:
+            for k, m in zip(group_ix, group):
+                why = last_refusal.get(k)
                 rejected.append(_row(m, "too_few_nodes",
-                                     "group of %d around node %d at %.6f s: min_nodes %d"
+                                     "group of %d around node %d at %.6f s: min_nodes %d%s"
                                      % (len(group), int(seed["node_id"]),
-                                        float(seed["t_utc_s"]), min_nodes), seed))
+                                        float(seed["t_utc_s"]), min_nodes,
+                                        "" if why is None else "; last refused: " + why), seed))
             continue
         arrivals = [float(m["t_utc_s"]) for m in group]
         events.append({
@@ -294,4 +382,8 @@ def associate(detections: Sequence[Dict], survey, temp_c: float = 20.0,
         "sound_speed_mps": c,
         "diameter_m": diameter_m,
         "n_input": len(detections),
+        "refusals": refusals,
+        "reporting_nodes": reporting_nodes,
+        "scan_seeds": scan_seeds,
+        "scan_candidate_visits": scan_visits,
     }
