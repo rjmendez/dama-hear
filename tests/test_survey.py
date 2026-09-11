@@ -243,13 +243,20 @@ class TestFile:
         assert sv.diameter_m() == pytest.approx(math.sqrt(2) * 100.0, abs=1e-9)
 
 
-class TheSurveyStatesWhichNodesCanRange:
+class TestTheSurveyStatesWhichNodesCanRange:
     """⚠️A SURVEYED POSITION IS NOT PERMISSION TO USE THE NODE AS AN ARRIVAL.
 
     hear/nodeclass.py has always known that a PUC timed by NTP is 3 ms -- 1.0 m of range -- and
     must be refused as a TDoA arrival. `require_arrival` was called from tests and from NOWHERE
     else, so nothing in the pipeline ever asked. Adding a non-ranging node to the survey for its
     position then made it indistinguishable from a PPS node at 3.4 cm.
+
+    ⚠️AND NONE OF IT RAN. This class was named `TheSurveyStatesWhichNodesCanRange`, which does not
+    match pytest's default `python_classes = Test*`, and the repo has no pytest.ini, setup.cfg or
+    pyproject.toml to widen it. `pytest --collect-only tests/test_survey.py` reported 40 tests and
+    not one of them was from here: seven assertions about the only production caller of
+    `contributes_arrival()` were dead the whole time. Renamed. A guard nobody collects is a
+    comment.
     """
 
     @staticmethod
@@ -273,14 +280,23 @@ class TheSurveyStatesWhichNodesCanRange:
         assert s.arrival_ids() == [1, 2, 3], "the NTP-timed node must not be a TDoA arrival"
         assert 4 in s.ids, "but it must still be IN the survey -- it has a position"
 
-    def test_a_pps_puc_would_be_admitted(self):
-        # the same hardware, once its 1PPS is wired: 3 ms -> 100 us
+    def test_a_pps_puc_is_still_not_admitted(self):
+        """⚠️THIS TEST USED TO ASSERT THE OPPOSITE, and it never ran to say so.
+
+        Wiring the PUC's 1PPS takes its clock from 3 ms to 100 us, and that is exactly half of
+        what an arrival needs. The other half is the delay between its diaphragm and its
+        timestamp, which nobody has measured on closed firmware -- a constant per-receiver offset
+        that does not average down and is invisible in the residual of a 3-node fit. The gate
+        stopped reading `time_source` and started reading numbers, and this is the case where the
+        two answers differ. See hear/nodeclass.py's puc-pps entry for what would change it.
+        """
         s = SV.from_dict(self._d([
             self._n(1, "a", 0.0, 0.0, "xiao-s3-pps"),
             self._n(2, "b", -16.0, 0.0, "xiao-s3-pps"),
             self._n(3, "puc", -22.0, 9.0, "puc-pps"),
         ]))
-        assert s.arrival_ids() == [1, 2, 3]
+        assert s.arrival_ids() == [1, 2]
+        assert 3 in s.ids, "it keeps its position; only its timestamps are refused"
 
     def test_an_unstated_class_is_included_not_silently_dropped(self):
         # every survey written before the field existed omits it; dropping those nodes would be a
