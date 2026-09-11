@@ -148,6 +148,53 @@ MODEL_FS_HZ = 32000
 #: under YAMNet, and inventing a windowing scheme here would be an unmeasured knob.
 MODEL_PASSES = 1
 
+#: The same weights under different input policies. Each lane has its own tag file, resume set
+#: and heartbeat. `mn10` is the original whole-clip pass and keeps clips/tags.jsonl and
+#: state/tag_heartbeat.json as they were. `mn10_pad10` zero-pads the normalised clip to the
+#: model's 10 s training length (docs/clip-calibration-2026-09-10.md S4).
+LANES: Dict[str, Dict[str, Any]] = {
+    "mn10": {"store": None, "variant": None, "pad_to_s": None},
+    "mn10_pad10": {"store": "mn10_pad10", "variant": "pad10", "pad_to_s": 10.0},
+}
+DEFAULT_LANE = "mn10"
+
+#: FS_ACQ / FS_NOMINAL. The clip-writer bug stamped the nominal rate over acquisition-rate audio.
+HEADER_RATE_FACTOR = 3
+
+#: Coarse groups for the per-run "heard" summary; a clip takes the first match in score order.
+#: OBSERVATION only -- nothing gates on it.
+COARSE: Tuple[Tuple[str, frozenset], ...] = (
+    ("insects", frozenset({"Insect", "Cricket", "Mosquito", "Fly, housefly", "Bee, wasp, etc.",
+                           "Buzz"})),
+    ("dog", frozenset({"Dog", "Bark", "Howl", "Bow-wow", "Growling", "Whimper (dog)", "Yip",
+                       "Canidae, dogs, wolves"})),
+    ("bird", frozenset({"Bird", "Bird vocalization, bird call, bird song", "Chirp, tweet", "Owl",
+                        "Hoot", "Crow", "Caw", "Squawk", "Pigeon, dove", "Coo", "Fowl"})),
+    ("frog", frozenset({"Frog", "Croak"})),
+    ("train", frozenset({"Train", "Rail transport", "Railroad car, train wagon",
+                         "Clickety-clack", "Train horn", "Train whistle"})),
+    ("aircraft", frozenset({"Aircraft", "Fixed-wing aircraft, airplane", "Aircraft engine",
+                            "Helicopter", "Jet engine", "Propeller, airscrew"})),
+    ("road", frozenset({"Vehicle", "Car", "Truck", "Motor vehicle (road)", "Motorcycle", "Bus",
+                        "Accelerating, revving, vroom", "Air horn, truck horn",
+                        "Vehicle horn, car horn, honking", "Car passing by", "Tire squeal"})),
+    ("weather", frozenset({"Wind", "Wind noise (microphone)", "Rustling leaves", "Rain",
+                           "Rain on surface", "Raindrop", "Thunder", "Thunderstorm"})),
+    ("machine", frozenset({"Engine", "Hum", "Mains hum", "Mechanical fan", "Air conditioning",
+                           "Power tool", "Lawn mower", "Chainsaw", "Hammer", "Drill", "Sawing",
+                           "Idling"})),
+    ("impulse", frozenset({"Gunshot, gunfire", "Bang", "Explosion", "Boom", "Knock",
+                           "Slap, smack", "Thump, thud", "Crack"})),
+    ("speech", frozenset({"Speech", "Male speech, man speaking", "Female speech, woman speaking",
+                          "Conversation", "Child speech, kid speaking", "Shout", "Yell"})),
+    ("music", frozenset({"Music"})),
+    ("silence", frozenset({"Silence"})),
+)
+#: Parents that say nothing on their own; skipped when picking a clip's group.
+COARSE_SKIP = frozenset({"Animal", "Domestic animals, pets", "Wild animals",
+                         "Outside, urban or manmade", "Outside, rural or natural",
+                         "Inside, small room", "Inside, large room or hall"})
+
 #: RMS target. -20 dBFS is where the two real clips above stop reading as Silence; it is also far
 #: enough below 0 that a 0.0134 peak clip does not clip after scaling.
 TARGET_DBFS = -20.0
@@ -335,6 +382,55 @@ def to_model_rate(pcm: "Any", header_fs: int, csv_fs: Optional[float] = None) ->
         return RESAMPLE.resample(pcm, float(header_fs), float(MODEL_FS_HZ))
     except RESAMPLE.RateRefused as e:
         raise RateRefused("%s The dets CSV said %s Hz." % (e, csv_fs))
+
+
+def settle_rate(n_samples: int, header_fs: int) -> Tuple[float, Optional[Dict[str, Any]]]:
+    """(rate to read the body at, recovery record or None). Raises RateRefused.
+
+    A header that snaps to 48 kHz is used as it stands. The one recovery allowed is the known lie,
+    the nominal rate stamped over 48 kHz audio: header x HEADER_RATE_FACTOR must snap to 48 kHz
+    AND the body must be exactly one clip at that rate while it is not one at the stated rate.
+    Everything else stays refused, mach's 22,624 Hz boots and the 4.0 s 16 kHz-era clips included.
+    """
+    try:
+        return RESAMPLE.snap(header_fs), None
+    except RESAMPLE.RateRefused as exc:
+        stated = str(exc)
+
+    def one_clip(fs: float) -> bool:
+        return abs(n_samples / fs - CLIPS.CLIP_TOTAL_S) <= CLIPS.CLIP_TOTAL_S * CLIPS.CLIP_DUR_TOL
+
+    if not header_fs or header_fs <= 0:
+        raise RateRefused(stated)
+    try:
+        fs = RESAMPLE.snap(header_fs * HEADER_RATE_FACTOR)
+    except RESAMPLE.RateRefused:
+        raise RateRefused(stated)
+    if one_clip(fs) and not one_clip(header_fs):
+        return fs, {"header_fs_hz": int(header_fs), "factor": HEADER_RATE_FACTOR, "fs_hz": fs}
+    raise RateRefused("%s x%d snaps to %g Hz, but %d samples at that rate is %.3f s, not one "
+                      "%.1f s clip." % (stated, HEADER_RATE_FACTOR, fs, n_samples,
+                                        n_samples / fs, CLIPS.CLIP_TOTAL_S))
+
+
+def coarse(scores: Dict[str, float]) -> str:
+    """The clip's coarse group: the first class in score order that maps to one."""
+    for name, _s in sorted(scores.items(), key=lambda kv: -kv[1]):
+        if name in COARSE_SKIP:
+            continue
+        for group, names in COARSE:
+            if name in names:
+                return group
+        return "other"
+    return "none"
+
+
+def format_heard(heard: Dict[str, Dict[str, int]]) -> str:
+    parts = []
+    for node in sorted(heard):
+        groups = sorted(heard[node].items(), key=lambda kv: (-kv[1], kv[0]))
+        parts.append("%s %s" % (node, " ".join("%s %d" % g for g in groups)))
+    return " | ".join(parts) if parts else "nothing tagged"
 
 
 class Tagger:
@@ -559,8 +655,9 @@ def state_dir(root: str) -> str:
     return os.path.join(root, "state")
 
 
-def heartbeat_path(root: str) -> str:
-    return os.path.join(state_dir(root), "tag_heartbeat.json")
+def heartbeat_path(root: str, lane: str = DEFAULT_LANE) -> str:
+    name = "tag_heartbeat.json" if lane == DEFAULT_LANE else "tag_heartbeat-%s.json" % lane
+    return os.path.join(state_dir(root), name)
 
 
 def card_path(root: str) -> str:
@@ -634,7 +731,8 @@ def empty_tally() -> Dict[str, Any]:
             "superseded": 0,
             "tagged": 0, "refused": 0, "already_tagged": 0, "deferred": 0,
             "by_reason": {}, "by_node": {}, "by_node_day_reason": {},
-            "silence_top": 0, "scored_any": 0, "dbfs": [], "unstored": [], "top_scores": []}
+            "silence_top": 0, "scored_any": 0, "dbfs": [], "unstored": [], "top_scores": [],
+            "heard": {}}
 
 
 def tally(t: Dict[str, Any], node: str, day: str, outcome: str,
@@ -654,6 +752,9 @@ def tally(t: Dict[str, Any], node: str, day: str, outcome: str,
                 n["silence_top"] += 1
             if top is not None:
                 t["top_scores"].append(float(scores[top]))
+            h = t["heard"].setdefault(node or "?", {})
+            g = coarse(scores)
+            h[g] = h.get(g, 0) + 1
             if row.get("pre_norm_dbfs") is not None:
                 t["dbfs"].append(float(row["pre_norm_dbfs"]))
             if row.get("max_unstored_score") is not None:
@@ -675,7 +776,8 @@ def tally(t: Dict[str, Any], node: str, day: str, outcome: str,
 
 
 def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
-            floor: float = SCORE_FLOOR, now: Optional[float] = None) -> Dict[str, Any]:
+            floor: float = SCORE_FLOOR, now: Optional[float] = None,
+            lane: str = DEFAULT_LANE) -> Dict[str, Any]:
     """One index row -> one tag row, or a refusal. NEVER raises for a data problem.
 
     ⚠️IT READS ONLY THE FIELDS hear.clips DECLARES: clip_key, node, boot, sample, path, anchored,
@@ -709,18 +811,18 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
                 "detail": "%s: %s" % (type(exc).__name__, exc)}
     # The rate is settled before the length, because the length is measured in it.
     try:
-        RESAMPLE.snap(header_fs)
-    except RESAMPLE.RateRefused as exc:
+        fs_read, recovered = settle_rate(len(pcm), header_fs)
+    except RateRefused as exc:
         return {"ok": False, "reason": R_RATE_REFUSED,
                 "detail": "%s The dets CSV said %s Hz." % (exc, row.get("fs_hz"))}
-    dur_s = len(pcm) / float(header_fs)
+    dur_s = len(pcm) / float(fs_read)
     if abs(dur_s - CLIPS.CLIP_TOTAL_S) > CLIPS.CLIP_TOTAL_S * CLIPS.CLIP_DUR_TOL:
         return {"ok": False, "reason": R_WAV_SAMPLES,
                 "detail": "%d samples at %g Hz is %.3f s; a clip is %.1f s (%.1f s pre, %.1f s post)"
-                          % (len(pcm), header_fs, dur_s, CLIPS.CLIP_TOTAL_S, CLIPS.CLIP_PRE_S,
+                          % (len(pcm), fs_read, dur_s, CLIPS.CLIP_TOTAL_S, CLIPS.CLIP_PRE_S,
                              CLIPS.CLIP_POST_S)}
     try:
-        rs = to_model_rate(pcm, header_fs, row.get("fs_hz"))
+        rs = to_model_rate(pcm, fs_read, row.get("fs_hz"))
     except RateRefused as exc:
         return {"ok": False, "reason": R_RATE_REFUSED, "detail": str(exc)}
     # The level recorded is the RECORDING's, taken before the 48 -> 32 kHz decimation removes the
@@ -731,6 +833,12 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
         pcm, _ = normalise(rs["pcm"])
     except ValueError as exc:
         return {"ok": False, "reason": R_DIGITAL_SILENCE, "detail": str(exc)}
+    pad_to_s = LANES[lane]["pad_to_s"]
+    if pad_to_s:
+        import numpy as np
+        short = int(round(pad_to_s * rs["fs_hz"])) - len(pcm)
+        if short > 0:
+            pcm = np.concatenate([pcm, np.zeros(short, dtype=pcm.dtype)])
     try:
         got = tagger.tag(pcm, floor=floor)
     except Exception as exc:
@@ -740,7 +848,9 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
     out = {
         "tag_schema_version": TAGS.TAG_SCHEMA_VERSION,
         "schema": TAG_SCHEMA,
-        "tag_key": TAGS.tag_key(ck, MODEL_NAME, MODEL_VERSION, mb.get("sha256")),
+        "tag_key": TAGS.tag_key(ck, MODEL_NAME, MODEL_VERSION, mb.get("sha256"),
+                                LANES[lane]["variant"]),
+        "lane": lane,
         "clip_key": ck,
         "det_ref": row.get("record_key"),
         "node": row.get("node"),
@@ -755,6 +865,8 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
         "embedding": got["embedding"],
         "pre_norm_dbfs": pre_db,
         "wav_header_fs_hz": int(header_fs),
+        "rate_recovered": recovered,
+        "input_pad_to_s": pad_to_s,
         "fs_model_hz": rs["fs_hz"],
         "fs_source_hz": rs["fs_source_hz"],
         # ⚠️BOTH RATES, SIDE BY SIDE, ALWAYS. The CSV estimate and the file's own header disagreed
@@ -783,8 +895,8 @@ def _write_json_atomic(path: str, obj: Any) -> None:
 def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
         deadline_s: float = DEFAULT_DEADLINE_S, floor: float = SCORE_FLOOR,
         write: bool = True, now: Optional[float] = None,
-        tagger: Optional[Any] = None, verified: Optional[Dict[str, Any]] = None
-        ) -> Dict[str, Any]:
+        tagger: Optional[Any] = None, verified: Optional[Dict[str, Any]] = None,
+        lane: str = DEFAULT_LANE) -> Dict[str, Any]:
     """Tag every indexed clip not already tagged at this model version. Returns the run report.
 
     ⚠️IT REFUSES TO START WITHOUT VERIFIED WEIGHTS. `WeightsRefused` propagates out of here; there
@@ -797,6 +909,9 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
     `conservation_ok: False` is a hard --check failure.
     """
     now = time.time() if now is None else now
+    if lane not in LANES:
+        raise ValueError("unknown lane %r; known: %s" % (lane, ", ".join(sorted(LANES))))
+    spec = LANES[lane]
     if verified is None:
         verified = verify_weights(model_dir)
     if tagger is None:
@@ -814,7 +929,8 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
     t["census_keys"] = census["keys"]
     index = CLIPS.read_index(root)
     t["index_keys"] = len(index)
-    held, t["versions_held"] = TAGS.read_resume(root)
+    held, t["versions_held"] = TAGS.read_resume(root, spec["store"])
+    t["lane"] = lane
 
     out_rows: List[Dict[str, Any]] = []
     t0 = time.time()
@@ -822,8 +938,8 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
     for row in work_order(index):
         node, day = row.get("node") or "?", _row_day(row)
         ck = row.get("clip_key")
-        if isinstance(ck, str) and TAGS.tag_key(ck, MODEL_NAME, MODEL_VERSION,
-                                                mb.get("sha256")) in held:
+        if isinstance(ck, str) and TAGS.tag_key(ck, MODEL_NAME, MODEL_VERSION, mb.get("sha256"),
+                                                spec["variant"]) in held:
             tally(t, node, day, "already_tagged")
             continue
         if stop_reason is None:
@@ -834,7 +950,7 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
         if stop_reason is not None:
             tally(t, node, day, "deferred")
             continue
-        got = tag_one(tagger, row, root, mb, floor=floor, now=now)
+        got = tag_one(tagger, row, root, mb, floor=floor, now=now, lane=lane)
         if got["ok"]:
             out_rows.append(got["row"])
             tally(t, node, day, "tagged", row=got["row"])
@@ -880,9 +996,9 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
 
     if write:
         if out_rows:
-            TAGS.append_tags(root, out_rows)
+            TAGS.append_tags(root, out_rows, spec["store"])
         _write_json_atomic(card_path(root), model_card(verified))
-        write_heartbeat(root, t, now=now)
+        write_heartbeat(root, t, now=now, lane=lane)
     return t
 
 
@@ -898,8 +1014,8 @@ def _distribution(vals: List[float]) -> Dict[str, Any]:
             "max": s[-1]}
 
 
-def write_heartbeat(root: str, report: Dict[str, Any], now: Optional[float] = None
-                    ) -> Dict[str, Any]:
+def write_heartbeat(root: str, report: Dict[str, Any], now: Optional[float] = None,
+                    lane: str = DEFAULT_LANE) -> Dict[str, Any]:
     """Merge this run into the heartbeat's ring, and record which refusal buckets are NEW.
 
     ⚠️A REASON APPEARING IN A NODE|DAY BUCKET THAT NEVER HAD IT IS AN EVENT, NOT A RATE. The rate
@@ -912,7 +1028,7 @@ def write_heartbeat(root: str, report: Dict[str, Any], now: Optional[float] = No
     and hear_score's run ring both exist to close.
     """
     now = time.time() if now is None else now
-    p = heartbeat_path(root)
+    p = heartbeat_path(root, lane)
     hb: Dict[str, Any] = {"runs": [], "buckets_ever": []}
     if os.path.exists(p):
         try:
@@ -960,6 +1076,8 @@ def write_heartbeat(root: str, report: Dict[str, Any], now: Optional[float] = No
         "new_buckets": new_buckets,
         "first_run": first_run,
         "observation_not_health": report.get("observation_not_health"),
+        "heard": report.get("heard") or {},
+        "lane": lane,
     }
     hb["runs"] = (hb["runs"] + [entry])[-RUN_RING:]
     _write_json_atomic(p, hb)
@@ -970,7 +1088,8 @@ def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
                min_mean_top_score: float = MEAN_TOP_SCORE_REPORT_ONLY,
                window_s: float = DEFAULT_RUN_WINDOW_S,
                max_stale_s: float = DEFAULT_MAX_STALE_S,
-               now: Optional[float] = None) -> Tuple[int, List[str]]:
+               now: Optional[float] = None,
+               lane: str = DEFAULT_LANE) -> Tuple[int, List[str]]:
     """(exit code, lines). Non-zero when tagging is not flowing, not when the period was quiet.
 
     ⚠️EVERY GATE HERE CAN ACTUALLY FAIL, AND THE ABSOLUTE ONES COME FIRST. A gate of the form "if
@@ -988,9 +1107,9 @@ def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
     a guess rather than from the measured envelope is the failure this repo names as its own.
     """
     now = time.time() if now is None else now
-    p = heartbeat_path(root)
+    p = heartbeat_path(root, lane)
     if not os.path.exists(p):
-        return 1, ["no heartbeat at %s -- hear-tag has never completed a run" % p]
+        return 1, ["no heartbeat at %s -- lane %s has never completed a run" % (p, lane)]
     try:
         hb = json.load(open(p))
     except Exception as exc:
@@ -999,7 +1118,7 @@ def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
     if not runs:
         return 1, ["heartbeat records no runs"]
 
-    lines, bad = [], 0
+    lines, bad = ["lane     %s" % lane], 0
     last = runs[-1]
     age = now - float(hb.get("last_run_s") or last.get("at") or 0.0)
     if age > max_stale_s:
@@ -1129,13 +1248,22 @@ def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
             reasons[k] = reasons.get(k, 0) + int(v)
     lines.append("refusals %s" % (json.dumps(reasons, sort_keys=True) if reasons
                                   else "none in the window"))
+    heard: Dict[str, Dict[str, int]] = {}
+    for r in window:
+        for node, groups in (r.get("heard") or {}).items():
+            h = heard.setdefault(node, {})
+            for g, n in groups.items():
+                h[g] = h.get(g, 0) + int(n)
+    lines.append("heard    %s  (OBSERVATION, not a gate; 'speech' is the model's null response, "
+                 "docs/clip-calibration-2026-09-10.md S2)" % format_heard(heard))
     obs = (last.get("observation_not_health") or {}).get("level_dbfs") or {}
     lines.append("levels   %s  (OBSERVATION, not a gate)" % json.dumps(obs, sort_keys=True))
     return (1 if bad else 0), lines
 
 
 def format_report(t: Dict[str, Any]) -> str:
-    out = ["index %d line(s) = %d clip(s) + %d superseded + %d unparseable"
+    out = ["lane %s" % t.get("lane", DEFAULT_LANE),
+           "index %d line(s) = %d clip(s) + %d superseded + %d unparseable"
            % (t["index_lines"], t["index_keys"], t["superseded"], t["unparseable"]),
            "tagged %d  refused %d  already-tagged %d  deferred %d  (%s)"
            % (t["tagged"], t["refused"], t["already_tagged"], t["deferred"],
@@ -1152,6 +1280,7 @@ def format_report(t: Dict[str, Any]) -> str:
         out.append("refusals by reason: " + json.dumps(t["by_reason"], sort_keys=True))
         for b in sorted(t["by_node_day_reason"]):
             out.append("  %-52s %d" % (b, t["by_node_day_reason"][b]))
+    out.append("heard (NOT a health input): " + format_heard(t.get("heard") or {}))
     out.append("observation (NOT a health input): "
                + json.dumps(t["observation_not_health"]["level_dbfs"], sort_keys=True)
                + "  silence-top frac %s" % t["silence_frac"])
@@ -1193,7 +1322,11 @@ def main(argv=None) -> int:
     ap.add_argument("--window-s", type=float, default=DEFAULT_RUN_WINDOW_S)
     ap.add_argument("--max-stale-s", type=float, default=DEFAULT_MAX_STALE_S)
     ap.add_argument("--json", action="store_true", help="machine-readable report on stdout")
+    ap.add_argument("--lane", action="append", choices=sorted(LANES),
+                    help="lane to run; repeat for several, which share one model load. "
+                         "--check reads exactly one. Default %s" % DEFAULT_LANE)
     a = ap.parse_args(argv)
+    lanes = a.lane or [DEFAULT_LANE]
 
     root = os.path.expanduser(a.pool)
 
@@ -1209,26 +1342,36 @@ def main(argv=None) -> int:
         return 2
 
     if a.check:
+        if len(lanes) != 1:
+            print("--check reads one lane; run it once per lane", file=sys.stderr)
+            return 2
         code, lines = check_tags(root, max_silence_frac=a.max_silence_frac,
                                  min_mean_top_score=a.min_mean_top_score,
-                                 window_s=a.window_s, max_stale_s=a.max_stale_s)
+                                 window_s=a.window_s, max_stale_s=a.max_stale_s, lane=lanes[0])
         print("\n".join(lines))
         return code
 
     try:
-        t = run(root, model_dir=a.model_dir, limit=a.limit, deadline_s=a.deadline_s,
-                floor=a.score_floor, write=not a.census)
+        verified = verify_weights(a.model_dir)
+        if not verified["ok"]:
+            raise WeightsRefused("; ".join(verified["problems"]))
+        mp, cp = weights_paths(a.model_dir)
+        tagger = Tagger(mp, cp)
+        reports = [run(root, model_dir=a.model_dir, limit=a.limit, deadline_s=a.deadline_s,
+                       floor=a.score_floor, write=not a.census, tagger=tagger,
+                       verified=verified, lane=lane) for lane in lanes]
     except WeightsRefused as exc:
         # ⚠️LOUD, AND EXIT 2 RATHER THAN 1, so a monitor can tell "the model is not what it says"
         # apart from "tagging is behind". A tagger that cannot name its weights must not run.
         print("REFUSED: the pinned weights did not verify, so nothing was tagged.\n  %s" % exc,
               file=sys.stderr)
         return 2
-    print(json.dumps(t, indent=2, sort_keys=True) if a.json else format_report(t))
+    for t in reports:
+        print(json.dumps(t, indent=2, sort_keys=True) if a.json else format_report(t))
     # ⚠️REFUSALS DO NOT FAIL THE RUN. A refused clip is data this tool read and correctly declined
     # to tag; failing on it would make a pruned backlog look like a broken tagger forever. What
     # fails is losing track of a row.
-    return 0 if t["conservation_ok"] else 1
+    return 0 if all(t["conservation_ok"] for t in reports) else 1
 
 
 if __name__ == "__main__":

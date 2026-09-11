@@ -1,6 +1,13 @@
 ---
-# ⚠️CREATED SUSPENDED, AND IT STAYS SUSPENDED UNTIL A HUMAN HAS LISTENED. All three of these must
-# hold before `kubectl patch cronjob hear-tag -n dama -p '{"spec":{"suspend":false}}'`:
+# ⚠️ENABLED 2026-09-11 BY THE OPERATOR, after the three conditions below were met on 2026-09-10.
+# To stop it: kubectl -n dama patch cronjob hear-tag -p '{"spec":{"suspend":true}}'
+#
+# TWO LANES, ONE MODEL LOAD. `--lane mn10` is the original whole-clip pass (clips/tags.jsonl,
+# state/tag_heartbeat.json, unchanged). `--lane mn10_pad10` scores the same normalised clip
+# zero-padded to the model's 10 s training length (clips/tags-mn10_pad10.jsonl); the measurement
+# is docs/clip-calibration-2026-09-10.md S4.
+#
+# The gate it was created behind:
 #
 #   1. clips/index.jsonl holds >= 300 rows with outcome "stored", across all three nodes, over at
 #      least 3 consecutive days. Below that the corpus cannot show what a normal day looks like.
@@ -52,12 +59,15 @@ metadata:
       69 heard by a human (25 from mach) and written up in docs/clip-calibration-2026-09-10.md
       with the labels in testdata/clip-labels-2026-09-10.jsonl; condition 3 met by RETIREMENT --
       the calibration set showed --max-silence-frac cannot separate healthy from broken, so the
-      canary is --min-mean-top-score instead. Unsuspending is now a human decision, not a
-      blocked one; the .onnx still has to be staged onto the PVC first.
+      canary is --min-mean-top-score instead. Enabled 2026-09-11 by the operator.
+    dama-hear/lanes: >-
+      mn10 (whole clip, clips/tags.jsonl) and mn10_pad10 (zero-padded to 10 s,
+      clips/tags-mn10_pad10.jsonl). Same weights, one load, separate resume sets and heartbeats.
 spec:
-  suspend: true
+  suspend: false
   # Twice an hour against a drain that runs every 15 minutes. Inference is ~12 ms per clip, so
-  # the cost is pod startup, not the model; --limit and --deadline-s bound the catch-up pass.
+  # the cost is pod startup, not the model; --limit and --deadline-s bound each lane's catch-up,
+  # and two 600 s lanes fit inside activeDeadlineSeconds.
   schedule: "12,42 * * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
@@ -129,6 +139,7 @@ spec:
                   exec python /app/tools/hear_tag.py \
                     --pool /pool/corpus \
                     --model-dir "$MODELS" \
+                    --lane mn10 --lane mn10_pad10 \
                     --limit 400 \
                     --deadline-s 600
               volumeMounts:
@@ -175,6 +186,10 @@ spec:
 # once RMS-normalised to -20 dBFS. So the fraction is worth watching. But the threshold has to
 # come from a measured calibration set, not from a number chosen today, and nobody has yet
 # listened to one clip. Set it in the SAME change that writes docs/clip-calibration-<date>.md.
+#
+# ⚠️EACH LANE IS CHECKED, AND THE JOB FAILS ON THE WORST. mn10_pad10 ships
+# --min-mean-top-score -1: on the calibration set its mean top score did not separate normalised
+# from un-normalised input (S4), so for that lane the number is reported, not gated.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -183,7 +198,7 @@ metadata:
   labels:
     app: hear-tag
 spec:
-  suspend: true
+  suspend: false
   schedule: "52 * * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
@@ -210,10 +225,15 @@ spec:
                 - |
                   set +e
                   export PYTHONPATH=/pool/pylib-tag:/app
-                  python /app/tools/hear_tag.py --pool /pool/corpus --check \
+                  python /app/tools/hear_tag.py --pool /pool/corpus --check --lane mn10 \
                     --window-s 7200 --max-stale-s 14400 --max-silence-frac -1 \
                     --min-mean-top-score 0.20
                   rc=$?
+                  python /app/tools/hear_tag.py --pool /pool/corpus --check --lane mn10_pad10 \
+                    --window-s 7200 --max-stale-s 14400 --max-silence-frac -1 \
+                    --min-mean-top-score -1
+                  rc2=$?
+                  [ "$rc2" -gt "$rc" ] && rc=$rc2
                   echo "--- weights ---"
                   python /app/tools/hear_tag.py --model-dir /pool/models/mn10_as --verify-weights || true
                   exit "$rc"
