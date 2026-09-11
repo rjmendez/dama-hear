@@ -41,6 +41,55 @@ class TestTheEmbedJobBringsItsOwnCuda:
         _script, env = _embed_script()
         assert int(env["TF_CPP_MIN_LOG_LEVEL"]) <= 1
 
+    def test_a_failed_install_still_reports_its_error(self):
+        script, _env = _embed_script()
+        install = script[script.index("pip install"):script.index('touch "$LIB/')]
+        assert ">/dev/null" in install and "2>&1" not in install
+
+
+def _ld_block():
+    """The manifest's own LD_LIBRARY_PATH lines, run as written."""
+    script, _env = _embed_script()
+    lines = script.splitlines()
+    start = next(i for i, l in enumerate(lines) if l.strip() == 'LD=""')
+    end = next(i for i, l in enumerate(lines) if l.strip().startswith("export LD_LIBRARY_PATH"))
+    return "\n".join(lines[start:end + 1]) + '\nprintf "%s" "$LD_LIBRARY_PATH"\n'
+
+
+def _run_ld(lib, ld_library_path=None):
+    import subprocess
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LIB": str(lib)}
+    if ld_library_path is not None:
+        env["LD_LIBRARY_PATH"] = ld_library_path
+    return subprocess.run(["/bin/sh", "-c", _ld_block()], capture_output=True, text=True,
+                          env=env)
+
+
+class TestTheLibraryPathHasNoEmptyElement:
+    """An empty entry on LD_LIBRARY_PATH means the current directory (Copilot, #57)."""
+
+    def _lib(self, tmp_path, names):
+        for n in names:
+            (tmp_path / "nvidia" / n / "lib").mkdir(parents=True)
+        return tmp_path
+
+    def test_an_empty_starting_path_adds_only_the_wheel_dirs(self, tmp_path):
+        lib = self._lib(tmp_path, ["cudnn", "cublas"])
+        r = _run_ld(lib)
+        assert r.returncode == 0, r.stderr
+        parts = r.stdout.split(":")
+        assert parts == sorted(parts) and all(parts), r.stdout
+        assert parts == [str(lib / "nvidia" / n / "lib") for n in ("cublas", "cudnn")]
+
+    def test_an_existing_path_is_kept_after_the_wheels(self, tmp_path):
+        lib = self._lib(tmp_path, ["cudnn"])
+        r = _run_ld(lib, "/usr/local/nvidia/lib")
+        assert r.stdout == "%s:/usr/local/nvidia/lib" % (lib / "nvidia" / "cudnn" / "lib")
+
+    def test_no_wheel_dirs_fails_instead_of_adding_a_glob(self, tmp_path):
+        r = _run_ld(tmp_path)
+        assert r.returncode != 0 and "*" not in r.stdout
+
 
 class TestTheReportSaysWhatTheScoresAre:
 
