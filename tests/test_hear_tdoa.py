@@ -422,10 +422,37 @@ class TestAdmit:
         null utc_trusted resolves trusted, and admitting an unstated one is the same answer."""
         rec = dict(P._record_from_node_row(node_row("nyquist", T0, seed=5)),
                    source="phone", node="nyquist", clock_tier="gnss", utc_trusted=None)
-        # a phone row still needs a latency entry once it clears the clock gate
+        # ⚠️THIS USED TO ASSERT D_LATENCY AND THE CHANGE IS THE FINDING, NOT A TEST REPAIR.
+        # A phone row now stops at `capture_path_bias` -- a CLASS property -- before the
+        # per-device --latency-cal gate below it is ever consulted, so admitting an unstated
+        # clock is still a no-op but for a different reason than it was. See
+        # test_the_latency_cal_gate_is_unreachable_for_a_phone for what that costs.
         r, _ = self._reasons(tmp_path, [], extra=[rec], sources=["node", "phone"],
                              clock_unstated="admit", heterogeneous_receivers=True)
-        assert r.get(HT.D_LATENCY) == 1, r
+        assert r.get(HT.D_CLOCK_UNSTATED) is None, r
+        assert r.get(HT.D_PATH_BIAS) == 1, r
+
+    def test_the_latency_cal_gate_is_unreachable_for_a_phone(self, tmp_path):
+        """⚠️A DEAD GATE, PINNED AS DEAD SO IT IS NOT MISTAKEN FOR A LIVE ONE. `capture_path_bias`
+        tests `nodeclass.get("gotchi-phone").path_bias_s`, a CLASS constant, and refuses before
+        the `--latency-cal` branch that would correct this row's timestamp by its own measured
+        offset. So a handset with a MEASURED calibration entry is refused exactly as one without:
+        running tools/hear_latency_cal.py does not, by itself, make a phone an arrival source --
+        somebody must also write the measured figure into nodeclass.py's `gotchi-phone` entry,
+        which is what that entry's own comment demands ("WHOEVER FILLS IN path_bias_s FROM A
+        CALIBRATION RUN MUST FILL IN THE SCATTER OF THAT RUN HERE IN THE SAME COMMIT").
+
+        Pinned rather than fixed: which of the two should win is a design decision for the
+        operator, and a silently dead gate is the thing worth preventing."""
+        rec = dict(P._record_from_node_row(node_row("nyquist", T0, seed=5)),
+                   source="phone", node="nyquist", clock_tier="gnss", utc_trusted=None)
+        r, _ = self._reasons(tmp_path, [], extra=[rec], sources=["node", "phone"],
+                             clock_unstated="admit", heterogeneous_receivers=True,
+                             latency_cal={"by_node_id": {"nyquist": 13_122_000}})
+        assert r.get(HT.D_LATENCY) is None
+        assert r.get(HT.D_PATH_BIAS) == 1, (
+            "a measured per-handset offset does not reach the correction: the class-level bias "
+            "gate refuses first, and no --latency-cal entry moves a class constant")
 
     def test_an_untrusted_clock_tier_is_refused(self, tmp_path):
         rec = dict(P._record_from_node_row(node_row("nyquist", T0, seed=6)),

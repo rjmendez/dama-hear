@@ -281,6 +281,43 @@ class TestTheBiasVerdictStaysSeparate:
         detail = [r["detail"] for r in a["ledger"] if r["drop_reason"] == TD.D_PATH_BIAS][0]
         assert "capture-path" in detail and "BIAS" in detail
 
+    def test_an_unclassed_phone_is_charged_its_own_class_and_not_a_xiao(self, tmp_path):
+        """⚠️THE HOLE BETWEEN THE TWO BRANCHES. The bias branch documented that survey.json MUST
+        carry `"class": "gotchi-phone"` on a phone; nothing enforced it. Unclassed, nodeclass
+        charges the strictest ARRIVAL class -- xiao-s3-pps, whose path_bias_s is the MEASURED
+        62.5 us of ITS OWN capture path -- so with the heterogeneous door open an unclassed phone
+        would clear the bias gate as a XIAO while carrying 13.122 ms = 4.50 m of its own.
+
+        On the 2026-09-11 pool it was refused anyway, on the CLOCK, because the XIAO's 100 us
+        capture term RSSes a stated 106 us over the 129.4 us bound. That holds only while a phone
+        states more than xiao-s3-pps.max_stated_clock_sigma_s() = 82.1 us; the lowest any handset
+        has stated is 100.0 us. This pins the refusal to the gate that is actually true of the
+        receiver, at a sigma BELOW that margin where the old arithmetic admitted it."""
+        root = tmp_path / "pool"
+        (root / "records" / "2026-09-10").mkdir(parents=True)
+        row = {"anchored": True, "ts_utc_s": 1788998406.636, "node": "handset",
+               "source": "phone", "key": "k1", "clock_tier": "gnss",
+               "sync_sigma_ns": 40_000.0, "onset_found": True, "utc_trusted": True}
+        (root / "records" / "2026-09-10" / "phone.jsonl").write_text(json.dumps(row) + "\n")
+        sv = SV.Survey(positions={1: (0.0, 0.0, 0.0)}, names={1: "handset"},
+                       sigma_m={1: 0.5}, classes={},          # ⚠️NO class key: the whole point
+                       origin={"lat_deg": 40.0, "lon_deg": -76.0, "h_ell_m": 0.0})
+        policy = {"sources": ["phone"], "days": [], "since": None, "until": None,
+                  "lookback_h": 10000.0, "settle_s": 0.0, "clock_unstated": "admit",
+                  "onset_unstated": "admit", "max_sync_sigma_ns": None, "latency_cal": {},
+                  "heterogeneous_receivers": True}
+        # 40 us clears xiao-s3-pps too: sqrt(100^2 + 40^2) = 107.7 us, inside 129.4 us. So the
+        # OLD arithmetic reached the bias gate and passed it on the XIAO's measured 62.5 us.
+        assert NC.get("xiao-s3-pps").stamp_admissible(40_000.0) is True
+        assert NC.get("xiao-s3-pps").capture_bias_bounded() is True
+        a = TD.admit(str(root), sv, sv, policy, now=1788998606.0)
+        assert a["n_admitted"] == 0, "an unclassed phone must never be admitted as a XIAO"
+        assert a["by_reason"].get(TD.D_PATH_BIAS) == 1, (
+            "and the reason must be its own capture path, not a clock it is inside")
+        assert TD.gate_class("phone", None) == "gotchi-phone"
+        assert TD.gate_class("node", None) is None
+        assert TD.gate_class("phone", "xiao-s3-pps") == "xiao-s3-pps", "the survey's word wins"
+
     def test_a_node_row_is_untouched_by_the_new_gate(self, tmp_path):
         """⚠️THE REGRESSION GUARD. The bias gate charges an unclassed receiver the strictest
         arrival class, whose path_bias_s is MEASURED and bounded, so every node row passes it --
