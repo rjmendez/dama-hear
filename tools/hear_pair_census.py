@@ -343,9 +343,12 @@ def main(argv=None) -> int:
                          "with a measured entry is judged on its OWN bias, not the blended "
                          "class-wide gotchi-phone constant")
     ap.add_argument("--phone-accuracy-m", action="append", default=[], metavar="NAME=METRES",
-                    help="--receiver-census only: a phone's OWN measured GPS horizontal accuracy "
-                         "(repeatable). Not read from anywhere automatically -- state where the "
-                         "number came from when you pass it")
+                    help="--receiver-census only: a phone's horizontal position ERROR against "
+                         "truth, metres (repeatable), e.g. its residual against RTK-PPK labels. "
+                         "NOT gotchi_gps_sync.accuracy_m: that is the chipset's self-report, and "
+                         "against PPK truth it under-claims 61.9%% of the time (claim p50 4.86 m, "
+                         "actual p50 5.64 m, n=104,010). Not read from anywhere automatically -- "
+                         "state where the number came from when you pass it")
     a = ap.parse_args(argv)
 
     sv = SV.load_survey(os.path.expanduser(a.survey))
