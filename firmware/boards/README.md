@@ -6,7 +6,7 @@ must be identical across boards or the nodes are not comparable.
 
 ## Why this exists
 
-`night_node.ino` reached 2702 lines with its pin map spread through it as bare `#define`s, and
+`hear_node.ino` reached 2702 lines with its pin map spread through it as bare `#define`s, and
 `puc_node.ino` began as a second copy of the same scaffolding because there was nowhere for the
 differences to live. Two boards is where that stops being tolerable: a third would mean a third
 copy of the OTA failback, the UTC anchor and `csv_open`, and those are the parts that took the

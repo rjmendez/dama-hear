@@ -36,14 +36,11 @@ TAGS_NAME = "tags.jsonl"
 #: imported so that a bundle carrying tags.py without clips.py still parses; the two are checked
 #: against each other by tests/test_hear_tag.py.
 CLIP_PRE_S = 1.0
-#: ⚠️FALLBACK ONLY -- see hear/clips.py. Two clip geometries are live in the corpus at once
-#: (1.0+3.0 s at 16 kHz, 1.0+4.0 s at 48 kHz); `sample_window` reads the length off the row and
-#: uses this only when the row has no body to read it from.
 CLIP_POST_S = 4.0
 FS_NOMINAL_HZ = 16000.0
 
-#: How many scene rows one overlap query will return before it says it truncated. A 4.0 s clip
-#: covers 4 or 5 rows of 1.024 s, so anything near this cap means the query matched something it
+#: How many scene rows one overlap query will return before it says it truncated. A 5.0 s clip
+#: covers 5 or 6 rows of 1.024 s, so anything near this cap means the query matched something it
 #: should not have -- it is a tripwire, not a page size.
 SCENE_ROWS_CAP = 64
 
@@ -145,60 +142,17 @@ def append_tags(root: str, rows) -> int:
     return n
 
 
-def _post_s(row: Dict[str, Any]) -> float:
-    """The clip's post-roll, read off the row rather than assumed.
-
-    ⚠️CLIP_POST_S IS THE FALLBACK, NOT THE ANSWER. The 16 kHz era wrote 1.0 + 3.0 s and the
-    48 kHz firmware writes 1.0 + 4.0 s, and both are in the corpus right now -- a window built
-    from one constant is 1.0 s wrong at the END for every clip of the other era. hear/clips.py
-    derives `dur_s` at index time (mis-header corrected) precisely so this can be a lookup, and
-    the pre-roll is 1.0 s in both eras, which is what makes the split recoverable from a total.
-    """
-    total = row.get("dur_s")
-    if total is None:
-        total = _v1_total_s(row.get("bytes"), row.get("wav_header_fs_hz"))
-    if total is None or not (CLIP_PRE_S < total <= 8.0):
-        return CLIP_POST_S
-    return total - CLIP_PRE_S
-
-
-#: The clip lengths this fleet writes and the rates it clocks. Repeated from hear/clips.py rather
-#: than imported, because clips.py imports THIS module; test_hear_tag asserts the copies agree.
-_GEOMETRIES_S = (4.0, 5.0)
-_GEOMETRY_TOL = 0.02
-_FLEET_RATES_HZ = (16000.0, 32000.0, 48000.0)
-
-
-def _v1_total_s(n_bytes, header_fs) -> Optional[float]:
-    """A v1 row's length, for rows written before `dur_s` existed. None when unknowable.
-
-    ⚠️NOT bytes / header rate. v1 rows include 48 kHz clips headed 16000 Hz, which that division
-    reads as 15.0 s. The header is believed only when it yields a length the fleet writes;
-    otherwise exactly one fleet rate must, or nothing is claimed.
-    """
-    if not n_bytes or not header_fs:
-        return None
-    n = (int(n_bytes) - 44) / 2.0
-    def is_geom(d):
-        return any(abs(d - g) <= g * _GEOMETRY_TOL for g in _GEOMETRIES_S)
-    at_header = n / float(header_fs)
-    if is_geom(at_header):
-        return at_header
-    hits = [n / r for r in _FLEET_RATES_HZ if is_geom(n / r)]
-    return hits[0] if len(hits) == 1 else None
-
-
 def sample_window(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """The clip's window in the node's own sample counter, or None when the name carried none.
 
-    night_node.ino:1848 writes the clip from `d.sample - CLIP_PRE_SAMPLES`, and clip_name()
+    hear_node.ino:1848 writes the clip from `d.sample - CLIP_PRE_SAMPLES`, and clip_name()
     embeds `d.sample` -- the TRIGGER, not the window start. Deriving the start here is what stops
     every consumer re-deriving CLIP_PRE_SAMPLES for itself and getting it 1.0 s wrong.
     """
     s = row.get("sample")
     if s is None:
         return None
-    post = _post_s(row)
+    post = CLIP_POST_S
     return {"node": row.get("node"), "boot": row.get("boot"),
             "start_sample": int(s) - int(CLIP_PRE_S * FS_NOMINAL_HZ),
             "end_sample": int(s) + int(post * FS_NOMINAL_HZ),
@@ -227,7 +181,7 @@ def _span_s(r: Dict[str, Any]) -> Optional[float]:
 
 
 def _days_touched(t0: float, t1: float) -> List[str]:
-    """The UTC day partitions a [t0, t1] window can land in. A 4.0 s clip at 23:59:58 straddles
+    """The UTC day partitions a [t0, t1] window can land in. A 5.0 s clip at 23:59:58 straddles
     midnight, and scanning only its start day would silently drop the rows after it."""
     import datetime as _dt
     out = []
@@ -248,7 +202,7 @@ def scene_overlap(pl, row: Dict[str, Any], *, allow_sample_basis: bool = False,
     -> {"basis": "utc"|"sample"|"none", "rows": [...], "refused": str|None, "weak": bool,
         "weakness": str|None, "truncated": bool, "scanned": int, "refused_records": int}
 
-    ⚠️A 4.0 s clip against 1.024 s scene rows is 64000/16384 = 3.906 rows, so the answer is 4 or 5
+    ⚠️A 5.0 s clip against 1.024 s scene rows is 80000/16384 = 4.883 rows, so the answer is 5 or 6
     depending on phase and NEVER fewer. A query returning 0 on an anchored clip means the scene
     store does not hold that node/day, which is a real finding and is returned as an empty list
     with basis "utc" -- not as a refusal, and not as a silent fallback to the sample basis.
@@ -344,7 +298,7 @@ SKETCH_BACK_S = 0.004
 def _sketch_span_s(fs_hz: Any) -> Optional[float]:
     """The sketch's own window length in seconds, at the rate IT was cut at.
 
-    night_node.ino: `SKETCH_SPAN = NFFT + (FRAMES-1)*HOP` samples. NFFT is a SAMPLE count, so its
+    hear_node.ino: `SKETCH_SPAN = NFFT + (FRAMES-1)*HOP` samples. NFFT is a SAMPLE count, so its
     duration depends on fs -- 256/16000 = 16 ms, 256/48000 = 5.33 ms -- while HOP_S is a fixed
     4 ms grid regardless of fs. That is why docs/acoustic-stack.md measures the sketch window at
     33-44 ms rather than one number: 5.33 + 7*4 = 33.3 ms at 48 kHz, 16 + 7*4 = 44 ms at 16 kHz,
@@ -385,7 +339,7 @@ def sketch_overlap(pl, row: Dict[str, Any], *, source: str = "node",
                    allow_sample_basis: bool = False,
                    max_rows: int = SCENE_ROWS_CAP) -> Dict[str, Any]:
     """READ-ONLY. The pooled sketches (dets/detection records, hear.pool's `records` store) whose
-    ~33-44 ms window overlaps this clip's 4.0 s window.
+    ~33-44 ms window overlaps this clip's 5.0 s window.
 
     `pl` is a hear.pool.Pool, taken as an argument, never imported -- see the module docstring;
     the same reason `scene_overlap` does it. `row` is one clips/index.jsonl row.
@@ -395,7 +349,7 @@ def sketch_overlap(pl, row: Dict[str, Any], *, source: str = "node",
 
     One row of `rows` carries `is_trigger: True` when its `key` equals `row["record_key"]` -- the
     clip's OWN triggering sketch, already joined by identity and not by a window guess. Every
-    other row is a DIFFERENT detection that happened to fall inside the same 4.0 s clip; on the
+    other row is a DIFFERENT detection that happened to fall inside the same 5.0 s clip; on the
     live fleet a retrigger inside `CLIP_DEDUPE_SAMPLES` is common, so 2+ rows is a real finding,
     not a bug.
 
@@ -472,7 +426,7 @@ def sketch_overlap(pl, row: Dict[str, Any], *, source: str = "node",
             continue
         # ⚠️TWO RATES, ONE ROW. `span` is a TIME and depends on the frame's own rate (fs_hz is
         # 48000.0 for every node frame cut after the acquisition-rate move). `sample` is a
-        # DECIMATED position -- night_node.ino writes `dets[idx].sample = g_samples + i` and
+        # DECIMATED position -- hear_node.ino writes `dets[idx].sample = g_samples + i` and
         # deliberately keeps it there -- so FS_NOMINAL_HZ is the only rate that turns a time into
         # this counter's samples, and it is the rate sample_window() built cs0/cs1 with. Using
         # the frame's rate here makes the window 3x too long and starts it 3x too far back.

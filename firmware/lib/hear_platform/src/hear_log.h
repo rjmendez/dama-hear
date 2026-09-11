@@ -1,6 +1,6 @@
 // Boot log ring, served over HTTP so a deployed node can be asked what happened at boot.
 //
-// FIRST module out of night_node.ino, chosen because everything else calls logf() and because it
+// FIRST module out of hear_node.ino, chosen because everything else calls logf() and because it
 // is small enough that if the library mechanism does not work, little is lost proving it.
 #pragma once
 #include <Arduino.h>

@@ -6,7 +6,7 @@ mark_healthy_once() were copy-pasted into both sketches and the copies drifted:
     mark_healthy_once()   45.2% identical
     boot_guard()          80.9% identical
 
-night_node's copy refused to mark an image healthy unless the node was reachable, and said why.
+hear_node's copy refused to mark an image healthy unless the node was reachable, and said why.
 puc_node's copy marked healthy after 30 s unconditionally, set proven_ok, and thereby switched off
 its own partition revert permanently -- on a node that tracks sta_ok in seven other places. The
 warning did not travel with the copy, which is what copies do.
@@ -21,7 +21,7 @@ import re
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SKETCHES = [ROOT / "firmware" / "night_node" / "night_node.ino",
+SKETCHES = [ROOT / "firmware" / "hear_node" / "hear_node.ino",
             ROOT / "firmware" / "puc_node" / "puc_node.ino"]
 LIB = ROOT / "firmware" / "lib" / "hear_platform" / "src"
 

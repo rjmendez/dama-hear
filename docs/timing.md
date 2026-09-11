@@ -81,7 +81,7 @@ returns the requested time exactly while the audio underneath is shifted.
 * **`i2s.measured_hz` was cumulative-over-cumulative**, so one stall poisoned it for the run. The
   two live nodes served 7984.6726 Hz (-500,958 ppm) and 15332.5601 Hz (-41,715 ppm) through it,
   and it is not an unread diagnostic: it is the headline of the node's own web page and what
-  `firmware/night_node/watch.py` announces. Now the drop-free cumulative rate, reported with the
+  `firmware/hear_node/watch.py` announces. Now the drop-free cumulative rate, reported with the
   `clean_s` it averaged over.
 * **`esp_clock.ppm_vs_gps` divided the whole span by `pps_count - 1`**, which counts edges seen,
   not seconds elapsed. mach read a median 3206 ppm and a maximum 37,988 ppm that way while

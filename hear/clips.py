@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """The clip store: names off a node, WAV bytes into the pool, and one append-only index of both.
 
-⚠️NOT ONE CLIP HAD EVER LEFT A NODE. Measured 2026-09-09 across the fleet: 625 clips written,
-~478 already destroyed. Every node writes 4.0 s WAVs into /clips against a 6,291,456 B budget --
-exactly 49 files of 128,044 B -- and evicts to make room. The pool is the archive; the card is a
-buffer that is already full on all three nodes (`budget_left_clips 0`).
+Every node writes 5.0 s 48 kHz WAVs into /clips, a rolling window of 13 files (6,291,456 B of
+480,044 B each) that evicts its oldest to make room. The drain fetches a clip before it rolls off,
+and the pool holds it for identification under its own byte cap.
 
 WHAT THIS MODULE IS FOR, and what it deliberately is not:
 
@@ -30,36 +29,20 @@ import json
 import os
 import re
 import shutil
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-#: 2 adds `dur_s` and `header_rate_suspect`. ⚠️A v1 row carries neither, and v1 rows DO include
-#: mis-headed 48 kHz clips -- they were stored before this field existed. A reader must not take
-#: bytes / wav_header_fs_hz at face value for a v1 row; hear/tags.py `_post_s` re-derives the
-#: length by the same uniqueness rule header_rate_suspect() uses.
-CLIP_SCHEMA_VERSION = 2
-#: 44-byte canonical header + 64000 samples * 2 bytes, at the 16 kHz / 4.0 s geometry.
-#: ⚠️KEPT ONLY AS THE HISTORICAL SIZE. It is NOT a validity test any more -- see wav_probe.
-CLIP_BYTES_16K_4S = 128044
-
-#: What a clip may be, as a DURATION rather than a byte count. The node's geometry has already
-#: changed once -- 4.0 s at 16 kHz became 5.0 s at 48 kHz, 128044 B to 480044 B -- and the fixed
-#: total here did not move with it, so the drain refused every clip the fleet wrote
-#: ("total_480044_expected_128044") while reporting itself healthy. A magic number layered on a
-#: SELF-DESCRIBING format is what made a firmware change into silent data loss.
+#: 3 drops `header_rate_suspect`: one clip geometry, and old clips roll off.
+CLIP_SCHEMA_VERSION = 3
+#: What a clip may be, as a duration: the header proves the body, not a byte count.
 CLIP_MIN_S, CLIP_MAX_S = 0.5, 30.0
 CLIP_PRE_S = 1.0
-#: ⚠️A FALLBACK, NOT THE TRUTH. Both clip geometries are live in the corpus at once: the 16 kHz
-#: era wrote 1.0 + 3.0 s (128044 B) and the 48 kHz firmware writes 1.0 + 4.0 s (480044 B, sized
-#: for Perch's non-overlapping 5 s window). Pinning one number here is the same mistake
-#: CLIP_BYTES_16K_4S was -- so `clip_total_s()` reads it off the clip and this is only what a row
-#: with no body falls back to. The PRE-roll is 1.0 s in both, which is what makes the split
-#: derivable at all.
 CLIP_POST_S = 4.0
+#: The firmware writes exactly this many seconds per clip.
+CLIP_TOTAL_S = CLIP_PRE_S + CLIP_POST_S
+#: Slack on a header-derived duration: the header's integer rate against the node's clock.
+CLIP_DUR_TOL = 0.02
 CLIP_DIR = "/clips"
 INDEX_NAME = "index.jsonl"
-FS_NOMINAL_HZ = 16000.0
-#: Measured header spread is 15986-16000 Hz; 64 Hz is 4x the observed 14 Hz.
-FS_TOLERANCE_HZ = 64.0
 
 #: Every terminal and non-terminal state one clip can be in. `index_row` refuses anything else --
 #: an outcome that is not on this list cannot be counted, and an uncounted refusal is the failure
@@ -70,10 +53,10 @@ OUTCOMES = ("stored", "already_held", "evicted_before_fetch", "refused_bad_body"
 
 #: Once an index row reaches one of these, the name is never probed again. Without it the drain
 #: re-probes 321 already-dead nyquist names every 15 minutes forever (measured 2026-09-09).
-#: ⚠️`probed_404` IS DELIBERATELY NOT HERE. night_node.ino:2436 answers 404 for ANY failed
+#: ⚠️`probed_404` IS DELIBERATELY NOT HERE. hear_node.ino:2436 answers 404 for ANY failed
 #: SD.open, not only for a missing file: max_files is 8 and the long-lived set reaches 6
 #: (dets.csv + scene.csv + the open clip + /ls's directory and entry + health.csv) with
-#: clip_evict_worse_than() taking 2 more during an eviction (night_node.ino:1725-1731). One
+#: the pre-FIFO firmware's clip_evict_worse_than() taking 2 more during an eviction. One
 #: descriptor-exhausted moment must not retire a clip that is still on the card.
 TERMINAL_OUTCOMES = ("stored", "evicted_before_fetch")
 
@@ -81,10 +64,14 @@ TERMINAL_OUTCOMES = ("stored", "evicted_before_fetch")
 #: confirming the 321 already-dead nyquist names costs one extra ~32 s pass, once.
 CONFIRM_404 = 2
 
-#: ⚠️BOTH SHIPPED SHAPES. The flashed fleet writes `<node>-<boot>-<sample>.wav`; the checkout's
-#: clip_name() prepends `%02u-` priority. A parser that knew only one would refuse the entire
-#: live fleet or the entire next reflash.
-_NAME_RE = re.compile(r"^(?:(\d{2})-)?([A-Za-z0-9_]+)-([0-9a-fA-F]+)-(\d+)\.wav$")
+#: ⚠️EVERY SHIPPED SHAPE. The oldest firmware wrote `<node>-<8 hex boot>-<sample>.wav`, the
+#: priority-eviction firmware prepended `%02u-`, and the FIFO firmware writes a 12 hex boot
+#: (6 hex boot sequence + 6 random). Older names stay on a card until they are evicted.
+#: A node id may contain dashes: gen_secrets.py allows them and a build without NODE_ID names
+#: itself `hear-<mac tail>` (rankine's 30 `hear-5c4c94` clips were refused as bad_name).
+_NODE = r"[A-Za-z0-9_][A-Za-z0-9_-]*"
+_FIFO_RE = re.compile(r"^(%s)-([0-9a-f]{12})-(\d{10})\.wav$" % _NODE)
+_NAME_RE = re.compile(r"^(?:(\d{2})-)?(%s)-([0-9a-fA-F]+)-(\d+)\.wav$" % _NODE)
 _MAX_BASENAME = 64
 
 
@@ -111,12 +98,31 @@ def parse_clip_name(name: str) -> Dict[str, Any]:
     if len(basename) > _MAX_BASENAME:
         raise ValueError("clip basename is %d chars, over the %d cap" % (len(basename),
                                                                         _MAX_BASENAME))
-    m = _NAME_RE.match(basename)
-    if not m:
-        raise ValueError("clip basename %r is not <prio->?<node>-<boot>-<sample>.wav" % basename)
-    prio, node, boot, sample = m.groups()
+    m = _FIFO_RE.match(basename)
+    if m:
+        prio, (node, boot, sample) = None, m.groups()
+    else:
+        m = _NAME_RE.match(basename)
+        if not m:
+            raise ValueError("clip basename %r is not <prio->?<node>-<boot>-<sample>.wav" % basename)
+        prio, node, boot, sample = m.groups()
     return {"raw": raw, "basename": basename, "node": node, "boot": boot,
             "sample": int(sample), "prio": None if prio is None else int(prio)}
+
+
+_FIFO_TAIL_RE = re.compile(r"-([0-9a-fA-F]{12})-(\d{10})\.wav$")
+
+
+def eviction_key(basename: str) -> Tuple[Any, ...]:
+    """Sort key that orders clips the way the node evicts them, oldest first.
+
+    Mirrors firmware/hear_node/clip_order.h (tests/test_clip_eviction.py runs both on the same
+    names): any name not of the FIFO shape first, by name; then by (boot sequence, sample).
+    """
+    m = _FIFO_TAIL_RE.search(basename)
+    if m is None or m.start() == 0 or int(m.group(2)) > 0xFFFFFFFF:
+        return (0, basename)
+    return (1, int(m.group(1)[:6], 16), int(m.group(2)), basename)
 
 
 def clip_key(node: str, boot: str, sample: int) -> str:
@@ -165,9 +171,8 @@ def index_path(root: str) -> str:
 def wav_probe(body: bytes) -> Dict[str, Any]:
     """Parse the 44-byte canonical header. No audio is decoded.
 
-    ⚠️IT DOES NOT REQUIRE 16000 Hz. mach shipped a whole boot headed 22624 Hz, and refusing it
-    here would delete the evidence of the fs_clean latch bug rather than record it. The rate is
-    REPORTED; whether it is usable is the tagger's decision, not the store's.
+    The rate is REPORTED, not required; whether it is usable is the tagger's decision, not the
+    store's.
     """
     out: Dict[str, Any] = {"ok": False, "reason": None, "fs_hz": None, "channels": None,
                            "bits": None, "data_bytes": None, "total_bytes": len(body), "dur_s": None, "fs_nameable": None}
@@ -206,11 +211,9 @@ def wav_probe(body: bytes) -> Dict[str, Any]:
     # ⚠️THE HEADER ALREADY PROVED THE BODY. `44 + data_bytes == len(body)` above catches a
     # truncated or padded fetch, so what is left to check is whether this is a PLAUSIBLE CLIP --
     # a question about duration and rate, not about one firmware's byte count.
-    # ⚠️A RATE THIS FORMAT CANNOT NAME IS REPORTED, NOT REFUSED. mach once wrote a whole boot
-    # headed 22624 Hz while its CSV said 16000; refusing on the header would have discarded every
-    # clip of it. `fs_nameable` travels with the row so the disagreement stays visible and the
-    # tagger decides -- which is the same rule the index already follows by carrying BOTH the
-    # header rate and the dets rate side by side.
+    # A rate this format cannot name is reported, not refused: `fs_nameable` travels with the row
+    # and the tagger decides, the same rule the index follows by carrying both the header rate and
+    # the dets rate.
     if not out["fs_hz"]:
         out["reason"] = "fs_zero"
         return out
@@ -223,169 +226,6 @@ def wav_probe(body: bytes) -> Dict[str, Any]:
     return out
 
 
-#: Decimation between the acquisition rate the clip is written at and the FS_NOMINAL rate every
-#: other lane runs at. Mirrors DECIM in night_node.ino.
-CLIP_DECIM_CANDIDATES = (2, 3, 4)
-#: Acquisition rates a node may legally clock the mic at, for confirming a suspected mis-header.
-#: MSM261D3526H1CPM Standard Performance Mode caps at 62.5 kHz; 32000 is the earlier target.
-CLIP_ACQ_RATES_HZ = (32000.0, 48000.0)
-#: A clip longer than this cannot be a clip -- the firmware writes a fixed CLIP_SAMPLES and
-#: refuses rather than shortening. Used only to notice a header that must be lying.
-CLIP_PLAUSIBLE_MAX_S = 8.0
-#: ⚠️EVERY CLIP LENGTH THIS FLEET HAS EVER WRITTEN. 4.0 s is the 16 kHz era (1.0 + 3.0); 5.0 s is
-#: the 48 kHz firmware (1.0 + 4.0), sized so Perch's non-overlapping 5 s window is not padded with
-#: fabricated silence. A correction is only accepted when it lands on one of these -- a duration
-#: "in a plausible range" is not evidence, and admitting a range is what let the /2 reading of a
-#: /3 mis-header look just as good as the right one.
-CLIP_GEOMETRIES_S = (4.0, 5.0)
-#: Clock drift on the header's integer rate. 2% is ~30x the 14 Hz observed header spread.
-CLIP_GEOMETRY_TOL = 0.02
-#: Rates a node is ever configured to clock the microphone at. Mirrors hear/resample.py, repeated
-#: rather than imported: clips.py ships in bundles that resample.py is not in.
-FLEET_ACQ_RATES_HZ = (16000.0, 32000.0, 48000.0)
-FLEET_RATE_TOL = 0.005
-
-
-def header_rate_suspect(probe: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Is this clip's header rate provably wrong, and by what integer factor?
-
-    ⚠️night_node.ino stamped every 48 kHz clip with the FS_NOMINAL timebase for the whole of the
-    48 kHz rollout: the body is CLIP_SAMPLES at FS_ACQ, the header said ~16000 Hz. A 5.0 s clip
-    reads back as 15.0 s and plays an octave and a half low, and NOTHING downstream could catch
-    it -- 16000 is exactly the rate hear_tag.py's assert_rate wants, so the lying header walks
-    straight past the guard built to stop wrong-rate audio reaching a model. Fixed in firmware,
-    but clips written before the reflash are on the PVC and are not rewritable.
-
-    ⚠️IT REFUSES TO GUESS, AND THE UNIQUENESS CHECK IS THE WHOLE OF THAT. A correction is
-    returned only when EXACTLY ONE factor closes: the recovered duration must land on a length
-    this fleet actually writes AND the recovered rate on one the mic can legally be clocked at.
-    Written first against a plausible RANGE instead, a 15.0 s body matched /2 (7.5 s at 32 kHz)
-    before it matched the correct /3 (5.0 s at 48 kHz), and returned the first hit. Two readings
-    that both close means the header is not recoverable, not that the first one wins.
-    """
-    fs = probe.get("fs_hz")
-    dur = probe.get("dur_s")
-    if not fs or not dur or dur <= CLIP_PLAUSIBLE_MAX_S:
-        return None
-    hits = []
-    for d in CLIP_DECIM_CANDIDATES:
-        true_fs = float(fs) * d
-        if not any(abs(true_fs - r) <= FS_TOLERANCE_HZ * d for r in CLIP_ACQ_RATES_HZ):
-            continue
-        true_dur = dur / d
-        if not any(abs(true_dur - g) <= g * CLIP_GEOMETRY_TOL for g in CLIP_GEOMETRIES_S):
-            continue
-        hits.append((d, true_fs, true_dur))
-    if len(hits) != 1:
-        return None
-    d, true_fs, true_dur = hits[0]
-    return {"header_fs_hz": float(fs), "true_fs_hz": true_fs, "decim": d,
-            "header_dur_s": dur, "true_dur_s": true_dur,
-            "why": ("body is %.1f s at the header's %g Hz, which is not a length this fleet "
-                    "writes; at %g Hz it is %.2f s -- the FS_NOMINAL-stamped 48 kHz clip bug"
-                    % (dur, fs, true_fs, true_dur))}
-
-
-def length_implies_rate(n_samples: int, header_fs: float,
-                        csv_fs: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    """A header rate nobody clocks -> the fleet rate its LENGTH says it must be. Or None.
-
-    ⚠️A DIFFERENT DEFECT FROM header_rate_suspect, WITH A DIFFERENT SHAPE. That one is a
-    decimation mismatch: the body is at FS_ACQ, the header at FS_NOMINAL, and the two are an
-    integer factor apart. This one is a rate that was simply LATCHED WRONG -- mach shipped a whole
-    boot headed 22624/22848 Hz over 16 kHz audio, and 22848/16000 is not an integer anything. The
-    only handle on it is that 64000 samples is 2.80 s at the header's rate, which is not a length
-    this fleet writes, and 4.00 s at 16 kHz, which is.
-
-    ⚠️IT ONLY LOOKS AT A HEADER THAT IS ALREADY IMPOSSIBLE. A rate the fleet clocks is left alone
-    even if the length is odd -- then the LENGTH is the anomaly and rewriting the rate to explain
-    it away would be exactly backwards.
-
-    ⚠️UNIQUENESS IS THE PROOF. Exactly one fleet rate must turn the sample count into a length
-    this fleet writes; two candidates or none means the header is not recoverable.
-
-    ⚠️THE CSV IS NOT INDEPENDENT EVIDENCE, AND ASSUMING IT WAS COST A CLIP. This function first
-    required `csv_fs` to agree with the recovered rate. It does not, on the very boot this exists
-    for: mach-a75b9e4c has BOTH the header and dets.csv at 22848 Hz, so the veto fired and the
-    clip stayed broken. night_node.ino writes both from `fs_timebase()` -- the clip header at
-    :1958 and the detection row at :3498 -- so when `fs_clean` latches wrong, both inherit it.
-    Their DISAGREEMENT is informative and is why they travel side by side; their AGREEMENT is one
-    measurement written twice.
-
-    So `csv_fs` may only veto when it names a rate the fleet ACTUALLY CLOCKS and that rate is not
-    the recovered one -- a real three-way disagreement. A `csv_fs` that merely echoes an
-    impossible header carries no information and is ignored.
-    """
-    if not n_samples or not header_fs or header_fs <= 0:
-        return None
-    for r in FLEET_ACQ_RATES_HZ:
-        if abs(float(header_fs) - r) <= r * FLEET_RATE_TOL:
-            return None                     # the header names a rate we really do clock
-    hits = []
-    for r in FLEET_ACQ_RATES_HZ:
-        d = n_samples / r
-        if any(abs(d - g) <= g * CLIP_GEOMETRY_TOL for g in CLIP_GEOMETRIES_S):
-            hits.append((r, d))
-    if len(hits) != 1:
-        return None
-    r, d = hits[0]
-    csv_names_a_fleet_rate = bool(csv_fs) and any(
-        abs(float(csv_fs) - q) <= q * FLEET_RATE_TOL for q in FLEET_ACQ_RATES_HZ)
-    if csv_names_a_fleet_rate and abs(float(csv_fs) - r) > r * FLEET_RATE_TOL:
-        return None                         # a real three-way disagreement: recover nothing
-    return {"header_fs_hz": float(header_fs), "true_fs_hz": r, "true_dur_s": d,
-            "header_dur_s": n_samples / float(header_fs),
-            "csv_fs_hz": None if csv_fs is None else float(csv_fs),
-            "csv_was_independent": csv_names_a_fleet_rate,
-            "why": ("header states %g Hz, which this fleet never clocks; %d samples is %.2f s "
-                    "there and %.2f s at %g Hz, the one rate that makes it a clip -- the latched "
-                    "fs_clean bug, not a decimation mismatch"
-                    % (header_fs, n_samples, n_samples / float(header_fs), d, r))}
-
-
-def clip_total_s(row: Dict[str, Any]) -> Optional[float]:
-    """The clip's length in seconds from its OWN header, mis-header corrected. None if unknowable.
-
-    Both geometries are live in the corpus at once -- 1.0+3.0 s at 16 kHz and 1.0+4.0 s at
-    48 kHz -- so a caller that needs the window has to read it off the clip. CLIP_PRE_S is 1.0 s
-    in both, which is the only reason the pre/post split is derivable from a total.
-    """
-    n = row.get("bytes")
-    fs = row.get("wav_header_fs_hz")
-    if not n or not fs:
-        return None
-    dur = (int(n) - 44) / float(int(fs) * 2)
-    fix = (header_rate_suspect({"fs_hz": fs, "dur_s": dur})
-           or length_implies_rate((int(n) - 44) // 2, fs, row.get("fs_hz")))
-    return fix["true_dur_s"] if fix else dur
-
-
-def _post_s_of(probe: Optional[Dict[str, Any]], csv_fs: Optional[float] = None) -> float:
-    """Post-roll from the clip's own length; CLIP_POST_S only when there is no clip to read."""
-    total = _row_dur_s(probe, csv_fs)
-    if total is None or not (CLIP_PRE_S < total <= CLIP_PLAUSIBLE_MAX_S):
-        return CLIP_POST_S
-    return total - CLIP_PRE_S
-
-
-def _rate_fix(probe: Optional[Dict[str, Any]], csv_fs: Optional[float] = None):
-    """Either rate correction, or None. The two cannot both fire on one clip."""
-    if not probe or not probe.get("dur_s"):
-        return None
-    n = probe.get("data_bytes")
-    return (header_rate_suspect(probe)
-            or (length_implies_rate(int(n) // 2, probe.get("fs_hz"), csv_fs) if n else None))
-
-
-def _row_dur_s(probe: Optional[Dict[str, Any]], csv_fs: Optional[float] = None) -> Optional[float]:
-    # ⚠️BOTH corrections. With only header_rate_suspect here, mach's 22848 Hz clips were indexed
-    # at 2.80 s and every scene/sketch window built on them ended 1.2 s early.
-    if not probe or not probe.get("dur_s"):
-        return None
-    fix = _rate_fix(probe, csv_fs)
-    return fix["true_dur_s"] if fix else probe["dur_s"]
-
-
 def index_row(*, clip: str, parts: Optional[Dict[str, Any]], node: str, body: Optional[bytes],
               probe: Optional[Dict[str, Any]], dets: Dict[str, Any], path: Optional[str],
               outcome: str, fetched_at: float, reason: Optional[str] = None,
@@ -396,9 +236,7 @@ def index_row(*, clip: str, parts: Optional[Dict[str, Any]], node: str, body: Op
     and `t_start/t_end` are null for an unanchored clip rather than derived from `fetched_at`.
     They exist at all so no consumer re-derives CLIP_PRE_SAMPLES for itself.
 
-    ⚠️`fs_hz` AND `wav_header_fs_hz` TRAVEL SIDE BY SIDE, ALWAYS. The CSV's estimate and the
-    file's own header disagreed by 6,624 Hz for a whole boot on mach. Keeping one would have made
-    that invisible; keeping the disagreement is the point.
+    `fs_hz` and `wav_header_fs_hz` travel side by side, so a disagreement between them is visible.
     """
     if outcome not in OUTCOMES:
         raise ValueError("unknown clip outcome %r; known: %s" % (outcome, ", ".join(OUTCOMES)))
@@ -423,20 +261,11 @@ def index_row(*, clip: str, parts: Optional[Dict[str, Any]], node: str, body: Op
         "ts_utc_s": ts,
         "anchored": anchored,
         "t_start_utc_s": (ts - CLIP_PRE_S) if (anchored and ts) else None,
-        # ⚠️THE END COMES FROM THE CLIP, NOT FROM A CONSTANT. A 16 kHz-era clip is 1.0+3.0 s and
-        # a 48 kHz one is 1.0+4.0 s; both are in the corpus. Adding a fixed CLIP_POST_S put
-        # t_end 1.0 s wrong for one era or the other, and every scene/sketch join downstream is
-        # built on this pair.
-        "t_end_utc_s": (ts + _post_s_of(probe, dets.get("fs_hz"))) if (anchored and ts) else None,
+        "t_end_utc_s": (ts + CLIP_POST_S) if (anchored and ts) else None,
         "uptime_s": dets.get("uptime_s"),
         "fs_hz": dets.get("fs_hz"),
         "wav_header_fs_hz": (probe or {}).get("fs_hz"),
-        # ⚠️DERIVED HERE SO NO CONSUMER RE-DERIVES IT. Two clip geometries are live at once and
-        # one firmware build stamped the wrong rate, so "how long is this clip" stopped being a
-        # constant. Computing it once at index time is what lets hear/tags.py keep its no-import
-        # bundle discipline without duplicating the correction logic.
-        "dur_s": _row_dur_s(probe, dets.get("fs_hz")),
-        "header_rate_suspect": _rate_fix(probe, dets.get("fs_hz")),
+        "dur_s": (probe or {}).get("dur_s"),
         "trigger": dets.get("trigger"),
         "clip_why": dets.get("clip_why"),
         "dets_origin": dets.get("dets_origin"),
@@ -570,7 +399,7 @@ def sweep_tmp(root: str, now: float, older_than_s: float = 900.0) -> Dict[str, A
     """Delete abandoned `*.tmp` part-files under clips/<day>/<node>/.
 
     ⚠️`_audio_files` FILTERS ON `.wav`, SO A `.wav.<pid>.tmp` IS INVISIBLE TO THE CAP. A pod
-    killed by `activeDeadlineSeconds: 780` mid-write leaks up to 128044 B per node per run onto a
+    killed by `activeDeadlineSeconds: 780` mid-write leaks up to 480044 B per node per run onto a
     5Gi PVC that nothing else would ever reclaim. `older_than_s` is one drain interval, and the
     pid in the name means a live writer's file is never the one being swept.
     """

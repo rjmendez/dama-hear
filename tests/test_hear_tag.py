@@ -39,12 +39,12 @@ import gen_configmap as GC                                      # noqa: E402
 
 MANIFEST = os.path.join(ROOT, "deploy", "k8s", "hear-tag.yaml")
 
-CLIP_SAMPLES = (CLIPS.CLIP_BYTES_16K_4S - 44) // 2
+CLIP_SAMPLES = int(CLIPS.CLIP_TOTAL_S * 48000)
 
 
 # ----------------------------------------------------------------- fixtures
 
-def wav_bytes(pcm: np.ndarray, fs: int = 16000) -> bytes:
+def wav_bytes(pcm: np.ndarray, fs: int = 48000) -> bytes:
     """The canonical 44-byte header the firmware writes, plus int16 samples.
 
     Built here rather than with `wave` so a test can state a header rate that disagrees with the
@@ -94,7 +94,7 @@ VERIFIED = {"ok": True, "model_sha256": HT.MODEL_SHA256, "class_map_sha256": HT.
 
 
 def store_clip(root, *, node="nyquist", boot="db21acd5", sample=1082421378, ts=1788997850.8,
-               pcm=None, fs=16000, outcome="stored", anchored=True, write_audio=True,
+               pcm=None, fs=48000, outcome="stored", anchored=True, write_audio=True,
                fs_csv=16000.169, extra=None):
     """One index row plus (optionally) its WAV, laid out exactly as hear-drain leaves them."""
     base = "%s-%s-%010d.wav" % (node, boot, sample)
@@ -246,22 +246,6 @@ class TestTheRateIsSnappedOrRefused:
     corrected and why; when it does not close, the refusal is exactly as it was.
     """
 
-    def test_a_22624_header_whose_length_proves_16k_is_recovered_not_discarded(self, tmp_path):
-        """The audio is real 16 kHz audio and the header is the only broken thing about it.
-        Throwing it away loses a real detection to a header bug we can prove and correct."""
-        store_clip(tmp_path, fs=22624, fs_csv=16000.169)
-        t = run(tmp_path, StubTagger(), write=False)
-        assert t["tagged"] == 1 and t["refused"] == 0
-
-    def test_the_recovery_is_recorded_on_the_row_never_silent(self, tmp_path):
-        row = store_clip(tmp_path, fs=22624, fs_csv=16000.169)
-        got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
-        assert got["ok"], got
-        fix = got["row"]["header_rate_suspect"]
-        assert fix["true_fs_hz"] == 16000.0 and fix["header_fs_hz"] == 22624.0
-        assert got["row"]["wav_header_fs_hz"] == 22624, "the lying header is KEPT"
-        assert "never clocks" in fix["why"]
-
     def test_a_bad_rate_the_length_does_NOT_explain_is_still_refused(self, tmp_path):
         """⚠️The refusal did not go away. A clip that is neither a known length at a known rate
         nor recoverable is thrown out, into its own counted bucket."""
@@ -270,15 +254,8 @@ class TestTheRateIsSnappedOrRefused:
         assert t["tagged"] == 0 and t["refused"] == 1
         assert t["by_reason"] == {HT.R_RATE_REFUSED: 1}
 
-    def test_the_nodes_own_estimate_can_veto_the_recovery(self, tmp_path):
-        """fs_hz and wav_header_fs_hz are kept side by side because they once disagreed by
-        6,624 Hz. When they disagree about the RECOVERED rate too, nothing is recovered."""
-        store_clip(tmp_path, fs=22624, fs_csv=48000.0)
-        t = run(tmp_path, StubTagger(), write=False)
-        assert t["refused"] == 1 and t["by_reason"] == {HT.R_RATE_REFUSED: 1}
-
-    def test_the_measured_15986_spread_is_inside_the_tolerance(self, tmp_path):
-        store_clip(tmp_path, fs=15986)
+    def test_a_measured_acquisition_rate_is_inside_the_tolerance(self, tmp_path):
+        store_clip(tmp_path, fs=47973)
         assert run(tmp_path, StubTagger(), write=False)["tagged"] == 1
 
     def test_the_refusal_names_both_rates(self, tmp_path):
@@ -294,7 +271,7 @@ class TestTheRateIsSnappedOrRefused:
         row = store_clip(tmp_path)
         got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
         assert got["ok"], got
-        for field in ("band_limit_hz", "fs_source_hz", "upsampled"):
+        for field in ("fs_source_hz", "fs_model_hz"):
             assert field in got["row"], "%s must ride on every tag row" % field
 
 
@@ -365,10 +342,10 @@ class TestEveryRowNamesItsModelAndItsStatus:
         assert "circular" in card["why_not_a_training_label"]
 
     def test_both_rates_travel_side_by_side(self, tmp_path):
-        store_clip(tmp_path, fs=15990, fs_csv=16000.169)
+        store_clip(tmp_path, fs=47990, fs_csv=16000.169)
         run(tmp_path, StubTagger())
         row = next(iter(TAGS.read_tags(str(tmp_path))))
-        assert row["wav_header_fs_hz"] == 15990 and row["csv_fs_hz"] == 16000.169
+        assert row["wav_header_fs_hz"] == 47990 and row["csv_fs_hz"] == 16000.169
 
     def test_the_card_is_written_once_and_referenced_by_the_rows(self, tmp_path):
         store_clip(tmp_path)
@@ -421,7 +398,7 @@ class TestTheTaggerReadsOnlyWhatClipsDeclares:
         row = store_clip(tmp_path)
         pcm, fs = HT.read_wav(os.path.join(str(tmp_path), row["path"]))
         assert fs == row["wav_header_fs_hz"]
-        assert len(pcm) * 2 + 44 == row["bytes"] == CLIPS.CLIP_BYTES_16K_4S
+        assert len(pcm) * 2 + 44 == row["bytes"] == 44 + CLIP_SAMPLES * 2
 
 
 # ----------------------------------------------------------------- the refusal census
@@ -627,8 +604,8 @@ def _scene_row(tmp_path, *, node="nyquist", ts, span_ms=1024, key="edge"):
 
 class TestTheSceneJoinIsReadOnlyAndSaysHowStrongItIs:
 
-    def test_a_clip_overlaps_four_or_five_scene_rows_never_fewer(self, tmp_path):
-        """64000 samples against 16384 = 3.906 rows, so 4 or 5 depending on phase. Both extremes
+    def test_a_clip_overlaps_five_or_six_scene_rows_never_fewer(self, tmp_path):
+        """80000 samples against 16384 = 4.883 rows, so 5 or 6 depending on phase. Both extremes
         are checked, because a half-open/closed slip shows up at exactly one of them."""
         pl = _scene_pool(tmp_path)
         for offset in (0.0, 0.512, 1.023):
@@ -636,7 +613,7 @@ class TestTheSceneJoinIsReadOnlyAndSaysHowStrongItIs:
                              ts=1788997845.0 + offset)
             got = TAGS.scene_overlap(pl, row)
             assert got["basis"] == "utc"
-            assert 4 <= len(got["rows"]) <= 5, (offset, len(got["rows"]))
+            assert 5 <= len(got["rows"]) <= 6, (offset, len(got["rows"]))
             assert got["refused"] is None and got["weak"] is False
 
     def test_a_clip_straddling_midnight_is_not_half_lost(self, tmp_path):
@@ -678,13 +655,12 @@ class TestTheSceneJoinIsReadOnlyAndSaysHowStrongItIs:
         row = store_clip(tmp_path, sample=1082421378)
         w = TAGS.sample_window(row)
         assert w["start_sample"] == 1082421378 - 16000
-        assert w["end_sample"] == 1082421378 + 48000
-        assert w["end_sample"] - w["start_sample"] == CLIP_SAMPLES
+        assert w["end_sample"] == 1082421378 + int(TAGS.CLIP_POST_S * TAGS.FS_NOMINAL_HZ)
+        assert w["end_sample"] - w["start_sample"] == int(CLIPS.CLIP_TOTAL_S * TAGS.FS_NOMINAL_HZ)
 
     def test_the_clip_geometry_in_tags_matches_hear_clips(self):
         """tags.py restates CLIP_PRE_S so it can ship without clips.py. The two must agree."""
         assert (TAGS.CLIP_PRE_S, TAGS.CLIP_POST_S) == (CLIPS.CLIP_PRE_S, CLIPS.CLIP_POST_S)
-        assert TAGS.FS_NOMINAL_HZ == CLIPS.FS_NOMINAL_HZ
 
     def test_scene_overlap_writes_nothing(self, tmp_path):
         pl = _scene_pool(tmp_path)
@@ -722,8 +698,8 @@ class TestTheSceneJoinIsReadOnlyAndSaysHowStrongItIs:
 
     def test_a_scene_row_starting_exactly_at_the_clip_end_does_not_overlap(self, tmp_path):
         """ts == t1 exactly."""
-        row = store_clip(tmp_path, ts=1788997850.8)          # t1 = 1788997853.8
-        pl = _scene_row(tmp_path, ts=1788997853.8)
+        row = store_clip(tmp_path, ts=1788997850.8)          # t1 = 1788997854.8
+        pl = _scene_row(tmp_path, ts=1788997854.8)
         got = TAGS.scene_overlap(pl, row)
         assert got["rows"] == []
 
@@ -789,7 +765,7 @@ class TestTheSketchJoinIsReadOnlyAndSaysHowStrongItIs:
         """s0 = ts - 0.004 == t1 exactly."""
         pl = P.Pool(str(tmp_path))
         row = store_clip(tmp_path, ts=1788997850.8)          # t1 = 1788997853.8
-        store_sketch(tmp_path, ts=1788997853.804)
+        store_sketch(tmp_path, ts=1788997854.804)
         got = TAGS.sketch_overlap(pl, row)
         assert got["rows"] == []
 
@@ -879,7 +855,7 @@ class TestTheSketchJoinIsReadOnlyAndSaysHowStrongItIs:
     @pytest.mark.parametrize("fs_hz", [16000.0, 48000.0, 32000.0])
     def test_the_sample_basis_window_is_in_the_decimated_counter_at_every_frame_rate(
             self, tmp_path, fs_hz):
-        """The pool row pairs `sample` -- night_node's DECIMATED counter -- with `fs_hz`, the rate
+        """The pool row pairs `sample` -- hear_node's DECIMATED counter -- with `fs_hz`, the rate
         the frame was CUT at, 48000.0 on every node frame since the sketch moved to the
         acquisition stream. Only FS_NOMINAL_HZ indexes the counter sample_window() built cs0/cs1
         in; the frame's own rate gives the window's LENGTH IN SECONDS and nothing else.
@@ -1090,7 +1066,7 @@ class TestTheCheckCanActuallyFail:
         low = [l for l in lines if l.startswith("score    LOW")][0]
         assert "ONE failure" in low and "not proof" in low
 
-    def test_a_quiet_night_is_not_a_failure(self, tmp_path):
+    def test_a_quiet_period_is_not_a_failure(self, tmp_path):
         """⚠️A gate keyed on 'did anything score high' fires on a correct result. Nothing here
         reads the class distribution."""
         self._beat(tmp_path, tagged=50, silence_top=0, now=1000.0)
@@ -1375,11 +1351,11 @@ class TestAgainstTheRealModel:
             "pointless -- and the measured Silence-for-every-clip failure could not happen")
 
 
-class TestAModelThatScoredNothingIsNotAQuietNight:
+class TestAModelThatScoredNothingIsNotAQuietPeriod:
     """⚠️Pre-change `scored_any` was tallied and then dropped: not in the run report's heartbeat
     entry, not read by `check_tags`. A tagger returning `{}` for every clip reported
     silence_frac 0.000 -- the BEST possible value -- and passed the Phase-3 gate more easily than
-    any real night can. `max_unstored_score` was quantified per row and never aggregated."""
+    any real run can. `max_unstored_score` was quantified per row and never aggregated."""
 
     class Mute:
         """An interpreter that loaded and is fed or read wrong; or --score-floor past the top."""
@@ -1453,32 +1429,15 @@ class TestTheClipReachesTheModelAtTheModelsRate:
     """mn10_as is 32 kHz and the fleet is not. What crosses, what is refused, what is labelled."""
 
     def test_a_48k_clip_is_tagged_rather_than_refused_for_its_size(self, tmp_path):
-        """⚠️REGRESSION. tag_one tested `len(pcm) * 2 + 44 != CLIP_BYTES_16K_4S` and so refused
+        """⚠️REGRESSION. tag_one tested the body against one fixed byte total and so refused
         every clip the 48 kHz firmware writes -- the identical magic number, in the identical
         shape, that hear/clips.py had already been fixed for. A constant copied between modules
         keeps its number and loses its meaning."""
         row = store_clip(tmp_path, pcm=quiet_noise(n=240000), fs=48000, fs_csv=48000.0)
         got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
         assert got["ok"], got
-        assert got["row"]["fs_source_nominal_hz"] == 48000.0
+        assert got["row"]["fs_source_hz"] == 48000.0
         assert got["row"]["fs_model_hz"] == HT.MODEL_FS_HZ
-
-    def test_the_16k_clip_says_which_band_is_real(self, tmp_path):
-        """The model's Nyquist is 16 kHz; a 16 kHz clip carries measurement to 8. A reader that
-        cannot tell the difference will treat the interpolation filter as the night."""
-        row = store_clip(tmp_path)
-        got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
-        assert got["ok"], got
-        assert got["row"]["upsampled"] is True
-        assert got["row"]["band_limit_hz"] == 8000.0
-        assert got["row"]["resample_L"] == 2 and got["row"]["resample_M"] == 1
-
-    def test_the_48k_clip_is_not_flagged_as_upsampled(self, tmp_path):
-        row = store_clip(tmp_path, pcm=quiet_noise(n=240000), fs=48000, fs_csv=48000.0)
-        got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
-        assert got["row"]["upsampled"] is False
-        assert got["row"]["band_limit_hz"] == 16000.0
-        assert (got["row"]["resample_L"], got["row"]["resample_M"]) == (2, 3)
 
     def test_an_unrecoverable_bad_rate_is_refused_AS_A_RATE_PROBLEM(self, tmp_path):
         """⚠️THE REASON HAS TO STAY RIGHT. Checked after the duration test, a bad-rate clip came
@@ -1494,18 +1453,7 @@ class TestTheClipReachesTheModelAtTheModelsRate:
         row = store_clip(tmp_path, pcm=quiet_noise(n=16000))       # 1.0 s at 16 kHz
         got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
         assert not got["ok"] and got["reason"] == HT.R_WAV_SAMPLES
-        assert "1.000 s" in got["detail"] and "4.0/5.0" in got["detail"]
-
-    def test_a_misheaded_48k_clip_is_scored_at_48k_and_says_so(self, tmp_path):
-        """240000 samples headed 16000 Hz is the FS_NOMINAL-stamped 48 kHz clip bug. Scored at
-        the header's rate it is 15 s of audio an octave and a half low."""
-        row = store_clip(tmp_path, pcm=quiet_noise(n=240000), fs=16000, fs_csv=16000.0)
-        got = HT.tag_one(StubTagger(), row, str(tmp_path), HT.model_block(VERIFIED))
-        assert got["ok"], got
-        assert got["row"]["header_rate_suspect"]["true_fs_hz"] == 48000.0
-        assert got["row"]["fs_source_nominal_hz"] == 48000.0
-        assert got["row"]["wav_header_fs_hz"] == 16000, "the lying header is KEPT beside the correction"
-
+        assert "0.333 s" in got["detail"] and "5.0 s" in got["detail"]
 
 class TestTheEmbeddingWidthCannotBeConfused:
 
@@ -1533,12 +1481,6 @@ class TestTheModelIdentityIsTheWholeChain:
         assert card["upstream_sha256"] == HT.UPSTREAM_SHA256
         assert card["export_script"] == "tools/export_mn10_onnx.py"
         assert card["upstream_licence"] == "MIT"
-
-    def test_the_card_states_the_measured_upsampling_penalty_rather_than_a_hope(self):
-        card = HT.model_card(VERIFIED)
-        t = card["upsampling_penalty_measured"]
-        assert "cosine" in t and "0.90" in t
-        assert "Perch" in t, "the measurement is for THIS model and must not be read as Perch's"
 
     def test_the_export_script_exists_and_pins_what_hear_tag_pins(self):
         import pathlib

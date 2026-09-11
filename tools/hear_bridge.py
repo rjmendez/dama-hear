@@ -91,8 +91,8 @@ SHARD_PREFIX = "telem"
 SHARD_S = 60                    # audio_embed_archiver.py:51,104; log_forwarder.py:52 globs telem_*.jsonl
 
 # ------------------------------------------------------------------ THE CAPTURE
-# Every measured number in this file comes from one run, and this is it: the 2026-09-07 night
-# retrieved to ~/dama-hear-night-2026-09-07/{dets.csv,health.csv}. 59 detection rows (48 with
+# Every measured number in this file comes from one run, and this is it: the 2026-09-07 capture
+# retrieved to ~/dama-hear-capture-2026-09-07/{dets.csv,health.csv}. 59 detection rows (48 with
 # utc_us > 0), 1360 health rows, uptime_s 28 to 40819 = 11.3308 h. Recipes are stated beside each
 # number and every one of them is `csv.DictReader` over those two files plus the numpy call named;
 # tests/test_bridge.py recomputes them and fails if they drift (set DAMA_HEAR_CAPTURE to point it
@@ -135,22 +135,22 @@ NOMINAL_FS = 16000.0
 # happen to coincide today.
 LEGACY_NODE_FS = 16000.0
 
-# The node's sketch shape, COPIED from firmware/night_node/mel_impulse.h (MELIMP_BANDS,
+# The node's sketch shape, COPIED from firmware/hear_node/mel_impulse.h (MELIMP_BANDS,
 # MELIMP_FRAMES). Held here so a frame of a DIFFERENT shape is recognised as different rather than
 # silently measured with these -- bands and frames ARE on the wire, so a frame of another shape
 # decodes to another shape and `known` in to_record() goes False, and span_ms becomes an honest
 # null rather than a wrong number. (Hop and nfft are NOT copied here at all any more: they came
 # from hear.sketch, not from a second reading of it -- see feature_span_ms.)
-# tests/test_bridge.py::TestFirmwareConstantsDoNotDrift parses mel_impulse.h and night_node.ino
+# tests/test_bridge.py::TestFirmwareConstantsDoNotDrift parses mel_impulse.h and hear_node.ino
 # and fails on either of the two, or on AUDIO_MAX_S against NODE_MAX_DUR_S.
 NODE_BANDS, NODE_FRAMES = 20, 8
 
-# The node caps `dur` at AUDIO_MAX_S (night_node.ino, the "/audio" handler: `if (dur >
+# The node caps `dur` at AUDIO_MAX_S (hear_node.ino, the "/audio" handler: `if (dur >
 # (float)AUDIO_MAX_S) dur = (float)AUDIO_MAX_S;`). A pointer asking for more would silently come
 # back short, so audio_pointer clamps to it here and says so in the record instead.
 NODE_MAX_DUR_S = 30.0
 
-# v1 FLAGS ONLY. hear/sketch.py's 2-byte flags word is free-form and the firmware (night_node.ino,
+# v1 FLAGS ONLY. hear/sketch.py's 2-byte flags word is free-form and the firmware (hear_node.ino,
 # in the gate's detection branch) uses exactly these two bits: bit 0 retrigger, bit 1 "the ring had
 # not filled behind the trigger". ⚠️A v2 frame's flags word means something else entirely --
 # seq<<8 | version<<5 | profile<<1 | retrigger (hear/wire.py: _F_SEQ_SHIFT, _F_VERSION_SHIFT,
@@ -159,7 +159,7 @@ NODE_MAX_DUR_S = 30.0
 V1_FLAG_RETRIGGER = 0x0001
 V1_FLAG_NO_CONTEXT = 0x0002
 
-# The literal header the firmware writes (night_node.ino: DETS_HDR). Checked rather than trusted:
+# The literal header the firmware writes (hear_node.ino: DETS_HDR). Checked rather than trusted:
 # File::size() returns uninitialised memory on a file SD.open() has just created, so a node can
 # and does produce a dets.csv with NO header at all. Parsed with csv.DictReader, a headerless
 # file turns its first detection into the column names and every later row into plausible
@@ -167,7 +167,7 @@ V1_FLAG_NO_CONTEXT = 0x0002
 DETS_COLUMNS = ["utc_us", "uptime_s", "sample", "pps_n", "us_since_pps",
                 "trigger", "flags", "fs_hz", "frame_hex"]
 
-# The literal header the firmware writes for the scene feature (night_node.ino: SCENE_HDR),
+# The literal header the firmware writes for the scene feature (hear_node.ino: SCENE_HDR),
 # checked for the same reason.
 SCENE_COLUMNS = ["utc_us", "uptime_s", "sample", "bands", "slices", "span_ms",
                  "ref_db4", "frames", "fft_us", "mel_hex"]
@@ -182,7 +182,7 @@ FEATURE_KEYS = ("frame_hex", "mel_hex")
 # [25, 50, 75])`): p25 848.5, median 953.0, p75 1252.25, with min 796 and max 2709.
 # tests/test_bridge.py recomputes all five from the file and fails if any drifts.
 #
-# ⚠️MEASURED ON ~/dama-hear-night-2026-09-07/dets.csv, NOT ON final/dets.csv. The same three lines
+# ⚠️MEASURED ON ~/dama-hear-capture-2026-09-07/dets.csv, NOT ON final/dets.csv. The same three lines
 # over final/ -- 51 anchored rows instead of 48, the longer snapshot -- give 860.5 / 965.0 /
 # 1283.5. Same run, same site, three more detections, three different edges: which file, always.
 #
@@ -200,7 +200,7 @@ FEATURE_KEYS = ("frame_hex", "mel_hex")
 #     both below the 796 minimum above, so banding on them puts all 48 detections in one bucket --
 #     measured, not feared -- which is the all-one-name failure these tags exist to avoid. The
 #     detections' own quartiles split them 12/12/12/12, counted in
-#     tests/test_bridge.py::test_the_bands_actually_separate_this_night.
+#     tests/test_bridge.py::test_the_bands_actually_separate_in_this_capture.
 DET_PEAK_QUARTILES = (848.5, 953.0, 1252.25)
 
 REASONS: frozenset = frozenset({
@@ -277,7 +277,7 @@ def parse_scene_csv(text: str) -> List[Dict]:
     """Rows from a /scene.csv pulled off the card over /sd (`GET /sd?file=/scene.csv`).
 
     Same header discipline as dets.csv, against SCENE_COLUMNS. The rows are continuous -- one
-    every 1.024 s whether or not anything triggered -- so a night is tens of thousands of them,
+    every 1.024 s whether or not anything triggered -- so a capture is tens of thousands of them,
     and every one with utc_us 0 (pre-PPS-lock) is refused downstream exactly as a detection is.
     """
     return _parse_csv(text, SCENE_COLUMNS, "scene.csv")
@@ -286,7 +286,7 @@ def parse_scene_csv(text: str) -> List[Dict]:
 def _parse_csv(text: str, columns: Sequence[str], src: str) -> List[Dict]:
     """Header-checked rows, or ValueError. NEVER [] for a file that had no header.
 
-    ⚠️AN EMPTY FILE IS A FAILURE AND MUST NOT READ AS A QUIET NIGHT. Returning [] here made a
+    ⚠️AN EMPTY FILE IS A FAILURE AND MUST NOT READ AS A QUIET PERIOD. Returning [] here made a
     zero-byte or wiped dets.csv -- the exact SD-card failure DETS_COLUMNS exists to catch, and one
     this node has actually produced -- travel all the way to a "0 row(s) -> 0 record(s)" line and
     an exit status of 0. "The card lost the file" and "the node saw nothing" are opposite
@@ -302,7 +302,7 @@ def _parse_csv(text: str, columns: Sequence[str], src: str) -> List[Dict]:
         raise ValueError(
             "%s is empty: %d byte(s), no header line and no rows. A file the node created but "
             "never wrote to, and a file whose content was lost, both read exactly like this, and "
-            "neither is an empty night: an empty night still carries the header %r and zero rows."
+            "neither is an empty capture: an empty capture still carries the header %r and zero rows."
             % (src, len(text), ",".join(columns)))
     head = [c.strip() for c in lines[0].split(",")]
     if head[:len(columns)] != list(columns):
@@ -321,7 +321,7 @@ def _parse_csv(text: str, columns: Sequence[str], src: str) -> List[Dict]:
 def rows_from_detections(obj: Sequence[Dict]) -> List[Dict]:
     """Rows from the node's /detections JSON, normalised to the dets.csv column names.
 
-    /detections is the live ring (night_node.ino: h_dets()): the newest MAXDET=128, oldest first,
+    /detections is the live ring (hear_node.ino: h_dets()): the newest MAXDET=128, oldest first,
     in RAM. It carries `frame` and `frame_len` where the card carries `frame_hex`; frame_len is
     checked against the hex it came with, because a truncated JSON body is otherwise
     indistinguishable from a short frame and would decode as a smaller sketch.
@@ -369,7 +369,7 @@ def decode_scene_row(row: Dict) -> Dict:
     feature_vector() sees one kind of thing. The second axis is `slices`, not `frames`: see the
     note on frames_summed below.
 
-    THE FORMAT, as the firmware writes it (night_node.ino: scene_emit()): mel_hex is a BARE array
+    THE FORMAT, as the firmware writes it (hear_node.ino: scene_emit()): mel_hex is a BARE array
     of bands x slices int8 values, hex-encoded, band-major (index b*slices + s), each a 0.5 dB
     step below the row's own reference -- `roundf((scene_db[i] - ref) * 2.0f)` clamped to int8 --
     and the reference is the row's `ref_db4` column in quarter-dB. There is NO v1/v2 header on it
@@ -434,7 +434,7 @@ def frame_flags(dec: Dict) -> Tuple[bool, Optional[bool]]:
 
     ⚠️THE FLAGS WORD IS NOT ONE FORMAT. v1 (hear/sketch.py) hands its 16 bits to the firmware,
     which spends two of them: bit 0 retrigger, bit 1 "the ring had not filled behind the trigger"
-    (night_node.ino, the gate's detection branch). v2 (hear/wire.py) packs the SAME word as
+    (hear_node.ino, the gate's detection branch). v2 (hear/wire.py) packs the SAME word as
     seq<<8 | version<<5 | profile<<1 | retrigger, so bit 1 is profile-id bit 0: masking
     V1_FLAG_NO_CONTEXT against a v2 frame carrying profile 1 (flags 0x0342) reports "no context"
     for a frame that has full context. Reproduced in tests/test_bridge.py.
@@ -511,15 +511,15 @@ def level_tags(peak: float, retrigger: bool = False, context_ok: Optional[bool] 
     top_tags[0]["name"] (:37, :93-95) and sorts anything named "?" or "Silence" into
     silence/ambient (:103-110). A stream with no tags yields all-"?" clusters at purity 1.0 and
     the report means nothing. The node has no classifier and inventing class names it cannot
-    defend would be worse, so the label is an ORDERING BUCKET against the night's own trigger-peak
+    defend would be worse, so the label is an ORDERING BUCKET against the capture's own trigger-peak
     distribution, named after its boundary so it cannot be mistaken for a posterior.
 
-    ⚠️These order detections against one night at one site; they do not measure anything. Pass
+    ⚠️These order detections against one capture at one site; they do not measure anything. Pass
     `edges` from your own capture -- `--peak-edges` on the command line -- rather than carrying
     this site's quartiles to another.
 
     `no_context` leads when the frame says so, because a v1 sketch taken before the ring filled is
-    all-equal bands (night_node.ino, the gate's detection branch sets bit 1 when
+    all-equal bands (hear_node.ino, the gate's detection branch sets bit 1 when
     `aring_total < back`) and its shape is an artefact -- "the vector is meaningless" is the
     honest dominant label, and it puts those rows in their own cluster instead of seeding a false
     one. `context_ok=None` (a v2 frame, which has no such bit) adds no tag either way: it is
@@ -547,8 +547,8 @@ def scene_tags(ref_db: float, edges: Optional[Sequence[float]] = None) -> List[D
     the detection quartiles do not apply to it and reusing them would be a fabrication. What it
     does have is its own reference level, `ref_db4/4`, and bucketing that would order the rows the
     way DET_PEAK_QUARTILES orders detections. There are no edges here for it: this repo has no
-    scene capture to measure them from (the 2026-09-07 night predates /scene.csv), and inventing
-    four numbers is exactly what the house rule forbids. Pass `--scene-ref-edges` once a night of
+    scene capture to measure them from (the 2026-09-07 capture predates /scene.csv), and inventing
+    four numbers is exactly what the house rule forbids. Pass `--scene-ref-edges` once a capture of
     scene rows exists and the bucket LEADS the tag list, so cluster_audio_embed has something that
     varies to name a cluster with; until then every scene record is tagged "scene", which will
     cluster into one name and should be read as "unlabelled", not as a finding.
@@ -607,8 +607,8 @@ def audio_pointer(node: str, utc_us: int, sample: Optional[int], fs_hz: float,
 
     `retention_s` is how long the ring holds a window before overwriting it, and it has NO
     default. The ring does now exist in the firmware, but its size is decided at boot: the node
-    asks for 240 s and steps down through 180/120/60/30 until one fits the largest contiguous free
-    PSRAM block (240 x 16000 x 2 B = 7.68 MB of int16), so only that boot's /status -- `audio.raw.
+    asks for 80 s and steps down through 60/45/30 until one fits the largest contiguous free
+    PSRAM block (80 x 48000 x 2 B = 7.68 MB of int16), so only that boot's /status -- `audio.raw.
     span_s` -- says which it got. A number invented here would be read as a promise.
     """
     fs = float(fs_hz) if float(fs_hz) > 1000.0 else NOMINAL_FS
@@ -675,12 +675,12 @@ def to_record(row: Dict, node: str, node_id: Optional[int] = None,
     if utc_us is None:
         raise Reject("malformed_row", "row has no utc_us column; it cannot be placed in time")
     if utc_us <= 0:
-        # The firmware writes 0 when the GPS anchor was not trusted at that instant (night_node
+        # The firmware writes 0 when the GPS anchor was not trusted at that instant (hear_node
         # .ino: `dets[idx].utc_us = tok ? t : 0;`, and scene_emit's `sample_to_utc` returning 0).
         # Zero is not "unknown" to anything downstream: the archiver buckets it into
         # telem_0.jsonl and cluster_audio_embed's coverage footprint spans it against the rest of
-        # the night, which turns pre-lock rows into a 56-year event (epoch 0 to the capture's
-        # 1788763952 s is 56.7 years). 11 of the 59 rows in ~/dama-hear-night-2026-09-07/dets.csv
+        # the capture, which turns pre-lock rows into a 56-year event (epoch 0 to the capture's
+        # 1788763952 s is 56.7 years). 11 of the 59 rows in ~/dama-hear-capture-2026-09-07/dets.csv
         # have utc_us 0; 11 of the 62 in final/dets.csv do too.
         raise Reject("unanchored_time",
                      "utc_us is %d: the GPS anchor was not trusted for this row" % utc_us)
@@ -789,16 +789,16 @@ def convert(rows: Sequence[Dict], node: str, node_id: Optional[int] = None,
     Every input FEATURE ends in exactly one of `records` or `rejected`, and the caller can assert
     `len(records) + len(rejected) == n_features` -- the same conservation
     hear/backend/associate.py:19 holds itself to, for the same reason: a converter that quietly
-    discards is indistinguishable from a quiet night. The quantity is features and not rows
+    discards is indistinguishable from a quiet period. The quantity is features and not rows
     because a row carrying two features would yield TWO records sharing one `utc_us`, not one
     record with two vectors: a record can only have one `embed`, which is all that
     npu-audio/audio_anomaly_score.py:60 and npu-audio/cluster_audio_embed.py:33 read. A row with
     no feature at all is one rejection, so it counts as one.
 
     That contract is why the loop's backstop catches every exception and not just Reject: one
-    malformed line out of a night's scene rows -- an 11.33 h run at one row per scene window is
+    malformed line out of a capture's scene rows -- an 11.33 h run at one row per scene window is
     tens of thousands of them, and the window is firmware's to set -- must cost that line, not the
-    night. Anything unexpected is still named -- reason `malformed_row`, with the exception type
+    capture. Anything unexpected is still named -- reason `malformed_row`, with the exception type
     in `why` -- so a surprise is loud in the summary rather than absent from it.
     """
     records: List[Dict] = []
@@ -871,7 +871,7 @@ def group_into_shards(records: Sequence[Dict], shard_s: int = SHARD_S,
 
     The live archiver buckets on ARRIVAL time because it is a subscriber. This is a batch
     converter over a capture that is already over, so it buckets on each record's own `ts`; a
-    night that took 11.33 h to record therefore lands in the shards it would have had if it had
+    capture that took 11.33 h to record therefore lands in the shards it would have had if it had
     been streamed, instead of one enormous shard stamped with the hour someone ran this.
     """
     out: Dict[str, List[Dict]] = {}
@@ -889,10 +889,10 @@ def write_shards(out_dir: str, shards: Dict[str, List[str]]) -> List[str]:
 
     Refuses to overwrite an existing shard. The archiver sidesteps a collision with a pid suffix
     (audio_embed_archiver.py:84-85) because it is a daemon that cannot stop; a batch tool can
-    stop, and a silent second copy of a night is worse than a failed run.
+    stop, and a silent second copy of a capture is worse than a failed run.
 
     Refuses an EMPTY mapping for the same reason main() does: creating the output directory and
-    returning [] is indistinguishable from having written a night, and log_forwarder.py:52 globs
+    returning [] is indistinguishable from having written a capture, and log_forwarder.py:52 globs
     that directory and finds nothing to say so. A caller with nothing to write has a result to
     report, not a directory to make.
     """
@@ -907,7 +907,7 @@ def write_shards(out_dir: str, shards: Dict[str, List[str]]) -> List[str]:
         if os.path.exists(final):
             raise FileExistsError(
                 "%s already exists; use a fresh --out or remove it. Re-running into a forwarded "
-                "directory would post the same night twice under new idempotency keys." % final)
+                "directory would post the same capture twice under new idempotency keys." % final)
         part = final + ".partial"
         with open(part, "w", encoding="utf-8") as fh:
             fh.writelines(lines)
@@ -979,7 +979,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                                       "boot got")
     ap.add_argument("--peak-edges", help="comma-separated ascending trigger-peak edges for the "
                                          "lvl_* tags, measured on YOUR capture. Default is this "
-                                         "repo's 2026-09-07 night: %s -- one night at one site, "
+                                         "repo's 2026-09-07 capture: %s -- one capture at one site, "
                                          "which orders nothing anywhere else."
                                          % ",".join(str(x) for x in DET_PEAK_QUARTILES))
     ap.add_argument("--scene-ref-edges", help="comma-separated ascending ref_db edges for scene "

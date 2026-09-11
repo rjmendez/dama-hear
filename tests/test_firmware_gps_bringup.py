@@ -34,12 +34,12 @@ import re
 
 import pytest
 
-INO = pathlib.Path(__file__).resolve().parents[1] / "firmware" / "night_node" / "night_node.ino"
+INO = pathlib.Path(__file__).resolve().parents[1] / "firmware" / "hear_node" / "hear_node.ino"
 
 
 def _source():
     if not INO.exists():
-        pytest.skip("night_node.ino not in this checkout")
+        pytest.skip("hear_node.ino not in this checkout")
     t = INO.read_text()
     t = re.sub(r"/\*.*?\*/", "", t, flags=re.S)
     return re.sub(r"//[^\n]*", "", t)

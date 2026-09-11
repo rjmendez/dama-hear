@@ -128,7 +128,7 @@ on the air — not against your own extraction, which will happily agree with it
 
 ```
 arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi --libraries firmware/lib \
-  --build-property "compiler.cpp.extra_flags=-DHEAR_ALLOW_NO_WIFI" firmware/night_node
+  --build-property "compiler.cpp.extra_flags=-DHEAR_ALLOW_NO_WIFI" firmware/hear_node
 ```
 
 Such an image reports `wifi_configured: false` in `/status`, so a node answering on its own AP says

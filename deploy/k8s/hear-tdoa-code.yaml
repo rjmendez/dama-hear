@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 511711 B serialised against a 262144 B last-applied-configuration cap.
+# apply-mode server: 511693 B serialised against a 262144 B last-applied-configuration cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '93bb6df-dirty'
+    dama-hear/commit: '0db0b4e-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '511711'
+    dama-hear/serialised-bytes: '511693'
 data:
   hear__init__.py: |
     
@@ -703,7 +703,7 @@ data:
     WHY THIS IS NOT `csv.DictReader`. Five generations of `dets.csv` exist on the cards and in the
     drains, and one of them writes a header that does not describe its own rows:
     
-        G1   9 cols   utc_us..frame_hex                          the 2026-09-07 night
+        G1   9 cols   utc_us..frame_hex                          the 2026-09-07 capture
         G2  11 cols   + clip, clip_why
         G3  12 cols DECLARED, 11 WRITTEN  ⚠️ header says `node,` and the writer never emits it
         G4  12 cols   node_id, ...                               fs/layout build, node_id populated
@@ -833,7 +833,7 @@ data:
             raise ValueError(
                 "dets.csv is empty: %d byte(s), no header and no rows. A file the node created but "
                 "never wrote, and a file whose content was lost, both read like this; neither is a "
-                "quiet night. An empty night still carries its header." % len(text))
+                "quiet period. An empty capture still carries its header." % len(text))
         header = tuple(c.strip() for c in next(csv.reader([lines[0]])))
         gen = identify(header)
         out = DetsRead(generation=gen, header=header)
@@ -894,7 +894,7 @@ data:
     smaller descriptor.
     
     ⚠️THE SECOND AXIS IS `slices`, NOT `frames`, AND `frames` IS A ROW TOTAL. The column carries
-    `SCENE_FRAMES = SCENE_SLICES * SCENE_FRAMES_PER_SLICE` (night_node.ino:1138-1140, written at
+    `SCENE_FRAMES = SCENE_SLICES * SCENE_FRAMES_PER_SLICE` (hear_node.ino:1138-1140, written at
     :1239) -- 64 for the whole row, at 4 slices of 16. The per-slice averaging divides by
     SCENE_FRAMES_PER_SLICE, so a reader that takes this column as the per-slice count is out by a
     factor of `slices`. Neither number is the shape. `frames_per_slice()` derives the per-slice count
@@ -1133,7 +1133,7 @@ data:
     exactly as strict. What this module adds is the ONE case the guard cannot tell apart from a
     mis-flash and which is not one: a node that wrote rows before it had a name.
     
-    ⚠️AN UNPROVISIONED ID IS NOT ANOTHER NODE'S NAME. firmware/night_node/night_node.ino:84-88 is
+    ⚠️AN UNPROVISIONED ID IS NOT ANOTHER NODE'S NAME. firmware/hear_node/hear_node.ino:84-88 is
     the whole mechanism:
     
         #ifdef NODE_ID
@@ -1141,7 +1141,7 @@ data:
         #else
           snprintf(node_id, sizeof node_id, "hear-%02x%02x%02x", m[3], m[4], m[5]);
     
-    `NODE_ID` is a compile-time #define written by firmware/night_node/gen_secrets.py:58, so a build
+    `NODE_ID` is a compile-time #define written by firmware/hear_node/gen_secrets.py:58, so a build
     made before someone ran gen_secrets.py falls back to the last three bytes of that ESP32's OWN
     MAC. `hear-5c4c94` is therefore a name no operator ever chose and no second board can answer to:
     it is a hardware address, and the board that emitted it is by construction the board whose MAC
@@ -1171,7 +1171,7 @@ data:
     from typing import Dict, Optional, Tuple
     
     #: The only id shape this module will ever rename FROM: `hear-` + three MAC bytes, lower-case
-    #: hex, exactly as night_node.ino:88 formats them. A name outside this shape is a name a human
+    #: hex, exactly as hear_node.ino:88 formats them. A name outside this shape is a name a human
     #: chose, and no evidence can make one human-chosen name mean another.
     UNPROVISIONED = re.compile(r"^hear-[0-9a-f]{6}$")
     
@@ -1179,7 +1179,7 @@ data:
     #: the pool and the cards; a line here is a claim about hardware, not a convenience.
     ALIASES: Dict[str, Tuple[str, str]] = {
         "hear-5c4c94": ("rankine", (
-            "MEASURED 2026-09-10. (a) The id matches night_node.ino:88's unprovisioned fallback, so "
+            "MEASURED 2026-09-10. (a) The id matches hear_node.ino:88's unprovisioned fallback, so "
             "it is one board's MAC tail and not a name. (b) EXCLUSIVITY: of the archived cards in "
             "the pool's raw/ tree it appears on rankine's and only rankine's -- 23 of 23 rankine "
             "dets archives and 13 scene archives, 0 of mach's and 0 of nyquist's; and rankine's dets "
@@ -1204,7 +1204,7 @@ data:
         """
         for raw, (name, why) in ALIASES.items():
             assert UNPROVISIONED.match(raw), (
-                "alias source %r is not an unprovisioned id -- only night_node.ino:88's "
+                "alias source %r is not an unprovisioned id -- only hear_node.ino:88's "
                 "hear-<mac tail> form may be renamed" % raw)
             assert not UNPROVISIONED.match(name), (
                 "alias target %r is itself an unprovisioned id" % name)
@@ -1411,7 +1411,7 @@ data:
     
         ⚠️CALLED BEFORE `_node_mismatch`, NEVER INSTEAD OF IT. The guard below still has to agree
         with the fetch afterwards; all this does is decide which name the guard is comparing. See
-        `hear.identity` for what may be renamed (only night_node.ino:88's `hear-<mac tail>` form, and
+        `hear.identity` for what may be renamed (only hear_node.ino:88's `hear-<mac tail>` form, and
         only with an entry stating its evidence) and why the raw id is kept on the row rather than
         overwritten.
         """
@@ -1455,7 +1455,7 @@ data:
         destroy the only trace of the flashing error.
     
         ⚠️ONE THING IS RENAMED BEFORE THIS RUNS, AND IT IS NOT A NAME. `_resolve_identity` maps an
-        UNPROVISIONED id -- night_node.ino:88's `hear-<mac tail>`, emitted only by a build with no
+        UNPROVISIONED id -- hear_node.ino:88's `hear-<mac tail>`, emitted only by a build with no
         NODE_ID compiled in -- to the node that board is declared to be, keeping the raw id on the
         row as `node_alias_of`. That is a different act from the one refused above: `nyquist` is a
         name someone chose and can be wrong about, a MAC tail is the board itself. This guard is
@@ -1481,8 +1481,8 @@ data:
         d = SK.unpack(frame)
         utc_us = int(row.get("utc_us") or 0)
         node = row["node"]
-        # fs: the FRAME is authoritative when it states a rate, because the CSV column is the node's
-        # running estimate and the fs_clean latch has already put 22624.0 in it for a whole boot.
+        # fs: the FRAME is authoritative when it states a rate; the CSV column is only the node's
+        # running estimate.
         fs_csv = row.get("fs_hz")
         fs_csv = float(fs_csv) if fs_csv not in (None, "") else None
         return {
@@ -2485,8 +2485,8 @@ data:
     
             `limit` is "microphone" or "nyquist", and they need different remedies: a Nyquist ceiling
             is fixed by sampling faster, a microphone ceiling is fixed only by a different part. The
-            distinction is not pedantic -- the XIAO nodes are Nyquist-bound at 8 kHz today and would
-            still be microphone-bound at 15 kHz with the planned ICS-43434.
+            distinction is not pedantic -- the XIAO PDM nodes are microphone-bound at 10 kHz, and the
+            planned ICS-43434 would be microphone-bound at 15 kHz.
             """
             hi, limit = self.band_hz[1], "microphone"
             if self.nyquist_hz < hi:
@@ -2653,12 +2653,12 @@ data:
         # measured on BOTH sides, not just on its own.
         path_bias_s=1.0 / 16000.0,
         mic_count=1,
-        fs_hz=16000.0,
-        # The XIAO's onboard PDM MEMS part. The low edge is where the firmware's DC block sits (1.6 Hz)
-        # and the high edge is well above Nyquist, so Nyquist is what binds -- usable_band_hz() says so.
+        fs_hz=48000.0,
+        # The XIAO's onboard PDM MEMS part. The low edge is where the firmware's DC block sits (1.6 Hz);
+        # the datasheet's response ends at 10 kHz, so at 48 kHz the microphone binds, not Nyquist.
         band_hz=(50.0, 10000.0),
         env=("temp", "press"),
-        raw_retain_s=240.0,
+        raw_retain_s=60.0,   # measured on all three nodes; 80 s only if 7.94 MB of PSRAM is contiguous
         notes="XIAO ESP32-S3 Sense + u-blox GPS on D0 PPS + BMP280 + microSD. nyquist, mach, rankine "
               "-- all three answered GET /status with this class 2026-09-10.",
     ))
@@ -3283,7 +3283,7 @@ data:
     #: Slow up, quick down. The rise must outlast an event string (a clap burst, a magazine, a
     #: firework finale) so the floor cannot be lifted by the very events it is there to catch; the
     #: fall only has to outlast one event, so the node recovers when a site genuinely quietens.
-    #: Mirrored in firmware/night_node/night_node.ino as AMB_TAU_RISE_S / AMB_TAU_FALL_S.
+    #: Mirrored in firmware/hear_node/hear_node.ino as AMB_TAU_RISE_S / AMB_TAU_FALL_S.
     AMBIENT_TAU_RISE_S = 30.0
     AMBIENT_TAU_FALL_S = 5.0
     
@@ -7045,7 +7045,7 @@ data:
     #:     `onset_index_checked` returns it and the gate puts it in the detection dict -- and it
     #:     dies at the wire boundary, a 172-byte format shared byte-for-byte with the Android
     #:     producer.
-    #:   * The node firmware never computes it at all: firmware/night_node/night_node.ino derives
+    #:   * The node firmware never computes it at all: firmware/hear_node/hear_node.ino derives
     #:     the stamp with `sk_onset_acq_at(acq_base, i, DECIM, DECIM_DELAY)`, index arithmetic on
     #:     the gate-crossing sample back-dated by the decimator group delay. There is no
     #:     constant-fraction search on the node, so there is no verdict to carry.
