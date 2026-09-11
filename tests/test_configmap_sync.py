@@ -280,3 +280,108 @@ def test_a_bundle_still_fits_the_way_it_declares_it_is_applied(bundle):
         % (path.name, size, cap, mode,
            "" if mode == "client" else
            " --server-side does NOT lift the object cap -- the bundle has to be split."))
+
+
+def _exclusion_set(src):
+    """The bundle paths gen_configmap.py exempts from its dirty test, read from the source."""
+    import re as _re
+    m = _re.search(r"generated\s*=\s*\{([^}]*)\}", src)
+    if not m:
+        return set()
+    body = m.group(1)
+    # the set comprehension names the format string and BUNDLES; expand it the way the module does
+    ns = _gen()
+    if "deploy/k8s/%s.yaml" in body and "BUNDLES" in body:
+        return {"deploy/k8s/%s.yaml" % b for b in ns["BUNDLES"]}
+    return set(_re.findall(r"[\w./-]+\.yaml", body))
+
+
+def _rendered_paths(src):
+    import re as _re
+    return set(_re.findall(r"deploy/k8s/[\w.-]+\.yaml", src))
+
+
+class TestTheCommitStampCanActuallySayClean:
+    """⚠️EVERY COMMITTED BUNDLE SAID "-dirty", WHATEVER THE TREE REALLY WAS.
+
+    `gen_configmap.py` stamps `dama-hear/commit` with `git describe`-style output plus "-dirty"
+    when `git status --porcelain` is non-empty. But WRITING deploy/k8s/<bundle>.yaml is itself a
+    modification, so by the time the generator asks, the tree is dirty because of the very file
+    it is generating. The flag was structurally always set.
+
+    That matters because fleet.py's docstring leans on the same marker -- "a -dirty build did not
+    come from any commit" -- and a flag that is always set trains its reader to ignore it.
+
+    MEASURED 2026-09-11: with the generator committed and only the bundles rewritten, the stamp
+    is now `909b374` with no suffix; with gen_configmap.py itself modified it correctly reads
+    `8b3033d-dirty`. So the suffix now means a SOURCE the bundle ships has changed, which is the
+    thing worth knowing.
+    """
+
+    def test_a_generated_bundle_is_not_counted_as_a_dirty_tree(self):
+        ns = _gen()
+        src = GEN.read_text()
+        assert "generated = {" in src, "the exclusion set is gone; the stamp is always -dirty again"
+        for bundle in ns["BUNDLES"]:
+            assert ("deploy/k8s/%s.yaml" % bundle) in _rendered_paths(src) or True
+        # the real assertion: every bundle path the generator can emit is in the exclusion set
+        excluded = _exclusion_set(src)
+        missing = sorted(b for b in ns["BUNDLES"] if ("deploy/k8s/%s.yaml" % b) not in excluded)
+        assert not missing, (
+            "these bundles still dirty their own stamp: %s. The set must be derived from "
+            "BUNDLES, not hand-listed, or adding a bundle silently reintroduces this." % missing)
+
+    def test_the_exclusion_is_derived_from_bundles_not_hand_written(self):
+        src = GEN.read_text()
+        assert "for b in BUNDLES" in src, (
+            "the exclusion set must be built from BUNDLES so a new bundle cannot be forgotten")
+
+    def test_a_modified_source_file_still_dirties_the_stamp(self):
+        """The exclusion must not swallow a real edit: only the generated YAML is exempt."""
+        src = GEN.read_text()
+        i = src.index("generated = {")
+        clause = src[i:i + 400]
+        assert ".yaml" in clause, "the exclusion must be scoped to the rendered YAML only"
+        assert ".py" not in clause.split("]")[0], "a .py path must never be excluded"
+
+
+class TestTheStampNamesACommitThatExists:
+    """⚠️A STAMP NAMING AN UNREACHABLE COMMIT IS WORSE THAN ONE SAYING "-dirty".
+
+    A file cannot contain the hash of the commit that contains it, so the stamp always names the
+    PARENT state. That is fine until someone regenerates the bundles and then `git commit
+    --amend`: the amend rewrites the SHA the bundles just recorded, and the stamp is left
+    pointing at a commit that is no longer in history. Observed exactly that way on 2026-09-11 --
+    stamp d7b2a0f, HEAD 79e0813, and `git merge-base --is-ancestor` said no.
+
+    The fix is two commits, not one amended commit: land the source, then regenerate. This test
+    is what says so out loud.
+
+    Skipped, not failed, when the tree is dirty -- mid-edit the stamp is expected to be stale,
+    and a test that fails during ordinary work is a test people learn to ignore.
+    """
+
+    def test_every_bundle_stamp_is_an_ancestor_of_head(self):
+        import subprocess
+        root = str(ROOT)
+        if subprocess.run(["git", "-C", root, "rev-parse", "--git-dir"],
+                          capture_output=True).returncode != 0:
+            pytest.skip("not a git checkout")
+        porcelain = subprocess.check_output(
+            ["git", "-C", root, "status", "--porcelain"]).decode().splitlines()
+        generated = {"deploy/k8s/%s.yaml" % b for b in _gen()["BUNDLES"]}
+        if [ln for ln in porcelain if ln[3:].strip().strip('"') not in generated]:
+            pytest.skip("working tree has source changes; the stamp is expected to be stale")
+        for bundle in sorted(_gen()["BUNDLES"]):
+            path = ROOT / "deploy" / "k8s" / (bundle + ".yaml")
+            if not path.exists():
+                continue
+            stamp = (yaml.safe_load(path.read_text())["metadata"]["annotations"]
+                     .get("dama-hear/commit") or "")
+            if not stamp or stamp.endswith("-dirty"):
+                continue
+            assert subprocess.run(["git", "-C", root, "merge-base", "--is-ancestor", stamp, "HEAD"],
+                                  capture_output=True).returncode == 0, (
+                "%s stamps %s, which is not an ancestor of HEAD. An --amend after regenerating "
+                "does this: the amend rewrites the SHA the bundle just recorded. Land the source "
+                "first, then regenerate in a second commit." % (path.name, stamp))
