@@ -113,3 +113,65 @@ class TestTheSplitGate(TestDriftReport):
         # ⚠️the gate is for the split ALONE. A node still acquiring must not fail a scheduled run.
         assert self._rc({"a=1": self._status("x", "a"),
                          "b=2": self._status("x", "b", sats=0, fix=0)}, monkeypatch) == 0
+
+    def test_an_unreachable_node_does_not_fail_the_gate_either(self, monkeypatch):
+        # ⚠️THE REGRESSION. hear-drain-check's own comment already says "gates on the SPLIT
+        # ALONE", but the code fell through to `0 if not dead else 1` even with the flag set, so
+        # a node that was merely unreachable (a reboot, or the ESP32 refusing a concurrent
+        # client -- deploy/k8s/hear-drain.yaml's hear-drain-check job, reproduced live 2026-09-10)
+        # turned the whole hourly job red.
+        def fetch(n):
+            if n == "b=2":
+                raise ConnectionRefusedError("refused")
+            return self._status("x", "a")
+        monkeypatch.setattr(F, "fetch", fetch)
+        rc = F.main(["--require-one-build", "a=1", "b=2"])
+        assert rc == 0, "an unreachable node is not a split and must not gate"
+
+    def test_a_split_still_fails_the_gate_even_with_an_unreachable_third_node(self, monkeypatch):
+        # the fix above must not swallow a real split along with unreachability
+        def fetch(n):
+            if n == "c=3":
+                raise ConnectionRefusedError("refused")
+            return self._status("aaa" if n == "a=1" else "bbb", n[0])
+        monkeypatch.setattr(F, "fetch", fetch)
+        rc = F.main(["--require-one-build", "a=1", "b=2", "c=3"])
+        assert rc == 2
+
+
+class TestFetchRetry:
+    """A refused connection is not necessarily a dead node -- see RETRY_BACKOFF_S."""
+
+    def test_a_transient_refusal_is_retried_and_can_still_succeed(self, monkeypatch):
+        calls = []
+
+        def urlopen(url, timeout):
+            calls.append(url)
+            if len(calls) == 1:
+                raise ConnectionRefusedError("refused")
+            class _Resp:
+                def __enter__(self_):
+                    return self_
+
+                def __exit__(self_, *a):
+                    return False
+
+                def read(self_):
+                    return b'{"node": "a"}'
+            return _Resp()
+
+        sleeps = []
+        monkeypatch.setattr(F.urllib.request, "urlopen", urlopen)
+        monkeypatch.setattr(F.time, "sleep", lambda s: sleeps.append(s))
+        got = F.fetch("a=1")
+        assert got == {"node": "a"}
+        assert len(calls) == 2, "one failure, one retry"
+        assert sleeps == [F.RETRY_BACKOFF_S], "backs off before retrying, does not hammer it"
+
+    def test_two_failures_in_a_row_still_raise(self, monkeypatch):
+        def urlopen(url, timeout):
+            raise ConnectionRefusedError("refused")
+        monkeypatch.setattr(F.urllib.request, "urlopen", urlopen)
+        monkeypatch.setattr(F.time, "sleep", lambda s: None)
+        with pytest.raises(ConnectionRefusedError):
+            F.fetch("a=1")
