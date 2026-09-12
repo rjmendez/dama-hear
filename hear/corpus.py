@@ -39,6 +39,33 @@ from . import sketch as SK
 TRUSTED_CLOCK_TIERS = frozenset({"gnss", "location"})
 
 
+def phone_utc_us(ts_utc_ms: Any, node_us: int) -> Optional[int]:
+    """Phone sketch UTC at the frame's own microsecond precision, or None if unstated.
+
+    dama-gotchi publishes TWO pieces of one instant:
+      * `ts_utc_ms`: the absolute UTC stamp, rounded to the nearest millisecond
+        (GPSTimingSync.Stamp.utcMs)
+      * `node_us`: the sketch frame's microseconds WITHIN that UTC second
+
+    Reading `ts_utc_ms` alone quantises the phone side onto a 1 ms grid even though the frame
+    already carries 1 us within-second precision, and a stamp at 00:00:00.999600 rounds onto the
+    NEXT second's millisecond bucket. The absolute second therefore comes from `ts_utc_ms`, but
+    the within-second digits come from `node_us`, choosing the second whose combined timestamp is
+    nearest the rounded millisecond value.
+    """
+    if ts_utc_ms is None:
+        return None
+    coarse_us = int(round(float(ts_utc_ms) * 1000.0))
+    sec_us = (coarse_us // 1_000_000) * 1_000_000
+    utc_us = sec_us + int(node_us)
+    delta_us = utc_us - coarse_us
+    if delta_us > 500_000:
+        utc_us -= 1_000_000
+    elif delta_us < -500_000:
+        utc_us += 1_000_000
+    return utc_us
+
+
 def utc_trusted_of(fields: Dict[str, Any]) -> Optional[bool]:
     """The rungs behind `Record.utc_trusted`, over a plain mapping.
 
@@ -204,12 +231,12 @@ def from_phone(payload: Dict[str, Any], node_id: Optional[str] = None) -> Record
         # An older phone build that packed no rate code but reported it alongside. Believable,
         # and recorded as coming from the JSON rather than the frame.
         fs = float(payload["fs"])
-    ts = payload.get("ts_utc_ms")
+    utc_us = phone_utc_us(payload.get("ts_utc_ms"), d["node_us"])
     return Record(
         node_id=str(nid), source="phone", q=d["q"], ref_db=d["ref_db"], peak=d["peak"],
         bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=d["node_us"],
         retrigger=bool(d["retrigger"]),
-        ts_utc_s=None if ts is None else float(ts) / 1000.0,
+        ts_utc_s=None if utc_us is None else utc_us / 1e6,
         clipped=payload.get("clipped"),
         clock_tier=payload.get("clock_tier"),
         sync_sigma_ns=payload.get("sync_sigma_ns"),
