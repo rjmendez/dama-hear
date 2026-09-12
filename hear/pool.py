@@ -468,14 +468,15 @@ class Pool:
                 skips[r] = skips.get(r, 0) + 1
                 continue
             ts_ms = payload.get("ts_utc_ms")
-            ts = None if ts_ms is None else float(ts_ms) / 1000.0
-            utc_us = int(round(ts * 1e6)) if ts else 0
+            stated_utc_us = C.phone_utc_us(ts_ms, d["node_us"])
+            ts = None if stated_utc_us is None else stated_utc_us / 1e6
+            utc_us = 0 if stated_utc_us is None else stated_utc_us
             node = str(nid or payload.get("node_id") or "?")
             recs.append({
                 "schema_version": SCHEMA_VERSION,
                 "key": key("phone", node, utc_us, payload.get("trigger_ts_utc_ms"), frame),
                 "source": "phone", "node": node, "node_from": "topic" if nid else "payload",
-                "utc_us": utc_us, "anchored": bool(ts), "ts_utc_s": ts,
+                "utc_us": utc_us, "anchored": stated_utc_us is not None, "ts_utc_s": ts,
                 "frame_b64": base64.b64encode(frame).decode(),
                 "fs_hz": d["fs_hz"] if d["fs_hz"] is not None else payload.get("fs"),
                 "fs_stated_by": "frame" if d["fs_hz"] is not None else
