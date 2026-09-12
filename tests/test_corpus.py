@@ -36,6 +36,25 @@ class TestPhone:
         assert r.fs_hz == 48000.0
         assert r.ts_utc_s == pytest.approx(1788700000.123)
 
+    def test_the_phone_timestamp_uses_the_frames_microseconds_not_the_ms_bucket(self):
+        """⚠️THE CROSS-REPO TIMING CONTRACT. dama-gotchi puts the absolute second in
+        `ts_utc_ms` and the frame's own microseconds-within-that-second in `node_us`. Reading the
+        millisecond field alone quantises the sketch onto a 1 ms grid and loses the onset
+        precision the frame already carries.
+
+        Pick the near-rollover case because it proves both halves at once: 999.600 ms rounds to
+        the next integer millisecond, so the absolute second still has to come from `ts_utc_ms`
+        while the within-second digits come from the frame.
+        """
+        true_utc_us = 1788700000999600
+        frame, q, ref = _frame(fs=48000.0)
+        frame = SK.pack(true_utc_us % 1_000_000, ref, 500, q, fs=48000.0, layout=SK.LAYOUT_FIXED)
+        r = C.from_phone({"sketch_b64": base64.b64encode(frame).decode(),
+                          "ts_utc_ms": round(true_utc_us / 1000),
+                          "clock_tier": "gnss"})
+        assert r.node_us == 999600
+        assert r.ts_utc_s == pytest.approx(true_utc_us / 1e6, abs=1e-12)
+
     def test_absolute_db_is_recoverable(self):
         p, q, ref = _phone_payload()
         r = C.from_phone(p)

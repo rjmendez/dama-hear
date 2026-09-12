@@ -122,6 +122,26 @@ class TestOneDataset:
         k2 = P.key("node", "nyquist", 0, "200", _frame(seed=2))
         assert k1 != k2
 
+    def test_phone_ingest_keeps_the_frames_microseconds_in_absolute_utc(self, tmp_path):
+        """The pool is the OTHER reader of the same wire contract. If it stores ts_utc_ms
+        directly, every phone sketch lands on a 1 ms grid before hear_tdoa ever sees it."""
+        true_utc_us = 1788763952999600
+        q, ref = SK.sketch(np.random.default_rng(123).normal(0, 1000, 4096), 48000.0)
+        frame = SK.pack(true_utc_us % 1_000_000, ref, 1140, q,
+                        fs=48000.0, layout=SK.LAYOUT_FIXED)
+        p = tmp_path / "phone.jsonl"
+        p.write_text(json.dumps({
+            "topic": "dama/phone-a/acoustic_sketch",
+            "payload": {"sketch_b64": base64.b64encode(frame).decode(),
+                        "ts_utc_ms": round(true_utc_us / 1000),
+                        "clock_tier": "gnss"}
+        }) + "\n")
+        pl = P.Pool(str(tmp_path / "pool"))
+        pl.ingest_mqtt_jsonl(str(p))
+        row = next(iter(pl.raw()))
+        assert row["utc_us"] == true_utc_us
+        assert row["ts_utc_s"] == pytest.approx(true_utc_us / 1e6, abs=1e-12)
+
 
 class TestNothingIsDroppedOnTheWayOut:
     """⚠️records() must not quietly lose a field the store held.
