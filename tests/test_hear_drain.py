@@ -120,7 +120,7 @@ class GrowingNode(FakeNode):
     ⚠️`FakeNode` grows only between drains, and that is exactly the blind spot that let a
     catch-up refetch look correct. A 2 MB tail at the node's measured 40-135 KB/s takes 15-50 s,
     during which the file gains ~3.5-12 KB at ~235 B/s -- and `/sd` seeks against the size AT
-    REFETCH TIME (hear_node.ino:1985-1986), not against the size the drain read from `/ls`.
+    REFETCH TIME (hear_node.ino:2899), not against the size the drain read from `/ls`.
     """
 
     def __init__(self, grow_rows_per_fetch=0, **kw):
@@ -356,7 +356,7 @@ class TestThereIsNoCatchUp:
     """⚠️THE DRAIN MEASURES THE GAP AND DOES NOT TRY TO CLOSE IT, AND THAT IS DELIBERATE.
 
     A refetch has to size a bigger `tail=` against a size read BEFORE the first body, but the node
-    seeks against the size at REFETCH time (hear_node.ino:1985-1986) and the file grew for the
+    seeks against the size at REFETCH time (hear_node.ino:2899) and the file grew for the
     whole of the first fetch. The refetch therefore lands forward of the gap. Worse, the residual
     was recomputed against the same stale size, so a refetch that missed reported success. These
     tests are the guard on that decision: one scene fetch per run, and an honest number.
