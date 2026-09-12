@@ -77,7 +77,7 @@ So the drain MEASURES the reach-back instead of assuming it, and does not try to
 
 ⚠️A CATCH-UP REFETCH IS DELIBERATELY ABSENT, AND THIS IS THE SECOND TIME THAT HAS BEEN DECIDED.
 The node has no offset argument and no Range header, so the only reach-back control is a bigger
-`tail=` -- and `/sd` seeks against the size AT REFETCH TIME (hear_node.ino:1985-1986,
+`tail=` -- and `/sd` seeks against the size AT REFETCH TIME (hear_node.ino:2899,
 `size_t remain = f.size(); if (tail > 0 && remain > (size_t)tail) f.seek(remain - tail)`). The
 file grows underneath for the whole of the first fetch (2 MB at the measured 40-135 KB/s is
 15-50 s, ~3.5-12 KB at ~235 B/s), so a tail sized against the pre-fetch `size_now` lands FORWARD
