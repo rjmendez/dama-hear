@@ -36,8 +36,8 @@ GOLDEN = os.path.join(ROOT, "testdata", "sketch_golden.json")
 
 # ----------------------------------------------------------------- fixtures
 
-def _frame_bytes(fs=48000.0, layout=SK.LAYOUT_NYQUIST, amp=300.0, seed=0, node_us=1000,
-                 state_fs=True, bands=15, f_hi=24000.0):
+def _frame_bytes(fs=48000.0, layout=SK.LAYOUT_FIXED, amp=300.0, seed=0, node_us=1000,
+                 state_fs=True, bands=20, f_hi=20000.0):
     q, ref = SK.sketch(np.random.default_rng(seed).normal(0, amp, 4096), fs,
                        bands=bands, f_hi=f_hi, layout=layout)
     return SK.pack(node_us, ref, 500, q, fs=(fs if state_fs else None), layout=layout)
@@ -126,9 +126,9 @@ class TestTheModelIsActuallyWired:
     def test_the_shipped_goldens_score_exactly_these_values(self, model):
         """Measured on this checkout, pinned to 1e-9 relative. Any of the three defects below
         moves every one of them, which is what a `< 0.5` assertion would not notice."""
-        for seed, want in ((0, 0.0109740003450659),
-                           (1, 0.0800225232891966),
-                           (2, 0.0167765755202587)):
+        for seed, want in ((0, 2.2689195315887243e-03),
+                           (1, 1.4685785098193101e-02),
+                           (2, 6.8016671068528466e-04)):
             f = SK.unpack(_frame_bytes(seed=seed))
             got = CL.score_sketch(f, model)
             assert got == pytest.approx(want, rel=1e-9), "seed %d = %.12e" % (seed, got)
@@ -192,7 +192,7 @@ class TestZIsTheLogitBehindP:
 
 class TestARefusalIsCountedNotDropped:
     def test_a_legacy_layout_pool_refuses_every_row_and_counts_every_one(self, tmp_path):
-        rows = quiet_rows(16, layout=SK.LAYOUT_FIXED, bands=20, f_hi=20000.0)
+        rows = quiet_rows(16, layout=SK.LAYOUT_NYQUIST, bands=15, f_hi=24000.0)
         build_pool(tmp_path, rows)
         t = HS.run(str(tmp_path), MODEL_PATH, write=False)
         assert t["scored"] == 0
@@ -201,11 +201,11 @@ class TestARefusalIsCountedNotDropped:
         assert t["conservation_ok"]
 
     def test_a_refused_row_carries_the_reason_and_the_message_verbatim(self, model, mb):
-        rec = one_record(_frame_bytes(layout=SK.LAYOUT_FIXED, bands=20, f_hi=20000.0))
+        rec = one_record(_frame_bytes(layout=SK.LAYOUT_NYQUIST, bands=15, f_hi=24000.0))
         row = score(rec, model, mb)
         assert row["outcome"] == "refused"
         assert row["refused_reason"] == HS.R_LAYOUT_MISMATCH
-        assert "layout" in row["refused_detail"] and "fixed" in row["refused_detail"]
+        assert "layout" in row["refused_detail"] and "nyquist" in row["refused_detail"]
 
     def test_refusals_are_broken_out_by_node_and_by_day_partition(self, tmp_path):
         """⚠️A SCALAR HIDES THE BISECT. One real pool is 0% scorable in one day partition and
