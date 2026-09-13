@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 635730 B serialised; 635908 B of annotations against a 262144 B cap.
+# apply-mode server: 635877 B serialised; 636055 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: 'eec15f2'
+    dama-hear/commit: '62da8f5'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '635730'
+    dama-hear/serialised-bytes: '635877'
 data:
   hear__init__.py: |
     
@@ -7713,6 +7713,8 @@ data:
         d = float(separation_m)
         if d <= 0.0:
             raise ValueError("separation must be > 0 m (got %r)" % separation_m)
+        if sigma_d_m < 0.0 or sigma_tau_s < 0.0:
+            raise ValueError("sigmas must be >= 0")
         f_survey = float(sigma_d_m) / d
         f_timing = c * float(sigma_tau_s) / d
         frac = math.hypot(f_survey, f_timing)
@@ -7966,6 +7968,7 @@ data:
     from . import placement as PL
     from . import point as PT
     from . import shockwave as SW
+    from . import soundspeed as SS
     
     
     class CalibrationError(ValueError):
@@ -8015,7 +8018,7 @@ data:
         survey = float(sigma_pos_m) / c
         pick = float(sigma_pick_t_s)
         node = float(sigma_node_t_s)
-        speed = (float(path_m) / c) * abs(float(sigma_temp_c)) * 0.606 / c
+        speed = (float(path_m) / c) * abs(float(sigma_temp_c)) * SS.DC_DT / c
         single = math.sqrt(survey ** 2 + pick ** 2 + node ** 2 + speed ** 2)
         averaged = math.sqrt((survey / rt if source_moves else survey) ** 2
                              + (pick / rt) ** 2 + (node / rt) ** 2 + speed ** 2)
