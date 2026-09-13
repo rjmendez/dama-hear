@@ -36,6 +36,9 @@ sys.path.insert(0, HERE)
 import wifi_store  # noqa: E402
 
 REPO_SLUG = "rjmendez/dama-hear"
+# NOTE: this fleet's Gold/Kasami/Ageev nodes are esp32s3-i2s-gps boards, not the
+# XIAO PSRAM=opi profile below. That mismatch is harmless for --no-flash/--input-dir
+# uploads today, but --release would need a fleet-specific FQBN before using it here.
 FQBN = "esp32:esp32:XIAO_ESP32S3:PSRAM=opi"
 SKETCH = "hear_node"
 ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,22}")
