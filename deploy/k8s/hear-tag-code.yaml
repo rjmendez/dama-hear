@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-tag-code.yaml
-# apply-mode client: 169576 B serialised; 169754 B of annotations against a 262144 B cap.
+# apply-mode client: 169099 B serialised; 169277 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tag
   annotations:
-    dama-hear/commit: 'dd09fc2'
+    dama-hear/commit: '55e40c4'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '169576'
+    dama-hear/serialised-bytes: '169099'
 data:
   hear__init__.py: |
     
@@ -171,14 +171,14 @@ data:
     
     
     def sketch(x: np.ndarray, fs: float, bands: int = MEL_BANDS, frames: int = FRAMES,
-               hop_s: float = HOP_S, nfft: int = NFFT, f_lo: float = F_LO,
-               f_hi: float = F_HI, layout: str = LAYOUT_NYQUIST) -> Tuple[np.ndarray, float]:
+               hop_s: float = HOP_S, nfft: int = NFFT,
+               layout: str = LAYOUT_NYQUIST) -> Tuple[np.ndarray, float]:
         """(int8 [bands x frames], ref_db). Frames start at the sample the caller passes as index 0.
     
         `layout` decides what band k MEANS -- see [mel_filterbank]. At any rate above
         LAYOUT_EQUIVALENT_ABOVE_HZ the two are the same bytes."""
         x = np.asarray(x, float)
-        fb = mel_filterbank(fs, nfft, bands, f_lo=f_lo, f_hi=f_hi, layout=layout)
+        fb = mel_filterbank(fs, nfft, bands, layout=layout)
         hop = max(1, int(hop_s * fs))
         win = np.hanning(nfft)
         out = np.zeros((bands, frames))
@@ -798,17 +798,8 @@ data:
     import os
     from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
     
-    TAG_SCHEMA_VERSION = 2
+    TAG_SCHEMA_VERSION = 1
     TAGS_NAME = "tags.jsonl"
-    
-    #: Schema 2.0 enhancements:
-    #: - Native 48kHz acoustic metadata support via fs_source_hz (phone/HUGBOT captures)
-    #: - NPU embedding vectors (embedding_dim, embedding) carried on every tag row for model outputs
-    #: - Multi-rate support: fs_source_hz (capture rate), fs_model_hz (model inference rate),
-    #:   csv_fs_hz (decimation rate estimate from node telemetry)
-    #: - rate_recovered flag to disambiguate when header rate differs from actual samples
-    #:
-    #: Future: 6-DoF spatial pose vectors (pitch/roll/yaw) for phone/HUGBOT devices if available.
     
     #: The clip's own geometry, from hear.clips. Repeated here as a local constant rather than
     #: imported so that a bundle carrying tags.py without clips.py still parses; the two are checked
@@ -825,23 +816,6 @@ data:
     BASIS_UTC = "utc"
     BASIS_SAMPLE = "sample"
     BASIS_NONE = "none"
-    
-    # Stable deployment names remain separate from versioned lane/artifact names.
-    MODEL_BACKENDS = ("yamnet", "birdnet", "perch")
-    MODEL_BACKEND_LANES = {
-        "yamnet": "mn10",
-        "birdnet": "birdnet_v24",
-        "perch": "perch_v2",
-    }
-    
-    
-    def backend_lane(name: str) -> str:
-        """Return the canonical tag lane for a public model backend name."""
-        try:
-            return MODEL_BACKEND_LANES[name]
-        except KeyError:
-            raise ValueError("unknown model backend %r; known: %s" %
-                             (name, ", ".join(MODEL_BACKENDS)))
     
     
     def tags_path(root: str, store: Optional[str] = None) -> str:
@@ -1454,8 +1428,9 @@ data:
     
     WHAT IT WRITES. `<pool>/clips/tags.jsonl` (one row per clip per model version, append-only),
     `<pool>/clips/tag_model_card.json` (the prose provenance, written once per model, referenced by
-    sha256 from every row) and `<pool>/state/tag_heartbeat.json` (instrumentation for --check). It
-    NEVER writes `clips/index.jsonl` -- that store is hear-drain's.
+    sha256 from every row) and `<pool>/state/tag_heartbeat.json` (instrumentation for --check, also
+    stamped with a refusal when the model will not verify or load so an older green run cannot mask
+    it). It NEVER writes `clips/index.jsonl` -- that store is hear-drain's.
     
     WEIGHTS ARE NEVER FETCHED BY THIS FILE. It verifies two pinned sha256 digests and refuses to run
     otherwise, so a run is reproducible offline once the cache exists and a substituted model is a
@@ -1483,7 +1458,7 @@ data:
     from hear import tags as TAGS                                             # noqa: E402
     from hear import resample as RESAMPLE                                     # noqa: E402
     
-    TAG_SCHEMA = "hear.clip_tag.v2"
+    TAG_SCHEMA = "hear.clip_tag.v1"
     
     MODEL_NAME = "efficientat-mn10_as"
     #: Bumping this is what makes a re-tag a NEW row beside the old one rather than an overwrite.
@@ -1591,7 +1566,6 @@ data:
     #: 3.0 s, the model's input. Windows at 0, 1 and 2 s cover the whole 5.0 s clip.
     BIRDNET_WINDOW = 144000
     BIRDNET_HOP = 48000
-    BIRDNET_BANDPASS_HZ = (150.0, 12000.0)
     #: BirdNET-Analyzer's default cut on the range model's output.
     BIRDNET_LOCATION_THRESHOLD = 0.03
     #: A species enters the heard summary at this score. OBSERVATION only.
@@ -1653,6 +1627,7 @@ data:
     
     DEFAULT_LIMIT = 400
     DEFAULT_DEADLINE_S = 600.0
+    DEFAULT_POOL = "~/hear-pool"
     
     #: ⚠️REPORT-ONLY UNTIL THE PHASE-3 GATE IN docs/acoustic-stack.md IS MET. -1 means "print the
     #: measured silence fraction and never fail on it". A threshold set before anyone has listened to
@@ -1850,17 +1825,6 @@ data:
         if not len(x) or not np.any(x):
             raise ValueError("digital silence: every sample is zero")
         return x
-    
-    
-    def birdnet_bandpass(pcm: "Any", fs_hz: float) -> "Any":
-        """Apply BirdNET V2.4's 150--12000 Hz band without changing the 48 kHz rate."""
-        import numpy as np
-        x = np.asarray(pcm, dtype=np.float32)
-        if not len(x):
-            return x
-        freqs = np.fft.rfftfreq(len(x), 1.0 / float(fs_hz))
-        mask = (freqs >= BIRDNET_BANDPASS_HZ[0]) & (freqs <= BIRDNET_BANDPASS_HZ[1])
-        return np.fft.irfft(np.fft.rfft(x) * mask, n=len(x)).astype(np.float32)
     
     
     def to_model_rate(pcm: "Any", header_fs: int, csv_fs: Optional[float] = None,
@@ -2219,7 +2183,7 @@ data:
     
         def tag(self, pcm: "Any", floor: float = SCORE_FLOOR, week: int = -1) -> Dict[str, Any]:
             np = self._np
-            x = birdnet_bandpass(pcm, BIRDNET_FS_HZ)
+            x = np.asarray(pcm, dtype=np.float32)
             starts = list(range(0, max(1, len(x) - BIRDNET_WINDOW + 1), BIRDNET_HOP)) or [0]
             probs = []
             for s in starts:
@@ -2429,14 +2393,6 @@ data:
     }
     
     
-    MODEL_BACKENDS = dict(TAGS.MODEL_BACKEND_LANES)
-    
-    
-    def backend_lane(name: str) -> str:
-        """Resolve a stable CLI backend name to its compatibility lane."""
-        return TAGS.backend_lane(name)
-    
-    
     # ----------------------------------------------------------------- I/O
     
     def state_dir(root: str) -> str:
@@ -2502,35 +2458,16 @@ data:
         return CLIPS._day(row.get("ts_utc_s") if row.get("anchored") else None)
     
     
-    def _work_order_meta(root: Optional[str], row: Dict[str, Any]) -> Dict[str, Any]:
-        p = row.get("path")
-        basename = (os.path.basename(p) if isinstance(p, str) else "") or os.path.basename(
-            row.get("clip") or "")
-        mtime = None
-        if root and isinstance(p, str):
-            ap = os.path.join(root, p)
-            if os.path.exists(ap):
-                try:
-                    mtime = os.path.getmtime(ap)
-                except OSError:
-                    mtime = None
-        return {"day": _row_day(row),
-                "mtime": float(mtime if mtime is not None else (row.get("fetched_at")
-                                                                 or row.get("ts_utc_s") or 0.0)),
-                "node": row.get("node") or "",
-                "basename": basename}
+    def work_order(index: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Every indexed clip, OLDEST UTC DAY FIRST.
     
-    
-    def work_order(index: Dict[str, Dict[str, Any]], root: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Every indexed clip, IN THE SAME ORDER `clips.prune()` WOULD EVICT ITS AUDIO.
-    
-        ⚠️ORDER IS BY PRUNE RISK. `clips.prune()` deletes `unanchored` clips first by measured file
-        mtime, then the dated days oldest-first. Tagging against any other order leaves the clips most
-        likely to disappear at the back of the queue.
+        ⚠️ORDER IS BY PRUNE RISK. `clips.prune()` deletes whole day directories oldest-first at a byte
+        cap, so the oldest un-tagged clip is the one whose audio disappears next. Tagging newest-first
+        would spend the run on the clips least likely to be gone by the next one.
         """
         return sorted(index.values(),
-                      key=lambda r: (CLIPS._prune_order(_work_order_meta(root, r)),
-                                     r.get("clip_key") or ""))
+                      key=lambda r: (CLIPS._day_order(_row_day(r)),
+                                     float(r.get("ts_utc_s") or 0.0), r.get("clip_key") or ""))
     
     
     def empty_tally() -> Dict[str, Any]:
@@ -2743,7 +2680,7 @@ data:
         out_rows: List[Dict[str, Any]] = []
         t0 = time.time()
         stop_reason = None
-        for row in work_order(index, root):
+        for row in work_order(index):
             node, day = row.get("node") or "?", _row_day(row)
             ck = row.get("clip_key")
             if isinstance(ck, str) and TAGS.tag_key(ck, mb.get("name"), mb.get("version"),
@@ -2826,6 +2763,61 @@ data:
                 "max": s[-1]}
     
     
+    def _last_heartbeat_run(root: str, lane: str = DEFAULT_LANE) -> Optional[Dict[str, Any]]:
+        p = heartbeat_path(root, lane)
+        if not os.path.exists(p):
+            return None
+        try:
+            runs = (json.load(open(p)).get("runs") or [])
+        except Exception:
+            return None
+        return runs[-1] if runs else None
+    
+    
+    def write_weights_refusal_heartbeat(root: str, detail: str, *, model: Dict[str, Any],
+                                        now: Optional[float] = None,
+                                        lane: str = DEFAULT_LANE) -> Dict[str, Any]:
+        """Record a run-level refusal before exit so `--check` does not read stale green."""
+        last = _last_heartbeat_run(root, lane) or {}
+        report: Dict[str, Any] = {
+            "index_lines": last.get("index_lines"),
+            "index_keys": last.get("index_keys"),
+            "census_keys": last.get("census_keys"),
+            "superseded": last.get("superseded", 0),
+            "unparseable": last.get("unparseable", 0),
+            "tagged": 0,
+            "refused": 0,
+            "already_tagged": 0,
+            "deferred": 0,
+            "cap_hit": False,
+            "stop_reason": "weights_refused",
+            "conservation_ok": True,
+            "weights_ok": False,
+            "weights_problem": detail,
+            "silence_top": 0,
+            "mean_top_score": None,
+            "n_top_scores": 0,
+            "silence_frac": None,
+            "scored_any": 0,
+            "versions_held": last.get("versions_held") or {},
+            "by_reason": {},
+            "by_node": {},
+            "by_node_day_reason": {},
+            "model": model,
+            "heard": {},
+            "lane": lane,
+            "observation_not_health": {
+                "level_dbfs": {"n": 0},
+                "max_unstored_score": {"n": 0},
+                "silence_top_frac": None,
+                "mean_top_score": None,
+                "note": ("the run refused before any clip was read because the configured model did "
+                         "not verify or load"),
+            },
+        }
+        return write_heartbeat(root, report, now=now, lane=lane)
+    
+    
     def write_heartbeat(root: str, report: Dict[str, Any], now: Optional[float] = None,
                         lane: str = DEFAULT_LANE) -> Dict[str, Any]:
         """Merge this run into the heartbeat's ring, and record which refusal buckets are NEW.
@@ -2873,6 +2865,7 @@ data:
             "stop_reason": report.get("stop_reason"),
             "conservation_ok": bool(report.get("conservation_ok")),
             "weights_ok": bool(report.get("weights_ok")),
+            "weights_problem": report.get("weights_problem"),
             "silence_top": report.get("silence_top"),
             "mean_top_score": report.get("mean_top_score"),
             "n_top_scores": report.get("n_top_scores"),
@@ -2940,7 +2933,8 @@ data:
             lines.append("tagger   ok        last run %.0f s ago" % age)
     
         if not last.get("weights_ok", True):
-            lines.append("weights  REFUSED   the last run could not verify the pinned model sha256")
+            lines.append("weights  REFUSED   %s" % (last.get("weights_problem")
+                         or "the last run did not verify or would not load the configured model"))
             bad += 1
     
         window = [r for r in runs if now - float(r.get("at") or 0.0) <= window_s] or [last]
@@ -3107,9 +3101,9 @@ data:
     
     def main(argv=None) -> int:
         ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-        ap.add_argument("--pool", default="~/hear-pool",
+        ap.add_argument("--pool", default=DEFAULT_POOL,
                         help="pool root; clips/index.jsonl is read, clips/tags.jsonl is appended")
-        ap.add_argument("--model-dir", default=None,
+        ap.add_argument("--model-dir", default="~/hear-pool/models/yamnet",
                         help="directory holding %s and %s. ⚠️NOTHING HERE FETCHES THEM: both are "
                              "verified against a pinned sha256 and the run is refused otherwise"
                              % (MODEL_FILE, CLASSMAP_FILE))
@@ -3121,7 +3115,8 @@ data:
                              "summarised by max_unstored_score")
         ap.add_argument("--verify-weights", action="store_true",
                         help="hash the two artifacts against their pinned digests and exit; 0 when "
-                             "both match, 2 otherwise. Tags nothing")
+                             "both match, 2 otherwise. With an explicit --pool, a failure also stamps "
+                             "a refusal heartbeat. Tags nothing")
         ap.add_argument("--census", action="store_true",
                         help="tag everything and report, writing nothing")
         ap.add_argument("--check", action="store_true",
@@ -3140,21 +3135,8 @@ data:
         ap.add_argument("--lane", action="append", choices=sorted(LANES),
                         help="lane to run; repeat for several, which share one model load. "
                              "--check reads exactly one. Default %s" % DEFAULT_LANE)
-        ap.add_argument("--model", choices=sorted(TAGS.MODEL_BACKENDS),
-                        help="model backend: yamnet, birdnet, or perch")
         a = ap.parse_args(argv)
-        selected_backend_lane = backend_lane(a.model) if a.model else None
-        if a.lane and selected_backend_lane:
-            selected_model = LANES[selected_backend_lane]["model"]
-            if any(LANES[lane]["model"] != selected_model for lane in a.lane):
-                print("--model %s conflicts with --lane %s" % (a.model, a.lane), file=sys.stderr)
-                return 2
-        lanes = a.lane or ([selected_backend_lane] if selected_backend_lane else [DEFAULT_LANE])
-        if a.model_dir is None:
-            default_dirs = {"mn10": "~/hear-pool/models/mn10_as",
-                            "birdnet_v24": "~/hear-pool/models/birdnet_v24",
-                            "perch_v2": "~/hear-pool/models/perch_v2"}
-            a.model_dir = default_dirs[LANES[lanes[0]]["model"]]
+        lanes = a.lane or [DEFAULT_LANE]
         models = sorted({LANES[lane]["model"] for lane in lanes})
         if len(models) != 1 and not a.check:
             print("one invocation runs one model; lanes %s use %s" % (lanes, models), file=sys.stderr)
@@ -3173,6 +3155,10 @@ data:
             if v["ok"]:
                 print("weights OK  %s  tree sha256 %s" % (models[0], v["model_sha256"][:16]))
                 return 0
+            if a.pool != DEFAULT_POOL:
+                for lane in lanes:
+                    write_weights_refusal_heartbeat(root, "; ".join(v["problems"]),
+                                                    model=model["block"](v), lane=lane)
             for p in v["problems"]:
                 print("weights REFUSED: %s" % p, file=sys.stderr)
             return 2
@@ -3187,6 +3173,7 @@ data:
             print("\n".join(lines))
             return code
     
+        verified = None
         try:
             verified = model["verify"](a.model_dir)
             if not verified["ok"]:
@@ -3198,6 +3185,11 @@ data:
         except WeightsRefused as exc:
             # ⚠️LOUD, AND EXIT 2 RATHER THAN 1, so a monitor can tell "the model is not what it says"
             # apart from "tagging is behind". A tagger that cannot name its weights must not run.
+            block = model["block"](verified or {"ok": False, "model_sha256": None,
+                                                "class_map_sha256": None, "model_bytes": None,
+                                                "class_map_bytes": None, "files": {}})
+            for lane in lanes:
+                write_weights_refusal_heartbeat(root, str(exc), model=block, lane=lane)
             print("REFUSED: the model did not verify or would not load, so nothing was tagged.\n  %s"
                   % exc, file=sys.stderr)
             return 2
