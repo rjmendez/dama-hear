@@ -33,6 +33,7 @@ import zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
+import deploy_gate  # noqa: E402
 import wifi_store  # noqa: E402
 
 REPO_SLUG = "rjmendez/dama-hear"
@@ -199,6 +200,11 @@ def exchange(port, line, wait_s=120):
     die("the node did not come back on its NVS record within %d s" % wait_s)
 
 
+def fetch_status(ip, timeout=6):
+    with urllib.request.urlopen("http://%s/status" % ip, timeout=timeout) as r:
+        return json.load(r)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("node")
@@ -209,6 +215,10 @@ def main(argv=None):
     src.add_argument("--no-flash", action="store_true", help="the board already runs a release image")
     ap.add_argument("--class", dest="cls", default="xiao-s3-pps")
     ap.add_argument("--wifi", default=wifi_store.PATH)
+    ap.add_argument("--allow-gps-no-fix-indoors", action="store_true",
+                    help="accept selftest gps=no-fix after enrollment (for indoor bench work only)")
+    ap.add_argument("--allow-pps-absent", action="store_true",
+                    help="accept selftest pps=absent after enrollment")
     a = ap.parse_args(argv)
 
     try:
@@ -232,15 +242,19 @@ def main(argv=None):
     ip = exchange(a.port, line)
     print("enroll: %s joined Wi-Fi at %s" % (a.node, ip))
     try:
-        with urllib.request.urlopen("http://%s/status" % ip, timeout=6) as r:
-            st = json.load(r)
-    except OSError:
-        print("enroll: joined, but %s is not reachable from here to confirm /status" % ip)
-        return 0
-    prov = st.get("prov") or {}
-    if st.get("node") != a.node or prov.get("src") != "nvs":
-        die("%s reports node=%r prov=%r" % (ip, st.get("node"), prov))
-    print("enroll: OK -- %s reports node=%r fw=%r prov=%r" % (ip, st["node"], st.get("fw"), prov))
+        st = fetch_status(ip, timeout=6)
+    except OSError as e:
+        die("%s joined Wi-Fi but is not answering live /status (%s)" % (ip, e))
+    reasons = deploy_gate.status_reasons(
+        st,
+        node=a.node,
+        allow_gps_no_fix_indoors=a.allow_gps_no_fix_indoors,
+        allow_pps_absent=a.allow_pps_absent,
+    )
+    if reasons:
+        die("%s failed the live readiness gate: %s" % (ip, "; ".join(reasons)))
+    print("enroll: OK -- %s reports node=%r fw=%r prov=%r %s"
+          % (ip, st["node"], st.get("fw"), st.get("prov"), deploy_gate.format_selftest(st)))
     return 0
 
 
