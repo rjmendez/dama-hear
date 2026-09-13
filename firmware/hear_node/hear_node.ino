@@ -2200,7 +2200,11 @@ static bool     clip_have_last = false;
 static char clip_rand[CLIP_RAND_HEX + 1] = "000000";
 
 #ifndef HEAR_PUSH_HOST
-#define HEAR_PUSH_HOST              "mrpink"
+// "mrpink" was a Tailscale MagicDNS name; this firmware's WiFiClient has no MagicDNS resolver, so
+// that name never resolved and no heartbeat has ever reached a receiver under this default. The
+// receiver now runs at this LAN-routable address -- override per fleet by defining HEAR_PUSH_HOST
+// in secrets.h (gen_secrets.py writes it from ~/.hear_push) before this default is reached.
+#define HEAR_PUSH_HOST              "172.21.171.198"
 #endif
 #ifndef HEAR_PUSH_PORT
 #define HEAR_PUSH_PORT              5051u
@@ -2211,6 +2215,7 @@ static char clip_rand[CLIP_RAND_HEX + 1] = "000000";
 #define HEAR_PUSH_HEARTBEAT_PATH    "/api/hear/heartbeat"
 #define HEAR_PUSH_EVENT_PATH        "/api/hear/event"
 #define HEAR_PUSH_CONNECT_TIMEOUT_MS 15u
+#define HEAR_PUSH_READ_TIMEOUT_MS   2000u
 #define HEAR_PUSH_FAIL_LOG_MS       60000UL
 #define HEAR_PUSH_HEARTBEAT_MS      10000UL
 #define HEAR_PUSH_HEARTBEAT_MAX_MS  60000UL
@@ -2340,13 +2345,25 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
     return false;
   }
   size_t wrote = client.write((const uint8_t *)req, (size_t)n);
-  client.stop();
   if (wrote != (size_t)n) {
+    client.stop();
     if (code_out) *code_out = -5;
     return false;
   }
-  if (code_out) *code_out = 204;
-  return true;
+  // READ THE STATUS LINE. A write() that lands on the wire is not a write the server accepted --
+  // a stale/blank auth token gets a 401 and, before this, the firmware called that success and
+  // never told anyone. One bounded read of the "HTTP/1.1 NNN ..." line is enough to know which
+  // one happened; the body (if any) is discarded because nothing here consumes it.
+  client.setTimeout(HEAR_PUSH_READ_TIMEOUT_MS);
+  String status_line = client.readStringUntil('\n');
+  client.stop();
+  int code = -6;  // no status line arrived within the read timeout
+  if (status_line.length() >= 12 && status_line.startsWith("HTTP/1.")) {
+    code = status_line.substring(9, 12).toInt();
+    if (code < 100 || code > 599) code = -7;  // malformed status line
+  }
+  if (code_out) *code_out = code;
+  return code >= 200 && code < 300;
 }
 
 static void push_mark_clip_written(const char *path) {
