@@ -1,0 +1,73 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hear-mqtt-bridge
+  namespace: dama
+  labels:
+    app: hear-mqtt-bridge
+  annotations:
+    dama-hear/what: >-
+      Subscribes to the local mqtt-broker for hear_node telemetry relayed through
+      dama-gotchi's AWS ingest API (hear_node -> API Gateway -> batch_ingest Lambda -> SQS ->
+      forwarder Lambda -> Oxalis SQS -> dama-sqs-consumer.py) and writes it into the same
+      dama:hear:* Redis schema hear-heartbeat.yaml's LAN-only receiver writes.
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hear-mqtt-bridge
+  template:
+    metadata:
+      labels:
+        app: hear-mqtt-bridge
+    spec:
+      # The local broker (fed directly by dama-sqs-consumer.py) is bound on this node's host
+      # network, not exposed through the `mqtt-broker` k8s Service (its selector currently
+      # matches zero pods -- that Service is stale). mqtt-bridge-botnet reaches the same broker
+      # the same way, at 127.0.0.1:31883, for the same reason.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: bridge
+          image: python:3.13-slim
+          command: ["/bin/sh", "-lc"]
+          args:
+            - |
+              set -e
+              LIB=/deps
+              export PYTHONPATH="$LIB:/app"
+              need_install=0
+              python -c 'import redis,sys; sys.exit(0 if redis.__version__=="7.4.0" else 1)' 2>/dev/null || need_install=1
+              python -c 'import paho.mqtt.client,sys; sys.exit(0 if paho.mqtt.client.__version__=="1.6.1" else 1)' 2>/dev/null || need_install=1
+              if [ "$need_install" = "1" ]; then
+                echo "installing redis==7.4.0 paho-mqtt==1.6.1 into $LIB"
+                pip install --no-cache-dir --upgrade --target "$LIB" 'redis==7.4.0' 'paho-mqtt==1.6.1' >/dev/null 2>&1
+              fi
+              exec python /app/tools/hear_mqtt_bridge.py
+          env:
+            - { name: MQTT_HOST, value: "127.0.0.1" }
+            - { name: MQTT_PORT, value: "31883" }
+            - { name: MQTT_TOPIC, value: "dama/+/telemetry" }
+            - { name: MQTT_CLIENT_ID, value: "hear-mqtt-bridge" }
+            - { name: REDIS_HOST, value: "audit-redis.infra.svc.cluster.local" }
+            - { name: REDIS_PORT, value: "6379" }
+            - name: REDIS_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: dama-redis-secret
+                  key: REDIS_PASS
+                  optional: true
+          volumeMounts:
+            - { name: code, mountPath: /app/tools/hear_heartbeat_receiver.py, subPath: tools_hear_heartbeat_receiver.py }
+            - { name: code, mountPath: /app/tools/hear_mqtt_bridge.py, subPath: tools_hear_mqtt_bridge.py }
+            - { name: deps, mountPath: /deps }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: "1",  memory: 256Mi }
+      volumes:
+        - name: code
+          configMap:
+            name: hear-mqtt-bridge-code
+        - name: deps
+          emptyDir: {}

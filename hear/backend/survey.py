@@ -29,6 +29,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
+import zlib
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -58,6 +61,36 @@ class SurveyError(ValueError):
     precondition errors catches these too."""
 
 
+class SiteOriginError(SurveyError):
+    """HEAR_SITE_ORIGIN is malformed, or a real origin is required and the survey's is fictional."""
+
+
+SITE_ORIGIN_ENV = "HEAR_SITE_ORIGIN"
+_SITE_FIELD = re.compile(r"-?\d+(?:\.\d+)?")
+_H_ELL_RANGE_M = (-1000.0, 10000.0)
+
+
+def site_origin(environ=None) -> Optional[Dict]:
+    """The origin HEAR_SITE_ORIGIN names as 'lat,lon,h_ell_m', or None when it is unset.
+    Refusals never echo the value: it is the site."""
+    env = os.environ if environ is None else environ
+    if SITE_ORIGIN_ENV not in env:
+        return None
+    fields = [f.strip() for f in env[SITE_ORIGIN_ENV].split(",")]
+    if len(fields) != 3 or not all(_SITE_FIELD.fullmatch(f) for f in fields):
+        raise SiteOriginError("%s must be three plain decimals 'lat,lon,h_ell_m'; got %d field(s)"
+                              % (SITE_ORIGIN_ENV, len(fields)))
+    lat, lon, h = (float(f) for f in fields)
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0) or (lat == 0.0 and lon == 0.0):
+        raise SiteOriginError("%s is not a latitude,longitude on the earth (or is 0,0)"
+                              % SITE_ORIGIN_ENV)
+    if not (_H_ELL_RANGE_M[0] <= h <= _H_ELL_RANGE_M[1]):
+        raise SiteOriginError("%s height is outside %g..%g m above the ellipsoid"
+                              % (SITE_ORIGIN_ENV, _H_ELL_RANGE_M[0], _H_ELL_RANGE_M[1]))
+    return {"lat_deg": lat, "lon_deg": lon, "h_ell_m": h,
+            "source": "environment %s" % SITE_ORIGIN_ENV}
+
+
 def _is_number(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
@@ -72,13 +105,45 @@ class Survey:
     def __init__(self, positions: Dict[int, Sequence[float]],
                  names: Optional[Dict[int, str]] = None,
                  sigma_m: Optional[Dict[int, float]] = None,
-                 origin: Optional[Dict] = None) -> None:
+                 origin: Optional[Dict] = None,
+                 classes: Optional[Dict[int, str]] = None,
+                 position_sources: Optional[Dict[int, str]] = None) -> None:
         self.ids: List[int] = sorted(int(k) for k in positions)
         self._pos: Dict[int, np.ndarray] = {
             int(k): np.asarray(v, float).reshape(3) for k, v in positions.items()}
         self.names: Dict[int, str] = {i: (names or {}).get(i, "") for i in self.ids}
         self.sigma_m: Dict[int, float] = {i: float((sigma_m or {}).get(i, 0.0)) for i in self.ids}
+        self.classes: Dict[int, str] = {i: (classes or {}).get(i, "") for i in self.ids}
+        # "survey" unless the position came from somewhere weaker; see augment_from_node_gps().
+        self.position_sources: Dict[int, str] = {
+            i: (position_sources or {}).get(i, "survey") for i in self.ids}
         self.origin: Optional[Dict] = origin
+
+    def arrival_ids(self) -> List[int]:
+        """The subset whose hardware class admits its timestamps as TDoA arrivals.
+
+        ⚠️BEING IN THE SURVEY IS NOT THE SAME AS BEING SOLVABLE. hear/nodeclass.py already knows
+        which classes can produce an arrival and raises saying what the alternative would cost --
+        but `require_arrival` was called from tests and from nowhere else, so nothing in the
+        pipeline ever asked. A node added to the survey for its position (a PUC on NTP, 3 ms =
+        1.0 m of range) was then indistinguishable from a PPS node at 3.4 cm.
+
+        A node with NO stated class is included, because every survey written before the field
+        existed omits it and silently dropping those nodes would be a worse failure than the one
+        this fixes. A PRESENT but unrecognised class is refused: a typo or a class that has not
+        been registered yet is not the same thing as "unstated".
+        """
+        from .. import nodeclass                       # local: keeps survey.py importable alone
+        out = []
+        for i in self.ids:
+            c = self.classes.get(i, "")
+            if not c:
+                out.append(i)
+                continue
+            cls = nodeclass.CLASSES.get(c)
+            if cls is not None and cls.contributes_arrival():
+                out.append(i)
+        return out
 
     def __len__(self) -> int:
         return len(self.ids)
@@ -151,6 +216,12 @@ class Survey:
             raise SurveyError("survey origin needs numeric lat_deg, lon_deg and h_ell_m; got %r"
                               % (o,))
 
+    def origin_is_fictional(self) -> bool:
+        """Fails closed: a `fictional` key with any value but an explicit false counts."""
+        if not isinstance(self.origin, dict) or "fictional" not in self.origin:
+            return False
+        return self.origin["fictional"] is not False
+
     def diameter_m(self) -> float:
         """Largest pairwise 3D distance, metres. 3D and not horizontal because it bounds
         inter-node propagation and associate uses it as an upper bound -- the conservative side."""
@@ -216,7 +287,20 @@ def _read_node(entry, index: int, seen: Dict[int, int]) -> Dict:
     name = entry.get("name", "")
     if not isinstance(name, str):
         raise SurveyError("node %d has name %r, which is not a string" % (nid, name))
-    return {"node_id": nid, "xyz": xyz, "name": name, "sigma_m": float(sig)}
+    # ⚠️A SURVEYED POSITION IS NOT PERMISSION TO USE THE NODE AS AN ARRIVAL. `class` names the
+    # hardware class from hear/nodeclass.py, which is what says whether the node's timestamps are
+    # TDoA arrivals at all -- a PUC timed by NTP is 3 ms, 1.0 m of range, and is refused. Before
+    # this field existed the survey carried no such statement, so an entry added for a node that
+    # cannot range was indistinguishable from one that can. Unset means "unstated", not "yes".
+    cls = entry.get("class")
+    if cls is not None and not isinstance(cls, str):
+        raise SurveyError("node %d has class %r, which is not a string" % (nid, cls))
+    src = entry.get("position_source", "survey")
+    if not isinstance(src, str) or not src:
+        raise SurveyError("node %d has position_source %r, which is not a non-empty string"
+                          % (nid, src))
+    return {"node_id": nid, "xyz": xyz, "name": name, "sigma_m": float(sig),
+            "class": cls or "", "position_source": src}
 
 
 def from_dict(d: Dict, min_nodes: int = 3) -> Survey:
@@ -249,6 +333,8 @@ def from_dict(d: Dict, min_nodes: int = 3) -> Survey:
     sv = Survey({r["node_id"]: r["xyz"] for r in rows},
                 names={r["node_id"]: r["name"] for r in rows},
                 sigma_m={r["node_id"]: r["sigma_m"] for r in rows},
+                classes={r["node_id"]: r["class"] for r in rows},
+                position_sources={r["node_id"]: r["position_source"] for r in rows},
                 origin=d.get("origin"))
 
     P = sv.positions(sv.ids)
@@ -312,7 +398,143 @@ def from_wgs84_nodes(entries: Sequence[Dict], origin: Optional[Dict] = None,
                      min_nodes=min_nodes)
 
 
-def load_survey(path: str, min_nodes: int = 3) -> Survey:
-    """Read JSON from `path` and validate it. Does not search, cache or default a path."""
+# ---------------------------------------------------------------- node GPS fallback
+# ⚠️A NODE WITH NO SURVEY ENTRY IS POSITIONED FROM ITS OWN GPS MEAN, AND SAYS SO. Refusing it
+# outright threw away a receiver the array could still use at a wider sigma. A surveyed position
+# always wins; the fallback only fills names the survey does not have.
+#
+# The floor is the upper end of what tools/node_survey.py measured for these receivers' mean
+# position ("sigma_d is between 0.61 m and about 2.1 m"); the node's own hAcc understates it, so
+# hAcc only ever widens the sigma. The reject bound is node_survey.py's HACC_REJECT_M.
+GPS_SIGMA_FLOOR_M: float = 2.1
+GPS_HACC_REJECT_M: float = 10.0
+GPS_MIN_FIXES: int = 60
+GPS_MAX_AGE_S: float = 86400.0
+#: GPS-positioned ids are derived from the NAME so they are stable across runs and do not shift
+#: when another node appears. Surveyed ids in this repo are small integers, below this base.
+GPS_NODE_ID_BASE: int = 1000
+POSITION_SOURCE_GPS = "gps_mean"
+
+
+def gps_node_id(name: str) -> int:
+    return GPS_NODE_ID_BASE + zlib.crc32(name.encode("utf-8")) % (_MAX_NODE_ID + 1 - GPS_NODE_ID_BASE)
+
+
+def _gps_refusal(p, now: float, max_hacc_m: float, min_fixes: int,
+                 max_age_s: float) -> Optional[str]:
+    """Why this node's reported GPS mean cannot place it, or None. States numbers, never lat/lon."""
+    if not isinstance(p, dict):
+        return "position entry is %s, not an object" % type(p).__name__
+    if p.get("h_ell_m") is None and p.get("hmsl_m") is not None:
+        return "only hmsl_m was reported. %s" % GEO.GEOID_NOTE
+    # ⚠️THE COUNT OF AVERAGED FIXES IS THE QUALITY GATE, NOT THE LIVE `fix` FIELD. `fix` is UBX
+    # fixType on a u-blox node (3 = 3D) and GGA fix quality on a PMTK node (1 = a fix), so one
+    # threshold on it refuses a valid PMTK fix. The firmware only averages fixes that passed its
+    # own 3D and hAcc gate, and a mean of zero fixes is 0.0/0.0, which is not a position.
+    fixes = p.get("fixes")
+    if not _is_number(fixes) or int(fixes) <= 0:
+        return "the node has averaged no position fixes, so its mean is not a position"
+    for k in ("lat_deg", "lon_deg", "h_ell_m"):
+        if not _is_number(p.get(k)) or not math.isfinite(float(p[k])):
+            return "no numeric %s in the node's GPS mean" % k
+    if int(fixes) < int(min_fixes):
+        return "only %r fix(es) averaged, need %d" % (fixes, int(min_fixes))
+    hacc = p.get("hacc_m")
+    if not _is_number(hacc) or float(hacc) > float(max_hacc_m):
+        return "hAcc %r m is over the %.1f m reject bound" % (hacc, float(max_hacc_m))
+    at = p.get("at")
+    if not _is_number(at):
+        return "the position carries no timestamp, so its age is unknown"
+    age = float(now) - float(at)
+    if age > float(max_age_s):
+        return "the position is %.0f s old, over the %.0f s limit" % (age, float(max_age_s))
+    return None
+
+
+def augment_from_node_gps(sv: "Survey", positions, now: float,
+                          sigma_floor_m: float = GPS_SIGMA_FLOOR_M,
+                          max_hacc_m: float = GPS_HACC_REJECT_M,
+                          min_fixes: int = GPS_MIN_FIXES,
+                          max_age_s: float = GPS_MAX_AGE_S):
+    """(survey, report): `sv` plus every unsurveyed node whose GPS mean is usable.
+
+    `positions` is {name: {lat_deg, lon_deg, h_ell_m, hacc_m, fixes, fix, at, class}}, what
+    tools/hear_drain.py records from each node's /status. The report names every node considered
+    and why it was or was not used, with sigma and age but NEVER a coordinate.
+
+    Never raises for a bad entry: a node that cannot be placed is left out and reported, and if
+    adding the placeable ones would make the survey invalid, the original survey is returned.
+    """
+    report: List[Dict] = []
+    if not isinstance(positions, dict):
+        return sv, [{"name": None, "used": False,
+                     "why": "positions is %s, not an object" % type(positions).__name__}]
+    surveyed = {sv.names[i] for i in sv.ids if sv.names[i]}
+    o = sv.origin if isinstance(sv.origin, dict) else {}
+    origin_ok = (not sv.origin_is_fictional()
+                 and all(_is_number(o.get(k)) for k in ("lat_deg", "lon_deg", "h_ell_m")))
+    taken = set(sv.ids)
+    added: List[Dict] = []
+    for name in sorted(k for k in positions if isinstance(k, str)):
+        if name in surveyed:
+            continue
+        p = positions[name]
+        why = _gps_refusal(p, now, max_hacc_m, min_fixes, max_age_s)
+        if why is None and not origin_ok:
+            why = ("the survey origin is fictional or incomplete, so a lat/lon cannot be placed "
+                   "in its frame")
+        nid = gps_node_id(name)
+        if why is None and nid in taken:
+            why = "derived node_id %d is already taken" % nid
+        if why is not None:
+            report.append({"name": name, "used": False, "why": why})
+            continue
+        e, n, u = GEO.geodetic_to_enu(float(p["lat_deg"]), float(p["lon_deg"]),
+                                      float(p["h_ell_m"]), float(o["lat_deg"]),
+                                      float(o["lon_deg"]), float(o["h_ell_m"]))
+        sigma = max(float(p["hacc_m"]), float(sigma_floor_m))
+        cls = p.get("class") if isinstance(p.get("class"), str) else ""
+        taken.add(nid)
+        added.append({"node_id": nid, "name": name, "e_m": e, "n_m": n, "u_m": u,
+                      "sigma_m": sigma, "class": cls, "position_source": POSITION_SOURCE_GPS})
+        report.append({"name": name, "used": True, "node_id": nid, "sigma_m": sigma,
+                       "hacc_m": float(p["hacc_m"]), "fixes": int(p["fixes"]),
+                       "age_s": float(now) - float(p["at"]), "class": cls or "(unstated)"})
+    if not added:
+        return sv, report
+    rows = []
+    for i in sv.ids:
+        e, n, u = (float(x) for x in sv.position(i))
+        rows.append({"node_id": i, "name": sv.names[i], "e_m": e, "n_m": n, "u_m": u,
+                     "sigma_m": sv.sigma_m[i], "class": sv.classes.get(i, ""),
+                     "position_source": sv.position_sources.get(i, "survey")})
+    try:
+        out = from_dict({"frame": _FRAME, "units": _UNITS, "origin": sv.origin,
+                         "nodes": rows + added}, min_nodes=0)
+    except SurveyError as exc:
+        for r in report:
+            if r.get("used"):
+                r.update(used=False, why="adding the GPS-positioned nodes made the survey "
+                                          "invalid: %s" % exc)
+        return sv, report
+    return out, report
+
+
+def load_survey(path: str, min_nodes: int = 3, require_real_origin: bool = False) -> Survey:
+    """Read JSON from `path` and validate it. Does not search, cache or default a path.
+
+    HEAR_SITE_ORIGIN, when set, replaces the file's origin. `require_real_origin` refuses a survey
+    whose origin is still marked fictional, which is what the public repo ships."""
+    site = site_origin()
     with open(path, "r") as fh:
-        return from_dict(json.load(fh), min_nodes=min_nodes)
+        d = json.load(fh)
+    if site is not None and isinstance(d, dict):
+        d = dict(d, origin=site)
+    sv = from_dict(d, min_nodes=min_nodes)
+    if require_real_origin and sv.origin_is_fictional():
+        raise SiteOriginError(
+            "the origin in %s is marked fictional (the public repo does not carry the site) and "
+            "%s is unset; every lat/lon converted against it would be misplaced. Set %s="
+            "'lat,lon,h_ell_m' to the real frame origin (cluster: Secret hear-site, key origin)"
+            % (path, SITE_ORIGIN_ENV, SITE_ORIGIN_ENV))
+    return sv

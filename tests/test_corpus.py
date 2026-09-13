@@ -7,6 +7,7 @@ import pytest
 
 from hear import corpus as C
 from hear import sketch as SK
+from hear import wire as WR
 
 
 def _frame(fs=48000.0, flags=0, seed=1, ref_peak=500):
@@ -35,6 +36,25 @@ class TestPhone:
         assert r.ref_db == pytest.approx(ref, abs=0.25)      # ref travels quantised to 0.25 dB
         assert r.fs_hz == 48000.0
         assert r.ts_utc_s == pytest.approx(1788700000.123)
+
+    def test_the_phone_timestamp_uses_the_frames_microseconds_not_the_ms_bucket(self):
+        """⚠️THE CROSS-REPO TIMING CONTRACT. dama-gotchi puts the absolute second in
+        `ts_utc_ms` and the frame's own microseconds-within-that-second in `node_us`. Reading the
+        millisecond field alone quantises the sketch onto a 1 ms grid and loses the onset
+        precision the frame already carries.
+
+        Pick the near-rollover case because it proves both halves at once: 999.600 ms rounds to
+        the next integer millisecond, so the absolute second still has to come from `ts_utc_ms`
+        while the within-second digits come from the frame.
+        """
+        true_utc_us = 1788700000999600
+        frame, q, ref = _frame(fs=48000.0)
+        frame = SK.pack(true_utc_us % 1_000_000, ref, 500, q, fs=48000.0, layout=SK.LAYOUT_FIXED)
+        r = C.from_phone({"sketch_b64": base64.b64encode(frame).decode(),
+                          "ts_utc_ms": round(true_utc_us / 1000),
+                          "clock_tier": "gnss"})
+        assert r.node_us == 999600
+        assert r.ts_utc_s == pytest.approx(true_utc_us / 1e6, abs=1e-12)
 
     def test_absolute_db_is_recoverable(self):
         p, q, ref = _phone_payload()
@@ -69,6 +89,25 @@ class TestPhone:
         r = C.from_phone({"sketch_b64": base64.b64encode(frame).decode()})
         assert r.retrigger is True
 
+    def test_v2_173_byte_phone_payload_decodes_correctly(self):
+        rng = np.random.default_rng(42)
+        q, ref = SK.sketch(rng.normal(0, 1000, 4096), 48000.0)
+        v2_frame = WR.pack_v2(us_of_day=12_345_678, node_id=42, seq=7, ref_db=ref, peak=600,
+                              q=q, profile_id=1)
+        assert len(v2_frame) == 173
+        p = {"sketch_b64": base64.b64encode(v2_frame).decode(),
+             "ts_utc_ms": 1788700000000 + int(12345.678),
+             "clock_tier": "gnss", "node_id": "phone-v2"}
+        r = C.from_phone(p)
+        assert r.source == "phone"
+        assert r.node_id == "phone-v2"
+        assert r.fs_hz == 48000.0
+        assert r.ref_db == pytest.approx(ref, abs=0.25)
+        assert r.extra["us_of_day"] == 12_345_678
+        assert r.extra["seq"] == 7
+        assert r.extra["profile_id"] == 1
+        assert np.array_equal(r.q, q)
+
 
 class TestNode:
     def test_node_us_alone_carries_no_absolute_time(self):
@@ -89,6 +128,52 @@ class TestNode:
         e48 = C.from_node(f48, "n").band_edges_hz()
         assert e48[-1] == pytest.approx(20000.0)
         assert e16[-1] == pytest.approx(7840.0)
+
+    def test_the_records_band_edges_are_the_frames_own_and_not_the_nyquist_axis(self):
+        """⚠️Record.band_edges_hz() is the accessor a caller uses to decide whether two frames are
+        comparable, so it has to answer from the axis the frame states. Fails against
+        `SK.band_edges_hz(self.fs_hz, self.bands)` -- the layout argument defaulted, which gives
+        a fixed-layout 16 kHz node frame a 7840.0 Hz top edge against its own frame's 20000.0 and
+        so makes two frames on ONE axis compare as two.
+
+        16 kHz is the rate that reproduces it: at 48 kHz the two layouts coincide, which is why
+        every frame the node emits from here on hides this and only the stored history shows it.
+        """
+        for fs in (16000.0, 48000.0):
+            frame = SK.pack(123456, -20.0, 500,
+                            SK.sketch(np.random.default_rng(5).normal(0, 1000, 4096), fs)[0],
+                            fs=fs, layout=SK.LAYOUT_FIXED)
+            rec = C.from_node(frame, "n")
+            assert rec.extra["layout"] == SK.LAYOUT_FIXED
+            assert np.allclose(rec.band_edges_hz(), SK.unpack(frame)["band_edges_hz"]), fs
+        # and the two rates are then the same axis, which is the question this accessor answers
+        r16 = C.from_node(SK.pack(1, -20.0, 500, SK.sketch(
+            np.random.default_rng(5).normal(0, 1000, 4096), 16000.0)[0],
+            fs=16000.0, layout=SK.LAYOUT_FIXED), "n")
+        r48 = C.from_node(SK.pack(1, -20.0, 500, SK.sketch(
+            np.random.default_rng(5).normal(0, 1000, 4096), 48000.0)[0],
+            fs=48000.0, layout=SK.LAYOUT_FIXED), "p")
+        assert np.allclose(r16.band_edges_hz(), r48.band_edges_hz())
+
+    def test_v2_173_byte_node_frame_decodes_correctly(self):
+        rng = np.random.default_rng(99)
+        q, ref = SK.sketch(rng.normal(0, 1000, 4096), 48000.0)
+        v2_frame = WR.pack_v2(us_of_day=45_123_456, node_id=101, seq=55, ref_db=ref, peak=12000,
+                              q=q, profile_id=1)
+        assert len(v2_frame) == 173
+        rec = C.from_node(v2_frame, "node-101", second_utc_s=1788700000)
+        assert rec.source == "node"
+        assert rec.node_id == "node-101"
+        assert rec.fs_hz == 48000.0
+        assert rec.ref_db == pytest.approx(ref, abs=0.25)
+        assert rec.peak == 12000
+        assert rec.node_us == 123456
+        assert rec.ts_utc_s == pytest.approx(WR.unwrap_utc(45_123_456, 1788700000))
+        assert rec.extra["us_of_day"] == 45_123_456
+        assert rec.extra["seq"] == 55
+        assert rec.extra["profile_id"] == 1
+        assert rec.extra["layout"] == SK.LAYOUT_FIXED
+        assert np.array_equal(rec.q, q)
 
 
 class TestFeatureMatrix:
@@ -227,6 +312,17 @@ class TestCrossRateAlignment:
         recs = [self._rec(48000.0, 0), self._rec(16000.0, 1, layout=SK.LAYOUT_NYQUIST)]
         with pytest.raises(ValueError, match="nyquist"):
             C.aligned_matrix(recs)
+
+    def test_a_record_that_states_no_axis_is_refused_not_assumed_onto_the_shared_one(self):
+        """The refusal above reads `extra["layout"]`, so what an ABSENT key means decides whether
+        an axis-less record is checked at all. Fails against `extra.get("layout",
+        SK.LAYOUT_FIXED)`, which walks it straight through the one refusal this function exists
+        for. Nothing in-tree builds such a Record today -- all three constructors set the key --
+        which is exactly why the default has to be the refusing one."""
+        r = self._rec(48000.0, 0)
+        r.extra.pop("layout")
+        with pytest.raises(ValueError, match="nyquist"):
+            C.aligned_matrix([r])
 
     def test_an_unstated_rate_is_dropped_because_its_empty_bands_are_unknown(self):
         q, ref = SK.sketch(np.zeros(4096), 16000.0, layout=SK.LAYOUT_FIXED)

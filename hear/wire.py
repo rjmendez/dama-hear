@@ -58,7 +58,7 @@ HDR_V2: int = 13                        # bytes. 5 ts + 2 ref + 2 peak + 2 node_
 # profile_id -> (bands, frames). LITERAL AND FROZEN: if SK.MEL_BANDS/SK.FRAMES were ever edited,
 # reading these from them would silently change the meaning of every deployed frame. A test
 # compares the two so an edit forces a NEW profile id instead of a reinterpretation.
-PROFILES: Dict[int, Tuple[int, int]] = {0: (20, 8), 1: (20, 8), 2: (20, 8)}
+PROFILES: Dict[int, Tuple[int, int]] = {0: (20, 8), 1: (20, 8), 2: (20, 8), 3: (20, 8), 4: (20, 8)}
 
 
 class Geometry(NamedTuple):
@@ -92,11 +92,17 @@ PROFILE_GEOMETRY: Dict[int, Geometry] = {
     0: Geometry(20, 8, 256, 0.004, None, SK.LAYOUT_NYQUIST, 300.0, 20000.0),
     1: Geometry(20, 8, 256, 0.004, 48000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
     2: Geometry(20, 8, 256, 0.004, 16000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
+    # Schema 2.0 multi-rate profiles: 3 for 32 kHz (HUGBOT5000), 4 for 24 kHz
+    3: Geometry(20, 8, 256, 0.004, 32000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
+    4: Geometry(20, 8, 256, 0.004, 24000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
 }
 
 #: Ids a NEW frame may claim. 0 is excluded because a frame that cannot say its own rate is the
 #: defect, not a choice.
 LEGACY_PROFILES = frozenset({0})
+
+#: Valid profile ids for a NEW frame (excludes legacy/read-only profile 0).
+NEW_PROFILE_IDS: frozenset[int] = frozenset(k for k in PROFILE_GEOMETRY if k not in LEGACY_PROFILES)
 
 #: What pack_v2 uses when the caller names no profile.
 #:
@@ -109,8 +115,6 @@ DEFAULT_PROFILE: int = 1
 
 # 237 B Meshtastic payload minus 37 B protobuf/portnum, per sketch.py:31,107.
 MESHTASTIC_USABLE: int = 200
-
-_SHAPES: Dict[Tuple[int, int], int] = {v: k for k, v in PROFILES.items()}
 
 _TS_BITS = 37
 _TS_MASK = (1 << _TS_BITS) - 1
@@ -222,6 +226,9 @@ def pack_v2(us_of_day: int, node_id: int, seq: int, ref_db: float, peak: int,
     if q.ndim != 2:
         raise ValueError("q is %d-D; a sketch is 2-D (bands, frames)" % q.ndim)
     pid = DEFAULT_PROFILE if profile_id is None else int(profile_id)
+    if pid not in NEW_PROFILE_IDS:
+        raise ValueError("profile_id %d is not a valid new profile id (valid: %s)"
+                         % (pid, sorted(NEW_PROFILE_IDS)))
     bands, frames = profile_shape(pid)
     if q.shape != (bands, frames):
         raise ValueError("q shape %r does not match profile %d (%dx%d)"
@@ -261,42 +268,70 @@ def unpack_v2(b: bytes) -> Dict:
 
     ref4, peak, node_id, _ = struct.unpack_from("<hHHH", b, 5)
     q = np.frombuffer(b[HDR_V2:n], dtype=np.int8).reshape(bands, frames)
+    geom = profile_geometry(pid)
+    fs = geom.fs_hz
+    layout = geom.layout
+    vb = None if fs is None else SK.valid_bands(fs, bands, layout=layout)
+    be = None if fs is None else SK.band_edges_hz(fs, bands, layout=layout)
     return {"version": VERSION, "us_of_day": us,
             "node_id": node_id, "seq": (flags >> _F_SEQ_SHIFT) & _F_SEQ_MASK,
             "ref_db": ref4 / 4.0, "peak": peak,
             "retrigger": bool(flags & _F_RETRIG), "profile_id": pid,
             "bands": bands, "frames": frames, "flags": flags,
+            "fs_hz": fs, "layout": layout, "valid_bands": vb, "band_edges_hz": be,
             "q": q, "db": q.astype(float) / 2.0 + ref4 / 4.0}
 
 
-def version_of(b: bytes) -> int:
-    """1 or 2, by length plus self-consistency. v2 is tested FIRST and that order is contract.
+def version_of(b: bytes, explicit_version: Optional[int] = None) -> int:
+    """1 or 2, by length plus self-consistency.
 
-    ⚠️THE DISCRIMINATION IS NOT EXACT AND NOTHING CAN MAKE IT SO: v1 has no version field to read
+    If explicit_version is provided (e.g. from MQTT topic or transport envelope),
+    it is honored directly if the byte length and structure match the requested version.
+    Otherwise, v2 is tested FIRST and that order is contract.
+
+    ⚠️THE HEURISTIC DISCRIMINATION IS NOT EXACT AND NOTHING CAN MAKE IT SO: v1 has no version field to read
     (sketch.py:97). A v1 frame whose bands*frames happened to equal a v2 profile's payload and
     whose bytes 11-12 happened to spell version 2 would be misread. With MEL_BANDS 20 and
     FRAMES 8 frozen (sketch.py:26-27) that collision does not exist in this repo, which is a
     property of the constants and not of this function.
     """
-    if len(b) >= HDR_V2:
-        flags = struct.unpack_from("<H", b, 11)[0]
-        pid = (flags >> _F_PROFILE_SHIFT) & _F_PROFILE_MASK
-        version = (flags >> _F_VERSION_SHIFT) & _F_VERSION_MASK
-        if version == VERSION and pid in PROFILES and len(b) == wire_size_v2(pid):
-            if not (int.from_bytes(b[0:5], "little") >> _TS_BITS):
-                return VERSION
-    if len(b) >= _V1_HDR and 1 <= b[8] <= 64 and 1 <= b[9] <= 64 and len(b) == _V1_HDR + b[8] * b[9]:
-        return 1
+    if explicit_version == 1:
+        if len(b) >= _V1_HDR and 1 <= b[8] <= 64 and 1 <= b[9] <= 64:
+            want = _V1_HDR + b[8] * b[9]
+            if 0 <= len(b) - want <= 16:
+                return 1
+        raise ValueError(f"explicit v1 specified but frame is not a valid v1 frame: {len(b)} bytes")
+
+    if explicit_version == 2 or explicit_version is None:
+        if len(b) >= HDR_V2:
+            flags = struct.unpack_from("<H", b, 11)[0]
+            pid = (flags >> _F_PROFILE_SHIFT) & _F_PROFILE_MASK
+            version = (flags >> _F_VERSION_SHIFT) & _F_VERSION_MASK
+            if version == VERSION and pid in PROFILES and len(b) >= wire_size_v2(pid):
+                if not (int.from_bytes(b[0:5], "little") >> _TS_BITS):
+                    return VERSION
+        if explicit_version == 2:
+            raise ValueError(f"explicit v2 specified but frame is not a valid v2 frame: {len(b)} bytes")
+
+    if len(b) >= _V1_HDR and 1 <= b[8] <= 64 and 1 <= b[9] <= 64:
+        want = _V1_HDR + b[8] * b[9]
+        if 0 <= len(b) - want <= 16:
+            return 1
     raise ValueError("unrecognised frame: %d bytes" % len(b))
 
 
-def decode(b: bytes) -> Dict:
+def decode(b: bytes, explicit_version: Optional[int] = None) -> Dict:
     """version_of() then the matching unpacker. A v1 result gains 'version': 1 from HERE --
     sketch.py is read-only -- and keeps its own 'node_us' key. Nothing else is renamed."""
-    v = version_of(b)
+    v = version_of(b, explicit_version=explicit_version)
     if v == VERSION:
-        return unpack_v2(b)
-    d = SK.unpack(b)
+        flags = struct.unpack_from("<H", b, 11)[0]
+        pid = (flags >> _F_PROFILE_SHIFT) & _F_PROFILE_MASK
+        n = wire_size_v2(pid)
+        return unpack_v2(b[:n])
+    node_us, ref4, peak, bands, frames, flags = struct.unpack("<IhHBBH", b[:12])
+    want = 12 + bands * frames
+    d = SK.unpack(b[:want])
     d["version"] = 1
     return d
 

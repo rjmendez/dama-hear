@@ -3,9 +3,10 @@
   "units": "m",
   "origin": {
     "lat_deg": 40.292522149999996,
-    "lon_deg": -76.1221604,
+    "lon_deg": -79.1221604,
     "h_ell_m": 0.0,
-    "source": "median of nyquist; height datum is the --heights argument, NOT GNSS (storey = 3.0 m nominal US residential floor-to-floor, NOT measured) (storey = 3.0 m nominal US residential floor-to-floor, NOT measured)"
+    "fictional": true,
+    "source": "FICTIONAL, NOT THE SITE: this repo is public, so the longitude here is deliberately wrong. The real origin comes from the environment at runtime (HEAR_SITE_ORIGIN='lat,lon,h_ell_m'; in the cluster Secret hear-site, key origin) and hear-tdoa refuses to run without it. The e/n/u below are relative to that real origin: median of nyquist; height datum is the --heights argument, NOT GNSS (storey = 3.0 m nominal US residential floor-to-floor, NOT measured)"
   },
   "nodes": [
     {
@@ -27,6 +28,27 @@
       "sigma_m": 0.521,
       "u_source": "nominal storey, +/-1.0 m assumed",
       "sigma_u_m": 1.0
+    },
+    {
+      "node_id": 3,
+      "name": "rankine",
+      "e_m": -4.58,
+      "n_m": 10.48,
+      "u_m": 3.0,
+      "sigma_m": 0.49,
+      "u_source": "same storey as mach, operator-stated; NOT measured",
+      "sigma_u_m": 1.0
+    },
+    {
+      "node_id": 4,
+      "name": "puc",
+      "class": "puc-ntp",
+      "e_m": -22.16,
+      "n_m": 8.98,
+      "u_m": 0.0,
+      "sigma_m": 6.5,
+      "u_source": "PROVISIONAL -- not installed. e/n from the PUC's own GPS mean over 18 fixes (4-6 sats, HDOP 1.3-3.9), which scattered 6.5 m rms / 10.0 m max while stationary; u is a placeholder, NOT measured. Re-survey when sited.",
+      "sigma_u_m": 5.0
     }
   ]
 }

@@ -10,13 +10,14 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hear import detsfile as DF        # noqa: E402
 from hear import sketch as SK          # noqa: E402
 from hear import wire as WR            # noqa: E402
 from tools import hear_bridge as BR    # noqa: E402
 
-# The retrieved night. Absent, every test that needs it skips -- the capture is not in the repo,
+# The retrieved capture. Absent, every test that needs it skips -- the capture is not in the repo,
 # the same arrangement tests/test_node.py:18-19 makes for DAMA_HEAR_REAL_WAV.
-CAPTURE = os.environ.get("DAMA_HEAR_CAPTURE", os.path.expanduser("~/dama-hear-night-2026-09-07"))
+CAPTURE = os.environ.get("DAMA_HEAR_CAPTURE", os.path.expanduser("~/dama-hear-capture-2026-09-07"))
 DETS = os.path.join(CAPTURE, "dets.csv")
 HAVE_CAPTURE = os.path.exists(DETS)
 needs_capture = pytest.mark.skipif(
@@ -43,8 +44,8 @@ def _row(utc_us=UTC_US, q=None, ref_db=52.5, peak=818, flags=0, sample=2222, fs_
 
 # A /scene.csv row in the firmware's own format: 20 bands x 4 slices of BARE int8 half-dB steps,
 # band-major, no wire header, geometry and reference in the row's own columns. No scene capture
-# exists yet (the 2026-09-07 night predates the feature), so this is synthesised to the format
-# night_node.ino's scene_emit() writes rather than lifted from a file.
+# exists yet (the 2026-09-07 capture predates the feature), so this is synthesised to the format
+# hear_node.ino's scene_emit() writes rather than lifted from a file.
 def _scene_q(bands=20, slices=4, seed=7):
     r = np.random.RandomState(seed)
     return np.clip(r.normal(-24, 10, (bands, slices)), -128, 0).round().astype(np.int8)
@@ -101,6 +102,42 @@ class TestDetsCsv:
         line = "%d,12,2222,11,189911,818,0,16000.169,%s,%s" % (UTC_US, r["frame_hex"], "42")
         rows = BR.parse_dets_csv(hdr + "\n" + line)
         assert rows[0]["some_future_column"] == "42"
+
+    def test_reads_every_header_hear_detsfile_knows_about(self):
+        # Built from hear.detsfile.GENERATIONS directly rather than retyped here, so the two
+        # tables cannot drift apart again the way DETS_COLUMNS (G1 only) drifted from the real,
+        # node_id-first header every node has written since G4.
+        r = _row()
+        for gen in DF.GENERATIONS:
+            if gen.broken_header:
+                continue  # G3: covered separately below, its declared header is not its rows
+            values = {
+                "node_id": "3", "sketch_back": "192", "clip": "", "clip_why": "",
+                "sync_sigma_ns": "35000",
+            }
+            values.update({k: str(r[k]) for k in
+                          ("utc_us", "uptime_s", "sample", "pps_n", "us_since_pps",
+                           "trigger", "flags", "fs_hz", "frame_hex")})
+            hdr = ",".join(gen.declared)
+            line = ",".join(values[c] for c in gen.declared)
+            rows = BR.parse_dets_csv(hdr + "\n" + line)
+            assert len(rows) == 1, gen.name
+            assert int(rows[0]["utc_us"]) == UTC_US, gen.name
+            assert rows[0]["frame_hex"] == r["frame_hex"], gen.name
+
+    def test_g3s_lying_header_is_read_by_position_not_by_name(self):
+        # G3's declared header says `node,utc_us,...`; the firmware never wrote that column, so
+        # every real row is one field narrower than its own header. A straight DictReader (keyed
+        # off the header's names) shifts utc_us into the `node` slot; parse_dets_csv must not.
+        r = _row()
+        hdr = ",".join(DF.G3.declared)
+        line = ",".join(str(r[k]) for k in
+                        ("utc_us", "uptime_s", "sample", "pps_n", "us_since_pps",
+                         "trigger", "flags", "fs_hz", "frame_hex")) + ",,"
+        rows = BR.parse_dets_csv(hdr + "\n" + line)
+        assert len(rows) == 1
+        assert int(rows[0]["utc_us"]) == UTC_US
+        assert "node" not in rows[0]
 
 
 class TestSceneCsv:
@@ -251,7 +288,7 @@ class TestTimestamp:
         assert int(round(rec["ts"] * 1e6)) == rec["utc_us"]
 
     @needs_capture
-    def test_every_stamp_in_the_night_round_trips(self):
+    def test_every_stamp_in_the_capture_round_trips(self):
         res = BR.convert(_capture_rows(), NODE)
         bad = [r for r in res["records"] if int(round(r["ts"] * 1e6)) != r["utc_us"]]
         assert not bad, "ts is the compatibility field; it must not lose a microsecond"
@@ -308,7 +345,6 @@ class TestFrameFlags:
         # frame has full context. Profile 1 is not in this build's table, so it is added for the
         # length of this test -- the bit layout is what is under test, not the profile list.
         monkeypatch.setitem(WR.PROFILES, 1, (20, 8))
-        monkeypatch.setitem(WR._SHAPES, (20, 8), 0)
         frame = WR.pack_v2(189911, 7, 3, 52.5, 818, _q(), retrigger=False, profile_id=1)
         assert struct.unpack_from("<H", frame, 11)[0] == 0x0342
         assert 0x0342 & BR.V1_FLAG_NO_CONTEXT, "this is the bit the old reading masked"
@@ -442,7 +478,7 @@ class TestFeatureVector:
 
     def test_a_flat_sketch_is_zeros_not_nan(self):
         # Every cell at the reference is a real sketch of silence, not an error. A NaN here would
-        # poison a covariance fit for the whole night.
+        # poison a covariance fit for the whole capture.
         rec = BR.to_record(_row(q=np.zeros((20, 8), np.int8)), NODE)
         assert rec["embed"] == [0.0] * 160
         assert not any(np.isnan(rec["embed"]))
@@ -487,7 +523,7 @@ class TestTags:
         assert min(pk) < 800
 
     @needs_capture
-    def test_the_bands_actually_separate_this_night(self):
+    def test_the_bands_actually_separate_in_this_capture(self):
         # cluster_audio_embed names a cluster by top_tags[0] and sorts "?" into silence/ambient,
         # so a single-valued label makes the report meaningless. The detections' own quartiles
         # split them 12/12/12/12.
@@ -543,7 +579,7 @@ class TestAudioPointer:
         assert a["utc_us_to"] - a["utc_us_from"] == pytest.approx(dur * 1e6, abs=2)
 
     @needs_capture
-    def test_every_pointer_in_the_night_dereferences(self):
+    def test_every_pointer_in_the_capture_dereferences(self):
         # The first record of this capture is the one that used to emit from=0 -> epoch 0 -> 400.
         res = BR.convert(_capture_rows(), NODE, base_url="http://node.invalid")
         lo = min(r["utc_us"] for r in res["records"])
@@ -552,7 +588,7 @@ class TestAudioPointer:
             _, q = _qs(r["audio"]["url"])
             frm, dur = int(q["from"][0]), float(q["dur"][0])
             assert frm > 0, "a from= of 0 is 1970 and the node answers 400"
-            assert lo - 2_000_000 <= frm <= hi, "inside the night it came from"
+            assert lo - 2_000_000 <= frm <= hi, "inside the capture it came from"
             assert 0 < dur <= BR.NODE_MAX_DUR_S
             assert r["audio"]["sample_from"] >= 0
 
@@ -612,7 +648,7 @@ class TestAudioPointer:
 
     def test_retention_is_absent_unless_the_operator_measured_it(self):
         # The ring exists now, but its span is chosen at boot from whatever PSRAM was contiguous
-        # (240 s down to 30 s). Only that boot's /status knows which.
+        # (80 s down to 30 s). Only that boot's /status knows which.
         a = BR.audio_pointer(NODE, UTC_US, 2222, 16000.0)
         assert a["retention_s"] is None and a["expires_utc_us"] is None
         b = BR.audio_pointer(NODE, UTC_US, 2222, 16000.0, retention_s=180.0)
@@ -647,7 +683,7 @@ class TestShards:
     def test_buckets_follow_the_recording_not_the_hour_it_was_converted(self):
         rows = [_row(utc_us=UTC_US), _row(utc_us=UTC_US + 3_600_000_000)]
         sh = BR.group_into_shards(BR.convert(rows, NODE)["records"])
-        assert len(sh) == 2, "an 11 h night must not collapse into one shard"
+        assert len(sh) == 2, "an 11 h capture must not collapse into one shard"
 
     def test_write_leaves_no_partial_behind(self, tmp_path):
         sh = BR.group_into_shards(BR.convert([_row()], NODE)["records"])
@@ -655,7 +691,7 @@ class TestShards:
         names = sorted(p.name for p in tmp_path.iterdir())
         assert names == list(sh), "log_forwarder globs telem_*.jsonl and posts what it finds"
 
-    def test_a_second_run_refuses_rather_than_duplicating_a_night(self, tmp_path):
+    def test_a_second_run_refuses_rather_than_duplicating_a_capture(self, tmp_path):
         sh = BR.group_into_shards(BR.convert([_row()], NODE)["records"])
         BR.write_shards(str(tmp_path), sh)
         with pytest.raises(FileExistsError):
@@ -680,7 +716,7 @@ class TestCommandLine:
         rec = json.loads(next(out.iterdir()).read_text().splitlines()[0])
         assert rec["top_tags"][0]["name"] == "lvl_p75_up"
 
-    def test_default_edges_are_this_repos_night(self, tmp_path):
+    def test_default_edges_are_this_repos_capture(self, tmp_path):
         d = self._dets(tmp_path, [_row(peak=818)])
         out = tmp_path / "sh"
         BR.main(["--dets-csv", d, "--out", str(out), "--node", NODE])
@@ -745,7 +781,7 @@ class TestEmptyIsNotSuccess:
     wiped dets.csv -- the exact SD failure DETS_COLUMNS exists to catch -- read as a completed
     run."""
 
-    def test_a_zero_byte_file_is_refused_not_read_as_a_quiet_night(self):
+    def test_a_zero_byte_file_is_refused_not_read_as_a_quiet_period(self):
         for body in ("", "   ", "\n\n", "\n \t\n"):
             with pytest.raises(ValueError, match="empty"):
                 BR.parse_dets_csv(body)
@@ -762,7 +798,7 @@ class TestEmptyIsNotSuccess:
         out = tmp_path / "sh"
         with pytest.raises(ValueError):
             BR.write_shards(str(out), {})
-        assert not out.exists(), "an empty --out looks exactly like a forwarded night"
+        assert not out.exists(), "an empty --out looks exactly like a forwarded capture"
 
     def test_main_on_a_wiped_dets_csv_fails_loudly(self, tmp_path):
         p = tmp_path / "dets.csv"
@@ -781,7 +817,7 @@ class TestEmptyIsNotSuccess:
         assert "NOTHING WAS WRITTEN" in cap.err
         assert "0 record(s)" not in cap.out, "stdout must not report a completed run"
 
-    def test_a_night_that_was_entirely_rejected_is_not_a_completed_run(self, tmp_path, capsys):
+    def test_a_capture_that_was_entirely_rejected_is_not_a_completed_run(self, tmp_path, capsys):
         # Every row unanchored: rows were read, nothing shippable came out. log_forwarder would
         # glob an --out that does not exist, so the exit status has to say so.
         body = [",".join(BR.DETS_COLUMNS)]
@@ -798,15 +834,25 @@ class TestEmptyIsNotSuccess:
 
 
 class TestFirmwareConstantsDoNotDrift:
-    """NODE_BANDS/FRAMES/HOP/NFFT and NODE_MAX_DUR_S are COPIES of firmware constants, and a copy
-    drifts. Bands and frames are on the wire, so a frame of another shape decodes to another shape
-    and span_ms goes honestly null. HOP and NFFT are NOT on the wire: edit MEL16_HOP alone and
-    to_record still calls the geometry `known`, and feature_span_ms goes quietly wrong by exactly
-    the edit. Nothing inside the module can see that, so this is the detector."""
+    """NODE_BANDS/FRAMES and NODE_MAX_DUR_S are COPIES of firmware constants, and a copy drifts.
+    Bands and frames are on the wire, so a frame of another shape decodes to another shape and
+    span_ms goes honestly null. Hop and nfft are NOT copied here any more (D8): feature_span_ms
+    reads SK.HOP_S/SK.NFFT straight from hear.sketch, so there is nothing left in this module for
+    a firmware edit to leave stale -- the risk that remains is passing feature_span_ms the WRONG
+    fs, and that is what test_the_span_... below proves against, for both rates the fleet has.
+
+    ⚠️THIS CLASS USED TO POINT AT firmware/hear_node/mel16.h, WHICH IS GONE (D1: the hear_node
+    bank was renamed mel_impulse.h / MELIMP_ when it moved to 48 kHz, precisely so a stale
+    reference to the old name fails loudly -- FileNotFoundError -- instead of reading a real,
+    valid, WRONG-RATE header and passing green. That FileNotFoundError firing here, once, on this
+    change, was this guard doing its job; the fix is to point it at the new file and check the
+    new rate, not to make it tolerant of either."""
 
     ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    MEL16 = os.path.join(ROOT, "firmware", "night_node", "mel16.h")
-    INO = os.path.join(ROOT, "firmware", "night_node", "night_node.ino")
+    IMPULSE = os.path.join(ROOT, "firmware", "hear_node", "mel_impulse.h")
+    PATH_TEST = os.path.join(ROOT, "firmware", "path_test", "mel16.h")
+    BOARD = os.path.join(ROOT, "firmware", "boards", "xiao_s3_sense.h")
+    INO = os.path.join(ROOT, "firmware", "hear_node", "hear_node.ino")
 
     @staticmethod
     def _define(path, name):
@@ -816,24 +862,78 @@ class TestFirmwareConstantsDoNotDrift:
         assert m, "%s is not #defined in %s any more; this copy is now unanchored" % (name, path)
         return m.group(1).rstrip("f")
 
-    def test_the_impulse_geometry_still_matches_mel16_h(self):
-        d = lambda n: int(self._define(self.MEL16, n))            # noqa: E731
-        assert (BR.NODE_BANDS, BR.NODE_FRAMES) == (d("MEL16_BANDS"), d("MEL16_FRAMES"))
-        assert (BR.NODE_HOP, BR.NODE_NFFT) == (d("MEL16_HOP"), d("MEL16_NFFT"))
-        assert BR.NOMINAL_FS == float(self._define(self.MEL16, "MEL16_FS"))
+    def test_the_impulse_geometry_still_matches_the_compiled_bank(self):
+        d = lambda n: int(self._define(self.IMPULSE, n))          # noqa: E731
+        assert (BR.NODE_BANDS, BR.NODE_FRAMES) == (d("MELIMP_BANDS"), d("MELIMP_FRAMES"))
+        # NOMINAL_FS converts a DECIMATED `sample` index; LEGACY_NODE_FS guesses a rate-unstated
+        # sketch's rate. Both are the board's FS_NOMINAL -- two names, one number, on purpose (D8).
+        fs_nominal = float(self._define(self.BOARD, "FS_NOMINAL"))
+        assert BR.NOMINAL_FS == fs_nominal
+        assert BR.LEGACY_NODE_FS == fs_nominal
+        # And the impulse bank itself must NOT be at that rate any more -- it is the one thing
+        # this whole change moves.
+        assert float(self._define(self.IMPULSE, "MELIMP_FS")) == fs_nominal * int(
+            self._define(self.INO, "DECIM"))
 
     def test_the_span_this_module_reports_is_the_span_the_firmware_fetches(self):
-        # night_node.ino: `uint32_t back = MEL16_NFFT + (MEL16_FRAMES - 1) * MEL16_HOP + 32;`
-        # -- 736 samples, of which 32 is guard and 704 is span. 704 / 16000 * 1000 = 44.0 ms.
-        nfft = int(self._define(self.MEL16, "MEL16_NFFT"))
-        hop = int(self._define(self.MEL16, "MEL16_HOP"))
-        frames = int(self._define(self.MEL16, "MEL16_FRAMES"))
-        fs = float(self._define(self.MEL16, "MEL16_FS"))
+        # hear_node.ino: `#define SKETCH_SPAN (MELIMP_NFFT + (MELIMP_FRAMES - 1) * MELIMP_HOP)`.
+        # No +32 guard term any more -- the ring fetch IS the span (D2/D4 replaced the old
+        # over-fetch with an exact readiness test) -- so this is the rate-agnostic property with
+        # nothing subtracted off either side, checked against the header that is actually built
+        # into a hear_node: mel_impulse.h, at its own (48 kHz) rate.
+        nfft = int(self._define(self.IMPULSE, "MELIMP_NFFT"))
+        hop = int(self._define(self.IMPULSE, "MELIMP_HOP"))
+        frames = int(self._define(self.IMPULSE, "MELIMP_FRAMES"))
+        fs = float(self._define(self.IMPULSE, "MELIMP_FS"))
         span_samples = nfft + (frames - 1) * hop
-        assert (span_samples, span_samples + 32) == (704, 736)
-        assert BR.feature_span_ms(frames) == pytest.approx(span_samples / fs * 1000.0, abs=1e-9)
-        assert BR.feature_span_ms(BR.NODE_FRAMES) == 44.0
+        assert BR.feature_span_ms(frames, fs) == pytest.approx(
+            span_samples / fs * 1000.0, abs=1e-9)
+
+        # THE SAME CALL, both rates the fleet actually writes: a legacy/16 kHz frame (path_test's
+        # bank, and every node before this move) and a current 48 kHz one. Fails against a version
+        # of feature_span_ms that re-pins its formula to one configuration -- e.g. hardcoding the
+        # 48 kHz numbers this test's first assertion just checked -- because that would still pass
+        # the first assertion and fail one of these two.
+        assert BR.feature_span_ms(BR.NODE_FRAMES, 16000.0) == 44.0
+        assert BR.feature_span_ms(BR.NODE_FRAMES, 48000.0) == pytest.approx(33.333, abs=0.001)
+        # path_test's own compiled bank names the legacy rate explicitly, rather than trusting the
+        # literal 16000.0 above to still be what that file says.
+        assert BR.feature_span_ms(BR.NODE_FRAMES, float(
+            self._define(self.PATH_TEST, "MEL16_FS"))) == 44.0
+
+        # A row whose frame does not state a rate (predates the fs code, or SK.fs_code() cannot
+        # name it) falls back to LEGACY_NODE_FS -- still 44.0 ms, which is the whole fleet's
+        # history before this move.
         assert BR.to_record(_row(), NODE)["feature"]["span_ms"] == 44.0
+
+    def test_the_column_and_the_frame_agree_on_four_milliseconds(self):
+        """D6: dets.csv's `sketch_back` column is NOT renamed when its unit changes (64 decimated
+        samples on a legacy row, 192 acquisition samples on a current one) -- tools/hear_bridge.py
+        does not even read that column (see DETS_COLUMNS), so the unit has to be recoverable from
+        the rest of the SAME row instead: the row's own frame_hex states its rate (flags bits
+        8-11), and sketch_back / that rate is SKETCH_BACK_S regardless of which row it is.
+
+        Proved against the firmware's own SKETCH_BACK_S and the value hear_node.ino currently
+        writes to the column (SKETCH_BACK, derived per sketch_domain.h's sk_back_acq_len -- see
+        tests/test_firmware_sketch_domain.py::test_the_back_off_is_derived_from_time_not_from_the_hop
+        for that derivation itself), plus the legacy pairing every stored row before this move
+        used. Fails against a firmware that writes an acquisition-domain sketch_back but a frame
+        whose flags still claim the decimated rate, or vice versa -- exactly the mismatch a G6
+        column rename would have been catching, without paying for a G6 column rename."""
+        back_s = float(self._define(self.INO, "SKETCH_BACK_S"))
+        fs_nominal = float(self._define(self.BOARD, "FS_NOMINAL"))
+        fs_acq = fs_nominal * int(self._define(self.INO, "DECIM"))
+        # SKETCH_BACK == MELIMP_HOP at this rate is a coincidence (D5), not asserted equal in C
+        # on purpose -- so this is derived from SKETCH_BACK_S x fs_acq, the way the firmware does.
+        sketch_back_acq = round(back_s * fs_acq)
+
+        for sketch_back, fs in ((sketch_back_acq, fs_acq),   # what a row writes today
+                                (64, fs_nominal)):            # what every row wrote before
+            q = _q()
+            raw = SK.pack(0, 0.0, 0, q, fs=fs, layout=SK.LAYOUT_FIXED)
+            u = SK.unpack(raw)
+            assert u["fs_hz"] == fs, "SK.pack/unpack did not round-trip this rate"
+            assert sketch_back / u["fs_hz"] == pytest.approx(back_s, abs=1e-12)
 
     def test_the_pointer_clamp_is_the_limit_the_node_actually_serves(self):
         # A pointer promising more than AUDIO_MAX_S comes back short with no error.
@@ -843,7 +943,7 @@ class TestFirmwareConstantsDoNotDrift:
 @needs_capture
 class TestMeasuredNumbers:
     """The house rule, enforced: every number quoted in tools/hear_bridge.py's comments is
-    recomputed here from ~/dama-hear-night-2026-09-07, with the recipe the comment states."""
+    recomputed here from ~/dama-hear-capture-2026-09-07, with the recipe the comment states."""
 
     def _health(self):
         import csv as _csv
@@ -916,18 +1016,18 @@ class TestMeasuredNumbers:
         assert 1788763952 / 86400 / 365.25 == pytest.approx(56.7, abs=0.05)   # "a 56-year event"
 
     def test_the_ring_arithmetic_in_the_pointer_docstring(self):
-        assert 240 * 16000 * 2 / 1e6 == 7.68        # MB of int16 for the 240 s the node asks for
+        assert 80 * 48000 * 2 / 1e6 == 7.68         # MB of int16 for the 80 s the node asks for
 
 
 @needs_capture
-class TestTheRetrievedNight:
-    def test_the_whole_night_converts_to_one_dimension(self):
+class TestTheRetrievedCapture:
+    def test_the_whole_capture_converts_to_one_dimension(self):
         res = BR.convert(_capture_rows(), NODE, node_id=1, base_url="http://node.invalid")
         assert {r["embed_dim"] for r in res["records"]} == {160}
         assert all(r["feature"]["bands"] == 20 and r["feature"]["frames"] == 8
                    for r in res["records"])
 
-    def test_the_shards_span_the_night_and_every_line_parses(self):
+    def test_the_shards_span_the_capture_and_every_line_parses(self):
         res = BR.convert(_capture_rows(), NODE)
         sh = BR.group_into_shards(res["records"])
         rows = [json.loads(l) for lines in sh.values() for l in lines]

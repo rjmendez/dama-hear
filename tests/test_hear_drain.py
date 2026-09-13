@@ -120,7 +120,7 @@ class GrowingNode(FakeNode):
     ⚠️`FakeNode` grows only between drains, and that is exactly the blind spot that let a
     catch-up refetch look correct. A 2 MB tail at the node's measured 40-135 KB/s takes 15-50 s,
     during which the file gains ~3.5-12 KB at ~235 B/s -- and `/sd` seeks against the size AT
-    REFETCH TIME (night_node.ino:1985-1986), not against the size the drain read from `/ls`.
+    REFETCH TIME (hear_node.ino:2899), not against the size the drain read from `/ls`.
     """
 
     def __init__(self, grow_rows_per_fetch=0, **kw):
@@ -356,7 +356,7 @@ class TestThereIsNoCatchUp:
     """⚠️THE DRAIN MEASURES THE GAP AND DOES NOT TRY TO CLOSE IT, AND THAT IS DELIBERATE.
 
     A refetch has to size a bigger `tail=` against a size read BEFORE the first body, but the node
-    seeks against the size at REFETCH time (night_node.ino:1985-1986) and the file grew for the
+    seeks against the size at REFETCH time (hear_node.ino:2899) and the file grew for the
     whole of the first fetch. The refetch therefore lands forward of the gap. Worse, the residual
     was recomputed against the same stale size, so a refetch that missed reported success. These
     tests are the guard on that decision: one scene fetch per run, and an honest number.
@@ -453,14 +453,18 @@ class TestLsFailure:
         # and no watermark is written off a size nobody measured
         assert HD.read_watermarks(pl.root).get("nyquist", {}).get("scene.csv") is None
 
-    def test_a_file_missing_from_the_listing_is_also_unknown(self, tmp_path, wired, monkeypatch):
+    def test_a_file_missing_from_the_listing_fails_as_no_scene_file(self, tmp_path, wired, monkeypatch):
         pl = P.Pool(str(tmp_path / "pool"))
         n = wired()
         n.grow(50)
         monkeypatch.setattr(HD, "_ls_sizes", lambda *a, **kw: {"dets.csv": 4557})
         r = _drain(pl, n, 20_000)
-        g = [f for f in r["files"] if f["name"] == "scene.csv"][0]["gap"]
-        assert g["size_unknown"] is True and g["unfetched_bytes"] is None
+        assert r["scene_files"] == []
+        assert r["scene_live"] is None
+        assert r["scene_missing"] is True
+        assert r["unfetched_unknown"] is False
+        assert r["unfetched_bytes"] == 0
+        assert r["unfetched_reason"] == "the node served no scene file of any name"
 
 
 class TestLsParsing:
@@ -540,6 +544,51 @@ class TestStatusKeyNames:
     def test_a_status_missing_the_blocks_gives_nones_rather_than_raising(self):
         a = HD.status_audit({"node": "puc"})
         assert a["scene"]["rows"] is None and a["acq"]["drop_s"] is None
+
+
+class TestRingWallSpan:
+    RAW_SAMPLES = 3_840_000
+    AUDIO_SAMPLES = 3_584_000
+    FS_NOMINAL = 16_000
+
+    def _status(self, raw_ratio):
+        span_us = int(round(raw_ratio * (self.RAW_SAMPLES / self.FS_NOMINAL) * 1_000_000))
+        return {"node": "nyquist", "i2s": {"nominal_hz": self.FS_NOMINAL},
+                "raw": {"cap_samples": self.RAW_SAMPLES,
+                        "from_utc_us": 0, "to_utc_us": span_us}}
+
+    def _audio(self, audio_ratio):
+        span_us = int(round(audio_ratio * (self.AUDIO_SAMPLES / self.FS_NOMINAL) * 1_000_000))
+        return {"addressable_samples": self.AUDIO_SAMPLES,
+                "from_utc_us": 0, "to_utc_us": span_us}
+
+    @pytest.mark.parametrize("node, ratio", [("nyquist", 1.09148),
+                                             ("mach", 1.11629),
+                                             ("rankine", 1.00224)])
+    def test_raw_ratio_matches_the_doc_examples(self, node, ratio):
+        m = HD.ring_wall_span_measurement(self._status(ratio), self._audio(ratio))
+        assert m["raw"]["ratio"] == pytest.approx(ratio, abs=1e-9), node
+
+    def test_audio_ratio_uses_addressable_samples_not_cap_samples(self):
+        # docs/acoustic-stack.md section 0.2: 245.958 s over 224.0 s addressable = 1.0980
+        audio = {"addressable_samples": self.AUDIO_SAMPLES,
+                 "from_utc_us": 0, "to_utc_us": 245_958_000}
+        m = HD.ring_wall_span_measurement(self._status(1.09148), audio)
+        assert m["audio"]["ratio"] == pytest.approx(245.958 / 224.0, abs=1e-12)
+        wrong = HD.ring_wall_span_ratio(m["audio"]["span_us"], self.RAW_SAMPLES, m["fs_hz"])
+        assert wrong == pytest.approx(245.958 / 240.0, abs=1e-12)
+        assert wrong < m["audio"]["ratio"]
+
+    def test_healthy_control_self_test_catches_the_wrong_denominator(self):
+        healthy = HD.ring_wall_span_measurement(self._status(1.00224), self._audio(1.00224))
+        assert HD.ring_wall_span_self_test(healthy)["ok"] is True
+        wrong = {"fs_hz": healthy["fs_hz"], "raw": healthy["raw"],
+                 "audio": dict(healthy["audio"])}
+        wrong["audio"]["ratio"] = HD.ring_wall_span_ratio(
+            wrong["audio"]["span_us"], healthy["raw"]["samples"], healthy["fs_hz"])
+        chk = HD.ring_wall_span_self_test(wrong)
+        assert chk["ok"] is False
+        assert abs(wrong["audio"]["ratio"] - 1.0) > chk["tolerance"]
 
 
 # ---------------------------------------------------------------- the ledger
@@ -737,6 +786,24 @@ class TestCheck:
         self._hb(root, kind="node", last_success_s=1000.0, last_unfetched_bytes=500)
         assert HD.check(root, now=1010.0, max_unfetched_bytes=1000)[0] == 0
         assert HD.check(root, now=1010.0, max_unfetched_bytes=100)[0] == 1
+
+    def test_live_ring_wall_span_uses_the_existing_check_entrypoint(self, tmp_path, monkeypatch):
+        root = str(tmp_path)
+        self._hb(root, kind="node", last_success_s=1000.0, last_unfetched_bytes=0)
+        monkeypatch.setattr(HD, "fetch_status",
+                            lambda *a, **kw: {"node": "nyquist",
+                                              "i2s": {"nominal_hz": 16000},
+                                              "raw": {"cap_samples": 3_840_000,
+                                                      "from_utc_us": 0,
+                                                      "to_utc_us": 261_955_200}})
+        monkeypatch.setattr(HD, "fetch_audio_status",
+                            lambda *a, **kw: {"addressable_samples": 3_584_000,
+                                              "from_utc_us": 0,
+                                              "to_utc_us": 245_958_000})
+        code, lines = HD.check(root, max_stale_s=7200.0, now=1010.0,
+                               nodes=[("nyquist", "10.0.0.1")], max_ring_wall_span=1.02)
+        assert code == 1
+        assert "RING WALL SPAN raw 1.09148 / audio 1.09803" in lines[0]
 
 
 class TestHeartbeatCarriesTheLoss:

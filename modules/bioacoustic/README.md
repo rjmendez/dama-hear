@@ -71,14 +71,14 @@ configuration, and it now lives there.
 
 ## Why not `hear/node/detect.py` with different numbers
 
-Measured on the 2026-09-07 capture (`~/dama-hear-night-2026-09-07/final/`). It ran **12.08 h**:
+Measured on the 2026-09-07 capture (`~/dama-hear-capture-2026-09-07/final/`). It ran **12.08 h**:
 `health.csv` has 1450 rows, its `utc_us` spans 07:16:23.7 → 19:21:15.9 UTC and its `uptime_s` runs
 28 s → 43521 s, which is 12.081 h either way. That gate's floor is 800 counts against a median
 `ambient` of **28.95** over those 1450 rows — 20·log₁₀(800/28.95) = **28.8 dB** over the
 background, and 20·log₁₀(800/84.11) = **19.6 dB** over ambient p95 (84.11). A chorus a plausible
 10 dB over ambient sits ~19 dB below it and cannot fire it at any hour.
 
-Its envelope is also broadband, and the night's own sketches price that. **Recipe, so the numbers
+Its envelope is also broadband, and the capture's own sketches price that. **Recipe, so the numbers
 below can be checked rather than believed:** `dets.csv` holds 62 rows. 14 carry `uptime_s == 12` —
 the boot-time burst — and 11 of those 14 also set flags bit 1 (*insufficient context*: the sketch
 is of a ring that had not filled). Dropping the 14 leaves the **48 in-run detections**, and on
@@ -161,4 +161,4 @@ the 48 … and the other two in bands 9 and 12"; there are no other two. It also
 *impulsive*, which the sketches do not support: reducing each row's `db` to a per-frame mean over
 the 20 bands, the median spread between the loudest and quietest of the 8 frames is only 2.01 dB,
 so the energy fills the whole 44 ms the sketch covers rather than spiking inside it. These
-thresholds remain provisional, to be refitted the first night a person labels something real.
+thresholds remain provisional, to be refitted the first time a person labels something real.

@@ -48,6 +48,26 @@ is a closed route kept for why it closed.
 The field captures are not redistributable. Point `DAMA_HEAR_REAL_WAV` at your own single-channel
 WAV to run the recorded-audio test.
 
+## CI and releases
+
+Every push to `main` and every pull request runs `.github/workflows/ci.yml` on GitHub-hosted
+runners:
+
+- the test suite twice: Python 3.12 with `requirements/ci-dev.txt`, and Python 3.13 with
+  `requirements/ci-pods.txt`, which pins what the k3s pods install;
+- the firmware generators (`firmware/gen_*.py`), failing if any committed header differs from
+  what they write;
+- every sketch under `firmware/` compiled with esp32 core 3.3.11 and `-DHEAR_ALLOW_NO_WIFI`, plus a
+  build of `hear_node` and `puc_node` without it that must fail on the Wi-Fi guard. The images are
+  kept as workflow artifacts for 14 days.
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the `hear_node` images
+for each supported board class, their `.elf`, `build-info.json` and `SHA256SUMS` as a GitHub
+release. This repo is public, so the images carry no Wi-Fi credentials and no node name. Each
+node keeps its own in NVS, written once over USB by `firmware/hear_node/enroll.py`, and
+`firmware/hear_node/flash.py <node> <ip> --release <tag>` refuses unless it can match the node's
+live `/status class` to the right release asset. See `firmware/hear_node/README.md`.
+
 ## Licence
 
 GPL-3.0. See `LICENSE`.

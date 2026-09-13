@@ -34,6 +34,8 @@
 #include <ESP_I2S.h>
 #include <WiFiUdp.h>
 #include <time.h>
+#include <hear_boot.h>   // ⚠️unconditional: nesting it in the secrets guard
+                          // builds a sketch with no failback and no error
 
 // Declared up here because the .ino preprocessor inserts function prototypes ahead of the file's
 // own declarations; a type named in one of those prototypes must already exist.
@@ -46,11 +48,7 @@ struct NtpResult {
 #if __has_include("secrets.h")
 #include "secrets.h"
 #endif
-#ifndef WIFI_N
-static const char *WIFI_SSIDS[] = {""};
-static const char *WIFI_PASSES[] = {""};
-#define WIFI_N 0
-#endif
+#include <hear_wifi_guard.h>   // no credentials -> compile error, not a silent AP-only node
 #ifndef NODE_CLASS
 #define NODE_CLASS "puc-ntp"        // until 1PPS is wired. hear/nodeclass.py refuses this class
 #endif                              // as a TDoA arrival source, and is right to.
@@ -58,40 +56,48 @@ static const char *WIFI_PASSES[] = {""};
 #define GPS_RX_PIN 44               // module TX -> here
 #define GPS_TX_PIN 43               // here -> module RX
 #define GPS_BAUD   9600
-#define PPS_PIN    18               // WHERE THE WIRE GOES. Held low, not a strapping pin, clear of
-                                    // flash, PSRAM and USB. Nothing drives it today.
+// ⚠️17, NOT 18, AND THIS IS THE SECOND TIME. GPIO18 was the landing pad for two months on the
+// strength of "reads low and is not a strapping pin" -- both true, both insufficient. The vendor
+// dump configures GPIO18 as an INPUT (gpio_config pin_bit_mask 0x40000), and measured on the live
+// board with /scanpu and /scanpd it reads LOW against the ESP32's ~45k internal PULLUP:
+//
+//     gpio   pullup   pulldown   reading
+//       15    HIGH      low      floats -- free
+//       16    HIGH      low      floats -- free
+//       17    HIGH      low      free, and where the joint is
+//       18    low       low      HELD LOW -- something external owns this net
+//       39    low       low      HELD LOW -- and puc.h's FREE_PADS lists it, wrongly
+//       38    8 edges, 50% duty -- the DS3231 1 Hz, which is what proves the scan can see 1 Hz
+//
+// A floating pin follows whichever internal resistor is engaged; 18 and 39 do not. The L86's 1PPS
+// is a push-pull output (Hardware Design Table 3: VOHmin 2.4 V), so landing it on 18 puts two
+// drivers on one net. GPIO17 is physical pin 10 on ESP32-S3-WROOM-1, pad silkscreen IO17.
+//
+// ⚠️THIS LINE HAS BEEN REVERTED TWICE, BY TWO DIFFERENT ROUTES, AND THAT IS THE REAL HAZARD.
+// First a6bbdab wrote the correction into firmware/boards/puc.h, which `grep -rn "puc\.h"` shows
+// is included by NOTHING -- so the header held -1 while this file, the one that compiles, said 18.
+// Then cfe3ec4 fixed it here and b2d47de ("platform: one failback...") reverted it back to 18 as a
+// side effect of a 125-line refactor from a branch carrying an older copy of this file. Neither
+// revert was noticed, because nothing compares the compiled pin against the measurement.
+// puc.h now points HERE as the file that builds. Do not let a stale branch quietly undo it again.
+#define PPS_PIN    17               // L86 pin 6 (1PPS) lands here. Wired 2026-09-09.
 
 static char node_id[24];
 static WebServer http(80);
 static bool sta_ok = false;
 
 // ---------------------------------------------------------------- boot failback
-// Same shape as night_node: count boots in RTC memory, and flip back if a new image never proves
+// Same shape as hear_node: count boots in RTC memory, and flip back if a new image never proves
 // itself. It does NOT rely on the bootloader's rollback, which this core's prebuilt bootloader may
 // not have enabled -- depending on that would be depending on something unverified.
-RTC_NOINIT_ATTR static uint32_t boot_magic, boot_try, proven_ok;
-#define BOOT_MAGIC 0x50554331
-#define BOOT_MAX_TRIES 3
+// Failback lives in hear_platform/hear_boot.{h,cpp}. It used to be a SECOND COPY here, and
+// this copy was the broken one: mark_healthy_once() marked the image healthy after 30 s
+// without ever checking sta_ok, which set proven_ok and switched off the partition revert
+// permanently -- on a node that tracks sta_ok in seven other places. The shared version takes
+// reachability as an argument so it cannot be left out.
+// ⚠️The RTC magic changed with the move, so the FIRST boot on this build resets the counter
+// once. That is a one-off, and it fails safe: a fresh counter cannot trigger a spurious revert.
 
-static void boot_guard() {
-  if (boot_magic != BOOT_MAGIC) { boot_magic = BOOT_MAGIC; boot_try = 0; proven_ok = 0; }
-  boot_try++;
-  // Only ever revert an UNPROVEN image. Once a build has reached healthy, being unreachable means
-  // the node moved or the AP changed, not that the firmware is bad.
-  if (proven_ok) { boot_try = 0; return; }
-  if (boot_try > BOOT_MAX_TRIES) {
-    const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
-    boot_try = 0;
-    if (other) { esp_ota_set_boot_partition(other); esp_restart(); }
-  }
-}
-static void mark_healthy_once() {
-  static bool done = false;
-  if (done || millis() < 30000) return;
-  done = true; boot_try = 0; proven_ok = 1;
-  esp_ota_mark_app_valid_cancel_rollback();
-  Serial.println("boot  marked healthy");
-}
 
 // Whether power was actually removed is not something to infer from "I plugged it back in", and a
 // low uptime proves nothing when OTAs reboot this thing several times an hour. The chip knows:
@@ -122,7 +128,7 @@ static void node_identity() {
 }
 
 // ---------------------------------------------------------------- GPS (PMTK, not UBX)
-// The L86 speaks MediaTek's PMTK, so none of night_node's UBX config applies here: no CFG-VALSET,
+// The L86 speaks MediaTek's PMTK, so none of hear_node's UBX config applies here: no CFG-VALSET,
 // no TIM-TP, no NAV-PVT. Fix and satellite count come from NMEA, and the timepulse -- when there
 // is a wire for it -- is set with PMTK285 rather than CFG-TP-*.
 static uint32_t gps_sentences = 0, gps_valid = 0;
@@ -699,7 +705,8 @@ static void routes() {
       "\"baud\":%d,\"rx_pin\":%d,\"tx_pin\":%d,\"last\":\"%s\"},"
       "\"pps\":{\"pin\":%d,\"edges\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,"
       "\"wired\":%s},"
-      "\"wifi\":{\"sta\":%s,\"rssi\":%d,\"ip\":\"%s\"}}",
+      // configured is a BUILD fact (were there credentials at all); sta is the link state.
+      "\"wifi\":{\"configured\":%s,\"sta\":%s,\"rssi\":%d,\"ip\":\"%s\"}}",
       node_id, NODE_CLASS, (unsigned long)(millis() / 1000),
       reset_name(), esp_reset_reason() == ESP_RST_POWERON ? "true" : "false",
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getFreePsram(),
@@ -711,7 +718,7 @@ static void routes() {
       // Not a configuration flag: it reports whether edges have ACTUALLY arrived. The wire either
       // exists and pulses or it does not, and nothing else should be allowed to claim otherwise.
       pps_count > 2 ? "true" : "false",
-      sta_ok ? "true" : "false", WiFi.RSSI(),
+      HEAR_WIFI_CONFIGURED ? "true" : "false", sta_ok ? "true" : "false", WiFi.RSSI(),
       sta_ok ? WiFi.localIP().toString().c_str() : "0.0.0.0");
     http.send(200, "application/json", b);
   });
@@ -791,7 +798,11 @@ static void routes() {
     double now = tv.tv_sec + tv.tv_usec / 1e6 + r.offset_s;
     tv.tv_sec = (time_t)now; tv.tv_usec = (suseconds_t)((now - tv.tv_sec) * 1e6);
     settimeofday(&tv, nullptr);
-    bool rtc_ok = ds3231_write_time(47, 48, (time_t)now);
+    // ⚠️ROUND, DO NOT TRUNCATE. The DS3231 holds whole seconds, so (time_t)now discards the
+    // fraction just computed and lands up to 1 s behind; nearest halves the worst case. The
+    // /timesync path avoids this properly by waiting for the second boundary -- this path does
+    // not wait, so rounding is the best available here. (Copilot review, PR #19.)
+    bool rtc_ok = ds3231_write_time(47, 48, (time_t)llround(now));
     g_sync_bound_s = r.rtt_best / 2.0; g_sync_at_ms = millis();
     g_sync_off_s = r.offset_s; g_sync_count++;
     char b[520];
@@ -1090,7 +1101,8 @@ static void routes() {
     snprintf(b, sizeof b, "running %s @ 0x%06x\nboot_try %lu (reverts after %d)\nhealthy %s\n\n"
                           "push: curl -F firmware=@<bin> http://%s.local/update\n",
              r ? r->label : "?", r ? (unsigned)r->address : 0,
-             (unsigned long)boot_try, BOOT_MAX_TRIES, proven_ok ? "yes" : "not yet", node_id);
+             (unsigned long)hear_boot_try(), HEAR_BOOT_MAX_TRIES,
+             hear_boot_proven() ? "yes" : "not yet", node_id);
     http.send(200, "text/plain", b);
   });
 
@@ -1114,7 +1126,7 @@ static void routes() {
 }
 
 void setup() {
-  boot_guard();
+  hear_boot_guard();
   Serial.begin(115200);
   delay(400);
   node_identity();
@@ -1152,7 +1164,7 @@ void setup() {
 void loop() {
   http.handleClient();
   gps_pump();
-  mark_healthy_once();
+  hear_boot_tick(sta_ok);   // ⚠️the argument this node used to ignore
   static uint32_t last = 0;
   if (millis() - last > 30000) {
     last = millis();

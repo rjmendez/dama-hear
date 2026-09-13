@@ -47,7 +47,7 @@ class TestEcefAnchors:
 
 
 class TestRoundTrips:
-    CASES = [(0.0, 0.0, 0.0), (40.2925513, -76.1221659, 234.0), (-33.8688, 151.2093, 58.0),
+    CASES = [(0.0, 0.0, 0.0), (40.2925513, -79.1221659, 234.0), (-33.8688, 151.2093, 58.0),
              (89.9, 179.9, -420.0), (-89.9, -179.9, 8848.0), (51.4778, 0.0, 0.0)]
 
     @pytest.mark.parametrize("lat,lon,h", CASES)
@@ -68,7 +68,7 @@ class TestRoundTrips:
 
 
 class TestEnuFrame:
-    ORIGIN = (40.2925513, -76.1221659, 234.0)
+    ORIGIN = (40.2925513, -79.1221659, 234.0)
 
     def test_origin_maps_to_zero(self):
         e, n, u = G.geodetic_to_enu(*self.ORIGIN, *self.ORIGIN)
@@ -125,8 +125,8 @@ class TestTheBugThisReplaces:
         # height. Treat the numbers as a FIXTURE, not as surveyed truth -- that height difference
         # was single-epoch GNSS noise (vAcc 2.9 m) and reversed sign on the next reading. What is
         # being pinned is the arithmetic, which holds whatever the real geometry turns out to be.
-        nyq = (40.2925513, -76.1221659, 234.0)
-        mach = (40.2925364, -76.1223763, 222.4)
+        nyq = (40.2925513, -79.1221659, 234.0)
+        mach = (40.2925364, -79.1223763, 222.4)
         e, n, u = G.geodetic_to_enu(*mach, *nyq)
         horiz = math.hypot(e, n)
         full = G.ecef_distance(nyq, mach)
@@ -152,7 +152,7 @@ class TestFrameError:
 
 class TestCentroid:
     def test_centroid_of_one_point_is_that_point(self):
-        p = (40.2925513, -76.1221659, 234.0)
+        p = (40.2925513, -79.1221659, 234.0)
         la, lo, h = G.centroid([p])
         assert (la, lo) == pytest.approx(p[:2], abs=1e-9)
         assert h == pytest.approx(p[2], abs=1e-6)
@@ -177,11 +177,11 @@ class TestSurveyBridge:
     """
 
     NODES = [
-        {"node_id": 1, "name": "nyquist", "lat_deg": 40.2925513, "lon_deg": -76.1221659,
+        {"node_id": 1, "name": "nyquist", "lat_deg": 40.2925513, "lon_deg": -79.1221659,
          "h_ell_m": 234.0},
-        {"node_id": 2, "name": "mach", "lat_deg": 40.2925364, "lon_deg": -76.1223763,
+        {"node_id": 2, "name": "mach", "lat_deg": 40.2925364, "lon_deg": -79.1223763,
          "h_ell_m": 222.4},
-        {"node_id": 3, "name": "third", "lat_deg": 40.2927000, "lon_deg": -76.1222500,
+        {"node_id": 3, "name": "third", "lat_deg": 40.2927000, "lon_deg": -79.1222500,
          "h_ell_m": 230.0},
     ]
 
@@ -199,8 +199,8 @@ class TestSurveyBridge:
         _, s = self._survey()
         P = s.positions([1, 2])
         enu = float(math.dist(P[0], P[1]))
-        direct = G.ecef_distance((40.2925513, -76.1221659, 234.0),
-                                 (40.2925364, -76.1223763, 222.4))
+        direct = G.ecef_distance((40.2925513, -79.1221659, 234.0),
+                                 (40.2925364, -79.1223763, 222.4))
         assert enu == pytest.approx(direct, abs=1e-6)
         assert enu == pytest.approx(21.39, abs=0.05)
 
@@ -242,7 +242,7 @@ class TestSurveyBridge:
     def test_enu_of_places_a_measured_point_in_the_frame(self):
         _, s = self._survey()
         # A node's own coordinates must map back onto its surveyed position.
-        got = s.enu_of(40.2925513, -76.1221659, 234.0)
+        got = s.enu_of(40.2925513, -79.1221659, 234.0)
         assert got == pytest.approx(s.position(1), abs=1e-6)
 
     def test_a_frame_with_no_origin_refuses_rather_than_assuming_one(self):

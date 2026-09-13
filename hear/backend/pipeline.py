@@ -54,6 +54,19 @@ def to_dama_event(ev: Dict, array_id: str = "hear") -> Dict:
         "contributing_node_ids": list(ev["node_ids"]),
         "rms_residual_ms": sol.get("rms_residual_ms"),
         "residual_is_meaningful": sol.get("residual_is_meaningful"),
+        # ⚠️BESIDE residual_is_meaningful BECAUSE IT ANSWERS THE OTHER HALF. That flag says the
+        # residual cannot falsify the fit at this node count; this one says the arrivals could
+        # not have come from one point source at all, whatever the fit. A consumer that reads
+        # only the residual sees nothing wrong with either.
+        # ⚠️SUBSCRIPTED, NOT `.get`. It shipped as `.get` and the one caller that actually runs
+        # in the cluster -- tools/hear_tdoa.py, which hand-builds this dict -- did not put the
+        # key in, so every published payload carried `point_source_possible: null` while
+        # associate() had computed True or False for that same event. A field that is always
+        # null is worse than an absent one: it reads as "not stated / probably fine". A caller
+        # that omits it is now a KeyError here rather than a silent null downstream.
+        "point_source_possible": ev["point_source_possible"],
+        # The magnitude behind the flag, so False is actionable rather than only alarming.
+        "worst_pair_excess_s": ev["worst_pair_excess_s"],
         "sound_speed_mps": sol.get("sound_speed_mps"),
         "note": sol.get("note"),
     }
@@ -144,8 +157,8 @@ class Backend:
     def flush(self) -> Dict:
         """Associate, solve and publish everything buffered, then clear the buffer.
 
-        A solver ValueError becomes `solve_error` on that one event and the flush continues: one
-        refused event must not cost the others their answer.
+        A solver ValueError becomes `solve_error` on that one event, is not published, and the
+        flush continues: one refused event must not cost the others their answer.
         """
         grouped = AS.associate(self._detections, self.survey, temp_c=self.temp_c,
                                margin_s=self.margin_s, min_nodes=self.min_nodes,
@@ -173,10 +186,17 @@ class Backend:
                 "node_ids": list(ev["node_ids"]), "arrivals": list(ev["arrivals"]),
                 "n_nodes": ev["n_nodes"], "n_equations": ev["n_equations"],
                 "span_s": ev["span_s"], "source_class": cls, "model": model,
+                # ⚠️CARRIED, NOT RECOMPUTED. associate() admits on d/c + MARGIN_S; this is the
+                # zero-margin verdict. Three of the four events the live array delivered on
+                # 2026-09-11 were 2.81-9.01 m past any bound it has, and this emitter had no way
+                # to say so. A solution fitted to an impossible group is not a source.
+                "point_source_possible": ev["point_source_possible"],
+                "worst_pair_excess_s": ev["worst_pair_excess_s"],
                 "solution": sol, "solve_error": err, "published": None,
             }
-            r["published"] = to_dama_event(r, self.array_id)
-            self._emit(r["published"])
+            if err is None:
+                r["published"] = to_dama_event(r, self.array_id)
+                self._emit(r["published"])
             events.append(r)
         out = {
             "events": events,

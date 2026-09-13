@@ -240,9 +240,15 @@ class TestTheWindowGuard:
         return fr
 
     def test_the_late_node_is_rejected_by_geometry_and_the_rest_solve(self):
-        # measured for this layout: 88-100 ms of disagreement against bounds of 41-49 ms
+        # measured for this layout: 88-100 ms of disagreement against bounds of 41-49 ms.
+        # The gate still refuses it; since associate() stopped CONSUMING its refusals the late
+        # node goes on to seed a group of one, so its terminal reason is `too_few_nodes` and the
+        # geometry numbers ride in that row's detail. What matters here is unchanged: it is not
+        # in the event and the bearing is not wrecked.
         got = BP.Backend(_survey(TIGHT), temp_c=T, v_mps=V).run(self._burst_frames())
-        assert [r["reason"] for r in got["rejected"]] == ["pairwise_dt_exceeds_geometry"]
+        assert [r["reason"] for r in got["rejected"]] == ["too_few_nodes"]
+        assert "exceeds" not in got["rejected"][0]["detail"]
+        assert " ms > " in got["rejected"][0]["detail"], "the refusing numbers must survive"
         ev = got["events"][0]
         assert ev["n_nodes"] == 3
         assert _bearing_error(ev["solution"]["bearing_deg"], 0.0) < 1.0
@@ -409,3 +415,95 @@ class TestPublishing:
         assert "bearing_deg" in body and "offset_m" in body
         assert "east_m" not in body and "north_m" not in body
         assert got["events"][0]["published"]["node_type"] == "hear"
+
+
+    def test_a_solver_value_error_is_recorded_but_not_published(self, monkeypatch):
+        seen = []
+
+        def boom(*_a, **_kw):
+            raise ValueError("forced solve failure")
+
+        monkeypatch.setattr(BP.PT, "solve", boom)
+        got = BP.Backend(_survey(RING), temp_c=T, v_mps=V, publish=seen.append,
+                         source_class="blast").run(
+            _frames(range(1, 6), _shock_arrivals(RING, BEARING, OFFSET)))
+        assert len(got["events"]) == 1
+        ev = got["events"][0]
+        assert ev["solution"] is None
+        assert ev["solve_error"] == "forced solve failure"
+        assert ev["published"] is None
+        assert seen == []
+        assert got["n_published"] == 0
+
+
+class TestThePublishedEventSaysWhetherItCouldBeReal:
+    """⚠️THE EMITTER HAD NO WAY TO SAY AN EVENT WAS IMPOSSIBLE.
+
+    `associate()` admits on d/c + MARGIN_S. Three of the four events the live array delivered on
+    2026-09-11 were 2.81 m, 7.51 m and 9.01 m past any bound the array has, and `flush()` fitted
+    a solution to each and published it looking exactly like the one real event.
+
+    `residual_is_meaningful` does not cover this: it says the residual cannot FALSIFY the fit at
+    this node count, which is a statement about the solver. This says the arrivals could not have
+    come from one point source at all, whatever the solver did with them.
+    """
+
+    def _one(self, dt_s):
+        import hear.backend.associate as AS
+        got = AS.associate([{"node_id": 1, "seq": 0, "t_utc_s": 100.0},
+                            {"node_id": 2, "seq": 0, "t_utc_s": 100.0 + dt_s},
+                            {"node_id": 3, "seq": 0, "t_utc_s": 100.0 + dt_s / 2}], _SV)
+        assert len(got["events"]) == 1
+        return got["events"][0]
+
+    def test_flush_carries_the_verdict_rather_than_recomputing_it(self):
+        ev = self._one(0.020)
+        assert "point_source_possible" in ev and "worst_pair_excess_s" in ev
+
+    def test_the_published_payload_carries_it_beside_the_residual_flag(self):
+        ev = dict(self._one(0.020))
+        ev.update({"model": "point", "source_class": None, "solution": None})
+        body = BP.to_dama_event(ev)["event"]
+        assert "point_source_possible" in body
+        assert "residual_is_meaningful" in body, "the two must travel together"
+
+    def test_flush_itself_publishes_the_real_verdict_not_a_constant(self):
+        """⚠️THE FIRST VERSION OF THIS CLASS DID NOT COVER flush(). Hardcoding True on the line
+        inside flush() survived the mutation run, because every other test here builds the event
+        dict by hand and calls to_dama_event directly. This one drives real frames through
+        Backend.run() so the carry-through itself is exercised."""
+        sv = _survey([(0.0, 0.0), (10.0, 0.0), (5.0, 8.0)])
+        ids = [1, 2, 3]
+
+        # a real point source 30 m away: every pair inside its own d/c
+        real = _point_arrivals([(0.0, 0.0), (10.0, 0.0), (5.0, 8.0)], (30.0, 20.0))
+        got = BP.Backend(sv, temp_c=T).run(_frames(ids, real))
+        assert len(got["events"]) == 1
+        assert got["events"][0]["point_source_possible"] is True
+        assert got["events"][0]["published"]["event"]["point_source_possible"] is True
+
+        # 1 and 2 are 10 m apart = 29.1 ms; 50 ms is past that and inside the admission window
+        bad = [T0, T0 + 0.050, T0 + 0.025]
+        got = BP.Backend(sv, temp_c=T).run(_frames(ids, bad))
+        assert len(got["events"]) == 1, "it must still be delivered, not dropped"
+        assert got["events"][0]["point_source_possible"] is False
+        assert got["events"][0]["published"]["event"]["point_source_possible"] is False
+
+    def test_an_impossible_event_publishes_false_not_absent(self):
+        ev = dict(self._one(0.050))          # 50 ms across a 10 m pair: impossible
+        assert ev["point_source_possible"] is False
+        ev.update({"model": "point", "source_class": None, "solution": None})
+        assert BP.to_dama_event(ev)["event"]["point_source_possible"] is False
+
+
+
+class _Stub:
+    def __init__(self, nodes): self.nodes = {int(k): __import__("numpy").asarray(v, float) for k, v in nodes.items()}
+    def __contains__(self, n): return int(n) in self.nodes
+    def position(self, n): return self.nodes[int(n)]
+    def diameter_m(self):
+        import itertools, numpy as np
+        return max(float(np.linalg.norm(a - b)) for a, b in itertools.combinations(self.nodes.values(), 2))
+
+
+_SV = _Stub({1: (0, 0, 0), 2: (10, 0, 0), 3: (5, 8, 0)})

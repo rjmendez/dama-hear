@@ -18,7 +18,7 @@ length is CHECKED against them, because a truncated line is otherwise indistingu
 smaller descriptor.
 
 ⚠️THE SECOND AXIS IS `slices`, NOT `frames`, AND `frames` IS A ROW TOTAL. The column carries
-`SCENE_FRAMES = SCENE_SLICES * SCENE_FRAMES_PER_SLICE` (night_node.ino:1138-1140, written at
+`SCENE_FRAMES = SCENE_SLICES * SCENE_FRAMES_PER_SLICE` (hear_node.ino:1569-1571, written at
 :1239) -- 64 for the whole row, at 4 slices of 16. The per-slice averaging divides by
 SCENE_FRAMES_PER_SLICE, so a reader that takes this column as the per-slice count is out by a
 factor of `slices`. Neither number is the shape. `frames_per_slice()` derives the per-slice count
@@ -123,9 +123,11 @@ def decode_row(row: Dict[str, Any]) -> Dict[str, Any]:
     s = str(row.get("mel_hex") or "").strip()
     if not s:
         raise ValueError("empty mel_hex")
-    if len(s) != 2 * bands * slices:
+    need = 2 * bands * slices
+    if len(s) < need:
         raise ValueError("mel_hex is %d hex chars, %dx%d needs %d"
-                         % (len(s), bands, slices, 2 * bands * slices))
+                         % (len(s), bands, slices, need))
+    s = s[:need]
     try:
         b = bytes.fromhex(s)
     except ValueError as e:

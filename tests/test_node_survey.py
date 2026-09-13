@@ -151,7 +151,7 @@ class TestOutputLoadsBack:
         import json
         from hear.backend import survey as SV
         doc = {"frame": NS._FRAME, "units": NS._UNITS,
-               "origin": {"lat_deg": 40.29, "lon_deg": -76.12, "h_ell_m": 0.0},
+               "origin": {"lat_deg": 40.29, "lon_deg": -79.12, "h_ell_m": 0.0},
                "nodes": [{"node_id": 1, "name": "a", "e_m": 0.0, "n_m": 0.0, "u_m": 0.0,
                           "sigma_m": 0.7},
                          {"node_id": 2, "name": "b", "e_m": -16.6, "n_m": -0.3, "u_m": 3.0,

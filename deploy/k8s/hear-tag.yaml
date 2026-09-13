@@ -1,0 +1,263 @@
+---
+# ⚠️ENABLED 2026-09-11 BY THE OPERATOR, after the three conditions below were met on 2026-09-10.
+# To stop it: kubectl -n dama patch cronjob hear-tag -p '{"spec":{"suspend":true}}'
+#
+# THREE PUBLIC BACKENDS are available through `--model yamnet`, `--model birdnet`, and
+# `--model perch`; this CronJob keeps the original two EfficientAT-compatible lanes below.
+# TWO LANES, ONE MODEL LOAD. `--lane mn10` is the original whole-clip pass (clips/tags.jsonl,
+# state/tag_heartbeat.json, unchanged). `--lane mn10_pad10` scores the same normalised clip
+# zero-padded to the model's 10 s training length (clips/tags-mn10_pad10.jsonl); the measurement
+# is docs/clip-calibration-2026-09-10.md S4.
+#
+# The gate it was created behind:
+#
+#   1. clips/index.jsonl holds >= 300 rows with outcome "stored", across all three nodes, over at
+#      least 3 consecutive days. Below that the corpus cannot show what a normal day looks like.
+#   2. A human has LISTENED to >= 30 of them, including at least one from mach, and written what
+#      they heard into docs/clip-calibration-<date>.md, per node. Three models agreeing on "Dog"
+#      is corroboration, not ground truth, and nobody has yet heard a single clip this fleet
+#      recorded. `tools/hear_listen.py` stages this: the pool WAVs sit at -65.7 to -43.3 dBFS and
+#      are INAUDIBLE played directly, so the tool writes a gain-corrected copy beside each one
+#      plus the worksheet. Condition 3 comes from the ORIGINAL levels it records, never the
+#      audible copy.
+#   3. ⚠️MET BY BEING RETIRED, 2026-09-10. The condition asked for --max-silence-frac to be set
+#      from the measured distribution. 69 clips were heard and the measurement killed the knob:
+#      mn10_as returns Silence top-1 on 0 of 69 healthy and 3 of 69 un-normalised, so any gate
+#      between those rests on three clips. The normalisation canary is now --min-mean-top-score
+#      (0.254 healthy against 0.162 un-normalised, 13.6 sigma apart at a 400-clip run).
+#      docs/clip-calibration-2026-09-10.md has the working.
+#
+# ⚠️IT TOUCHES THE PVC AND NEVER A NODE. The ESP32 serves one client at a time and REFUSES the
+# rest rather than queueing, so a second workload reaching a node would convert hear-drain's slow
+# run into a refused one. Nothing in this file opens a socket to 172.16.100.x.
+#
+# ⚠️APPLY ONLY THESE TWO FILES:
+#     python3 deploy/k8s/gen_configmap.py hear-tag-code > deploy/k8s/hear-tag-code.yaml
+#     kubectl apply -f deploy/k8s/hear-tag-code.yaml -f deploy/k8s/hear-tag.yaml
+# NEVER `kubectl apply -f deploy/k8s/`. A ConfigMap and a CronJob are both written WHOLE, so a
+# directory apply would also push this branch's hear-drain.yaml over the live drain -- which has
+# already been caught carrying an argument the checked-in file lacked.
+#
+# ⚠️NO PersistentVolumeClaim HERE. `hear-pool` is declared once, in deploy/k8s/hear-drain.yaml.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-tag
+  namespace: dama
+  labels:
+    app: hear-tag
+  annotations:
+    dama-hear/what: >-
+      Runs EfficientAT mn10_as (ONNX, onnxruntime) over the clips hear-drain pulled off the cards and
+      appends /pool/corpus/clips/tags.jsonl. Reads clips/index.jsonl, touches no node.
+    dama-hear/what-a-tag-is-not: >-
+      A tag is a MODEL's opinion. It is NOT a species identification (AudioSet has Bird, Owl, Hoot,
+      Chirp and stops), NOT calibrated to this site, NOT confirmed by any human, and NOT usable
+      as a training label -- fitting a scene- or sketch-based model on these targets would
+      reproduce the circular self-labelling that all 35 dama ant models were trained on. Every
+      row carries those as booleans; clips/tag_model_card.json carries the reasoning.
+    dama-hear/unsuspend-gate: >-
+      ALL THREE MET 2026-09-10. 473 stored clips across nyquist/mach/rankine over 09-08..10;
+      69 heard by a human (25 from mach) and written up in docs/clip-calibration-2026-09-10.md
+      with the labels in testdata/clip-labels-2026-09-10.jsonl; condition 3 met by RETIREMENT --
+      the calibration set showed --max-silence-frac cannot separate healthy from broken, so the
+      canary is --min-mean-top-score instead. Enabled 2026-09-11 by the operator.
+    dama-hear/lanes: >-
+      mn10 (whole clip, clips/tags.jsonl) and mn10_pad10 (zero-padded to 10 s,
+      clips/tags-mn10_pad10.jsonl). Same weights, one load, separate resume sets and heartbeats.
+spec:
+  suspend: false
+  # Twice an hour against a drain that runs every 15 minutes. Inference is ~12 ms per clip, so
+  # the cost is pod startup, not the model; --limit and --deadline-s bound each lane's catch-up,
+  # and two 600 s lanes fit inside activeDeadlineSeconds.
+  schedule: "12,42 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 1500
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: hear-tag
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: tag
+              image: python:3.13-slim
+              command: ["/bin/sh", "-lc"]
+              args:
+                - |
+                  set -e
+                  # ⚠️A SEPARATE TARGET DIR FROM THE DRAIN'S /pool/pylib, ON PURPOSE. The tag lane
+                  # pulls onnxruntime and its transitive pins; resolving those into the dir the
+                  # drain imports from would let a tagger dependency break the collector that
+                  # feeds it.
+                  LIB=/pool/pylib-tag
+                  MODELS=/pool/models/mn10_as
+                  export PYTHONPATH="$LIB:/app"
+                  if ! python -c 'import onnxruntime,sys; sys.exit(0 if onnxruntime.__version__=="1.27.0" else 1)' 2>/dev/null; then
+                    echo "installing onnxruntime==1.27.0 into $LIB"
+                    pip install --no-cache-dir --upgrade --target "$LIB" 'onnxruntime==1.27.0' 'numpy==2.2.6' >/dev/null 2>&1
+                  fi
+                  python -c 'import onnxruntime,numpy; print("onnxruntime",onnxruntime.__version__,"numpy",numpy.__version__)'
+                  mkdir -p "$MODELS"
+                  # ⚠️THE CLASS MAP IS FETCHABLE; THE MODEL IS NOT, AND THAT IS DELIBERATE.
+                  # Upstream publishes PyTorch checkpoints. Converting one needs torch, torchaudio and
+                  # torchvision (EfficientAT's model code imports it) -- roughly 3 GB into a 5 Gi PVC to run a 24 MB graph once. So the
+                  # .onnx is built OUT OF BAND by tools/export_mn10_onnx.py, whose own input is
+                  # the sha256-pinned upstream .pt, and staged onto the PVC. This job VERIFIES it
+                  # and refuses; it never builds and never downloads a model it cannot check.
+                  # ⚠️FETCHED WITH PYTHON, NOT wget OR curl -- neither exists in python:*-slim,
+                  # and a loader that shells out to one of them is a documented reason PANNs was
+                  # refused.
+                  python - "$MODELS" <<'PY'
+                  import os, sys, urllib.request
+                  d = sys.argv[1]
+                  cmap = ("https://github.com/fschmid56/EfficientAT/raw/v0.0.1/"
+                          "metadata/class_labels_indices.csv")
+                  p = d + "/audioset_class_labels_indices.csv"
+                  if not os.path.exists(p):
+                      open(p, "wb").write(urllib.request.urlopen(cmap, timeout=120).read())
+                  PY
+                  # ⚠️UNCONDITIONAL AND FATAL. The digests are pinned in tools/hear_tag.py, which
+                  # is shipped in this ConfigMap, so the check travels with the code that enforces
+                  # it. A mismatch stops the job; it does not degrade to tagging with whatever is
+                  # on the PVC. Hashing the FILE is the point -- the existing numpy guard in
+                  # hear-drain.yaml tested only that a directory existed, which enforces nothing.
+                  if ! python /app/tools/hear_tag.py --model-dir "$MODELS" --verify-weights; then
+                    echo "-----------------------------------------------------------------"
+                    echo "mn10_as.onnx is missing or is not the pinned graph. Build and stage:"
+                    echo "  python tools/export_mn10_onnx.py --out mn10_as.onnx"
+                    echo "  kubectl -n dama cp mn10_as.onnx <a pod mounting hear-pool>:$MODELS/"
+                    echo "The export is byte-reproducible and its input .pt is sha-pinned, so"
+                    echo "the digest in tools/hear_tag.py checks the whole chain."
+                    echo "-----------------------------------------------------------------"
+                    exit 1
+                  fi
+                  exec python /app/tools/hear_tag.py \
+                    --pool /pool/corpus \
+                    --model-dir "$MODELS" \
+                    --model yamnet \
+                    --lane mn10 --lane mn10_pad10 \
+                    --limit 400 \
+                    --deadline-s 600
+              volumeMounts:
+                - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/sketch.py,   subPath: hear_sketch.py }
+                - { name: code, mountPath: /app/hear/clips.py,    subPath: hear_clips.py }
+                - { name: code, mountPath: /app/hear/tags.py,     subPath: hear_tags.py }
+                - { name: code, mountPath: /app/hear/resample.py, subPath: hear_resample.py }
+                - { name: code, mountPath: /app/tools/hear_tag.py, subPath: tools_hear_tag.py }
+                - { name: pool, mountPath: /pool }
+              resources:
+                # At the namespace LimitRange's per-Container minimum for cpu. Measured RSS is
+                # 82 MB for the interpreter plus the model; the limit covers the pip install too.
+                requests: { cpu: 100m, memory: 256Mi }
+                limits:   { cpu: "1",  memory: 1Gi }
+          volumes:
+            - name: code
+              configMap:
+                name: hear-tag-code
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool
+---
+# ⚠️THE TAGGER'S OWN EXIT STATUS IS NOT A HEALTH SIGNAL. It exits 0 on a run that refused every
+# clip it read -- correctly, because a pruned or evicted clip is a row it read and honestly
+# declined to tag. It also exits 0 on a run that read an EMPTY directory. This job is what a
+# monitor keys on.
+#
+# ⚠️IT MUST NOT KEY ON THE CLASSES. A quiet period is the expected result, and a gate asking "did
+# anything score high" fires on a correct run and stays silent on a broken one. The gates are
+# throughput, refusal buckets, torn lines, the accounting invariant, weight verification and
+# staleness. The class distribution prints under `OBSERVATION, not a gate`.
+#
+# ⚠️--min-mean-top-score 0.20 IS THE CALIBRATED FLOOR, NOT A GUESS. Measured over the 69-clip
+# human calibration set: 0.254 with normalisation, 0.162 without, and at this job's 400-clip
+# --limit the two run-level means are 13.6 sigma apart. 0.20 sits between them, nearer the broken
+# end because a false HIGH wakes an operator and a false ok leaves a dead lane looking alive.
+# ⚠️IT IS CALIBRATED AGAINST ONE FAILURE -- normalisation disabled. Wrong weights, a corrupt
+# resample or silence on the wire may not move it. Passing is not proof the lane is healthy.
+#
+# ⚠️--max-silence-frac IS NEGATIVE ON PURPOSE AND THE OUTPUT SAYS "REPORT". Silence-dominated
+# output is the exact signature of normalisation not running -- measured, two real clips at -56.9
+# and -62.1 dBFS return Silence 0.406 and 0.723 raw, and Animal/Cricket and Animal/Wild animals
+# once RMS-normalised to -20 dBFS. So the fraction is worth watching. But the threshold has to
+# come from a measured calibration set, not from a number chosen today, and nobody has yet
+# listened to one clip. Set it in the SAME change that writes docs/clip-calibration-<date>.md.
+#
+# ⚠️EACH LANE IS CHECKED, AND THE JOB FAILS ON THE WORST. mn10_pad10 ships
+# --min-mean-top-score -1: on the calibration set its mean top score did not separate normalised
+# from un-normalised input (S4), so for that lane the number is reported, not gated.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-tag-check
+  namespace: dama
+  labels:
+    app: hear-tag
+spec:
+  suspend: false
+  schedule: "52 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: hear-tag
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: check
+              image: python:3.13-slim
+              command: ["/bin/sh", "-lc"]
+              args:
+                # ⚠️`set +e`, NOT `set -e`, and every gate rc is captured before the final exit.
+                # Runners have been seen delivering -e on the command line where the script
+                # cannot clear it, and a check job whose last command always succeeds is a green
+                # light nobody reads -- hear-drain shipped exactly that bug. Weight verification
+                # must fail this CronJob too, and it gets `--pool` so hear_tag.py can stamp a
+                # refusal heartbeat before exit 2 instead of leaving an older green one in place.
+                - |
+                  set +e
+                  export PYTHONPATH=/pool/pylib-tag:/app
+                  python /app/tools/hear_tag.py --pool /pool/corpus --check --model yamnet --lane mn10 \
+                    --window-s 7200 --max-stale-s 14400 --max-silence-frac -1 \
+                    --min-mean-top-score 0.20
+                  rc=$?
+                  python /app/tools/hear_tag.py --pool /pool/corpus --check --lane mn10_pad10 \
+                    --window-s 7200 --max-stale-s 14400 --max-silence-frac -1 \
+                    --min-mean-top-score -1
+                  rc2=$?
+                  [ "$rc2" -gt "$rc" ] && rc=$rc2
+                  echo "--- weights ---"
+                  python /app/tools/hear_tag.py --pool /pool/corpus --model-dir /pool/models/mn10_as --verify-weights
+                  rc3=$?
+                  [ "$rc3" -gt "$rc" ] && rc=$rc3
+                  exit "$rc"
+              volumeMounts:
+                - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/sketch.py,   subPath: hear_sketch.py }
+                - { name: code, mountPath: /app/hear/clips.py,    subPath: hear_clips.py }
+                - { name: code, mountPath: /app/hear/tags.py,     subPath: hear_tags.py }
+                - { name: code, mountPath: /app/hear/resample.py, subPath: hear_resample.py }
+                - { name: code, mountPath: /app/tools/hear_tag.py, subPath: tools_hear_tag.py }
+                - { name: pool, mountPath: /pool }
+              resources:
+                requests: { cpu: 100m, memory: 128Mi }
+                limits:   { cpu: "1",  memory: 512Mi }
+          volumes:
+            - name: code
+              configMap:
+                name: hear-tag-code
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool

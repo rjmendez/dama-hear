@@ -55,8 +55,10 @@ import numpy as np
 
 from . import corpus as C
 from . import detsfile as DF
+from . import identity as ID
 from . import scenefile as SF
 from . import sketch as SK
+from . import wire as WR
 
 SCHEMA_VERSION = 1
 
@@ -149,22 +151,124 @@ def _why_geoms_differ(a: Tuple[Any, Any, Any, Any], b: Tuple[Any, Any, Any, Any]
     return "; and ".join(why) if why else "they compare unequal on no named field"
 
 
+def _resolve_identity(row: Dict[str, Any]) -> Optional[str]:
+    """Rename an UNPROVISIONED id in place to the node it is declared to be. Returns the raw id
+    when it renamed one, None otherwise.
+
+    ⚠️CALLED BEFORE `_node_mismatch`, NEVER INSTEAD OF IT. The guard below still has to agree
+    with the fetch afterwards; all this does is decide which name the guard is comparing. See
+    `hear.identity` for what may be renamed (only hear_node.ino:88's `hear-<mac tail>` form, and
+    only with an entry stating its evidence) and why the raw id is kept on the row rather than
+    overwritten.
+    """
+    node, node_from, raw = ID.resolve(row.get("node"), row.get("node_from"))
+    if raw is None:
+        return None
+    row["node"], row["node_from"], row["node_alias_of"] = node, node_from, raw
+    return raw
+
+
+def _node_mismatch(row: Dict[str, Any], expect: Optional[str]) -> Optional[str]:
+    """The name the ROW carries against the name the FETCH says it came from. Returns the row's
+    name when they disagree, None when they agree or when there is nothing to compare.
+
+    ⚠️MEASURED, 2026-09-07 drain. `mach/scene.csv` is one file off one card written across 15
+    boot sessions, and rows 2610-2885 of it -- one complete boot, uptime 14->298 s, sample 0 to
+    275*16384, every row utc_us == 0 -- carry `node` = "nyquist". The floor of that block is
+    38.50 dB and its quiet-time band spread 0.75 dB, inside mach's other fourteen sessions
+    (36.75-39.00 dB, 0.50-1.00 dB) and nowhere near nyquist's four (23.75-26.25 dB, 1.50-16.50
+    dB): whatever hardware stood at mach's position recorded them. The `node` column is NODE_ID,
+    a compile-time #define from tools/gen_secrets.py, so a mid-file identity change means the
+    BINARY changed -- gen_secrets.py:30-31 names the failure verbatim ("copying the file by hand
+    is how a node ends up flashed with another node's identity").
+
+    Without this check `ingest_scene` buckets on the row's own label, so those 276 rows landed in
+    scene/unanchored/nyquist.jsonl.gz. The whole drain holds exactly ONE legitimately unanchored
+    nyquist row, so that partition was 276/277 = 99.6% another node's microphone, and `scene()`
+    walks `unanchored` by default while `scene_matrix()` cannot even switch it off.
+
+    ⚠️FOUR THINGS THAT LOOKED LIKE THIS GUARD AND ARE NOT. (a) `origin` reaches the ledger entry
+    and was never compared to anything. (b) `default_node` does NOT do this job on its own:
+    `scenefile.read_text` consults it only when the node cell is EMPTY, and an S2 row always
+    carries one, so the argument is structurally unreachable for exactly this file. (c)
+    `node_from` is stored on every record and read by nothing outside a test. (d) the ledger
+    assertion `rows == added + duplicate + skipped` still closed -- the rows were MIS-ROUTED, not
+    dropped, which is the loss a conservation check cannot see. That is why the refusal below is
+    counted into `skip_reasons`: the assertion has to keep closing for a reason, not by luck.
+
+    Refusing rather than relabelling is deliberate. The label is evidence that a node was flashed
+    with the wrong identity; rewriting it to the fetch's name would file the rows correctly and
+    destroy the only trace of the flashing error.
+
+    ⚠️ONE THING IS RENAMED BEFORE THIS RUNS, AND IT IS NOT A NAME. `_resolve_identity` maps an
+    UNPROVISIONED id -- hear_node.ino:88's `hear-<mac tail>`, emitted only by a build with no
+    NODE_ID compiled in -- to the node that board is declared to be, keeping the raw id on the
+    row as `node_alias_of`. That is a different act from the one refused above: `nyquist` is a
+    name someone chose and can be wrong about, a MAC tail is the board itself. This guard is
+    unchanged and still fires on the renamed name, so a `hear-...` row that turns up on the wrong
+    card is refused exactly as it was. See `hear.identity`.
+    """
+    if not expect:
+        return None
+    node = row.get("node")
+    # ⚠️"alias" IS A NAME THE ROW CARRIES, exactly as "file" is. Only "argument" means the name
+    # came from `expect` itself and so cannot disagree with it. Reading this as `!= "file"`
+    # disarmed the guard for every renamed row -- caught by
+    # tests/test_node_alias.py::test_an_unnamed_boot_on_the_WRONG_card_is_still_refused, which
+    # put rankine's card in mach's fetch and watched six rows walk in.
+    if not node or row.get("node_from") not in ("file", "alias"):
+        return None            # the name came from `expect` itself: nothing disagrees
+    return None if node == expect else str(node)
+
+
+def _sync_sigma_ns(v: Any) -> Optional[float]:
+    """A stated clock sigma in nanoseconds, or None for "not stated".
+
+    ⚠️NON-POSITIVE IS NOT STATED. The firmware writes an EMPTY cell for a row it could not stamp,
+    but a 0 that reached here from any source must not become a claim of a perfect clock --
+    hear/nodeclass.py refuses `t_sigma_s <= 0` at construction for exactly that reason, and this
+    value is fed to the same budget.
+
+    ⚠️ONE COPY OF THE RULE, IN `hear.detsfile`. This used to be a second implementation, and the
+    reader's own version had a hole -- it tested truthiness, so the string "0" survived it. The
+    duplicate is what hid that: this function compensated, so the suite stayed green while the
+    reader's docstring and the reader's behaviour disagreed. This path is still needed because it
+    also normalises MQTT payload values, which never pass through the CSV reader.
+    """
+    return DF.stated_sigma_ns(v)
+
+
 def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
-    frame = binascii.unhexlify(row["frame_hex"])
-    d = SK.unpack(frame)
-    utc_us = int(row.get("utc_us") or 0)
+    fh = (row.get("frame_hex") or "").strip()
+    if len(fh) % 2 != 0:
+        fh = fh[:-1]
+    frame = binascii.unhexlify(fh)
+    d = WR.decode(frame)
+    try:
+        utc_us = int(float(row.get("utc_us") or 0))
+    except (TypeError, ValueError):
+        utc_us = 0
     node = row["node"]
-    # fs: the FRAME is authoritative when it states a rate, because the CSV column is the node's
-    # running estimate and the fs_clean latch has already put 22624.0 in it for a whole boot.
+    # fs: the FRAME is authoritative when it states a rate; the CSV column is only the node's
+    # running estimate.
     fs_csv = row.get("fs_hz")
-    fs_csv = float(fs_csv) if fs_csv not in (None, "") else None
-    return {
+    try:
+        fs_csv = float(fs_csv) if fs_csv not in (None, "") else None
+    except (TypeError, ValueError):
+        fs_csv = None
+    node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
+    event_flags = d.get("event_flags", 0)
+    no_context = bool(event_flags & SK.FLAG_NO_CONTEXT) if d.get("version", 1) == 1 else False
+    rec = {
         "schema_version": SCHEMA_VERSION,
         "key": key("node", node, utc_us, row.get("sample"), frame),
         "source": "node",
         "node": node,
         "node_from": row.get("node_from"),
+        # Present ONLY on a renamed row: absent is not False, it is "this row was never
+        # renamed". Every row already written is absent, and stays byte-identical.
+        **({"node_alias_of": row["node_alias_of"]} if row.get("node_alias_of") else {}),
         "utc_us": utc_us,
         "anchored": utc_us > 0,
         "ts_utc_s": (utc_us / 1e6) if utc_us > 0 else None,
@@ -178,20 +282,50 @@ def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "frames": int(d["q"].shape[1]),
         "peak": d["peak"],
         "ref_db": d["ref_db"],
-        "node_us": d["node_us"],
+        "node_us": node_us,
         "retrigger": bool(d["retrigger"]),
         # event_flags, not the raw flags word: bit 1 is "no context" only in v1, and is a profile
         # bit in v2. Masking the raw word tags good v2 frames as broken.
-        "no_context": bool(d["event_flags"] & SK.FLAG_NO_CONTEXT),
+        "no_context": no_context,
         "sketch_back": (int(row["sketch_back"]) if row.get("sketch_back") not in (None, "")
                         else None),
+        # ⚠️THE SAME KEY AND THE SAME UNIT AS THE PHONE PATH ABOVE (ingest_mqtt_jsonl), which is
+        # why it is not called anything else: 1-sigma uncertainty of the producer's clock-to-UTC
+        # anchor, NANOSECONDS. For a node it is `STAMP_ANCHOR_SIGMA_US + drift * anchor age`,
+        # written per detection since dets.csv G6 -- the column that makes a frozen anchor
+        # visible, because `time_valid` never goes false once it is set.
+        # None on every G1-G5 row and on any G6 row the node could not stamp. NOT 0: a stated 0
+        # would claim a perfect clock, and `hear.corpus.Record.sync_sigma_ns` is read by gates
+        # that treat absent and stated differently.
+        "sync_sigma_ns": _sync_sigma_ns(row.get("sync_sigma_ns")),
         "sample": row.get("sample"),
         "uptime_s": row.get("uptime_s"),
+        # ⚠️THE INGEST USED TO DROP THESE TWO, WHICH IS WHY AN UNANCHORED ROW WAS UNRECOVERABLE
+        # THE MOMENT IT LANDED. Every generation of dets.csv has carried them -- they are in
+        # `hear.detsfile._BASE`, i.e. even G1 -- and they are the only fields that place a row on
+        # the node's own PPS edge counter. `utc_us == 0` says the node could not NAME the edge;
+        # `pps_n` still says WHICH edge, and `us_since_pps` how far into it. Without the pair, a
+        # row whose neighbours in the same boot ARE anchored cannot be placed even in principle,
+        # so unanchored recovery (hear/pool.py:unanchored_window) would have had nothing to work on.
+        "pps_n": row.get("pps_n"),
+        "us_since_pps": row.get("us_since_pps"),
         "trigger": row.get("trigger"),
         "clip": row.get("clip") or None,
         "dets_schema": row.get("schema"),
     }
+    if "us_of_day" in d:
+        rec["us_of_day"] = d["us_of_day"]
+    if "seq" in d:
+        rec["seq"] = d["seq"]
+    if "profile_id" in d:
+        rec["profile_id"] = d["profile_id"]
+    return rec
 
+
+
+#: The /detections (hear_node.ino: h_dets) fields that map straight onto a dets.csv row.
+LIVE_RING_COLUMNS = ("utc_us", "uptime_s", "sample", "pps_n", "us_since_pps", "trigger",
+                     "flags", "fs_hz")
 
 
 class Pool:
@@ -274,8 +408,15 @@ class Pool:
         raw = open(path, "rb").read()
         sha = hashlib.sha256(raw).hexdigest()
         read = DF.read_text(raw.decode("utf-8", "replace"), default_node=default_node)
-        recs, bad = [], {}
+        recs, bad, mism, aliased = [], {}, {}, {}
         for row in read.rows:
+            raw_id = _resolve_identity(row)
+            if raw_id:
+                aliased[raw_id] = aliased.get(raw_id, 0) + 1
+            wrong = _node_mismatch(row, default_node)
+            if wrong:
+                mism[wrong] = mism.get(wrong, 0) + 1
+                continue
             try:
                 recs.append(_record_from_node_row(row))
             except Exception as e:                       # short frame, bad hex, bad header
@@ -290,16 +431,73 @@ class Pool:
         reasons = dict(read.counts)
         for k, v in bad.items():
             reasons["decode_" + k] = reasons.get("decode_" + k, 0) + v
-        skipped = len(read.skips) + sum(bad.values())
+        if mism:
+            # ONE reason key, not one per name: a garbage file must not be able to grow the
+            # breakdown without bound. The names live in their own field, like decode_errors.
+            reasons["node_mismatch"] = reasons.get("node_mismatch", 0) + sum(mism.values())
+        skipped = len(read.skips) + sum(bad.values()) + sum(mism.values())
         entry = {
             "kind": "dets.csv", "path": os.path.abspath(path), "origin": origin or path,
             "sha256": sha, "bytes": len(raw), "generation": read.generation.name,
             "rows": len(read.rows) + len(read.skips), "decoded": len(recs), "added": added,
             "duplicate": len(recs) - added,
-            "skipped": skipped, "skip_reasons": reasons,
+            "skipped": skipped, "skip_reasons": reasons, "node_mismatch": mism,
+            # ⚠️NOT a skip reason and not part of the sum: an aliased row was KEPT. It is its own
+            # field so "how many rows did this file need renaming to be readable at all" is a
+            # number the ledger answers, beside the refusals rather than inside them.
+            "aliased": aliased,
             "decode_errors": bad, "schema_version": SCHEMA_VERSION,
         }
         assert entry["rows"] == added + entry["duplicate"] + skipped, entry
+        self._ledger(entry)
+        return entry
+
+    def ingest_detections_json(self, path: str, default_node: str,
+                               origin: Optional[str] = None) -> Dict[str, Any]:
+        """Ingest one archived `/detections` body, the live ring of a node with no card.
+
+        Idempotent like ingest_dets: consecutive runs overlap and re-reading a row adds 0. The
+        body carries no node name, so `default_node` is required and every row is filed under it.
+        """
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        sha = hashlib.sha256(raw).hexdigest()
+        obj = json.loads(raw.decode("utf-8", "replace"))
+        if not isinstance(obj, list):
+            raise ValueError("%s: /detections body is %s, not a list" % (path, type(obj).__name__))
+        recs: List[Dict[str, Any]] = []
+        bad: Dict[str, int] = {}
+        for d in obj:
+            if not isinstance(d, dict):
+                bad["not_an_object"] = bad.get("not_an_object", 0) + 1
+                continue
+            hexs = d.get("frame") or ""
+            n = d.get("frame_len")
+            try:
+                short = n is not None and len(hexs) != 2 * int(n)
+            except (TypeError, ValueError):
+                short = True
+            if short:
+                # a truncated body is otherwise indistinguishable from a smaller sketch
+                bad["frame_len_mismatch"] = bad.get("frame_len_mismatch", 0) + 1
+                continue
+            row = {k: d[k] for k in LIVE_RING_COLUMNS if k in d}
+            if row.get("sample") is not None:
+                row["sample"] = str(row["sample"])
+            row.update(frame_hex=hexs, node=default_node, clip=d.get("clip") or None,
+                       schema="live")
+            try:
+                recs.append(_record_from_node_row(row))
+            except Exception as e:
+                r = "decode_" + type(e).__name__
+                bad[r] = bad.get(r, 0) + 1
+        added = self._append(recs)
+        entry = {"kind": "detections.json", "path": os.path.abspath(path),
+                 "origin": origin or path, "sha256": sha, "bytes": len(raw),
+                 "generation": "live", "rows": len(obj), "decoded": len(recs), "added": added,
+                 "duplicate": len(recs) - added, "skipped": sum(bad.values()),
+                 "skip_reasons": bad, "schema_version": SCHEMA_VERSION}
+        assert entry["rows"] == added + entry["duplicate"] + entry["skipped"], entry
         self._ledger(entry)
         return entry
 
@@ -333,29 +531,33 @@ class Pool:
                 continue
             try:
                 frame = base64.b64decode(b64)
-                d = SK.unpack(frame)
+                d = WR.decode(frame)
             except Exception as e:
                 r = type(e).__name__
                 skips[r] = skips.get(r, 0) + 1
                 continue
             ts_ms = payload.get("ts_utc_ms")
-            ts = None if ts_ms is None else float(ts_ms) / 1000.0
-            utc_us = int(round(ts * 1e6)) if ts else 0
+            node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
+            stated_utc_us = C.phone_utc_us(ts_ms, node_us)
+            ts = None if stated_utc_us is None else stated_utc_us / 1e6
+            utc_us = 0 if stated_utc_us is None else stated_utc_us
             node = str(nid or payload.get("node_id") or "?")
-            recs.append({
+            event_flags = d.get("event_flags", 0)
+            no_context = bool(event_flags & SK.FLAG_NO_CONTEXT) if d.get("version", 1) == 1 else False
+            rec = {
                 "schema_version": SCHEMA_VERSION,
                 "key": key("phone", node, utc_us, payload.get("trigger_ts_utc_ms"), frame),
                 "source": "phone", "node": node, "node_from": "topic" if nid else "payload",
-                "utc_us": utc_us, "anchored": bool(ts), "ts_utc_s": ts,
+                "utc_us": utc_us, "anchored": stated_utc_us is not None, "ts_utc_s": ts,
                 "frame_b64": base64.b64encode(frame).decode(),
                 "fs_hz": d["fs_hz"] if d["fs_hz"] is not None else payload.get("fs"),
                 "fs_stated_by": "frame" if d["fs_hz"] is not None else
                                 ("json" if payload.get("fs") else None),
                 "layout": d["layout"], "valid_bands": d["valid_bands"],
                 "bands": int(d["q"].shape[0]), "frames": int(d["q"].shape[1]),
-                "peak": d["peak"], "ref_db": d["ref_db"], "node_us": d["node_us"],
+                "peak": d["peak"], "ref_db": d["ref_db"], "node_us": node_us,
                 "retrigger": bool(d["retrigger"]),
-                "no_context": bool(d["event_flags"] & SK.FLAG_NO_CONTEXT),
+                "no_context": no_context,
                 "sketch_back": None,
                 "clipped": payload.get("clipped"),
                 "clock_tier": payload.get("clock_tier"),
@@ -370,7 +572,14 @@ class Pool:
                 # If a producer ever states it outright, it outranks the derivation. Absent is
                 # the normal case and stays absent, NOT False: see Record.utc_trusted.
                 "utc_trusted": payload.get("utc_trusted"),
-            })
+            }
+            if "us_of_day" in d:
+                rec["us_of_day"] = d["us_of_day"]
+            if "seq" in d:
+                rec["seq"] = d["seq"]
+            if "profile_id" in d:
+                rec["profile_id"] = d["profile_id"]
+            recs.append(rec)
         added = self._append(recs)
         entry = {"kind": "mqtt.jsonl", "path": os.path.abspath(path), "origin": origin or path,
                  "sha256": sha, "bytes": len(raw), "rows": rows_seen, "decoded": len(recs),
@@ -432,7 +641,18 @@ class Pool:
 
         recs: List[Dict[str, Any]] = []
         bad: Dict[str, int] = {}
+        mism: Dict[str, int] = {}
+        aliased: Dict[str, int] = {}
         for row in read.rows:
+            # BEFORE the decode, because a row whose identity is wrong is not a row this file may
+            # contribute no matter how well it decodes. See `_node_mismatch`.
+            raw_id = _resolve_identity(row)
+            if raw_id:
+                aliased[raw_id] = aliased.get(raw_id, 0) + 1
+            wrong = _node_mismatch(row, default_node)
+            if wrong:
+                mism[wrong] = mism.get(wrong, 0) + 1
+                continue
             try:
                 d = SF.decode_row(row)
             except ValueError as e:
@@ -453,6 +673,7 @@ class Pool:
                 # into one record.
                 "key": key("scene", node, utc_us, row.get("sample"), d["q"].tobytes()),
                 "source": "scene", "node": node, "node_from": row.get("node_from"),
+                **({"node_alias_of": row["node_alias_of"]} if row.get("node_alias_of") else {}),
                 "utc_us": utc_us, "anchored": utc_us > 0, "ts_utc_s": ts,
                 "mel_b64": base64.b64encode(d["q"].tobytes()).decode(),
                 "ref_db": d["ref_db"], "bands": d["bands"],
@@ -496,12 +717,20 @@ class Pool:
         reasons = dict(read.counts)
         for k, v in bad.items():
             reasons[k] = reasons.get(k, 0) + v
-        skipped = len(read.skips) + sum(bad.values())
+        if mism:
+            reasons["node_mismatch"] = reasons.get("node_mismatch", 0) + sum(mism.values())
+        skipped = len(read.skips) + sum(bad.values()) + sum(mism.values())
         entry = {
             "kind": "scene.csv", "path": os.path.abspath(path), "origin": origin or path,
             "sha256": sha, "bytes": len(raw), "generation": read.generation.name,
             "rows": len(read.rows) + len(read.skips), "decoded": len(recs), "added": added,
             "duplicate": len(recs) - added, "skipped": skipped, "skip_reasons": reasons,
+            # Which OTHER node's name the refused rows carried, and how many. A count in
+            # skip_reasons says the drain refused something; this says a node is flashed wrong.
+            "node_mismatch": mism,
+            # Kept rows that had to be renamed first. See `ingest_dets` for why it sits outside
+            # `skip_reasons` and outside the conservation sum.
+            "aliased": aliased,
             "decode_errors": bad, "partial_first_line": read.partial_first_line,
             "schema_version": SCHEMA_VERSION,
         }
@@ -669,11 +898,14 @@ class Pool:
             if usable_only and (r.get("fs_hz") is None or r.get("no_context")
                                 or r.get("layout") != SK.LAYOUT_FIXED):
                 continue
-            d = SK.unpack(base64.b64decode(r["frame_b64"]))
+            d = WR.decode(base64.b64decode(r["frame_b64"]))
+            node_us = r.get("node_us")
+            if node_us is None:
+                node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
             out.append(C.Record(
                 node_id=r["node"], source=r["source"], q=d["q"], ref_db=d["ref_db"],
                 peak=d["peak"], bands=d["q"].shape[0], frames=d["q"].shape[1],
-                fs_hz=r.get("fs_hz"), node_us=d["node_us"], retrigger=bool(d["retrigger"]),
+                fs_hz=r.get("fs_hz"), node_us=node_us, retrigger=bool(d["retrigger"]),
                 ts_utc_s=r.get("ts_utc_s"), clipped=r.get("clipped"),
                 clock_tier=r.get("clock_tier"), sync_sigma_ns=r.get("sync_sigma_ns"),
                 # ⚠️EVERYTHING THE STORE HELD THAT IS NOT ALREADY A FIELD. This was a fixed
@@ -748,8 +980,6 @@ class Pool:
         skips: Dict[str, int] = {}
         for e in led:
             for k, v in (e.get("skip_reasons") or {}).items():
-                skips[k] = skips.get(k, 0) + v
-            for k, v in (e.get("decode_errors") or {}).items():
                 skips[k] = skips.get(k, 0) + v
         return {"records": n, "by_source": by_source, "by_node": by_node, "by_fs_hz": by_fs,
                 "by_day": by_day, "anchored": anchored, "unanchored": n - anchored,

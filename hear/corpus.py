@@ -25,6 +25,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 from . import sketch as SK
+from . import wire as WR
 
 #: Phone `clock_tier` values whose stamp is a UTC MEASUREMENT rather than a wall-clock reading.
 #: Copied deliberately, not invented: this is dama-gotchi's own
@@ -37,6 +38,33 @@ from . import sketch as SK
 #: has never heard of: an unrecognised label is a producer we do not understand, and the
 #: conservative reading is the one that does not admit it to a solve.
 TRUSTED_CLOCK_TIERS = frozenset({"gnss", "location"})
+
+
+def phone_utc_us(ts_utc_ms: Any, node_us: int) -> Optional[int]:
+    """Phone sketch UTC at the frame's own microsecond precision, or None if unstated.
+
+    dama-gotchi publishes TWO pieces of one instant:
+      * `ts_utc_ms`: the absolute UTC stamp, rounded to the nearest millisecond
+        (GPSTimingSync.Stamp.utcMs)
+      * `node_us`: the sketch frame's microseconds WITHIN that UTC second
+
+    Reading `ts_utc_ms` alone quantises the phone side onto a 1 ms grid even though the frame
+    already carries 1 us within-second precision, and a stamp at 00:00:00.999600 rounds onto the
+    NEXT second's millisecond bucket. The absolute second therefore comes from `ts_utc_ms`, but
+    the within-second digits come from `node_us`, choosing the second whose combined timestamp is
+    nearest the rounded millisecond value.
+    """
+    if ts_utc_ms is None:
+        return None
+    coarse_us = int(round(float(ts_utc_ms) * 1000.0))
+    sec_us = (coarse_us // 1_000_000) * 1_000_000
+    utc_us = sec_us + int(node_us)
+    delta_us = utc_us - coarse_us
+    if delta_us > 500_000:
+        utc_us -= 1_000_000
+    elif delta_us < -500_000:
+        utc_us += 1_000_000
+    return utc_us
 
 
 def utc_trusted_of(fields: Dict[str, Any]) -> Optional[bool]:
@@ -100,7 +128,19 @@ class Record:
         return self.q.astype(float) / 2.0 + self.ref_db
 
     def band_edges_hz(self) -> Optional[np.ndarray]:
-        return None if self.fs_hz is None else SK.band_edges_hz(self.fs_hz, self.bands)
+        """⚠️THE LAYOUT IS PART OF THE ANSWER. This accessor's whole job is "do two frames mean
+        the same frequencies", and it used to answer from the NYQUIST axis whatever the record's
+        own layout said: for a fixed-layout 16 kHz node frame -- every node sketch in the stored
+        history -- it returned a 7840.0 Hz top edge where the frame itself states 20000.0, so two
+        frames that ARE on one axis compared as different. It read correct at 48 kHz only because
+        the two layouts coincide above LAYOUT_EQUIVALENT_ABOVE_HZ.
+
+        Defaults to NYQUIST, not FIXED: a record that states no axis must not be assumed onto the
+        shared one."""
+        if self.fs_hz is None:
+            return None
+        return SK.band_edges_hz(self.fs_hz, self.bands,
+                                layout=self.extra.get("layout", SK.LAYOUT_NYQUIST))
 
     @property
     def utc_trusted(self) -> Optional[bool]:
@@ -155,10 +195,10 @@ class SkipReason(Exception):
 
 
 def _decode(frame: bytes) -> Dict:
-    """SK.unpack's ValueErrors become SkipReason: a malformed frame is a message this corpus
+    """hear.wire.decode's ValueErrors become SkipReason: a malformed frame is a message this corpus
     could not use, not a crash in the reader."""
     try:
-        return SK.unpack(frame)
+        return WR.decode(frame)
     except ValueError as e:
         raise SkipReason(str(e))
 
@@ -192,12 +232,28 @@ def from_phone(payload: Dict[str, Any], node_id: Optional[str] = None) -> Record
         # An older phone build that packed no rate code but reported it alongside. Believable,
         # and recorded as coming from the JSON rather than the frame.
         fs = float(payload["fs"])
-    ts = payload.get("ts_utc_ms")
+    node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
+    utc_us = phone_utc_us(payload.get("ts_utc_ms"), node_us)
+    extra = dict({k: payload[k] for k in
+                ("trigger_ts_utc_ms", "onset_offset_us", "onset_dated", "onset_found",
+                 "since_prev_s", "utc_trusted")
+                if k in payload},
+               # from the FRAME, not the JSON: it decides whether this row can be aligned
+               # with a row from a sensor running at another rate.
+               layout=d["layout"], valid_bands=d["valid_bands"])
+    if "us_of_day" in d:
+        extra["us_of_day"] = d["us_of_day"]
+    if "seq" in d:
+        extra["seq"] = d["seq"]
+    if "profile_id" in d:
+        extra["profile_id"] = d["profile_id"]
+    if "version" in d:
+        extra["version"] = d["version"]
     return Record(
         node_id=str(nid), source="phone", q=d["q"], ref_db=d["ref_db"], peak=d["peak"],
-        bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=d["node_us"],
+        bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=node_us,
         retrigger=bool(d["retrigger"]),
-        ts_utc_s=None if ts is None else float(ts) / 1000.0,
+        ts_utc_s=None if utc_us is None else utc_us / 1e6,
         clipped=payload.get("clipped"),
         clock_tier=payload.get("clock_tier"),
         sync_sigma_ns=payload.get("sync_sigma_ns"),
@@ -206,13 +262,7 @@ def from_phone(payload: Dict[str, Any], node_id: Optional[str] = None) -> Record
         # `Record.utc_trusted` -- so a Record that drops them cannot answer the gate's question
         # about itself. `onset_found` was being dropped here entirely
         # (AcousticRangingCollector.kt:3513 publishes it).
-        extra=dict({k: payload[k] for k in
-                    ("trigger_ts_utc_ms", "onset_offset_us", "onset_dated", "onset_found",
-                     "since_prev_s", "utc_trusted")
-                    if k in payload},
-                   # from the FRAME, not the JSON: it decides whether this row can be aligned
-                   # with a row from a sensor running at another rate.
-                   layout=d["layout"], valid_bands=d["valid_bands"]),
+        extra=extra,
     )
 
 
@@ -226,12 +276,26 @@ def from_node(frame: bytes, node_id: str, second_utc_s: Optional[int] = None,
     """
     d = _decode(frame)
     fs = d["fs_hz"] if d["fs_hz"] is not None else fs_hz
-    ts = None if second_utc_s is None else float(second_utc_s) + d["node_us"] / 1e6
+    if d.get("version", 1) >= 2:
+        node_us = d["us_of_day"] % 1_000_000
+        ts = None if second_utc_s is None else WR.unwrap_utc(d["us_of_day"], float(second_utc_s))
+    else:
+        node_us = d["node_us"]
+        ts = None if second_utc_s is None else float(second_utc_s) + d["node_us"] / 1e6
+    extra = {"layout": d["layout"], "valid_bands": d["valid_bands"]}
+    if "us_of_day" in d:
+        extra["us_of_day"] = d["us_of_day"]
+    if "seq" in d:
+        extra["seq"] = d["seq"]
+    if "profile_id" in d:
+        extra["profile_id"] = d["profile_id"]
+    if "version" in d:
+        extra["version"] = d["version"]
     return Record(
         node_id=str(node_id), source="node", q=d["q"], ref_db=d["ref_db"], peak=d["peak"],
-        bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=d["node_us"],
+        bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=node_us,
         retrigger=bool(d["retrigger"]), ts_utc_s=ts,
-        extra={"layout": d["layout"], "valid_bands": d["valid_bands"]},
+        extra=extra,
     )
 
 
@@ -294,7 +358,10 @@ def aligned_matrix(records: Iterable[Record], mode: str = "db",
     if mode not in ("db", "q"):
         raise ValueError("mode must be 'db' or 'q'")
     recs = [r for r in records if r.fs_hz is not None]
-    bad = [r for r in recs if r.extra.get("layout", SK.LAYOUT_FIXED) != SK.LAYOUT_FIXED]
+    # ⚠️ABSENT DEFAULTS TO NYQUIST, i.e. to REFUSED -- the same rule Record.band_edges_hz() and
+    # classify.score_sketch() apply. Defaulting a missing key to FIXED walked an axis-less record
+    # straight through the refusal below, which is the one thing this function exists to do.
+    bad = [r for r in recs if r.extra.get("layout", SK.LAYOUT_NYQUIST) != SK.LAYOUT_FIXED]
     if bad:
         raise ValueError(
             "%d record(s) use the %r layout, whose band edges are rescaled per rate; they cannot "

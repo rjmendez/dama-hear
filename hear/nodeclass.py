@@ -4,32 +4,112 @@
 WHY THIS EXISTS. `hear/backend/survey.py` answers "where is node 7". Nothing answered "can node 7
 produce an arrival time at all", and the honest answer is not always yes. A BirdWeather PUC has two
 microphones, a full environmental suite and an on-device classifier, and it is a genuinely better
-listener than the XIAO nodes -- but if its GPS PPS is not wired to a pin, its timestamps are NTP
-timestamps, and an NTP timestamp in a TDoA solve is not a worse measurement, it is a different
-measurement wearing the same units.
+listener than the XIAO nodes -- but if its clock carries milliseconds of error, its timestamps in a
+TDoA solve are not a worse measurement, they are a different measurement wearing the same units.
 
-The number that makes this concrete: sound travels 343 mm in a millisecond. A node timed by PPS
-carries tens of microseconds of timestamp error (nyquist measures tAcc 22-26 ns and a PPS interval
-spread of 10-15 us over 11.33 h). A node timed by NTP carries units of milliseconds -- dama-gotchi's
-own GPSTimingSync docstring claims 1-5 ms cross-device, which is 0.34-1.7 m. Averaging the two into
-one solve does not split the difference; it takes the worse one and hides it behind a residual that
+The number that makes this concrete: sound travels 343 mm in a millisecond. A node disciplined to
+GPS PPS carries tens of microseconds of timestamp error (measured live on all three nodes
+2026-09-10 22:09 UTC: GPS tAcc 28/31/38 ns, PPS interval spread 20/14/46 us for mach/nyquist/
+rankine). A node timed by ordinary phone-grade sync carries units of milliseconds -- dama-gotchi's
+GPSTimingSync.java:45 pins its "location" tier at 5 ms, which is 1.7 m. Averaging the two into one
+solve does not split the difference; it takes the worse one and hides it behind a residual that
 still looks fine, because a common-mode timing error moves every range together.
 
 So capability is declared per class, checked at the door, and REFUSED rather than degraded --
 the same discipline as SurveyError raising at load time instead of decorating every later answer.
 
+⚠️THE GATE TESTS NUMBERS, NOT LABELS. This file used to admit an arrival on
+`time_source == "gps_pps"` -- a string comparison. That refused a receiver for the name of its
+clock source rather than for the size of its error, so a chrony-disciplined host measured at 124 us
+would have been inadmissible while a class that merely *called itself* "gps_pps" was waved through.
+`contributes_arrival()` is now two measured predicates, both required:
+
+    clock_admissible()      t_sigma_s within ARRIVAL_T_SIGMA_MAX_S
+    capture_bias_bounded()  path_bias_s STATED and within ARRIVAL_PATH_BIAS_MAX_S
+
+⚠️THOSE TWO ARE THE CLASS DOOR. THE PER-DETECTION DOOR IS NOT THE SAME DOOR, AND THE CLASS FIGURE
+IS NOT ITS CEILING. A producer that states `sync_sigma_ns` has MEASURED the quantity `t_sigma_s`
+guesses at, so `stamp_admissible()` judges the statement -- RSS'd with the class's CAPTURE terms,
+which the statement does not measure -- and NOT the class constant. It used to short-circuit on
+`clock_admissible()`, which made the whole per-detection budget unreachable for every class whose
+class figure is over the bound; since a class inside the bound needs no rescuing, that was all of
+them. Measured cost of that short-circuit on the 2026-09-10 pool: 7,863 phone detections, 82.9% of
+them stating a sigma INSIDE the 129.4 us bound, refused on a 5 ms constant describing a clock tier
+none of them were running.
+
+⚠️AND THE BIAS GATE DOES NOT MOVE WHEN THE CLOCK GATE OPENS. A stated sigma buys a receiver a
+clock verdict and nothing else. `path_bias_s` is a systematic offset; weighting handles variance
+and does not handle bias. `bias_refusal()` is the separate verdict, in separate words, so an
+operator can see that a phone is one run of tools/hear_latency_cal.py away rather than unusable.
+
+⚠️THE SECOND PREDICATE IS WHY THE FIRST IS NOT A LOOPHOLE. A good clock is necessary and it is
+nowhere near sufficient. Between the wavefront reaching the diaphragm and the number the firmware
+writes down sits an analogue-to-digital path -- a decimation filter, a DMA block, an ALSA/USB
+buffer, an Android HAL -- whose delay is a BIAS: a constant per-receiver offset that
+
+  * does not average down over events, however many events are collected;
+  * is INVISIBLE in a 3-node fit, because two independent TDoAs exactly determine (x, y) with z
+    fixed, so the residual is identically zero by construction and cannot report it;
+  * moves that receiver's range directly, at 343 mm per millisecond.
+
+That, and not the name of its clock, is the reason a phone or an ALSA-captured host is out today.
+A class may state a `path_bias_s` only if someone MEASURED the delay against an external
+reference. `None` means never measured, and never-measured is a refusal.
+
+⚠️WHAT THIS MODEL DOES NOT DO. `path_bias_s` is per class and is treated as if it never cancels.
+In a solve between two receivers of the SAME class an identical capture path does cancel, so the
+gate is conservative there; between DIFFERENT classes it does not cancel at all, and that
+difference is not represented. Adding a receiver of a new class is therefore the case this file is
+sized for, and it is the case where an unmeasured path stops being harmless.
+
 ⚠️A CLASS DESCRIBES HARDWARE, NOT A PROMISE. `xiao-s3-pps` says a node of that class HAS a PPS
-input wired to D0. It does not say the GPS is talking: mach is that class and its module currently
-decodes at no baud rate at all. Use the class to decide what a node could contribute and the
-node's own telemetry to decide what it did.
+input wired to D0. It does not say the GPS is talking: measured live 2026-09-10, nyquist and
+rankine both report `valid_nmea: 0` at baud 230400 while decoding UBX normally (`ubx_pvt` 8906 and
+8872, fix 3), and mach -- which an older revision of this comment named as the broken one -- is
+decoding 154023 of 182688 sentences at 115200. Use the class to decide what a node could
+contribute and the node's own telemetry to decide what it did.
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Sequence
 
 # Speed of sound at 20 C, only used to turn a timing error into a distance for the messages below.
 # The live value comes from a node's own BMP280 (hear reports env.c_mps); this is for exposition.
 _C_NOMINAL_MPS = 343.0
+
+# ---------------------------------------------------------------- the arrival budget
+# ONE sourced number, and everything below is arithmetic on it. docs/node-hardware.md, "The BME280
+# is an acoustic sensor here": `c = 331.3 + 0.606 * T`, so one degree of unmeasured air temperature
+# is 0.606 m/s, which over the array's ~35 m working scale is
+#     dt = d * dc / c**2 = 35 * 0.606 / 343**2 = 1.80e-4 s
+# -- the 183 us that file states, and that hear/node/detect.py, hear/node/telemetry.py and
+# tools/hear_latency_cal.py all already argue against. It is the size of an error the design
+# tolerates from a sensor it cannot fully remove, so it is the honest ceiling for a term it CAN
+# choose to refuse. Refusing something an order below it would be theatre; admitting something an
+# order above it would make the temperature work pointless.
+ARRIVAL_ONE_WAY_BUDGET_S = 183e-6
+
+# WHY NOT survey.json's TIGHTEST PAIR. The alternative anchor was the shortest baseline the array
+# actually has -- nyquist->rankine, sqrt(4.58**2 + 10.48**2 + 3.00**2) = 11.82 m, against which
+# 183 us (62.8 mm) is 0.53%. It was considered and REJECTED as the threshold for three reasons:
+# it is site geometry, so moving one node would silently change which HARDWARE is admissible;
+# those coordinates carry sigma_m 0.49-0.72 m, which is 8-11x the budget being set, so the
+# threshold would be less certain than the thing it gates; and two of the three heights are
+# "nominal storey, NOT measured". The survey is used here only as the cross-check in the previous
+# sentence. A gate must test the receiver, not the parking spot.
+
+# A TDoA is a DIFFERENCE of two arrivals, so a PER-NODE threshold is the one-way budget divided by
+# the way that node's error combines with its partner's -- and the two kinds combine differently:
+#
+#   random (t_sigma_s)    independent between receivers -> RSS -> the pair carries sqrt(2)*sigma
+#   bias   (path_bias_s)  deterministic; worst case the two offsets have opposite signs and add
+#                         -> the pair carries 2*bias
+#
+# Hence the bias bound is the TIGHTER of the two despite coming from the same budget. That is the
+# correct direction anyway: scatter averages down over events and a bias does not.
+ARRIVAL_T_SIGMA_MAX_S = ARRIVAL_ONE_WAY_BUDGET_S / math.sqrt(2.0)   # 129.4 us = 44.4 mm
+ARRIVAL_PATH_BIAS_MAX_S = ARRIVAL_ONE_WAY_BUDGET_S / 2.0            # 91.5 us = 31.4 mm
 
 
 class CapabilityError(ValueError):
@@ -43,10 +123,26 @@ class NodeClass:
     Fields are deliberately about MEASURABLE hardware limits, not about intent:
 
     time_source     "gps_pps" | "ntp" | "none"
-                    The only field that decides TDoA eligibility. "gps_pps" means a PPS edge
-                    reaches a GPIO and the firmware disciplines its clock to it.
-    t_sigma_s       Timestamp uncertainty, seconds, 1-sigma. This is the number a solver should
-                    propagate, and it is what makes classes non-interchangeable.
+                    ⚠️NOT the eligibility test -- see contributes_arrival(). It is documentation,
+                    plus ONE load-bearing use: "none" means nothing disciplines this receiver's
+                    clock to UTC at all, so `t_sigma_s` is a guess about a free-running oscillator
+                    rather than a measurement of a disciplined one, and no sigma it states can be
+                    believed. That is a floor, not a label check.
+    t_sigma_s       RANDOM timestamp uncertainty, seconds, 1-sigma: the part that averages down.
+                    This is the number a solver should propagate as noise. It is the WHOLE
+                    budget -- clock terms and capture terms RSS'd together.
+    clock_sigma_s   How much of `t_sigma_s` is the CLOCK-to-UTC anchor, seconds, or None for
+                    "the split has never been apportioned". It exists because a producer's own
+                    per-detection `sync_sigma_ns` measures exactly this term and nothing else
+                    (firmware/hear_node/hear_node.ino:1281-1288, docs/timing.md:63-65), so it is
+                    the term a statement REPLACES -- see stamp_t_sigma_s. None keeps the
+                    conservative double-count, so adding a class can never loosen the gate by
+                    omission.
+    path_bias_s     The part of the capture-path delay that is NOT corrected before the timestamp
+                    is emitted, seconds, as a magnitude. `None` means NEVER MEASURED, which is a
+                    REFUSAL and not a zero -- see the module docstring. Exactly 0.0 is rejected at
+                    construction for the same reason `t_sigma_s = 0` is: no hardware supports the
+                    claim.
     mic_count       2 or more permits an on-node bearing from the fixed baseline; 1 does not.
     fs_hz           Sample rate. Nyquist is fs/2 and no filter, model or integration time
                     recovers anything above it.
@@ -61,7 +157,9 @@ class NodeClass:
 
     def __init__(self, name: str, time_source: str, t_sigma_s: float, mic_count: int,
                  fs_hz: float, band_hz: Sequence[float], env: Sequence[str] = (),
-                 raw_retain_s: float = 0.0, notes: str = "") -> None:
+                 raw_retain_s: float = 0.0, notes: str = "",
+                 path_bias_s: Optional[float] = None,
+                 clock_sigma_s: Optional[float] = None) -> None:
         if time_source not in ("gps_pps", "ntp", "none"):
             raise CapabilityError("unknown time_source %r" % (time_source,))
         if mic_count < 1:
@@ -74,9 +172,33 @@ class NodeClass:
         if t_sigma_s <= 0:
             raise CapabilityError("%s: t_sigma_s must be positive -- a node with no timing error "
                                   "is a claim no hardware supports" % name)
+        if path_bias_s is not None:
+            path_bias_s = float(path_bias_s)
+            if not math.isfinite(path_bias_s) or path_bias_s <= 0.0:
+                raise CapabilityError(
+                    "%s: path_bias_s must be a positive finite number of seconds, or None. None "
+                    "means the capture-path delay was never measured, which is a refusal; %r "
+                    "claims a capture path with no residual offset, which no hardware supports."
+                    % (name, path_bias_s))
+        if clock_sigma_s is not None:
+            clock_sigma_s = float(clock_sigma_s)
+            if not math.isfinite(clock_sigma_s) or clock_sigma_s <= 0.0:
+                raise CapabilityError(
+                    "%s: clock_sigma_s must be a positive finite number of seconds, or None. "
+                    "None means the clock/capture split has never been apportioned; %r claims a "
+                    "clock anchor with no error, which no hardware supports." % (name,
+                                                                                clock_sigma_s))
+            if clock_sigma_s > float(t_sigma_s):
+                raise CapabilityError(
+                    "%s: clock_sigma_s %.1f us is a PART of t_sigma_s %.1f us and cannot exceed "
+                    "it -- the whole budget is the RSS of that part and the capture terms, so a "
+                    "larger clock term would make the capture terms imaginary"
+                    % (name, clock_sigma_s * 1e6, float(t_sigma_s) * 1e6))
         self.name = name
         self.time_source = time_source
         self.t_sigma_s = float(t_sigma_s)
+        self.clock_sigma_s = clock_sigma_s
+        self.path_bias_s = path_bias_s
         self.mic_count = int(mic_count)
         self.fs_hz = float(fs_hz)
         self.band_hz = (lo, hi)
@@ -89,13 +211,24 @@ class NodeClass:
     def nyquist_hz(self) -> float:
         return self.fs_hz / 2.0
 
+    @property
+    def capture_sigma_s(self) -> float:
+        """`t_sigma_s` with the clock term taken back out: the part a statement does NOT replace.
+
+        `sqrt(t_sigma_s**2 - clock_sigma_s**2)`, because the class budget is an RSS. Undeclared
+        split -> the whole `t_sigma_s`, which is what this file did before the field existed.
+        """
+        if self.clock_sigma_s is None:
+            return self.t_sigma_s
+        return math.sqrt(max(0.0, self.t_sigma_s ** 2 - self.clock_sigma_s ** 2))
+
     def usable_band_hz(self):
         """(lo, hi, limit) -- the band this node can actually deliver, and WHICH ceiling bound it.
 
         `limit` is "microphone" or "nyquist", and they need different remedies: a Nyquist ceiling
         is fixed by sampling faster, a microphone ceiling is fixed only by a different part. The
-        distinction is not pedantic -- the XIAO nodes are Nyquist-bound at 8 kHz today and would
-        still be microphone-bound at 15 kHz with the planned ICS-43434.
+        distinction is not pedantic -- the XIAO PDM nodes are microphone-bound at 10 kHz, and the
+        planned ICS-43434 would be microphone-bound at 15 kHz.
         """
         hi, limit = self.band_hz[1], "microphone"
         if self.nyquist_hz < hi:
@@ -103,8 +236,17 @@ class NodeClass:
         return self.band_hz[0], hi, limit
 
     def range_sigma_m(self, c_mps: float = _C_NOMINAL_MPS) -> float:
-        """The timestamp error expressed as distance. This is the honest cost of a class."""
+        """The RANDOM timestamp error expressed as distance. Half the honest cost of a class."""
         return self.t_sigma_s * float(c_mps)
+
+    def path_bias_m(self, c_mps: float = _C_NOMINAL_MPS) -> Optional[float]:
+        """The uncorrected capture-path delay as distance, or None if it was never measured.
+
+        The other half of the cost, and the half a residual cannot show you.
+        """
+        if self.path_bias_s is None:
+            return None
+        return self.path_bias_s * float(c_mps)
 
     def can_hear(self, f_lo_hz: float, f_hi_hz: float) -> bool:
         """Does the requested band lie wholly inside what this node delivers?"""
@@ -115,15 +257,216 @@ class NodeClass:
         """Can this node produce a bearing on its own? Needs at least two microphones."""
         return self.mic_count >= 2
 
+    # ---- the two arrival predicates ---------------------------------------------------------
+    def clock_admissible(self) -> bool:
+        """Is this receiver's CLOCK good enough for its timestamps to be arrivals?
+
+        A measured test, with one string check that is genuinely load-bearing: `time_source`
+        "none" says nothing disciplines this clock to UTC, so whatever `t_sigma_s` it states is
+        not a measurement of a synchronised clock and there is nothing to compare against the
+        threshold. Every other source name -- "gps_pps", "ntp" -- is documentation, and a
+        receiver disciplined by any means that MEASURES small enough passes.
+        """
+        if self.time_source == "none":
+            return False
+        return self.t_sigma_s <= ARRIVAL_T_SIGMA_MAX_S
+
+    def capture_bias_bounded(self) -> bool:
+        """Has the capture path's fixed delay been MEASURED, and is what remains small enough?
+
+        Separate from clock_admissible() on purpose. These two fail for unrelated reasons, and a
+        caller told only "refused" cannot tell whether to fix a clock or a microphone driver.
+        Unmeasured is False: see the module docstring on why a bias cannot be recovered from a
+        residual after the fact.
+        """
+        if self.path_bias_s is None:
+            return False
+        return self.path_bias_s <= ARRIVAL_PATH_BIAS_MAX_S
+
+    def arrival_refusals(self, c_mps: float = _C_NOMINAL_MPS) -> List[str]:
+        """Every reason this class is not an arrival source, as sentences with numbers in them.
+
+        contributes_arrival() and require_arrival()'s message are both built from this one list,
+        so the gate and its explanation cannot drift apart. The bias half is `bias_refusal()`
+        verbatim, for the same reason: the class door and the per-detection door must refuse an
+        unmeasured capture path in the same words.
+        """
+        out: List[str] = []
+        if self.time_source == "none":
+            out.append(
+                "nothing disciplines its clock to UTC (time_source \"none\"), so its stated "
+                "t_sigma of %.3f ms is not a measurement of a synchronised clock"
+                % (self.t_sigma_s * 1e3,))
+        elif self.t_sigma_s > ARRIVAL_T_SIGMA_MAX_S:
+            # ⚠️SAY THAT THIS IS THE no-statement FIGURE. This class-level verdict is what the
+            # class is worth when a detection says NOTHING about its clock; a detection that
+            # states its own sigma is judged on that instead (stamp_admissible). Without the
+            # second clause an operator reads a 5 ms constant and concludes the receiver's clock
+            # is hopeless, when every one of its rows is stating 106 us.
+            rescue = self.max_stated_clock_sigma_s()
+            out.append(
+                "clock t_sigma %.1f us = %.3f m of range exceeds the %.1f us per-node bound "
+                "(%.0f us one-way budget / sqrt(2), because two independent clocks combine in "
+                "RSS)%s"
+                % (self.t_sigma_s * 1e6, self.range_sigma_m(c_mps),
+                   ARRIVAL_T_SIGMA_MAX_S * 1e6, ARRIVAL_ONE_WAY_BUDGET_S * 1e6,
+                   "" if rescue <= 0.0 else
+                   " -- that is the FALLBACK for a detection that states no clock sigma of its "
+                   "own; one stating <= %.1f us clears this gate per detection" % (rescue * 1e6,)))
+        bias = self.bias_refusal(c_mps)
+        if bias is not None:
+            out.append(bias)
+        return out
+
     def contributes_arrival(self) -> bool:
-        """Is this node's timestamp admissible as a TDoA arrival at all?"""
-        return self.time_source == "gps_pps"
+        """Is this node's timestamp admissible as a TDoA arrival at all?
+
+        Both predicates, and no shortcut: a receiver with an excellent clock and an unmeasured
+        audio path is refused, because the error it would inject is exactly the kind this array's
+        geometry cannot detect.
+        """
+        return self.clock_admissible() and self.capture_bias_bounded()
+
+    # ---- the same budget, per DETECTION ------------------------------------------------------
+    # ⚠️WHY A CLASS-WIDE t_sigma_s IS NOT THE WHOLE ANSWER ANY MORE. `t_sigma_s` says what this
+    # hardware is worth when it is WORKING. A xiao-s3-pps whose GPS UART has died keeps stamping
+    # from a frozen PPS anchor -- `time_valid` latches true at the first NAV-PVT and the firmware
+    # never clears it -- and free-runs on the ESP crystal at a MEASURED 4.2 to 11.7 ppm
+    # (health.csv archives, three nodes, 461 windows of >= 300 s, 2026-09-10). That is ~30 ms per
+    # hour of silently wrong stamp on a class whose declared sigma is 100 us, and no class-wide
+    # constant can express it because it is a property of one detection's anchor age, not of the
+    # part number. The firmware now states it per row as dets.csv `sync_sigma_ns`; these three
+    # methods are where that statement meets this budget.
+    def stamp_t_sigma_s(self, sync_sigma_ns: Optional[float]) -> float:
+        """This class's random timestamp sigma for ONE detection, given the producer's own
+        statement about its clock, seconds.
+
+        ⚠️A STATEMENT REPLACES THE CLOCK TERM, IT DOES NOT ADD TO IT. `sync_sigma_ns` is the
+        1-sigma error of the producer's clock-to-UTC anchor and NOTHING ELSE -- the firmware says
+        so where it computes it ("⚠️CLOCK ONLY ... hear/nodeclass.py combines this with the
+        class's capture terms", firmware/hear_node/hear_node.ino:1284-1288) and docs/timing.md:63
+        repeats it for the phone side. So the honest combination is the statement RSS'd with the
+        class's CAPTURE terms, which `capture_sigma_s` is.
+
+        ⚠️THIS USED TO RSS THE STATEMENT WITH THE WHOLE `t_sigma_s`, AND FOR A PHONE THAT ERASED
+        IT. Charging the clock twice costs a node almost nothing -- for xiao-s3-pps, whose
+        `clock_sigma_s` is undeclared and which therefore still gets exactly that arithmetic,
+        100 us RSS 25 us is 103.1 us. For `gotchi-phone` the class figure IS entirely clock, so
+        5000 us RSS the live fleet median of 106.4 us returned 5001.1 us: the statement moved the
+        answer by 0.023% and every one of 7,863 stated phone rows in the 2026-09-10 pool was
+        refused on a constant describing a tier none of them were running. Measured, both
+        numbers, on that corpus.
+
+        A `None` statement returns the class figure unchanged: not stated is not zero, and it is
+        also not a refusal here -- see `stamp_admissible`. An undeclared `clock_sigma_s` keeps
+        the old conservative double-count, so this change cannot loosen a class by omission.
+        """
+        if sync_sigma_ns is None:
+            return self.t_sigma_s
+        s = float(sync_sigma_ns) / 1e9
+        cap = self.capture_sigma_s
+        return math.sqrt(cap * cap + s * s)
+
+    def stamp_admissible(self, sync_sigma_ns: Optional[float]) -> Optional[bool]:
+        """Is ONE detection's timestamp inside the per-node arrival budget?
+
+        Three states, and the third is the one that occurs: None means the producer did not
+        state a clock sigma, which is every dets.csv row before generation G6 and every phone
+        payload with no `sync_sigma_ns`. None is NOT a refusal -- `associate.arrival_is_usable`
+        reads absent as usable by design, so a new field cannot retroactively delete history.
+
+        ⚠️THE CLASS FIGURE IS A FALLBACK IN THE CLOCK DIMENSION AND A FLOOR IN THE CAPTURE ONE.
+        It is NOT a ceiling, and it used to be: this method short-circuited on
+        `clock_admissible()`, a test of the CLASS `t_sigma_s`, before it read the statement at
+        all. That made the whole per-detection budget unreachable for any class whose class
+        figure is over the bound -- which is every class the statement was built for, because a
+        class inside the bound does not need rescuing. `max_stated_clock_sigma_s` returned 0.0
+        for `gotchi-phone`: there was no number a phone could state that would have been read.
+
+        The capture terms stay charged whatever is stated, because `sync_sigma_ns` does not
+        measure them. The one string test that survives is `time_source "none"`: with nothing
+        disciplining the clock to UTC there is no anchor for a stated anchor-error to describe,
+        so the statement is not a measurement and cannot be believed. That is a property of the
+        producer, not a threshold, which is why it is not a ceiling either.
+        """
+        if sync_sigma_ns is None:
+            return None
+        if self.time_source == "none":
+            return False
+        return self.stamp_t_sigma_s(sync_sigma_ns) <= ARRIVAL_T_SIGMA_MAX_S
+
+    def stamp_refusal(self, sync_sigma_ns: Optional[float],
+                      c_mps: float = _C_NOMINAL_MPS) -> Optional[str]:
+        """Why this detection's stamp is not an arrival ON ITS CLOCK, with the numbers in it.
+
+        ⚠️THE CLOCK VERDICT ONLY. A receiver refused here and a receiver refused by
+        `bias_refusal` need different people to fix different hardware, and the two must stay
+        legible as two -- see that method.
+        """
+        if self.stamp_admissible(sync_sigma_ns) is not False:
+            return None
+        if self.time_source == "none":
+            return ("nothing disciplines its clock to UTC (time_source \"none\"), so the "
+                    "%.1f us it states is not a measurement of a synchronised clock"
+                    % (float(sync_sigma_ns) / 1e3,))
+        tot = self.stamp_t_sigma_s(sync_sigma_ns)
+        return ("the producer states a clock sigma of %.1f us, which against class %r's own "
+                "%.1f us of CAPTURE terms gives a per-detection t_sigma of %.1f us = %.3f m of "
+                "range, over the %.1f us per-node bound"
+                % (float(sync_sigma_ns) / 1e3, self.name, self.capture_sigma_s * 1e6,
+                   tot * 1e6, tot * float(c_mps), ARRIVAL_T_SIGMA_MAX_S * 1e6))
+
+    def bias_refusal(self, c_mps: float = _C_NOMINAL_MPS) -> Optional[str]:
+        """Why this class's CAPTURE PATH is not an arrival source, or None if it is fine.
+
+        ⚠️SEPARATE FROM THE CLOCK VERDICT AND IT MUST STAY SEPARATE. Weighting handles variance;
+        it does not handle bias. A stated `sync_sigma_ns` says how much this receiver's stamps
+        SCATTER, and a solver can widen that receiver's contribution accordingly. An uncorrected
+        capture-path delay is not scatter: it moves that receiver's range by a fixed amount, in
+        one direction, on every event, and no weight removes it -- it relocates the fit instead
+        of widening it. So a phone can pass the clock verdict on its own stated sigma and must
+        still be refused here until tools/hear_latency_cal.py has measured its path against a
+        co-located PPS node. Two gates, two messages, and an operator who reads the second one
+        knows the receiver is one CALIBRATION away rather than unusable.
+        """
+        if self.path_bias_s is None:
+            return ("its capture-path delay has NEVER BEEN MEASURED (path_bias_s is None). A "
+                    "bias does not average down and is invisible in a 3-node exactly-determined "
+                    "fit, whose residual is identically zero by construction, so it cannot be "
+                    "discovered later -- it has to be measured against an external reference "
+                    "first")
+        if self.path_bias_s > ARRIVAL_PATH_BIAS_MAX_S:
+            return ("its uncorrected capture-path delay %.1f us = %.3f m of range exceeds the "
+                    "%.1f us per-node bound (%.0f us one-way budget / 2, because two biases can "
+                    "add). This is a BIAS, not scatter: no per-detection weight removes it"
+                    % (self.path_bias_s * 1e6, self.path_bias_m(c_mps),
+                       ARRIVAL_PATH_BIAS_MAX_S * 1e6, ARRIVAL_ONE_WAY_BUDGET_S * 1e6))
+        return None
+
+    def max_stated_clock_sigma_s(self) -> float:
+        """The largest `sync_sigma_ns` (as seconds) this class may state and still be admitted.
+
+        `sqrt(budget**2 - capture_sigma_s**2)`, i.e. the inverse of `stamp_t_sigma_s`. 0.0 for a
+        class whose CAPTURE terms alone are already over the bound -- there is no statement that
+        rescues that -- and 0.0 for `time_source "none"`, where no statement is believed at all.
+        Exported so a firmware author can see what the wire number is being spent against
+        without re-deriving the algebra: 82.1 us for xiao-s3-pps today.
+
+        ⚠️IT IS NO LONGER GATED ON `clock_admissible()`. That made it return 0.0 for exactly the
+        classes a statement exists to rescue, and a firmware author reading 0.0 would have
+        concluded, wrongly, that the field was not worth sending.
+        """
+        if self.time_source == "none":
+            return 0.0
+        return math.sqrt(max(0.0, ARRIVAL_T_SIGMA_MAX_S ** 2 - self.capture_sigma_s ** 2))
 
     def __repr__(self) -> str:
         lo, hi, lim = self.usable_band_hz()
-        return ("NodeClass(%s, %s, t_sigma=%.0f us = %.2f m, %d mic, %.0f-%.0f Hz [%s])"
+        bias = ("bias unmeasured" if self.path_bias_s is None
+                else "bias %.0f us" % (self.path_bias_s * 1e6,))
+        return ("NodeClass(%s, %s, t_sigma=%.0f us = %.2f m, %s, %d mic, %.0f-%.0f Hz [%s])"
                 % (self.name, self.time_source, self.t_sigma_s * 1e6,
-                   self.range_sigma_m(), self.mic_count, lo, hi, lim))
+                   self.range_sigma_m(), bias, self.mic_count, lo, hi, lim))
 
 
 # ---------------------------------------------------------------- the registry
@@ -143,25 +486,81 @@ register(NodeClass(
     name="xiao-s3-pps",
     time_source="gps_pps",
     # MEASURED on nyquist over the 2026-09-07 11.33 h capture: GPS tAcc 22-26 ns, PPS interval
-    # spread 10-15 us, zero glitches in 40825 edges. The dominant term is NOT the GPS -- it is the
-    # 256-sample I2S block, which the firmware back-dates but only to about one sample. 100 us is
-    # a deliberately conservative round number above the parts that have been measured; it has
-    # never been checked against an external reference because the node has no second clock.
+    # spread 10-15 us, zero glitches in 40825 edges. Re-checked live on all three nodes
+    # 2026-09-10 22:09 UTC: tAcc 28/31/38 ns and PPS spread 20/14/46 us (mach/nyquist/rankine),
+    # zero glitches on all three. The dominant term is NOT the GPS -- it is the 256-sample I2S
+    # block, which the firmware back-dates but only to about one sample. 100 us is a deliberately
+    # conservative round number above the parts that have been measured; it has never been checked
+    # against an external reference because the node has no second clock.
+    #
+    # ⚠️THE BUDGET HOLDS ON THE DETECTION PATH AND USED TO FAIL BY 11x ON THE RAW-RING PATH.
+    # Termwise RSS for a dets.csv arrival, 2026-09-08: GPS tAcc 0.02 us, PPS spread/2 5.00 us,
+    # esp_timer between anchors 12.20 us (9.5-12.2 ppm vs GPS, re-zeroed every PPS second),
+    # I2S block-quantisation residual ~1 sample 62.47 us, fs_clean back-date differential
+    # 8.90 us -> 64.47 us = 22.1 mm. It fits, and the term that dominates it is the one this
+    # comment already named. Recomputed with rankine's worse live spread (46 us, so spread/2 =
+    # 23 us) it is 68.3 us -- still inside 100 us, so the constant covers the worst of the three.
+    #
+    # The RING is a different path and was NOT inside this number. sample_to_utc interpolates
+    # from the nearest PPS mark with fs_clean as the slope, and fs_clean is block-quantised to
+    # 16000/win_s ppm, so two nodes 1118 ppm apart carried 1118 us = 0.384 m of differential
+    # error at the far end of a one-second mark gap, and a full 30 s /audio window pulled from
+    # both differed by 33-41 ms = 11-14 m. Round-tripping through X-Audio-From-Utc-Us does not
+    # help: the node computes it with the same wrong slope. The firmware now refuses to use
+    # fs_clean as a timebase until its window supports 100 ppm (FS_TIMEBASE_MIN_WIN_S = 160 s,
+    # derived from THIS constant -- tests/test_firmware_timebase.py holds the two together), and
+    # falls back to the nominal rate below that, which is wrong identically on every node and
+    # cancels in a TDoA. See docs/timing.md for the full budget and what is still open.
     t_sigma_s=100e-6,
+    # ⚠️`clock_sigma_s` IS DELIBERATELY NOT DECLARED HERE, AND THE OMISSION IS THE CONSERVATIVE
+    # ANSWER. The clock terms of the budget above are GPS tAcc 0.02 us, PPS spread/2 5.00 us and
+    # esp_timer between anchors 12.20 us -- 13.18 us RSS'd -- so declaring it would drop this
+    # class's capture figure from 100.0 us to 99.13 us and RAISE `max_stated_clock_sigma_s` from
+    # 82.1 us to 83.2 us. That is a 1.3% LOOSENING bought by transplanting three numbers out of
+    # docs/timing.md into this file, where nothing else reads them and nothing keeps them in step
+    # with it. The double-count it avoids is worth 0.8 us on a 100 us budget (100.0 RSS 25.0 is
+    # 103.08; 99.13 RSS 25.0 is 102.23). Nothing needs that 0.8 us, so the transplant is not
+    # bought. The phone entry below is a different case entirely: its class figure is 100% clock
+    # by its own comment, so declaring the split there is transcription, not transplant.
+    # THE CAPTURE PATH IS CORRECTED, WHICH IS WHY THIS CLASS PASSES THE BIAS PREDICATE AND THE
+    # OTHERS DO NOT. docs/timing.md, "The two paths, which are not the same path": the detection
+    # timestamp is `utc = local_to_utc(esp_timer_get_time() - back_us)` with
+    # `back_us = (n-1-i)*1e6/fs_clean`, which moves the stamp back off the block boundary onto the
+    # sample that actually carried the peak. The DMA block delay is subtracted rather than carried,
+    # and what is left is the quantisation of that correction: one sample period, 1/16000 =
+    # 62.5 us, matching the 62.47 us the timing budget measures for the same term.
+    #
+    # ⚠️THIS IS DELIBERATELY DOUBLE-COUNTED. The same 62.47 us is already one of the RSS terms
+    # inside t_sigma_s above. Charging it again here is the conservative direction for a gate and
+    # is cheaper than arguing about which half of it is random.
+    #
+    # ⚠️WHAT IS NOT IN IT: the PDM microphone's own decimation-filter group delay, which nothing in
+    # this repo has measured. It is identical on every node of this class, so it cancels in a
+    # xiao-to-xiao TDoA and this array has never seen it -- and it would NOT cancel against a
+    # receiver of any other class. A fourth receiver of a different class needs that number
+    # measured on BOTH sides, not just on its own.
+    path_bias_s=1.0 / 16000.0,
     mic_count=1,
-    fs_hz=16000.0,
-    # The XIAO's onboard PDM MEMS part. The low edge is where the firmware's DC block sits (1.6 Hz)
-    # and the high edge is well above Nyquist, so Nyquist is what binds -- usable_band_hz() says so.
+    fs_hz=48000.0,
+    # The XIAO's onboard PDM MEMS part. The low edge is where the firmware's DC block sits (1.6 Hz);
+    # the datasheet's response ends at 10 kHz, so at 48 kHz the microphone binds, not Nyquist.
     band_hz=(50.0, 10000.0),
     env=("temp", "press"),
-    raw_retain_s=240.0,
-    notes="XIAO ESP32-S3 Sense + u-blox GPS on D0 PPS + BMP280 + microSD. nyquist, mach.",
+    raw_retain_s=60.0,   # measured on all three nodes; 80 s only if 7.94 MB of PSRAM is contiguous
+    notes="XIAO ESP32-S3 Sense + u-blox GPS on D0 PPS + BMP280 + microSD. nyquist, mach, rankine "
+          "-- all three answered GET /status with this class 2026-09-10.",
 ))
 
 register(NodeClass(
     name="xiao-s3-i2s",
     time_source="gps_pps",
     t_sigma_s=100e-6,
+    # NOT BUILT, so nothing has been measured through it. The back-date argument that earns
+    # xiao-s3-pps its number is about firmware this variant does not yet run, on hardware that
+    # does not yet exist, and inheriting a measurement across a change of microphone technology
+    # (PDM to I2S: different decimation, different group delay) is exactly the transplant that
+    # makes a constant wrong while it still looks right. None until someone measures it.
+    path_bias_s=None,
     mic_count=1,
     fs_hz=48000.0,
     # ICS-43434, docs/node-hardware.md "What the ICS-43434 can and cannot do": 50 Hz - 15 kHz,
@@ -170,31 +569,61 @@ register(NodeClass(
     band_hz=(50.0, 15000.0),
     env=("temp", "press"),
     raw_retain_s=80.0,   # same PSRAM budget, three times the rate
-    notes="Planned I2S variant. Not built. Bandwidth-limited by the part, not by the sample rate.",
+    notes="Planned I2S variant. Not built. Bandwidth-limited by the part, not by the sample rate. "
+          "Refused for arrivals ONLY because its capture path has never been measured; its clock "
+          "budget would pass.",
 ))
 
 register(NodeClass(
     name="puc-pps",
     time_source="gps_pps",
     # PROVISIONAL. Same order as the XIAO nodes IF the GPS PPS reaches a GPIO -- unverified, and
-    # the single fact that decides whether this class exists at all. See docs/node-classes.md.
+    # the single fact that decides whether this class exists at all. (An earlier revision pointed
+    # at docs/node-classes.md for this; `git log --all -- docs/node-classes.md` is empty, so that
+    # file has never existed in this repo. What would settle it is a scope on the PUC's ESP32-S3
+    # or a teardown, and neither has been done.)
     t_sigma_s=100e-6,
+    # ⚠️THIS CLASS USED TO BE ADMITTED AS AN ARRIVAL SOURCE AND IS NOT ANY MORE. Nothing about the
+    # hardware changed; the gate stopped taking a class's word for it. The PUC is closed firmware
+    # whose audio path nobody here has instrumented, so its capture delay is unmeasured -- and
+    # under the old string test that fact could not be expressed, because "gps_pps" alone let it
+    # through. Admitting it would have put an unknown constant offset into a solve whose residual
+    # is identically zero by construction. Measure the PUC's path against a co-located
+    # xiao-s3-pps -- tools/hear_latency_cal.py already does exactly this subtraction for phones --
+    # and put the number here.
+    path_bias_s=None,
     mic_count=2,
     fs_hz=48000.0,
     band_hz=(50.0, 15000.0),
     env=("temp", "humidity", "press", "voc", "co2", "light"),
     raw_retain_s=0.0,
     notes="BirdWeather PUC, IF its GPS PPS is wired to the ESP32-S3. UNVERIFIED -- do not survey a "
-          "PUC as this class until a scope or a teardown confirms the PPS pin.",
+          "PUC as this class until a scope or a teardown confirms the PPS pin, and do not expect "
+          "arrivals from it until its capture-path delay is measured.",
 ))
 
 register(NodeClass(
     name="puc-ntp",
     time_source="ntp",
     # dama-gotchi's GPSTimingSync docstring claims 1-5 ms cross-device sync for the same class of
-    # (UTC, monotonic) anchoring. 3 ms is the middle of that, and it is 1.0 m of range. This class
-    # is admissible for classification and environment and is REFUSED for arrivals.
+    # (UTC, monotonic) anchoring. 3 ms is the middle of that, and it is 1.0 m of range -- 23x the
+    # 129.4 us per-node clock bound. This class is admissible for classification and environment
+    # and is REFUSED for arrivals.
+    #
+    # ⚠️NOTE WHAT CHANGED AND WHAT DID NOT. The refusal no longer depends on the word "ntp". If a
+    # PUC were disciplined by NTP to a MEASURED tens of microseconds -- which PTP, or a LAN-local
+    # chrony source, genuinely can do -- the clock predicate would admit it, and it would still
+    # need its capture path measured before it produced an arrival. The old test refused this
+    # class for its label. This one refuses it for its 3 ms.
     t_sigma_s=3e-3,
+    # ENTIRELY CLOCK: the 3 ms above is a cross-device SYNC figure and contains no capture term,
+    # so a PUC that ever states a `sync_sigma_ns` is judged on that statement and not on this
+    # constant. It changes nothing today -- the PUC's capture path is unmeasured, so
+    # `bias_refusal` refuses it whatever its clock says -- and it is written down because the
+    # alternative is a reader concluding from `max_stated_clock_sigma_s() == 0` that the field is
+    # not worth sending from a PUC.
+    clock_sigma_s=3e-3,
+    path_bias_s=None,
     mic_count=2,
     fs_hz=48000.0,
     band_hz=(50.0, 15000.0),
@@ -206,46 +635,247 @@ register(NodeClass(
 
 
 register(NodeClass(
-    name="gotchi-phone",
-    time_source="none",
-    # NOT "ntp". The phone HAS a good clock -- GPSTimingSync anchors (UTC, CLOCK_BOOTTIME) at each
-    # GPS fix and claims 1-5 ms, which would be a usable NTP-class node. The problem is upstream of
-    # the clock: the audio path never asks it what time it is.
-    #
-    # AcousticAntCollector.java:240 takes System.nanoTime() AFTER record.read() returns and calls
-    # that the event time. Read as an arrival, that number carries:
-    #
-    #   hop quantisation        HOP_SIZE 1024 @ 44100 Hz = 23.2 ms, one stamp for the whole chunk
-    #                           -> 6.7 ms sd and an 11.6 ms bias, before anything else
-    #   AudioRecord buffering   max(minBuf, 8192 B) = 4096 frames = 92.9 ms of slack
-    #   Android input HAL       20-100 ms, device-specific, NEVER MEASURED on this fleet
-    #   ---------------------------------------------------------------------------------
-    #   about 25 ms of scatter on about 70 ms of per-device BIAS = 8.6 m on 24.6 m
-    #
-    # The bias is the disqualifying part. Scatter averages down over events; a constant per-device
-    # offset does not, and in TDoA it moves that node's range by 24.6 m -- half again the entire
-    # nyquist-mach baseline. It is also invisible: it shifts the answer without touching the
-    # residual in a 3-node exactly-determined fit.
-    #
-    # Two further facts, both from the source:
-    #   - AudioRecord.getTimestamp() is never called anywhere in the app. GPSTimingSync's own
-    #     docstring names it as the intended input and nothing uses it.
-    #   - The impulse callback DISCARDS the timestamp it is handed:
-    #     DeviceMetricsPoller.java:869 is `(peakDb, riseDb, ns) -> takAcou.onAcousticImpulse(
-    #     peakDb, riseDb)`. There is no arrival time leaving the phone today at all.
-    #   - No raw PCM is retained, so cross-correlation against a node is not possible either --
-    #     only onsets, and onsets are what the timestamp problem ruins.
-    t_sigma_s=25.1e-3,
+    name="esp32s3-i2s-gps",
+    time_source="gps_pps",
+    # NOT MEASURED ON THIS BOARD. firmware/boards/esp32s3_i2s_gps.h: PMTK GPS with 1PPS on GPIO4
+    # and one ICS-43434-class I2S microphone acquired at 48 kHz, no card and no barometer. The
+    # 100 us is the same unmeasured figure xiao-s3-i2s carries, not a number anyone took here.
+    t_sigma_s=100e-6,
+    # None: the I2S capture path has never been measured against a xiao-s3-pps, and a PDM-to-I2S
+    # change is exactly the offset that does not cancel across classes. Refused until measured.
+    path_bias_s=None,
     mic_count=1,
-    fs_hz=44100.0,
+    fs_hz=48000.0,
+    band_hz=(50.0, 15000.0),
+    env=(),
+    raw_retain_s=0.0,
+    notes="Minimal ESP32-S3 + PMTK GPS/1PPS + I2S mic and NO SD card, so detections come from "
+          "/detections only. gold, ageev, kasami answered /status with this class 2026-09-13. "
+          "Refused for arrivals ONLY because its capture path has never been measured; "
+          "positioned from its own GPS mean when it has no survey entry.",
+))
+
+register(NodeClass(
+    name="gotchi-phone",
+    time_source="ntp",
+    # ⚠️THIS ENTRY WAS SUBSTANTIALLY STALE AND IS REWRITTEN AGAINST THE SOURCE, 2026-09-10. It used
+    # to declare time_source "none" on the grounds that "the audio path never asks the clock what
+    # time it is", cite 44100 Hz, cite System.nanoTime(), and conclude "There is no arrival time
+    # leaving the phone today at all". Every one of those is now false. Checked in
+    # /home/rjmendez/dama-gotchi:
+    #
+    #   fs                  AcousticAntCollector.java:56 SAMPLE_RATE = 48_000, not 44100. The old
+    #                       "HOP_SIZE 1024 @ 44100 Hz = 23.2 ms" arithmetic was on the wrong rate
+    #                       (1024/48000 is 21.33 ms) and is no longer what dates an onset anyway.
+    #   HAL anchor          AcousticRangingCollector.kt:3142 calls
+    #                       `rec.getTimestamp(ts, AudioTimestamp.TIMEBASE_BOOTTIME)` and anchors
+    #                       the capture ring's frame axis on it (capAnchorFrame / capAnchorBootNs,
+    #                       :3144-3146). AcousticAntCollector consumes it through setFrameClock
+    #                       (:904), wired at DeviceMetricsPoller.java:1689. The old claim
+    #                       "AudioRecord.getTimestamp() is never called anywhere in the app" is
+    #                       false.
+    #   clock               feedSamples (:906-916) stamps on SystemClock.elapsedRealtimeNanos(),
+    #                       CLOCK_BOOTTIME -- nanoTime() was removed because it stops advancing in
+    #                       deep sleep. GPSTimingSync.java:45 pins the "location" tier at 5 ms.
+    #   arrival on the wire DeviceMetricsPoller.java:1588 installs a FIVE-argument impulse callback
+    #                       `(peakDb, riseDb, ns, sigmaNs, clipFrac)` and passes all five to
+    #                       AcousticEnvRecorder.noteImpulse. Only the TAK/CoT branch drops `ns`,
+    #                       and a CoT detection is not an arrival. The sketch payload carries
+    #                       onset_offset_us, onset_dated, onset_found, clock_tier and
+    #                       sync_sigma_ns, and hear/pool.py reads all five into the pool record.
+    #   raw PCM             AudioCaptureRing of CAPTURE_RING_SAMPLES = ROUND_SAMPLES*8 = 384000 at
+    #                       48 kHz = 8.0 s (AcousticRangingCollector.kt:258, :2910), served by
+    #                       AudioPullResponder (:2986) on dama/colony/audio/pull. The old claim
+    #                       "no raw PCM is retained, so cross-correlation against a node is not
+    #                       possible either" is false -- and cross-correlation is the obvious way
+    #                       to measure the bias below.
+    #
+    # t_sigma_s is now the CLOCK term and only the clock term: GPSTimingSync's own location-tier
+    # figure, LOCATION_TIER_SIGMA_NS = 5_000_000 ns (GPSTimingSync.java:45), mirrored in
+    # dama-gotchi/sensors/tdoa_triangulation.py's TIER_DEFAULT_SIGMA_NS. 5 ms is 1.7 m and 39x the
+    # 129.4 us bound, so the phone is still refused on its clock -- but by a number it publishes
+    # itself in sync_sigma_ns, so a phone that ever reports better is not held back by this
+    # entry's history.
+    t_sigma_s=5e-3,
+    # ⚠️ALL OF IT IS CLOCK, WHICH IS WHY THE 5 ms ABOVE IS A FALLBACK AND NOT A VERDICT. The
+    # comment above already says so -- "t_sigma_s is now the CLOCK term and only the clock term"
+    # -- and writing it into the model is what stops `stamp_t_sigma_s` RSSing a stated 106 us
+    # with it and handing back 5001 us. Measured on the 2026-09-10 pool: 7,863 phone rows state a
+    # sigma, median 106.4 us = 0.037 m, 82.9% of them inside the 129.4 us per-node bound, and
+    # under the old arithmetic every single one was refused. 8,800 of 9,480 rows are clock_tier
+    # "gnss"; the 5 ms is GPSTimingSync's "location" tier, which is not the tier these devices run.
+    #
+    # ⚠️THE CONSEQUENCE IS capture_sigma_s == 0, AND THAT IS A GAP, NOT A MEASUREMENT. It says the
+    # handset's audio path contributes no RANDOM jitter, which nobody has measured and which no
+    # hardware supports. It is not load-bearing today and must not be allowed to become so
+    # quietly: no phone arrival can reach a solver while `path_bias_s` below is over the bias
+    # bound, and the tool that lifts that -- tools/hear_latency_cal.py, against a co-located PPS
+    # node -- is the same tool that would produce the scatter. ⚠️WHOEVER FILLS IN path_bias_s
+    # FROM A CALIBRATION RUN MUST FILL IN THE SCATTER OF THAT RUN HERE IN THE SAME COMMIT, or the
+    # phone is admitted carrying an unmeasured capture term at weight zero.
+    clock_sigma_s=5e-3,
+    # THE DISQUALIFYING TERM, AND THE ONE THIS FILE EXISTS TO NAME.
+    # dama-gotchi/android/app/src/main/assets/acoustic_latency_calibration.json, read 2026-09-10:
+    #     myasshurts-9669aa0e         13_122_000 ns = 13.122 ms
+    #     financialdistress-a4a491b0 293_499_000 ns = 293.499 ms
+    #     by_model                    {}
+    # Three phones, two entries, and the second is past the app's own
+    # MAX_PLAUSIBLE_LATENCY_OFFSET_NS = 100 ms, so it is refused on-device and never applied. With
+    # by_model empty the model fallback cannot fire either, so two of three phones apply NO
+    # correction at all and carry their whole path delay into every arrival.
+    #
+    # 13.122 ms is therefore the BEST of the fleet and not the typical one, and even that best
+    # case is 4.50 m of range: 143x the 91.5 us bias bound. It is stated here rather than left as
+    # None because it is a real measurement, and a refusal that quotes a measured 4.50 m is worth
+    # more than one that says "unknown". tools/hear_latency_cal.py is the tool that produces these
+    # numbers from a co-located PPS node, and its own warning applies -- the co-location is the
+    # operator's assumption, and every metre of separation is 2.9 ms of pure bias in the answer.
+    path_bias_s=13.122e-3,
+    mic_count=1,
+    fs_hz=48000.0,
+    # UNSOURCED, inherited from the previous revision of this entry: no datasheet for the handset
+    # MEMS parts has been consulted and no sweep has been run. At 48 kHz Nyquist is 24 kHz, so
+    # this bound is what usable_band_hz() reports, and it is the one figure in this class that
+    # nobody has checked.
     band_hz=(50.0, 20000.0),
     env=("temp", "press"),
-    raw_retain_s=0.0,
-    notes="dama-gotchi Android node. EXCELLENT sensor platform and a good clock; the audio path "
-          "does not use either. Refused for arrivals until AcousticAntCollector stamps frames "
-          "with AudioRecord.getTimestamp() converted through GPSTimingSync.toUtcMs(), and the "
-          "impulse callback stops dropping the timestamp. Fixed, it would be ~2.8 ms (0.98 m).",
+    raw_retain_s=8.0,
+    notes="dama-gotchi Android node. EXCELLENT sensor platform: a 48 kHz microphone wider than any "
+          "XIAO node, an 8 s raw ring it will serve on request, a HAL-anchored frame axis and an "
+          "onset that reaches the pool. Refused for arrivals on ONE count now: the uncorrected "
+          "13.1 ms capture-path latency on the BEST of three devices, 4.50 m of pure bias that no "
+          "weight removes. The 5 ms clock above is the fallback for a detection that states "
+          "nothing, and the live devices state ~106 us per row on clock_tier \"gnss\" -- they "
+          "clear the clock gate on their own numbers. Run tools/hear_latency_cal.py against a "
+          "co-located PPS node and this class becomes an arrival source.",
 ))
+
+
+register(NodeClass(
+    name="hugbot-array",
+    time_source="ntp",
+    # ⚠️HUGBOT IS NOT AN ARRIVAL SOURCE. measured live 2026-09-10 over the acoustic latency
+    # calibration rig (tools/hugbot_latency.py, testdata/hugbot_latency_trials.json):
+    # A Raspberry Pi 4 running the dama-gotchi orchestrator stack, with a 16-channel TDM I2S
+    # microphone array (ICS-52000 MEMS mics) on GPIO20/21 I2S at 48 kHz. The measurement caught
+    # one aligned channel (board 0, column 3) across 20 trials where both the hugbot and a
+    # co-located xiao-s3-pps ESP32 node played and recorded the same Chirp impulse. The latency
+    # between the ESP tap and the hugbot ring was 178.5 ms ± 11.3 ms. This is not a CLOCK issue --
+    # the Pi running chrony is near a PPS/GPS source on the mast and would pass the t_sigma gate
+    # if it had one. The latency is the AUDIO PATH: Bluetooth-connected USB audio card, ALSA ring
+    # buffer, DMA block boundaries, and the Android emulator + dama-gotchi stack. 178.5 ms is
+    # 61.2 m of pure bias; the arrival budget allows 91.5 us (31.4 mm). Hugbot is refused by a
+    # factor of nearly 2000x.
+    #
+    # That is conservative and it is the honest number: the Pi's local time is Stratum 3 at best,
+    # worse than the ntp-NTP figure below. But the real problem is the audio path, which will never
+    # align in a TDoA no matter how good the clock is.
+    #
+    # ⚠️BUT HUGBOT IS AN EXCELLENT SENSOR NODE. A 16-mic array beats any single-mic node on
+    # classification, direction finding, and bearing. The firmware reads the ring and ships snapshots
+    # to a pool, dama-gotchi processes them into tags, and those tags and raw audio are how hugbot
+    # contributes. It is excluded from arrivals; it is not excluded from the pool.
+    t_sigma_s=3e-3,  # Stratum 3 NTP / system time
+    # The entire budget is clock and no capture term has been measured to split it.
+    clock_sigma_s=3e-3,
+    # THE DISQUALIFYING TERM: hugbot's AUDIO PATH LATENCY. Measured and unmeasured variants both
+    # refuse it: the best-aligned board carried 178.5 ms = 61.2 m of bias, 670x over the 91.5 us
+    # (31.4 mm) bound. Even if that channel's per-trial scatter (11.3 ms = 3.88 m) is called a
+    # capture sigma, it is still a bias that does not average. The second board had no alignment at
+    # all (rho < 0.9), so the spread across boards exceeded the array's ability to explain it.
+    # A hugbot array measuring itself against itself might bridge that gap; against an ESP32 node
+    # it does not.
+    path_bias_s=0.1784917,
+    mic_count=16,
+    fs_hz=48000.0,
+    # Nyquist at 48 kHz is 24 kHz; the ICS-52000 datasheet (docs/node-hardware.md, HUGBOT5000 section)
+    # and the 3D mic array spec (docs/MIC_ARRAY_3D.md) do not state a lower edge. Empirically it is
+    # around 50 Hz. The datasheet says "low-passed above 24 kHz, NO ultrasonic content at any
+    # sample rate" which matches xiao-s3-i2s.
+    band_hz=(50.0, 24000.0),
+    env=("temp",),  # Pi ambient temp only; no HAL-anchored sensor suite
+    raw_retain_s=0.0,  # Audio is served on-demand by dama-gotchi, not retained locally
+    notes="Raspberry Pi 4 running dama-gotchi with 16-channel TDM I2S microphone array "
+          "(ICS-52000 MEMS mics). EXCELLENT platform for classification and bearing: 16 mics "
+          "for 3D DoA, low noise floor, 8+ s ring in dama-gotchi's memory for calibration and "
+          "training. Refused for arrivals on ONE count only: the 178.5 ms uncorrected audio-path "
+          "latency measured live 2026-09-10 against a co-located xiao-s3-pps, 61.2 m of pure bias "
+          "that no weight removes (1951x over the 31.4 mm arrival bias budget). The clock (Stratum "
+          "3 NTP at best) would ALSO refuse it by 87x on random sigma, but the audio path is the "
+          "load-bearing refusal.",
+))
+
+
+def strictest_arrival_class() -> NodeClass:
+    """The admissible class with the LEAST room for a stated clock sigma.
+
+    Used where a receiver's class is not stated, which on this array is every receiver: the
+    shipped survey.json names no `class` on any node, and `Survey.arrival_ids()` admits an
+    unstated class by design. A gate that needed the class to be declared would therefore be
+    dead code in production -- that is how the per-detection budget below would have shipped
+    doing nothing at all.
+
+    `min` over `max_stated_clock_sigma_s`, so adding a class can only ever TIGHTEN the fallback.
+    Classes that are not arrival sources at all are excluded: their headroom is 0 and using them
+    would refuse every stated sigma on every unclassed node.
+    """
+    adm = [c for c in CLASSES.values() if c.contributes_arrival()]
+    if not adm:
+        raise CapabilityError("no registered class is an arrival source, so there is no budget "
+                              "an unclassed receiver could be held to")
+    return min(adm, key=lambda c: c.max_stated_clock_sigma_s())
+
+
+def _stamp_class(class_name: Optional[str]) -> NodeClass:
+    """The class to charge a stated sigma against. Unstated or unrecognised -> the strictest."""
+    c = CLASSES.get(class_name or "")
+    return c if c is not None else strictest_arrival_class()
+
+
+def stamp_admissible(sync_sigma_ns: Optional[float],
+                     class_name: Optional[str] = None) -> Optional[bool]:
+    """Is ONE detection's stamp inside the per-node arrival budget? None = the producer did not
+    state a sigma, which every dets.csv row before generation G6 does not."""
+    return _stamp_class(class_name).stamp_admissible(sync_sigma_ns)
+
+
+def stamp_refusal(sync_sigma_ns: Optional[float], class_name: Optional[str] = None,
+                  c_mps: float = _C_NOMINAL_MPS) -> Optional[str]:
+    """Why that stamp is not an arrival, with the numbers in it, or None."""
+    cls = _stamp_class(class_name)
+    why = cls.stamp_refusal(sync_sigma_ns, c_mps)
+    if why is None or class_name in CLASSES:
+        return why
+    return ("%s (the receiver's class is unstated, so the strictest arrival class is charged)"
+            % why)
+
+
+def stamp_t_sigma_s(sync_sigma_ns: Optional[float],
+                    class_name: Optional[str] = None) -> float:
+    """ONE detection's total random timestamp sigma, SECONDS -- the number a solver weights on.
+
+    ⚠️SECONDS, WHERE THE WIRE AND THE POOL CARRY NANOSECONDS. `sync_sigma_ns` is nanoseconds
+    everywhere it is produced (dets.csv, the phone sketch payload, hear/pool.py, corpus.Record);
+    the ns -> s conversion happens HERE and once, because this is also where the class's capture
+    terms -- which are already seconds -- are RSS'd in. A caller that converted first and RSS'd
+    later would have to know the split, which is exactly what this module owns.
+
+    ⚠️THIS IS SCATTER AND NOT THE WHOLE COST. It says nothing about `path_bias_s`; see
+    `bias_refusal`. A solver handed this number is being told how much to WIDEN a receiver, which
+    is not a licence to admit one whose capture path was never measured.
+    """
+    return _stamp_class(class_name).stamp_t_sigma_s(sync_sigma_ns)
+
+
+def bias_refusal(class_name: Optional[str] = None,
+                 c_mps: float = _C_NOMINAL_MPS) -> Optional[str]:
+    """Why this receiver's CAPTURE PATH is not an arrival source, or None. Never the clock."""
+    cls = _stamp_class(class_name)
+    why = cls.bias_refusal(c_mps)
+    if why is None or class_name in CLASSES:
+        return why
+    return ("%s (the receiver's class is unstated, so the strictest arrival class is charged)"
+            % why)
 
 
 def get(name: str) -> NodeClass:
@@ -257,23 +887,27 @@ def get(name: str) -> NodeClass:
 
 
 # ---------------------------------------------------------------- the door
-def require_arrival(name: str, node_id=None) -> NodeClass:
+def require_arrival(name: str, node_id=None, c_mps: float = _C_NOMINAL_MPS) -> NodeClass:
     """Admit a class as a source of TDoA arrivals, or raise saying what it would have cost.
 
-    This is the function that makes the model worth having. A caller that skips it and averages an
-    NTP node into a PPS solve gets an answer with a plausible residual and a metre of common-mode
-    error, which no later check can find.
+    This is the function that makes the model worth having. A caller that skips it and averages a
+    millisecond-class receiver into a microsecond-class solve gets an answer with a plausible
+    residual and a metre of common-mode error, which no later check can find.
+
+    The message names EVERY failing predicate, not just the first. A receiver refused for its
+    clock is usually also unmeasured on its capture path, and reporting one at a time turns a
+    single fix into two round trips through the field.
     """
     cls = get(name)
-    if cls.contributes_arrival():
+    why = cls.arrival_refusals(c_mps)
+    if not why:
         return cls
     where = "" if node_id is None else " (node %r)" % (node_id,)
     raise CapabilityError(
-        "class %r%s is timed by %s, not by GPS PPS, so its timestamps are not TDoA arrivals: "
-        "t_sigma %.1f ms is %.2f m of range against a %s budget. Use it for classification, "
-        "bearing and environment instead."
-        % (cls.name, where, cls.time_source, cls.t_sigma_s * 1e3, cls.range_sigma_m(),
-           "183 us" ))
+        "class %r%s is not a source of TDoA arrivals, against a %.0f us one-way budget "
+        "(docs/node-hardware.md: one degree of unmeasured air temperature over 35 m): %s. "
+        "Use it for classification, bearing and environment instead."
+        % (cls.name, where, ARRIVAL_ONE_WAY_BUDGET_S * 1e6, "; ".join(why)))
 
 
 def require_band(name: str, f_lo_hz: float, f_hi_hz: float, node_id=None) -> NodeClass:
@@ -291,20 +925,47 @@ def require_band(name: str, f_lo_hz: float, f_hi_hz: float, node_id=None) -> Nod
 
 
 def timing_budget_m(names: Sequence[str], c_mps: float = _C_NOMINAL_MPS) -> Dict[str, float]:
-    """Per-class range error for a set of classes, so a mixed network's weakest link is visible
-    before it is averaged into an answer rather than after."""
+    """Per-class RANDOM range error for a set of classes, so a mixed network's weakest link is
+    visible before it is averaged into an answer rather than after.
+
+    ⚠️This is the sigma only. A class can score well here and still be inadmissible because its
+    capture-path bias is unmeasured, which is the error a residual cannot show -- see
+    arrival_budget_m() for both halves.
+    """
     return {n: get(n).range_sigma_m(c_mps) for n in dict.fromkeys(names)}
+
+
+def arrival_budget_m(names: Sequence[str],
+                     c_mps: float = _C_NOMINAL_MPS) -> Dict[str, Dict[str, Optional[float]]]:
+    """Both halves of each class's cost, in metres, plus whether it is admissible at all.
+
+    `bias_m` is None where the capture path was never measured. None is NOT zero and must not be
+    summed as if it were; a caller that wants one number out of this should refuse the class.
+    """
+    out: Dict[str, Dict[str, Optional[float]]] = {}
+    for n in dict.fromkeys(names):
+        c = get(n)
+        out[n] = {"sigma_m": c.range_sigma_m(c_mps),
+                  "bias_m": c.path_bias_m(c_mps),
+                  "admissible": c.contributes_arrival()}
+    return out
 
 
 def describe(names: Optional[Sequence[str]] = None) -> str:
     """A table for a human. Kept here so the refusal messages and the documentation cannot drift."""
     rows = [get(n) for n in (names if names is not None else sorted(CLASSES))]
-    out = ["%-14s %-9s %10s %8s %5s  %-18s %s"
-           % ("class", "time", "t_sigma", "range", "mics", "usable band", "notes")]
+    out = ["arrival gate: t_sigma <= %.1f us AND a MEASURED capture bias <= %.1f us "
+           "(%.0f us one-way budget, / sqrt(2) and / 2)"
+           % (ARRIVAL_T_SIGMA_MAX_S * 1e6, ARRIVAL_PATH_BIAS_MAX_S * 1e6,
+              ARRIVAL_ONE_WAY_BUDGET_S * 1e6),
+           "%-14s %-9s %10s %8s %11s %4s %5s  %-18s %s"
+           % ("class", "time", "t_sigma", "range", "bias", "arr", "mics", "usable band", "notes")]
     for c in rows:
         lo, hi, lim = c.usable_band_hz()
-        out.append("%-14s %-9s %8.1f us %6.2f m %5d  %6.0f-%-6.0f %-3s %s"
-                   % (c.name, c.time_source, c.t_sigma_s * 1e6, c.range_sigma_m(), c.mic_count,
+        bias = "unmeasured" if c.path_bias_s is None else "%8.1f us" % (c.path_bias_s * 1e6,)
+        out.append("%-14s %-9s %8.1f us %6.2f m %11s %4s %5d  %6.0f-%-6.0f %-3s %s"
+                   % (c.name, c.time_source, c.t_sigma_s * 1e6, c.range_sigma_m(), bias,
+                      "yes" if c.contributes_arrival() else "NO", c.mic_count,
                       lo, hi, lim[:3], c.notes))
     return "\n".join(out)
 

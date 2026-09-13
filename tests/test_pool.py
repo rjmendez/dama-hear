@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hear import detsfile as DF                                    # noqa: E402
 from hear import pool as P                                         # noqa: E402
 from hear import sketch as SK                                      # noqa: E402
+from hear import wire as WR                                        # noqa: E402
 from tools import hear_drain as HD                                 # noqa: E402
 
 
@@ -109,6 +110,52 @@ class TestOneDataset:
         X, kept = C.feature_matrix(recs, 16000.0)
         assert X.shape == (3, SK.MEL_BANDS * SK.FRAMES)
 
+    def test_v2_173_byte_node_frame_ingest_and_records(self, tmp_path):
+        from hear import corpus as C
+        pl = P.Pool(str(tmp_path / "pool"))
+        rng = np.random.default_rng(77)
+        q, ref = SK.sketch(rng.normal(0, 1000, 4096), 48000.0)
+        v2_frame = WR.pack_v2(us_of_day=50_000_123, node_id=202, seq=12, ref_db=ref, peak=1500,
+                              q=q, profile_id=1)
+        assert len(v2_frame) == 173
+        fh = binascii.hexlify(v2_frame).decode()
+        p = tmp_path / "dets_v2.csv"
+        lines = [",".join(DF.G5.declared),
+                 "node-202,1788763952000000,1234,5000000,42,123,1500,4608,48000.000,64,%s,," % fh]
+        p.write_text("\n".join(lines) + "\n")
+        res = pl.ingest_dets(str(p))
+        assert res["added"] == 1
+        recs = pl.records()
+        assert len(recs) == 1
+        assert isinstance(recs[0], C.Record)
+        assert recs[0].node_id == "node-202"
+        assert recs[0].fs_hz == 48000.0
+        assert recs[0].ref_db == pytest.approx(ref, abs=0.25)
+        assert np.array_equal(recs[0].q, q)
+
+    def test_v2_173_byte_mqtt_jsonl_ingest_and_records(self, tmp_path):
+        from hear import corpus as C
+        pl = P.Pool(str(tmp_path / "pool"))
+        rng = np.random.default_rng(88)
+        q, ref = SK.sketch(rng.normal(0, 1000, 4096), 48000.0)
+        v2_frame = WR.pack_v2(us_of_day=60_000_456, node_id=303, seq=20, ref_db=ref, peak=2500,
+                              q=q, profile_id=1)
+        assert len(v2_frame) == 173
+        p = tmp_path / "phone_v2.jsonl"
+        p.write_text(json.dumps({
+            "topic": "dama/phone-v2/acoustic_sketch",
+            "payload": {"sketch_b64": base64.b64encode(v2_frame).decode(),
+                        "ts_utc_ms": 1788763952189, "clock_tier": "gnss",
+                        "sync_sigma_ns": 105000.0, "clipped": False, "onset_found": True}}))
+        res = pl.ingest_mqtt_jsonl(str(p))
+        assert res["added"] == 1
+        recs = pl.records()
+        assert len(recs) == 1
+        assert isinstance(recs[0], C.Record)
+        assert recs[0].node_id == "phone-v2"
+        assert recs[0].fs_hz == 48000.0
+        assert np.array_equal(recs[0].q, q)
+
     def test_the_key_is_content_so_two_drains_of_one_detection_agree(self, tmp_path):
         frame = _frame()
         a = P.key("node", "nyquist", 1788763952189911, "5000000", frame)
@@ -121,6 +168,26 @@ class TestOneDataset:
         k1 = P.key("node", "nyquist", 0, "100", _frame(seed=1))
         k2 = P.key("node", "nyquist", 0, "200", _frame(seed=2))
         assert k1 != k2
+
+    def test_phone_ingest_keeps_the_frames_microseconds_in_absolute_utc(self, tmp_path):
+        """The pool is the OTHER reader of the same wire contract. If it stores ts_utc_ms
+        directly, every phone sketch lands on a 1 ms grid before hear_tdoa ever sees it."""
+        true_utc_us = 1788763952999600
+        q, ref = SK.sketch(np.random.default_rng(123).normal(0, 1000, 4096), 48000.0)
+        frame = SK.pack(true_utc_us % 1_000_000, ref, 1140, q,
+                        fs=48000.0, layout=SK.LAYOUT_FIXED)
+        p = tmp_path / "phone.jsonl"
+        p.write_text(json.dumps({
+            "topic": "dama/phone-a/acoustic_sketch",
+            "payload": {"sketch_b64": base64.b64encode(frame).decode(),
+                        "ts_utc_ms": round(true_utc_us / 1000),
+                        "clock_tier": "gnss"}
+        }) + "\n")
+        pl = P.Pool(str(tmp_path / "pool"))
+        pl.ingest_mqtt_jsonl(str(p))
+        row = next(iter(pl.raw()))
+        assert row["utc_us"] == true_utc_us
+        assert row["ts_utc_s"] == pytest.approx(true_utc_us / 1e6, abs=1e-12)
 
 
 class TestNothingIsDroppedOnTheWayOut:
@@ -299,6 +366,27 @@ class TestAnchoredIsNotTrusted:
         pl.ingest_dets(_dets(tmp_path, "dets.csv", 1))
         assert pl.records()[0].utc_trusted is None
 
+    def test_the_ingest_keeps_the_edge_index_an_unanchored_row_is_placed_by(self, tmp_path):
+        """⚠️pps_n AND us_since_pps USED TO BE DROPPED AT INGEST, so an unanchored row became
+        unplaceable the moment it reached the pool. Measured 2026-09-10: 517 of mach's 2557 node
+        records were stored with `anchored: false` and neither field, i.e. with no way even in
+        principle to say WHICH second they happened in. `utc_us == 0` means the node could not
+        NAME the edge; pps_n still says which edge it was and us_since_pps how far into it, and
+        every generation of dets.csv has carried both (they are in `hear.detsfile._BASE`).
+        What may and may not be reconstructed from them is `hear/unanchored.py`'s business --
+        keeping them is this one's."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        fh = binascii.hexlify(_frame()).decode()
+        p = tmp_path / "unanchored.csv"
+        p.write_text(",".join(DF.G5.declared) + "\n"
+                     + "mach,0,34,5000000,31,-1140,200,4608,16000.000,64,%s,,ring\n" % fh)
+        assert pl.ingest_dets(str(p))["added"] == 1
+        rec = json.loads((tmp_path / "pool" / "records" / "unanchored" / "node.jsonl")
+                         .read_text().splitlines()[0])
+        assert rec["anchored"] is False and rec["utc_us"] == 0
+        assert rec["pps_n"] == "31"
+        assert rec["us_since_pps"] == "-1140"
+
     def test_the_mqtt_arithmetic_still_closes_with_the_new_columns(self, tmp_path):
         pl = P.Pool(str(tmp_path / "pool"))
         f = _mqtt_payloads(tmp_path, "c.jsonl", [{"clock_tier": "wall"}, {"clock_tier": "gnss"}])
@@ -381,6 +469,18 @@ class TestTheArithmeticCloses:
         self._closed(e)
         assert e["skipped"] == 3 and e["added"] == 0
         assert e["skip_reasons"] == {"decode_AttributeError": 3}
+        assert pl.stats()["skipped_at_ingest"] == {"decode_AttributeError": 3}
+
+    def test_float_utc_and_padded_frame_ingest_without_decode_value_error(self, tmp_path):
+        pl = P.Pool(str(tmp_path / "pool"))
+        fh = binascii.hexlify(_frame()).decode() + "0000"
+        p = tmp_path / "dets.csv"
+        p.write_text("node_id,utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,sketch_back,frame_hex,clip,clip_why\n"
+                     + f"mach,1788763952189911.0,1234,5000000,42,597174,1140,4608,16000.000,64,{fh},,\n")
+        e = pl.ingest_dets(str(p))
+        self._closed(e)
+        assert e["rows"] == 1 and e["added"] == 1 and e["skipped"] == 0
+        assert e["skip_reasons"] == {}
 
     def test_an_mqtt_file_closes_too(self, tmp_path):
         pl = P.Pool(str(tmp_path / "pool"))

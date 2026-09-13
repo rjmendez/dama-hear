@@ -24,3 +24,33 @@ Two facts these captures happen to record, both load-bearing elsewhere:
 
 Do not regenerate them to make a test pass. If the firmware changes a name, that is the test
 telling the truth.
+
+⚠️These captures predate the 2026-09-08 acquisition-audit change, so they do NOT carry
+`acq.fs_win_s`, `acq.fs_step_ppm`, `acq.fs_used_hz`, `acq.over_s`, `i2s.clean_s` or `pps.gaps`,
+and their `i2s.measured_hz` (15651.2904 and 15483.2787) is the old cumulative-over-cumulative
+figure that any stall poisons. That is not a reason to regenerate them -- the rule above still
+holds. It is a note that the NEW names are pinned only by tests/test_firmware_csv_schema.py and
+tests/test_firmware_timebase.py against the source, and are not yet pinned against a live node.
+Re-capture both files the next time a node runs a build that has them, and the drain's audit
+block will be pinned against hardware again.
+
+## ls-clips-nyquist.txt -- CONSTRUCTED, NOT CAPTURED
+
+⚠️THIS ONE IS NOT A LIVE CAPTURE AND MUST NOT BE READ AS ONE. Every other file here came off a
+node; this one could not, because the `/ls?dir=` handler it exercises exists only in this
+checkout and **the fleet has not been flashed**. It is built from two things that ARE measured:
+the line format the handler in `firmware/hear_node/hear_node.ino` emits (dir-qualified name,
+two spaces, size, ` B`), and real clip names and the real 480044 B clip size
+on 2026-09-09.
+
+It mixes both shipped name shapes on purpose. `nyquist-<boot>-<sample>.wav` is what the FLASHED
+fleet writes -- a prefix histogram over 370 live names is `{'ny': 370}`, i.e. no `%02u-` field at
+all -- and `07-nyquist-<boot>-<sample>.wav` is what `clip_name()` in this checkout writes. A card
+that has been flashed holds both, under two different boot ids, which is exactly why
+`hear.clips.parse_clip_name` accepts both and why this fixture carries both.
+
+Replace it with a real capture the first time a node runs a build that has the handler:
+
+    curl 'http://172.16.100.105/ls?dir=/clips' > ls-clips-nyquist.txt
+
+If that capture disagrees with this file, the capture is right.

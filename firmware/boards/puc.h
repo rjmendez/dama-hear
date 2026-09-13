@@ -29,7 +29,10 @@
 // GPIO18 is where the wire should land -- held low, not a strapping pin, clear of the flash
 // (26-32), PSRAM (33-37) and USB (19-20) ranges. Set to -1 until the joint exists; a node with
 // PPS_PIN -1 must be refused as a TDoA arrival source rather than quietly trusted.
-#define PPS_PIN        18
+// ⚠️STALE AND INCONSISTENT WITH ITS OWN COMMENT, kept only because nothing compiles this file.
+// The measured pad is GPIO17 (see puc_node.ino, which is what builds); 18 was a guess from before
+// the pin scan, and the comment above says to use -1 until the joint exists. Do not copy this line.
+#define PPS_PIN        -1
 #define PPS_WIRED      0         // flip to 1 only when /pps has actually reported edges
 
 // ---- the tick that DOES exist ---------------------------------------------------------------
@@ -107,7 +110,19 @@
 // ---- reserved ------------------------------------------------------------------------------
 // 19,20 USB D-/D+ -- reconfiguring these killed the console once already and cost a replug caught
 // inside a four-second window. 26-32 SPI flash. 33-37 octal PSRAM. Never touch any of them.
-#define FREE_PADS      {15, 16, 17, 18, 21, 38, 39}
+//
+// ⚠️THIS LIST WAS WRONG AND OFFERED FOUR PADS THE SCAN HAD ALREADY DISQUALIFIED. It read
+// {15, 16, 17, 18, 21, 38, 39}. Against /scanpu + /scanpd on the live board, 2026-09-10:
+//
+//     18  HELD LOW against an internal pullup -- something external drives this net
+//     39  HELD LOW likewise
+//     38  8 edges at 50% duty -- the DS3231's 1 Hz SQW, i.e. a driven output, not a free pad
+//     21  never appeared in the scan at all, so it is UNMEASURED, not free
+//
+// Landing the L86's push-pull 1PPS on 18 is what this header's own PPS_PIN history is about;
+// offering it again three lines from that fix is the same mistake with a different name.
+// tests/test_puc_pps_pin.py now parses this list, so it cannot drift back silently.
+#define FREE_PADS      {15, 16, 17}
 
 // ---- I2C ------------------------------------------------------------------------------------
 // Found 2026-09-08 by /i2c. /scan alone never could: an idle bus does not toggle. The narrowing is
