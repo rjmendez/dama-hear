@@ -145,6 +145,21 @@ class TestCardlessDrain:
         text = json.dumps(r)
         assert str(POS["mean_lat"]) not in text and str(POS["mean_lon"]) not in text
 
+    def test_a_node_that_averaged_no_fix_files_no_position_and_drops_a_stale_one(self, tmp_path,
+                                                                                 cardless):
+        pl = P.Pool(str(tmp_path / "pool"))
+        n = cardless().fire(1)
+        _run(pl, n, T)
+        path = tmp_path / "pool" / "state" / HD.NODE_POSITIONS_FILE
+        assert "gold" in json.loads(path.read_text())["nodes"]
+        zero = dict(POS, mean_lat=0.0, mean_lon=0.0, mean_hell_m=0.0, hacc_m=0.0, vacc_m=0.0, n=0)
+        real = n.status
+        n.status = lambda ip, timeout=None: dict(real(ip, timeout), pos=dict(zero))
+        HD.fetch_status = n.status
+        r = _run(pl, n.tick(900), T + 900)
+        assert r["position"] is None and r["ok"]
+        assert "gold" not in json.loads(path.read_text())["nodes"]
+
     def test_what_the_drain_files_is_what_the_survey_fallback_reads(self, tmp_path, cardless):
         pl = P.Pool(str(tmp_path / "pool"))
         _run(pl, cardless().fire(1), T)
