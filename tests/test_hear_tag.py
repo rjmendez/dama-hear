@@ -168,6 +168,38 @@ class TestTheWeightsAreProvenOrTheRunStops:
     def test_verify_weights_alone_exits_2(self, tmp_path):
         assert HT.main(["--model-dir", str(tmp_path), "--verify-weights"]) == 2
 
+    def test_a_weights_refusal_run_stamps_the_heartbeat_red(self, tmp_path):
+        beat = {"index_lines": 1, "index_keys": 1, "census_keys": 1, "superseded": 0,
+                "unparseable": 0, "tagged": 1, "refused": 0, "already_tagged": 0,
+                "deferred": 0, "cap_hit": False, "stop_reason": None,
+                "conservation_ok": True, "weights_ok": True, "silence_top": 0,
+                "by_reason": {}, "by_node": {}, "by_node_day_reason": {},
+                "model": {}, "silence_frac": 0.0, "mean_top_score": 0.25,
+                "n_top_scores": 1, "observation_not_health": {}}
+        HT.write_heartbeat(str(tmp_path), beat, now=1000.0)
+        assert HT.main(["--pool", str(tmp_path), "--model-dir", str(tmp_path)]) == 2
+        code, lines = HT.check_tags(str(tmp_path), now=1001.0)
+        assert code == 1
+        assert any("weights" in l and "REFUSED" in l for l in lines)
+        hb = json.load(open(HT.heartbeat_path(str(tmp_path))))
+        assert hb["runs"][-1]["weights_ok"] is False
+        assert "is absent" in hb["runs"][-1]["weights_problem"]
+
+    def test_verify_weights_mode_can_stamp_a_refusal_heartbeat_when_pool_is_explicit(self, tmp_path):
+        beat = {"index_lines": 1, "index_keys": 1, "census_keys": 1, "superseded": 0,
+                "unparseable": 0, "tagged": 1, "refused": 0, "already_tagged": 0,
+                "deferred": 0, "cap_hit": False, "stop_reason": None,
+                "conservation_ok": True, "weights_ok": True, "silence_top": 0,
+                "by_reason": {}, "by_node": {}, "by_node_day_reason": {},
+                "model": {}, "silence_frac": 0.0, "mean_top_score": 0.25,
+                "n_top_scores": 1, "observation_not_health": {}}
+        HT.write_heartbeat(str(tmp_path), beat, now=1000.0)
+        assert HT.main(["--pool", str(tmp_path), "--model-dir", str(tmp_path),
+                        "--verify-weights"]) == 2
+        hb = json.load(open(HT.heartbeat_path(str(tmp_path))))
+        assert hb["runs"][-1]["weights_ok"] is False
+        assert "is absent" in hb["runs"][-1]["weights_problem"]
+
     def test_the_upstream_checkpoint_is_pinned_too_not_only_the_export(self):
         """⚠️THE CHAIN HAS THREE LINKS. Upstream ships PyTorch, this repo ships an export script,
         the pod loads ONNX. Pinning only the ONNX would make the digest a record of what was
@@ -1217,14 +1249,14 @@ class TestTheCheckJobCanActuallyFail:
     """⚠️Run it. hear-drain shipped a check job whose script ended on a command that always
     succeeds, so the shell returned 0 whatever the gate found. Only the shell can prove it gone."""
 
-    def _run(self, script, tmp_path, check_rc):
+    def _run(self, script, tmp_path, check_rc, verify_rc=0):
         stub = tmp_path / "python"
         stub.write_text(
             "#!/bin/sh\n"
             "for a in \"$@\"; do\n"
             "  [ \"$a\" = \"--check\" ] && exit %d\n"
-            "  [ \"$a\" = \"--verify-weights\" ] && { echo WEIGHTS_RAN; exit 0; }\n"
-            "done\nexit 0\n" % check_rc)
+            "  [ \"$a\" = \"--verify-weights\" ] && { echo WEIGHTS_RAN; exit %d; }\n"
+            "done\nexit 0\n" % (check_rc, verify_rc))
         stub.chmod(0o755)
         env = dict(os.environ, PATH="%s:%s" % (tmp_path, os.environ.get("PATH", "")))
         return subprocess.run(["/bin/sh", "-lc", script], capture_output=True, text=True, env=env)
@@ -1243,10 +1275,16 @@ class TestTheCheckJobCanActuallyFail:
         r = self._run(self._script(docs), tmp_path, check_rc=1)
         assert "WEIGHTS_RAN" in r.stdout
 
+    def test_a_failing_weight_verify_fails_the_job(self, docs, tmp_path):
+        assert self._run(self._script(docs), tmp_path, check_rc=0, verify_rc=2).returncode == 2
+
+    def test_a_failing_weight_verify_wins_over_a_check_failure_too(self, docs, tmp_path):
+        assert self._run(self._script(docs), tmp_path, check_rc=1, verify_rc=2).returncode == 2
+
     def test_the_summary_cannot_mask_a_failing_check(self, docs, tmp_path):
         stub = tmp_path / "python"
         stub.write_text("#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = \"--check\" ] && exit 1; "
-                        "done\nexit 7\n")
+                        "[ \"$a\" = \"--verify-weights\" ] && exit 0; done\nexit 7\n")
         stub.chmod(0o755)
         env = dict(os.environ, PATH="%s:%s" % (tmp_path, os.environ.get("PATH", "")))
         r = subprocess.run(["/bin/sh", "-lc", self._script(docs)], capture_output=True, text=True,
@@ -1548,4 +1586,3 @@ class TestTheHumanCalibrationSetIsRealAndBounded:
         auc = (wins + 0.5 * ties) / (len(emp) * len(snd))
         assert auc < 0.5, ("silence_frac AUC is %.3f; if this ever rises above chance the "
                            "retirement of --max-silence-frac deserves revisiting" % auc)
-

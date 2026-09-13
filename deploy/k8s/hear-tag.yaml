@@ -220,11 +220,12 @@ spec:
               image: python:3.13-slim
               command: ["/bin/sh", "-lc"]
               args:
-                # ⚠️`set +e`, NOT `set -e`, and the gate's rc is captured before anything else
-                # runs. Runners have been seen delivering -e on the command line where the script
+                # ⚠️`set +e`, NOT `set -e`, and every gate rc is captured before the final exit.
+                # Runners have been seen delivering -e on the command line where the script
                 # cannot clear it, and a check job whose last command always succeeds is a green
-                # light nobody reads -- hear-drain shipped exactly that bug. The census after it
-                # is `|| true` so a summary failure can neither mask nor manufacture a result.
+                # light nobody reads -- hear-drain shipped exactly that bug. Weight verification
+                # must fail this CronJob too, and it gets `--pool` so hear_tag.py can stamp a
+                # refusal heartbeat before exit 2 instead of leaving an older green one in place.
                 - |
                   set +e
                   export PYTHONPATH=/pool/pylib-tag:/app
@@ -238,7 +239,9 @@ spec:
                   rc2=$?
                   [ "$rc2" -gt "$rc" ] && rc=$rc2
                   echo "--- weights ---"
-                  python /app/tools/hear_tag.py --model-dir /pool/models/mn10_as --verify-weights || true
+                  python /app/tools/hear_tag.py --pool /pool/corpus --model-dir /pool/models/mn10_as --verify-weights
+                  rc3=$?
+                  [ "$rc3" -gt "$rc" ] && rc=$rc3
                   exit "$rc"
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
