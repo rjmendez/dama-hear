@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 289273 B serialised; 289457 B of annotations against a 262144 B cap.
+# apply-mode server: 290174 B serialised; 290358 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: '4de6c19-dirty'
+    dama-hear/commit: '4d46fa1-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '289273'
+    dama-hear/serialised-bytes: '290174'
 data:
   hear__init__.py: |
     
@@ -300,22 +300,37 @@ data:
                 "q": q, "db": q.astype(float) / 2.0 + ref4 / 4.0}
     
     
-    def version_of(b: bytes) -> int:
-        """1 or 2, by length plus self-consistency. v2 is tested FIRST and that order is contract.
+    def version_of(b: bytes, explicit_version: Optional[int] = None) -> int:
+        """1 or 2, by length plus self-consistency.
     
-        ⚠️THE DISCRIMINATION IS NOT EXACT AND NOTHING CAN MAKE IT SO: v1 has no version field to read
+        If explicit_version is provided (e.g. from MQTT topic or transport envelope),
+        it is honored directly if the byte length and structure match the requested version.
+        Otherwise, v2 is tested FIRST and that order is contract.
+    
+        ⚠️THE HEURISTIC DISCRIMINATION IS NOT EXACT AND NOTHING CAN MAKE IT SO: v1 has no version field to read
         (sketch.py:97). A v1 frame whose bands*frames happened to equal a v2 profile's payload and
         whose bytes 11-12 happened to spell version 2 would be misread. With MEL_BANDS 20 and
         FRAMES 8 frozen (sketch.py:26-27) that collision does not exist in this repo, which is a
         property of the constants and not of this function.
         """
-        if len(b) >= HDR_V2:
-            flags = struct.unpack_from("<H", b, 11)[0]
-            pid = (flags >> _F_PROFILE_SHIFT) & _F_PROFILE_MASK
-            version = (flags >> _F_VERSION_SHIFT) & _F_VERSION_MASK
-            if version == VERSION and pid in PROFILES and len(b) >= wire_size_v2(pid):
-                if not (int.from_bytes(b[0:5], "little") >> _TS_BITS):
-                    return VERSION
+        if explicit_version == 1:
+            if len(b) >= _V1_HDR and 1 <= b[8] <= 64 and 1 <= b[9] <= 64:
+                want = _V1_HDR + b[8] * b[9]
+                if 0 <= len(b) - want <= 16:
+                    return 1
+            raise ValueError(f"explicit v1 specified but frame is not a valid v1 frame: {len(b)} bytes")
+    
+        if explicit_version == 2 or explicit_version is None:
+            if len(b) >= HDR_V2:
+                flags = struct.unpack_from("<H", b, 11)[0]
+                pid = (flags >> _F_PROFILE_SHIFT) & _F_PROFILE_MASK
+                version = (flags >> _F_VERSION_SHIFT) & _F_VERSION_MASK
+                if version == VERSION and pid in PROFILES and len(b) >= wire_size_v2(pid):
+                    if not (int.from_bytes(b[0:5], "little") >> _TS_BITS):
+                        return VERSION
+            if explicit_version == 2:
+                raise ValueError(f"explicit v2 specified but frame is not a valid v2 frame: {len(b)} bytes")
+    
         if len(b) >= _V1_HDR and 1 <= b[8] <= 64 and 1 <= b[9] <= 64:
             want = _V1_HDR + b[8] * b[9]
             if 0 <= len(b) - want <= 16:
@@ -323,10 +338,10 @@ data:
         raise ValueError("unrecognised frame: %d bytes" % len(b))
     
     
-    def decode(b: bytes) -> Dict:
+    def decode(b: bytes, explicit_version: Optional[int] = None) -> Dict:
         """version_of() then the matching unpacker. A v1 result gains 'version': 1 from HERE --
         sketch.py is read-only -- and keeps its own 'node_us' key. Nothing else is renamed."""
-        v = version_of(b)
+        v = version_of(b, explicit_version=explicit_version)
         if v == VERSION:
             flags = struct.unpack_from("<H", b, 11)[0]
             pid = (flags >> _F_PROFILE_SHIFT) & _F_PROFILE_MASK
