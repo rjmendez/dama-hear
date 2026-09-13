@@ -445,6 +445,8 @@ static void IRAM_ATTR pps_isr() {
 
 // ---------------------------------------------------------------- GPS (minimal NMEA)
 static volatile uint32_t gps_tacc_ns = 0, ubx_pvt = 0, ubx_timtp = 0, ubx_nak = 0, ubx_ack = 0;
+static volatile uint32_t pmtk_ack = 0, pmtk_nak = 0;
+static volatile uint8_t  pmtk_cfg_ack = 0, pmtk_cfg_nak = 0;
 static volatile int32_t  gps_qerr_ps = 0;
 static volatile uint8_t  timtp_flags = 0xFF;
 // Read-back of what the module says its timepulse config actually is. An ACK to VALSET means the
@@ -482,9 +484,127 @@ static uint32_t pos_n = 0;
 static char gps_utc[16] = "--:--:--";
 static uint32_t gps_sentences = 0;
 
+#define PMTK_CFG_220  0x01u
+#define PMTK_CFG_300  0x02u
+#define PMTK_CFG_314  0x04u
+#define PMTK_CFG_255  0x08u
+#define PMTK_CFG_REQUIRED (PMTK_CFG_220 | PMTK_CFG_300 | PMTK_CFG_314)
+
+static bool nmea_checksum_ok(const char *s) {
+  const char *star = strrchr(s, '*');
+  if (s[0] != '$' || !star || !star[1] || !star[2]) return false;
+  uint8_t cs = 0;
+  for (const char *c = s + 1; c < star; c++) cs ^= (uint8_t)*c;
+  char *end = nullptr;
+  long got = strtol(star + 1, &end, 16);
+  return end == star + 3 && (uint8_t)got == cs;
+}
+
+static long long civil_to_unix_s(int yr, int mo, int dy, int hh, int mi, int ss) {
+  int y = yr; int m = mo;
+  y -= m <= 2;
+  int era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153u * (m + (m > 2 ? -3 : 9)) + 2u) / 5u + (unsigned)dy - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  long long days = (long long)era * 146097 + (long long)doe - 719468;
+  return days * 86400LL + (long long)hh * 3600LL + (long long)mi * 60LL + ss;
+}
+
+static int nmea_dec2(const char *s) {
+  return (s[0] >= '0' && s[0] <= '9' && s[1] >= '0' && s[1] <= '9')
+         ? (s[0] - '0') * 10 + (s[1] - '0') : -1;
+}
+
+static uint8_t pmtk_cfg_bit(long cmd) {
+  switch (cmd) {
+    case 220: return PMTK_CFG_220;
+    case 255: return PMTK_CFG_255;
+    case 300: return PMTK_CFG_300;
+    case 314: return PMTK_CFG_314;
+    default:  return 0;
+  }
+}
+
+static bool gps_config_acked() {
+  if (GPS_PROTO == GPS_PMTK) return (pmtk_cfg_ack & PMTK_CFG_REQUIRED) == PMTK_CFG_REQUIRED;
+  return ubx_ack != 0;
+}
+
+static bool gps_config_replied() {
+  if (GPS_PROTO == GPS_PMTK)
+    return ((pmtk_cfg_ack | pmtk_cfg_nak) & PMTK_CFG_REQUIRED) == PMTK_CFG_REQUIRED;
+  return ubx_ack != 0 || ubx_nak != 0;
+}
+
+static void pmtk_parse_ack(const char *s) {
+  if (!(s[0] == '$' && !strncmp(s + 1, "PMTK001,", 8))) return;
+  if (!nmea_checksum_ok(s)) return;
+  char *end = nullptr;
+  long cmd = strtol(s + 9, &end, 10);
+  if (end == s + 9 || *end != ',') return;
+  long flag = strtol(end + 1, nullptr, 10);
+  uint8_t bit = pmtk_cfg_bit(cmd);
+  if (flag == 3) {
+    pmtk_ack++;
+    if (bit) pmtk_cfg_ack |= bit;
+  } else {
+    pmtk_nak++;
+    if (bit) pmtk_cfg_nak |= bit;
+  }
+}
+
+static void pmtk_parse_rmc(const char *s) {
+  if (GPS_PROTO != GPS_PMTK) return;
+  if (!(s[0] == '$' && s[3] == 'R' && s[4] == 'M' && s[5] == 'C')) return;
+  if (!nmea_checksum_ok(s)) return;
+  int f = 0; const char *p = s;
+  char tm[12] = {0}, dt[8] = {0};
+  char status = 0;
+  while (*p && f < 9) {
+    if (*p == ',') {
+      f++; const char *v = p + 1;
+      if (f == 1) { int i = 0; while (v[i] && v[i] != ',' && v[i] != '*' && i < 10) { tm[i] = v[i]; i++; } tm[i] = 0; }
+      else if (f == 2) status = *v;
+      else if (f == 9) { int i = 0; while (v[i] && v[i] != ',' && v[i] != '*' && i < 6) { dt[i] = v[i]; i++; } dt[i] = 0; }
+    }
+    p++;
+  }
+  if (strlen(tm) >= 6)
+    snprintf(gps_utc, sizeof gps_utc, "%c%c:%c%c:%c%c", tm[0], tm[1], tm[2], tm[3], tm[4], tm[5]);
+  if (status != 'A' || strlen(tm) < 6 || strlen(dt) < 6) return;
+  int hh = nmea_dec2(tm), mi = nmea_dec2(tm + 2), ss = nmea_dec2(tm + 4);
+  int dy = nmea_dec2(dt), mo = nmea_dec2(dt + 2), yy = nmea_dec2(dt + 4);
+  if (hh < 0 || mi < 0 || ss < 0 || dy < 1 || mo < 1 || mo > 12 || yy < 0) return;
+  long long unix_s = civil_to_unix_s(2000 + yy, mo, dy, hh, mi, ss);
+  uint64_t now_us = (uint64_t)esp_timer_get_time();
+  if (pend_edge_n && (now_us - pend_local_us) < 900000ULL) {
+    bool ok = true;
+    if (prev_edge_n && prev_unix_s) {
+      long long d_sec = unix_s - prev_unix_s;
+      long long d_edge = (long long)pend_edge_n - (long long)prev_edge_n;
+      if (d_sec != d_edge) { ok = false; time_glitch++; }
+    }
+    if (ok) {
+      edge_local_us = pend_local_us;
+      edge_unix_us = (int64_t)unix_s * 1000000LL;
+      time_valid = true;
+      if (!first_label_s) {
+        uint32_t up = (millis() - boot_ms) / 1000;
+        first_label_s = up ? up : 1;
+      }
+    }
+    prev_unix_s = unix_s; prev_edge_n = pend_edge_n;
+  }
+}
+
 static void nmea_line(const char *s) {
   gps_sentences++;
   if (s[0] == '$' && s[1] >= 'A' && s[1] <= 'Z' && s[2] >= 'A' && s[2] <= 'Z') nmea_valid++;
+  if (GPS_PROTO == GPS_PMTK) {
+    pmtk_parse_ack(s);
+    pmtk_parse_rmc(s);
+  }
   // $xxGGA,hhmmss.ss,lat,N,lon,E,fix,sats,...
   if (ubx_pvt) return;                          // UBX is authoritative once it arrives
   if (!(s[0] == '$' && s[3] == 'G' && s[4] == 'G' && s[5] == 'A')) return;
@@ -897,7 +1017,22 @@ static void gps_set_pulse_len(uint32_t us) {
   vs_send();
 }
 
+static void pmtk_send(const char *body) {
+  uint8_t cs = 0;
+  for (const char *c = body; *c; c++) cs ^= (uint8_t)*c;
+  Serial1.printf("$%s*%02X\r\n", body, cs);
+}
+
 static void gps_configure() {
+  if (GPS_PROTO == GPS_PMTK) {
+    // PMTK receivers have no NAV-PVT or TIM-TP. Keep the cadence at one report per PPS edge and
+    // ask for the only NMEA sentences this firmware can use: GGA for fix/sats and RMC for UTC.
+    pmtk_send("PMTK220,1000");
+    pmtk_send("PMTK300,1000,0,0,0,0");
+    pmtk_send("PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0");
+    pmtk_send("PMTK255,1");
+    return;
+  }
   vs_begin();
   vs_add(K_PULSE_DEF, 0); vs_add(K_PULSE_LEN_DEF, 1);
   vs_add(K_PERIOD_TP1, 1000000); vs_add(K_PERIOD_LOCK, 1000000);   // 1 Hz locked AND unlocked
@@ -2570,7 +2705,7 @@ static String status_json() {
       "\"loop_max_boot_ms\":%lu,\"chip_c\":%.1f,\"stream_stalls\":%lu,\"stream_gone\":%lu},"
     "\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
-    "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
+    "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"pmtk_ack\":%lu,\"pmtk_nak\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
     // hell_m is height above the WGS84 ELLIPSOID and is the field a geodetic transform wants;
     // hmsl_m is the human-readable one and must not be fed to lat/lon/h -> ECEF.
     "\"pos\":{\"lat\":%.7f,\"lon\":%.7f,\"hell_m\":%.3f,\"hmsl_m\":%.3f,"
@@ -2649,7 +2784,8 @@ static String status_json() {
     (unsigned long)nmea_valid, (unsigned long)gps_baud,
     (unsigned long)gps_tacc_ns, (long)gps_qerr_ps, (unsigned long)ubx_pvt,
     (unsigned long)ubx_timtp, (unsigned long)ubx_ack, (unsigned long)ubx_nak,
-    (ubx_ack ? "true" : "false"), (unsigned)timtp_flags,
+    (unsigned long)pmtk_ack, (unsigned long)pmtk_nak,
+    (gps_config_acked() ? "true" : "false"), (unsigned)timtp_flags,
     ((timtp_flags != 0xFF && !(timtp_flags & 0x10)) ? "true" : "false"),
     pos_lat_e7 * 1e-7, pos_lon_e7 * 1e-7,
     pos_hell_mm / 1000.0, pos_hmsl_mm / 1000.0,
@@ -3571,7 +3707,8 @@ void setup() {
   });
   http.on("/gpsraw", []() {           // what the module is ACTUALLY sending, not what a parser counted
     String o = "bytes=" + String((unsigned long)raw_tot) + " valid_nmea_lines=" + String((unsigned long)nmea_valid) +
-               " ubx_ack=" + String((unsigned long)ubx_ack) + " ubx_nak=" + String((unsigned long)ubx_nak) + "\n\n";
+               " ubx_ack=" + String((unsigned long)ubx_ack) + " ubx_nak=" + String((unsigned long)ubx_nak) +
+               " pmtk_ack=" + String((unsigned long)pmtk_ack) + " pmtk_nak=" + String((unsigned long)pmtk_nak) + "\n\n";
     uint16_t st = raw_i;
     // ?hex=1: '.' for every non-printable byte hides exactly the structure worth looking for --
     // a UBX sync pair (b5 62), an NMEA '$' at the wrong framing, or a line stuck at one value.
@@ -4514,13 +4651,18 @@ void loop() {
   // The module ACKs or NAKs a VALSET. Silence means nothing reached it -- almost always the
   // node->GPS TX wire, since NMEA arriving proves only the other direction. Retry, then say which.
   static uint32_t cfg_try = 0, cfg_at = 0;
-  if (!ubx_ack && !ubx_nak && cfg_try < 6 && millis() - cfg_at > 5000) {
+  if (!gps_config_acked() && !gps_config_replied() && cfg_try < 6 && millis() - cfg_at > 5000) {
     cfg_at = millis();
     if (cfg_try) gps_configure();
     cfg_try++;
-    if (cfg_try == 6)
-      logln("gps   no ACK/NAK after 6 tries -- node TX (D6/GPIO43) -> module RX is not "
-                     "connected. Running the module's stock config; PPS will appear only on fix.");
+    if (cfg_try == 6) {
+      if (GPS_PROTO == GPS_PMTK)
+        logf("gps   no PMTK command replies after 6 tries -- node TX (GPIO%d) -> module RX may be disconnected. Running the module's stock NMEA output.\n",
+             gps_tx_pin);
+      else
+        logf("gps   no ACK/NAK after 6 tries -- node TX (GPIO%d) -> module RX is not connected. Running the module's stock config; PPS will appear only on fix.\n",
+             gps_tx_pin);
+    }
   }
 
   if (sta_ok && WiFi.status() != WL_CONNECTED) {     // AP blipped; a node reconnects
