@@ -25,9 +25,14 @@ class StubEmbedder:
 
     def tag(self, pcm, floor=0.0):
         self.calls.append(np.asarray(pcm))
+        e = np.zeros(HT.PERCH_EMBED_DIM, dtype=np.float64)
+        e[0] = 1.0
         return {"scores": None, "max_unstored_score": None, "n_classes_scored": 0,
-                "n_passes": 1, "embedding": [0.0] * HT.PERCH_EMBED_DIM,
-                "embedding_dim": HT.PERCH_EMBED_DIM}
+                "n_passes": 1, "embedding": [float(v) for v in e],
+                "embedding_dim": HT.PERCH_EMBED_DIM,
+                "window_embeddings": [[float(v) for v in e]],
+                "embedding_mean": [float(v) for v in e],
+                "embedding_max": [float(v) for v in e]}
 
 
 def run_perch(root, emb, **kw):
@@ -79,6 +84,15 @@ class TestPerchInput:
         store_clip(tmp_path, pcm=np.zeros(240000))
         t = run_perch(tmp_path, StubEmbedder())
         assert t["by_reason"] == {HT.R_DIGITAL_SILENCE: 1}
+
+    def test_dense_window_pools_to_mean_and_max(self):
+        x = np.linspace(-1.0, 1.0, HT.PERCH_WINDOW, dtype=np.float32)
+        e = StubEmbedder()
+        out = e.tag(x)
+        assert len(out["window_embeddings"]) >= 1
+        assert len(out["embedding"]) == HT.PERCH_EMBED_DIM
+        assert len(out["embedding_mean"]) == HT.PERCH_EMBED_DIM
+        assert len(out["embedding_max"]) == HT.PERCH_EMBED_DIM
 
 
 class TestEmbedOnlyGates:

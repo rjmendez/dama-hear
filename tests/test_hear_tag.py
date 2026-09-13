@@ -311,6 +311,21 @@ class TestNormalisationIsNotAnOptimisation:
         assert t["refused"] == 1
         assert t["by_reason"] == {HT.R_DIGITAL_SILENCE: 1}
 
+    def test_dense_windows_and_agc_are_robust_to_silent_and_impulsive_audio(self):
+        with pytest.raises(ValueError):
+            HT.normalise(np.zeros(256))
+        y, pre = HT.normalise(np.full(256, 0.5))
+        assert np.isfinite(y).all()
+        assert np.max(np.abs(y)) <= 1.0
+        assert pre < 0.0
+        x = np.zeros(48000)
+        x[24000] = 1.0
+        z = HT.normalise_peak(x)
+        assert np.max(np.abs(z)) == pytest.approx(HT.PERCH_TARGET_PEAK, abs=1e-6)
+        windows = HT.dense_windows(np.zeros(160000), 80000, 40000)
+        assert len(windows) >= 2
+        assert HT.center_window_weights([0, 40000, 80000], 160000, 80000)[1] > 0.75
+
 
 # ----------------------------------------------------------------- the rate
 
@@ -1635,3 +1650,22 @@ class TestTheHumanCalibrationSetIsRealAndBounded:
         auc = (wins + 0.5 * ties) / (len(emp) * len(snd))
         assert auc < 0.5, ("silence_frac AUC is %.3f; if this ever rises above chance the "
                            "retirement of --max-silence-frac deserves revisiting" % auc)
+
+
+class TestBirdnetScorePartitionsOnStoredRows:
+
+    def test_partitioned_scores_are_serialized_for_species_metrics(self, tmp_path):
+        class PartitionedTagger(StubTagger):
+            def tag(self, pcm, floor=HT.SCORE_FLOOR):
+                got = super().tag(pcm, floor=floor)
+                got["species_scores"] = {"Turdus_migratorius_American Robin": 0.8}
+                got["anthrophony_scores"] = {"Dog_Dog": 0.7}
+                got["scores"].update(got["species_scores"], **got["anthrophony_scores"])
+                return got
+
+        store_clip(tmp_path)
+        run(tmp_path, PartitionedTagger())
+        row = next(iter(TAGS.read_tags(str(tmp_path))))
+        assert row["species_scores"] == {"Turdus_migratorius_American Robin": 0.8}
+        assert row["anthrophony_scores"] == {"Dog_Dog": 0.7}
+        assert row["scores"]["Dog_Dog"] == 0.7

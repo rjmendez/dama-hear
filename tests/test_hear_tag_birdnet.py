@@ -84,6 +84,65 @@ class TestTheLane:
         assert HT.claim_block()["is_species_id"] is False
 
 
+class TestTheBirdnetWindowingAndPartitions:
+
+    def _stub_tagger(self, monkeypatch, window_probs):
+        tagger = object.__new__(HT.BirdNETTagger)
+        tagger._np = np
+        tagger.lat, tagger.lon = 12.3, -45.7
+        tagger.labels = ["Turdus_migratorius_American Robin", "Dog_Dog"]
+        tagger._always = np.array([False, True])
+        tagger.hop_s = HT.BIRDNET_HOP_S
+        tagger.hop_samples = HT.BIRDNET_HOP
+        tagger._keep = {}
+        tagger._in_range = lambda _week: np.ones(2, dtype=bool)
+
+        class Audio:
+            def __init__(self):
+                self.i = -1
+                self.tensor = None
+
+            def set_tensor(self, _index, tensor):
+                self.tensor = tensor
+
+            def invoke(self):
+                self.i += 1
+
+            def get_tensor(self, _index):
+                p = window_probs[min(self.i, len(window_probs) - 1)]
+                return np.asarray([[np.log(p / (1.0 - p)) for p in p]], dtype=np.float32)
+
+        tagger._a = Audio()
+        tagger._ai, tagger._ao = {"index": 0}, {"index": 1}
+        return tagger
+
+    def test_default_hop_covers_a_five_second_clip_densely(self, monkeypatch):
+        tagger = self._stub_tagger(monkeypatch, [[0.2, 0.2]] * 9)
+        got = tagger.tag(np.ones(240000, dtype=np.float32), floor=0.0)
+        assert HT.BIRDNET_HOP == 12000
+        assert got["n_passes"] == 9
+        assert got["hop_samples"] == 12000
+
+    def test_fusion_combines_max_top_k_and_energy_pooling(self, monkeypatch):
+        tagger = self._stub_tagger(monkeypatch, [[0.9, 0.2], [0.1, 0.2], [0.1, 0.2]])
+        got = tagger.tag(np.ones(144000 + 2 * HT.BIRDNET_HOP, dtype=np.float32), floor=0.0)
+        assert got["fusion"] == "mean(max, top3, energy_weighted)"
+        assert got["scores"]["Turdus_migratorius_American Robin"] == pytest.approx((0.9 + (0.9 + 0.1 + 0.1) / 3.0 + (0.9 + 0.1 + 0.1) / 3.0) / 3.0, abs=0.01)
+
+    def test_bandpass_rejects_invalid_rate_and_sub_nyquist_band(self, monkeypatch):
+        with pytest.raises(ValueError, match="sample rate"):
+            HT.birdnet_bandpass(np.ones(8), 0)
+        monkeypatch.setattr(HT, "BIRDNET_BANDPASS_HZ", (1000.0, 1200.0))
+        assert np.all(HT.birdnet_bandpass(np.ones(32), 1000.0) == 0.0)
+
+    def test_scores_are_partitioned_without_dropping_anthrophony(self, monkeypatch):
+        tagger = self._stub_tagger(monkeypatch, [[0.8, 0.7]])
+        got = tagger.tag(np.ones(144000, dtype=np.float32), floor=0.0)
+        assert got["species_scores"] == {"Turdus_migratorius_American Robin": pytest.approx(0.8)}
+        assert got["anthrophony_scores"] == {"Dog_Dog": pytest.approx(0.7)}
+        assert set(got["scores"]) == {"Turdus_migratorius_American Robin", "Dog_Dog"}
+
+
 class TestTheSiteNeverComesFromTheRepo:
 
     def test_no_site_refuses(self, monkeypatch):
