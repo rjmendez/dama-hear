@@ -195,6 +195,12 @@ SCENE_TAIL_BYTES = 2_000_000
 # successful window. Pool already creates `state/`.
 SCENE_STATE_FILE = "scene_fetch.json"
 
+# `<pool>/state/node_positions.json`: each node's own GPS mean as /status last reported it, read by
+# hear-tdoa to position a node with no survey entry (hear/backend/survey.py: augment_from_node_gps).
+NODE_POSITIONS_FILE = "node_positions.json"
+# hear_node.ino DETS_HTTP_MAX: /detections serves only the newest this many rows.
+LIVE_RING_HTTP_MAX = 128
+
 # --check fails above this many unfetched bytes. Zero is the right default because `scene_gap()`
 # has already clamped anything smaller than one row to zero: what survives to the heartbeat is a
 # whole row of scene the pool will never see, and there is no acceptable number of those.
@@ -286,6 +292,10 @@ def fetch_status(ip: str, timeout: float = DEFAULT_TIMEOUT_S) -> Dict[str, Any]:
 
 def fetch_audio_status(ip: str, timeout: float = DEFAULT_TIMEOUT_S) -> Dict[str, Any]:
     return json.loads(_get("http://%s/audio" % ip, timeout).decode("utf-8", "replace"))
+
+
+def fetch_detections(ip: str, timeout: float = DEFAULT_TIMEOUT_S) -> bytes:
+    return _get("http://%s/detections" % ip, timeout)
 
 
 def fetch_sd(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S,
@@ -1169,6 +1179,133 @@ def drain_clips(pl: "P.Pool", node: str, ip: str, candidates: List[Dict[str, Any
     return out
 
 
+def record_node_position(root: str, node: str, st: Dict[str, Any],
+                         now: float) -> Optional[Dict[str, Any]]:
+    """File this node's GPS mean from /status under state/, or None when it reported none.
+
+    The return value is what the run report carries: fix count and hAcc, never a coordinate.
+    """
+    pos = st.get("pos")
+    if not isinstance(pos, dict) or pos.get("mean_lat") is None or pos.get("mean_lon") is None:
+        return None
+    gps = st.get("gps") if isinstance(st.get("gps"), dict) else {}
+    p = os.path.join(root, "state", NODE_POSITIONS_FILE)
+    doc: Dict[str, Any] = {"schema": "hear.node_positions.v1", "nodes": {}}
+    if os.path.exists(p):
+        try:
+            with open(p) as fh:
+                got = json.load(fh)
+            if isinstance(got, dict) and isinstance(got.get("nodes"), dict):
+                doc = got
+        except (OSError, ValueError):
+            pass
+    doc["nodes"][node] = {
+        "class": st.get("class"), "lat_deg": pos.get("mean_lat"), "lon_deg": pos.get("mean_lon"),
+        "h_ell_m": pos.get("mean_hell_m"), "hacc_m": pos.get("hacc_m"),
+        "vacc_m": pos.get("vacc_m"), "fixes": pos.get("n"), "fix": gps.get("fix"),
+        "at": now, "uptime_s": st.get("uptime_s"), "source": "/status pos.mean_*"}
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(doc, fh, indent=2, sort_keys=True)
+    os.replace(tmp, p)
+    return {"fixes": pos.get("n"), "hacc_m": pos.get("hacc_m")}
+
+
+#: Two runs saw the same boot when the boot EPOCH they imply (run time minus uptime) agrees to
+#: within this. Comparing uptimes alone reads a reboot as continuity once the new boot has been up
+#: longer than the old one was.
+BOOT_EPOCH_TOLERANCE_S = 300.0
+
+
+def _same_boot(prev: Dict[str, Any], uptime_s: Optional[int], total: Optional[int],
+               stamp: float) -> bool:
+    if prev.get("uptime_s") is None or prev.get("at") is None or uptime_s is None:
+        return False
+    if total is not None and int(total) < int(prev.get("last_i", -1)) + 1:
+        return False
+    implied = float(stamp) - float(uptime_s)
+    was = float(prev["at"]) - float(prev["uptime_s"])
+    return abs(implied - was) <= BOOT_EPOCH_TOLERANCE_S
+
+
+def live_ring_loss(prev: Dict[str, Any], served: Sequence[int], total: Optional[int],
+                   uptime_s: Optional[int], stamp: float) -> Tuple[Optional[int], Optional[str]]:
+    """(detections the pool will never see, why that number is partial or absent).
+
+    `served` is every `i` this run's /detections carried and `total` is /status audio.detections,
+    the node's detection count this boot. None is UNMEASURED, never zero.
+    """
+    first = min(served) if served else None
+    if not prev:
+        return None, ("first sighting of this node's live ring, so rows before this run are "
+                      "unmeasured")
+    if not _same_boot(prev, uptime_s, total, stamp):
+        aged = first if first is not None else total
+        return (None if aged is None else int(aged)), (
+            "the node rebooted since the last run: counted are this boot's rows that aged out "
+            "before this run; the previous boot's rows after the last run are unmeasured")
+    last = int(prev.get("last_i", -1))
+    if total is not None:
+        got = sum(1 for i in served if i > last)
+        return max(0, int(total) - (last + 1) - got), None
+    if first is None:
+        return None, "/status states no detection count and the ring was empty"
+    return max(0, first - last - 1), None
+
+
+def _drain_live_ring(pl: "P.Pool", node: str, ip: str, st: Dict[str, Any], out: Dict[str, Any],
+                     timeout: float, stamp: int) -> Dict[str, Any]:
+    """A node reporting `sd: false` has no card files, so its detections exist only in the live
+    ring. Scene and clips are NOT APPLICABLE to it, which is a different answer from UNKNOWN."""
+    out["no_card"] = True
+    out["unfetched_unknown"] = False
+    out["unfetched_reason"] = "the node reports no card, so it writes no scene file"
+    out["clips_unknown"] = False
+    out["clips_reason"] = "the node reports no card, so it writes no clips"
+    out["live_ring_rows"] = None
+    out["live_ring_lost"] = None
+    try:
+        body = fetch_detections(ip, timeout)
+        ring = json.loads(body.decode("utf-8", "replace"))
+    except Exception as e:
+        out["errors"].append("detections: %r" % (e,))
+        out["live_ring_reason"] = "/detections could not be fetched, so nothing was measured"
+        return out
+    path = archive(pl.root, node, "detections.json", body, stamp)
+    try:
+        entry = pl.ingest_detections_json(path, default_node=node,
+                                          origin="%s:/detections" % node)
+    except Exception as e:
+        out["errors"].append("detections: ingest: %r" % (e,))
+        out["live_ring_reason"] = "the /detections body did not ingest, so no row was stored"
+        return out
+    out["added"] += entry["added"]
+    out["files"].append({"name": "/detections", "bytes": len(body), "ingested": True,
+                         "live_ring": True, "archived": path,
+                         **{k: entry[k] for k in ("generation", "rows", "added", "duplicate",
+                                                  "skipped", "skip_reasons")}})
+    served = sorted(int(d["i"]) for d in ring
+                    if isinstance(d, dict) and isinstance(d.get("i"), int))
+    audio = st.get("audio") if isinstance(st.get("audio"), dict) else {}
+    total = audio.get("detections") if isinstance(audio.get("detections"), int) else None
+    up = st.get("uptime_s")
+    wm = read_watermarks(pl.root)
+    node_wm = dict(wm.get(node) or {})
+    prev = node_wm.get("live_ring") or {}
+    lost, why = live_ring_loss(prev, served, total, up, stamp)
+    out["live_ring_rows"] = len(served)
+    out["live_ring_lost"] = lost
+    out["live_ring_reason"] = why
+    same_boot = _same_boot(prev, up, total, stamp)
+    last_i = max(served) if served else (int(prev.get("last_i", -1)) if same_boot else -1)
+    node_wm["live_ring"] = {"last_i": last_i, "uptime_s": up, "at": stamp}
+    wm[node] = node_wm
+    write_watermarks(pl.root, wm)
+    out["ok"] = not out["errors"]
+    return out
+
+
 def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOUT_S,
                stamp: Optional[int] = None,
                clip_max_per_node: int = CLIP_MAX_PER_NODE_DEFAULT,
@@ -1223,6 +1360,14 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
         out["clips_reason"] = ("%s answered as %r, so no clip of %r's was measured"
                                % (ip, said, node))
         return out
+
+    try:
+        out["position"] = record_node_position(pl.root, node, st, stamp)
+    except Exception as e:
+        # advisory: a position that did not file must not cost the node its data lanes
+        out["position_error"] = repr(e)
+    if st.get("sd") is False:
+        return _drain_live_ring(pl, node, ip, st, out, timeout, stamp)
 
     for name in CONTEXT_FILES:
         try:
@@ -1587,7 +1732,9 @@ def write_heartbeat(root: str, results: List[Dict[str, Any]], phone: Optional[Di
         if not isinstance(ring, list):
             ring = []
         ring.append({"at": now, "bytes": measured, "reason": r.get("unfetched_reason"),
-                     "missing": bool(r.get("scene_missing"))})
+                     "missing": bool(r.get("scene_missing")),
+                     # present only on a card-less run, so every other ring entry is unchanged
+                     **({"no_card": True} if r.get("no_card") else {})})
         s["unfetched_recent"] = ring[-UNFETCHED_RING:]
         # ⚠️THE CLIP COUNTERS GO IN THE SAME RING, FOR THE SAME REASON. A cap that binds during a
         # burst is the failure mode the deadline creates, and `check` runs `17 * * * *` against a
@@ -1610,8 +1757,17 @@ def write_heartbeat(root: str, results: List[Dict[str, Any]], phone: Optional[Di
                       "refused": None if c_unknown else (r.get("clips_refused") or {}),
                       "cap_reason": r.get("clips_cap_reason"),
                       "unknown": c_unknown,
+                      **({"no_card": True} if r.get("no_card") else {}),
                       "reason": r.get("clips_reason")})
         s["clips_recent"] = cring[-UNFETCHED_RING:]
+        if r.get("no_card"):
+            s["no_card"] = True
+            lring = s.get("live_recent")
+            if not isinstance(lring, list):
+                lring = []
+            lring.append({"at": now, "rows": r.get("live_ring_rows"), "added": r.get("added"),
+                          "lost": r.get("live_ring_lost"), "reason": r.get("live_ring_reason")})
+            s["live_recent"] = lring[-UNFETCHED_RING:]
         if r["ok"]:
             s["last_success_s"] = now
             s["last_added"] = r["added"]
@@ -1664,6 +1820,9 @@ def _unfetched_note(s: Dict[str, Any], now: float, max_unfetched_bytes: int,
     recent = [e for e in ring if float(e.get("at") or 0) >= now - window_s]
     if not recent:
         return "  unfetched none in the last %.0f s" % window_s, False
+    if all(e.get("no_card") for e in recent):
+        return "  scene n/a (no card)", False
+    recent = [e for e in recent if not e.get("no_card")]
     total = sum(int(e["bytes"]) for e in recent if e.get("bytes") is not None)
     unknown = [e for e in recent if e.get("bytes") is None]
     missing = [e for e in recent if e.get("missing")]
@@ -1708,6 +1867,9 @@ def _clip_note(s: Dict[str, Any], now: float, max_deferred: int, max_lost: int,
     recent = [e for e in ring if float(e.get("at") or 0) >= now - window_s]
     if not recent:
         return "  clips none in the last %.0f s" % window_s, False
+    if all(e.get("no_card") for e in recent):
+        return "  clips n/a (no card)", False
+    recent = [e for e in recent if not e.get("no_card")]
     known = [e for e in recent if not e.get("unknown")]
     unknown = [e for e in recent if e.get("unknown")]
     fetched = sum(int(e.get("fetched") or 0) for e in known)
@@ -1745,6 +1907,31 @@ def _clip_note(s: Dict[str, Any], now: float, max_deferred: int, max_lost: int,
         note += ("  clips UNKNOWN for %d of %d run(s) (%s)"
                  % (len(unknown), len(recent),
                     unknown[-1].get("reason") or "no reason recorded"))
+    return note, bad
+
+
+def _live_ring_note(s: Dict[str, Any], now: float, window_s: float) -> Tuple[str, bool]:
+    """(text, is-it-a-failure) for a card-less node's live ring, with the same three states: a
+    run whose loss is None measured nothing and is UNKNOWN, never a clean zero."""
+    ring = s.get("live_recent")
+    if not isinstance(ring, list) or not ring:
+        return "", False
+    recent = [e for e in ring if float(e.get("at") or 0) >= now - window_s]
+    if not recent:
+        return "  live ring none in the last %.0f s" % window_s, False
+    rows = sum(int(e.get("rows") or 0) for e in recent)
+    added = sum(int(e.get("added") or 0) for e in recent)
+    lost = sum(int(e["lost"]) for e in recent if e.get("lost") is not None)
+    unknown = [e for e in recent if e.get("lost") is None]
+    note = "  live ring %d row(s) read, +%d new over %d run(s)" % (rows, added, len(recent))
+    bad = False
+    if lost > 0:
+        note += ("  ⚠️LIVE RING LOST %d detection(s) the drain never read (/detections serves only "
+                 "the newest %d)" % (lost, LIVE_RING_HTTP_MAX))
+        bad = True
+    if unknown:
+        note += ("  loss UNKNOWN for %d of %d run(s) (%s)"
+                 % (len(unknown), len(recent), unknown[-1].get("reason") or "no reason recorded"))
     return note, bad
 
 
@@ -1792,6 +1979,8 @@ def check(root: str, max_stale_s: float = DEFAULT_MAX_STALE_S,
         bad += clip_bad
         ring_note, ring_bad = _ring_wall_span_note(ring_polls.get(name), max_ring_wall_span)
         bad += ring_bad
+        live_note, live_bad = _live_ring_note(s, now, unfetched_window_s)
+        bad += live_bad
         if s.get("ls_truncated_at"):
             # Not fatal: the fetch and the ingest are unaffected. But scene_names() and the clip
             # work list are both built from a listing the node says it cut short, so a run on a
@@ -1800,15 +1989,15 @@ def check(root: str, max_stale_s: float = DEFAULT_MAX_STALE_S,
                           % int(s["ls_truncated_at"]))
         last = s.get("last_success_s")
         if last is None:
-            lines.append("%-10s NEVER succeeded (last error: %s)%s%s%s"
-                         % (name, s.get("last_error"), gap_note, clip_note, ring_note))
+            lines.append("%-10s NEVER succeeded (last error: %s)%s%s%s%s"
+                         % (name, s.get("last_error"), gap_note, clip_note, live_note, ring_note))
             bad += 1
             continue
         age = now - float(last)
         state = "STALE" if age > max_stale_s else "ok"
         bad += state == "STALE"
-        lines.append("%-10s %-5s last success %.0f s ago%s%s%s%s"
-                     % (name, state, age, gap_note, clip_note, ring_note, "" if not s.get("last_error")
+        lines.append("%-10s %-5s last success %.0f s ago%s%s%s%s%s"
+                     % (name, state, age, gap_note, clip_note, live_note, ring_note, "" if not s.get("last_error")
                         else "  (last error: %s)" % s["last_error"]))
     return (1 if bad else 0), lines
 
@@ -1925,6 +2114,12 @@ def main(argv=None) -> int:
             print("%-9s %-4s +%d sketch, +%d scene%s" % (
                 r["node"], "ok" if r["ok"] else "FAIL", r["added"], r.get("scene_added", 0),
                 "" if r["ok"] else "  " + "; ".join(r["errors"])))
+            if r.get("no_card"):
+                lost = r.get("live_ring_lost")
+                print("    no card: live ring %s row(s) read, %s"
+                      % (r.get("live_ring_rows"),
+                         "%d lost" % lost if lost is not None
+                         else "loss UNMEASURED (%s)" % r.get("live_ring_reason")))
             if r.get("clips_unknown"):
                 print("    clips UNMEASURED this run, not clean: %s" % r.get("clips_reason"))
             elif r.get("clips_seen"):
@@ -1960,6 +2155,8 @@ def main(argv=None) -> int:
                           % (f["name"], f["generation"], f["rows"], f["added"], f["duplicate"],
                              f["skipped"], f["skip_reasons"] or "",
                              "  [tail]" if f.get("partial_first_line") else ""))
+                    if f.get("live_ring"):
+                        continue
                     g = f.get("gap") or {}
                     if g.get("unfetched_bytes") is None and not g.get("whole_file"):
                         print("      reach-back UNKNOWN: /ls gave no size for this file")

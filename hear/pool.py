@@ -323,6 +323,11 @@ def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+#: The /detections (hear_node.ino: h_dets) fields that map straight onto a dets.csv row.
+LIVE_RING_COLUMNS = ("utc_us", "uptime_s", "sample", "pps_n", "us_since_pps", "trigger",
+                     "flags", "fs_hz")
+
+
 class Pool:
     """An append-only, content-addressed store of sketches under one directory."""
 
@@ -444,6 +449,55 @@ class Pool:
             "decode_errors": bad, "schema_version": SCHEMA_VERSION,
         }
         assert entry["rows"] == added + entry["duplicate"] + skipped, entry
+        self._ledger(entry)
+        return entry
+
+    def ingest_detections_json(self, path: str, default_node: str,
+                               origin: Optional[str] = None) -> Dict[str, Any]:
+        """Ingest one archived `/detections` body, the live ring of a node with no card.
+
+        Idempotent like ingest_dets: consecutive runs overlap and re-reading a row adds 0. The
+        body carries no node name, so `default_node` is required and every row is filed under it.
+        """
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        sha = hashlib.sha256(raw).hexdigest()
+        obj = json.loads(raw.decode("utf-8", "replace"))
+        if not isinstance(obj, list):
+            raise ValueError("%s: /detections body is %s, not a list" % (path, type(obj).__name__))
+        recs: List[Dict[str, Any]] = []
+        bad: Dict[str, int] = {}
+        for d in obj:
+            if not isinstance(d, dict):
+                bad["not_an_object"] = bad.get("not_an_object", 0) + 1
+                continue
+            hexs = d.get("frame") or ""
+            n = d.get("frame_len")
+            try:
+                short = n is not None and len(hexs) != 2 * int(n)
+            except (TypeError, ValueError):
+                short = True
+            if short:
+                # a truncated body is otherwise indistinguishable from a smaller sketch
+                bad["frame_len_mismatch"] = bad.get("frame_len_mismatch", 0) + 1
+                continue
+            row = {k: d[k] for k in LIVE_RING_COLUMNS if k in d}
+            if row.get("sample") is not None:
+                row["sample"] = str(row["sample"])
+            row.update(frame_hex=hexs, node=default_node, clip=d.get("clip") or None,
+                       schema="live")
+            try:
+                recs.append(_record_from_node_row(row))
+            except Exception as e:
+                r = "decode_" + type(e).__name__
+                bad[r] = bad.get(r, 0) + 1
+        added = self._append(recs)
+        entry = {"kind": "detections.json", "path": os.path.abspath(path),
+                 "origin": origin or path, "sha256": sha, "bytes": len(raw),
+                 "generation": "live", "rows": len(obj), "decoded": len(recs), "added": added,
+                 "duplicate": len(recs) - added, "skipped": sum(bad.values()),
+                 "skip_reasons": bad, "schema_version": SCHEMA_VERSION}
+        assert entry["rows"] == added + entry["duplicate"] + entry["skipped"], entry
         self._ledger(entry)
         return entry
 

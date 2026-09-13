@@ -525,6 +525,40 @@ def _iter_raw(root: str, sources: Sequence[str]) -> Iterator[Tuple[str, Optional
 
 # ================================================================= geometry (composed, not written)
 
+def _augment_with_node_gps(sv: SV.Survey, path: Optional[str], now: float
+                           ) -> Tuple[SV.Survey, List[Dict[str, Any]]]:
+    """`sv` plus the unsurveyed nodes tools/hear_drain.py holds a usable GPS mean for.
+
+    ⚠️NEVER A REFUSAL. A missing or unreadable positions file leaves the survey exactly as loaded
+    and says why in the report: the fallback can only add receivers, never cost one.
+    """
+    if not path:
+        return sv, []
+    try:
+        with open(path) as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return sv, [{"name": None, "used": False, "why": "no positions file at %s" % path}]
+    except (OSError, ValueError) as exc:
+        return sv, [{"name": None, "used": False,
+                     "why": "positions file %s is unreadable: %s" % (path, exc)}]
+    nodes = doc.get("nodes") if isinstance(doc, dict) else None
+    return SV.augment_from_node_gps(sv, nodes, now)
+
+
+def _with_position_sigma(t_sigma_s: float, sv: SV.Survey, node_id: int,
+                         policy: Dict[str, Any]) -> float:
+    """A GPS-positioned receiver's position sigma, as time, RSS'd into its arrival sigma.
+
+    Surveyed receivers are returned unchanged: their sigma_m has never been in the solver weights
+    (nodeclass.py's budget note), and putting it there would move every existing solve.
+    """
+    if sv.position_sources.get(node_id, "survey") == "survey":
+        return t_sigma_s
+    c_mps = SW.sound_speed(policy["temp_c"])
+    return math.hypot(float(t_sigma_s), float(sv.sigma_m[node_id]) / float(c_mps))
+
+
 def arrival_survey(sv: SV.Survey, min_nodes: int = 3) -> SV.Survey:
     """The sub-survey of receivers whose hardware class admits their timestamps as arrivals.
 
@@ -544,6 +578,7 @@ def arrival_survey(sv: SV.Survey, min_nodes: int = 3) -> SV.Survey:
                   names={i: sv.names[i] for i in keep},
                   sigma_m={i: sv.sigma_m[i] for i in keep},
                   classes={i: sv.classes[i] for i in keep},
+                  position_sources={i: sv.position_sources.get(i, "survey") for i in keep},
                   origin=sv.origin)
     if len(s) < int(min_nodes):
         raise Refusal("survey has %d arrival-class receiver(s) (%s), solver needs %d. A 2-sensor "
@@ -767,9 +802,12 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
                     why = "%s: %s" % (type(exc).__name__, exc)
                 _drop(day, row, D_NOT_ARRIVAL, _detail(row, why))
             else:
+                gps_why = (policy.get("gps_refused") or {}).get(name)
                 _drop(day, row, D_UNSURVEYED,
                       _detail(row, "no survey entry, so no position and no int node_id; "
-                                   "associate() would call int(%r)" % (name,)))
+                                   "associate() would call int(%r)%s"
+                                   % (name, "; node GPS fallback not used: %s" % gps_why
+                                      if gps_why else "")))
             continue
         nid = name_to_id[name]
         cname = sv.classes.get(nid)
@@ -924,7 +962,9 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
             # `event["arrival_sigma_s"]` index-aligned with `arrivals`; solve_event() hands it
             # to the solver. None when the producer stated nothing: that is the class figure and
             # not a measurement, and a solver must be able to tell the two apart.
-            "t_sigma_s": (None if ssig is None else NC.stamp_t_sigma_s(ssig, gcls)),
+            "t_sigma_s": (None if ssig is None else
+                          _with_position_sigma(NC.stamp_t_sigma_s(ssig, gcls), arr_sv,
+                                               int(nid), policy)),
             # A REAL BOOLEAN for the same reason `utc_trusted` below is one: associate() cannot
             # resolve it, because the budget is per CLASS and associate has never seen a class.
             # None here means the producer stated no sigma, which that gate reads as usable.
@@ -1605,6 +1645,8 @@ def model_card(sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
         "array": {
             "arrival_node_ids": ids,
             "arrival_names": [arr_sv.names[i] for i in ids],
+            "position_sources": {arr_sv.names[i] or str(i): arr_sv.position_sources.get(i, "survey")
+                                 for i in ids},
             "aperture_m": aperture,
             "pair_bounds_ms": {"%d|%d" % k: v["bound_s"] * 1e3 for k, v in sorted(bounds.items())},
             "pair_separations_m": {"%d|%d" % k: v["d_m"] for k, v in sorted(bounds.items())},
@@ -1789,6 +1831,9 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
         raise Refusal("survey %s did not load: %s" % (survey_path, exc))
     except OSError as exc:
         raise Refusal("survey %s is unreadable: %s" % (survey_path, exc))
+    sv, gps_report = _augment_with_node_gps(sv, policy.get("gps_positions"), now)
+    policy["gps_refused"] = {r["name"]: r["why"] for r in gps_report
+                             if r.get("name") and not r.get("used")}
     arr_sv = arrival_survey(sv, min_nodes=3)
     fixed_up = policy["fixed_up_m"]
     if fixed_up is None and len(arr_sv) < 4:
@@ -1822,7 +1867,8 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
         "run_id": _dt.datetime.fromtimestamp(now, _dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
         "at": now,
         "pool": pool_root, "out": out, "survey": survey_path,
-        "policy": {k: v for k, v in sorted(policy.items()) if k != "latency_cal"},
+        "policy": {k: v for k, v in sorted(policy.items())
+                   if k not in ("latency_cal", "gps_refused")},
         # ⚠️MEASURED, NOT ASSERTED. Whether a stated per-arrival sigma actually reached the
         # solver is a fact about the code this run imported, and a report that only said the
         # sigma was "carried" would be true while every receiver still voted at par. `delivered`
@@ -1841,6 +1887,9 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
             "all_ids": list(sv.ids), "all_names": [sv.names[i] for i in sv.ids],
             "arrival_ids": list(arr_sv.ids),
             "arrival_names": [arr_sv.names[i] for i in arr_sv.ids],
+            "position_sources": {sv.names[i] or str(i): sv.position_sources.get(i, "survey")
+                                 for i in sv.ids},
+            "gps_fallback": gps_report,
             "refused_as_arrivals": [{"node_id": i, "name": sv.names[i],
                                      "class": sv.classes.get(i) or "(unstated)",
                                      "sigma_m": sv.sigma_m[i], "why": _why_refused(sv, i)}
@@ -2048,6 +2097,7 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
             "arrival_sigma_s": sigmas,
             "pool_keys": pkeys,
             "node_names": [d["node_name"] for d in group],
+            "position_sources": [arr_sv.position_sources.get(i, "survey") for i in ids],
             "n_nodes": len(group), "n_equations": len(group) - 1,
             "model": model, "source_class": policy["source_class"],
             "solution": sol, "solver_error": err,
@@ -2599,6 +2649,14 @@ def format_report(t: Dict[str, Any]) -> str:
                   ", ".join(sb.get("arrival_names") or [])))
     for r in sb.get("refused_as_arrivals") or []:
         out.append("         REFUSED %s (sigma %.2f m): %s" % (r["name"], r["sigma_m"], r["why"]))
+    for r in sb.get("gps_fallback") or []:
+        if r.get("used"):
+            out.append("         GPS-POSITIONED %s (no survey entry): sigma %.2f m from hAcc %.2f m "
+                       "over %d fixes, %.0f s old" % (r["name"], r["sigma_m"], r["hacc_m"],
+                                                       r["fixes"], r["age_s"]))
+        else:
+            out.append("         gps fallback not used%s: %s"
+                       % (" for %s" % r["name"] if r.get("name") else "", r["why"]))
     a = t.get("association") or {}
     m = t.get("margin") or {}
     if a:
@@ -2790,6 +2848,10 @@ def main(argv=None) -> int:
                          "onset_quality block")
     ap.add_argument("--latency-cal", default=None,
                     help="acoustic_latency_calibration.json from tools/hear_latency_cal.py")
+    ap.add_argument("--gps-positions", default=None,
+                    help="node GPS means recorded by hear-drain, used to position a node that has "
+                         "no survey entry (default <pool>/state/node_positions.json; 'none' "
+                         "disables)")
     ap.add_argument("--null-trials", type=int, default=DEFAULT_NULL_TRIALS)
     ap.add_argument("--null-seed", type=int, default=DEFAULT_NULL_SEED)
     ap.add_argument("--calibrate", action="store_true")
@@ -2810,12 +2872,18 @@ def main(argv=None) -> int:
 
     root = os.path.expanduser(a.pool)
     out = os.path.expanduser(a.out) if a.out else out_dir_default(root)
+    if a.gps_positions is not None and a.gps_positions.strip().lower() == "none":
+        gps_path = None
+    else:
+        gps_path = os.path.expanduser(a.gps_positions
+                                      or os.path.join(root, "state", "node_positions.json"))
 
     if a.check:
         expect = None
         try:
             sv = SV.load_survey(os.path.expanduser(a.survey), min_nodes=3,
                                 require_real_origin=True)
+            sv, _gps = _augment_with_node_gps(sv, gps_path, time.time())
             expect = AS.max_window_s(
                 arrival_survey(sv), a.temp_c,
                 derive_margin_s(pair_bounds(arrival_survey(sv), SW.sound_speed(a.temp_c)),
@@ -2873,6 +2941,7 @@ def main(argv=None) -> int:
         "target_events": a.target_events, "array_id": a.array_id,
         "allow_phones": bool(a.allow_phones),
         "heterogeneous_receivers": bool(a.admit_heterogeneous_receivers),
+        "gps_positions": gps_path,
     }
 
     try:
