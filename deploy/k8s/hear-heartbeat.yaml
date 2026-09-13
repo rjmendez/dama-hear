@@ -1,0 +1,87 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hear-heartbeat
+  namespace: dama
+  labels:
+    app: hear-heartbeat
+  annotations:
+    dama-hear/what: >-
+      Receives hear_node heartbeat and event POSTs and writes short-TTL Redis liveness keys plus
+      advisory event state.
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hear-heartbeat
+  template:
+    metadata:
+      labels:
+        app: hear-heartbeat
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: receiver
+          image: python:3.13-slim
+          command: ["/bin/sh", "-lc"]
+          args:
+            - |
+              set -e
+              LIB=/deps
+              export PYTHONPATH="$LIB:/app"
+              if ! python -c 'import redis,sys; sys.exit(0 if redis.__version__=="7.4.0" else 1)' 2>/dev/null; then
+                echo "installing redis==7.4.0 into $LIB"
+                pip install --no-cache-dir --upgrade --target "$LIB" 'redis==7.4.0' >/dev/null 2>&1
+              fi
+              exec python /app/tools/hear_heartbeat_receiver.py --port 5051
+          ports:
+            - { name: http, containerPort: 5051, hostPort: 5051 }
+          env:
+            - { name: HEAR_HEARTBEAT_TTL_S, value: "30" }
+            - { name: HEAR_HEARTBEAT_SOCKET_TIMEOUT_S, value: "0.5" }
+            - { name: REDIS_HOST, value: "100.73.200.19" }
+            - { name: REDIS_PORT, value: "30379" }
+            - name: REDIS_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: hear-heartbeat-redis
+                  key: password
+                  optional: true
+            - name: HEAR_HEARTBEAT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hear-heartbeat-token
+                  key: token
+          volumeMounts:
+            - { name: code, mountPath: /app/tools/hear_heartbeat_receiver.py, subPath: tools_hear_heartbeat_receiver.py }
+            - { name: deps, mountPath: /deps }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: "1",  memory: 256Mi }
+      volumes:
+        - name: code
+          configMap:
+            name: hear-heartbeat-code
+        - name: deps
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hear-heartbeat
+  namespace: dama
+  labels:
+    app: hear-heartbeat
+spec:
+  selector:
+    app: hear-heartbeat
+  ports:
+    - { name: http, port: 5051, targetPort: http }
