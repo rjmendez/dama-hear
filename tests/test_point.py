@@ -318,7 +318,6 @@ def test_solves_at_a_real_utc_epoch_not_just_a_small_t0():
         "accuracy must not depend on the epoch the operator happens to run at"
 
 
-<<<<<<< HEAD
 # --------------------------------------------------------- weighted least squares
 # MEASURED over the 8,720 phone rows that state sync_sigma_ns in the 2026-09-11 pool snapshot
 # (9,356 phone rows, 7,758 node rows). The maximum is why the degenerate case below is real data
