@@ -559,6 +559,20 @@ class TestResumeIsTheStoreItself:
         row = next(iter(TAGS.read_tags(str(tmp_path))))
         assert row["day"] == "2026-09-09"
 
+    def test_work_order_matches_prune_order_and_puts_unanchored_first(self, tmp_path):
+        anchored = store_clip(tmp_path, sample=1, ts=1788997850.0)
+        unanchored = store_clip(tmp_path, sample=2, anchored=False)
+        for row, mtime in ((anchored, 1_700_000_000), (unanchored, 1_800_000_000)):
+            p = os.path.join(str(tmp_path), row["path"])
+            os.utime(p, (mtime, mtime))
+        index = CLIPS.read_index(str(tmp_path))
+        files = [{"day": HT._row_day(row), "mtime": os.path.getmtime(os.path.join(str(tmp_path),
+                  row["path"])), "node": row["node"], "basename": os.path.basename(row["path"]),
+                  "clip_key": row["clip_key"]} for row in index.values()]
+        want = [f["clip_key"] for f in sorted(files, key=CLIPS._prune_order)]
+        got = [r["clip_key"] for r in HT.work_order(index, str(tmp_path))]
+        assert want == got == [unanchored["clip_key"], anchored["clip_key"]]
+
 
 # ----------------------------------------------------------------- the scene join (seam S7)
 
