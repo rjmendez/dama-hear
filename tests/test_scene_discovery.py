@@ -60,6 +60,43 @@ def test_prev_is_never_mistaken_for_the_live_file():
     assert "scene-prev.csv" in names
 
 
+def test_rolled_daily_scene_partitions_are_discovered_and_never_live():
+    # Rolled files created on header change (e.g. scene-20260909-prev.csv) or pre-lock roll
+    # must be fetched whole and never mistaken for the live tailed file.
+    ls = {
+        "scene-20260908.csv": 9_000_000,
+        "scene-20260908-prev.csv": 4_500_000,
+        "scene-20260909.csv": 2_000_000,
+        "scene-20260909-prev.csv": 1_000_000,
+        "scene-00000000.csv": 4_096,
+        "scene-00000000-prev.csv": 2_048,
+        "scene.csv": 20_000_000,
+        "scene-prev.csv": 10_000_000,
+    }
+    names, live = scene_names(ls)
+    assert live == "scene-20260909.csv"
+    assert set(names) == {
+        "scene-20260908.csv", "scene-20260908-prev.csv",
+        "scene-20260909.csv", "scene-20260909-prev.csv",
+        "scene-00000000.csv", "scene-00000000-prev.csv",
+        "scene.csv", "scene-prev.csv",
+    }
+
+
+def test_adaptive_timeout_for_large_rolled_files():
+    # 20 MB at 40 KB/s transfer rate takes ~500 s; timeout must adapt beyond 30 s default.
+    t_20mb = HD.rolled_file_timeout(20_000_000, base_timeout=30.0)
+    assert t_20mb >= 530.0, "20 MB file over Wi-Fi needs at least 500 s + margin"
+
+    # When size is unknown (None), sensible default must be at least 300 s (5 min).
+    t_none = HD.rolled_file_timeout(None, base_timeout=30.0)
+    assert t_none >= 300.0
+
+    # Small file should not drop below base timeout
+    t_small = HD.rolled_file_timeout(1024, base_timeout=30.0)
+    assert t_small >= 30.0
+
+
 # ---------------------------------------------------------------- the refetch the discovery cost
 
 class MultiFileNode:
@@ -74,6 +111,7 @@ class MultiFileNode:
         self.node = node
         self.files = dict(files)                 # name -> bytes
         self.sd_calls = []                       # (name, tail)
+        self.sd_timeouts = {}                    # name -> timeout
         self.bytes_served = 0
 
     def status(self, ip, timeout=None):
@@ -83,6 +121,7 @@ class MultiFileNode:
 
     def sd(self, ip, name, timeout=None, tail=None):
         self.sd_calls.append((name, tail))
+        self.sd_timeouts[name] = timeout
         body = self.files.get(name)
         if body is None:
             return None
@@ -186,3 +225,30 @@ def test_yesterdays_tailed_file_is_not_skipped_on_its_tail_mark(tmp_path, multi)
         HD.SCENE_TAIL_BYTES = old
     assert len(_fetched_whole(n, "scene-20260909.csv")) == 1, \
         "the rolled file was skipped on a mark that a tail wrote, stranding its early rows"
+
+
+def test_daily_prev_file_is_pulled_whole_with_adaptive_timeout_and_skipped_when_unchanged(tmp_path, multi):
+    # scene-20260908-prev.csv is a rolled file from a header change on that date.
+    # It must be fetched whole with an adaptive timeout, ingested, and skipped on subsequent runs.
+    prev_bytes = _scene_bytes(250)
+    live_bytes = _scene_bytes(5, start_uptime=5000)
+    n = multi({
+        "scene-20260908-prev.csv": prev_bytes,
+        "scene-20260908.csv": _scene_bytes(20),
+        "scene-20260909.csv": live_bytes,
+    })
+    pl = P.Pool(str(tmp_path / "pool"))
+    out1 = HD.drain_node(pl, n.node, "10.0.0.1")
+    assert out1["ok"]
+    assert len(_fetched_whole(n, "scene-20260908-prev.csv")) == 1
+    # Check timeout passed was adaptive
+    expected_timeout = HD.rolled_file_timeout(len(prev_bytes), HD.DEFAULT_TIMEOUT_S)
+    assert n.sd_timeouts["scene-20260908-prev.csv"] == expected_timeout
+
+    # Second drain run: unchanged rolled file must be skipped
+    out2 = HD.drain_node(pl, n.node, "10.0.0.1")
+    assert out2["ok"]
+    assert len(_fetched_whole(n, "scene-20260908-prev.csv")) == 1, "rolled file should not be refetched"
+    skipped = [f["name"] for f in out2["files"] if f.get("skipped_unchanged")]
+    assert "scene-20260908-prev.csv" in skipped
+
