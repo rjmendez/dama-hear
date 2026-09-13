@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import types
 
 import numpy as np
 import pytest
@@ -98,6 +99,48 @@ class TestEmbedOnlyGates:
         assert HT.main(["--lane", "perch_v2", "--model-dir", str(tmp_path),
                         "--verify-weights"]) == 2
         assert "saved_model.pb" in capsys.readouterr().err
+
+
+class TestTheConstructorVerifiesPinnedFiles:
+
+    def _fake_tensorflow(self, monkeypatch):
+        class _Shape(tuple):
+            @property
+            def rank(self):
+                return len(self)
+
+        sig = types.SimpleNamespace(
+            structured_outputs={
+                "embedding": types.SimpleNamespace(shape=_Shape((None, HT.PERCH_EMBED_DIM)))
+            },
+            structured_input_signature=(
+                None,
+                {"waveform": types.SimpleNamespace(shape=_Shape((None, HT.PERCH_WINDOW)))},
+            ),
+        )
+        tf = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                list_physical_devices=lambda kind: [object()] if kind == "GPU" else [],
+                experimental=types.SimpleNamespace(set_memory_growth=lambda *_a, **_kw: None),
+            ),
+            saved_model=types.SimpleNamespace(
+                load=lambda _p: types.SimpleNamespace(signatures={"serving_default": sig})
+            ),
+        )
+        monkeypatch.setitem(sys.modules, "tensorflow", tf)
+
+    def test_perch_refuses_tampered_weights_by_default(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(HT, "verify_perch", lambda _d: {
+            "ok": False, "problems": ["perch tampered"]})
+        with pytest.raises(HT.WeightsRefused, match="perch tampered"):
+            HT.PerchEmbedder(str(tmp_path))
+
+    def test_perch_skip_requires_an_explicit_unsafe_flag(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(HT, "verify_perch", lambda _d: {
+            "ok": False, "problems": ["perch tampered"]})
+        self._fake_tensorflow(monkeypatch)
+        emb = HT.PerchEmbedder(str(tmp_path), unsafe_skip_verification=True)
+        assert emb.verified is None
 
 
 class TestThePinnedFiles:
