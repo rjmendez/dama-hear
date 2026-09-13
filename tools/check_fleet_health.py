@@ -38,6 +38,9 @@ DEPLOYED_DEFAULT_IPS: Dict[str, str] = {
     "nyquist": "172.16.100.105",
     "mach": "172.16.100.116",
     "rankine": "172.16.100.50",
+    "gold": "172.16.100.82",
+    "ageev": "172.16.100.83",
+    "kasami": "172.16.100.90",
 }
 
 DEFAULT_OPNSENSE = "https://172.16.100.1"
