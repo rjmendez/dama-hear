@@ -469,6 +469,7 @@ class TestTheArithmeticCloses:
         self._closed(e)
         assert e["skipped"] == 3 and e["added"] == 0
         assert e["skip_reasons"] == {"decode_AttributeError": 3}
+        assert pl.stats()["skipped_at_ingest"] == {"decode_AttributeError": 3}
 
     def test_float_utc_and_padded_frame_ingest_without_decode_value_error(self, tmp_path):
         pl = P.Pool(str(tmp_path / "pool"))
