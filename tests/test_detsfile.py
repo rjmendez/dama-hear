@@ -129,3 +129,12 @@ class TestRefusals:
         s = DF.read_text(text).summary()
         assert s == {"generation": "G5", "rows": 1, "skipped": 1,
                      "reasons": {"frame_hex_len_4": 1}}
+
+    def test_padded_frame_hex_and_float_utc_us_parse_cleanly(self):
+        fh_padded = _frame_hex() + "0000"
+        body_float_utc = "1788763952189911.0,1234,5000000,42,597174,1140,4608,16000.000"
+        text = _csv(DF.G5.declared, ["mach,%s,64,%s,," % (body_float_utc, fh_padded)])
+        got = DF.read_text(text)
+        assert len(got.rows) == 1
+        assert not got.skips
+        assert got.rows[0]["utc_us"] == "1788763952189911.0"
