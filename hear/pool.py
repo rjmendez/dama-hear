@@ -927,8 +927,6 @@ class Pool:
         for e in led:
             for k, v in (e.get("skip_reasons") or {}).items():
                 skips[k] = skips.get(k, 0) + v
-            for k, v in (e.get("decode_errors") or {}).items():
-                skips[k] = skips.get(k, 0) + v
         return {"records": n, "by_source": by_source, "by_node": by_node, "by_fs_hz": by_fs,
                 "by_day": by_day, "anchored": anchored, "unanchored": n - anchored,
                 "by_clock_tier": by_tier,
