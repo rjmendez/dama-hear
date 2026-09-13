@@ -346,22 +346,19 @@ def weights_paths(model_dir: str) -> Tuple[str, str]:
     return os.path.join(d, MODEL_FILE), os.path.join(d, CLASSMAP_FILE)
 
 
-def verify_weights(model_dir: str) -> Dict[str, Any]:
-    """Both artifacts present, right size, right sha256. Never raises; the caller decides.
-
-    ⚠️IT HASHES THE FILE, IT DOES NOT TEST THAT A DIRECTORY EXISTS. The existing numpy guard in
-    deploy/k8s/hear-drain.yaml tested only for a directory and therefore enforced nothing -- the
-    first workload to reach an empty PVC decided the version and the other silently used whatever
-    it found. Existence is the weaker question and it is not the one being asked here.
-    """
-    mp, cp = weights_paths(model_dir)
+def verify_weight_files(model_path: str, class_map_path: str, *,
+                        model_url: str = MODEL_URL,
+                        class_map_url: str = CLASSMAP_URL) -> Dict[str, Any]:
+    """The exact mn10 artifacts passed to a constructor, proven by size and sha256."""
+    mp = os.path.expanduser(model_path)
+    cp = os.path.expanduser(class_map_path)
     out: Dict[str, Any] = {"ok": False, "problems": [], "model_path": mp, "class_map_path": cp,
                            "model_sha256": None, "class_map_sha256": None,
                            "model_bytes": None, "class_map_bytes": None}
     for path, want_sha, want_n, sha_field, n_field, url in (
-            (mp, MODEL_SHA256, MODEL_BYTES, "model_sha256", "model_bytes", MODEL_URL),
+            (mp, MODEL_SHA256, MODEL_BYTES, "model_sha256", "model_bytes", model_url),
             (cp, CLASSMAP_SHA256, CLASSMAP_BYTES, "class_map_sha256", "class_map_bytes",
-             CLASSMAP_URL)):
+             class_map_url)):
         if not os.path.exists(path):
             out["problems"].append("%s is absent. Fetch it from %s" % (path, url))
             continue
@@ -377,6 +374,24 @@ def verify_weights(model_dir: str) -> Dict[str, Any]:
                                    "weights and the run is refused" % (path, got, want_sha))
     out["ok"] = not out["problems"]
     return out
+
+
+def verify_weights(model_dir: str) -> Dict[str, Any]:
+    """Both pinned mn10 artifacts present, right size, right sha256. Never raises.
+
+    ⚠️IT HASHES THE FILE, IT DOES NOT TEST THAT A DIRECTORY EXISTS. The existing numpy guard in
+    deploy/k8s/hear-drain.yaml tested only for a directory and therefore enforced nothing -- the
+    first workload to reach an empty PVC decided the version and the other silently used whatever
+    it found. Existence is the weaker question and it is not the one being asked here.
+    """
+    return verify_weight_files(*weights_paths(model_dir))
+
+
+def require_verified_weights(verified: Dict[str, Any]) -> Dict[str, Any]:
+    """The pinned files must verify before a model can be used."""
+    if not verified["ok"]:
+        raise WeightsRefused('; '.join(verified['problems']))
+    return verified
 
 
 def read_wav(path: str) -> Tuple["Any", int]:
@@ -568,7 +583,13 @@ class Tagger:
     softmax here would invent a competition between Bird and Wind that the model never ran.
     """
 
-    def __init__(self, model_path: str, class_map_path: str):
+    def __init__(self, model_path: str, class_map_path: str,
+                 unsafe_skip_verification: bool = False):
+        if unsafe_skip_verification:
+            self.verified = None
+        else:
+            self.verified = require_verified_weights(
+                verify_weight_files(model_path, class_map_path))
         import numpy as np
         import onnxruntime as ort                                 # lazy: absent in the test env
         self.class_names = load_class_map(class_map_path)
@@ -645,7 +666,9 @@ class PerchEmbedder:
     among the platforms required: [CUDA]"), so this refuses at load instead of after staging.
     """
 
-    def __init__(self, model_dir: str):
+    def __init__(self, model_dir: str, unsafe_skip_verification: bool = False):
+        self.verified = None if unsafe_skip_verification else require_verified_weights(
+            verify_perch(model_dir))
         import numpy as np
         import tensorflow as tf                                   # lazy: absent in the test env
         gpus = tf.config.list_physical_devices("GPU")
@@ -798,7 +821,9 @@ class BirdNETTagger:
 
     wants_time = True
 
-    def __init__(self, model_dir: str):
+    def __init__(self, model_dir: str, unsafe_skip_verification: bool = False):
+        self.verified = None if unsafe_skip_verification else require_verified_weights(
+            verify_birdnet(model_dir))
         import numpy as np
         from ai_edge_litert.interpreter import Interpreter           # lazy: absent in tests
         d = os.path.expanduser(model_dir)
@@ -1029,6 +1054,15 @@ def model_card(verified: Dict[str, Any]) -> Dict[str, Any]:
 
 
 #: model -> how it is verified, loaded, identified on a row, described, and fed.
+def load_verified_model(model: Dict[str, Any], model_dir: str) -> Tuple[Any, Dict[str, Any]]:
+    """Load the model once and reuse the constructor's own verification result."""
+    tagger = model['load'](model_dir)
+    verified = getattr(tagger, 'verified', None)
+    if verified is None:
+        verified = model['verify'](model_dir)
+    return tagger, require_verified_weights(verified)
+
+
 MODELS: Dict[str, Dict[str, Any]] = {
     "mn10": {"verify": verify_weights, "load": lambda d: Tagger(*weights_paths(d)),
              "block": model_block, "card": model_card, "card_file": "tag_model_card.json",
@@ -1337,12 +1371,13 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
         raise ValueError("unknown lane %r; known: %s" % (lane, ", ".join(sorted(LANES))))
     spec = LANES[lane]
     model = MODELS[spec["model"]]
+    if tagger is None:
+        tagger, verified = load_verified_model(model, model_dir)
+    elif verified is None:
+        verified = getattr(tagger, 'verified', None)
     if verified is None:
         verified = model["verify"](model_dir)
-    if tagger is None:
-        if not verified["ok"]:
-            raise WeightsRefused("; ".join(verified["problems"]))
-        tagger = model["load"](model_dir)
+    verified = require_verified_weights(verified)
     mb = model["block"](verified)
 
     t = empty_tally()
@@ -1867,10 +1902,7 @@ def main(argv=None) -> int:
 
     verified = None
     try:
-        verified = model["verify"](a.model_dir)
-        if not verified["ok"]:
-            raise WeightsRefused("; ".join(verified["problems"]))
-        tagger = model["load"](a.model_dir)
+        tagger, verified = load_verified_model(model, a.model_dir)
         reports = [run(root, model_dir=a.model_dir, limit=a.limit, deadline_s=a.deadline_s,
                        floor=a.score_floor, write=not a.census, tagger=tagger,
                        verified=verified, lane=lane) for lane in lanes]
