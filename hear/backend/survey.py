@@ -427,14 +427,17 @@ def _gps_refusal(p, now: float, max_hacc_m: float, min_fixes: int,
         return "position entry is %s, not an object" % type(p).__name__
     if p.get("h_ell_m") is None and p.get("hmsl_m") is not None:
         return "only hmsl_m was reported. %s" % GEO.GEOID_NOTE
+    # ⚠️THE COUNT OF AVERAGED FIXES IS THE QUALITY GATE, NOT THE LIVE `fix` FIELD. `fix` is UBX
+    # fixType on a u-blox node (3 = 3D) and GGA fix quality on a PMTK node (1 = a fix), so one
+    # threshold on it refuses a valid PMTK fix. The firmware only averages fixes that passed its
+    # own 3D and hAcc gate, and a mean of zero fixes is 0.0/0.0, which is not a position.
+    fixes = p.get("fixes")
+    if not _is_number(fixes) or int(fixes) <= 0:
+        return "the node has averaged no position fixes, so its mean is not a position"
     for k in ("lat_deg", "lon_deg", "h_ell_m"):
         if not _is_number(p.get(k)) or not math.isfinite(float(p[k])):
             return "no numeric %s in the node's GPS mean" % k
-    fix = p.get("fix")
-    if not _is_number(fix) or int(fix) < 3:
-        return "GPS fix %r is not a 3D fix" % (fix,)
-    fixes = p.get("fixes")
-    if not _is_number(fixes) or int(fixes) < int(min_fixes):
+    if int(fixes) < int(min_fixes):
         return "only %r fix(es) averaged, need %d" % (fixes, int(min_fixes))
     hacc = p.get("hacc_m")
     if not _is_number(hacc) or float(hacc) > float(max_hacc_m):
