@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hear import clips as CL                                        # noqa: E402
 from hear import detsfile as DF                                     # noqa: E402
 from hear import pool as P                                          # noqa: E402
+from hear import scenefile as SF                                    # noqa: E402
 from hear import sketch as SK                                       # noqa: E402
 from tools import hear_drain as HD                                  # noqa: E402
 
@@ -46,6 +47,18 @@ def _dets_row(clip, node="nyquist", utc_us=1757459321000000, uptime_s=54912, sam
 
 def _dets_csv(rows):
     return (",".join(DF.G5.declared) + "\n" + "\n".join(rows) + "\n").encode()
+
+
+def _scene_csv(node="nyquist", gen=SF.S2):
+    mel_hex = (b"\x11" * (20 * 4)).hex()
+    vals = {
+        "node": node, "utc_us": "1757459321000000", "uptime_s": "54912", "sample": "16384",
+        "bands": "20", "slices": "4", "span_ms": "1024", "ref_db4": "251",
+        "frames": "64", "fft_us": "18987", "mel_hex": mel_hex,
+        "f_lo_hz": "62.5", "f_hi_hz": "7812.5",
+    }
+    row = ",".join(vals[c] for c in gen.written)
+    return (",".join(gen.declared) + "\n" + row + "\n").encode()
 
 
 CLIP_BYTES = 44 + int(CL.CLIP_TOTAL_S * 48000) * 2      # 480044
@@ -91,13 +104,14 @@ class ClipNode:
         self.max_in_flight = 0
         self.dets_raises = False
         self.watch = None                        # callable run at the first clip request
+        self.scene = _scene_csv(node=node)
 
     def status(self, ip, timeout=None):
         return {"node": self.node, "uptime_s": 54912,
                 "acq": {"fs_clean_hz": 16000.0, "win_s": 300, "drop_s": 0, "drop_samples": 0}}
 
     def ls(self, ip, timeout=None):
-        return {"dets.csv": 4557}
+        return {"dets.csv": 4557, "scene.csv": len(self.scene)}
 
     def sd(self, ip, name, timeout=None, tail=None):
         self.sd_calls.append((name, tail))
@@ -107,6 +121,12 @@ class ClipNode:
             return _dets_csv(self.dets_rows) if self.dets_rows else None
         if name == "dets-prev.csv" and self.prev_rows:
             return _dets_csv(self.prev_rows)
+        if name == "scene.csv":
+            body = self.scene
+            if tail and len(body) > tail:
+                body = body[len(body) - tail:]
+                return body if b"\n" in body else None
+            return body
         return None
 
     def get(self, url, timeout=None):
