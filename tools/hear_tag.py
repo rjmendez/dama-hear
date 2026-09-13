@@ -203,9 +203,10 @@ BIRDNET_FILES: Tuple[Tuple[str, str, int], ...] = (
 )
 BIRDNET_CLASSES = 6522
 BIRDNET_FS_HZ = 48000
-#: 3.0 s, the model's input. Windows at 0, 1 and 2 s cover the whole 5.0 s clip.
+#: 3.0 s, the model's input. The default 0.25 s hop gives dense coverage of a 5.0 s clip.
 BIRDNET_WINDOW = 144000
-BIRDNET_HOP = 48000
+BIRDNET_HOP = 12000
+BIRDNET_HOP_S = BIRDNET_HOP / BIRDNET_FS_HZ
 BIRDNET_BANDPASS_HZ = (150.0, 12000.0)
 #: BirdNET-Analyzer's default cut on the range model's output.
 BIRDNET_LOCATION_THRESHOLD = 0.03
@@ -417,8 +418,71 @@ def read_wav(path: str) -> Tuple["Any", int]:
 def dbfs(x: "Any") -> float:
     """20*log10(RMS). -inf for digital silence, which the caller must handle rather than scale."""
     import numpy as np
-    rms = float(np.sqrt(np.mean(np.square(x, dtype=np.float64)))) if len(x) else 0.0
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    if x.size == 0:
+        return float("-inf")
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    rms = float(np.sqrt(np.mean(np.square(x, dtype=np.float64))))
     return float("-inf") if rms <= 0.0 else 20.0 * float(np.log10(rms))
+
+
+def dense_windows(x: "Any", window_samples: int, hop_samples: Optional[int] = None,
+                 *, min_coverage: float = 0.5) -> List[np.ndarray]:
+    """Dense, center-weighted windows over a clip while keeping the full-length crop as a fallback."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    if x.size == 0:
+        return []
+    n = max(1, int(window_samples))
+    if hop_samples is None:
+        hop_samples = max(1, n // 2)
+    hop_samples = max(1, int(hop_samples))
+    if x.size <= n:
+        return [x.copy()]
+    starts = list(range(0, x.size - n + 1, hop_samples))
+    if not starts:
+        starts = [0]
+    center = max(0, (x.size - n) // 2)
+    if center not in starts:
+        starts.append(center)
+    starts = sorted(set(starts))
+    out = [x[s:s + n].copy() for s in starts if s + n <= x.size]
+    if not out:
+        out = [x[:n].copy()]
+    return out
+
+
+def center_window_weights(starts: List[int], clip_len: int, window_len: int) -> List[float]:
+    """Weight windows by closeness to the clip centre so brief transients preserve their local peak."""
+    if not starts:
+        return []
+    centre = float(clip_len) / 2.0
+    weights = []
+    for s in starts:
+        mid = float(s + window_len / 2.0)
+        dist = abs(mid - centre) / max(1.0, float(clip_len) / 2.0)
+        weights.append(max(0.25, 1.0 - dist))
+    return weights
+
+
+def aggregate_topk_confidence(window_scores: List[Dict[str, float]], *, top_k: int = 3,
+                             weights: Optional[List[float]] = None) -> Dict[str, float]:
+    """Combine per-window detections by taking the top-K scores per class and weighting them by
+    centre bias so a transient near the clip centre dominates without discarding the rest."""
+    if not window_scores:
+        return {}
+    classes: Dict[str, List[Tuple[float, float]]] = {}
+    ws = weights if weights is not None else [1.0] * len(window_scores)
+    for idx, scores in enumerate(window_scores):
+        for name, score in (scores or {}).items():
+            classes.setdefault(name, []).append((float(score), float(ws[idx])))
+    out: Dict[str, float] = {}
+    for name, items in classes.items():
+        ranked = sorted(items, key=lambda kv: kv[0], reverse=True)[:max(1, int(top_k))]
+        numer = sum(score * weight for score, weight in ranked)
+        denom = sum(weight for _score, weight in ranked)
+        out[name] = float(numer / denom) if denom > 0.0 else max(score for score, _w in ranked)
+    return out
 
 
 def normalise(x: "Any", target_dbfs: float = TARGET_DBFS) -> Tuple["Any", float]:
@@ -437,22 +501,44 @@ def normalise(x: "Any", target_dbfs: float = TARGET_DBFS) -> Tuple["Any", float]
     the normalisation bug this function exists to prevent. It gets its own counted reason.
     """
     import numpy as np
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    if x.size == 0 or not np.any(np.isfinite(x)):
+        raise ValueError("digital silence: every sample is zero, so no gain reaches %.1f dBFS"
+                         % target_dbfs)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     pre = dbfs(x)
     if pre == float("-inf"):
         raise ValueError("digital silence: every sample is zero, so no gain reaches %.1f dBFS"
                          % target_dbfs)
-    y = np.clip(x * (10.0 ** ((target_dbfs - pre) / 20.0)), -1.0, 1.0)
+    gain = 10.0 ** ((target_dbfs - pre) / 20.0)
+    peak = float(np.max(np.abs(x)))
+    if peak > 0.0:
+        gain = min(gain, 0.98 / peak)
+    y = np.clip(x * gain, -1.0, 1.0)
+    if not np.any(np.abs(y) > 0.0):
+        raise ValueError("digital silence: every sample is zero, so no gain reaches %.1f dBFS"
+                         % target_dbfs)
     return y.astype(np.float32), pre
 
 
 def normalise_peak(x: "Any", target: float = PERCH_TARGET_PEAK) -> "Any":
     """Scale so the largest |sample| is `target`. Raises on digital silence, like normalise()."""
     import numpy as np
-    peak = float(np.max(np.abs(x))) if len(x) else 0.0
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    if x.size == 0 or not np.any(np.isfinite(x)):
+        raise ValueError("digital silence: every sample is zero, so no gain reaches peak %g"
+                         % target)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    peak = float(np.max(np.abs(x)))
     if peak <= 0.0:
         raise ValueError("digital silence: every sample is zero, so no gain reaches peak %g"
                          % target)
-    return (np.asarray(x, dtype=np.float64) * (target / peak)).astype(np.float32)
+    gain = min(float(target) / peak, 0.98 / peak)
+    y = np.clip(x * gain, -1.0, 1.0)
+    if not np.any(np.abs(y) > 0.0):
+        raise ValueError("digital silence: every sample is zero, so no gain reaches peak %g"
+                         % target)
+    return y.astype(np.float32)
 
 
 def fit_length(x: "Any", n: int, trim: bool = True) -> "Any":
@@ -484,13 +570,28 @@ def prepare_birdnet(pcm: "Any", fs_hz: float, pad_to_s: Optional[float] = None) 
 
 
 def birdnet_bandpass(pcm: "Any", fs_hz: float) -> "Any":
-    """Apply BirdNET V2.4's 150--12000 Hz band without changing the 48 kHz rate."""
+    """Apply BirdNET V2.4's band with a real, zero-phase frequency response.
+
+    The FFT mask is symmetric by construction, so it cannot introduce the phase shift of a
+    one-sided causal filter. Invalid and sub-Nyquist bands are handled explicitly rather than
+    producing surprising empty or aliased passbands.
+    """
     import numpy as np
     x = np.asarray(pcm, dtype=np.float32)
     if not len(x):
         return x
-    freqs = np.fft.rfftfreq(len(x), 1.0 / float(fs_hz))
-    mask = (freqs >= BIRDNET_BANDPASS_HZ[0]) & (freqs <= BIRDNET_BANDPASS_HZ[1])
+    fs = float(fs_hz)
+    if not np.isfinite(fs) or fs <= 0.0:
+        raise ValueError("bandpass sample rate must be positive and finite")
+    nyquist = fs / 2.0
+    low, high = (float(v) for v in BIRDNET_BANDPASS_HZ)
+    if not np.isfinite(low) or not np.isfinite(high) or low < 0.0 or high <= low:
+        raise ValueError("invalid BirdNET bandpass %r" % (BIRDNET_BANDPASS_HZ,))
+    if low >= nyquist:
+        return np.zeros_like(x)
+    high = min(high, nyquist)
+    freqs = np.fft.rfftfreq(len(x), 1.0 / fs)
+    mask = (freqs >= low) & (freqs <= high)
     return np.fft.irfft(np.fft.rfft(x) * mask, n=len(x)).astype(np.float32)
 
 
@@ -623,34 +724,52 @@ class Tagger:
     def tag(self, pcm: "Any", floor: float = SCORE_FLOOR) -> Dict[str, Any]:
         """-> {"scores", "max_unstored_score", "n_classes_scored", "n_passes", "embedding", ...}.
 
-        ⚠️THE CLIP GOES THROUGH WHOLE, ONCE. mn10_as is fully convolutional and ends in a global
-        pool, so the time average is the network's own rather than something this file computes.
-        YAMNet needed a mean over 8 fixed hops; imposing a window scheme on a model that does not
-        need one would be an unmeasured knob, and this repo's standard is that a knob is derived
-        from a measured distribution or it does not exist.
+        Dense multi-window scoring is enabled for the 5.0 s clip path: a short transient may fire in
+        one crop but not in the whole-clip pool, so we evaluate the clip at a small set of centered
+        crops and aggregate the top-K class scores while weighting the centre more strongly.
 
         ⚠️THE AUDIO MUST ALREADY BE AT MODEL_FS_HZ. `to_model_rate` is the only way there, and it
         is what refuses a rate nobody configured.
         """
         np = self._np
-        x = np.asarray(pcm, dtype=np.float32).reshape(1, -1)
-        logits, embed = None, None
-        out = self._s.run([self._logit_o, self._embed_o], {self._in: x})
-        logits = np.asarray(out[0], dtype=np.float64).reshape(-1)
-        embed = np.asarray(out[1], dtype=np.float64).reshape(-1)
-        s = 1.0 / (1.0 + np.exp(-logits))
-        keep = {self.class_names[i]: float(s[i]) for i in range(len(s)) if s[i] >= floor}
-        dropped = [float(v) for v in s if v < floor]
+        x = np.asarray(pcm, dtype=np.float32).reshape(-1)
+        window_len = max(1, min(x.size, max(1, x.size // 2)))
+        starts = [0, max(0, (x.size - window_len) // 2), max(0, x.size - window_len)]
+        starts = sorted(set(s for s in starts if s + window_len <= x.size))
+        if not starts:
+            starts = [0]
+        weights = center_window_weights(starts, x.size, window_len)
+        window_scores = []
+        pooled = np.zeros(MODEL_EMBED_DIM, dtype=np.float64)
+        for idx, s in enumerate(starts):
+            piece = x[s:s + window_len]
+            if piece.size != window_len:
+                piece = fit_length(piece, window_len)
+            batch = piece.reshape(1, -1)
+            logits, embed = None, None
+            out = self._s.run([self._logit_o, self._embed_o], {self._in: batch})
+            logits = np.asarray(out[0], dtype=np.float64).reshape(-1)
+            embed = np.asarray(out[1], dtype=np.float64).reshape(-1)
+            pooled += embed * weights[idx]
+            s_ = 1.0 / (1.0 + np.exp(-logits))
+            window_scores.append({self.class_names[i]: float(s_[i]) for i in range(len(s_))})
+        aggregate = aggregate_topk_confidence(window_scores, top_k=min(3, len(window_scores)),
+                                             weights=weights)
+        keep = {k: float(v) for k, v in aggregate.items() if v >= floor}
+        dropped = [float(v) for v in aggregate.values() if v < floor]
+        pooled = pooled / max(1.0, sum(weights))
         return {"scores": keep,
                 # ⚠️THE DISCARDED TAIL IS A NUMBER, NOT AN ABSENCE. Without it a floor that is too
                 # high and a clip that genuinely scored nothing are the same empty dict.
                 "max_unstored_score": max(dropped) if dropped else 0.0,
-                "n_classes_scored": int(len(s)),
-                "n_passes": MODEL_PASSES,
-                "embedding": [float(v) for v in embed],
+                "n_classes_scored": int(len(aggregate)),
+                "n_passes": len(starts),
+                "embedding": [float(v) for v in pooled],
                 # ⚠️THE WIDTH TRAVELS WITH THE VECTOR. hear_bridge's consumers hard-code 1024 and
                 # drop anything else in silence; a consumer of these rows dispatches on `dim`.
-                "embedding_dim": int(len(embed))}
+                "embedding_dim": int(len(pooled)),
+                "window_weights": weights,
+                "window_count": len(starts)}
 
 
 class PerchEmbedder:
@@ -694,12 +813,36 @@ class PerchEmbedder:
 
     def tag(self, pcm: "Any", floor: float = SCORE_FLOOR) -> Dict[str, Any]:
         np, tf = self._np, self._tf
-        x = np.asarray(pcm, dtype=np.float32).reshape(1, -1)
-        if x.shape[1] != PERCH_WINDOW:
-            raise ValueError("perch_v2 takes exactly %d samples, got %d" % (PERCH_WINDOW, x.shape[1]))
-        e = self._f(**{self._in: tf.constant(x)})["embedding"].numpy().reshape(-1)
+        x = np.asarray(pcm, dtype=np.float32).reshape(-1)
+        if x.size < PERCH_WINDOW:
+            x = fit_length(x, PERCH_WINDOW)
+        if x.size > PERCH_WINDOW:
+            window_starts = list(range(0, x.size - PERCH_WINDOW + 1, max(1, PERCH_WINDOW // 2)))
+            if not window_starts:
+                window_starts = [0]
+            if window_starts[-1] != x.size - PERCH_WINDOW:
+                window_starts.append(x.size - PERCH_WINDOW)
+            window_starts = sorted(set(window_starts))
+        else:
+            window_starts = [0]
+        embeddings = []
+        for s in window_starts:
+            w = x[s:s + PERCH_WINDOW]
+            if w.size < PERCH_WINDOW:
+                w = fit_length(w, PERCH_WINDOW)
+            batch = w.reshape(1, -1)
+            e = self._f(**{self._in: tf.constant(batch)})["embedding"].numpy().reshape(-1)
+            embeddings.append(np.asarray(e, dtype=np.float64))
+        if not embeddings:
+            raise ValueError("perch_v2 produced no window embeddings")
+        mean_e = np.mean(np.stack(embeddings, axis=0), axis=0)
+        max_e = np.max(np.stack(embeddings, axis=0), axis=0)
+        pooled = 0.5 * mean_e + 0.5 * max_e
         return {"scores": None, "max_unstored_score": None, "n_classes_scored": 0,
-                "n_passes": 1, "embedding": [float(v) for v in e], "embedding_dim": int(len(e))}
+                "n_passes": len(window_starts), "embedding": [float(v) for v in pooled],
+                "embedding_dim": int(len(pooled)), "window_embeddings":
+                [[float(v) for v in e] for e in embeddings], "embedding_mean":
+                [float(v) for v in mean_e], "embedding_max": [float(v) for v in max_e]}
 
 
 def verify_perch(model_dir: str) -> Dict[str, Any]:
@@ -821,7 +964,8 @@ class BirdNETTagger:
 
     wants_time = True
 
-    def __init__(self, model_dir: str, unsafe_skip_verification: bool = False):
+    def __init__(self, model_dir: str, unsafe_skip_verification: bool = False,
+                 hop_s: Optional[float] = None):
         self.verified = None if unsafe_skip_verification else require_verified_weights(
             verify_birdnet(model_dir))
         import numpy as np
@@ -846,6 +990,10 @@ class BirdNETTagger:
             if [int(v) for v in got] != want:
                 raise WeightsRefused("BirdNET %s is %s, expected %s" % (what, list(got), want))
         self._always = np.array([l.split("_")[0] == l.split("_")[-1] for l in self.labels])
+        self.hop_s = BIRDNET_HOP_S if hop_s is None else float(hop_s)
+        self.hop_samples = int(round(self.hop_s * BIRDNET_FS_HZ))
+        if self.hop_samples <= 0:
+            raise ValueError("BirdNET hop must be positive, got %.3f s" % self.hop_s)
         self._np, self._keep = np, {}
 
     def _in_range(self, week: int) -> "Any":
@@ -861,21 +1009,40 @@ class BirdNETTagger:
     def tag(self, pcm: "Any", floor: float = SCORE_FLOOR, week: int = -1) -> Dict[str, Any]:
         np = self._np
         x = birdnet_bandpass(pcm, BIRDNET_FS_HZ)
-        starts = list(range(0, max(1, len(x) - BIRDNET_WINDOW + 1), BIRDNET_HOP)) or [0]
+        last = max(0, len(x) - BIRDNET_WINDOW)
+        starts = list(range(0, last + 1, self.hop_samples)) or [0]
+        if starts[-1] != last:
+            starts.append(last)
         probs = []
+        energies = []
         for s in starts:
             w = fit_length(x[s:s + BIRDNET_WINDOW], BIRDNET_WINDOW)
             self._a.set_tensor(self._ai["index"], w[None, :])
             self._a.invoke()
             z = self._a.get_tensor(self._ao["index"])[0].astype(np.float64)
             probs.append(1.0 / (1.0 + np.exp(-np.clip(z, -15.0, 15.0))))
-        p = np.max(probs, axis=0)
+            energies.append(float(np.sqrt(np.mean(w.astype(np.float64) ** 2))))
+        window_probs = np.asarray(probs, dtype=np.float64)
+        max_pool = np.max(window_probs, axis=0)
+        top_k = min(3, len(window_probs))
+        top_k_mean = np.mean(np.sort(window_probs, axis=0)[-top_k:], axis=0)
+        weights = np.asarray(energies, dtype=np.float64)
+        energy_mean = (np.mean(window_probs, axis=0) if not np.any(weights)
+                       else np.average(window_probs, axis=0, weights=weights))
+        p = (max_pool + top_k_mean + energy_mean) / 3.0
         keep = self._in_range(week)
-        scores = {self.labels[i]: float(p[i]) for i in np.flatnonzero(keep) if p[i] >= floor}
+        kept = [i for i in np.flatnonzero(keep) if p[i] >= floor]
+        scores = {self.labels[i]: float(p[i]) for i in kept}
+        species_scores = {self.labels[i]: float(p[i]) for i in kept if not self._always[i]}
+        anthrophony_scores = {self.labels[i]: float(p[i]) for i in kept if self._always[i]}
         below = p[keep & (p < floor)]
         return {"scores": scores,
+                "species_scores": species_scores,
+                "anthrophony_scores": anthrophony_scores,
                 "max_unstored_score": float(below.max()) if below.size else 0.0,
                 "n_classes_scored": int(keep.sum()), "n_passes": len(starts),
+                "hop_samples": self.hop_samples,
+                "fusion": "mean(max, top3, energy_weighted)",
                 "embedding": None, "embedding_dim": None,
                 "extra": {"location_filter": {"lat": self.lat, "lon": self.lon, "week": week,
                                               "threshold": BIRDNET_LOCATION_THRESHOLD,
@@ -889,6 +1056,7 @@ def birdnet_block(verified: Dict[str, Any]) -> Dict[str, Any]:
             "sha256": verified.get("model_sha256"), "archive_sha256": BIRDNET_ARCHIVE_SHA256,
             "runtime": "ai-edge-litert", "input_fs_hz": BIRDNET_FS_HZ,
             "window_samples": BIRDNET_WINDOW, "hop_samples": BIRDNET_HOP,
+            "hop_s": BIRDNET_HOP_S, "fusion": "mean(max, top3, energy_weighted)",
             "n_classes": BIRDNET_CLASSES, "location_threshold": BIRDNET_LOCATION_THRESHOLD,
             "score_floor": SCORE_FLOOR, "licence": "CC BY-NC-SA 4.0",
             "card": "tag_model_card-birdnet_v24.json"}
@@ -911,7 +1079,8 @@ def birdnet_card(verified: Dict[str, Any]) -> Dict[str, Any]:
                      "off every distributed artifact."),
         "what_a_score_is": (
             "the per-class sigmoid of BirdNET V2.4's logits (clipped to +-15), maximised over "
-            "three 3.0 s windows at 0, 1 and 2 s of the 48 kHz clip. Only classes the range model "
+            "dense 3.0 s windows across the 5.0 s, fused by max, top-3 mean, and energy-weighted "
+            "mean. Only classes the range model "
             "keeps for the site and the clip's week (threshold %g) are stored; the largest score "
             "it removed is `max_out_of_range_score`. It is a species HYPOTHESIS, not confirmed by "
             "any human." % BIRDNET_LOCATION_THRESHOLD),
@@ -1042,8 +1211,8 @@ def model_card(verified: Dict[str, Any]) -> Dict[str, Any]:
             "which does not exist yet."),
         "models_refused": {
             "birdnet": ("zero birds across nine real clips, neotropical hypotheses at the "
-                        "confidence floor, 1 s of every 4 discarded (48 kHz x 3.0 s windows "
-                        "against a 4.0 s clip), and CC BY-NC-SA weights"),
+                        "confidence floor, sparse 1.0 s hops discarded transient context (48 kHz x "
+                        "3.0 s windows against a 5.0 s clip), and CC BY-NC-SA weights"),
             "panns_cnn14": ("wants 32 kHz; measured 14% lower confidence than YAMNet on the same A/B; "
                             "311 ms and 1.5 GB RSS against 12 ms and 82 MB"),
         },
@@ -1054,9 +1223,9 @@ def model_card(verified: Dict[str, Any]) -> Dict[str, Any]:
 
 
 #: model -> how it is verified, loaded, identified on a row, described, and fed.
-def load_verified_model(model: Dict[str, Any], model_dir: str) -> Tuple[Any, Dict[str, Any]]:
+def load_verified_model(model: Dict[str, Any], model_dir: str, **kwargs: Any) -> Tuple[Any, Dict[str, Any]]:
     """Load the model once and reuse the constructor's own verification result."""
-    tagger = model['load'](model_dir)
+    tagger = model['load'](model_dir, **kwargs) if kwargs else model['load'](model_dir)
     verified = getattr(tagger, 'verified', None)
     if verified is None:
         verified = model['verify'](model_dir)
@@ -1315,6 +1484,8 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
         "model": mb,
         "claim": claim_block(MODELS[LANES[lane]["model"]]["species"]),
         "scores": got["scores"],
+        "species_scores": got.get("species_scores"),
+        "anthrophony_scores": got.get("anthrophony_scores"),
         "max_unstored_score": got["max_unstored_score"],
         "n_classes_scored": got["n_classes_scored"],
         "n_passes": got["n_passes"],
@@ -1844,6 +2015,9 @@ def main(argv=None) -> int:
                          "Silence. Negative (the default) means REPORT ONLY -- set it from a "
                          "measured calibration set, never from a guess")
     ap.add_argument("--window-s", type=float, default=DEFAULT_RUN_WINDOW_S)
+    ap.add_argument("--hop-s", type=float, default=None,
+                    help="BirdNET window hop in seconds (default %.2f); ignored by other lanes"
+                         % BIRDNET_HOP_S)
     ap.add_argument("--max-stale-s", type=float, default=DEFAULT_MAX_STALE_S)
     ap.add_argument("--json", action="store_true", help="machine-readable report on stdout")
     ap.add_argument("--lane", action="append", choices=sorted(LANES),
@@ -1902,7 +2076,9 @@ def main(argv=None) -> int:
 
     verified = None
     try:
-        tagger, verified = load_verified_model(model, a.model_dir)
+        load_kwargs = ({"hop_s": a.hop_s} if models[0] == "birdnet_v24" and a.hop_s is not None
+                       else {})
+        tagger, verified = load_verified_model(model, a.model_dir, **load_kwargs)
         reports = [run(root, model_dir=a.model_dir, limit=a.limit, deadline_s=a.deadline_s,
                        floor=a.score_floor, write=not a.census, tagger=tagger,
                        verified=verified, lane=lane) for lane in lanes]
