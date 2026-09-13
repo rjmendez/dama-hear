@@ -459,7 +459,8 @@ class Pool:
         Idempotent like ingest_dets: consecutive runs overlap and re-reading a row adds 0. The
         body carries no node name, so `default_node` is required and every row is filed under it.
         """
-        raw = open(path, "rb").read()
+        with open(path, "rb") as fh:
+            raw = fh.read()
         sha = hashlib.sha256(raw).hexdigest()
         obj = json.loads(raw.decode("utf-8", "replace"))
         if not isinstance(obj, list):
