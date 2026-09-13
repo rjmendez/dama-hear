@@ -2,6 +2,8 @@
 # ⚠️ENABLED 2026-09-11 BY THE OPERATOR, after the three conditions below were met on 2026-09-10.
 # To stop it: kubectl -n dama patch cronjob hear-tag -p '{"spec":{"suspend":true}}'
 #
+# THREE PUBLIC BACKENDS are available through `--model yamnet`, `--model birdnet`, and
+# `--model perch`; this CronJob keeps the original two EfficientAT-compatible lanes below.
 # TWO LANES, ONE MODEL LOAD. `--lane mn10` is the original whole-clip pass (clips/tags.jsonl,
 # state/tag_heartbeat.json, unchanged). `--lane mn10_pad10` scores the same normalised clip
 # zero-padded to the model's 10 s training length (clips/tags-mn10_pad10.jsonl); the measurement
@@ -139,6 +141,7 @@ spec:
                   exec python /app/tools/hear_tag.py \
                     --pool /pool/corpus \
                     --model-dir "$MODELS" \
+                    --model yamnet \
                     --lane mn10 --lane mn10_pad10 \
                     --limit 400 \
                     --deadline-s 600
@@ -225,7 +228,7 @@ spec:
                 - |
                   set +e
                   export PYTHONPATH=/pool/pylib-tag:/app
-                  python /app/tools/hear_tag.py --pool /pool/corpus --check --lane mn10 \
+                  python /app/tools/hear_tag.py --pool /pool/corpus --check --model yamnet --lane mn10 \
                     --window-s 7200 --max-stale-s 14400 --max-silence-frac -1 \
                     --min-mean-top-score 0.20
                   rc=$?

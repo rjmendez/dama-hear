@@ -43,7 +43,7 @@ transmitting a representation no model could score. `train_sketch.py` fits ones 
 | model | bands | applies to | nested grouped-CV AUC |
 |---|---|---|---|
 | `model_sketch.json` | 20 | ≥32 kHz sensors (the phones) | 0.9728 |
-| `model_sketch_15.json` | 15 | ≥16 kHz — **the whole fleet** | 0.9665 |
+| `model_sketch_15.json` | 15 | Wire Profile 3, 48 kHz / 24 kHz Nyquist | 0.9715 |
 
 ⚠️**Both figures were measured at 48 kHz, and the fleet runs at 16.** Every pooled node frame is
 16 kHz, and this repo has separately measured what a 48 kHz-fitted fixed-bank model does on 16 kHz

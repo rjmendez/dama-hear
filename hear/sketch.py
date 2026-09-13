@@ -153,14 +153,14 @@ def mel_filterbank(fs: float, nfft: int = NFFT, bands: int = MEL_BANDS,
 
 
 def sketch(x: np.ndarray, fs: float, bands: int = MEL_BANDS, frames: int = FRAMES,
-           hop_s: float = HOP_S, nfft: int = NFFT,
-           layout: str = LAYOUT_NYQUIST) -> Tuple[np.ndarray, float]:
+           hop_s: float = HOP_S, nfft: int = NFFT, f_lo: float = F_LO,
+           f_hi: float = F_HI, layout: str = LAYOUT_NYQUIST) -> Tuple[np.ndarray, float]:
     """(int8 [bands x frames], ref_db). Frames start at the sample the caller passes as index 0.
 
     `layout` decides what band k MEANS -- see [mel_filterbank]. At any rate above
     LAYOUT_EQUIVALENT_ABOVE_HZ the two are the same bytes."""
     x = np.asarray(x, float)
-    fb = mel_filterbank(fs, nfft, bands, layout=layout)
+    fb = mel_filterbank(fs, nfft, bands, f_lo=f_lo, f_hi=f_hi, layout=layout)
     hop = max(1, int(hop_s * fs))
     win = np.hanning(nfft)
     out = np.zeros((bands, frames))

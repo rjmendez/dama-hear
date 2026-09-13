@@ -10,6 +10,22 @@ ships first, what each stage costs in node hearing and operator hours, what it r
 and which stages cannot start until a phone release, an RTK survey, or a microphone that does
 not exist yet arrives.
 
+### Node reachability is a three-layer verdict
+
+Never declare a node **offline** from a failed curl or `/status` probe alone. The node's HTTP
+server is single-client and can refuse a probe while the node remains on the network and its
+data continues to arrive. Use all three layers, in order, and record the evidence:
+
+1. **OPNsense gateway:** confirm the node's DHCP lease and ARP entry. This establishes that the
+gateway still sees the expected hardware and address, even when the node's HTTP server is busy.
+2. **Node HTTP:** probe `http://<node>/status` (with the normal retry/backoff). A successful
+response proves the endpoint is serving now; a failure proves only that this probe failed.
+3. **Pipeline ingestion:** verify the node's `hear-drain` heartbeat and ingestion result. A fresh
+successful fetch/ingest is the end-to-end proof that the node is contributing to the pipeline.
+
+Until all three layers agree, report **offline unconfirmed** and continue the investigation; do
+not remove the node, reassign its lease, or treat missing HTTP as proof of a dead sensor.
+
 ---
 
 ## 0. Three live failures found while writing this
