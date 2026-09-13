@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-tag-code.yaml
-# apply-mode client: 168208 B serialised; 168392 B of annotations against a 262144 B cap.
+# apply-mode client: 168763 B serialised; 168947 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tag
   annotations:
-    dama-hear/commit: '2777f93-dirty'
+    dama-hear/commit: '284560b-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '168208'
+    dama-hear/serialised-bytes: '168763'
 data:
   hear__init__.py: |
     
@@ -798,8 +798,17 @@ data:
     import os
     from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
     
-    TAG_SCHEMA_VERSION = 1
+    TAG_SCHEMA_VERSION = 2
     TAGS_NAME = "tags.jsonl"
+    
+    #: Schema 2.0 enhancements:
+    #: - Native 48kHz acoustic metadata support via fs_source_hz (phone/HUGBOT captures)
+    #: - NPU embedding vectors (embedding_dim, embedding) carried on every tag row for model outputs
+    #: - Multi-rate support: fs_source_hz (capture rate), fs_model_hz (model inference rate),
+    #:   csv_fs_hz (decimation rate estimate from node telemetry)
+    #: - rate_recovered flag to disambiguate when header rate differs from actual samples
+    #:
+    #: Future: 6-DoF spatial pose vectors (pitch/roll/yaw) for phone/HUGBOT devices if available.
     
     #: The clip's own geometry, from hear.clips. Repeated here as a local constant rather than
     #: imported so that a bundle carrying tags.py without clips.py still parses; the two are checked
@@ -1474,7 +1483,7 @@ data:
     from hear import tags as TAGS                                             # noqa: E402
     from hear import resample as RESAMPLE                                     # noqa: E402
     
-    TAG_SCHEMA = "hear.clip_tag.v1"
+    TAG_SCHEMA = "hear.clip_tag.v2"
     
     MODEL_NAME = "efficientat-mn10_as"
     #: Bumping this is what makes a re-tag a NEW row beside the old one rather than an overwrite.

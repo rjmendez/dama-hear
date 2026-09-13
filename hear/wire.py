@@ -93,8 +93,8 @@ PROFILE_GEOMETRY: Dict[int, Geometry] = {
     1: Geometry(20, 8, 256, 0.004, 48000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
     2: Geometry(20, 8, 256, 0.004, 16000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
     # Schema 2.0 multi-rate profiles: 3 for 32 kHz (HUGBOT5000), 4 for 24 kHz
-    3: Geometry(20, 8, 256, 0.004, 32000.0, SK.LAYOUT_FIXED, 300.0, 16000.0),
-    4: Geometry(20, 8, 256, 0.004, 24000.0, SK.LAYOUT_FIXED, 300.0, 12000.0),
+    3: Geometry(20, 8, 256, 0.004, 32000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
+    4: Geometry(20, 8, 256, 0.004, 24000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
 }
 
 #: Ids a NEW frame may claim. 0 is excluded because a frame that cannot say its own rate is the
@@ -112,8 +112,6 @@ DEFAULT_PROFILE: int = 1
 
 # 237 B Meshtastic payload minus 37 B protobuf/portnum, per sketch.py:31,107.
 MESHTASTIC_USABLE: int = 200
-
-_SHAPES: Dict[Tuple[int, int], int] = {v: k for k, v in PROFILES.items()}
 
 _TS_BITS = 37
 _TS_MASK = (1 << _TS_BITS) - 1

@@ -345,7 +345,6 @@ class TestFrameFlags:
         # frame has full context. Profile 1 is not in this build's table, so it is added for the
         # length of this test -- the bit layout is what is under test, not the profile list.
         monkeypatch.setitem(WR.PROFILES, 1, (20, 8))
-        monkeypatch.setitem(WR._SHAPES, (20, 8), 0)
         frame = WR.pack_v2(189911, 7, 3, 52.5, 818, _q(), retrigger=False, profile_id=1)
         assert struct.unpack_from("<H", frame, 11)[0] == 0x0342
         assert 0x0342 & BR.V1_FLAG_NO_CONTEXT, "this is the bit the old reading masked"

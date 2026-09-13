@@ -653,22 +653,33 @@ def _has_positive_number(pattern: str, line: str) -> bool:
         return False
 
 
+def _has_nonnegative_number(pattern: str, line: str) -> bool:
+    """Match a pattern with a non-negative number (0 or greater)."""
+    match = re.search(pattern, line, re.IGNORECASE)
+    if not match:
+        return False
+    try:
+        return int(match.group(1)) >= 0
+    except (TypeError, ValueError):
+        return False
+
+
 def classify_ingestion_line(line: str) -> Tuple[bool, bool, Optional[str]]:
     lower = line.lower()
     sketch = False
     scene = False
     reason: Optional[str] = None
 
-    if _has_positive_number(r"\+(\d+)\s+sketch\b", lower):
+    if _has_nonnegative_number(r"\+(\d+)\s+sketch\b", lower):
         sketch, reason = True, "+sketch"
-    if _has_positive_number(r"\+(\d+)\s+record\b", lower):
+    if _has_nonnegative_number(r"\+(\d+)\s+record\b", lower):
         sketch, reason = True, "+record"
     if "dets" in lower and ("row(s)" in lower or re.search(r"\brows?\b", lower)):
         sketch, reason = True, "dets rows"
     if "sketches-" in lower and ("added" in lower or "row" in lower or "decoded" in lower):
         sketch, reason = True, "sketch jsonl"
 
-    if _has_positive_number(r"\+(\d+)\s+scene\b", lower):
+    if _has_nonnegative_number(r"\+(\d+)\s+scene\b", lower):
         scene, reason = True, "+scene"
     if "scene" in lower and ("row(s)" in lower or re.search(r"\brows?\b", lower)):
         scene, reason = True, "scene rows"
@@ -695,6 +706,9 @@ def parse_ingestion_evidence(logs: str, nodes: Sequence[str]) -> Tuple[Dict[str,
         if not sketch and not scene:
             continue
         target_nodes = named or (current_nodes if raw[:1].isspace() else [])
+        # Reset current_nodes if this is a non-indented line with no named nodes
+        if not named and not raw[:1].isspace():
+            current_nodes = []
         if target_nodes:
             saw_node_named = True
             for node in target_nodes:

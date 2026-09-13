@@ -64,8 +64,8 @@ GRID = [0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0]
 # profile here rather than inheriting hear.sketch's older 20 kHz application range.
 PROFILE_3_FS_HZ = 48000.0
 PROFILE_3_F_LO_HZ = 300.0
-PROFILE_3_F_HI_HZ = 24000.0
-PROFILE_3_BANDS = 15
+PROFILE_3_F_HI_HZ = 20000.0
+PROFILE_3_BANDS = 20
 
 
 def _onset(xi, fs):
