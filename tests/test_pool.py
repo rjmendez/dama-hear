@@ -470,6 +470,17 @@ class TestTheArithmeticCloses:
         assert e["skipped"] == 3 and e["added"] == 0
         assert e["skip_reasons"] == {"decode_AttributeError": 3}
 
+    def test_float_utc_and_padded_frame_ingest_without_decode_value_error(self, tmp_path):
+        pl = P.Pool(str(tmp_path / "pool"))
+        fh = binascii.hexlify(_frame()).decode() + "0000"
+        p = tmp_path / "dets.csv"
+        p.write_text("node_id,utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,sketch_back,frame_hex,clip,clip_why\n"
+                     + f"mach,1788763952189911.0,1234,5000000,42,597174,1140,4608,16000.000,64,{fh},,\n")
+        e = pl.ingest_dets(str(p))
+        self._closed(e)
+        assert e["rows"] == 1 and e["added"] == 1 and e["skipped"] == 0
+        assert e["skip_reasons"] == {}
+
     def test_an_mqtt_file_closes_too(self, tmp_path):
         pl = P.Pool(str(tmp_path / "pool"))
         f = _mqtt(tmp_path, "sketches-2026-09-08.jsonl", 4)

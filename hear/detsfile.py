@@ -180,11 +180,14 @@ def read_text(text: str, default_node: Optional[str] = None) -> DetsRead:
             out._skip(n, "row_width_%d_expected_%d" % (len(row), width))
             continue
         d = dict(zip(gen.written, (c.strip() for c in row)))
-        fh = d.get("frame_hex", "")
+        fh = d.get("frame_hex", "").strip()
         if not fh:
             out._skip(n, "no_frame")
             continue
-        if len(fh) not in FRAME_HEX_LENS:
+        if len(fh) % 2 != 0:
+            out._skip(n, "frame_hex_len_%d" % len(fh))
+            continue
+        if len(fh) < 344:
             out._skip(n, "frame_hex_len_%d" % len(fh))
             continue
         if "node_id" in d and d["node_id"]:

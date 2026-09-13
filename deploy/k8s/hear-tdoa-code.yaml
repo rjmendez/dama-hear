@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 610997 B serialised; 611175 B of annotations against a 262144 B cap.
+# apply-mode server: 611727 B serialised; 611911 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '21c089e'
+    dama-hear/commit: 'f23ae44-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '610997'
+    dama-hear/serialised-bytes: '611727'
 data:
   hear__init__.py: |
     
@@ -931,11 +931,14 @@ data:
                 out._skip(n, "row_width_%d_expected_%d" % (len(row), width))
                 continue
             d = dict(zip(gen.written, (c.strip() for c in row)))
-            fh = d.get("frame_hex", "")
+            fh = d.get("frame_hex", "").strip()
             if not fh:
                 out._skip(n, "no_frame")
                 continue
-            if len(fh) not in FRAME_HEX_LENS:
+            if len(fh) % 2 != 0:
+                out._skip(n, "frame_hex_len_%d" % len(fh))
+                continue
+            if len(fh) < 344:
                 out._skip(n, "frame_hex_len_%d" % len(fh))
                 continue
             if "node_id" in d and d["node_id"]:
@@ -1088,9 +1091,11 @@ data:
         s = str(row.get("mel_hex") or "").strip()
         if not s:
             raise ValueError("empty mel_hex")
-        if len(s) != 2 * bands * slices:
+        need = 2 * bands * slices
+        if len(s) < need:
             raise ValueError("mel_hex is %d hex chars, %dx%d needs %d"
-                             % (len(s), bands, slices, 2 * bands * slices))
+                             % (len(s), bands, slices, need))
+        s = s[:need]
         try:
             b = bytes.fromhex(s)
         except ValueError as e:
@@ -1584,14 +1589,23 @@ data:
     
     def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
-        frame = binascii.unhexlify(row["frame_hex"])
+        fh = (row.get("frame_hex") or "").strip()
+        if len(fh) % 2 != 0:
+            fh = fh[:-1]
+        frame = binascii.unhexlify(fh)
         d = WR.decode(frame)
-        utc_us = int(row.get("utc_us") or 0)
+        try:
+            utc_us = int(float(row.get("utc_us") or 0))
+        except (TypeError, ValueError):
+            utc_us = 0
         node = row["node"]
         # fs: the FRAME is authoritative when it states a rate; the CSV column is only the node's
         # running estimate.
         fs_csv = row.get("fs_hz")
-        fs_csv = float(fs_csv) if fs_csv not in (None, "") else None
+        try:
+            fs_csv = float(fs_csv) if fs_csv not in (None, "") else None
+        except (TypeError, ValueError):
+            fs_csv = None
         node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
         event_flags = d.get("event_flags", 0)
         no_context = bool(event_flags & SK.FLAG_NO_CONTEXT) if d.get("version", 1) == 1 else False
@@ -3693,11 +3707,13 @@ data:
             flags = struct.unpack_from("<H", b, 11)[0]
             pid = (flags >> _F_PROFILE_SHIFT) & _F_PROFILE_MASK
             version = (flags >> _F_VERSION_SHIFT) & _F_VERSION_MASK
-            if version == VERSION and pid in PROFILES and len(b) == wire_size_v2(pid):
+            if version == VERSION and pid in PROFILES and len(b) >= wire_size_v2(pid):
                 if not (int.from_bytes(b[0:5], "little") >> _TS_BITS):
                     return VERSION
-        if len(b) >= _V1_HDR and 1 <= b[8] <= 64 and 1 <= b[9] <= 64 and len(b) == _V1_HDR + b[8] * b[9]:
-            return 1
+        if len(b) >= _V1_HDR and 1 <= b[8] <= 64 and 1 <= b[9] <= 64:
+            want = _V1_HDR + b[8] * b[9]
+            if 0 <= len(b) - want <= 16:
+                return 1
         raise ValueError("unrecognised frame: %d bytes" % len(b))
     
     
@@ -3706,8 +3722,13 @@ data:
         sketch.py is read-only -- and keeps its own 'node_us' key. Nothing else is renamed."""
         v = version_of(b)
         if v == VERSION:
-            return unpack_v2(b)
-        d = SK.unpack(b)
+            flags = struct.unpack_from("<H", b, 11)[0]
+            pid = (flags >> _F_PROFILE_SHIFT) & _F_PROFILE_MASK
+            n = wire_size_v2(pid)
+            return unpack_v2(b[:n])
+        node_us, ref4, peak, bands, frames, flags = struct.unpack("<IhHBBH", b[:12])
+        want = 12 + bands * frames
+        d = SK.unpack(b[:want])
         d["version"] = 1
         return d
     

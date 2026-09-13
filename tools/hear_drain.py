@@ -890,7 +890,10 @@ def clip_candidates(bodies: Sequence[Tuple[str, bytes]], node: str) -> List[Dict
             if k in seen:
                 continue
             seen.add(k)
-            utc_us = int(row.get("utc_us") or 0)
+            try:
+                utc_us = int(float(row.get("utc_us") or 0))
+            except (TypeError, ValueError):
+                utc_us = 0
             fs = row.get("fs_hz")
             out.append({
                 "clip": clip,
@@ -983,8 +986,13 @@ def _record_key(row: Dict[str, Any], node: str, utc_us: int) -> Optional[str]:
     `None` when the frame will not decode: the clip is still worth fetching, and inventing a key
     for it would put it in the pool's namespace pointing at nothing.
     """
+    fh = (row.get("frame_hex") or "").strip()
+    if not fh:
+        return None
+    if len(fh) % 2 != 0:
+        fh = fh[:-1]
     try:
-        frame = binascii.unhexlify(row["frame_hex"])
+        frame = binascii.unhexlify(fh)
     except Exception:
         return None
     return P.key("node", node, utc_us, row.get("sample"), frame)
