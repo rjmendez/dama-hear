@@ -542,6 +542,51 @@ class TestStatusKeyNames:
         assert a["scene"]["rows"] is None and a["acq"]["drop_s"] is None
 
 
+class TestRingWallSpan:
+    RAW_SAMPLES = 3_840_000
+    AUDIO_SAMPLES = 3_584_000
+    FS_NOMINAL = 16_000
+
+    def _status(self, raw_ratio):
+        span_us = int(round(raw_ratio * (self.RAW_SAMPLES / self.FS_NOMINAL) * 1_000_000))
+        return {"node": "nyquist", "i2s": {"nominal_hz": self.FS_NOMINAL},
+                "raw": {"cap_samples": self.RAW_SAMPLES,
+                        "from_utc_us": 0, "to_utc_us": span_us}}
+
+    def _audio(self, audio_ratio):
+        span_us = int(round(audio_ratio * (self.AUDIO_SAMPLES / self.FS_NOMINAL) * 1_000_000))
+        return {"addressable_samples": self.AUDIO_SAMPLES,
+                "from_utc_us": 0, "to_utc_us": span_us}
+
+    @pytest.mark.parametrize("node, ratio", [("nyquist", 1.09148),
+                                             ("mach", 1.11629),
+                                             ("rankine", 1.00224)])
+    def test_raw_ratio_matches_the_doc_examples(self, node, ratio):
+        m = HD.ring_wall_span_measurement(self._status(ratio), self._audio(ratio))
+        assert m["raw"]["ratio"] == pytest.approx(ratio, abs=1e-9), node
+
+    def test_audio_ratio_uses_addressable_samples_not_cap_samples(self):
+        # docs/acoustic-stack.md section 0.2: 245.958 s over 224.0 s addressable = 1.0980
+        audio = {"addressable_samples": self.AUDIO_SAMPLES,
+                 "from_utc_us": 0, "to_utc_us": 245_958_000}
+        m = HD.ring_wall_span_measurement(self._status(1.09148), audio)
+        assert m["audio"]["ratio"] == pytest.approx(245.958 / 224.0, abs=1e-12)
+        wrong = HD.ring_wall_span_ratio(m["audio"]["span_us"], self.RAW_SAMPLES, m["fs_hz"])
+        assert wrong == pytest.approx(245.958 / 240.0, abs=1e-12)
+        assert wrong < m["audio"]["ratio"]
+
+    def test_healthy_control_self_test_catches_the_wrong_denominator(self):
+        healthy = HD.ring_wall_span_measurement(self._status(1.00224), self._audio(1.00224))
+        assert HD.ring_wall_span_self_test(healthy)["ok"] is True
+        wrong = {"fs_hz": healthy["fs_hz"], "raw": healthy["raw"],
+                 "audio": dict(healthy["audio"])}
+        wrong["audio"]["ratio"] = HD.ring_wall_span_ratio(
+            wrong["audio"]["span_us"], healthy["raw"]["samples"], healthy["fs_hz"])
+        chk = HD.ring_wall_span_self_test(wrong)
+        assert chk["ok"] is False
+        assert abs(wrong["audio"]["ratio"] - 1.0) > chk["tolerance"]
+
+
 # ---------------------------------------------------------------- the ledger
 
 class TestLedgerInvariants:
@@ -737,6 +782,24 @@ class TestCheck:
         self._hb(root, kind="node", last_success_s=1000.0, last_unfetched_bytes=500)
         assert HD.check(root, now=1010.0, max_unfetched_bytes=1000)[0] == 0
         assert HD.check(root, now=1010.0, max_unfetched_bytes=100)[0] == 1
+
+    def test_live_ring_wall_span_uses_the_existing_check_entrypoint(self, tmp_path, monkeypatch):
+        root = str(tmp_path)
+        self._hb(root, kind="node", last_success_s=1000.0, last_unfetched_bytes=0)
+        monkeypatch.setattr(HD, "fetch_status",
+                            lambda *a, **kw: {"node": "nyquist",
+                                              "i2s": {"nominal_hz": 16000},
+                                              "raw": {"cap_samples": 3_840_000,
+                                                      "from_utc_us": 0,
+                                                      "to_utc_us": 261_955_200}})
+        monkeypatch.setattr(HD, "fetch_audio_status",
+                            lambda *a, **kw: {"addressable_samples": 3_584_000,
+                                              "from_utc_us": 0,
+                                              "to_utc_us": 245_958_000})
+        code, lines = HD.check(root, max_stale_s=7200.0, now=1010.0,
+                               nodes=[("nyquist", "10.0.0.1")], max_ring_wall_span=1.02)
+        assert code == 1
+        assert "RING WALL SPAN raw 1.09148 / audio 1.09803" in lines[0]
 
 
 class TestHeartbeatCarriesTheLoss:
