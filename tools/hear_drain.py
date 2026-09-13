@@ -298,6 +298,30 @@ def fetch_detections(ip: str, timeout: float = DEFAULT_TIMEOUT_S) -> bytes:
     return _get("http://%s/detections" % ip, timeout)
 
 
+def parse_live_ring(body: bytes) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """(rows, truncated body length or None): the /detections array, or its whole-row prefix.
+
+    ⚠️A TRUNCATED BODY IS THE NODE OUT OF HEAP, NOT A BAD RUN. h_dets() builds the whole array in
+    one String, and on gold (psram 0, heap_min 5684 B, 2026-09-13) it stopped growing and the node
+    sent a 200 cut mid-row at 37,199 B, twice in a row. The rows are oldest first, so the whole
+    ones before the cut are good and the newest simply arrive on a later run.
+    """
+    text = body.decode("utf-8", "replace")
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        end = text.rfind("}")
+        if end < 0 or not text.lstrip().startswith("["):
+            raise
+        obj = json.loads(text[:end + 1] + "]")
+        truncated: Optional[int] = len(body)
+    else:
+        truncated = None
+    if not isinstance(obj, list):
+        raise ValueError("/detections body is %s, not a list" % type(obj).__name__)
+    return obj, truncated
+
+
 def fetch_sd(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S,
              tail: Optional[int] = None) -> Optional[bytes]:
     """One file off the card, or None if the node does not have it.
@@ -1246,11 +1270,13 @@ def live_ring_loss(prev: Dict[str, Any], served: Sequence[int], total: Optional[
             "the node rebooted since the last run: counted are this boot's rows that aged out "
             "before this run; the previous boot's rows after the last run are unmeasured")
     last = int(prev.get("last_i", -1))
-    if total is not None:
-        got = sum(1 for i in served if i > last)
-        return max(0, int(total) - (last + 1) - got), None
+    # ⚠️THE GAP BELOW THE OLDEST ROW SERVED IS THE LOSS, NOT `total` MINUS WHAT CAME BACK. A body
+    # the node truncated leaves its newest rows unserved; they are still in the ring and arrive
+    # later, so counting them now would report a loss that has not happened.
     if first is None:
-        return None, "/status states no detection count and the ring was empty"
+        if total is not None and int(total) <= last + 1:
+            return 0, None
+        return None, "the ring body carried no row, so nothing past the last run was measured"
     return max(0, first - last - 1), None
 
 
@@ -1267,11 +1293,15 @@ def _drain_live_ring(pl: "P.Pool", node: str, ip: str, st: Dict[str, Any], out: 
     out["live_ring_lost"] = None
     try:
         body = fetch_detections(ip, timeout)
-        ring = json.loads(body.decode("utf-8", "replace"))
+        ring, truncated = parse_live_ring(body)
     except Exception as e:
         out["errors"].append("detections: %r" % (e,))
         out["live_ring_reason"] = "/detections could not be fetched, so nothing was measured"
         return out
+    out["live_ring_truncated_bytes"] = truncated
+    if truncated is not None:
+        archive(pl.root, node, "detections-truncated.raw", body, stamp)
+        body = json.dumps(ring).encode()
     path = archive(pl.root, node, "detections.json", body, stamp)
     try:
         entry = pl.ingest_detections_json(path, default_node=node,
@@ -1297,6 +1327,8 @@ def _drain_live_ring(pl: "P.Pool", node: str, ip: str, st: Dict[str, Any], out: 
     out["live_ring_rows"] = len(served)
     out["live_ring_lost"] = lost
     out["live_ring_reason"] = why
+    out["live_ring_pending"] = (max(0, int(total) - 1 - max(served))
+                                if total is not None and served else None)
     same_boot = _same_boot(prev, up, total, stamp)
     last_i = max(served) if served else (int(prev.get("last_i", -1)) if same_boot else -1)
     node_wm["live_ring"] = {"last_i": last_i, "uptime_s": up, "at": stamp}
@@ -1766,7 +1798,8 @@ def write_heartbeat(root: str, results: List[Dict[str, Any]], phone: Optional[Di
             if not isinstance(lring, list):
                 lring = []
             lring.append({"at": now, "rows": r.get("live_ring_rows"), "added": r.get("added"),
-                          "lost": r.get("live_ring_lost"), "reason": r.get("live_ring_reason")})
+                          "lost": r.get("live_ring_lost"), "reason": r.get("live_ring_reason"),
+                          "truncated": r.get("live_ring_truncated_bytes") is not None})
             s["live_recent"] = lring[-UNFETCHED_RING:]
         if r["ok"]:
             s["last_success_s"] = now
@@ -1929,6 +1962,10 @@ def _live_ring_note(s: Dict[str, Any], now: float, window_s: float) -> Tuple[str
         note += ("  ⚠️LIVE RING LOST %d detection(s) the drain never read (/detections serves only "
                  "the newest %d)" % (lost, LIVE_RING_HTTP_MAX))
         bad = True
+    cut = [e for e in recent if e.get("truncated")]
+    if cut:
+        note += ("  body TRUNCATED by the node in %d of %d run(s) (out of heap; newest rows "
+                 "arrive on a later run)" % (len(cut), len(recent)))
     if unknown:
         note += ("  loss UNKNOWN for %d of %d run(s) (%s)"
                  % (len(unknown), len(recent), unknown[-1].get("reason") or "no reason recorded"))
@@ -2116,10 +2153,13 @@ def main(argv=None) -> int:
                 "" if r["ok"] else "  " + "; ".join(r["errors"])))
             if r.get("no_card"):
                 lost = r.get("live_ring_lost")
-                print("    no card: live ring %s row(s) read, %s"
+                print("    no card: live ring %s row(s) read, %s%s"
                       % (r.get("live_ring_rows"),
                          "%d lost" % lost if lost is not None
-                         else "loss UNMEASURED (%s)" % r.get("live_ring_reason")))
+                         else "loss UNMEASURED (%s)" % r.get("live_ring_reason"),
+                         "  body TRUNCATED by the node at %d B, %s newer row(s) left for a later "
+                         "run" % (r["live_ring_truncated_bytes"], r.get("live_ring_pending"))
+                         if r.get("live_ring_truncated_bytes") is not None else ""))
             if r.get("clips_unknown"):
                 print("    clips UNMEASURED this run, not clean: %s" % r.get("clips_reason"))
             elif r.get("clips_seen"):
