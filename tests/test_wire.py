@@ -324,3 +324,22 @@ class TestDecodeTrailingBytes:
         assert got["version"] == 1
         assert got["node_us"] == 597174
 
+    def test_explicit_version_discrimination(self):
+        v1_frame = SK.pack(597174, -12.5, 1140, _q())
+        v2_frame = WR.pack_v2(12_345_678, 42, 7, -10.0, 500, _q())
+
+        assert WR.version_of(v1_frame, explicit_version=1) == 1
+        assert WR.version_of(v2_frame, explicit_version=2) == 2
+
+        with pytest.raises(ValueError, match="explicit v1 specified but frame is not a valid v1"):
+            WR.version_of(b"too short", explicit_version=1)
+
+        with pytest.raises(ValueError, match="explicit v2 specified but frame is not a valid v2"):
+            WR.version_of(v1_frame, explicit_version=2)
+
+        d1 = WR.decode(v1_frame, explicit_version=1)
+        assert d1["version"] == 1
+        d2 = WR.decode(v2_frame, explicit_version=2)
+        assert d2["version"] == 2
+
+
