@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 288612 B serialised; 288790 B of annotations against a 262144 B cap.
+# apply-mode server: 288436 B serialised; 288614 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'dd09fc2'
+    dama-hear/commit: 'd365be1'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '288612'
+    dama-hear/serialised-bytes: '288436'
 data:
   hear__init__.py: |
     
@@ -5239,24 +5239,20 @@ data:
     def main(argv: Optional[Sequence[str]] = None) -> int:
         ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
         ap.add_argument("nodes", nargs="+")
-        # ⚠️OPT-IN, AND ONLY FOR THE SPLIT -- UNREACHABILITY DOES NOT COUNT. This tool's default is to
-        # report and not gate, because a node with no sky yet is not a failure and a tool that cries
-        # wolf teaches its operator to ignore it. A SPLIT FLEET is different in kind: it is never
-        # transient, never self-healing, and it silently invalidates the capture -- arrivals from
-        # different builds are not comparable. So a scheduled caller can ask for that one condition to
-        # be an error, and gets nothing else: with this flag, the exit code is 2 for a split and 0
-        # otherwise, full stop -- a node that did not answer is neither.
+        # ⚠️OPT-IN, AND ONLY FOR A VERIFIED ONE-BUILD FLEET. This tool's default stays report-only,
+        # because a node with no sky yet is not a failure and a tool that cries wolf teaches its
+        # operator to ignore it. But when a scheduled caller asks for the one-build invariant, absence
+        # must not read as agreement: a split/canary build hidden behind an unreachable node is
+        # exactly the drift this tool exists to catch.
         #
-        # ⚠️IT USED TO FALL THROUGH TO `0 if not dead else 1` even with this flag set, so
-        # deploy/k8s/hear-drain.yaml's hear-drain-check (the only caller) went red on an unreachable
-        # node -- transient (a reboot, or the ESP32 refusing a second concurrent client, see
-        # RETRY_BACKOFF_S) or not -- even though its own comment already says "gates on the SPLIT
-        # ALONE. A node with no fix yet is not a failure". Reachability has its own, better check
-        # already: tools/hear_drain.py --check's per-sensor last-success staleness gate. This flag is
-        # not a second one.
+        # So this flag fails CLOSED. The exit code is 2 when the answering nodes are split, 1 when any
+        # node did not answer and the invariant therefore could not be verified, and 0 only when every
+        # node answered and all reported one build. That mirrors the same "absent must not read as ok"
+        # rule now enforced in tools/hear_drain.py's scene-file check.
         ap.add_argument("--require-one-build", action="store_true",
-                        help="exit 2 if the nodes that ANSWERED are not all on one build, 0 "
-                             "otherwise -- unreachability is not gated by this flag at all")
+                        help="exit 2 if the answering nodes are split, 1 if any node did not answer "
+                             "and the one-build check is inconclusive, 0 only when all nodes answer "
+                             "and report one build")
         a = ap.parse_args(argv)
     
         got: Dict[str, Dict] = {}
@@ -5279,8 +5275,8 @@ data:
             print("  HTTP PROBE FAILED  " + d)
             print("    OFFLINE UNCONFIRMED -- " + OFFLINE_VERIFICATION)
     
+        builds = {d.get("fw", "?") for d in got.values()}
         if len(got) > 1:
-            builds = {d.get("fw", "?") for d in got.values()}
             print()
             if len(builds) == 1:
                 b = builds.pop()
@@ -5311,7 +5307,14 @@ data:
                 if why:
                     print("  %-9s %s" % (n, "; ".join(why)))
         if a.require_one_build:
-            return 2 if len({d.get("fw", "?") for d in got.values()}) > 1 else 0
+            if len(builds) > 1:
+                return 2
+            if dead:
+                print()
+                print("⚠️BUILD CHECK INCONCLUSIVE: %d node(s) did not answer, so one-build could not "
+                      "be verified" % len(dead))
+                return 1
+            return 0
         return 0 if not dead else 1
     
     

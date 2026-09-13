@@ -86,8 +86,9 @@ class TestTheSplitGate(TestDriftReport):
     """`--require-one-build` — opt-in, and ONLY for the split.
 
     The default stays report-only on purpose: a node with no sky yet is not a failure, and a tool
-    that cries wolf teaches its operator to ignore it. A split fleet is different in
-    kind -- never transient, never self-healing, and it silently invalidates the capture.
+    that cries wolf teaches its operator to ignore it. But once the invariant is requested,
+    absence must not read as agreement: a split fleet hidden behind an unreachable node is still
+    not verified safe.
     """
 
     def _rc(self, mapping, monkeypatch, flag=True):
@@ -114,19 +115,19 @@ class TestTheSplitGate(TestDriftReport):
         assert self._rc({"a=1": self._status("x", "a"),
                          "b=2": self._status("x", "b", sats=0, fix=0)}, monkeypatch) == 0
 
-    def test_an_unreachable_node_does_not_fail_the_gate_either(self, monkeypatch):
-        # ⚠️THE REGRESSION. hear-drain-check's own comment already says "gates on the SPLIT
-        # ALONE", but the code fell through to `0 if not dead else 1` even with the flag set, so
-        # a node that was merely unreachable (a reboot, or the ESP32 refusing a concurrent
-        # client -- deploy/k8s/hear-drain.yaml's hear-drain-check job, reproduced live 2026-09-10)
-        # turned the whole hourly job red.
+    def test_an_unreachable_node_makes_the_gate_inconclusive(self, capsys, monkeypatch):
+        # ⚠️THE REGRESSION. A split/canary build hidden behind a refused /status must not pass as
+        # "all one build" by omission. With the invariant flag set, a missing answer is UNKNOWN
+        # and the caller gets a non-zero rc rather than a silent green.
         def fetch(n):
             if n == "b=2":
                 raise ConnectionRefusedError("refused")
             return self._status("x", "a")
         monkeypatch.setattr(F, "fetch", fetch)
         rc = F.main(["--require-one-build", "a=1", "b=2"])
-        assert rc == 0, "an unreachable node is not a split and must not gate"
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "BUILD CHECK INCONCLUSIVE" in out
 
     def test_a_split_still_fails_the_gate_even_with_an_unreachable_third_node(self, monkeypatch):
         # the fix above must not swallow a real split along with unreachability
