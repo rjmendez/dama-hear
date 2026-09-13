@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import types
 
 import numpy as np
 import pytest
@@ -116,6 +117,46 @@ class TestTheWeekAndTheGroup:
         assert HT.birdnet_group({"Dog_Dog": 0.9, "Cyanocitta cristata_Blue Jay": 0.1}) == "Dog"
         assert HT.birdnet_group({"Cyanocitta cristata_Blue Jay": 0.2}) == "below 0.5"
         assert HT.birdnet_group({}) == "none"
+
+
+class TestTheConstructorVerifiesPinnedFiles:
+
+    def _fake_runtime(self, monkeypatch):
+        class _Interpreter:
+            def __init__(self, model_path, num_threads=1):
+                self.model_path = model_path
+
+            def allocate_tensors(self):
+                pass
+
+            def get_input_details(self):
+                if self.model_path.endswith("audio-model.tflite"):
+                    return [{"index": 0, "shape": [1, HT.BIRDNET_WINDOW]}]
+                return [{"index": 0, "shape": [1, 3]}]
+
+            def get_output_details(self):
+                return [{"index": 0, "shape": [1, HT.BIRDNET_CLASSES]}]
+
+        interp = types.SimpleNamespace(Interpreter=_Interpreter)
+        monkeypatch.setitem(sys.modules, "ai_edge_litert", types.SimpleNamespace(interpreter=interp))
+        monkeypatch.setitem(sys.modules, "ai_edge_litert.interpreter", interp)
+
+    def test_birdnet_refuses_tampered_weights_by_default(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(HT, "verify_birdnet", lambda _d: {
+            "ok": False, "problems": ["birdnet tampered"]})
+        with pytest.raises(HT.WeightsRefused, match="birdnet tampered"):
+            HT.BirdNETTagger(str(tmp_path))
+
+    def test_birdnet_skip_requires_an_explicit_unsafe_flag(self, tmp_path, monkeypatch):
+        labels = tmp_path / "labels" / "en_us.txt"
+        labels.parent.mkdir(parents=True, exist_ok=True)
+        labels.write_text("\n".join(f"species_{i}_species_{i}" for i in range(HT.BIRDNET_CLASSES)))
+        monkeypatch.setenv(HT.SITE_ENV, "12.3,-45.7")
+        monkeypatch.setattr(HT, "verify_birdnet", lambda _d: {
+            "ok": False, "problems": ["birdnet tampered"]})
+        self._fake_runtime(monkeypatch)
+        tagger = HT.BirdNETTagger(str(tmp_path), unsafe_skip_verification=True)
+        assert tagger.verified is None
 
 
 class TestThePinnedFiles:

@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import types
 
 import numpy as np
 import pytest
@@ -220,6 +221,54 @@ in that release are all called mn10_as and differ only in mel bins and hop"
         # verification fail closed, but silently -- and nobody would know the pin was never done.
         for s in (HT.MODEL_SHA256, HT.CLASSMAP_SHA256):
             assert re.fullmatch(r"[0-9a-f]{64}", s), s
+
+class TestTheConstructorsVerifyPinnedWeightsThemselves:
+
+    def _fake_onnxruntime(self, monkeypatch):
+        class _Session:
+            def __init__(self, model_path, opts, providers):
+                self._outputs = [
+                    types.SimpleNamespace(name="logits", shape=[1, HT.MODEL_CLASSES]),
+                    types.SimpleNamespace(name="embed", shape=[1, HT.MODEL_EMBED_DIM]),
+                ]
+
+            def get_inputs(self):
+                return [types.SimpleNamespace(name="waveform")]
+
+            def get_outputs(self):
+                return self._outputs
+
+        monkeypatch.setitem(
+            sys.modules,
+            "onnxruntime",
+            types.SimpleNamespace(
+                SessionOptions=lambda: types.SimpleNamespace(),
+                InferenceSession=_Session,
+            ),
+        )
+
+    def test_tagger_refuses_tampered_weights_before_importing_the_runtime(self, tmp_path, monkeypatch):
+        mp = tmp_path / HT.MODEL_FILE
+        cp = tmp_path / HT.CLASSMAP_FILE
+        mp.write_bytes(b"not pinned")
+        cp.write_text("index,mid,display_name\n0,/m/0,zero\n")
+        monkeypatch.setattr(HT, "verify_weight_files", lambda *_a, **_kw: {
+            "ok": False, "problems": ["tampered weights"]})
+        with pytest.raises(HT.WeightsRefused, match="tampered weights"):
+            HT.Tagger(str(mp), str(cp))
+
+    def test_tagger_skip_requires_an_explicit_unsafe_flag(self, tmp_path, monkeypatch):
+        mp = tmp_path / HT.MODEL_FILE
+        cp = tmp_path / HT.CLASSMAP_FILE
+        mp.write_bytes(b"not pinned")
+        cp.write_text("index,mid,display_name\n0,/m/0,zero\n")
+        monkeypatch.setattr(HT, "verify_weight_files", lambda *_a, **_kw: {
+            "ok": False, "problems": ["tampered weights"]})
+        monkeypatch.setattr(HT, "load_class_map",
+                            lambda _p: ["c"] * HT.MODEL_CLASSES)
+        self._fake_onnxruntime(monkeypatch)
+        t = HT.Tagger(str(mp), str(cp), unsafe_skip_verification=True)
+        assert t.verified is None
 
 # ----------------------------------------------------------------- normalisation
 
