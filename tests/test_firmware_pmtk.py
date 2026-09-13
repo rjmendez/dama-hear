@@ -18,12 +18,40 @@ INO = pathlib.Path(__file__).resolve().parents[1] / "firmware" / "hear_node" / "
 POS_HACC_MAX_MM = 25_000
 
 
+def _strip_comments(src):
+    """Remove // and /* */ comments, leaving string and char literals intact (so "http://" and
+    '/' survive)."""
+    out, i, n = [], 0, len(src)
+    while i < n:
+        c = src[i]
+        if c in "\"'":
+            j = i + 1
+            while j < n and src[j] != c:
+                j += 2 if src[j] == "\\" else 1
+            out.append(src[i:j + 1])
+            i = j + 1
+        elif src.startswith("//", i):
+            j = src.find("\n", i)
+            i = n if j < 0 else j
+        elif src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def _source():
     if not INO.exists():
         pytest.skip("hear_node.ino not in this checkout")
-    src = INO.read_text()
-    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
-    return re.sub(r"//[^\n]*", "", src)
+    return _strip_comments(INO.read_text())
+
+
+def test_the_comment_stripper_keeps_literals():
+    src = 'a = "http://x"; // gone\nb = \'/\'; /* gone */ c = "\\"//"; // gone'
+    assert _strip_comments(src) == 'a = "http://x"; \nb = \'/\';  c = "\\"//"; '
+
 
 
 def _body(src, start, end):
