@@ -157,8 +157,8 @@ class Backend:
     def flush(self) -> Dict:
         """Associate, solve and publish everything buffered, then clear the buffer.
 
-        A solver ValueError becomes `solve_error` on that one event and the flush continues: one
-        refused event must not cost the others their answer.
+        A solver ValueError becomes `solve_error` on that one event, is not published, and the
+        flush continues: one refused event must not cost the others their answer.
         """
         grouped = AS.associate(self._detections, self.survey, temp_c=self.temp_c,
                                margin_s=self.margin_s, min_nodes=self.min_nodes,
@@ -194,8 +194,9 @@ class Backend:
                 "worst_pair_excess_s": ev["worst_pair_excess_s"],
                 "solution": sol, "solve_error": err, "published": None,
             }
-            r["published"] = to_dama_event(r, self.array_id)
-            self._emit(r["published"])
+            if err is None:
+                r["published"] = to_dama_event(r, self.array_id)
+                self._emit(r["published"])
             events.append(r)
         out = {
             "events": events,

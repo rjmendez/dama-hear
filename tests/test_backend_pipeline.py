@@ -417,6 +417,25 @@ class TestPublishing:
         assert got["events"][0]["published"]["node_type"] == "hear"
 
 
+    def test_a_solver_value_error_is_recorded_but_not_published(self, monkeypatch):
+        seen = []
+
+        def boom(*_a, **_kw):
+            raise ValueError("forced solve failure")
+
+        monkeypatch.setattr(BP.PT, "solve", boom)
+        got = BP.Backend(_survey(RING), temp_c=T, v_mps=V, publish=seen.append,
+                         source_class="blast").run(
+            _frames(range(1, 6), _shock_arrivals(RING, BEARING, OFFSET)))
+        assert len(got["events"]) == 1
+        ev = got["events"][0]
+        assert ev["solution"] is None
+        assert ev["solve_error"] == "forced solve failure"
+        assert ev["published"] is None
+        assert seen == []
+        assert got["n_published"] == 0
+
+
 class TestThePublishedEventSaysWhetherItCouldBeReal:
     """⚠️THE EMITTER HAD NO WAY TO SAY AN EVENT WAS IMPOSSIBLE.
 
