@@ -32,6 +32,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 DRAIN_CODE = [
     ("hear__init__.py", "hear/__init__.py"),
+    ("hear_wire.py", "hear/wire.py"),
     ("hear_sketch.py", "hear/sketch.py"),
     ("hear_corpus.py", "hear/corpus.py"),
     ("hear_detsfile.py", "hear/detsfile.py"),

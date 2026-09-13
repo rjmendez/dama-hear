@@ -58,6 +58,7 @@ from . import detsfile as DF
 from . import identity as ID
 from . import scenefile as SF
 from . import sketch as SK
+from . import wire as WR
 
 SCHEMA_VERSION = 1
 
@@ -240,14 +241,17 @@ def _sync_sigma_ns(v: Any) -> Optional[float]:
 def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
     frame = binascii.unhexlify(row["frame_hex"])
-    d = SK.unpack(frame)
+    d = WR.decode(frame)
     utc_us = int(row.get("utc_us") or 0)
     node = row["node"]
     # fs: the FRAME is authoritative when it states a rate; the CSV column is only the node's
     # running estimate.
     fs_csv = row.get("fs_hz")
     fs_csv = float(fs_csv) if fs_csv not in (None, "") else None
-    return {
+    node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
+    event_flags = d.get("event_flags", 0)
+    no_context = bool(event_flags & SK.FLAG_NO_CONTEXT) if d.get("version", 1) == 1 else False
+    rec = {
         "schema_version": SCHEMA_VERSION,
         "key": key("node", node, utc_us, row.get("sample"), frame),
         "source": "node",
@@ -269,11 +273,11 @@ def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "frames": int(d["q"].shape[1]),
         "peak": d["peak"],
         "ref_db": d["ref_db"],
-        "node_us": d["node_us"],
+        "node_us": node_us,
         "retrigger": bool(d["retrigger"]),
         # event_flags, not the raw flags word: bit 1 is "no context" only in v1, and is a profile
         # bit in v2. Masking the raw word tags good v2 frames as broken.
-        "no_context": bool(d["event_flags"] & SK.FLAG_NO_CONTEXT),
+        "no_context": no_context,
         "sketch_back": (int(row["sketch_back"]) if row.get("sketch_back") not in (None, "")
                         else None),
         # ⚠️THE SAME KEY AND THE SAME UNIT AS THE PHONE PATH ABOVE (ingest_mqtt_jsonl), which is
@@ -293,18 +297,20 @@ def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         # the node's own PPS edge counter. `utc_us == 0` says the node could not NAME the edge;
         # `pps_n` still says WHICH edge, and `us_since_pps` how far into it. Without the pair, a
         # row whose neighbours in the same boot ARE anchored cannot be placed even in principle,
-        # and 517 mach records were stored that way (2026-09-10, /pool/corpus/records).
-        # Keeping them does NOT make a row anchored -- see hear/unanchored.py for what may and
-        # may not be reconstructed from them, and why the pre-lock case is refused.
-        # ⚠️Records already written keep the shape they were written with: the pool is
-        # content-addressed and a re-fetch of the same row dedupes rather than rewrites. These
-        # fields appear on rows ingested from here on, not retroactively.
+        # so unanchored recovery (hear/pool.py:unanchored_window) would have had nothing to work on.
         "pps_n": row.get("pps_n"),
         "us_since_pps": row.get("us_since_pps"),
         "trigger": row.get("trigger"),
         "clip": row.get("clip") or None,
         "dets_schema": row.get("schema"),
     }
+    if "us_of_day" in d:
+        rec["us_of_day"] = d["us_of_day"]
+    if "seq" in d:
+        rec["seq"] = d["seq"]
+    if "profile_id" in d:
+        rec["profile_id"] = d["profile_id"]
+    return rec
 
 
 
@@ -462,17 +468,20 @@ class Pool:
                 continue
             try:
                 frame = base64.b64decode(b64)
-                d = SK.unpack(frame)
+                d = WR.decode(frame)
             except Exception as e:
                 r = type(e).__name__
                 skips[r] = skips.get(r, 0) + 1
                 continue
             ts_ms = payload.get("ts_utc_ms")
-            stated_utc_us = C.phone_utc_us(ts_ms, d["node_us"])
+            node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
+            stated_utc_us = C.phone_utc_us(ts_ms, node_us)
             ts = None if stated_utc_us is None else stated_utc_us / 1e6
             utc_us = 0 if stated_utc_us is None else stated_utc_us
             node = str(nid or payload.get("node_id") or "?")
-            recs.append({
+            event_flags = d.get("event_flags", 0)
+            no_context = bool(event_flags & SK.FLAG_NO_CONTEXT) if d.get("version", 1) == 1 else False
+            rec = {
                 "schema_version": SCHEMA_VERSION,
                 "key": key("phone", node, utc_us, payload.get("trigger_ts_utc_ms"), frame),
                 "source": "phone", "node": node, "node_from": "topic" if nid else "payload",
@@ -483,9 +492,9 @@ class Pool:
                                 ("json" if payload.get("fs") else None),
                 "layout": d["layout"], "valid_bands": d["valid_bands"],
                 "bands": int(d["q"].shape[0]), "frames": int(d["q"].shape[1]),
-                "peak": d["peak"], "ref_db": d["ref_db"], "node_us": d["node_us"],
+                "peak": d["peak"], "ref_db": d["ref_db"], "node_us": node_us,
                 "retrigger": bool(d["retrigger"]),
-                "no_context": bool(d["event_flags"] & SK.FLAG_NO_CONTEXT),
+                "no_context": no_context,
                 "sketch_back": None,
                 "clipped": payload.get("clipped"),
                 "clock_tier": payload.get("clock_tier"),
@@ -500,7 +509,14 @@ class Pool:
                 # If a producer ever states it outright, it outranks the derivation. Absent is
                 # the normal case and stays absent, NOT False: see Record.utc_trusted.
                 "utc_trusted": payload.get("utc_trusted"),
-            })
+            }
+            if "us_of_day" in d:
+                rec["us_of_day"] = d["us_of_day"]
+            if "seq" in d:
+                rec["seq"] = d["seq"]
+            if "profile_id" in d:
+                rec["profile_id"] = d["profile_id"]
+            recs.append(rec)
         added = self._append(recs)
         entry = {"kind": "mqtt.jsonl", "path": os.path.abspath(path), "origin": origin or path,
                  "sha256": sha, "bytes": len(raw), "rows": rows_seen, "decoded": len(recs),
@@ -819,11 +835,14 @@ class Pool:
             if usable_only and (r.get("fs_hz") is None or r.get("no_context")
                                 or r.get("layout") != SK.LAYOUT_FIXED):
                 continue
-            d = SK.unpack(base64.b64decode(r["frame_b64"]))
+            d = WR.decode(base64.b64decode(r["frame_b64"]))
+            node_us = r.get("node_us")
+            if node_us is None:
+                node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
             out.append(C.Record(
                 node_id=r["node"], source=r["source"], q=d["q"], ref_db=d["ref_db"],
                 peak=d["peak"], bands=d["q"].shape[0], frames=d["q"].shape[1],
-                fs_hz=r.get("fs_hz"), node_us=d["node_us"], retrigger=bool(d["retrigger"]),
+                fs_hz=r.get("fs_hz"), node_us=node_us, retrigger=bool(d["retrigger"]),
                 ts_utc_s=r.get("ts_utc_s"), clipped=r.get("clipped"),
                 clock_tier=r.get("clock_tier"), sync_sigma_ns=r.get("sync_sigma_ns"),
                 # ⚠️EVERYTHING THE STORE HELD THAT IS NOT ALREADY A FIELD. This was a fixed

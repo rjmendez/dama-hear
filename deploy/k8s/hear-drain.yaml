@@ -94,6 +94,7 @@ spec:
                     --clip-deadline-s 120
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py,  subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/wire.py,      subPath: hear_wire.py }
                 - { name: code, mountPath: /app/hear/sketch.py,    subPath: hear_sketch.py }
                 - { name: code, mountPath: /app/hear/corpus.py,    subPath: hear_corpus.py }
                 - { name: code, mountPath: /app/hear/detsfile.py,  subPath: hear_detsfile.py }
@@ -203,6 +204,7 @@ spec:
                   exit "$rc"
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py,  subPath: hear__init__.py }
+                - { name: code, mountPath: /app/hear/wire.py,      subPath: hear_wire.py }
                 - { name: code, mountPath: /app/hear/sketch.py,    subPath: hear_sketch.py }
                 - { name: code, mountPath: /app/hear/corpus.py,    subPath: hear_corpus.py }
                 - { name: code, mountPath: /app/hear/detsfile.py,  subPath: hear_detsfile.py }
