@@ -205,14 +205,36 @@ def test_heartbeat_backoff_is_tens_of_seconds_capped_at_one_minute():
     assert "return HEAR_PUSH_HEARTBEAT_MAX_MS;" in body
 
 
-def test_firmware_uses_the_host_port_the_receiver_actually_exposes():
+def test_firmware_defaults_to_the_public_ingest_api_over_tls():
+    # The LAN receiver (172.21.171.198:5051) turned out unreachable inbound from the fleet's
+    # subnet -- confirmed empirically (zero SYN packets arriving) after fixing the connect
+    # timeout did not help. The default now targets dama-gotchi's existing public ingest API,
+    # which the fleet already reaches like any other internet host.
+    assert '#define HEAR_PUSH_HOST              "api.botnet.floppydicks.net"' in CODE
+    assert '#define HEAR_PUSH_PORT              443u' in CODE
+    assert '#define HEAR_PUSH_TLS               1' in CODE
+    assert '"172.21.171.198"' not in CODE
+
+
+def test_the_receiver_manifest_still_exposes_its_own_port_for_a_lan_only_build():
+    # HEAR_PUSH_WRAP_BATCH=0 / HEAR_PUSH_HOST override still targets this receiver directly, so
+    # its manifest and firmware's non-default LAN path must agree on the port even though the
+    # compiled-in default no longer points here.
     docs = list(yaml.safe_load_all(MANIFEST.read_text()))
     dep = docs[0]
     ports = dep["spec"]["template"]["spec"]["containers"][0]["ports"]
-    host_port = ports[0]["hostPort"]
-    assert '#define HEAR_PUSH_HOST              "172.21.171.198"' in CODE
-    assert '#define HEAR_PUSH_PORT              5051u' in CODE
-    assert host_port == 5051
+    assert ports[0]["hostPort"] == 5051
+    assert '"/api/hear/heartbeat"' in CODE
+    assert '"/api/hear/event"' in CODE
+
+
+def test_push_post_json_uses_tls_and_wraps_the_batch_envelope_for_the_ingest_api():
+    body = _fn("push_post_json")
+    assert "WiFiClientSecure client;" in body
+    assert "client.setInsecure();" in body
+    assert '"{\\"device_id\\":\\"%s\\",\\"messages\\":[%.*s]}"' in body
+    assert "node_id," in body
+    assert "Authorization: Bearer %s" in body
 
 
 def test_the_connect_timeout_is_long_enough_to_complete_a_real_tcp_handshake():

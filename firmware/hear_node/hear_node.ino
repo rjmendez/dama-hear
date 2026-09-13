@@ -16,6 +16,7 @@
 //     arduino-cli compile -u -p /dev/ttyACM0 \
 //       --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi firmware/hear_node
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <ESP_I2S.h>
@@ -2200,20 +2201,42 @@ static bool     clip_have_last = false;
 static char clip_rand[CLIP_RAND_HEX + 1] = "000000";
 
 #ifndef HEAR_PUSH_HOST
-// "mrpink" was a Tailscale MagicDNS name; this firmware's WiFiClient has no MagicDNS resolver, so
-// that name never resolved and no heartbeat has ever reached a receiver under this default. The
-// receiver now runs at this LAN-routable address -- override per fleet by defining HEAR_PUSH_HOST
-// in secrets.h (gen_secrets.py writes it from ~/.hear_push) before this default is reached.
-#define HEAR_PUSH_HOST              "172.21.171.198"
+// "mrpink" was a Tailscale MagicDNS name unresolvable by this firmware's plain DNS stack, and
+// a raw LAN IP (172.21.171.198) turned out unreachable inbound from the fleet's subnet -- no
+// heartbeat ever completed under either default. This one is dama-gotchi's existing public
+// ingest API (AWS API Gateway, already wired to SQS -> the home MQTT bridge -> Redis), which the
+// fleet reaches the same way it reaches the internet for anything else.
+#define HEAR_PUSH_HOST              "api.botnet.floppydicks.net"
 #endif
 #ifndef HEAR_PUSH_PORT
-#define HEAR_PUSH_PORT              5051u
+#define HEAR_PUSH_PORT              443u
+#endif
+#ifndef HEAR_PUSH_TLS
+// The API Gateway custom domain is HTTPS-only (ACM cert): there is no plaintext fallback.
+#define HEAR_PUSH_TLS               1
 #endif
 #ifndef HEAR_PUSH_TOKEN
 #define HEAR_PUSH_TOKEN             ""
 #endif
+#ifndef HEAR_PUSH_AUTH_BEARER
+// dama-gotchi's ingest Lambda reads a standard `Authorization: Bearer <key>` header, not the
+// X-Hear-Token header the old LAN-only receiver used. Kept switchable so a build still pointed
+// at that receiver (HEAR_PUSH_AUTH_BEARER=0 in secrets.h) keeps working unchanged.
+#define HEAR_PUSH_AUTH_BEARER       1
+#endif
+#ifndef HEAR_PUSH_WRAP_BATCH
+// The ingest Lambda expects one {"device_id":...,"messages":[...]} envelope per POST, not
+// hear_node's bare heartbeat/event object -- wrap it here so hear_push_payload.h's encoders
+// stay backend-agnostic. Off for a build still pointed at the old bare-JSON LAN receiver.
+#define HEAR_PUSH_WRAP_BATCH        1
+#endif
+#if HEAR_PUSH_WRAP_BATCH
+#define HEAR_PUSH_HEARTBEAT_PATH    "/ingest/batch"
+#define HEAR_PUSH_EVENT_PATH        "/ingest/batch"
+#else
 #define HEAR_PUSH_HEARTBEAT_PATH    "/api/hear/heartbeat"
 #define HEAR_PUSH_EVENT_PATH        "/api/hear/event"
+#endif
 #define HEAR_PUSH_CONNECT_TIMEOUT_MS 3000u
 #define HEAR_PUSH_READ_TIMEOUT_MS   2000u
 #define HEAR_PUSH_FAIL_LOG_MS       60000UL
@@ -2313,16 +2336,49 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
     if (code_out) *code_out = -2;
     return false;
   }
+#if HEAR_PUSH_WRAP_BATCH
+  // The ingest Lambda expects one batch envelope per POST; hear_push_payload.h's encoders build
+  // hear_node's own bare object, so wrap it here rather than teach them about this one backend.
+  char wrapped[512];
+  int wn = snprintf(wrapped, sizeof wrapped, "{\"device_id\":\"%s\",\"messages\":[%.*s]}",
+                     node_id, (int)body_len, body);
+  if (wn <= 0 || wn >= (int)sizeof wrapped) {
+    if (code_out) *code_out = -8;
+    return false;
+  }
+  body = wrapped;
+  body_len = (size_t)wn;
+#endif
+#if HEAR_PUSH_TLS
+  WiFiClientSecure client;
+  // No root CA pinned: ACM certs rotate on a schedule this firmware has no way to track, and a
+  // stale pin would silently blackhole every push again, the same failure mode this whole fix is
+  // for. That trades away MITM-resistance on a low-value heartbeat/event payload; revisit if
+  // this path ever carries anything sensitive.
+  client.setInsecure();
+#else
   WiFiClient client;
+#endif
   client.setNoDelay(true);
   if (!client.connect(HEAR_PUSH_HOST, HEAR_PUSH_PORT, HEAR_PUSH_CONNECT_TIMEOUT_MS)) {
     if (code_out) *code_out = -4;
     return false;
   }
   const bool have_token = HEAR_PUSH_TOKEN[0];
-  char req[768];
-  int n = have_token
-      ? snprintf(req, sizeof req,
+  char req[1024];
+  int n;
+  if (have_token && HEAR_PUSH_AUTH_BEARER) {
+    n = snprintf(req, sizeof req,
+                 "POST %s HTTP/1.1\r\n"
+                 "Host: %s:%u\r\n"
+                 "Content-Type: application/json\r\n"
+                 "Connection: close\r\n"
+                 "Authorization: Bearer %s\r\n"
+                 "Content-Length: %u\r\n\r\n%.*s",
+                 path, HEAR_PUSH_HOST, (unsigned)HEAR_PUSH_PORT, HEAR_PUSH_TOKEN,
+                 (unsigned)body_len, (int)body_len, body);
+  } else if (have_token) {
+    n = snprintf(req, sizeof req,
                  "POST %s HTTP/1.1\r\n"
                  "Host: %s:%u\r\n"
                  "Content-Type: application/json\r\n"
@@ -2330,8 +2386,9 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
                  "X-Hear-Token: %s\r\n"
                  "Content-Length: %u\r\n\r\n%.*s",
                  path, HEAR_PUSH_HOST, (unsigned)HEAR_PUSH_PORT, HEAR_PUSH_TOKEN,
-                 (unsigned)body_len, (int)body_len, body)
-      : snprintf(req, sizeof req,
+                 (unsigned)body_len, (int)body_len, body);
+  } else {
+    n = snprintf(req, sizeof req,
                  "POST %s HTTP/1.1\r\n"
                  "Host: %s:%u\r\n"
                  "Content-Type: application/json\r\n"
@@ -2339,6 +2396,7 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
                  "Content-Length: %u\r\n\r\n%.*s",
                  path, HEAR_PUSH_HOST, (unsigned)HEAR_PUSH_PORT,
                  (unsigned)body_len, (int)body_len, body);
+  }
   if (n <= 0 || n >= (int)sizeof req) {
     client.stop();
     if (code_out) *code_out = -3;
