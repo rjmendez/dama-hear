@@ -98,6 +98,9 @@ PROFILE_GEOMETRY: Dict[int, Geometry] = {
 #: defect, not a choice.
 LEGACY_PROFILES = frozenset({0})
 
+#: Valid profile ids for a NEW frame (excludes legacy/read-only profile 0).
+NEW_PROFILE_IDS: frozenset[int] = frozenset(k for k in PROFILE_GEOMETRY if k not in LEGACY_PROFILES)
+
 #: What pack_v2 uses when the caller names no profile.
 #:
 #: ⚠️A DECLARED CONSTANT, NOT A DERIVATION. It used to derive the id from q.shape, which is how a
@@ -222,6 +225,9 @@ def pack_v2(us_of_day: int, node_id: int, seq: int, ref_db: float, peak: int,
     if q.ndim != 2:
         raise ValueError("q is %d-D; a sketch is 2-D (bands, frames)" % q.ndim)
     pid = DEFAULT_PROFILE if profile_id is None else int(profile_id)
+    if pid not in NEW_PROFILE_IDS:
+        raise ValueError("profile_id %d is not a valid new profile id (valid: %s)"
+                         % (pid, sorted(NEW_PROFILE_IDS)))
     bands, frames = profile_shape(pid)
     if q.shape != (bands, frames):
         raise ValueError("q shape %r does not match profile %d (%dx%d)"
@@ -261,11 +267,17 @@ def unpack_v2(b: bytes) -> Dict:
 
     ref4, peak, node_id, _ = struct.unpack_from("<hHHH", b, 5)
     q = np.frombuffer(b[HDR_V2:n], dtype=np.int8).reshape(bands, frames)
+    geom = profile_geometry(pid)
+    fs = geom.fs_hz
+    layout = geom.layout
+    vb = None if fs is None else SK.valid_bands(fs, bands, layout=layout)
+    be = None if fs is None else SK.band_edges_hz(fs, bands, layout=layout)
     return {"version": VERSION, "us_of_day": us,
             "node_id": node_id, "seq": (flags >> _F_SEQ_SHIFT) & _F_SEQ_MASK,
             "ref_db": ref4 / 4.0, "peak": peak,
             "retrigger": bool(flags & _F_RETRIG), "profile_id": pid,
             "bands": bands, "frames": frames, "flags": flags,
+            "fs_hz": fs, "layout": layout, "valid_bands": vb, "band_edges_hz": be,
             "q": q, "db": q.astype(float) / 2.0 + ref4 / 4.0}
 
 
