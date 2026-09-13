@@ -297,4 +297,5 @@ def test_a_negative_tolerance_is_refused_and_a_zero_one_reads_without_nan():
         with _pt.raises(ValueError):
             _CB.interval_consistent({0: 0.010, 1: 0.011}, mics, **kw)
     chk = _CB.interval_consistent({0: 0.010, 1: 0.011}, mics, tol_s=0.0)
-    assert chk.note is None or "nan" not in chk.note.lower()
+    assert chk["tightest_bound_slack"] == float("inf")
+    assert "tol_s is 0" in chk["note"] and "nan" not in chk["note"].lower()
