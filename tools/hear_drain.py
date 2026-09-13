@@ -1223,17 +1223,28 @@ def record_node_position(root: str, node: str, st: Dict[str, Any],
                 doc = got
         except (OSError, ValueError):
             pass
+    # ⚠️pos.n 0 IS AN ABSENCE, NOT A PLACE. The firmware averages a position only from UBX
+    # NAV-PVT; the PMTK/NMEA boards (gold, ageev, kasami) parse no coordinate from GGA and report
+    # means of exactly 0.0. Filing that would be a node at lat 0, lon 0, so any entry is dropped.
+    if not pos.get("n"):
+        if doc["nodes"].pop(node, None) is not None:
+            _write_json_atomic(p, doc)
+        return None
     doc["nodes"][node] = {
         "class": st.get("class"), "lat_deg": pos.get("mean_lat"), "lon_deg": pos.get("mean_lon"),
         "h_ell_m": pos.get("mean_hell_m"), "hacc_m": pos.get("hacc_m"),
         "vacc_m": pos.get("vacc_m"), "fixes": pos.get("n"), "fix": gps.get("fix"),
         "at": now, "uptime_s": st.get("uptime_s"), "source": "/status pos.mean_*"}
+    _write_json_atomic(p, doc)
+    return {"fixes": pos.get("n"), "hacc_m": pos.get("hacc_m")}
+
+
+def _write_json_atomic(p: str, doc: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(p), exist_ok=True)
     tmp = p + ".tmp"
     with open(tmp, "w") as fh:
         json.dump(doc, fh, indent=2, sort_keys=True)
     os.replace(tmp, p)
-    return {"fixes": pos.get("n"), "hacc_m": pos.get("hacc_m")}
 
 
 #: Two runs saw the same boot when the boot EPOCH they imply (run time minus uptime) agrees to

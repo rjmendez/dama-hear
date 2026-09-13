@@ -63,7 +63,8 @@ class TestSurveyFallback:
         assert sv is base and rep == []
 
     @pytest.mark.parametrize("over,word", [
-        ({"fix": 2}, "3D fix"),
+        ({"fixes": 0}, "averaged no position fixes"),
+        ({"fix": 1}, None),
         ({"fixes": 10}, "fix(es) averaged"),
         ({"hacc_m": 12.0}, "reject bound"),
         ({"at": NOW - 3 * 86400.0}, "old"),
@@ -74,6 +75,9 @@ class TestSurveyFallback:
     def test_an_unusable_gps_mean_is_reported_and_left_out(self, over, word):
         base = base_survey()
         sv, rep = SV.augment_from_node_gps(base, {"gold": gps_entry(25, -20, **over)}, NOW)
+        if word is None:                     # a PMTK fix quality of 1 is a fix, not a refusal
+            assert rep[0]["used"] is True, rep
+            return
         assert sv is base
         assert rep[0]["used"] is False and word in rep[0]["why"], rep
 
@@ -138,11 +142,12 @@ class TestTdoaFallback:
         assert "no positions file" in json.dumps(t["survey_block"]["gps_fallback"])
 
     def test_a_refused_gps_mean_is_named_in_the_unsurveyed_detail(self, tmp_path):
-        t = self._run(tmp_path, [node_row("gold", T0, seed=7)], {"gold": gps_entry(25, -20, fix=2)})
+        t = self._run(tmp_path, [node_row("gold", T0, seed=7)],
+                      {"gold": gps_entry(25, -20, fixes=0)})
         assert t["funnel"]["by_reason"].get(HT.D_UNSURVEYED) == 1
         led = "\n".join(p.read_text()
                         for p in (pathlib.Path(t["out"]) / "arrivals").rglob("*.jsonl"))
-        assert "node GPS fallback not used" in led and "3D fix" in led
+        assert "node GPS fallback not used" in led and "averaged no position fixes" in led
 
     def test_a_gps_positioned_pps_node_joins_the_solve_carrying_its_position_sigma(self, tmp_path):
         entries = {"newnode": gps_entry(25.0, -20.0, 0.0, hacc_m=3.0, **{"class": "xiao-s3-pps"})}
