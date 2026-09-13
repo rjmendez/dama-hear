@@ -58,7 +58,7 @@ HDR_V2: int = 13                        # bytes. 5 ts + 2 ref + 2 peak + 2 node_
 # profile_id -> (bands, frames). LITERAL AND FROZEN: if SK.MEL_BANDS/SK.FRAMES were ever edited,
 # reading these from them would silently change the meaning of every deployed frame. A test
 # compares the two so an edit forces a NEW profile id instead of a reinterpretation.
-PROFILES: Dict[int, Tuple[int, int]] = {0: (20, 8), 1: (20, 8), 2: (20, 8)}
+PROFILES: Dict[int, Tuple[int, int]] = {0: (20, 8), 1: (20, 8), 2: (20, 8), 3: (20, 8), 4: (20, 8)}
 
 
 class Geometry(NamedTuple):
@@ -92,6 +92,9 @@ PROFILE_GEOMETRY: Dict[int, Geometry] = {
     0: Geometry(20, 8, 256, 0.004, None, SK.LAYOUT_NYQUIST, 300.0, 20000.0),
     1: Geometry(20, 8, 256, 0.004, 48000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
     2: Geometry(20, 8, 256, 0.004, 16000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
+    # Schema 2.0 multi-rate profiles: 3 for 32 kHz (HUGBOT5000), 4 for 24 kHz
+    3: Geometry(20, 8, 256, 0.004, 32000.0, SK.LAYOUT_FIXED, 300.0, 16000.0),
+    4: Geometry(20, 8, 256, 0.004, 24000.0, SK.LAYOUT_FIXED, 300.0, 12000.0),
 }
 
 #: Ids a NEW frame may claim. 0 is excluded because a frame that cannot say its own rate is the
