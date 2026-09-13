@@ -1,7 +1,6 @@
 #include "hear_net.h"
 #include "hear_log.h"
 #include <WiFi.h>
-#include "esp_task_wdt.h"
 
 static volatile uint32_t disc_n = 0, reconn_n = 0, last_disc_ms = 0;
 static volatile int last_reason = 0;
@@ -70,7 +69,7 @@ int hear_net_join(const hear_prov_t *p, uint32_t per_try_ms, hear_net_join_t *ou
     else                hear_logf("wifi  trying network %d/%d  not heard by the scan\n", k + 1, p->n);
     WiFi.begin(p->ssid[k], p->psk[k]);
     uint32_t t1 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t1 < per_try_ms) { esp_task_wdt_reset(); delay(100); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t1 < per_try_ms) delay(100);
     if (WiFi.status() == WL_CONNECTED) {
       out->joined = k + 1;
       out->rssi_join = WiFi.RSSI();
