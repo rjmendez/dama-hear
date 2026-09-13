@@ -102,6 +102,12 @@ static bool prov_loaded = false;    // ...and it was read back from NVS, not onl
 static hear_net_join_t net_join;
 static uint32_t loop_max_us = 0, loop_max_boot_us = 0;   // longest loop() pass: this health row, and boot
 static uint32_t stream_stall_n = 0, stream_gone_n = 0;    // sends that gave up: stalled, client gone
+static const char *selftest_mic = "untested";
+static const char *selftest_gps = "untested";
+static const char *selftest_pps = "untested";
+static const char *selftest_wifi = "untested";
+static bool gps_link_ok = false;
+static void log_selftest();
 static const char *reset_reason_name() {
   switch (esp_reset_reason()) {
     case ESP_RST_POWERON:   return "poweron";
@@ -455,6 +461,19 @@ static uint8_t rawbuf[512]; static volatile uint16_t raw_i = 0; static volatile 
 static volatile uint32_t nmea_valid = 0;      // lines that actually start '$' and carry a talker id
 static uint32_t gps_baud = 0;
 static volatile int gps_fix = 0, gps_sats = 0;
+static const char *selftest_gps_now() {
+  return gps_fix >= 3 ? "ok" : ((ubx_pvt > 0 || gps_link_ok) ? "no-fix" : "silent");
+}
+static const char *selftest_pps_now() {
+  return (pps_count > 0 || !strcmp(selftest_pps, "ok")) ? "ok" : "absent";
+}
+static const char *selftest_wifi_now() {
+  return WiFi.isConnected() ? "ok" : "ap-fallback";
+}
+static void log_selftest() {
+  logf("selftest mic=%s gps=%s pps=%s wifi=%s\n",
+       selftest_mic, selftest_gps, selftest_pps, selftest_wifi);
+}
 // Node POSITION. NAV-PVT has carried lat/lon all along and this firmware parsed the same message
 // for time and threw the position away -- which left the array unable to do the one thing it is
 // for: a TDoA is a hyperbola, and without the focus coordinates it is a number with no geometry.
@@ -1322,13 +1341,24 @@ static char ota_msg[96] = "idle";
 // The watchdog turns a hang into a reset, which the failback already knows how to handle. It is
 // armed only around the calls that touch hardware and can block, because the WiFi join above
 // deliberately spends up to 12 s and must not be killed for it.
+static bool boot_wdt_live = false;
 static void boot_wdt_arm(uint32_t ms) {
   esp_task_wdt_config_t c = { .timeout_ms = ms, .idle_core_mask = 0, .trigger_panic = true };
   // Arduino may already have initialised the TWDT; reconfigure then, init if not.
   if (esp_task_wdt_reconfigure(&c) != ESP_OK) esp_task_wdt_init(&c);
   esp_task_wdt_add(NULL);
+  esp_task_wdt_reset();
+  boot_wdt_live = true;
 }
-static void boot_wdt_disarm() { esp_task_wdt_delete(NULL); }
+static void boot_wdt_disarm() { boot_wdt_live = false; esp_task_wdt_delete(NULL); }
+static void boot_wdt_service() {
+  if (boot_wdt_live) esp_task_wdt_reset();
+  yield();
+}
+static void boot_wait_ms(uint32_t ms) {
+  uint32_t t0 = millis();
+  while (millis() - t0 < ms) { boot_wdt_service(); delay(1); }
+}
 
 static float env_peak_seen = 0;
 
@@ -1885,10 +1915,15 @@ static void stream_pump(uint64_t *due) {
 static void gps_pump(uint64_t *due) { if (i2s_up) stream_pump(due); }
 
 static void gps_wait_ms(uint32_t ms) {
-  if (!i2s_up) { delay(ms); return; }
+  // ⚠️ALSO SERVICES THE BOOT WATCHDOG. gps_wait_ms() is called both at boot (gps_listen's
+  // settle delay, gps_bringup's post-configure delay) and at runtime from the /gpspins handler --
+  // boot_wdt_service() is a no-op once boot_wdt_disarm() has run, so this is free after boot and
+  // is what keeps a runtime GPS reconfigure from starving the watchdog during the still-armed
+  // early-boot window if it is ever reached from there.
+  if (!i2s_up) { boot_wdt_service(); delay(ms); return; }
   uint64_t due = stream_start();
   uint32_t t0 = millis();
-  while (millis() - t0 < ms) { stream_pump(&due); delay(1); }
+  while (millis() - t0 < ms) { stream_pump(&due); boot_wdt_service(); delay(1); }
 }
 
 // Pumps until the socket can take STREAM_CHUNK_B without blocking. false: gone or stalled.
@@ -2545,7 +2580,7 @@ static String status_json() {
   // a buffer must not be sized from -- the old 3072 was already inside the bound. (The 5463 this
   // comment used to state no longer reproduces from the test that computes it; recomputed
   // 2026-09-10 at 129 conversions.)
-  static char b[5632];
+  static char b[6144];
   // JSON has no NaN. A node that does not know its temperature emits null, which every parser
   // reads as absent -- printing nan would be invalid JSON, and a downstream coercion of it to 0.0
   // would look like a freezing reading rather than a missing sensor.
@@ -2564,6 +2599,7 @@ static String status_json() {
     // ever be its own AP. prov says where they came from; nvs:true is what a release image needs.
     "{\"node\":\"%s\",\"class\":\"%s\",\"fw\":\"%s\",\"wifi_configured\":%s,"
     "\"prov\":{\"src\":\"%s\",\"nets\":%d,\"nvs\":%s,\"loaded\":%s},"
+    "\"selftest\":{\"mic\":\"%s\",\"gps\":\"%s\",\"pps\":\"%s\",\"wifi\":\"%s\"},"
     "\"net\":{\"connected\":%s,\"rssi\":%s,\"rssi_join\":%d,\"ch\":%d,\"bssid\":\"%s\",\"joined\":%d,"
       "\"seen\":%d,\"join_ms\":%lu,\"disc\":%lu,\"reconn\":%lu,\"reason\":%d,\"disc_age_s\":%s},"
     "\"sys\":{\"reset\":\"%s\",\"heap_min\":%lu,\"psram_min\":%lu,\"loop_max_ms\":%lu,"
@@ -2636,6 +2672,7 @@ static String status_json() {
     "\"sd\":%s,\"sd_free_mb\":%lu,\"sd_total_mb\":%lu,\"i2c\":\"%s\"}",
     node_id, node_class, FW_BUILD, prov.n > 0 ? "true" : "false",
     prov_src, prov.n, prov_nvs ? "true" : "false", prov_loaded ? "true" : "false",
+    selftest_mic, selftest_gps_now(), selftest_pps_now(), selftest_wifi_now(),
     WiFi.isConnected() ? "true" : "false", rssi_json(), net_join.rssi_join, net_join.channel,
     bssid_str(), net_join.joined, net_join.seen, (unsigned long)net_join.join_ms,
     (unsigned long)hear_net_disconnects(), (unsigned long)hear_net_reconnects(),
@@ -2814,6 +2851,7 @@ static void gps_listen(uint32_t window_ms, int *nm_out, int *ub_out) {
         i = 0;
       } else if (c != '\r' && c >= 32 && c < 127) ln[i++] = (char)c;
     }
+    boot_wdt_service();
   }
   *nm_out = nm; *ub_out = ub;
 }
@@ -2878,6 +2916,7 @@ static bool gps_autobaud() {
       int score = nm + ub;
       if (score > best_score) { best_score = score; best_b = cand[k]; best_ubx = (ub > nm); }
       Serial1.end();
+      boot_wdt_service();
     }
     gps_baud = best_b ? best_b : 9600;
     Serial1.begin(gps_baud, SERIAL_8N1, gps_rx_pin, gps_tx_pin);
@@ -2892,6 +2931,7 @@ static bool gps_autobaud() {
                   cnm, cub, GPS_CONFIRM_MS,
                   best_b ? (confirmed ? "linked" : "NOT confirmed, treating as silent")
                          : "nothing decoded at any rate");
+    boot_wdt_service();
     return confirmed;
   }
 }
@@ -2938,8 +2978,10 @@ static void gps_bringup() {
   // it calls end() first -- found 230400 on the first try. At boot the bug is invisible because no
   // UART is open yet, which is exactly why it survived until the fleet started retrying.
   Serial1.end();
+  gps_link_ok = false;
   Serial1.setRxBufferSize(GPS_RX_BUF);
   gps_pick_pins();
+  boot_wdt_service();
   // A proven order from a previous boot beats a probe that cannot see a transmitter on the pin it
   // is driving. Tried first, never trusted: if it does not decode, the search below runs unchanged.
   int hint = gps_pins_hint();
@@ -2954,7 +2996,9 @@ static void gps_bringup() {
     }
   }
   bool decoded = gps_autobaud();
+  gps_link_ok = decoded;
   if (decoded) gps_pins_persist(gps_rx_pin != GPS_RX);
+  boot_wdt_service();
 
   // IF NOTHING DECODED, TRY THE OTHER PIN ORDER BEFORE GIVING UP.
   //
@@ -2978,6 +3022,7 @@ static void gps_bringup() {
     logf("gps   nothing decoded on RX=GPIO%d -- trying the other order, RX=GPIO%d\n",
          rx, gps_rx_pin);
     if (gps_autobaud()) {
+      gps_link_ok = true;
       gps_pin_src = "measured: SWAPPED at the module (found by fallback)";
       gps_pins_persist(gps_rx_pin != GPS_RX);   // proven by decoded traffic, worth remembering
     } else {
@@ -2988,11 +3033,53 @@ static void gps_bringup() {
       logln("gps   neither pin order decoded -- module is silent or unpowered");
       gps_autobaud();
     }
+    boot_wdt_service();
   }
 
   gps_wait_ms(300);
   gps_configure();
+  boot_wdt_service();
   gps_bringup_ms = millis();
+}
+
+#define SELFTEST_SETTLE_MS 1500
+#define SELFTEST_MIC_SILENT_SPAN 8
+#define SELFTEST_MIC_SILENT_MEAN_ABS 2
+#define SELFTEST_MIC_SAT_PCT 90
+static void selftest_gps_settle() {
+  uint32_t t0 = millis();
+  while (millis() - t0 < SELFTEST_SETTLE_MS) {
+    while (Serial1.available()) ubx_feed((uint8_t)Serial1.read());
+    boot_wdt_service();
+    delay(1);
+  }
+  selftest_gps = gps_fix >= 3 ? "ok" : (gps_link_ok ? "no-fix" : "silent");
+}
+
+static void selftest_mic_probe() {
+  int16_t probe[ABLOCK];
+  size_t got = i2s.readBytes((char *)probe, sizeof probe);
+  int n = got / 2;
+  if (n <= 0) { selftest_mic = "silent"; return; }
+  int16_t lo = 32767, hi = -32768;
+  int64_t sum = 0, abs_sum = 0;
+  int sat = 0;
+  for (int i = 0; i < n; i++) {
+    int16_t v = probe[i];
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+    if (v <= -32000 || v >= 32000) sat++;
+    sum += v;
+  }
+  int32_t mean = (int32_t)(sum / n);
+  for (int i = 0; i < n; i++) abs_sum += llabs((long long)probe[i] - (long long)mean);
+  uint32_t span = (uint32_t)((int32_t)hi - (int32_t)lo);
+  uint32_t mean_abs = (uint32_t)(abs_sum / n);
+  if (sat * 100 >= n * SELFTEST_MIC_SAT_PCT) selftest_mic = "saturated";
+  else if (span <= SELFTEST_MIC_SILENT_SPAN && mean_abs <= SELFTEST_MIC_SILENT_MEAN_ABS)
+    selftest_mic = "silent";
+  else
+    selftest_mic = "ok";
 }
 
 void setup() {
@@ -3016,6 +3103,7 @@ void setup() {
   hear_net_watch();
   int joined_idx = prov.n > 0 ? hear_net_join(&prov, 12000, &net_join) : 0;
   sta_ok = joined_idx > 0;
+  selftest_wifi = sta_ok ? "ok" : "ap-fallback";
   if (sta_ok) {
     // Network NAME deliberately not logged: /log is unauthenticated and this node is meant to sit
     // outdoors. The index is enough to tell which of the configured networks answered.
@@ -3032,6 +3120,7 @@ void setup() {
                  : "      (not enrolled: run firmware/hear_node/enroll.py over USB)");
   }
   if (MDNS.begin(node_id)) logf("mdns  http://%s.local/\n", node_id);
+  boot_wdt_arm(15000);
 
   // PULLDOWN, not bare INPUT. An unconnected CMOS input floats and self-oscillates -- measured
   // ~3.4 kHz of phantom edges, which the rate maths happily turned into a plausible +626 ppm.
@@ -3039,7 +3128,12 @@ void setup() {
   // Same probe as the RX line. Once the module has a fix and has ACKed TP1, it IS pulsing, so
   // silence here can only be the wire or the tap point -- worth stating rather than inferring.
   { int high = 0, edges = 0, last = digitalRead(PPS_PIN); uint32_t t0 = millis();
-    while (millis() - t0 < 1500) { int v = digitalRead(PPS_PIN); if (v) high++; if (v != last) { edges++; last = v; } }
+    while (millis() - t0 < 1500) {
+      int v = digitalRead(PPS_PIN);
+      if (v) high++;
+      if (v != last) { edges++; last = v; }
+    }
+    selftest_pps = edges ? "ok" : "absent";
     logf("pps   pin (D0/GPIO%d) over 1.5 s: %d edges, %s\n", PPS_PIN, edges,
                   edges ? "something is pulsing it" : "flat -- nothing connected to the tap"); }
   attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
@@ -3056,6 +3150,7 @@ void setup() {
   // Mounted BEFORE gps_bringup(): the pin-order hint lives on the card, and read before the
   // mount it is always -1, so the one boot where it matters would never see it.
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
+  boot_wdt_service();
   sd_cs = 0;
   // max_files 8, not the library's default 5 (SD.h:29). The clip writer holds a WAV open across
   // loop iterations, so the long-lived set is now dets.csv + scene.csv + the clip = 3, and /ls
@@ -3064,7 +3159,9 @@ void setup() {
   // costs a pointer array; the per-file caches are allocated on open, not here.
   if (SD.begin(21, SPI, 20000000, "/sd", 8)) { sd_ok = true; sd_cs = 21; }
   else if (SD.begin(3, SPI, 20000000, "/sd", 8)) { sd_ok = true; sd_cs = 3; }
+  boot_wdt_service();
   gps_bringup();
+  selftest_gps_settle();
   logln("gps   UBX config sent (TP1 1 Hz locked+unlocked, NAV-PVT, TIM-TP; RAM layer)");
 
   Wire.begin(I2C_SDA, I2C_SCL, 100000);
@@ -3074,6 +3171,7 @@ void setup() {
   Wire.setTimeOut(25);
   i2c_scan();
   if (!bmp_begin()) logln("bmp   no BMP280/BME280 -- sound speed reported as null");
+  boot_wdt_service();
 
   if (sd_ok && gps_pins_pending >= 0) { gps_pins_persist(gps_pins_pending == 1); gps_pins_pending = -1; }
   logf("sd    %s%s", sd_ok ? "mounted, CS=" : "no card", sd_ok ? "" : "\n");
@@ -3814,11 +3912,13 @@ void setup() {
 #if MIC_KIND == MIC_PDM
   i2s.setPinsPdmRx(PDM_CLK, PDM_DIN);
   if (!i2s.begin(I2S_MODE_PDM_RX, FS_ACQ, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+    selftest_mic = "silent";
     logln("i2s   FAILED");
   } else {
     i2s_up = true;
     logf("i2s   PDM %d Hz on CLK=%d DIN=%d -> /%d -> %d Hz\n",
          FS_ACQ, PDM_CLK, PDM_DIN, DECIM, FS_NOMINAL);
+    selftest_mic_probe();
   }
 #elif MIC_KIND == MIC_I2S
   // ICS-43434-class I2S mics emit one 24-bit word in a 32-bit slot. Keep the bus at 32-bit and
@@ -3829,15 +3929,18 @@ void setup() {
                  I2S_SLOT_MODE_MONO, I2S_STD_SLOT_LEFT) ||
       !i2s.configureRX(FS_ACQ, I2S_DATA_BIT_WIDTH_32BIT,
                        I2S_SLOT_MODE_MONO, I2S_RX_TRANSFORM_32_TO_16)) {
+    selftest_mic = "silent";
     logln("i2s   FAILED");
   } else {
     i2s_up = true;
     logf("i2s   I2S %d Hz on BCLK=%d WS=%d DIN=%d -> /%d -> %d Hz\n",
          FS_ACQ, MIC_BCLK, MIC_WS, MIC_DIN, DECIM, FS_NOMINAL);
+    selftest_mic_probe();
   }
 #else
 #error "unsupported MIC_KIND"
 #endif
+  boot_wdt_service();
 
   // Raw ring. Ask for 80 s (7.68 MB of the 8.34 MB free) and step down rather than fail: what
   // matters is largest CONTIGUOUS free block, which total-free does not report. Log the span that
@@ -3876,6 +3979,7 @@ void setup() {
     logf("dets  ring %lu detections, %lu kB in %s\n", (unsigned long)det_cap,
          (unsigned long)(det_cap * sizeof(Det) / 1024UL), where);
   }
+  log_selftest();
   boot_wdt_disarm();
   push_init();
 }
@@ -4253,8 +4357,10 @@ static void audio_pump() {
 // whether it joined.
 static void prov_serial_line(const char *s) {
   if (!strcmp(s, "PROV?")) {
-    Serial.printf("PROV STATE src=%s node=%s nets=%d fw=%s ip=%s\n", prov_src, node_id, prov.n,
-                  FW_BUILD, sta_ok ? WiFi.localIP().toString().c_str() : "none");
+    Serial.printf("PROV STATE src=%s node=%s nets=%d fw=%s ip=%s selftest=mic:%s,gps:%s,pps:%s,wifi:%s\n",
+                  prov_src, node_id, prov.n, FW_BUILD,
+                  sta_ok ? WiFi.localIP().toString().c_str() : "none",
+                  selftest_mic, selftest_gps_now(), selftest_pps_now(), selftest_wifi_now());
     return;
   }
   if (strncmp(s, "PROV ", 5)) return;
@@ -4620,4 +4726,3 @@ void loop() {
     }
   }
 }
-
