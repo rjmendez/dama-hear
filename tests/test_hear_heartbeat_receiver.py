@@ -246,3 +246,12 @@ class TestHttpIntegration(TestValidation):
         assert _parse_port("tcp://10.43.154.155:5051") == 5051
         assert _parse_port("invalid", 5051) == 5051
 
+
+class TestStartupConfig:
+    @pytest.mark.parametrize("token", [None, "", "   "])
+    def test_configured_auth_token_rejects_missing_or_blank_values(self, token):
+        with pytest.raises(ValueError, match="HEAR_HEARTBEAT_TOKEN / --auth-token"):
+            HR._configured_auth_token(token)
+
+    def test_configured_auth_token_trims_whitespace(self):
+        assert HR._configured_auth_token("  secret  ") == "secret"

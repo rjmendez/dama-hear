@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-heartbeat-code.yaml
-# apply-mode client: 15065 B serialised; 15248 B of annotations against a 262144 B cap.
+# apply-mode client: 15440 B serialised; 15623 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-heartbeat
   annotations:
-    dama-hear/commit: 'e480812-dirty'
+    dama-hear/commit: '879c1d8-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '15065'
+    dama-hear/serialised-bytes: '15440'
 data:
   tools_hear_heartbeat_receiver.py: |
     #!/usr/bin/env python3
@@ -34,6 +34,17 @@ data:
     REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
     REDIS_PASS = os.environ.get("REDIS_PASS")
     AUTH_TOKEN = os.environ.get("HEAR_HEARTBEAT_TOKEN")
+    
+    
+    def _configured_auth_token(token: Optional[str]) -> str:
+        if token is None:
+            raise ValueError("HEAR_HEARTBEAT_TOKEN / --auth-token must be set")
+        token = token.strip()
+        if not token:
+            raise ValueError("HEAR_HEARTBEAT_TOKEN / --auth-token must be non-empty")
+        return token
+    
+    
     def _parse_port(env_val: Optional[str], default: int = 5051) -> int:
         if not env_val:
             return default
@@ -344,6 +355,7 @@ data:
     
     def main(argv: Optional[list[str]] = None) -> int:
         args = parse_args(argv)
+        auth_token = _configured_auth_token(args.auth_token)
         target = f"{args.redis_host}:{args.redis_port}"
         store = HeartbeatReceiverStore(
             make_redis_client(args.redis_host, args.redis_port, args.redis_pass),
@@ -355,7 +367,7 @@ data:
         print(f"[hear-heartbeat] Redis target configured -> {target}")
         print(f"[hear-heartbeat] Listening on http://{args.bind}:{args.port}")
         create_server(args.bind, args.port, store, max_body_bytes=args.max_body_bytes,
-                      auth_token=args.auth_token, socket_timeout_s=args.socket_timeout_s).serve_forever()
+                      auth_token=auth_token, socket_timeout_s=args.socket_timeout_s).serve_forever()
         return 0
     
     
