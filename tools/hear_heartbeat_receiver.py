@@ -14,8 +14,8 @@ from urllib.parse import urlparse
 
 import redis
 
-REDIS_HOST = os.environ.get("REDIS_HOST", "100.73.200.19")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", "30379"))
+REDIS_HOST = os.environ.get("REDIS_HOST", "audit-redis.infra.svc.cluster.local")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 REDIS_PASS = os.environ.get("REDIS_PASS")
 AUTH_TOKEN = os.environ.get("HEAR_HEARTBEAT_TOKEN")
 def _parse_port(env_val: Optional[str], default: int = 5051) -> int:
