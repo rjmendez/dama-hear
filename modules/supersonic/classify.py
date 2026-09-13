@@ -56,11 +56,8 @@ def score(feat: Dict[str, float], model: Dict[str, Any]) -> Optional[float]:
 
 DEFAULT_SKETCH_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                     "model_sketch.json")
-#: For a fleet with anything slower than 32 kHz in it. 15 bands, AUC 0.9665 against the 20-band
-#: model's 0.9728 -- within noise, and it is the only one a 16 kHz node's frame can be scored with
-#: at all. ⚠️Both of those were measured at 48 kHz; applied to 16 kHz audio over the common 15
-#: bands this model measures 0.9473 (hear/corpus.py:283-285). The figures previously quoted here
-#: (0.9588 / 0.9634) matched neither shipped file and were the pre-onset-fix, peak-aligned ones.
+#: Wire Profile 3: 15-band Nyquist-axis vectors acquired at 48 kHz (24 kHz Nyquist), with the
+#: 300 Hz lower edge and 24 kHz upper profile edge recorded in the artifact metadata.
 FLEET_SKETCH_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "model_sketch_15.json")
 
@@ -101,6 +98,12 @@ def score_sketch(frame, model: Dict[str, Any]) -> float:
     if frame["layout"] != model.get("layout"):
         raise SketchMismatch("frame layout %r, model trained on %r -- band k is not the same "
                              "frequency in the two" % (frame["layout"], model.get("layout")))
+    model_fs = model.get("sample_rate_hz")
+    if model.get("wire_profile") == 3 and model_fs is not None:
+        frame_fs = frame.get("fs_hz")
+        if frame_fs is None or float(frame_fs) != float(model_fs):
+            raise SketchMismatch("frame sample rate %r Hz, model trained at %r Hz"
+                                 % (frame_fs, model_fs))
     valid = frame.get("valid_bands")
     if valid is not None and valid < want_b:
         raise SketchMismatch(

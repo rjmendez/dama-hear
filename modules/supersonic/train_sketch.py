@@ -47,6 +47,7 @@ import os
 import sys
 
 import numpy as np
+from scipy.signal import resample_poly
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
@@ -58,6 +59,13 @@ from hear.node import detect as DT         # noqa: E402
 #: node and the phone use, expressed in the clip's own frame.
 SEARCH_S = (0.035, 0.085)
 GRID = [0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0]
+
+# Wire Profile 3 is acquired at 48 kHz, so its Nyquist edge is 24 kHz. Keep the
+# profile here rather than inheriting hear.sketch's older 20 kHz application range.
+PROFILE_3_FS_HZ = 48000.0
+PROFILE_3_F_LO_HZ = 300.0
+PROFILE_3_F_HI_HZ = 24000.0
+PROFILE_3_BANDS = 15
 
 
 def _onset(xi, fs):
@@ -83,18 +91,20 @@ def _onset(xi, fs):
                               back=max(1, int(DT.SKETCH_BACK_S * fs))))
 
 
-def sketch_of(xi, fs, layout=SK.LAYOUT_FIXED):
+def sketch_of(xi, fs, layout=SK.LAYOUT_NYQUIST, bands=PROFILE_3_BANDS,
+              f_lo=PROFILE_3_F_LO_HZ, f_hi=PROFILE_3_F_HI_HZ):
     """The sketch a node would have sent for this clip: same onset rule, same bank, same bytes."""
     i0 = _onset(xi, fs)
     span = (SK.FRAMES - 1) * max(1, int(SK.HOP_S * fs)) + SK.NFFT
     seg = xi[i0:i0 + span]
     if len(seg) < span:
         seg = np.pad(seg, (0, span - len(seg)))
-    q, ref = SK.sketch(seg, fs, layout=layout)
+    q, ref = SK.sketch(seg, fs, bands=bands, f_lo=f_lo, f_hi=f_hi, layout=layout)
     return q, float(ref)
 
 
-def load(labels_glob, items_path, layout=SK.LAYOUT_FIXED):
+def load(labels_glob, items_path, layout=SK.LAYOUT_NYQUIST, bands=PROFILE_3_BANDS,
+         sample_rate=PROFILE_3_FS_HZ, f_lo=PROFILE_3_F_LO_HZ, f_hi=PROFILE_3_F_HI_HZ):
     import soundfile as sf
     L = {}
     for p in glob.glob(os.path.expanduser(labels_glob)):
@@ -109,7 +119,14 @@ def load(labels_glob, items_path, layout=SK.LAYOUT_FIXED):
         x, fs = sf.read(io.BytesIO(base64.b64decode(it["uri"].split(",", 1)[1])))
         if x.ndim > 1:
             x = x[:, 0]
-        q, ref = sketch_of(x * 32767.0, fs, layout)
+        if float(fs) != float(sample_rate):
+            from math import gcd
+            src = int(round(float(fs)))
+            dst = int(round(float(sample_rate)))
+            divisor = gcd(src, dst)
+            x = resample_poly(x, dst // divisor, src // divisor)
+            fs = sample_rate
+        q, ref = sketch_of(x * 32767.0, fs, layout, bands, f_lo, f_hi)
         X.append(q.astype(float).reshape(-1) / 2.0 + ref)      # absolute dB
         y.append(1 if lab in ("crack", "both") else 0)
         g.append(int(it["utc"] // 3))                          # one string never spans folds
@@ -143,8 +160,8 @@ def nested_auc(X, y, g, outer=5, inner=4):
     return roc_auc_score(y, p), p
 
 
-def export(X, y, g, auc, layout, bands, frames):
-    """Flatten the scaler into the weights so the node needs no sklearn -- 160 multiply-adds."""
+def export(X, y, g, auc, layout, bands, frames, sample_rate, f_lo, f_hi):
+    """Flatten the scaler into weights so the node needs no sklearn."""
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import roc_auc_score
     from sklearn.model_selection import GroupKFold
@@ -178,6 +195,8 @@ def export(X, y, g, auc, layout, bands, frames):
         "nfft": int(SK.NFFT), "hop_s": float(SK.HOP_S),
         "window_start": "constant_fraction_onset_minus_one_hop",
         "layout": layout, "bands": int(bands), "frames": int(frames),
+        "sample_rate_hz": float(sample_rate), "f_lo_hz": float(f_lo),
+        "f_hi_hz": float(f_hi), "wire_profile": 3,
         "order": "band_major",          # x[b*frames + t], matching SK.sketch's own reshape
         "w": w.tolist(), "b": b,
         "auc_nested_grouped_cv": float(auc), "n_train": int(len(y)),
@@ -194,15 +213,18 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--items", default="~/analysis_20260905/label_items.json")
     ap.add_argument("--labels", default="~/analysis_20260905/labels/labels/*.json")
-    ap.add_argument("--layout", default=SK.LAYOUT_FIXED,
+    ap.add_argument("--layout", default=SK.LAYOUT_NYQUIST,
                     choices=[SK.LAYOUT_NYQUIST, SK.LAYOUT_FIXED])
-    ap.add_argument("--bands", type=int, default=SK.MEL_BANDS,
-                    help="keep only the lowest N bands. A model that must score a 16 kHz node "
-                         "cannot use bands that node does not have: SK.valid_bands(16000)=15.")
+    ap.add_argument("--bands", type=int, default=PROFILE_3_BANDS,
+                    help="number of mel bands in the wire feature vector")
+    ap.add_argument("--sample-rate", type=float, default=PROFILE_3_FS_HZ,
+                    help="rate to which labelled clips are resampled before sketching")
+    ap.add_argument("--f-lo", type=float, default=PROFILE_3_F_LO_HZ)
+    ap.add_argument("--f-hi", type=float, default=PROFILE_3_F_HI_HZ)
     ap.add_argument("--out")
     a = ap.parse_args(argv)
 
-    X, y, g, ids = load(a.labels, a.items, a.layout)
+    X, y, g, ids = load(a.labels, a.items, a.layout, a.bands, a.sample_rate, a.f_lo, a.f_hi)
     if a.bands < SK.MEL_BANDS:
         keep = np.array([b * SK.FRAMES + t for b in range(a.bands) for t in range(SK.FRAMES)])
         X = X[:, keep]
@@ -210,10 +232,9 @@ def main(argv=None):
           % (len(y), y.sum(), len(y) - y.sum(), len(set(g)), a.layout, X.shape[1]))
     auc, _ = nested_auc(X, y, g)
     print("nested grouped 5x4 CV: AUC %.4f" % auc)
-    payload = export(X, y, g, auc, a.layout, a.bands, SK.FRAMES)
-    payload["min_fs_hz"] = float(min(
-        [fs for fs in sorted(SK.FS_CODES) if SK.valid_bands(fs, layout=a.layout) >= a.bands]
-        or [0.0]))
+    payload = export(X, y, g, auc, a.layout, a.bands, SK.FRAMES,
+                     a.sample_rate, a.f_lo, a.f_hi)
+    payload["min_fs_hz"] = float(a.sample_rate)
     print("chosen C %.3g, %d weights" % (payload["C"], len(payload["w"])))
     if a.out:
         json.dump(payload, open(os.path.expanduser(a.out), "w"), indent=1)

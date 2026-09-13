@@ -12,7 +12,9 @@ silently differ is not one capture, and the difference shows up as a bias nobody
 
 It reports and does not gate. The exit code says whether every node ANSWERED, never whether the
 answers were good -- the same rule tools/validate_scene.py follows, and for the same reason: a
-tool that exits non-zero on a node with no sky yet trains its operator to ignore it.
+tool that exits non-zero on a node with no sky yet trains its operator to ignore it. It also never
+declares a node offline from HTTP alone: use the OPNsense DHCP/ARP lookup, the node `/status`
+probe, and the `hear-drain` ingestion heartbeat as the mandatory three-layer verification.
 
 ⚠️A `-dirty` build did not come from any commit. Two nodes both reporting the same -dirty string
 are NOT thereby on the same code; the string names the last tag, not the working tree.
@@ -41,6 +43,12 @@ RETRIES = 2
 # tools/hear_drain.py's LS_RETRY_BACKOFF_S, the other place this exact collision is measured and
 # waited out, so a future change to that number is one place to make, not two.
 RETRY_BACKOFF_S = 1.5
+
+OFFLINE_VERIFICATION = (
+    "1) confirm the node's DHCP lease and ARP entry on the OPNsense gateway; "
+    "2) probe the node HTTP /status endpoint; "
+    "3) verify hear-drain ingestion/heartbeat for that node"
+)
 
 # MEASURED, not assumed: nyquist wrote 2,689,167 B of scene.csv across 8,018 rows = 335 B/row, at
 # one row per 1.024 s. Everything else on the card is bounded or negligible -- the clip budget is a
@@ -149,7 +157,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # flash that landed the wrong identity is the failure this whole column exists for
             print(row(got[n].get("node") or names[n], got[n]))
     for d in dead:
-        print("  UNREACHABLE  " + d)
+        print("  HTTP PROBE FAILED  " + d)
+        print("    OFFLINE UNCONFIRMED -- " + OFFLINE_VERIFICATION)
 
     if len(got) > 1:
         builds = {d.get("fw", "?") for d in got.values()}
