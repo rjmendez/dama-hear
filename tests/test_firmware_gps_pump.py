@@ -142,7 +142,7 @@ def test_setup_bring_up_waits_as_before_because_audio_is_not_up():
         "expected exactly one i2s_up = true per i2s.begin() call inside setup() "
         "(%d begin() calls, %d assignments)" % (len(begins), len(hits)))
     assert re.search(r"\bif \(i2s_up\) stream_pump\(due\);", _fn("gps_pump"))
-    assert re.search(r"\bif \(!i2s_up\) \{ delay\(ms\); return; \}", _fn("gps_wait_ms"))
+    assert re.search(r"\bif \(!i2s_up\) \{ boot_wdt_service\(\); delay\(ms\); return; \}", _fn("gps_wait_ms"))
 
 
 def test_the_bit_time_probes_stay_contiguous():

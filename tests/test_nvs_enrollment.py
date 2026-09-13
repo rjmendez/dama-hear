@@ -68,6 +68,23 @@ def test_status_says_where_the_credentials_came_from():
                      r'\\"loaded\\":%s\}', _code())
 
 
+def test_status_and_prov_report_the_boot_selftest():
+    code = _code()
+    assert '\\"selftest\\":{\\"mic\\":\\"%s\\",\\"gps\\":\\"%s\\",\\"pps\\":\\"%s\\",\\"wifi\\":\\"%s\\"}' in code
+    assert "PROV STATE" in code and "selftest=mic:%s,gps:%s,pps:%s,wifi:%s" in code
+
+
+def test_setup_logs_one_concise_selftest_summary_and_keeps_the_watchdog_around_boot_probes():
+    code = _code()
+    setup = _body(code, "void setup(")
+    assert 'logf("selftest mic=%s gps=%s pps=%s wifi=%s\\n"' in code
+    arm = setup.index("boot_wdt_arm(15000);")
+    for token in ("pinMode(PPS_PIN, INPUT_PULLDOWN);", "SD.begin(21, SPI, 20000000, \"/sd\", 8)",
+                  "gps_bringup();", "Wire.begin(I2C_SDA, I2C_SCL, 100000);", "i2s.begin("):
+        assert arm < setup.index(token), token
+    assert setup.index("boot_wdt_disarm();") > setup.index("selftest_mic_probe();")
+
+
 def test_an_image_with_compiled_credentials_refuses_serial_provisioning():
     """They would win at the next boot and overwrite whatever was sent, so accepting it would be a
     lie that lasts until the reboot."""
