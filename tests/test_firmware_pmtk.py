@@ -211,3 +211,15 @@ def test_source_keeps_gga_validation_before_state_and_mean_updates():
     assert gga.index("pos_lat_e7 =") < gga.index("if (gps_fix >= 1")
     assert "pos_hmsl_mm = (int32_t)hmsl; pos_hell_mm = (int32_t)hell" in gga
     assert "int64_t hacc = (int64_t)(hdop * 2500.0 + 0.5)" in gga
+
+
+def test_the_gps_selftest_reads_a_pmtk_fix_as_a_fix():
+    """gold, ageev, kasami on 2026-09-13: gps.fix 1 with 390-550 averaged GGA fixes, selftest
+    "no-fix". gps_fix is GGA quality on PMTK (1 = a fix) and UBX fixType on u-blox (3 = 3D)."""
+    src = _source()
+    helper = _body(src, "static bool gps_has_fix()", "}")
+    assert re.search(r"GPS_PROTO\s*==\s*GPS_PMTK\s*\?\s*gps_fix\s*>=\s*1\s*:\s*gps_fix\s*>=\s*3", helper)
+    for fn in ("static const char *selftest_gps_now()", "static void selftest_gps_settle()"):
+        body = _body(src, fn, "\n}")
+        assert "gps_has_fix()" in body, fn
+        assert not re.search(r"gps_fix\s*>=\s*3", body), fn
