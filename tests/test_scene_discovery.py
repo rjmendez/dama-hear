@@ -22,8 +22,8 @@ def test_the_dated_file_is_found_and_the_newest_one_is_the_live_one():
           "scene-20260908.csv": 9_000_000, "scene-20260909.csv": 2_003_040, "dets.csv": 10}
     names, live = scene_names(ls)
     assert live == "scene-20260909.csv", "the newest dated file is the one still growing"
-    assert set(names) == {"scene.csv", "scene-00000000.csv",
-                          "scene-20260909.csv", "scene-20260908.csv"}
+    assert set(names) == {"scene-00000000.csv", "scene-20260909.csv", "scene-20260908.csv"}
+    assert "scene.csv" not in names, "dated files suppress legacy names entirely once discovered"
 
 
 def test_the_node_that_serves_no_legacy_file_is_still_drained():
@@ -45,7 +45,12 @@ def test_the_prelock_file_is_fetched_not_skipped():
 def test_a_blind_run_still_fetches_something():
     # /ls failed. A drain that then asks for nothing turns a blind spot into a data outage.
     assert scene_names(None) == (SCENE_FILES, "scene.csv")
-    assert scene_names({}) == (SCENE_FILES, "scene.csv")
+
+
+def test_an_empty_listing_is_not_treated_as_a_blind_run():
+    # /ls succeeded and named no scene file of any kind. That is a missing scene lane, not the
+    # old-firmware or no-/ls fallback, and it must surface as such.
+    assert scene_names({}) == ((), None)
 
 
 def test_old_firmware_that_only_has_the_legacy_names_still_works():
@@ -57,7 +62,8 @@ def test_old_firmware_that_only_has_the_legacy_names_still_works():
 def test_prev_is_never_mistaken_for_the_live_file():
     names, live = scene_names({"scene.csv": 100, "scene-prev.csv": 50, "scene-20260909.csv": 7})
     assert live == "scene-20260909.csv"
-    assert "scene-prev.csv" in names
+    assert names == ("scene-20260909.csv",)
+    assert "scene-prev.csv" not in names
 
 
 def test_rolled_daily_scene_partitions_are_discovered_and_never_live():
@@ -79,8 +85,8 @@ def test_rolled_daily_scene_partitions_are_discovered_and_never_live():
         "scene-20260908.csv", "scene-20260908-prev.csv",
         "scene-20260909.csv", "scene-20260909-prev.csv",
         "scene-00000000.csv", "scene-00000000-prev.csv",
-        "scene.csv", "scene-prev.csv",
     }
+    assert "scene.csv" not in names and "scene-prev.csv" not in names
 
 
 def test_adaptive_timeout_for_large_rolled_files():
@@ -162,46 +168,56 @@ def _fetched_whole(n, name):
     return [c for c in n.sd_calls if c[0] == name and not c[1]]
 
 
-def test_the_frozen_legacy_file_is_pulled_once_not_every_run(tmp_path, multi):
+def test_the_frozen_rolled_dated_file_is_pulled_once_not_every_run(tmp_path, multi):
     """⚠️THE REGRESSION DISCOVERY WOULD HAVE SHIPPED.
 
-    Before discovery, scene.csv was the LIVE name and was tailed. After it, a node with a dated
-    file makes scene.csv a ROLLED name -- and rolled names are fetched WHOLE. nyquist's is
-    20,751,993 B and the node serves 40-135 KB/s, so pulling it whole every 15 min would spend
-    most of the CronJob's interval re-reading rows the pool already has, with the node deaf for
-    2-7 minutes of it. The content-addressed ingest makes the repeat free in STORAGE only.
+    Before discovery, scene.csv was the LIVE name and was tailed. After it, the rolled file to
+    revisit is yesterday's dated partition, while legacy names are ignored entirely. Re-pulling a
+    large rolled partition every 15 min would still spend most of the CronJob's interval re-reading
+    rows the pool already has, with the node deaf for 2-7 minutes of it. The content-addressed
+    ingest makes the repeat free in STORAGE only.
     """
-    n = multi({"scene.csv": _scene_bytes(40), "scene-20260909.csv": _scene_bytes(5, start_uptime=900)})
+    n = multi({"scene.csv": _scene_bytes(40),
+               "scene-20260908.csv": _scene_bytes(40),
+               "scene-20260909.csv": _scene_bytes(5, start_uptime=900)})
     pl = P.Pool(str(tmp_path / "pool"))
     for _ in range(4):
         HD.drain_node(pl, n.node, "10.0.0.1")
-    assert len(_fetched_whole(n, "scene.csv")) == 1, \
-        "the frozen legacy file was re-downloaded whole on a later run"
+    assert len(_fetched_whole(n, "scene-20260908.csv")) == 1, \
+        "the frozen rolled dated file was re-downloaded whole on a later run"
     assert len([c for c in n.sd_calls if c[0] == "scene-20260909.csv"]) == 4, \
         "the live file must still be fetched every run"
+    assert not [c for c in n.sd_calls if c[0] == "scene.csv"], \
+        "legacy names must be ignored entirely when dated scene files exist"
 
 
 def test_a_skip_is_reported_not_silent(tmp_path, multi):
     # A drain that quietly does nothing is the failure this module exists to catch, so the skip
     # appears in the run record with the size it was skipped at.
-    n = multi({"scene.csv": _scene_bytes(10), "scene-20260909.csv": _scene_bytes(3, start_uptime=900)})
+    n = multi({"scene.csv": _scene_bytes(10),
+               "scene-20260908.csv": _scene_bytes(10),
+               "scene-20260909.csv": _scene_bytes(3, start_uptime=900)})
     pl = P.Pool(str(tmp_path / "pool"))
     HD.drain_node(pl, n.node, "10.0.0.1")
     out = HD.drain_node(pl, n.node, "10.0.0.1")
     skipped = [f for f in out["files"] if f.get("skipped_unchanged")]
-    assert [f["name"] for f in skipped] == ["scene.csv"]
-    assert skipped[0]["size"] == len(n.files["scene.csv"])
+    assert [f["name"] for f in skipped] == ["scene-20260908.csv"]
+    assert skipped[0]["size"] == len(n.files["scene-20260908.csv"])
+    assert not [c for c in n.sd_calls if c[0] == "scene.csv"]
 
 
 def test_a_rolled_file_that_grows_again_is_refetched(tmp_path, multi):
     # The skip is licensed by a SIZE, not by having seen the name. If the node appends to a file
     # the drain considers rolled, the new bytes must still land.
-    n = multi({"scene.csv": _scene_bytes(10), "scene-20260909.csv": _scene_bytes(3, start_uptime=900)})
+    n = multi({"scene.csv": _scene_bytes(10),
+               "scene-20260908.csv": _scene_bytes(10),
+               "scene-20260909.csv": _scene_bytes(3, start_uptime=900)})
     pl = P.Pool(str(tmp_path / "pool"))
     HD.drain_node(pl, n.node, "10.0.0.1")
-    n.files["scene.csv"] += _scene_bytes(4, start_uptime=500).split(b"\n", 1)[1]
+    n.files["scene-20260908.csv"] += _scene_bytes(4, start_uptime=500).split(b"\n", 1)[1]
     HD.drain_node(pl, n.node, "10.0.0.1")
-    assert len(_fetched_whole(n, "scene.csv")) == 2, "a file that grew again was skipped"
+    assert len(_fetched_whole(n, "scene-20260908.csv")) == 2, "a file that grew again was skipped"
+    assert not [c for c in n.sd_calls if c[0] == "scene.csv"]
 
 
 def test_yesterdays_tailed_file_is_not_skipped_on_its_tail_mark(tmp_path, multi):
@@ -251,4 +267,3 @@ def test_daily_prev_file_is_pulled_whole_with_adaptive_timeout_and_skipped_when_
     assert len(_fetched_whole(n, "scene-20260908-prev.csv")) == 1, "rolled file should not be refetched"
     skipped = [f["name"] for f in out2["files"] if f.get("skipped_unchanged")]
     assert "scene-20260908-prev.csv" in skipped
-
