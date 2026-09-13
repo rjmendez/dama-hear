@@ -90,6 +90,9 @@ spec:
                     --node mach=172.16.100.116 \
                     --phone-corpus /pool/sketch_corpus \
                     --node rankine=172.16.100.50 \
+                    --node gold=172.16.100.82 \
+                    --node kasami=172.16.100.90 \
+                    --node ageev=172.16.100.83 \
                     --clip-max-per-node 13 \
                     --clip-deadline-s 120
               volumeMounts:
@@ -180,6 +183,9 @@ spec:
                     --node nyquist=172.16.100.105 \
                     --node mach=172.16.100.116 \
                     --node rankine=172.16.100.50 \
+                    --node gold=172.16.100.82 \
+                    --node kasami=172.16.100.90 \
+                    --node ageev=172.16.100.83 \
                     --unfetched-window-s 7200 \
                     --max-ring-wall-span 1.02 \
                     --max-clips-deferred 0
