@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 277540 B serialised; 277724 B of annotations against a 262144 B cap.
+# apply-mode server: 259981 B serialised; 260159 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: '2777f93-dirty'
+    dama-hear/commit: '5287acc'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '277540'
+    dama-hear/serialised-bytes: '259981'
 data:
   hear__init__.py: |
     
@@ -3272,17 +3272,25 @@ data:
         today's. ⚠️scene-00000000.csv is the PRE-LOCK file -- rows the node wrote before it knew the
         date -- and it is a real file with real rows, not a placeholder, so it is fetched like any
         other rolled file. hear/pool.py keeps its rows and marks them unanchored.
+    
+        Rolled daily scene partitions (such as scene-YYYYMMDD-prev.csv and scene-prev.csv) created
+        when headers change or dates rollover are also discovered and fetched whole.
         """
         if not sizes:
             return SCENE_FILES, "scene.csv"
-        found = sorted(n for n in sizes
-                       if n.startswith(SCENE_GLOB) and n.endswith(".csv") and not n.endswith("-prev.csv"))
-        if not found:
+        all_scene = sorted(n for n in sizes
+                           if n.startswith(SCENE_GLOB) and n.endswith(".csv"))
+        if not all_scene:
             return SCENE_FILES, "scene.csv"
-        dated = [n for n in found if n != "scene.csv"]
-        live = dated[-1] if dated else "scene.csv"
-        names = tuple(found) + (("scene-prev.csv",) if "scene-prev.csv" in sizes else ())
-        return names, live
+        candidates = [n for n in all_scene if not n.endswith("-prev.csv")]
+        dated = [n for n in candidates if n != "scene.csv"]
+        if dated:
+            live = dated[-1]
+        elif "scene.csv" in candidates:
+            live = "scene.csv"
+        else:
+            live = "scene.csv"
+        return tuple(all_scene), live
     CONTEXT_FILES = ("health.csv",)
     
     # ⚠️SCENE IS FETCHED BY TAIL, NOT WHOLE. It grows without bound (16,771,742 B on nyquist and
@@ -3325,6 +3333,26 @@ data:
     BOOT_AUDIT_MAX_DAYS = 3
     
     DEFAULT_TIMEOUT_S = 30.0
+    # Slower Wi-Fi transfer rate floor to size adaptive timeouts for large whole-file fetches
+    # (40-135 KB/s measured from ESP32 nodes).
+    MIN_TRANSFER_RATE_BPS = 40_000.0
+    # Sensible default timeout for whole rolled files when size is unknown
+    DEFAULT_ROLLED_TIMEOUT_S = 300.0
+    
+    
+    def rolled_file_timeout(size_bytes: Optional[int],
+                            base_timeout: float = DEFAULT_TIMEOUT_S) -> float:
+        """Adaptive timeout for fetching a full rolled file off the node over Wi-Fi.
+    
+        A 20 MB file at the measured 40-135 KB/s transfer rate takes 150-500 s, so a fixed 30 s
+        timeout aborts large rolled file transfers.
+        """
+        if size_bytes is not None and size_bytes > 0:
+            needed = (float(size_bytes) / MIN_TRANSFER_RATE_BPS) + base_timeout
+            return max(base_timeout, needed)
+        return max(base_timeout, DEFAULT_ROLLED_TIMEOUT_S)
+    
+    
     # A node reporting detections at the measured field rate goes quiet for hours in daylight, so
     # staleness is measured on the FETCH, not on new rows. 2 h is comfortably longer than any timer
     # interval and short enough to catch a node that fell off the wifi before its buffer rolls over.
@@ -4236,8 +4264,11 @@ data:
                     out["files"].append({"name": name, "bytes": 0, "skipped_unchanged": True,
                                          "size": int(size_now), "scene": True})
                     continue
+                file_timeout = rolled_file_timeout(size_now, timeout)
+            else:
+                file_timeout = timeout
             try:
-                body = fetch_sd(ip, name, timeout, tail=tail)
+                body = fetch_sd(ip, name, file_timeout, tail=tail)
             except Exception as e:
                 out["errors"].append("%s: %r" % (name, e))
                 if tail:
