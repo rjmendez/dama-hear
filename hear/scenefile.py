@@ -123,9 +123,11 @@ def decode_row(row: Dict[str, Any]) -> Dict[str, Any]:
     s = str(row.get("mel_hex") or "").strip()
     if not s:
         raise ValueError("empty mel_hex")
-    if len(s) != 2 * bands * slices:
+    need = 2 * bands * slices
+    if len(s) < need:
         raise ValueError("mel_hex is %d hex chars, %dx%d needs %d"
-                         % (len(s), bands, slices, 2 * bands * slices))
+                         % (len(s), bands, slices, need))
+    s = s[:need]
     try:
         b = bytes.fromhex(s)
     except ValueError as e:

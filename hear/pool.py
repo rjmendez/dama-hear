@@ -240,14 +240,23 @@ def _sync_sigma_ns(v: Any) -> Optional[float]:
 
 def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
-    frame = binascii.unhexlify(row["frame_hex"])
+    fh = (row.get("frame_hex") or "").strip()
+    if len(fh) % 2 != 0:
+        fh = fh[:-1]
+    frame = binascii.unhexlify(fh)
     d = WR.decode(frame)
-    utc_us = int(row.get("utc_us") or 0)
+    try:
+        utc_us = int(float(row.get("utc_us") or 0))
+    except (TypeError, ValueError):
+        utc_us = 0
     node = row["node"]
     # fs: the FRAME is authoritative when it states a rate; the CSV column is only the node's
     # running estimate.
     fs_csv = row.get("fs_hz")
-    fs_csv = float(fs_csv) if fs_csv not in (None, "") else None
+    try:
+        fs_csv = float(fs_csv) if fs_csv not in (None, "") else None
+    except (TypeError, ValueError):
+        fs_csv = None
     node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
     event_flags = d.get("event_flags", 0)
     no_context = bool(event_flags & SK.FLAG_NO_CONTEXT) if d.get("version", 1) == 1 else False

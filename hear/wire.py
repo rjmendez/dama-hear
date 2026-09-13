@@ -295,11 +295,13 @@ def version_of(b: bytes) -> int:
         flags = struct.unpack_from("<H", b, 11)[0]
         pid = (flags >> _F_PROFILE_SHIFT) & _F_PROFILE_MASK
         version = (flags >> _F_VERSION_SHIFT) & _F_VERSION_MASK
-        if version == VERSION and pid in PROFILES and len(b) == wire_size_v2(pid):
+        if version == VERSION and pid in PROFILES and len(b) >= wire_size_v2(pid):
             if not (int.from_bytes(b[0:5], "little") >> _TS_BITS):
                 return VERSION
-    if len(b) >= _V1_HDR and 1 <= b[8] <= 64 and 1 <= b[9] <= 64 and len(b) == _V1_HDR + b[8] * b[9]:
-        return 1
+    if len(b) >= _V1_HDR and 1 <= b[8] <= 64 and 1 <= b[9] <= 64:
+        want = _V1_HDR + b[8] * b[9]
+        if 0 <= len(b) - want <= 16:
+            return 1
     raise ValueError("unrecognised frame: %d bytes" % len(b))
 
 
@@ -308,8 +310,13 @@ def decode(b: bytes) -> Dict:
     sketch.py is read-only -- and keeps its own 'node_us' key. Nothing else is renamed."""
     v = version_of(b)
     if v == VERSION:
-        return unpack_v2(b)
-    d = SK.unpack(b)
+        flags = struct.unpack_from("<H", b, 11)[0]
+        pid = (flags >> _F_PROFILE_SHIFT) & _F_PROFILE_MASK
+        n = wire_size_v2(pid)
+        return unpack_v2(b[:n])
+    node_us, ref4, peak, bands, frames, flags = struct.unpack("<IhHBBH", b[:12])
+    want = 12 + bands * frames
+    d = SK.unpack(b[:want])
     d["version"] = 1
     return d
 
