@@ -36,8 +36,8 @@ GOLDEN = os.path.join(ROOT, "testdata", "sketch_golden.json")
 
 # ----------------------------------------------------------------- fixtures
 
-def _frame_bytes(fs=48000.0, layout=SK.LAYOUT_FIXED, amp=300.0, seed=0, node_us=1000,
-                 state_fs=True, bands=20, f_hi=20000.0):
+def _frame_bytes(fs=48000.0, layout=SK.LAYOUT_NYQUIST, amp=300.0, seed=0, node_us=1000,
+                 state_fs=True, bands=15, f_hi=24000.0):
     q, ref = SK.sketch(np.random.default_rng(seed).normal(0, amp, 4096), fs,
                        bands=bands, f_hi=f_hi, layout=layout)
     return SK.pack(node_us, ref, 500, q, fs=(fs if state_fs else None), layout=layout)
@@ -126,16 +126,16 @@ class TestTheModelIsActuallyWired:
     def test_the_shipped_goldens_score_exactly_these_values(self, model):
         """Measured on this checkout, pinned to 1e-9 relative. Any of the three defects below
         moves every one of them, which is what a `< 0.5` assertion would not notice."""
-        for seed, want in ((0, 2.2689195315887243e-03),
-                           (1, 1.4685785098193101e-02),
-                           (2, 6.8016671068528466e-04)):
+        for seed, want in ((0, 0.0109740003450659),
+                           (1, 0.0800225232891966),
+                           (2, 0.0167765755202587)):
             f = SK.unpack(_frame_bytes(seed=seed))
             got = CL.score_sketch(f, model)
             assert got == pytest.approx(want, rel=1e-9), "seed %d = %.12e" % (seed, got)
 
     def test_six_of_the_nine_goldens_are_refused_and_all_six_on_layout(self, model):
-        """A fixed point for the refusal counter itself: the shipped fixture set is 2/3 legacy
-        `nyquist` layout, so a change that started silently accepting those would show here."""
+        """A fixed point for the refusal counter itself: the shipped fixture set includes legacy
+        `nyquist` layout frames, so a change that started silently accepting those would show here."""
         refused = {}
         for c in json.load(open(GOLDEN))["cases"]:
             f = SK.unpack(base64.b64decode(c["frame_b64"]))
@@ -143,8 +143,12 @@ class TestTheModelIsActuallyWired:
                 CL.score_sketch(f, model)
             except CL.SketchMismatch:
                 refused[c["name"]] = HS.classify_refusal(f, model)
-        assert len(refused) == 4
-        assert set(refused.values()) == {HS.R_LAYOUT_MISMATCH, HS.R_FS_MISMATCH}
+        # Now that the model uses LAYOUT_FIXED consistently, all LAYOUT_NYQUIST frames are refused
+        # Plus 2 LAYOUT_FIXED frames that are 16 kHz (insufficient bands for the 20-band model)
+        assert len(refused) == 8
+        # All refused frames should be due to layout_mismatch or bands_insufficient_for_rate
+        assert all(r in (HS.R_LAYOUT_MISMATCH, HS.R_BANDS_INSUFFICIENT_FOR_RATE) 
+                   for r in refused.values())
 
     def test_zeroing_the_weights_changes_them(self, model):
         """The pin above is only a check if a dead model fails it. It does."""
