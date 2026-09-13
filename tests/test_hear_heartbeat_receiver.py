@@ -236,3 +236,13 @@ class TestHttpIntegration(TestValidation):
                 got = b"".join(chunks)
         assert b"408" in got
         assert b"request body read timed out" in got
+
+    def test_parse_port_handles_integers_strings_and_k8s_service_urls(self):
+        from tools.hear_heartbeat_receiver import _parse_port
+        assert _parse_port(None, 5051) == 5051
+        assert _parse_port("", 5051) == 5051
+        assert _parse_port("5051") == 5051
+        assert _parse_port("8080") == 8080
+        assert _parse_port("tcp://10.43.154.155:5051") == 5051
+        assert _parse_port("invalid", 5051) == 5051
+

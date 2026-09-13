@@ -18,7 +18,18 @@ REDIS_HOST = os.environ.get("REDIS_HOST", "100.73.200.19")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "30379"))
 REDIS_PASS = os.environ.get("REDIS_PASS")
 AUTH_TOKEN = os.environ.get("HEAR_HEARTBEAT_TOKEN")
-API_PORT = int(os.environ.get("HEAR_HEARTBEAT_PORT", "5051"))
+def _parse_port(env_val: Optional[str], default: int = 5051) -> int:
+    if not env_val:
+        return default
+    if env_val.startswith("tcp://"):
+        return int(env_val.rsplit(":", 1)[-1])
+    try:
+        return int(env_val)
+    except ValueError:
+        return default
+
+
+API_PORT = _parse_port(os.environ.get("HEAR_HEARTBEAT_PORT", "5051"))
 HEARTBEAT_TTL_S = int(os.environ.get("HEAR_HEARTBEAT_TTL_S", "30"))
 MAX_BODY_BYTES = int(os.environ.get("HEAR_HEARTBEAT_MAX_BODY_BYTES", "8192"))
 SOCKET_TIMEOUT_S = float(os.environ.get("HEAR_HEARTBEAT_SOCKET_TIMEOUT_S", "0.5"))
