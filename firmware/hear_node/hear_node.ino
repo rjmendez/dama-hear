@@ -179,12 +179,24 @@ static void node_identity() {
 #define GPS_PMTK 2
 #define MIC_PDM  1
 #define MIC_I2S  2
+#if defined(HEAR_BOARD_ESP32S3_I2S_GPS)
+#include "../boards/esp32s3_i2s_gps.h"
+#else
 #include "../boards/xiao_s3_sense.h"
+#endif
 
 // Local aliases, kept so this file's 2700 lines do not all churn in one commit. The profile is
 // the source of truth; these are the names the existing code already uses.
+#if MIC_KIND == MIC_PDM
 #define PDM_CLK   MIC_CLK_PIN
 #define PDM_DIN   MIC_DIN_PIN
+#elif MIC_KIND == MIC_I2S
+#define MIC_BCLK  MIC_BCLK_PIN
+#define MIC_WS    MIC_WS_PIN
+#define MIC_DIN   MIC_DIN_PIN
+#else
+#error "unsupported MIC_KIND"
+#endif
 #define GPS_RX    GPS_RX_PIN
 #define GPS_TX    GPS_TX_PIN
 #define I2C_SDA   I2C_SDA_PIN
@@ -3078,8 +3090,14 @@ void setup() {
       else if (e.gpio == SD_SCK)  role = "microSD SCK   (driven output -- do not tap)";
       else if (e.gpio == SD_MISO) role = "microSD MISO  (driven output -- do not tap)";
       else if (e.gpio == SD_MOSI) role = "microSD MOSI  (driven output -- do not tap)";
+#if MIC_KIND == MIC_PDM
       else if (e.gpio == PDM_CLK) role = "PDM mic CLK   (driven output -- do not tap)";
       else if (e.gpio == PDM_DIN) role = "PDM mic DATA";
+#elif MIC_KIND == MIC_I2S
+      else if (e.gpio == MIC_BCLK) role = "I2S mic BCLK  (driven output -- do not tap)";
+      else if (e.gpio == MIC_WS)   role = "I2S mic WS    (driven output -- do not tap)";
+      else if (e.gpio == MIC_DIN)  role = "I2S mic DATA";
+#endif
       else if (e.gpio == (int)sd_cs) role = "microSD CS";
       char row[96];
       snprintf(row, sizeof row, "%-5s %-5d %s\n", e.pad, e.gpio, role);
@@ -3557,6 +3575,7 @@ void setup() {
   // boot_guard() counts resets that never happen. 15 s is far longer than either call has ever
   // taken.
   boot_wdt_arm(15000);
+#if MIC_KIND == MIC_PDM
   i2s.setPinsPdmRx(PDM_CLK, PDM_DIN);
   if (!i2s.begin(I2S_MODE_PDM_RX, FS_ACQ, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
     logln("i2s   FAILED");
@@ -3565,6 +3584,24 @@ void setup() {
     logf("i2s   PDM %d Hz on CLK=%d DIN=%d -> /%d -> %d Hz\n",
          FS_ACQ, PDM_CLK, PDM_DIN, DECIM, FS_NOMINAL);
   }
+#elif MIC_KIND == MIC_I2S
+  // ICS-43434-class I2S mics emit one 24-bit word in a 32-bit slot. Keep the bus at 32-bit and
+  // let ESP_I2S shift it down to int16 so every downstream buffer stays in 16-bit PCM samples.
+  // The Adafruit breakout in docs/node-hardware.md defaults SEL low, i.e. the LEFT slot.
+  i2s.setPins(MIC_BCLK, MIC_WS, -1, MIC_DIN);
+  if (!i2s.begin(I2S_MODE_STD, FS_ACQ, I2S_DATA_BIT_WIDTH_32BIT,
+                 I2S_SLOT_MODE_MONO, I2S_STD_SLOT_LEFT) ||
+      !i2s.configureRX(FS_ACQ, I2S_DATA_BIT_WIDTH_32BIT,
+                       I2S_SLOT_MODE_MONO, I2S_RX_TRANSFORM_32_TO_16)) {
+    logln("i2s   FAILED");
+  } else {
+    i2s_up = true;
+    logf("i2s   I2S %d Hz on BCLK=%d WS=%d DIN=%d -> /%d -> %d Hz\n",
+         FS_ACQ, MIC_BCLK, MIC_WS, MIC_DIN, DECIM, FS_NOMINAL);
+  }
+#else
+#error "unsupported MIC_KIND"
+#endif
 
   // Raw ring. Ask for 80 s (7.68 MB of the 8.34 MB free) and step down rather than fail: what
   // matters is largest CONTIGUOUS free block, which total-free does not report. Log the span that
