@@ -453,14 +453,18 @@ class TestLsFailure:
         # and no watermark is written off a size nobody measured
         assert HD.read_watermarks(pl.root).get("nyquist", {}).get("scene.csv") is None
 
-    def test_a_file_missing_from_the_listing_is_also_unknown(self, tmp_path, wired, monkeypatch):
+    def test_a_file_missing_from_the_listing_fails_as_no_scene_file(self, tmp_path, wired, monkeypatch):
         pl = P.Pool(str(tmp_path / "pool"))
         n = wired()
         n.grow(50)
         monkeypatch.setattr(HD, "_ls_sizes", lambda *a, **kw: {"dets.csv": 4557})
         r = _drain(pl, n, 20_000)
-        g = [f for f in r["files"] if f["name"] == "scene.csv"][0]["gap"]
-        assert g["size_unknown"] is True and g["unfetched_bytes"] is None
+        assert r["scene_files"] == []
+        assert r["scene_live"] is None
+        assert r["scene_missing"] is True
+        assert r["unfetched_unknown"] is False
+        assert r["unfetched_bytes"] == 0
+        assert r["unfetched_reason"] == "the node served no scene file of any name"
 
 
 class TestLsParsing:
