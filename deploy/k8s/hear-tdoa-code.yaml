@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 628072 B serialised; 628250 B of annotations against a 262144 B cap.
+# apply-mode server: 635730 B serialised; 635908 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '4f453da'
+    dama-hear/commit: 'eec15f2'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '628072'
+    dama-hear/serialised-bytes: '635730'
 data:
   hear__init__.py: |
     
@@ -6676,11 +6676,21 @@ data:
             "n_nodes": len(P), "n_equations": n_eq, "n_unknowns": n_unk,
             "up_assumed_m": float(fixed_up_m) if fixed_up_m is not None else None,
             "sound_speed_mps": c,
-            "dop": PL.dop(P, s)["dop"],
+            # ⚠️`dop` AND `pdop` PRICE DIFFERENT QUESTIONS AND ARE NOT COMPARABLE. dop() is the 2D,
+            # TWO-unknown dilution on the horizontal projection; dop3() is the THREE-unknown one this
+            # fit actually solved. Measured on a 4-node ground layout with a source at (30, 30, 2):
+            # dop 31.59, hdop 35.83, pdop 45.09 -- so `dop` reads 12% below the horizontal figure and
+            # 30% below the whole one. Both are reported because the 2D number is the one
+            # placement.dop_grid plans against, but the dimension is now in the payload rather than
+            # only in this comment, so a consumer cannot quote the smaller one as "the DOP".
+            "dop": PL.dop(P, s)["dop"], "dop_unknowns": 2,
             # hdop/vdop reported separately because they are not interchangeable: the vertical is the
             # weak axis of a ground-based array by construction, and a single combined figure hides
             # exactly the component this project keeps getting wrong.
-            "hdop": d3["hdop"], "vdop": d3["vdop"], "pdop": d3["pdop"],
+            "hdop": d3["hdop"], "vdop": d3["vdop"], "pdop": d3["pdop"], "pdop_unknowns": 3,
+            # ⚠️these two describe dop3, NOT `dop` above: with three nodes dop3 refuses (dof 0,
+            # singular True) while `dop` is finite and can look excellent. Named for what they are.
+            "dop3_dof": d3["dof"], "dop3_singular": d3["singular"],
             "dop_dof": d3["dof"], "dop_singular": d3["singular"],
             "linearity": lin,
             "planarity_rms_m": cop["planarity_rms_m"],
@@ -7647,6 +7657,75 @@ data:
                            % (self.available_sigma_s * 1e6, self.shortfall, self.achievable_dT_c()))
     
     
+    def separation_for_temperature(target_dT_c: float, sigma_d_m: float,
+                                   sigma_tau_s: float = 0.0, c: Optional[float] = None,
+                                   temp_c: float = 20.0) -> Dict[str, float]:
+        """How much RANGE DIFFERENCE a known-source pair needs to recover T to `target_dT_c`.
+    
+        This is the inversion the dama-gotchi phone chirp makes available, and it is the only one on
+        this fleet that needs no emission time and no per-handset audio offset: a phone at a SURVEYED
+        point emits, two clock-synced nodes at surveyed points hear it, and
+    
+            c = (d_2 - d_1) / (t_2 - t_1)
+    
+        -- the emission instant and every constant in the phone's playback path cancel in the
+        difference. With tau = Delta_d / c,
+    
+            sigma_c / c = sqrt(sigma_Delta_d^2 + c^2 sigma_tau^2) / Delta_d
+    
+        so the required separation is c * sqrt(...) / (0.606 * dT). `sigma_d_m` is the error in
+        Delta_d, i.e. the two NODE positions differenced -- a source far out on the baseline extension
+        contributes only second-order, which is where to stand.
+    
+        ⚠️THE SURVEY TERM DOES NOT AVERAGE DOWN OVER CHIRPS and the timing term does. Measured on
+        survey.json, the existing pair is the binding case: sigma_m 0.717 and 0.521 m give
+        sigma_Delta_d = 0.89 m against a maximum Delta_d of 16.873 m -- 5.3%, worth 18 m/s, worth
+        30 degC. The pair cannot measure air temperature to any useful precision until it is
+        re-surveyed, whatever the clock does.
+        """
+        c = sound_speed(temp_c) if c is None else float(c)
+        if target_dT_c <= 0.0:
+            raise ValueError("target dT must be > 0 degC (got %r)" % target_dT_c)
+        if sigma_d_m < 0.0 or sigma_tau_s < 0.0:
+            raise ValueError("sigmas must be >= 0")
+        num = math.hypot(float(sigma_d_m), c * float(sigma_tau_s))
+        need = c * num / (DC_DT * float(target_dT_c))
+        return {
+            "required_separation_m": need,
+            "required_delay_s": need / c,
+            "survey_only_separation_m": c * float(sigma_d_m) / (DC_DT * float(target_dT_c)),
+            "target_dT_c": float(target_dT_c),
+            "sigma_c_mps": DC_DT * float(target_dT_c),
+            "c_mps": c,
+        }
+    
+    
+    def temperature_from_separation(separation_m: float, sigma_d_m: float,
+                                    sigma_tau_s: float = 0.0, c: Optional[float] = None,
+                                    temp_c: float = 20.0) -> Dict[str, float]:
+        """The inverse of `separation_for_temperature`: what dT a given range difference buys.
+    
+        Reported term by term because the two error sources behave differently over repeated chirps --
+        the timing term averages as 1/sqrt(N), the survey term does not move at all until someone
+        re-surveys the nodes.
+        """
+        c = sound_speed(temp_c) if c is None else float(c)
+        d = float(separation_m)
+        if d <= 0.0:
+            raise ValueError("separation must be > 0 m (got %r)" % separation_m)
+        f_survey = float(sigma_d_m) / d
+        f_timing = c * float(sigma_tau_s) / d
+        frac = math.hypot(f_survey, f_timing)
+        return {
+            "separation_m": d,
+            "sigma_c_mps": frac * c,
+            "dT_c": frac * c / DC_DT,
+            "dT_c_survey_term": f_survey * c / DC_DT,
+            "dT_c_timing_term": f_timing * c / DC_DT,
+            "c_mps": c,
+        }
+    
+    
     def absolute_budget(path_m: float, target_dT_c: float = 1.0, c: Optional[float] = None,
                         temp_c: float = 20.0, available_sigma_s: Optional[float] = None) -> Budget:
         """Timing precision a path must be measured to for a target temperature precision.
@@ -7892,6 +7971,66 @@ data:
     class CalibrationError(ValueError):
         """The layout or the data cannot support a bias estimate. Raised at the door, as everywhere
         else in this package, rather than decorating an answer nobody can check."""
+    
+    
+    def known_source_offset_budget(path_m: float, sigma_pos_m: float, sigma_node_t_s: float,
+                                   sigma_pick_t_s: float, sigma_temp_c: float = 1.0,
+                                   temp_c: float = 20.0, n_chirps: int = 1,
+                                   source_moves: bool = False) -> Dict:
+        """What a KNOWN-SOURCE event buys for one node's constant audio-stamp offset.
+    
+        ⚠️THIS IS WHY THE PHONE CHIRP IS INSTRUMENTATION AND NOT A SEVENTH LABEL. `solve_multi` above
+        separates bias from position only because the source MOVES between events, and it needs
+        K >= 2 events plus a trusted node to do it. A dama-gotchi chirp is different in kind: its
+        source POSITION and its emission INSTANT are both known, so one event gives the offset
+        directly,
+    
+            beta = t_heard - t_emitted - d/c
+    
+        with no solve, no rank argument and no second event. The unknowns collapse the way
+        `soundspeed.determines_speed(..., n_known_sources=n_events)` counts them.
+    
+        The four terms and how each behaves over N chirps:
+    
+          survey     sigma_pos / c        random only if the phone MOVES between chirps
+          picking    sigma_pick           random, averages as 1/sqrt(N)
+          node clock sigma_node_t         random, averages as 1/sqrt(N)
+          sound speed (path/c)*0.176%/degC  COMMON MODE at a fixed path: never averages
+    
+        ⚠️SO STAND CLOSE. The sound-speed term is the only one proportional to path length, and it is
+        the only one repetition cannot remove. At 5 m an unknown 1 degC is worth 25 us; at 36 m it is
+        183 us. `soundspeed.separation_for_temperature` wants the OPPOSITE geometry -- a long
+        separation -- which is why measuring c and measuring beta are two different standoffs and not
+        one experiment.
+    
+        `source_moves=True` says the phone was re-surveyed at a different spot for each chirp, which
+        is what turns the survey term from a bias into noise.
+        """
+        c = SW.sound_speed(temp_c)
+        if path_m <= 0.0:
+            raise CalibrationError("path must be > 0 m (got %r)" % path_m)
+        if n_chirps < 1:
+            raise CalibrationError("need >= 1 chirp (got %d)" % n_chirps)
+        rt = math.sqrt(float(n_chirps))
+        survey = float(sigma_pos_m) / c
+        pick = float(sigma_pick_t_s)
+        node = float(sigma_node_t_s)
+        speed = (float(path_m) / c) * abs(float(sigma_temp_c)) * 0.606 / c
+        single = math.sqrt(survey ** 2 + pick ** 2 + node ** 2 + speed ** 2)
+        averaged = math.sqrt((survey / rt if source_moves else survey) ** 2
+                             + (pick / rt) ** 2 + (node / rt) ** 2 + speed ** 2)
+        return {
+            "terms_s": {"survey": survey, "onset_pick": pick, "node_clock": node,
+                        "sound_speed": speed},
+            "sigma_single_s": single,
+            "sigma_after_n_s": averaged,
+            "n_chirps": int(n_chirps),
+            "irreducible_s": speed if not source_moves else math.hypot(speed, 0.0),
+            "path_m": float(path_m),
+            "sound_speed_mps": c,
+            "limiting_term": max({"survey": survey, "onset_pick": pick, "node_clock": node,
+                                  "sound_speed": speed}.items(), key=lambda kv: kv[1])[0],
+        }
     
     
     def _seed_grid(P: np.ndarray, margin_m: float, step_m: float, up_m: float) -> np.ndarray:
