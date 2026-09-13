@@ -142,6 +142,11 @@ def _code_mounts(text):
     return out
 
 
+def _mount_lines(text):
+    """How many `code` volumeMount lines the manifest spells out under real containers."""
+    return sum(len(v) for v in _code_mounts(text).values())
+
+
 @pytest.mark.parametrize("bundle", sorted(_gen()["BUNDLES"]))
 def test_every_bundle_key_is_mounted_by_every_container_that_uses_it(bundle):
     """⚠️THE SEAM THAT BREAKS ONLY IN THE CLUSTER, CHECKED FOR EVERY BUNDLE.
@@ -177,8 +182,9 @@ def test_every_mount_path_matches_the_bundle_path(bundle):
     by_key = {k: rel for k, rel in list(_gen()["BUNDLES"][bundle][1])
               + list(_gen()["BUNDLES"][bundle][2])}
     manifest = _manifest_for(bundle)
+    text = manifest.read_text()
     seen = 0
-    for line in manifest.read_text().splitlines():
+    for line in text.splitlines():
         m = re.search(r"mountPath: (\S+?),\s*subPath: (\S+?)\s*\}", line)
         if not m:
             continue
@@ -187,8 +193,9 @@ def test_every_mount_path_matches_the_bundle_path(bundle):
         assert path == "/app/" + by_key[key], (
             "%s is mounted at %s but bundle %s says %s" % (key, path, bundle, by_key[key]))
         seen += 1
-    assert seen >= 2 * len(by_key), (
-        "only %d mounts parsed out of %s; the parser missed some" % (seen, manifest.name))
+    expect = _mount_lines(text)
+    assert seen >= expect >= len(by_key), (
+        "only %d mounts parsed out of %s; expected at least %d" % (seen, manifest.name, expect))
 
 
 #: `kubectl apply` writes the whole object into the `kubectl.kubernetes.io/last-applied-
