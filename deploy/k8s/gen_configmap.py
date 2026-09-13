@@ -159,6 +159,14 @@ HEARTBEAT_CODE = [
     ("tools_hear_heartbeat_receiver.py", "tools/hear_heartbeat_receiver.py"),
 ]
 
+MQTT_BRIDGE_CODE = [
+    # hear_mqtt_bridge.py imports validate_*/write_*/RequestError straight from this file so
+    # the AWS and LAN ingest paths share one schema instead of two that can drift apart --
+    # which means both files have to ship in the same ConfigMap for the import to resolve.
+    ("tools_hear_heartbeat_receiver.py", "tools/hear_heartbeat_receiver.py"),
+    ("tools_hear_mqtt_bridge.py", "tools/hear_mqtt_bridge.py"),
+]
+
 #: name -> (app label, code files, data files). The first entry is the default, so the command
 #: documented in deploy/k8s/README.md keeps working with no argument.
 BUNDLES = {
@@ -167,6 +175,7 @@ BUNDLES = {
     "hear-tag-code": ("hear-tag", TAG_CODE, []),
     "hear-tdoa-code": ("hear-tdoa", TDOA_CODE, TDOA_DATA),
     "hear-heartbeat-code": ("hear-heartbeat", HEARTBEAT_CODE, []),
+    "hear-mqtt-bridge-code": ("hear-mqtt-bridge", MQTT_BRIDGE_CODE, []),
 }
 DEFAULT_BUNDLE = "hear-drain-code"
 
