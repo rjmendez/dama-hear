@@ -300,21 +300,23 @@ class TestTheSurveyStatesWhichNodesCanRange:
 
     def test_an_unstated_class_is_included_not_silently_dropped(self):
         # every survey written before the field existed omits it; dropping those nodes would be a
-        # worse failure than the one this guards. Unset means "unstated", not "no".
+        # worse failure than the one this guards. Unset means "unstated", not "no", whether the
+        # field is absent or explicitly null on disk.
         s = SV.from_dict(self._d([
             self._n(1, "a", 0.0, 0.0),
-            self._n(2, "b", -16.0, 0.0),
-            self._n(3, "c", -4.0, 10.0),
+            {"node_id": 2, "name": "b", "e_m": -16.0, "n_m": 0.0, "u_m": 0.0,
+             "sigma_m": 0.5, "class": None},
+            self._n(3, "c", -4.0, 10.0, "xiao-s3-pps"),
         ]))
         assert s.arrival_ids() == [1, 2, 3]
 
-    def test_an_unknown_class_name_is_included_rather_than_refused(self):
+    def test_an_unknown_class_name_is_refused_rather_than_treated_as_unstated(self):
         s = SV.from_dict(self._d([
-            self._n(1, "a", 0.0, 0.0, "no-such-class"),
+            self._n(1, "a", 0.0, 0.0, "puc-ntpp"),
             self._n(2, "b", -16.0, 0.0),
-            self._n(3, "c", -4.0, 10.0),
+            self._n(3, "c", -4.0, 10.0, "xiao-s3-pps"),
         ]))
-        assert 1 in s.arrival_ids()
+        assert s.arrival_ids() == [2, 3]
 
     def test_a_non_string_class_is_refused_at_parse(self):
         import pytest as _p
