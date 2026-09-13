@@ -216,8 +216,8 @@ class TestTheHeaderIsPinnedToBytesNotToItself:
         assert WR.profile_geometry(got["profile_id"]).fs_hz == 48000.0
         # and an id nothing defines is still refused, from the same base
         b2 = bytearray(self._frame(profile_id=0))
-        b2[11] |= 0x08                                  # bit 3 -> profile 4
-        with pytest.raises(ValueError, match="unknown profile id 4"):
+        b2[11] |= 0x0E                                  # bits 1-3 -> profile 7 (currently undefined)
+        with pytest.raises(ValueError, match="unknown profile id 7"):
             WR.unpack_v2(bytes(b2))
 
     def test_the_profile_field_is_4_bits_and_stops_below_the_version_field(self):

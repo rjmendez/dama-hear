@@ -29,8 +29,17 @@ import json
 import os
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
-TAG_SCHEMA_VERSION = 1
+TAG_SCHEMA_VERSION = 2
 TAGS_NAME = "tags.jsonl"
+
+#: Schema 2.0 enhancements:
+#: - Native 48kHz acoustic metadata support via fs_source_hz (phone/HUGBOT captures)
+#: - NPU embedding vectors (embedding_dim, embedding) carried on every tag row for model outputs
+#: - Multi-rate support: fs_source_hz (capture rate), fs_model_hz (model inference rate),
+#:   csv_fs_hz (decimation rate estimate from node telemetry)
+#: - rate_recovered flag to disambiguate when header rate differs from actual samples
+#:
+#: Future: 6-DoF spatial pose vectors (pitch/roll/yaw) for phone/HUGBOT devices if available.
 
 #: The clip's own geometry, from hear.clips. Repeated here as a local constant rather than
 #: imported so that a bundle carrying tags.py without clips.py still parses; the two are checked

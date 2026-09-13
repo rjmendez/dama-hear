@@ -97,7 +97,7 @@ from hear import clips as CLIPS                                            # noq
 from hear import tags as TAGS                                             # noqa: E402
 from hear import resample as RESAMPLE                                     # noqa: E402
 
-TAG_SCHEMA = "hear.clip_tag.v1"
+TAG_SCHEMA = "hear.clip_tag.v2"
 
 MODEL_NAME = "efficientat-mn10_as"
 #: Bumping this is what makes a re-tag a NEW row beside the old one rather than an overwrite.

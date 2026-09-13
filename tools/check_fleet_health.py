@@ -18,7 +18,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+# Active fleet nodes that are expected to be online.
+# NOTE: `puc` (BirdWeather PUC) is NOT included because it has pending/unverified status.
+# See hear/nodeclass.py for details on why PUC nodes require GPS PPS verification before
+# being admitted as an arrival source.
 EXPECTED_NODES: Tuple[str, ...] = (
+    "gold",
     "nyquist",
     "mach",
     "rankine",
