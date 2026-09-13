@@ -306,3 +306,21 @@ class TestPeakIsRefusedNotClamped:
         for override in bad:
             with pytest.raises(ValueError):
                 WR.pack_v2(**{**base, **override})
+
+
+class TestDecodeTrailingBytes:
+    def test_v2_frame_with_trailing_bytes_decodes_cleanly(self):
+        f = WR.pack_v2(12_345_678, 42, 7, -10.0, 500, _q())
+        padded = f + b"\x00\x00\xff\xfe"
+        got = WR.decode(padded)
+        assert got["version"] == 2
+        assert got["us_of_day"] == 12_345_678
+        assert got["node_id"] == 42
+
+    def test_v1_frame_with_trailing_bytes_decodes_cleanly(self):
+        f = SK.pack(597174, -12.5, 1140, _q())
+        padded = f + b"\x00\x00\x00"
+        got = WR.decode(padded)
+        assert got["version"] == 1
+        assert got["node_us"] == 597174
+
