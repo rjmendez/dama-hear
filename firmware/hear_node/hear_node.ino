@@ -2214,7 +2214,7 @@ static char clip_rand[CLIP_RAND_HEX + 1] = "000000";
 #endif
 #define HEAR_PUSH_HEARTBEAT_PATH    "/api/hear/heartbeat"
 #define HEAR_PUSH_EVENT_PATH        "/api/hear/event"
-#define HEAR_PUSH_CONNECT_TIMEOUT_MS 15u
+#define HEAR_PUSH_CONNECT_TIMEOUT_MS 3000u
 #define HEAR_PUSH_READ_TIMEOUT_MS   2000u
 #define HEAR_PUSH_FAIL_LOG_MS       60000UL
 #define HEAR_PUSH_HEARTBEAT_MS      10000UL

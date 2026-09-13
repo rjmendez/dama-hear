@@ -215,7 +215,16 @@ def test_firmware_uses_the_host_port_the_receiver_actually_exposes():
     assert host_port == 5051
 
 
-def test_the_default_host_is_not_the_unresolvable_magicdns_name():
+def test_the_connect_timeout_is_long_enough_to_complete_a_real_tcp_handshake():
+    # HEAR_PUSH_CONNECT_TIMEOUT_MS was 15 -- 15 milliseconds, not 1.5 seconds -- which meant
+    # every single push failed at connect() before a WiFi TCP handshake could ever complete,
+    # regardless of whether the host was reachable or the token was valid. Caught by flashing a
+    # real node and reading its /log: "push heartbeat failed (-4)" (client.connect() returned
+    # false) on every attempt, even against a receiver later confirmed reachable and correctly
+    # configured.
+    m = re.search(r"#define HEAR_PUSH_CONNECT_TIMEOUT_MS\s+(\d+)u", CODE)
+    assert m, "HEAR_PUSH_CONNECT_TIMEOUT_MS not found"
+    assert int(m.group(1)) >= 1000
     # "mrpink" is a Tailscale MagicDNS name; WiFiClient on this firmware has no MagicDNS
     # resolver, so that default could never have delivered a single heartbeat.
     assert '"mrpink"' not in CODE
