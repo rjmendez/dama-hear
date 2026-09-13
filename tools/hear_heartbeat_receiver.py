@@ -18,6 +18,17 @@ REDIS_HOST = os.environ.get("REDIS_HOST", "audit-redis.infra.svc.cluster.local")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 REDIS_PASS = os.environ.get("REDIS_PASS")
 AUTH_TOKEN = os.environ.get("HEAR_HEARTBEAT_TOKEN")
+
+
+def _configured_auth_token(token: Optional[str]) -> str:
+    if token is None:
+        raise ValueError("HEAR_HEARTBEAT_TOKEN / --auth-token must be set")
+    token = token.strip()
+    if not token:
+        raise ValueError("HEAR_HEARTBEAT_TOKEN / --auth-token must be non-empty")
+    return token
+
+
 def _parse_port(env_val: Optional[str], default: int = 5051) -> int:
     if not env_val:
         return default
@@ -328,6 +339,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
+    auth_token = _configured_auth_token(args.auth_token)
     target = f"{args.redis_host}:{args.redis_port}"
     store = HeartbeatReceiverStore(
         make_redis_client(args.redis_host, args.redis_port, args.redis_pass),
@@ -339,7 +351,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"[hear-heartbeat] Redis target configured -> {target}")
     print(f"[hear-heartbeat] Listening on http://{args.bind}:{args.port}")
     create_server(args.bind, args.port, store, max_body_bytes=args.max_body_bytes,
-                  auth_token=args.auth_token, socket_timeout_s=args.socket_timeout_s).serve_forever()
+                  auth_token=auth_token, socket_timeout_s=args.socket_timeout_s).serve_forever()
     return 0
 
 
