@@ -390,7 +390,8 @@ static volatile uint64_t edge_local_us = 0;    // last edge that NAV-PVT success
 static volatile int64_t  edge_unix_us  = 0;    // UTC of that edge, in us since the Unix epoch
 static volatile bool     time_valid    = false;
 static volatile int32_t  last_nano     = 0;    // NAV-PVT fractional part; large = epoch not at TOS
-static volatile uint32_t time_glitch   = 0;    // labellings rejected as inconsistent
+static volatile uint32_t time_glitch   = 0;    // labellings rejected as inconsistent (UBX NAV-PVT branch only)
+static volatile uint32_t pmtk_glitch = 0; // same check, PMTK RMC branch -- its own name, not shared
 static int64_t  prev_unix_s = 0;               // last accepted label, for the +1s/edge check
 static uint32_t prev_edge_n = 0;
 // millis() at the end of setup's first statement. It lived below, in the `state` block, and is
@@ -583,7 +584,7 @@ static void pmtk_parse_rmc(const char *s) {
     if (prev_edge_n && prev_unix_s) {
       long long d_sec = unix_s - prev_unix_s;
       long long d_edge = (long long)pend_edge_n - (long long)prev_edge_n;
-      if (d_sec != d_edge) { ok = false; time_glitch++; }
+      if (d_sec != d_edge) { ok = false; pmtk_glitch++; }
     }
     if (ok) {
       edge_local_us = pend_local_us;
@@ -2705,7 +2706,7 @@ static String status_json() {
       "\"loop_max_boot_ms\":%lu,\"chip_c\":%.1f,\"stream_stalls\":%lu,\"stream_gone\":%lu},"
     "\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
-    "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"pmtk_ack\":%lu,\"pmtk_nak\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
+    "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"pmtk_ack\":%lu,\"pmtk_nak\":%lu,\"pmtk_glitch\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
     // hell_m is height above the WGS84 ELLIPSOID and is the field a geodetic transform wants;
     // hmsl_m is the human-readable one and must not be fed to lat/lon/h -> ECEF.
     "\"pos\":{\"lat\":%.7f,\"lon\":%.7f,\"hell_m\":%.3f,\"hmsl_m\":%.3f,"
@@ -2784,7 +2785,7 @@ static String status_json() {
     (unsigned long)nmea_valid, (unsigned long)gps_baud,
     (unsigned long)gps_tacc_ns, (long)gps_qerr_ps, (unsigned long)ubx_pvt,
     (unsigned long)ubx_timtp, (unsigned long)ubx_ack, (unsigned long)ubx_nak,
-    (unsigned long)pmtk_ack, (unsigned long)pmtk_nak,
+    (unsigned long)pmtk_ack, (unsigned long)pmtk_nak, (unsigned long)pmtk_glitch,
     (gps_config_acked() ? "true" : "false"), (unsigned)timtp_flags,
     ((timtp_flags != 0xFF && !(timtp_flags & 0x10)) ? "true" : "false"),
     pos_lat_e7 * 1e-7, pos_lon_e7 * 1e-7,
@@ -3708,7 +3709,8 @@ void setup() {
   http.on("/gpsraw", []() {           // what the module is ACTUALLY sending, not what a parser counted
     String o = "bytes=" + String((unsigned long)raw_tot) + " valid_nmea_lines=" + String((unsigned long)nmea_valid) +
                " ubx_ack=" + String((unsigned long)ubx_ack) + " ubx_nak=" + String((unsigned long)ubx_nak) +
-               " pmtk_ack=" + String((unsigned long)pmtk_ack) + " pmtk_nak=" + String((unsigned long)pmtk_nak) + "\n\n";
+               " pmtk_ack=" + String((unsigned long)pmtk_ack) + " pmtk_nak=" + String((unsigned long)pmtk_nak) +
+               " pmtk_glitch=" + String((unsigned long)pmtk_glitch) + "\n\n";
     uint16_t st = raw_i;
     // ?hex=1: '.' for every non-printable byte hides exactly the structure worth looking for --
     // a UBX sync pair (b5 62), an NMEA '$' at the wrong framing, or a line stuck at one value.
