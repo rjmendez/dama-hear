@@ -2753,6 +2753,7 @@ void setup() {
   // longer than that. Must precede begin(), which keeps a queue that already exists.
   Serial.setRxBufferSize(HEAR_PROV_LINE_MAX + 64);
   Serial.begin(115200);
+  Serial.setTxTimeoutMs(50);
   delay(1500);
   boot_ms = millis();
   logf("boot  attempt %lu on partition %s\n", (unsigned long)hear_boot_try(),
@@ -4252,7 +4253,7 @@ void loop() {
     if (millis() - retry > 15000) { retry = millis(); WiFi.reconnect(); }
   }
 
-  hear_boot_tick(sta_ok);          // reachability is the sketch's to answer, not the library's
+  if (prov.n > 0) hear_boot_tick(sta_ok);          // reachability is the sketch's to answer, not the library's
 
   static uint32_t last = 0;
   if (millis() - last > 30000) {
