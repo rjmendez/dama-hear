@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 286276 B serialised; 286454 B of annotations against a 262144 B cap.
+# apply-mode server: 288612 B serialised; 288790 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: '4c8cf4a'
+    dama-hear/commit: '034b43b'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '286276'
+    dama-hear/serialised-bytes: '288612'
 data:
   hear__init__.py: |
     
@@ -76,7 +76,7 @@ data:
     # profile_id -> (bands, frames). LITERAL AND FROZEN: if SK.MEL_BANDS/SK.FRAMES were ever edited,
     # reading these from them would silently change the meaning of every deployed frame. A test
     # compares the two so an edit forces a NEW profile id instead of a reinterpretation.
-    PROFILES: Dict[int, Tuple[int, int]] = {0: (20, 8), 1: (20, 8), 2: (20, 8)}
+    PROFILES: Dict[int, Tuple[int, int]] = {0: (20, 8), 1: (20, 8), 2: (20, 8), 3: (20, 8), 4: (20, 8)}
     
     
     class Geometry(NamedTuple):
@@ -110,6 +110,9 @@ data:
         0: Geometry(20, 8, 256, 0.004, None, SK.LAYOUT_NYQUIST, 300.0, 20000.0),
         1: Geometry(20, 8, 256, 0.004, 48000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
         2: Geometry(20, 8, 256, 0.004, 16000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
+        # Schema 2.0 multi-rate profiles: 3 for 32 kHz (HUGBOT5000), 4 for 24 kHz
+        3: Geometry(20, 8, 256, 0.004, 32000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
+        4: Geometry(20, 8, 256, 0.004, 24000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
     }
     
     #: Ids a NEW frame may claim. 0 is excluded because a frame that cannot say its own rate is the
@@ -130,8 +133,6 @@ data:
     
     # 237 B Meshtastic payload minus 37 B protobuf/portnum, per sketch.py:31,107.
     MESHTASTIC_USABLE: int = 200
-    
-    _SHAPES: Dict[Tuple[int, int], int] = {v: k for k, v in PROFILES.items()}
     
     _TS_BITS = 37
     _TS_MASK = (1 << _TS_BITS) - 1
@@ -508,14 +509,14 @@ data:
     
     
     def sketch(x: np.ndarray, fs: float, bands: int = MEL_BANDS, frames: int = FRAMES,
-               hop_s: float = HOP_S, nfft: int = NFFT,
-               layout: str = LAYOUT_NYQUIST) -> Tuple[np.ndarray, float]:
+               hop_s: float = HOP_S, nfft: int = NFFT, f_lo: float = F_LO,
+               f_hi: float = F_HI, layout: str = LAYOUT_NYQUIST) -> Tuple[np.ndarray, float]:
         """(int8 [bands x frames], ref_db). Frames start at the sample the caller passes as index 0.
     
         `layout` decides what band k MEANS -- see [mel_filterbank]. At any rate above
         LAYOUT_EQUIVALENT_ABOVE_HZ the two are the same bytes."""
         x = np.asarray(x, float)
-        fb = mel_filterbank(fs, nfft, bands, layout=layout)
+        fb = mel_filterbank(fs, nfft, bands, f_lo=f_lo, f_hi=f_hi, layout=layout)
         hop = max(1, int(hop_s * fs))
         win = np.hanning(nfft)
         out = np.zeros((bands, frames))
@@ -3263,34 +3264,44 @@ data:
     # firmware too old to have the endpoint, and as the answer when /ls fails -- a blind run must still
     # fetch something rather than nothing.
     SCENE_GLOB = "scene"
+    SCENE_DATED_RE = re.compile(r"^scene-(\d{8})(-prev)?\.csv$")
     
     
-    def scene_names(sizes: Optional[Dict[str, int]]) -> Tuple[Tuple[str, ...], str]:
+    def _scene_key(name: str) -> Tuple[int, int, str]:
+        """Oldest -> newest, with a rolled `-prev` partition before its same-day live file."""
+        m = SCENE_DATED_RE.match(name)
+        if not m:
+            return (-1, 0 if name.endswith("-prev.csv") else 1, name)
+        return (int(m.group(1)), 0 if m.group(2) else 1, name)
+    
+    
+    def scene_names(sizes: Optional[Dict[str, int]]) -> Tuple[Tuple[str, ...], Optional[str]]:
         """(names to fetch, which one is live). Live is tailed; the rest are rolled and fetched whole.
     
-        Lexicographic order is chronological for scene-YYYYMMDD.csv, so the greatest dated name is
-        today's. ⚠️scene-00000000.csv is the PRE-LOCK file -- rows the node wrote before it knew the
-        date -- and it is a real file with real rows, not a placeholder, so it is fetched like any
-        other rolled file. hear/pool.py keeps its rows and marks them unanchored.
+        ⚠️DATED PARTITIONS WIN AS A FAMILY. Since fw 7f84d29 the live file is scene-YYYYMMDD.csv and
+        the frozen legacy scene.csv is a compatibility leftover, so when one dated file exists the
+        drain fetches ONLY the dated family and ignores legacy names entirely. Legacy scene.csv /
+        scene-prev.csv stay as the blind fallback when /ls is unavailable and as the old-firmware path
+        when no dated file exists at all.
+    
+        ⚠️scene-00000000.csv is the PRE-LOCK file -- rows the node wrote before it knew the date -- and
+        it is a real file with real rows, not a placeholder, so it is fetched like any other rolled
+        file. hear/pool.py keeps its rows and marks them unanchored.
     
         Rolled daily scene partitions (such as scene-YYYYMMDD-prev.csv and scene-prev.csv) created
         when headers change or dates rollover are also discovered and fetched whole.
         """
-        if not sizes:
+        if sizes is None:
             return SCENE_FILES, "scene.csv"
-        all_scene = sorted(n for n in sizes
-                           if n.startswith(SCENE_GLOB) and n.endswith(".csv"))
-        if not all_scene:
-            return SCENE_FILES, "scene.csv"
-        candidates = [n for n in all_scene if not n.endswith("-prev.csv")]
-        dated = [n for n in candidates if n != "scene.csv"]
+        dated = sorted((n for n in sizes if SCENE_DATED_RE.match(n)), key=_scene_key)
         if dated:
-            live = dated[-1]
-        elif "scene.csv" in candidates:
-            live = "scene.csv"
-        else:
-            live = "scene.csv"
-        return tuple(all_scene), live
+            current = [n for n in dated if not n.endswith("-prev.csv")]
+            live = current[-1] if current else dated[-1]
+            return tuple(dated), live
+        legacy = [n for n in SCENE_FILES if n in sizes]
+        if legacy:
+            return SCENE_FILES, "scene.csv"
+        return (), None
     CONTEXT_FILES = ("health.csv",)
     
     # ⚠️SCENE IS FETCHED BY TAIL, NOT WHOLE. It grows without bound (16,771,742 B on nyquist and
@@ -4299,6 +4310,7 @@ data:
                                "files": [], "added": 0, "scene_added": 0, "errors": [],
                                "unfetched_bytes": None, "unfetched_unknown": True,
                                "unfetched_reason": "the run ended before any scene tail was measured",
+                               "scene_missing": False,
                                # ⚠️None, NOT 0. A run that never reached the node measured NO clips,
                                # and `clips_gone: 0` would read as "nothing was destroyed" -- the
                                # unmeasured-looks-clean failure this whole module is built against.
@@ -4368,6 +4380,11 @@ data:
         scene_fetch, scene_live = scene_names(sizes)
         out["scene_files"] = list(scene_fetch)
         out["scene_live"] = scene_live
+        if not scene_fetch and sizes is not None:
+            out["scene_missing"] = True
+            out["unfetched_unknown"] = False
+            out["unfetched_bytes"] = 0
+            out["unfetched_reason"] = "the node served no scene file of any name"
         for name in scene_fetch:
             # A rolled file does not grow, so it is fetched whole. Only the live file is tailed.
             tail = SCENE_TAIL_BYTES if name == scene_live else None
@@ -4677,6 +4694,7 @@ data:
             measured = None if r.get("unfetched_unknown") else r.get("unfetched_bytes")
             s["last_unfetched_bytes"] = measured
             s["last_unfetched_reason"] = r.get("unfetched_reason")
+            s["last_scene_missing"] = bool(r.get("scene_missing"))
             # A listing the node itself says it cut short is a PARTIAL CENSUS: scene_names() and
             # ls_candidates() both work off it, so it must not read as a short card.
             s["ls_truncated_at"] = r.get("ls_truncated_at")
@@ -4686,7 +4704,8 @@ data:
             ring = s.get("unfetched_recent")
             if not isinstance(ring, list):
                 ring = []
-            ring.append({"at": now, "bytes": measured, "reason": r.get("unfetched_reason")})
+            ring.append({"at": now, "bytes": measured, "reason": r.get("unfetched_reason"),
+                         "missing": bool(r.get("scene_missing"))})
             s["unfetched_recent"] = ring[-UNFETCHED_RING:]
             # ⚠️THE CLIP COUNTERS GO IN THE SAME RING, FOR THE SAME REASON. A cap that binds during a
             # burst is the failure mode the deadline creates, and `check` runs `17 * * * *` against a
@@ -4749,6 +4768,9 @@ data:
             # Fall back to the single pre-ring field so an old heartbeat still says something true.
             if "last_unfetched_bytes" not in s:
                 return "  unfetched n/a", False
+            if s.get("last_scene_missing"):
+                why = s.get("last_unfetched_reason") or "the node served no scene file of any name"
+                return "  NO SCENE FILE (%s)" % why, True
             v = s["last_unfetched_bytes"]
             if v is None:
                 why = s.get("last_unfetched_reason") or "not measured"
@@ -4762,8 +4784,14 @@ data:
             return "  unfetched none in the last %.0f s" % window_s, False
         total = sum(int(e["bytes"]) for e in recent if e.get("bytes") is not None)
         unknown = [e for e in recent if e.get("bytes") is None]
+        missing = [e for e in recent if e.get("missing")]
         lossy = [e for e in recent if e.get("bytes")]
         note, bad = "", False
+        if missing:
+            why = missing[-1].get("reason") or "the node served no scene file of any name"
+            note += ("  NO SCENE FILE for %d of %d run(s) (%s)"
+                     % (len(missing), len(recent), why))
+            bad = True
         if total > max_unfetched_bytes:
             note += ("  UNFETCHED %d B of scene never asked for, by %d of the %d run(s) in the last "
                      "%.0f s" % (total, len(lossy), len(recent), window_s))
@@ -5103,7 +5131,9 @@ data:
     
     It reports and does not gate. The exit code says whether every node ANSWERED, never whether the
     answers were good -- the same rule tools/validate_scene.py follows, and for the same reason: a
-    tool that exits non-zero on a node with no sky yet trains its operator to ignore it.
+    tool that exits non-zero on a node with no sky yet trains its operator to ignore it. It also never
+    declares a node offline from HTTP alone: use the OPNsense DHCP/ARP lookup, the node `/status`
+    probe, and the `hear-drain` ingestion heartbeat as the mandatory three-layer verification.
     
     ⚠️A `-dirty` build did not come from any commit. Two nodes both reporting the same -dirty string
     are NOT thereby on the same code; the string names the last tag, not the working tree.
@@ -5132,6 +5162,12 @@ data:
     # tools/hear_drain.py's LS_RETRY_BACKOFF_S, the other place this exact collision is measured and
     # waited out, so a future change to that number is one place to make, not two.
     RETRY_BACKOFF_S = 1.5
+    
+    OFFLINE_VERIFICATION = (
+        "1) confirm the node's DHCP lease and ARP entry on the OPNsense gateway; "
+        "2) probe the node HTTP /status endpoint; "
+        "3) verify hear-drain ingestion/heartbeat for that node"
+    )
     
     # MEASURED, not assumed: nyquist wrote 2,689,167 B of scene.csv across 8,018 rows = 335 B/row, at
     # one row per 1.024 s. Everything else on the card is bounded or negligible -- the clip budget is a
@@ -5240,7 +5276,8 @@ data:
                 # flash that landed the wrong identity is the failure this whole column exists for
                 print(row(got[n].get("node") or names[n], got[n]))
         for d in dead:
-            print("  UNREACHABLE  " + d)
+            print("  HTTP PROBE FAILED  " + d)
+            print("    OFFLINE UNCONFIRMED -- " + OFFLINE_VERIFICATION)
     
         if len(got) > 1:
             builds = {d.get("fw", "?") for d in got.values()}
