@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 608674 B serialised; 608858 B of annotations against a 262144 B cap.
+# apply-mode server: 610939 B serialised; 611123 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '284560b-dirty'
+    dama-hear/commit: '098f7c0-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '608674'
+    dama-hear/serialised-bytes: '610939'
 data:
   hear__init__.py: |
     
@@ -287,6 +287,7 @@ data:
     import numpy as np
     
     from . import sketch as SK
+    from . import wire as WR
     
     #: Phone `clock_tier` values whose stamp is a UTC MEASUREMENT rather than a wall-clock reading.
     #: Copied deliberately, not invented: this is dama-gotchi's own
@@ -456,10 +457,10 @@ data:
     
     
     def _decode(frame: bytes) -> Dict:
-        """SK.unpack's ValueErrors become SkipReason: a malformed frame is a message this corpus
+        """hear.wire.decode's ValueErrors become SkipReason: a malformed frame is a message this corpus
         could not use, not a crash in the reader."""
         try:
-            return SK.unpack(frame)
+            return WR.decode(frame)
         except ValueError as e:
             raise SkipReason(str(e))
     
@@ -493,10 +494,26 @@ data:
             # An older phone build that packed no rate code but reported it alongside. Believable,
             # and recorded as coming from the JSON rather than the frame.
             fs = float(payload["fs"])
-        utc_us = phone_utc_us(payload.get("ts_utc_ms"), d["node_us"])
+        node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
+        utc_us = phone_utc_us(payload.get("ts_utc_ms"), node_us)
+        extra = dict({k: payload[k] for k in
+                    ("trigger_ts_utc_ms", "onset_offset_us", "onset_dated", "onset_found",
+                     "since_prev_s", "utc_trusted")
+                    if k in payload},
+                   # from the FRAME, not the JSON: it decides whether this row can be aligned
+                   # with a row from a sensor running at another rate.
+                   layout=d["layout"], valid_bands=d["valid_bands"])
+        if "us_of_day" in d:
+            extra["us_of_day"] = d["us_of_day"]
+        if "seq" in d:
+            extra["seq"] = d["seq"]
+        if "profile_id" in d:
+            extra["profile_id"] = d["profile_id"]
+        if "version" in d:
+            extra["version"] = d["version"]
         return Record(
             node_id=str(nid), source="phone", q=d["q"], ref_db=d["ref_db"], peak=d["peak"],
-            bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=d["node_us"],
+            bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=node_us,
             retrigger=bool(d["retrigger"]),
             ts_utc_s=None if utc_us is None else utc_us / 1e6,
             clipped=payload.get("clipped"),
@@ -507,13 +524,7 @@ data:
             # `Record.utc_trusted` -- so a Record that drops them cannot answer the gate's question
             # about itself. `onset_found` was being dropped here entirely
             # (AcousticRangingCollector.kt:3513 publishes it).
-            extra=dict({k: payload[k] for k in
-                        ("trigger_ts_utc_ms", "onset_offset_us", "onset_dated", "onset_found",
-                         "since_prev_s", "utc_trusted")
-                        if k in payload},
-                       # from the FRAME, not the JSON: it decides whether this row can be aligned
-                       # with a row from a sensor running at another rate.
-                       layout=d["layout"], valid_bands=d["valid_bands"]),
+            extra=extra,
         )
     
     
@@ -527,12 +538,26 @@ data:
         """
         d = _decode(frame)
         fs = d["fs_hz"] if d["fs_hz"] is not None else fs_hz
-        ts = None if second_utc_s is None else float(second_utc_s) + d["node_us"] / 1e6
+        if d.get("version", 1) >= 2:
+            node_us = d["us_of_day"] % 1_000_000
+            ts = None if second_utc_s is None else WR.unwrap_utc(d["us_of_day"], float(second_utc_s))
+        else:
+            node_us = d["node_us"]
+            ts = None if second_utc_s is None else float(second_utc_s) + d["node_us"] / 1e6
+        extra = {"layout": d["layout"], "valid_bands": d["valid_bands"]}
+        if "us_of_day" in d:
+            extra["us_of_day"] = d["us_of_day"]
+        if "seq" in d:
+            extra["seq"] = d["seq"]
+        if "profile_id" in d:
+            extra["profile_id"] = d["profile_id"]
+        if "version" in d:
+            extra["version"] = d["version"]
         return Record(
             node_id=str(node_id), source="node", q=d["q"], ref_db=d["ref_db"], peak=d["peak"],
-            bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=d["node_us"],
+            bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=node_us,
             retrigger=bool(d["retrigger"]), ts_utc_s=ts,
-            extra={"layout": d["layout"], "valid_bands": d["valid_bands"]},
+            extra=extra,
         )
     
     
@@ -805,8 +830,9 @@ data:
     GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5, G6)
     LATEST = G6
     
-    # One packed v1 sketch is 172 bytes; the column holds it as hex.
+    # One packed v1 sketch is 172 bytes (344 hex); v2 is 173 bytes (346 hex).
     FRAME_HEX_LEN = 344
+    FRAME_HEX_LENS = frozenset({344, 346})
     
     
     class UnknownSchema(ValueError):
@@ -909,7 +935,7 @@ data:
             if not fh:
                 out._skip(n, "no_frame")
                 continue
-            if len(fh) != FRAME_HEX_LEN:
+            if len(fh) not in FRAME_HEX_LENS:
                 out._skip(n, "frame_hex_len_%d" % len(fh))
                 continue
             if "node_id" in d and d["node_id"]:
@@ -1376,6 +1402,7 @@ data:
     from . import identity as ID
     from . import scenefile as SF
     from . import sketch as SK
+    from . import wire as WR
     
     SCHEMA_VERSION = 1
     
@@ -1558,14 +1585,17 @@ data:
     def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
         frame = binascii.unhexlify(row["frame_hex"])
-        d = SK.unpack(frame)
+        d = WR.decode(frame)
         utc_us = int(row.get("utc_us") or 0)
         node = row["node"]
         # fs: the FRAME is authoritative when it states a rate; the CSV column is only the node's
         # running estimate.
         fs_csv = row.get("fs_hz")
         fs_csv = float(fs_csv) if fs_csv not in (None, "") else None
-        return {
+        node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
+        event_flags = d.get("event_flags", 0)
+        no_context = bool(event_flags & SK.FLAG_NO_CONTEXT) if d.get("version", 1) == 1 else False
+        rec = {
             "schema_version": SCHEMA_VERSION,
             "key": key("node", node, utc_us, row.get("sample"), frame),
             "source": "node",
@@ -1587,11 +1617,11 @@ data:
             "frames": int(d["q"].shape[1]),
             "peak": d["peak"],
             "ref_db": d["ref_db"],
-            "node_us": d["node_us"],
+            "node_us": node_us,
             "retrigger": bool(d["retrigger"]),
             # event_flags, not the raw flags word: bit 1 is "no context" only in v1, and is a profile
             # bit in v2. Masking the raw word tags good v2 frames as broken.
-            "no_context": bool(d["event_flags"] & SK.FLAG_NO_CONTEXT),
+            "no_context": no_context,
             "sketch_back": (int(row["sketch_back"]) if row.get("sketch_back") not in (None, "")
                             else None),
             # ⚠️THE SAME KEY AND THE SAME UNIT AS THE PHONE PATH ABOVE (ingest_mqtt_jsonl), which is
@@ -1611,18 +1641,20 @@ data:
             # the node's own PPS edge counter. `utc_us == 0` says the node could not NAME the edge;
             # `pps_n` still says WHICH edge, and `us_since_pps` how far into it. Without the pair, a
             # row whose neighbours in the same boot ARE anchored cannot be placed even in principle,
-            # and 517 mach records were stored that way (2026-09-10, /pool/corpus/records).
-            # Keeping them does NOT make a row anchored -- see hear/unanchored.py for what may and
-            # may not be reconstructed from them, and why the pre-lock case is refused.
-            # ⚠️Records already written keep the shape they were written with: the pool is
-            # content-addressed and a re-fetch of the same row dedupes rather than rewrites. These
-            # fields appear on rows ingested from here on, not retroactively.
+            # so unanchored recovery (hear/pool.py:unanchored_window) would have had nothing to work on.
             "pps_n": row.get("pps_n"),
             "us_since_pps": row.get("us_since_pps"),
             "trigger": row.get("trigger"),
             "clip": row.get("clip") or None,
             "dets_schema": row.get("schema"),
         }
+        if "us_of_day" in d:
+            rec["us_of_day"] = d["us_of_day"]
+        if "seq" in d:
+            rec["seq"] = d["seq"]
+        if "profile_id" in d:
+            rec["profile_id"] = d["profile_id"]
+        return rec
     
     
     
@@ -1780,17 +1812,20 @@ data:
                     continue
                 try:
                     frame = base64.b64decode(b64)
-                    d = SK.unpack(frame)
+                    d = WR.decode(frame)
                 except Exception as e:
                     r = type(e).__name__
                     skips[r] = skips.get(r, 0) + 1
                     continue
                 ts_ms = payload.get("ts_utc_ms")
-                stated_utc_us = C.phone_utc_us(ts_ms, d["node_us"])
+                node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
+                stated_utc_us = C.phone_utc_us(ts_ms, node_us)
                 ts = None if stated_utc_us is None else stated_utc_us / 1e6
                 utc_us = 0 if stated_utc_us is None else stated_utc_us
                 node = str(nid or payload.get("node_id") or "?")
-                recs.append({
+                event_flags = d.get("event_flags", 0)
+                no_context = bool(event_flags & SK.FLAG_NO_CONTEXT) if d.get("version", 1) == 1 else False
+                rec = {
                     "schema_version": SCHEMA_VERSION,
                     "key": key("phone", node, utc_us, payload.get("trigger_ts_utc_ms"), frame),
                     "source": "phone", "node": node, "node_from": "topic" if nid else "payload",
@@ -1801,9 +1836,9 @@ data:
                                     ("json" if payload.get("fs") else None),
                     "layout": d["layout"], "valid_bands": d["valid_bands"],
                     "bands": int(d["q"].shape[0]), "frames": int(d["q"].shape[1]),
-                    "peak": d["peak"], "ref_db": d["ref_db"], "node_us": d["node_us"],
+                    "peak": d["peak"], "ref_db": d["ref_db"], "node_us": node_us,
                     "retrigger": bool(d["retrigger"]),
-                    "no_context": bool(d["event_flags"] & SK.FLAG_NO_CONTEXT),
+                    "no_context": no_context,
                     "sketch_back": None,
                     "clipped": payload.get("clipped"),
                     "clock_tier": payload.get("clock_tier"),
@@ -1818,7 +1853,14 @@ data:
                     # If a producer ever states it outright, it outranks the derivation. Absent is
                     # the normal case and stays absent, NOT False: see Record.utc_trusted.
                     "utc_trusted": payload.get("utc_trusted"),
-                })
+                }
+                if "us_of_day" in d:
+                    rec["us_of_day"] = d["us_of_day"]
+                if "seq" in d:
+                    rec["seq"] = d["seq"]
+                if "profile_id" in d:
+                    rec["profile_id"] = d["profile_id"]
+                recs.append(rec)
             added = self._append(recs)
             entry = {"kind": "mqtt.jsonl", "path": os.path.abspath(path), "origin": origin or path,
                      "sha256": sha, "bytes": len(raw), "rows": rows_seen, "decoded": len(recs),
@@ -2137,11 +2179,14 @@ data:
                 if usable_only and (r.get("fs_hz") is None or r.get("no_context")
                                     or r.get("layout") != SK.LAYOUT_FIXED):
                     continue
-                d = SK.unpack(base64.b64decode(r["frame_b64"]))
+                d = WR.decode(base64.b64decode(r["frame_b64"]))
+                node_us = r.get("node_us")
+                if node_us is None:
+                    node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
                 out.append(C.Record(
                     node_id=r["node"], source=r["source"], q=d["q"], ref_db=d["ref_db"],
                     peak=d["peak"], bands=d["q"].shape[0], frames=d["q"].shape[1],
-                    fs_hz=r.get("fs_hz"), node_us=d["node_us"], retrigger=bool(d["retrigger"]),
+                    fs_hz=r.get("fs_hz"), node_us=node_us, retrigger=bool(d["retrigger"]),
                     ts_utc_s=r.get("ts_utc_s"), clipped=r.get("clipped"),
                     clock_tier=r.get("clock_tier"), sync_sigma_ns=r.get("sync_sigma_ns"),
                     # ⚠️EVERYTHING THE STORE HELD THAT IS NOT ALREADY A FIELD. This was a fixed
@@ -3454,6 +3499,9 @@ data:
     #: defect, not a choice.
     LEGACY_PROFILES = frozenset({0})
     
+    #: Valid profile ids for a NEW frame (excludes legacy/read-only profile 0).
+    NEW_PROFILE_IDS: frozenset[int] = frozenset(k for k in PROFILE_GEOMETRY if k not in LEGACY_PROFILES)
+    
     #: What pack_v2 uses when the caller names no profile.
     #:
     #: ⚠️A DECLARED CONSTANT, NOT A DERIVATION. It used to derive the id from q.shape, which is how a
@@ -3576,6 +3624,9 @@ data:
         if q.ndim != 2:
             raise ValueError("q is %d-D; a sketch is 2-D (bands, frames)" % q.ndim)
         pid = DEFAULT_PROFILE if profile_id is None else int(profile_id)
+        if pid not in NEW_PROFILE_IDS:
+            raise ValueError("profile_id %d is not a valid new profile id (valid: %s)"
+                             % (pid, sorted(NEW_PROFILE_IDS)))
         bands, frames = profile_shape(pid)
         if q.shape != (bands, frames):
             raise ValueError("q shape %r does not match profile %d (%dx%d)"
@@ -3615,11 +3666,17 @@ data:
     
         ref4, peak, node_id, _ = struct.unpack_from("<hHHH", b, 5)
         q = np.frombuffer(b[HDR_V2:n], dtype=np.int8).reshape(bands, frames)
+        geom = profile_geometry(pid)
+        fs = geom.fs_hz
+        layout = geom.layout
+        vb = None if fs is None else SK.valid_bands(fs, bands, layout=layout)
+        be = None if fs is None else SK.band_edges_hz(fs, bands, layout=layout)
         return {"version": VERSION, "us_of_day": us,
                 "node_id": node_id, "seq": (flags >> _F_SEQ_SHIFT) & _F_SEQ_MASK,
                 "ref_db": ref4 / 4.0, "peak": peak,
                 "retrigger": bool(flags & _F_RETRIG), "profile_id": pid,
                 "bands": bands, "frames": frames, "flags": flags,
+                "fs_hz": fs, "layout": layout, "valid_bands": vb, "band_edges_hz": be,
                 "q": q, "db": q.astype(float) / 2.0 + ref4 / 4.0}
     
     

@@ -79,8 +79,9 @@ G6 = Generation("G6", _G6, _G6)
 GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5, G6)
 LATEST = G6
 
-# One packed v1 sketch is 172 bytes; the column holds it as hex.
+# One packed v1 sketch is 172 bytes (344 hex); v2 is 173 bytes (346 hex).
 FRAME_HEX_LEN = 344
+FRAME_HEX_LENS = frozenset({344, 346})
 
 
 class UnknownSchema(ValueError):
@@ -183,7 +184,7 @@ def read_text(text: str, default_node: Optional[str] = None) -> DetsRead:
         if not fh:
             out._skip(n, "no_frame")
             continue
-        if len(fh) != FRAME_HEX_LEN:
+        if len(fh) not in FRAME_HEX_LENS:
             out._skip(n, "frame_hex_len_%d" % len(fh))
             continue
         if "node_id" in d and d["node_id"]:
