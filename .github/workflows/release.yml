@@ -30,17 +30,27 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          name: fw-hear_node
-          path: build
+          name: fw-hear_node-xiao-s3-pps
+          path: build/xiao-s3-pps
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: fw-hear_node-esp32s3-i2s-gps
+          path: build/esp32s3-i2s-gps
 
       - name: assemble
         run: |
           mkdir dist
-          cp build/hear_node.ino.bin            "dist/hear_node-$TAG.bin"
-          cp build/hear_node.ino.bootloader.bin "dist/hear_node-$TAG-bootloader.bin"
-          cp build/hear_node.ino.partitions.bin "dist/hear_node-$TAG-partitions.bin"
-          cp build/hear_node.ino.merged.bin     "dist/hear_node-$TAG-merged.bin"
-          cp build/hear_node.ino.elf            "dist/hear_node-$TAG.elf"
+          cp build/xiao-s3-pps/hear_node.ino.bin            "dist/hear_node-xiao-s3-pps-$TAG.bin"
+          cp build/xiao-s3-pps/hear_node.ino.bootloader.bin "dist/hear_node-xiao-s3-pps-$TAG-bootloader.bin"
+          cp build/xiao-s3-pps/hear_node.ino.partitions.bin "dist/hear_node-xiao-s3-pps-$TAG-partitions.bin"
+          cp build/xiao-s3-pps/hear_node.ino.merged.bin     "dist/hear_node-xiao-s3-pps-$TAG-merged.bin"
+          cp build/xiao-s3-pps/hear_node.ino.elf            "dist/hear_node-xiao-s3-pps-$TAG.elf"
+          cp build/esp32s3-i2s-gps/hear_node.ino.bin            "dist/hear_node-esp32s3-i2s-gps-$TAG.bin"
+          cp build/esp32s3-i2s-gps/hear_node.ino.bootloader.bin "dist/hear_node-esp32s3-i2s-gps-$TAG-bootloader.bin"
+          cp build/esp32s3-i2s-gps/hear_node.ino.partitions.bin "dist/hear_node-esp32s3-i2s-gps-$TAG-partitions.bin"
+          cp build/esp32s3-i2s-gps/hear_node.ino.merged.bin     "dist/hear_node-esp32s3-i2s-gps-$TAG-merged.bin"
+          cp build/esp32s3-i2s-gps/hear_node.ino.elf            "dist/hear_node-esp32s3-i2s-gps-$TAG.elf"
           python3 - <<'PY'
           import json, os
           tag = os.environ["TAG"]
@@ -51,7 +61,11 @@ jobs:
               "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
               "esp32_core": "3.3.11",
               "arduino_cli": "1.5.1",
-              "build_flags": ["-DHEAR_ALLOW_NO_WIFI"],
+              "variants": [
+                  {"board_class": "xiao-s3-pps", "build_flags": ["-DHEAR_ALLOW_NO_WIFI"]},
+                  {"board_class": "esp32s3-i2s-gps",
+                   "build_flags": ["-DHEAR_ALLOW_NO_WIFI", "-DHEAR_BOARD_ESP32S3_I2S_GPS"]},
+              ],
               "credentials": "none compiled in; read from the node's NVS (enroll.py)",
           }, open("dist/build-info.json", "w"), indent=2)
           PY
@@ -59,7 +73,7 @@ jobs:
           cat > notes.md <<EOF
           Firmware for \`firmware/hear_node\` at \`$GITHUB_SHA\`. \`/status\` reports it as \`fw: $TAG\`.
 
-          These images carry **no Wi-Fi credentials and no node name**. Each node keeps its own in NVS, which OTA does not touch, so the same image goes to every node.
+          These images carry **no Wi-Fi credentials and no node name**. Each node keeps its own in NVS, which OTA does not touch, so the release publishes one image per board class and \`flash.py --release\` chooses the one that matches the node's live \`/status\`.
 
           An enrolled node, over the air:
 
@@ -67,16 +81,14 @@ jobs:
 
           A new board, over USB, once:
 
-              python3 firmware/hear_node/enroll.py <node> /dev/ttyACM0 --release $TAG
+              python3 firmware/hear_node/enroll.py <node> /dev/ttyACM0 --class <board-class> --release $TAG
 
           A board that was never enrolled comes up as its own access point and says so in \`/status\`.
 
           | file | what it is |
           |---|---|
-          | \`hear_node-$TAG.bin\` | app image, what \`/update\` and \`flash.py --release\` take |
-          | \`hear_node-$TAG-bootloader.bin\`, \`-partitions.bin\` | what \`enroll.py\` uploads beside the app |
-          | \`hear_node-$TAG-merged.bin\` | bootloader + partitions + app, to write at 0x0 with esptool |
-          | \`hear_node-$TAG.elf\` | symbols, for backtraces |
+          | \`hear_node-xiao-s3-pps-$TAG.*\` | Seeed XIAO ESP32-S3 Sense release set |
+          | \`hear_node-esp32s3-i2s-gps-$TAG.*\` | ESP32-S3 + I2S mic + PMTK GPS release set |
           | \`build-info.json\` | toolchain and flags |
           | \`SHA256SUMS\` | checksums of all of the above |
           EOF
