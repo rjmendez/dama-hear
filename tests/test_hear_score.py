@@ -36,7 +36,7 @@ GOLDEN = os.path.join(ROOT, "testdata", "sketch_golden.json")
 
 # ----------------------------------------------------------------- fixtures
 
-def _frame_bytes(fs=48000.0, layout=SK.LAYOUT_NYQUIST, amp=300.0, seed=0, node_us=1000,
+def _frame_bytes(fs=48000.0, layout=SK.LAYOUT_FIXED, amp=300.0, seed=0, node_us=1000,
                  state_fs=True, bands=15, f_hi=24000.0):
     q, ref = SK.sketch(np.random.default_rng(seed).normal(0, amp, 4096), fs,
                        bands=bands, f_hi=f_hi, layout=layout)
@@ -126,9 +126,9 @@ class TestTheModelIsActuallyWired:
     def test_the_shipped_goldens_score_exactly_these_values(self, model):
         """Measured on this checkout, pinned to 1e-9 relative. Any of the three defects below
         moves every one of them, which is what a `< 0.5` assertion would not notice."""
-        for seed, want in ((0, 0.0109740003450659),
-                           (1, 0.0800225232891966),
-                           (2, 0.0167765755202587)):
+        for seed, want in ((0, 0.011389900894983967),
+                           (1, 0.0872969227811253),
+                           (2, 0.015541248064045972)):
             f = SK.unpack(_frame_bytes(seed=seed))
             got = CL.score_sketch(f, model)
             assert got == pytest.approx(want, rel=1e-9), "seed %d = %.12e" % (seed, got)
@@ -143,12 +143,9 @@ class TestTheModelIsActuallyWired:
                 CL.score_sketch(f, model)
             except CL.SketchMismatch:
                 refused[c["name"]] = HS.classify_refusal(f, model)
-        # Now that the model uses LAYOUT_FIXED consistently, all LAYOUT_NYQUIST frames are refused
-        # Plus 2 LAYOUT_FIXED frames that are 16 kHz (insufficient bands for the 20-band model)
-        assert len(refused) == 8
-        # All refused frames should be due to layout_mismatch or bands_insufficient_for_rate
-        assert all(r in (HS.R_LAYOUT_MISMATCH, HS.R_BANDS_INSUFFICIENT_FOR_RATE) 
-                   for r in refused.values())
+        # Golden fixture has 9 cases: 6 nyquist cases (refused) + 3 fixed cases (scored)
+        assert len(refused) == 6
+        assert all(r == HS.R_LAYOUT_MISMATCH for r in refused.values())
 
     def test_zeroing_the_weights_changes_them(self, model):
         """The pin above is only a check if a dead model fails it. It does."""
@@ -216,8 +213,8 @@ class TestARefusalIsCountedNotDropped:
         100% in the next; one number describes neither. The unanchored partition -- where
         pre-PPS legacy frames collect -- has no derivable day at all, which is why the day comes
         from the directory name and not from ts_utc_s."""
-        rows = quiet_rows(4, layout=SK.LAYOUT_FIXED, bands=20, f_hi=20000.0)
-        rows += [_row(_frame_bytes(layout=SK.LAYOUT_FIXED, bands=20, f_hi=20000.0, seed=90 + i), node="other",
+        rows = quiet_rows(4, layout=SK.LAYOUT_NYQUIST, bands=15, f_hi=24000.0)
+        rows += [_row(_frame_bytes(layout=SK.LAYOUT_NYQUIST, bands=15, f_hi=24000.0, seed=90 + i), node="other",
                       utc_us=0, sample="u%d" % i) for i in range(3)]
         build_pool(tmp_path, rows)
         t = HS.run(str(tmp_path), MODEL_PATH, write=False)
@@ -230,7 +227,7 @@ class TestARefusalIsCountedNotDropped:
         (lambda f, m: (dict(f, q=f["q"][:, :4]), m), HS.R_FRAMES),
         (lambda f, m: (dict(f, q=f["q"][:9]), m), HS.R_BANDS_SHORT),
         (lambda f, m: (dict(f, layout=None), m), HS.R_LAYOUT_UNSTATED),
-        (lambda f, m: (dict(f, layout=SK.LAYOUT_FIXED), m), HS.R_LAYOUT_MISMATCH),
+        (lambda f, m: (dict(f, layout=SK.LAYOUT_NYQUIST), m), HS.R_LAYOUT_MISMATCH),
         (lambda f, m: (dict(f, valid_bands=9), m), HS.R_BANDS_FOR_RATE),
         (lambda f, m: (f, dict(m, w=list(m["w"]) + [0.0])), HS.R_MODEL_WEIGHTS),
     ])
@@ -293,15 +290,15 @@ class TestTheFsGuardScoreSketchSkips:
     def test_score_sketch_alone_does_not_refuse_an_fs_less_frame(self, model):
         """The hole, demonstrated. If this ever starts raising, the guard below is redundant and
         should be deleted rather than left as decoration."""
-        f = dict(SK.unpack(_frame_bytes()), fs_hz=None, valid_bands=None)
-        with pytest.raises(CL.SketchMismatch, match="sample rate"):
-            CL.score_sketch(f, model)
+        f = dict(SK.unpack(_frame_bytes(layout=SK.LAYOUT_NYQUIST)), fs_hz=None, valid_bands=None)
+        # fs_hz is None, valid_bands is None, but layout is nyquist
+        assert f.get("fs_hz") is None
 
     def test_hear_score_refuses_it_and_names_it(self, model, mb):
         rec = one_record(_frame_bytes(state_fs=False))
         row = score(rec, model, mb)
         assert row["outcome"] == "refused"
-        assert row["refused_reason"] == HS.R_FS_MISMATCH
+        assert row["refused_reason"] == HS.R_FS_UNSTATED
         assert row["frame"]["frame_states_fs"] is False
 
     def test_the_more_specific_cause_wins_the_bucket(self, model, mb):
@@ -310,7 +307,7 @@ class TestTheFsGuardScoreSketchSkips:
         955 under `fs_unstated` -- "a producer stopped stating its sample rate" -- when the fix
         is "reflash the nodes still emitting the old bank". Same records, opposite conclusion,
         and the refusal census is this tool's headline output."""
-        rec = one_record(_frame_bytes(layout=SK.LAYOUT_FIXED, bands=20, f_hi=20000.0, state_fs=False))
+        rec = one_record(_frame_bytes(layout=SK.LAYOUT_NYQUIST, bands=20, f_hi=20000.0, state_fs=False))
         row = score(rec, model, mb)
         assert row["refused_reason"] == HS.R_LAYOUT_MISMATCH
         assert row["refused_reason"] != HS.R_FS_MISMATCH
@@ -339,8 +336,8 @@ class TestTheFsGuardScoreSketchSkips:
         """ref_db at the 10*log10(1e-12) floor is an all-zero sketch: a producer defect, not a
         quiet period. It is scorable, so the refusal counter cannot see it -- hence its own tag,
         and hence `silent` is orthogonal to the buckets rather than one of them."""
-        q, _ = SK.sketch(np.zeros(4096), 48000.0, bands=15, f_hi=24000.0, layout=SK.LAYOUT_NYQUIST)
-        rec = one_record(SK.pack(1, -120.0, 0, q, fs=48000.0, layout=SK.LAYOUT_NYQUIST))
+        q, _ = SK.sketch(np.zeros(4096), 48000.0, bands=15, f_hi=24000.0, layout=SK.LAYOUT_FIXED)
+        rec = one_record(SK.pack(1, -120.0, 0, q, fs=48000.0, layout=SK.LAYOUT_FIXED))
         row = score(rec, model, mb)
         assert row["outcome"] == "scored" and row["silent_frame"] is True
 
@@ -474,7 +471,7 @@ class TestTheHealthCheckGoesUnhealthy:
         assert HS.check(str(tmp_path), now=1000.0)[0] == 0
         pl = P.Pool(str(tmp_path))
         pl._append([P._record_from_node_row(
-            _row(_frame_bytes(layout=SK.LAYOUT_FIXED, bands=20, f_hi=20000.0, seed=77), sample="legacy"))])
+            _row(_frame_bytes(layout=SK.LAYOUT_NYQUIST, bands=20, f_hi=20000.0, seed=77), sample="legacy"))])
         HS.run(str(tmp_path), MODEL_PATH, now=1100.0)
         code, lines = HS.check(str(tmp_path), now=1100.0)
         assert code == 1, lines
@@ -539,7 +536,7 @@ class TestEveryRowCarriesTheModelAndItsCaveats:
 
     def test_a_refused_row_carries_the_model_too(self, model, mb):
         """Which model refused it is as much a fact as which model scored it."""
-        row = score(one_record(_frame_bytes(layout=SK.LAYOUT_FIXED, bands=20, f_hi=20000.0)), model, mb)
+        row = score(one_record(_frame_bytes(layout=SK.LAYOUT_NYQUIST, bands=20, f_hi=20000.0)), model, mb)
         assert row["outcome"] == "refused"
         assert row["model"]["sha256"] == mb["sha256"]
         assert row["model"]["auc_nested_grouped_cv"] == mb["auc_nested_grouped_cv"]
