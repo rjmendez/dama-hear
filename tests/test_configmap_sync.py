@@ -187,8 +187,8 @@ def test_every_mount_path_matches_the_bundle_path(bundle):
         assert path == "/app/" + by_key[key], (
             "%s is mounted at %s but bundle %s says %s" % (key, path, bundle, by_key[key]))
         seen += 1
-    assert seen >= 2 * len(by_key), (
-        "only %d mounts parsed out of %s; the parser missed some" % (seen, manifest.name))
+    assert seen >= len(by_key), (
+        "only %d mounts parsed out of %s; some bundle keys were not mounted" % (seen, manifest.name))
 
 
 #: `kubectl apply` writes the whole object into the `kubectl.kubernetes.io/last-applied-

@@ -155,6 +155,10 @@ TDOA_DATA = [
     ("survey.json", "survey.json"),
 ]
 
+HEARTBEAT_CODE = [
+    ("tools_hear_heartbeat_receiver.py", "tools/hear_heartbeat_receiver.py"),
+]
+
 #: name -> (app label, code files, data files). The first entry is the default, so the command
 #: documented in deploy/k8s/README.md keeps working with no argument.
 BUNDLES = {
@@ -162,6 +166,7 @@ BUNDLES = {
     "hear-score-code": ("hear-score", SCORE_CODE, SCORE_DATA),
     "hear-tag-code": ("hear-tag", TAG_CODE, []),
     "hear-tdoa-code": ("hear-tdoa", TDOA_CODE, TDOA_DATA),
+    "hear-heartbeat-code": ("hear-heartbeat", HEARTBEAT_CODE, []),
 }
 DEFAULT_BUNDLE = "hear-drain-code"
 
