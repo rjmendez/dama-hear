@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 303474 B serialised; 303652 B of annotations against a 262144 B cap.
+# apply-mode server: 303502 B serialised; 303680 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'edc0192'
+    dama-hear/commit: '1801fb6'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '303474'
+    dama-hear/serialised-bytes: '303502'
 data:
   hear__init__.py: |
     
@@ -2168,7 +2168,8 @@ data:
             Idempotent like ingest_dets: consecutive runs overlap and re-reading a row adds 0. The
             body carries no node name, so `default_node` is required and every row is filed under it.
             """
-            raw = open(path, "rb").read()
+            with open(path, "rb") as fh:
+                raw = fh.read()
             sha = hashlib.sha256(raw).hexdigest()
             obj = json.loads(raw.decode("utf-8", "replace"))
             if not isinstance(obj, list):
