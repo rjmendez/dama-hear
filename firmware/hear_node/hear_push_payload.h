@@ -61,6 +61,16 @@ static inline int hear_push_ts_field(int time_valid, int64_t utc_us, char *out, 
   return (m > 0 && (size_t)m < n) ? m : 0;
 }
 
+static inline long long hear_push_ts_ms(int time_valid, int64_t utc_us, unsigned long uptime_s) {
+  if (time_valid) return (long long)(utc_us / 1000);
+  // No wall-clock yet (no GPS fix): AWS's ingest Lambda quarantines any message whose ts_ms/ts/
+  // timestamp isn't a positive number, so "ts":null (below) alone would silently drop every
+  // heartbeat/event sent before first fix. This monotonic-but-not-epoch fallback only satisfies
+  // that gate; consumers must not treat it as wall-clock time -- "time":{"valid":false} says so,
+  // and the receiver's own "received_at" is what's trustworthy in that case.
+  return (long long)uptime_s * 1000 + 1;
+}
+
 static inline int hear_push_heartbeat_json(const hear_push_heartbeat_t *hb, char *out, size_t n) {
   if (!hb || !out || !n || !hb->device_id || !hb->node_class || !hb->fw_version) return 0;
   char ts[40], rssi[16];
@@ -75,11 +85,12 @@ static inline int hear_push_heartbeat_json(const hear_push_heartbeat_t *hb, char
   int m = snprintf(
       out, n,
       "{\"telemetry_path\":\"hear/heartbeat\",\"telemetry_schema_version\":1,"
-      "\"device_id\":\"%s\",\"ts\":%s,\"class\":\"%s\",\"fw_version\":\"%s\","
+      "\"device_id\":\"%s\",\"ts\":%s,\"ts_ms\":%lld,\"class\":\"%s\",\"fw_version\":\"%s\","
       "\"uptime_s\":%lu,\"gps\":{\"fix\":%d},\"time\":{\"valid\":%s},"
       "\"wifi\":{\"rssi_dbm\":%s},\"counters\":{\"scene_rows_written\":%lu,"
       "\"dets_rows_written\":%lu,\"clips_written\":%lu,\"clips_evicted\":%lu}}",
-      hb->device_id, ts, hb->node_class, hb->fw_version, hb->uptime_s, hb->gps_fix,
+      hb->device_id, ts, hear_push_ts_ms(hb->time_valid, hb->utc_us, hb->uptime_s),
+      hb->node_class, hb->fw_version, hb->uptime_s, hb->gps_fix,
       hb->time_valid ? "true" : "false", rssi, hb->scene_rows_written, hb->dets_rows_written,
       hb->clips_written, hb->clips_evicted);
   return (m > 0 && (size_t)m < n) ? m : 0;
@@ -90,25 +101,27 @@ static inline int hear_push_event_json(const hear_push_event_t *ev, char *out, s
     return 0;
   char ts[40];
   if (!hear_push_ts_field(ev->time_valid, ev->utc_us, ts, sizeof ts)) return 0;
+  long long ts_ms = hear_push_ts_ms(ev->time_valid, ev->utc_us, ev->uptime_s);
   int m = 0;
   if (ev->clip_basename && ev->clip_basename[0]) {
     m = snprintf(
         out, n,
         "{\"telemetry_path\":\"hear/event\",\"telemetry_schema_version\":1,"
-        "\"device_id\":\"%s\",\"ts\":%s,\"class\":\"%s\",\"fw_version\":\"%s\","
+        "\"device_id\":\"%s\",\"ts\":%s,\"ts_ms\":%lld,\"class\":\"%s\",\"fw_version\":\"%s\","
         "\"uptime_s\":%lu,\"event_type\":\"%s\",\"event_seq\":%lu,"
         "\"event\":{\"clip_basename\":\"%s\",\"clips_written\":%lu,\"clips_evicted\":%lu}}",
-        ev->device_id, ts, ev->node_class, ev->fw_version, ev->uptime_s, ev->event_type,
+        ev->device_id, ts, ts_ms, ev->node_class, ev->fw_version, ev->uptime_s, ev->event_type,
         ev->event_seq, ev->clip_basename, ev->clips_written, ev->clips_evicted);
   } else {
     m = snprintf(
         out, n,
         "{\"telemetry_path\":\"hear/event\",\"telemetry_schema_version\":1,"
-        "\"device_id\":\"%s\",\"ts\":%s,\"class\":\"%s\",\"fw_version\":\"%s\","
+        "\"device_id\":\"%s\",\"ts\":%s,\"ts_ms\":%lld,\"class\":\"%s\",\"fw_version\":\"%s\","
         "\"uptime_s\":%lu,\"event_type\":\"%s\",\"event_seq\":%lu,"
         "\"event\":{\"dets_rows_written\":%lu,\"batch_rows\":%lu}}",
-        ev->device_id, ts, ev->node_class, ev->fw_version, ev->uptime_s, ev->event_type,
+        ev->device_id, ts, ts_ms, ev->node_class, ev->fw_version, ev->uptime_s, ev->event_type,
         ev->event_seq, ev->dets_rows_written, ev->batch_rows);
   }
   return (m > 0 && (size_t)m < n) ? m : 0;
 }
+

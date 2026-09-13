@@ -115,6 +115,7 @@ def test_heartbeat_payload_matches_the_design_shape(hb):
         "telemetry_schema_version": 1,
         "device_id": "nyquist",
         "ts": "2026-09-12T23:43:04Z",
+        "ts_ms": 1789256584000,
         "class": "xiao-s3-pps",
         "fw_version": "7f84d29",
         "uptime_s": 12345,
@@ -135,6 +136,12 @@ def test_heartbeat_omits_untrusted_time_as_null(hb):
     assert got["ts"] is None
     assert got["time"] == {"valid": False}
     assert got["wifi"] == {"rssi_dbm": None}
+    # AWS's ingest Lambda quarantines any message without a positive ts_ms/ts/timestamp, so a
+    # bare "ts": null would silently drop every heartbeat sent before first GPS fix. ts_ms must
+    # still be a positive placeholder in that case -- callers must key off "time":{"valid":false}
+    # rather than trust it as wall-clock time.
+    assert got["ts_ms"] > 0
+    assert got["ts_ms"] == 22 * 1000 + 1
 
 
 def test_clip_event_payload_stays_small_and_names_only_the_clip(hb):
