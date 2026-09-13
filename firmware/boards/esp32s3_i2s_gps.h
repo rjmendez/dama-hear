@@ -28,7 +28,8 @@
 #define SD_SCK_PIN     -1
 #define SD_MISO_PIN    -1
 #define SD_MOSI_PIN    -1
-#define FS_NOMINAL     16000
+#define FS_NOMINAL     16000     // downstream scene/gate/timebase rate; hear_node keeps the
+                                 // I2S acquisition/sketch path at 48 kHz via FS_ACQ=FS_NOMINAL*DECIM.
 #define MIC_BAND_LO_HZ 50
 #define MIC_BAND_HI_HZ 15000
 
