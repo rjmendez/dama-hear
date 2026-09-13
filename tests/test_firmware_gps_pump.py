@@ -131,7 +131,16 @@ def test_http_is_not_served_because_a_handler_runs_the_sweep():
 def test_setup_bring_up_waits_as_before_because_audio_is_not_up():
     s = _fn("setup")
     assert s.index("gps_bringup();") < s.index("i2s.begin(") < s.index("i2s_up = true;")
-    assert len(re.findall(r"\bi2s_up\s*=\s*true", CODE)) == 1
+    # Each mic front-end (MIC_PDM, MIC_I2S, ...) gets its own #if/#elif branch in setup(), and
+    # each branch sets i2s_up = true exactly once after its own i2s.begin(). Only one branch is
+    # ever compiled in for a given board, so more than one assignment per #if/#elif arm would be
+    # a real duplicate-bring-up bug; more than one arm each setting it once is expected and grows
+    # with every mic front-end this firmware supports.
+    hits = [m.start() for m in re.finditer(r"\bi2s_up\s*=\s*true", s)]
+    begins = [m.start() for m in re.finditer(r"\bi2s\.begin\(", s)]
+    assert len(hits) == len(begins) > 0, (
+        "expected exactly one i2s_up = true per i2s.begin() call inside setup() "
+        "(%d begin() calls, %d assignments)" % (len(begins), len(hits)))
     assert re.search(r"\bif \(i2s_up\) stream_pump\(due\);", _fn("gps_pump"))
     assert re.search(r"\bif \(!i2s_up\) \{ delay\(ms\); return; \}", _fn("gps_wait_ms"))
 
