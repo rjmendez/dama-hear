@@ -199,8 +199,8 @@ spec:
                   # one of them a hand-built sketch reporting `fw: unknown` -- arrivals that are
                   # not comparable, with nothing in the fleet saying so.
                   #
-                  # --require-one-build gates on the SPLIT ALONE. A node with no fix yet is not a
-                  # failure and must not turn this job red; a split never self-heals.
+                  # --require-one-build fails CLOSED on build identity: a split fails, and a node
+                  # that does not answer means "could not verify" rather than a silent green.
                   echo "--- builds ---"
                   python /app/tools/fleet.py --require-one-build \
                     nyquist=172.16.100.105 \
