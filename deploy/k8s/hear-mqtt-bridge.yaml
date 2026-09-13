@@ -22,6 +22,12 @@ spec:
       labels:
         app: hear-mqtt-bridge
     spec:
+      # The local broker (fed directly by dama-sqs-consumer.py) is bound on this node's host
+      # network, not exposed through the `mqtt-broker` k8s Service (its selector currently
+      # matches zero pods -- that Service is stale). mqtt-bridge-botnet reaches the same broker
+      # the same way, at 127.0.0.1:31883, for the same reason.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: bridge
           image: python:3.13-slim
@@ -40,8 +46,8 @@ spec:
               fi
               exec python /app/tools/hear_mqtt_bridge.py
           env:
-            - { name: MQTT_HOST, value: "mqtt-broker.agents.svc.cluster.local" }
-            - { name: MQTT_PORT, value: "1883" }
+            - { name: MQTT_HOST, value: "127.0.0.1" }
+            - { name: MQTT_PORT, value: "31883" }
             - { name: MQTT_TOPIC, value: "dama/+/telemetry" }
             - { name: MQTT_CLIENT_ID, value: "hear-mqtt-bridge" }
             - { name: REDIS_HOST, value: "audit-redis.infra.svc.cluster.local" }
