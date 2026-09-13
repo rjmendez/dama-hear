@@ -47,9 +47,13 @@ def test_it_declares_the_expected_environment_and_required_token_secret():
     env = {item["name"]: item for item in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
     assert env["HEAR_HEARTBEAT_TTL_S"]["value"] == "30"
     assert env["HEAR_HEARTBEAT_SOCKET_TIMEOUT_S"]["value"] == "0.5"
-    assert env["REDIS_HOST"]["value"] == "100.73.200.19"
-    assert env["REDIS_PORT"]["value"] == "30379"
-    assert env["REDIS_PASS"]["valueFrom"]["secretKeyRef"]["key"] == "password"
+    assert env["REDIS_HOST"]["value"] == "audit-redis.infra.svc.cluster.local"
+    assert env["REDIS_PORT"]["value"] == "6379"
+    assert env["REDIS_PASS"]["valueFrom"]["secretKeyRef"] == {
+        "name": "dama-redis-secret",
+        "key": "REDIS_PASS",
+        "optional": True,
+    }
     assert env["HEAR_HEARTBEAT_TOKEN"]["valueFrom"]["secretKeyRef"] == {
         "name": "hear-heartbeat-token",
         "key": "token",

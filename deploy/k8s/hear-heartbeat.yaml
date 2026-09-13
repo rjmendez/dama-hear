@@ -41,13 +41,13 @@ spec:
           env:
             - { name: HEAR_HEARTBEAT_TTL_S, value: "30" }
             - { name: HEAR_HEARTBEAT_SOCKET_TIMEOUT_S, value: "0.5" }
-            - { name: REDIS_HOST, value: "100.73.200.19" }
-            - { name: REDIS_PORT, value: "30379" }
+            - { name: REDIS_HOST, value: "audit-redis.infra.svc.cluster.local" }
+            - { name: REDIS_PORT, value: "6379" }
             - name: REDIS_PASS
               valueFrom:
                 secretKeyRef:
-                  name: hear-heartbeat-redis
-                  key: password
+                  name: dama-redis-secret
+                  key: REDIS_PASS
                   optional: true
             - name: HEAR_HEARTBEAT_TOKEN
               valueFrom:
