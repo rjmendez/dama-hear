@@ -68,8 +68,9 @@ failure on file, all 35 dama ant models trained on circular self-labels.
 
 WHAT IT WRITES. `<pool>/clips/tags.jsonl` (one row per clip per model version, append-only),
 `<pool>/clips/tag_model_card.json` (the prose provenance, written once per model, referenced by
-sha256 from every row) and `<pool>/state/tag_heartbeat.json` (instrumentation for --check). It
-NEVER writes `clips/index.jsonl` -- that store is hear-drain's.
+sha256 from every row) and `<pool>/state/tag_heartbeat.json` (instrumentation for --check, also
+stamped with a refusal when the model will not verify or load so an older green run cannot mask
+it). It NEVER writes `clips/index.jsonl` -- that store is hear-drain's.
 
 WEIGHTS ARE NEVER FETCHED BY THIS FILE. It verifies two pinned sha256 digests and refuses to run
 otherwise, so a run is reproducible offline once the cache exists and a substituted model is a
@@ -267,6 +268,7 @@ DEFAULT_MAX_STALE_S = 14400.0
 
 DEFAULT_LIMIT = 400
 DEFAULT_DEADLINE_S = 600.0
+DEFAULT_POOL = "~/hear-pool"
 
 #: ⚠️REPORT-ONLY UNTIL THE PHASE-3 GATE IN docs/acoustic-stack.md IS MET. -1 means "print the
 #: measured silence fraction and never fail on it". A threshold set before anyone has listened to
@@ -1440,6 +1442,61 @@ def _distribution(vals: List[float]) -> Dict[str, Any]:
             "max": s[-1]}
 
 
+def _last_heartbeat_run(root: str, lane: str = DEFAULT_LANE) -> Optional[Dict[str, Any]]:
+    p = heartbeat_path(root, lane)
+    if not os.path.exists(p):
+        return None
+    try:
+        runs = (json.load(open(p)).get("runs") or [])
+    except Exception:
+        return None
+    return runs[-1] if runs else None
+
+
+def write_weights_refusal_heartbeat(root: str, detail: str, *, model: Dict[str, Any],
+                                    now: Optional[float] = None,
+                                    lane: str = DEFAULT_LANE) -> Dict[str, Any]:
+    """Record a run-level refusal before exit so `--check` does not read stale green."""
+    last = _last_heartbeat_run(root, lane) or {}
+    report: Dict[str, Any] = {
+        "index_lines": last.get("index_lines"),
+        "index_keys": last.get("index_keys"),
+        "census_keys": last.get("census_keys"),
+        "superseded": last.get("superseded", 0),
+        "unparseable": last.get("unparseable", 0),
+        "tagged": 0,
+        "refused": 0,
+        "already_tagged": 0,
+        "deferred": 0,
+        "cap_hit": False,
+        "stop_reason": "weights_refused",
+        "conservation_ok": True,
+        "weights_ok": False,
+        "weights_problem": detail,
+        "silence_top": 0,
+        "mean_top_score": None,
+        "n_top_scores": 0,
+        "silence_frac": None,
+        "scored_any": 0,
+        "versions_held": last.get("versions_held") or {},
+        "by_reason": {},
+        "by_node": {},
+        "by_node_day_reason": {},
+        "model": model,
+        "heard": {},
+        "lane": lane,
+        "observation_not_health": {
+            "level_dbfs": {"n": 0},
+            "max_unstored_score": {"n": 0},
+            "silence_top_frac": None,
+            "mean_top_score": None,
+            "note": ("the run refused before any clip was read because the configured model did "
+                     "not verify or load"),
+        },
+    }
+    return write_heartbeat(root, report, now=now, lane=lane)
+
+
 def write_heartbeat(root: str, report: Dict[str, Any], now: Optional[float] = None,
                     lane: str = DEFAULT_LANE) -> Dict[str, Any]:
     """Merge this run into the heartbeat's ring, and record which refusal buckets are NEW.
@@ -1487,6 +1544,7 @@ def write_heartbeat(root: str, report: Dict[str, Any], now: Optional[float] = No
         "stop_reason": report.get("stop_reason"),
         "conservation_ok": bool(report.get("conservation_ok")),
         "weights_ok": bool(report.get("weights_ok")),
+        "weights_problem": report.get("weights_problem"),
         "silence_top": report.get("silence_top"),
         "mean_top_score": report.get("mean_top_score"),
         "n_top_scores": report.get("n_top_scores"),
@@ -1554,7 +1612,8 @@ def check_tags(root: str, *, max_silence_frac: float = SILENCE_FRAC_REPORT_ONLY,
         lines.append("tagger   ok        last run %.0f s ago" % age)
 
     if not last.get("weights_ok", True):
-        lines.append("weights  REFUSED   the last run could not verify the pinned model sha256")
+        lines.append("weights  REFUSED   %s" % (last.get("weights_problem")
+                     or "the last run did not verify or would not load the configured model"))
         bad += 1
 
     window = [r for r in runs if now - float(r.get("at") or 0.0) <= window_s] or [last]
@@ -1721,7 +1780,7 @@ def format_report(t: Dict[str, Any]) -> str:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--pool", default="~/hear-pool",
+    ap.add_argument("--pool", default=DEFAULT_POOL,
                     help="pool root; clips/index.jsonl is read, clips/tags.jsonl is appended")
     ap.add_argument("--model-dir", default=None,
                     help="directory holding %s and %s. ⚠️NOTHING HERE FETCHES THEM: both are "
@@ -1735,7 +1794,8 @@ def main(argv=None) -> int:
                          "summarised by max_unstored_score")
     ap.add_argument("--verify-weights", action="store_true",
                     help="hash the two artifacts against their pinned digests and exit; 0 when "
-                         "both match, 2 otherwise. Tags nothing")
+                         "both match, 2 otherwise. With an explicit --pool, a failure also stamps "
+                         "a refusal heartbeat. Tags nothing")
     ap.add_argument("--census", action="store_true",
                     help="tag everything and report, writing nothing")
     ap.add_argument("--check", action="store_true",
@@ -1787,6 +1847,10 @@ def main(argv=None) -> int:
         if v["ok"]:
             print("weights OK  %s  tree sha256 %s" % (models[0], v["model_sha256"][:16]))
             return 0
+        if a.pool != DEFAULT_POOL:
+            for lane in lanes:
+                write_weights_refusal_heartbeat(root, "; ".join(v["problems"]),
+                                                model=model["block"](v), lane=lane)
         for p in v["problems"]:
             print("weights REFUSED: %s" % p, file=sys.stderr)
         return 2
@@ -1801,6 +1865,7 @@ def main(argv=None) -> int:
         print("\n".join(lines))
         return code
 
+    verified = None
     try:
         verified = model["verify"](a.model_dir)
         if not verified["ok"]:
@@ -1812,6 +1877,11 @@ def main(argv=None) -> int:
     except WeightsRefused as exc:
         # ⚠️LOUD, AND EXIT 2 RATHER THAN 1, so a monitor can tell "the model is not what it says"
         # apart from "tagging is behind". A tagger that cannot name its weights must not run.
+        block = model["block"](verified or {"ok": False, "model_sha256": None,
+                                            "class_map_sha256": None, "model_bytes": None,
+                                            "class_map_bytes": None, "files": {}})
+        for lane in lanes:
+            write_weights_refusal_heartbeat(root, str(exc), model=block, lane=lane)
         print("REFUSED: the model did not verify or would not load, so nothing was tagged.\n  %s"
               % exc, file=sys.stderr)
         return 2
