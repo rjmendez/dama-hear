@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 289388 B serialised; 289572 B of annotations against a 262144 B cap.
+# apply-mode server: 289273 B serialised; 289457 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'f23ae44-dirty'
+    dama-hear/commit: '4de6c19-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '289388'
+    dama-hear/serialised-bytes: '289273'
 data:
   hear__init__.py: |
     
@@ -2620,8 +2620,6 @@ data:
             skips: Dict[str, int] = {}
             for e in led:
                 for k, v in (e.get("skip_reasons") or {}).items():
-                    skips[k] = skips.get(k, 0) + v
-                for k, v in (e.get("decode_errors") or {}).items():
                     skips[k] = skips.get(k, 0) + v
             return {"records": n, "by_source": by_source, "by_node": by_node, "by_fs_hz": by_fs,
                     "by_day": by_day, "anchored": anchored, "unanchored": n - anchored,
