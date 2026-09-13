@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 610941 B serialised; 611119 B of annotations against a 262144 B cap.
+# apply-mode server: 610997 B serialised; 611175 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '1b27cc5'
+    dama-hear/commit: '93194c5'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '610941'
+    dama-hear/serialised-bytes: '610997'
 data:
   hear__init__.py: |
     
@@ -5222,8 +5222,8 @@ data:
         def flush(self) -> Dict:
             """Associate, solve and publish everything buffered, then clear the buffer.
     
-            A solver ValueError becomes `solve_error` on that one event and the flush continues: one
-            refused event must not cost the others their answer.
+            A solver ValueError becomes `solve_error` on that one event, is not published, and the
+            flush continues: one refused event must not cost the others their answer.
             """
             grouped = AS.associate(self._detections, self.survey, temp_c=self.temp_c,
                                    margin_s=self.margin_s, min_nodes=self.min_nodes,
@@ -5259,8 +5259,9 @@ data:
                     "worst_pair_excess_s": ev["worst_pair_excess_s"],
                     "solution": sol, "solve_error": err, "published": None,
                 }
-                r["published"] = to_dama_event(r, self.array_id)
-                self._emit(r["published"])
+                if err is None:
+                    r["published"] = to_dama_event(r, self.array_id)
+                    self._emit(r["published"])
                 events.append(r)
             out = {
                 "events": events,
