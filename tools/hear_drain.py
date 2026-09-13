@@ -138,34 +138,44 @@ SCENE_FILES = ("scene.csv", "scene-prev.csv")
 # firmware too old to have the endpoint, and as the answer when /ls fails -- a blind run must still
 # fetch something rather than nothing.
 SCENE_GLOB = "scene"
+SCENE_DATED_RE = re.compile(r"^scene-(\d{8})(-prev)?\.csv$")
 
 
-def scene_names(sizes: Optional[Dict[str, int]]) -> Tuple[Tuple[str, ...], str]:
+def _scene_key(name: str) -> Tuple[int, int, str]:
+    """Oldest -> newest, with a rolled `-prev` partition before its same-day live file."""
+    m = SCENE_DATED_RE.match(name)
+    if not m:
+        return (-1, 0 if name.endswith("-prev.csv") else 1, name)
+    return (int(m.group(1)), 0 if m.group(2) else 1, name)
+
+
+def scene_names(sizes: Optional[Dict[str, int]]) -> Tuple[Tuple[str, ...], Optional[str]]:
     """(names to fetch, which one is live). Live is tailed; the rest are rolled and fetched whole.
 
-    Lexicographic order is chronological for scene-YYYYMMDD.csv, so the greatest dated name is
-    today's. ⚠️scene-00000000.csv is the PRE-LOCK file -- rows the node wrote before it knew the
-    date -- and it is a real file with real rows, not a placeholder, so it is fetched like any
-    other rolled file. hear/pool.py keeps its rows and marks them unanchored.
+    ⚠️DATED PARTITIONS WIN AS A FAMILY. Since fw 7f84d29 the live file is scene-YYYYMMDD.csv and
+    the frozen legacy scene.csv is a compatibility leftover, so when one dated file exists the
+    drain fetches ONLY the dated family and ignores legacy names entirely. Legacy scene.csv /
+    scene-prev.csv stay as the blind fallback when /ls is unavailable and as the old-firmware path
+    when no dated file exists at all.
+
+    ⚠️scene-00000000.csv is the PRE-LOCK file -- rows the node wrote before it knew the date -- and
+    it is a real file with real rows, not a placeholder, so it is fetched like any other rolled
+    file. hear/pool.py keeps its rows and marks them unanchored.
 
     Rolled daily scene partitions (such as scene-YYYYMMDD-prev.csv and scene-prev.csv) created
     when headers change or dates rollover are also discovered and fetched whole.
     """
-    if not sizes:
+    if sizes is None:
         return SCENE_FILES, "scene.csv"
-    all_scene = sorted(n for n in sizes
-                       if n.startswith(SCENE_GLOB) and n.endswith(".csv"))
-    if not all_scene:
-        return SCENE_FILES, "scene.csv"
-    candidates = [n for n in all_scene if not n.endswith("-prev.csv")]
-    dated = [n for n in candidates if n != "scene.csv"]
+    dated = sorted((n for n in sizes if SCENE_DATED_RE.match(n)), key=_scene_key)
     if dated:
-        live = dated[-1]
-    elif "scene.csv" in candidates:
-        live = "scene.csv"
-    else:
-        live = "scene.csv"
-    return tuple(all_scene), live
+        current = [n for n in dated if not n.endswith("-prev.csv")]
+        live = current[-1] if current else dated[-1]
+        return tuple(dated), live
+    legacy = [n for n in SCENE_FILES if n in sizes]
+    if legacy:
+        return SCENE_FILES, "scene.csv"
+    return (), None
 CONTEXT_FILES = ("health.csv",)
 
 # ⚠️SCENE IS FETCHED BY TAIL, NOT WHOLE. It grows without bound (16,771,742 B on nyquist and
@@ -1046,6 +1056,7 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
                            "files": [], "added": 0, "scene_added": 0, "errors": [],
                            "unfetched_bytes": None, "unfetched_unknown": True,
                            "unfetched_reason": "the run ended before any scene tail was measured",
+                           "scene_missing": False,
                            # ⚠️None, NOT 0. A run that never reached the node measured NO clips,
                            # and `clips_gone: 0` would read as "nothing was destroyed" -- the
                            # unmeasured-looks-clean failure this whole module is built against.
@@ -1115,6 +1126,11 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
     scene_fetch, scene_live = scene_names(sizes)
     out["scene_files"] = list(scene_fetch)
     out["scene_live"] = scene_live
+    if not scene_fetch and sizes is not None:
+        out["scene_missing"] = True
+        out["unfetched_unknown"] = False
+        out["unfetched_bytes"] = 0
+        out["unfetched_reason"] = "the node served no scene file of any name"
     for name in scene_fetch:
         # A rolled file does not grow, so it is fetched whole. Only the live file is tailed.
         tail = SCENE_TAIL_BYTES if name == scene_live else None
@@ -1424,6 +1440,7 @@ def write_heartbeat(root: str, results: List[Dict[str, Any]], phone: Optional[Di
         measured = None if r.get("unfetched_unknown") else r.get("unfetched_bytes")
         s["last_unfetched_bytes"] = measured
         s["last_unfetched_reason"] = r.get("unfetched_reason")
+        s["last_scene_missing"] = bool(r.get("scene_missing"))
         # A listing the node itself says it cut short is a PARTIAL CENSUS: scene_names() and
         # ls_candidates() both work off it, so it must not read as a short card.
         s["ls_truncated_at"] = r.get("ls_truncated_at")
@@ -1433,7 +1450,8 @@ def write_heartbeat(root: str, results: List[Dict[str, Any]], phone: Optional[Di
         ring = s.get("unfetched_recent")
         if not isinstance(ring, list):
             ring = []
-        ring.append({"at": now, "bytes": measured, "reason": r.get("unfetched_reason")})
+        ring.append({"at": now, "bytes": measured, "reason": r.get("unfetched_reason"),
+                     "missing": bool(r.get("scene_missing"))})
         s["unfetched_recent"] = ring[-UNFETCHED_RING:]
         # ⚠️THE CLIP COUNTERS GO IN THE SAME RING, FOR THE SAME REASON. A cap that binds during a
         # burst is the failure mode the deadline creates, and `check` runs `17 * * * *` against a
@@ -1496,6 +1514,9 @@ def _unfetched_note(s: Dict[str, Any], now: float, max_unfetched_bytes: int,
         # Fall back to the single pre-ring field so an old heartbeat still says something true.
         if "last_unfetched_bytes" not in s:
             return "  unfetched n/a", False
+        if s.get("last_scene_missing"):
+            why = s.get("last_unfetched_reason") or "the node served no scene file of any name"
+            return "  NO SCENE FILE (%s)" % why, True
         v = s["last_unfetched_bytes"]
         if v is None:
             why = s.get("last_unfetched_reason") or "not measured"
@@ -1509,8 +1530,14 @@ def _unfetched_note(s: Dict[str, Any], now: float, max_unfetched_bytes: int,
         return "  unfetched none in the last %.0f s" % window_s, False
     total = sum(int(e["bytes"]) for e in recent if e.get("bytes") is not None)
     unknown = [e for e in recent if e.get("bytes") is None]
+    missing = [e for e in recent if e.get("missing")]
     lossy = [e for e in recent if e.get("bytes")]
     note, bad = "", False
+    if missing:
+        why = missing[-1].get("reason") or "the node served no scene file of any name"
+        note += ("  NO SCENE FILE for %d of %d run(s) (%s)"
+                 % (len(missing), len(recent), why))
+        bad = True
     if total > max_unfetched_bytes:
         note += ("  UNFETCHED %d B of scene never asked for, by %d of the %d run(s) in the last "
                  "%.0f s" % (total, len(lossy), len(recent), window_s))
