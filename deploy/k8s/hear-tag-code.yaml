@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-tag-code.yaml
-# apply-mode client: 166757 B serialised; 166935 B of annotations against a 262144 B cap.
+# apply-mode client: 169576 B serialised; 169754 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tag
   annotations:
-    dama-hear/commit: 'faa7332'
+    dama-hear/commit: 'a7701bd'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '166757'
+    dama-hear/serialised-bytes: '169576'
 data:
   hear__init__.py: |
     
@@ -171,14 +171,14 @@ data:
     
     
     def sketch(x: np.ndarray, fs: float, bands: int = MEL_BANDS, frames: int = FRAMES,
-               hop_s: float = HOP_S, nfft: int = NFFT,
-               layout: str = LAYOUT_NYQUIST) -> Tuple[np.ndarray, float]:
+               hop_s: float = HOP_S, nfft: int = NFFT, f_lo: float = F_LO,
+               f_hi: float = F_HI, layout: str = LAYOUT_NYQUIST) -> Tuple[np.ndarray, float]:
         """(int8 [bands x frames], ref_db). Frames start at the sample the caller passes as index 0.
     
         `layout` decides what band k MEANS -- see [mel_filterbank]. At any rate above
         LAYOUT_EQUIVALENT_ABOVE_HZ the two are the same bytes."""
         x = np.asarray(x, float)
-        fb = mel_filterbank(fs, nfft, bands, layout=layout)
+        fb = mel_filterbank(fs, nfft, bands, f_lo=f_lo, f_hi=f_hi, layout=layout)
         hop = max(1, int(hop_s * fs))
         win = np.hanning(nfft)
         out = np.zeros((bands, frames))
@@ -798,8 +798,17 @@ data:
     import os
     from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
     
-    TAG_SCHEMA_VERSION = 1
+    TAG_SCHEMA_VERSION = 2
     TAGS_NAME = "tags.jsonl"
+    
+    #: Schema 2.0 enhancements:
+    #: - Native 48kHz acoustic metadata support via fs_source_hz (phone/HUGBOT captures)
+    #: - NPU embedding vectors (embedding_dim, embedding) carried on every tag row for model outputs
+    #: - Multi-rate support: fs_source_hz (capture rate), fs_model_hz (model inference rate),
+    #:   csv_fs_hz (decimation rate estimate from node telemetry)
+    #: - rate_recovered flag to disambiguate when header rate differs from actual samples
+    #:
+    #: Future: 6-DoF spatial pose vectors (pitch/roll/yaw) for phone/HUGBOT devices if available.
     
     #: The clip's own geometry, from hear.clips. Repeated here as a local constant rather than
     #: imported so that a bundle carrying tags.py without clips.py still parses; the two are checked
@@ -816,6 +825,23 @@ data:
     BASIS_UTC = "utc"
     BASIS_SAMPLE = "sample"
     BASIS_NONE = "none"
+    
+    # Stable deployment names remain separate from versioned lane/artifact names.
+    MODEL_BACKENDS = ("yamnet", "birdnet", "perch")
+    MODEL_BACKEND_LANES = {
+        "yamnet": "mn10",
+        "birdnet": "birdnet_v24",
+        "perch": "perch_v2",
+    }
+    
+    
+    def backend_lane(name: str) -> str:
+        """Return the canonical tag lane for a public model backend name."""
+        try:
+            return MODEL_BACKEND_LANES[name]
+        except KeyError:
+            raise ValueError("unknown model backend %r; known: %s" %
+                             (name, ", ".join(MODEL_BACKENDS)))
     
     
     def tags_path(root: str, store: Optional[str] = None) -> str:
@@ -1457,7 +1483,7 @@ data:
     from hear import tags as TAGS                                             # noqa: E402
     from hear import resample as RESAMPLE                                     # noqa: E402
     
-    TAG_SCHEMA = "hear.clip_tag.v1"
+    TAG_SCHEMA = "hear.clip_tag.v2"
     
     MODEL_NAME = "efficientat-mn10_as"
     #: Bumping this is what makes a re-tag a NEW row beside the old one rather than an overwrite.
@@ -1565,6 +1591,7 @@ data:
     #: 3.0 s, the model's input. Windows at 0, 1 and 2 s cover the whole 5.0 s clip.
     BIRDNET_WINDOW = 144000
     BIRDNET_HOP = 48000
+    BIRDNET_BANDPASS_HZ = (150.0, 12000.0)
     #: BirdNET-Analyzer's default cut on the range model's output.
     BIRDNET_LOCATION_THRESHOLD = 0.03
     #: A species enters the heard summary at this score. OBSERVATION only.
@@ -1823,6 +1850,17 @@ data:
         if not len(x) or not np.any(x):
             raise ValueError("digital silence: every sample is zero")
         return x
+    
+    
+    def birdnet_bandpass(pcm: "Any", fs_hz: float) -> "Any":
+        """Apply BirdNET V2.4's 150--12000 Hz band without changing the 48 kHz rate."""
+        import numpy as np
+        x = np.asarray(pcm, dtype=np.float32)
+        if not len(x):
+            return x
+        freqs = np.fft.rfftfreq(len(x), 1.0 / float(fs_hz))
+        mask = (freqs >= BIRDNET_BANDPASS_HZ[0]) & (freqs <= BIRDNET_BANDPASS_HZ[1])
+        return np.fft.irfft(np.fft.rfft(x) * mask, n=len(x)).astype(np.float32)
     
     
     def to_model_rate(pcm: "Any", header_fs: int, csv_fs: Optional[float] = None,
@@ -2181,7 +2219,7 @@ data:
     
         def tag(self, pcm: "Any", floor: float = SCORE_FLOOR, week: int = -1) -> Dict[str, Any]:
             np = self._np
-            x = np.asarray(pcm, dtype=np.float32)
+            x = birdnet_bandpass(pcm, BIRDNET_FS_HZ)
             starts = list(range(0, max(1, len(x) - BIRDNET_WINDOW + 1), BIRDNET_HOP)) or [0]
             probs = []
             for s in starts:
@@ -2389,6 +2427,14 @@ data:
                         "prepare": prepare_birdnet, "embed_only": False, "fs_hz": BIRDNET_FS_HZ,
                         "group": birdnet_group, "species": True},
     }
+    
+    
+    MODEL_BACKENDS = dict(TAGS.MODEL_BACKEND_LANES)
+    
+    
+    def backend_lane(name: str) -> str:
+        """Resolve a stable CLI backend name to its compatibility lane."""
+        return TAGS.backend_lane(name)
     
     
     # ----------------------------------------------------------------- I/O
@@ -3063,7 +3109,7 @@ data:
         ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
         ap.add_argument("--pool", default="~/hear-pool",
                         help="pool root; clips/index.jsonl is read, clips/tags.jsonl is appended")
-        ap.add_argument("--model-dir", default="~/hear-pool/models/yamnet",
+        ap.add_argument("--model-dir", default=None,
                         help="directory holding %s and %s. ⚠️NOTHING HERE FETCHES THEM: both are "
                              "verified against a pinned sha256 and the run is refused otherwise"
                              % (MODEL_FILE, CLASSMAP_FILE))
@@ -3094,8 +3140,21 @@ data:
         ap.add_argument("--lane", action="append", choices=sorted(LANES),
                         help="lane to run; repeat for several, which share one model load. "
                              "--check reads exactly one. Default %s" % DEFAULT_LANE)
+        ap.add_argument("--model", choices=sorted(TAGS.MODEL_BACKENDS),
+                        help="model backend: yamnet, birdnet, or perch")
         a = ap.parse_args(argv)
-        lanes = a.lane or [DEFAULT_LANE]
+        selected_backend_lane = backend_lane(a.model) if a.model else None
+        if a.lane and selected_backend_lane:
+            selected_model = LANES[selected_backend_lane]["model"]
+            if any(LANES[lane]["model"] != selected_model for lane in a.lane):
+                print("--model %s conflicts with --lane %s" % (a.model, a.lane), file=sys.stderr)
+                return 2
+        lanes = a.lane or ([selected_backend_lane] if selected_backend_lane else [DEFAULT_LANE])
+        if a.model_dir is None:
+            default_dirs = {"mn10": "~/hear-pool/models/mn10_as",
+                            "birdnet_v24": "~/hear-pool/models/birdnet_v24",
+                            "perch_v2": "~/hear-pool/models/perch_v2"}
+            a.model_dir = default_dirs[LANES[lanes[0]]["model"]]
         models = sorted({LANES[lane]["model"] for lane in lanes})
         if len(models) != 1 and not a.check:
             print("one invocation runs one model; lanes %s use %s" % (lanes, models), file=sys.stderr)
