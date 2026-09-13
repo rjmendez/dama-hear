@@ -70,10 +70,21 @@ class CardlessNode(FakeNode):
         return json.dumps(self.ring[-HD.LIVE_RING_HTTP_MAX:]).encode()
 
 
+class TruncatingNode(CardlessNode):
+    """gold on 2026-09-13: a 200 whose body stops mid-row once the node's heap runs out."""
+
+    def __init__(self, cap=10 ** 9, **kw):
+        super().__init__(**kw)
+        self.cap = cap
+
+    def detections(self, ip, timeout=None):
+        return super().detections(ip, timeout)[:self.cap]
+
+
 @pytest.fixture
 def cardless(monkeypatch):
-    def build(**kw):
-        n = CardlessNode(**kw)
+    def build(cls=CardlessNode, **kw):
+        n = cls(**kw)
         monkeypatch.setattr(HD, "fetch_status", n.status)
         monkeypatch.setattr(HD, "fetch_sd", n.sd)
         monkeypatch.setattr(HD, "_ls_sizes", n.ls)
@@ -146,6 +157,30 @@ class TestCardlessDrain:
         sv, rep = SV.augment_from_node_gps(base, doc["nodes"], T + 60)
         assert rep and rep[0]["used"], rep
         assert sv.position_sources[SV.gps_node_id("gold")] == SV.POSITION_SOURCE_GPS
+
+    def test_a_body_the_node_cut_short_is_salvaged_and_its_newest_rows_are_late_not_lost(
+            self, tmp_path, cardless):
+        pl = P.Pool(str(tmp_path / "pool"))
+        n = cardless(cls=TruncatingNode).fire(20)
+        n.cap = len(json.dumps(n.ring).encode()) // 2 + 7          # cut mid-row
+        r1 = _run(pl, n, T)
+        assert r1["ok"] and 0 < r1["added"] < 20
+        assert r1["live_ring_truncated_bytes"] == n.cap
+        assert r1["live_ring_pending"] == 20 - r1["added"]
+        n.cap = 10 ** 9
+        r2 = _run(pl, n.tick(900), T + 900)
+        assert r1["added"] + r2["added"] == 20
+        assert r2["live_ring_lost"] == 0 and r2["live_ring_truncated_bytes"] is None
+
+    def test_a_truncated_body_shows_on_the_check_and_does_not_fail_it(self, tmp_path, cardless):
+        root = str(tmp_path / "pool")
+        pl = P.Pool(root)
+        n = cardless(cls=TruncatingNode).fire(20)
+        n.cap = len(json.dumps(n.ring).encode()) // 2 + 7
+        HD.write_heartbeat(root, [_run(pl, n, T)], None, now=T)
+        code, lines = HD.check(root, now=T + 60)
+        assert code == 0, lines
+        assert "body TRUNCATED by the node in 1 of 1 run(s)" in "\n".join(lines)
 
     def test_check_reads_a_card_less_node_as_not_applicable_not_failed(self, tmp_path, cardless):
         root = str(tmp_path / "pool")
