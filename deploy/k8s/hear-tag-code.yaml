@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-tag-code.yaml
-# apply-mode client: 171918 B serialised; 172096 B of annotations against a 262144 B cap.
+# apply-mode client: 172737 B serialised; 172915 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tag
   annotations:
-    dama-hear/commit: '6e8e46b'
+    dama-hear/commit: '491f7e9'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '171918'
+    dama-hear/serialised-bytes: '172737'
 data:
   hear__init__.py: |
     
@@ -2504,16 +2504,35 @@ data:
         return CLIPS._day(row.get("ts_utc_s") if row.get("anchored") else None)
     
     
-    def work_order(index: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Every indexed clip, OLDEST UTC DAY FIRST.
+    def _work_order_meta(root: Optional[str], row: Dict[str, Any]) -> Dict[str, Any]:
+        p = row.get("path")
+        basename = (os.path.basename(p) if isinstance(p, str) else "") or os.path.basename(
+            row.get("clip") or "")
+        mtime = None
+        if root and isinstance(p, str):
+            ap = os.path.join(root, p)
+            if os.path.exists(ap):
+                try:
+                    mtime = os.path.getmtime(ap)
+                except OSError:
+                    mtime = None
+        return {"day": _row_day(row),
+                "mtime": float(mtime if mtime is not None else (row.get("fetched_at")
+                                                                 or row.get("ts_utc_s") or 0.0)),
+                "node": row.get("node") or "",
+                "basename": basename}
     
-        ⚠️ORDER IS BY PRUNE RISK. `clips.prune()` deletes whole day directories oldest-first at a byte
-        cap, so the oldest un-tagged clip is the one whose audio disappears next. Tagging newest-first
-        would spend the run on the clips least likely to be gone by the next one.
+    
+    def work_order(index: Dict[str, Dict[str, Any]], root: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Every indexed clip, IN THE SAME ORDER `clips.prune()` WOULD EVICT ITS AUDIO.
+    
+        ⚠️ORDER IS BY PRUNE RISK. `clips.prune()` deletes `unanchored` clips first by measured file
+        mtime, then the dated days oldest-first. Tagging against any other order leaves the clips most
+        likely to disappear at the back of the queue.
         """
         return sorted(index.values(),
-                      key=lambda r: (CLIPS._day_order(_row_day(r)),
-                                     float(r.get("ts_utc_s") or 0.0), r.get("clip_key") or ""))
+                      key=lambda r: (CLIPS._prune_order(_work_order_meta(root, r)),
+                                     r.get("clip_key") or ""))
     
     
     def empty_tally() -> Dict[str, Any]:
@@ -2726,7 +2745,7 @@ data:
         out_rows: List[Dict[str, Any]] = []
         t0 = time.time()
         stop_reason = None
-        for row in work_order(index):
+        for row in work_order(index, root):
             node, day = row.get("node") or "?", _row_day(row)
             ck = row.get("clip_key")
             if isinstance(ck, str) and TAGS.tag_key(ck, mb.get("name"), mb.get("version"),
