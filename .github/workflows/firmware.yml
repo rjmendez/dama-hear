@@ -21,17 +21,18 @@ env:
 
 jobs:
   build:
-    name: build ${{ matrix.sketch }}
+    name: build ${{ matrix.sketch }}${{ matrix.board_class && format(' ({0})', matrix.board_class) || '' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { sketch: hear_node,     fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: true }
-          - { sketch: puc_node,      fqbn: "esp32:esp32:esp32s3:PSRAM=opi",      guarded: true }
-          - { sketch: hear_poc,      fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false }
-          - { sketch: path_test,     fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false }
-          - { sketch: sense_bringup, fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false }
+          - { sketch: hear_node,     fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: true,  board_class: "xiao-s3-pps",      release_stem: "hear_node-xiao-s3-pps",      build_flags: "-DHEAR_ALLOW_NO_WIFI",                                guard_flags: "",                              artifact: "fw-hear_node-xiao-s3-pps" }
+          - { sketch: hear_node,     fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: true,  board_class: "esp32s3-i2s-gps", release_stem: "hear_node-esp32s3-i2s-gps", build_flags: "-DHEAR_ALLOW_NO_WIFI -DHEAR_BOARD_ESP32S3_I2S_GPS", guard_flags: "-DHEAR_BOARD_ESP32S3_I2S_GPS", artifact: "fw-hear_node-esp32s3-i2s-gps" }
+          - { sketch: puc_node,      fqbn: "esp32:esp32:esp32s3:PSRAM=opi",      guarded: true,  board_class: "",                 release_stem: "",                            build_flags: "-DHEAR_ALLOW_NO_WIFI",                                guard_flags: "",                              artifact: "fw-puc_node" }
+          - { sketch: hear_poc,      fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false, board_class: "",                 release_stem: "",                            build_flags: "-DHEAR_ALLOW_NO_WIFI",                                guard_flags: "",                              artifact: "fw-hear_poc" }
+          - { sketch: path_test,     fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false, board_class: "",                 release_stem: "",                            build_flags: "-DHEAR_ALLOW_NO_WIFI",                                guard_flags: "",                              artifact: "fw-path_test" }
+          - { sketch: sense_bringup, fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false, board_class: "",                 release_stem: "",                            build_flags: "-DHEAR_ALLOW_NO_WIFI",                                guard_flags: "",                              artifact: "fw-sense_bringup" }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -60,19 +61,23 @@ jobs:
       - name: compile (no Wi-Fi credentials, -DHEAR_ALLOW_NO_WIFI)
         run: |
           arduino-cli compile --fqbn "${{ matrix.fqbn }}" --libraries firmware/lib \
-            --build-property "compiler.cpp.extra_flags=-DHEAR_ALLOW_NO_WIFI" \
+            --build-property "compiler.cpp.extra_flags=${{ matrix.build_flags }}" \
             --output-dir "out/${{ matrix.sketch }}" "firmware/${{ matrix.sketch }}" | tee build.log
           {
-            echo "### ${{ matrix.sketch }} (${{ matrix.fqbn }})"
+            echo "### ${{ matrix.sketch }}${{ matrix.board_class && format(' ({0})', matrix.board_class) || '' }} (${{ matrix.fqbn }})"
             grep -E "Sketch uses|Global variables" build.log
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: a build with no Wi-Fi configuration must fail on the guard
         if: matrix.guarded
         run: |
+          extra=()
+          if [ -n "${{ matrix.guard_flags }}" ]; then
+            extra+=(--build-property "compiler.cpp.extra_flags=${{ matrix.guard_flags }}")
+          fi
           set +e
           arduino-cli compile --fqbn "${{ matrix.fqbn }}" --libraries firmware/lib \
-            "firmware/${{ matrix.sketch }}" > guard.log 2>&1
+            "${extra[@]}" "firmware/${{ matrix.sketch }}" > guard.log 2>&1
           rc=$?
           set -e
           if [ "$rc" -eq 0 ]; then
@@ -87,7 +92,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: fw-${{ matrix.sketch }}
+          name: ${{ matrix.artifact }}
           path: |
             out/${{ matrix.sketch }}/*.bin
             out/${{ matrix.sketch }}/*.elf
