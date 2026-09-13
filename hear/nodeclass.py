@@ -635,6 +635,27 @@ register(NodeClass(
 
 
 register(NodeClass(
+    name="esp32s3-i2s-gps",
+    time_source="gps_pps",
+    # NOT MEASURED ON THIS BOARD. firmware/boards/esp32s3_i2s_gps.h: PMTK GPS with 1PPS on GPIO4
+    # and one ICS-43434-class I2S microphone acquired at 48 kHz, no card and no barometer. The
+    # 100 us is the same unmeasured figure xiao-s3-i2s carries, not a number anyone took here.
+    t_sigma_s=100e-6,
+    # None: the I2S capture path has never been measured against a xiao-s3-pps, and a PDM-to-I2S
+    # change is exactly the offset that does not cancel across classes. Refused until measured.
+    path_bias_s=None,
+    mic_count=1,
+    fs_hz=48000.0,
+    band_hz=(50.0, 15000.0),
+    env=(),
+    raw_retain_s=0.0,
+    notes="Minimal ESP32-S3 + PMTK GPS/1PPS + I2S mic and NO SD card, so detections come from "
+          "/detections only. gold, ageev, kasami answered /status with this class 2026-09-13. "
+          "Refused for arrivals ONLY because its capture path has never been measured; "
+          "positioned from its own GPS mean when it has no survey entry.",
+))
+
+register(NodeClass(
     name="gotchi-phone",
     time_source="ntp",
     # ⚠️THIS ENTRY WAS SUBSTANTIALLY STALE AND IS REWRITTEN AGAINST THE SOURCE, 2026-09-10. It used
