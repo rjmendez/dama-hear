@@ -221,3 +221,20 @@ class TestTheApiRefuses:
     def test_mixed_arity_positions_are_refused(self):
         with pytest.raises(ValueError):
             RD.baseline_m((0, 0), (1, 2, 3))
+
+
+def test_fisher_refuses_a_non_positive_sigma():
+    import pytest as _pt
+    from hear.solve import rangediff as _RD
+    for bad in (0.0, -1e-4):
+        with _pt.raises(ValueError):
+            _RD.fisher((0.0, 0.0), (10.0, 0.0), (5.0, 5.0), sigma_tau_s=bad)
+
+
+def test_a_delay_inside_the_tolerance_past_endfire_does_not_raise():
+    from hear.solve import rangediff as _RD
+    c = 343.0
+    tau = (10.0 / c) * (1.0 + 1e-6)
+    r = _RD.cue((0.0, 0.0), (10.0, 0.0), tau, sigma_tau_s=1e-4, sigma_pos_m=(0.1, 0.1),
+                c=c, tol_s=1e-4)
+    assert isinstance(r, dict)

@@ -408,6 +408,8 @@ def interval_consistent(intervals_s: Dict[int, float], mic_positions, c: float =
                          "not a test (38 mm pairs bound at 0.22 ms and always fail)")
     if tol_s is None:
         tol_s = 3.0 * math.sqrt(2.0) * float(sigma_s)
+    if float(tol_s) < 0.0:
+        raise ValueError("tol_s must be >= 0 s (got %r)" % (tol_s,))
     P = np.asarray(mic_positions, dtype=float)
     keys = sorted(intervals_s)
     pairs, bad = [], []
@@ -439,6 +441,12 @@ def interval_consistent(intervals_s: Dict[int, float], mic_positions, c: float =
         tightest_bound_slack=tightest,
         position_floor_m=floor_m,
         note=(None if discriminating else
+              # tol_s == 0 is the exact physical bound: its slack is unbounded, and inf * 0 is NaN
+              ("tol_s is 0, so the bound is tested exactly and its slack over the tolerance is "
+               "unbounded: `valid` says nothing about whether an onset error would fail it. "
+               "Report position_floor_m = %s instead -- pass sigma_s to get it."
+               % ("%.2f m" % floor_m if floor_m is not None else "(needs sigma_s)"))
+              if tol_s <= 0.0 else
               "the tightest pair's bound is %.0fx its tolerance (%.2f ms over %.2f ms), so no "
               "onset error this detector produces can fail it: `valid` here is true by "
               "construction. Report position_floor_m = %s instead -- pass sigma_s to get it."

@@ -111,6 +111,8 @@ def fisher(p1, p2, source, c: float = 345.238, sigma_tau_s: float = 1.0) -> Dict
     about. `rank` is 1 for every non-degenerate input; `null_directions` are the displacement
     directions along which the TDoA does not change AT ALL -- moving the source there is free.
     """
+    if not (math.isfinite(float(sigma_tau_s)) and float(sigma_tau_s) > 0.0):
+        raise ValueError("sigma_tau_s must be a finite number > 0 s (got %r)" % (sigma_tau_s,))
     a, b = _pts(p1, p2)
     s = np.asarray(source, float).ravel()
     if s.shape != a.shape:
@@ -280,7 +282,8 @@ def cue(p1, p2, tau_s: float, *, sigma_tau_s: float, sigma_pos_m: Sequence[float
     delta = range_difference_m(tau_s, cc)
     q = min(1.0, abs(delta) / B)                 # |cos(theta)|
     endfire = q >= ENDFIRE_FRACTION
-    th = math.radians(asymptote_angle_deg(delta, B))
+    # physically_possible() admits |tau| up to tol_s past d/c; that delta is endfire, not a raise
+    th = math.radians(asymptote_angle_deg(max(-B, min(B, delta)), B))
     sin_t = math.sin(th)
 
     along, perp = _survey_terms(a, b, sigma_pos_m, sigma_up_m or (0.0, 0.0))

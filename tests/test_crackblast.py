@@ -287,3 +287,14 @@ def test_the_floor_is_reported_whenever_a_sigma_was_given():
     assert with_sigma["position_floor_m"] == pytest.approx(1430.0 * 0.00025)
     with_tol = interval_consistent({i: 0.0538 for i in range(6)}, ESP_MICS, c=C, tol_s=1e-3)
     assert with_tol["position_floor_m"] is None, "no sigma, no floor -- do not invent one"
+
+
+def test_a_negative_tolerance_is_refused_and_a_zero_one_reads_without_nan():
+    import pytest as _pt
+    from hear.solve import crackblast as _CB
+    mics = [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0)]
+    for kw in ({"sigma_s": -1e-4}, {"tol_s": -1e-4}):
+        with _pt.raises(ValueError):
+            _CB.interval_consistent({0: 0.010, 1: 0.011}, mics, **kw)
+    chk = _CB.interval_consistent({0: 0.010, 1: 0.011}, mics, tol_s=0.0)
+    assert chk.note is None or "nan" not in chk.note.lower()

@@ -278,3 +278,11 @@ def test_it_refuses_impossible_targets():
         separation_for_temperature(1.0, -0.02)
     with pytest.raises(ValueError):
         temperature_from_separation(0.0, 0.02)
+
+
+def test_temperature_from_separation_refuses_negative_sigmas():
+    import pytest as _pt
+    from hear.solve import soundspeed as _SS
+    for kw in ({"sigma_d_m": -0.1}, {"sigma_d_m": 0.1, "sigma_tau_s": -1e-6}):
+        with _pt.raises(ValueError):
+            _SS.temperature_from_separation(10.0, **kw)

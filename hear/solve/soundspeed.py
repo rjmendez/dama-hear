@@ -233,6 +233,8 @@ def temperature_from_separation(separation_m: float, sigma_d_m: float,
     d = float(separation_m)
     if d <= 0.0:
         raise ValueError("separation must be > 0 m (got %r)" % separation_m)
+    if sigma_d_m < 0.0 or sigma_tau_s < 0.0:
+        raise ValueError("sigmas must be >= 0")
     f_survey = float(sigma_d_m) / d
     f_timing = c * float(sigma_tau_s) / d
     frac = math.hypot(f_survey, f_timing)

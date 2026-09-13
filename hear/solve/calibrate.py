@@ -42,6 +42,7 @@ from scipy.sparse import coo_matrix
 from . import placement as PL
 from . import point as PT
 from . import shockwave as SW
+from . import soundspeed as SS
 
 
 class CalibrationError(ValueError):
@@ -91,7 +92,7 @@ def known_source_offset_budget(path_m: float, sigma_pos_m: float, sigma_node_t_s
     survey = float(sigma_pos_m) / c
     pick = float(sigma_pick_t_s)
     node = float(sigma_node_t_s)
-    speed = (float(path_m) / c) * abs(float(sigma_temp_c)) * 0.606 / c
+    speed = (float(path_m) / c) * abs(float(sigma_temp_c)) * SS.DC_DT / c
     single = math.sqrt(survey ** 2 + pick ** 2 + node ** 2 + speed ** 2)
     averaged = math.sqrt((survey / rt if source_moves else survey) ** 2
                          + (pick / rt) ** 2 + (node / rt) ** 2 + speed ** 2)
