@@ -122,9 +122,11 @@ spec:
               image: python:3.13-slim
               command: ["/bin/sh", "-lc"]
               args:
-                # `set +e` and the gate's rc captured first, as in hear-tag-check. The check needs
-                # numpy (hear.clips imports hear.sketch) but not LiteRT, so it reads the tag
-                # lane's library dir rather than one the birdnet job may be installing into.
+                # `set +e` and every gate rc captured before exit, as in hear-tag-check. The
+                # check needs numpy (hear.clips imports hear.sketch) but not LiteRT, so it reads
+                # the tag lane's library dir rather than one the birdnet job may be installing
+                # into. Weight verification gets `--pool` as well so a refusal heartbeat replaces
+                # any stale green one before the job exits non-zero.
                 - |
                   set +e
                   export PYTHONPATH=/pool/pylib-tag:/app
@@ -133,7 +135,10 @@ spec:
                     --min-mean-top-score -1
                   rc=$?
                   echo "--- weights ---"
-                  python /app/tools/hear_tag.py --lane birdnet_v24 --model-dir /pool/models/birdnet_v24 --verify-weights || true
+                  python /app/tools/hear_tag.py --pool /pool/corpus --lane birdnet_v24 \
+                    --model-dir /pool/models/birdnet_v24 --verify-weights
+                  rc2=$?
+                  [ "$rc2" -gt "$rc" ] && rc=$rc2
                   exit "$rc"
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }

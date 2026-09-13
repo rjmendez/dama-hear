@@ -189,12 +189,21 @@ class TestTheBirdnetManifest:
             body = "\n".join(l for l in fh.read().splitlines() if not l.strip().startswith("#"))
         assert "172.16.100." not in body
 
-    def test_a_failing_check_fails_the_job(self, bdocs, tmp_path):
+    def _run_check(self, bdocs, tmp_path, check_rc=0, verify_rc=0):
         stub = tmp_path / "python"
-        stub.write_text("#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = \"--check\" ] && exit 1; "
-                        "done\nexit 7\n")
+        stub.write_text(
+            "#!/bin/sh\n"
+            "for a in \"$@\"; do\n"
+            "  [ \"$a\" = \"--check\" ] && exit %d\n"
+            "  [ \"$a\" = \"--verify-weights\" ] && exit %d\n"
+            "done\nexit 7\n" % (check_rc, verify_rc))
         stub.chmod(0o755)
         env = dict(os.environ, PATH="%s:%s" % (tmp_path, os.environ.get("PATH", "")))
-        r = subprocess.run(["/bin/sh", "-lc", textwrap.dedent(_container(bdocs[1])["args"][0])],
-                           capture_output=True, text=True, env=env)
-        assert r.returncode == 1
+        return subprocess.run(["/bin/sh", "-lc", textwrap.dedent(_container(bdocs[1])["args"][0])],
+                              capture_output=True, text=True, env=env)
+
+    def test_a_failing_check_fails_the_job(self, bdocs, tmp_path):
+        assert self._run_check(bdocs, tmp_path, check_rc=1).returncode == 1
+
+    def test_a_failing_weight_verify_fails_the_job(self, bdocs, tmp_path):
+        assert self._run_check(bdocs, tmp_path, verify_rc=2).returncode == 2
