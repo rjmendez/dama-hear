@@ -49,7 +49,8 @@ def _define(src, name, cast=int):
     return cast(m.group(1).rstrip("fu"))
 
 
-assert '#include "../boards/xiao_s3_sense.h"' in CODE, "hear_node changed boards"
+assert ('#include "../boards/xiao_s3_sense.h"' in CODE
+        or '#include "../boards/esp32s3_i2s_gps.h"' in CODE), "hear_node changed boards"
 FS_NOMINAL = _define(_strip_comments(BOARD.read_text()), "FS_NOMINAL")
 DECIM = _define(CODE, "DECIM")
 FS_ACQ = FS_NOMINAL * DECIM
