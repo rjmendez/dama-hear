@@ -465,8 +465,14 @@ static uint8_t rawbuf[512]; static volatile uint16_t raw_i = 0; static volatile 
 static volatile uint32_t nmea_valid = 0;      // lines that actually start '$' and carry a talker id
 static uint32_t gps_baud = 0;
 static volatile int gps_fix = 0, gps_sats = 0;
+// gps_fix is UBX fixType on a u-blox module (3 = 3D) but GGA fix quality on a PMTK one (1 = a fix),
+// so one threshold reads every PMTK fix as no-fix.
+static bool gps_has_fix() {
+  return GPS_PROTO == GPS_PMTK ? gps_fix >= 1 : gps_fix >= 3;
+}
+
 static const char *selftest_gps_now() {
-  return gps_fix >= 3 ? "ok" : ((ubx_pvt > 0 || gps_link_ok) ? "no-fix" : "silent");
+  return gps_has_fix() ? "ok" : ((ubx_pvt > 0 || gps_link_ok) ? "no-fix" : "silent");
 }
 static const char *selftest_pps_now() {
   return (pps_count > 0 || !strcmp(selftest_pps, "ok")) ? "ok" : "absent";
@@ -3308,7 +3314,7 @@ static void selftest_gps_settle() {
     boot_wdt_service();
     delay(1);
   }
-  selftest_gps = gps_fix >= 3 ? "ok" : (gps_link_ok ? "no-fix" : "silent");
+  selftest_gps = gps_has_fix() ? "ok" : (gps_link_ok ? "no-fix" : "silent");
 }
 
 static void selftest_mic_probe() {
