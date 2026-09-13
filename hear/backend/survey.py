@@ -125,7 +125,8 @@ class Survey:
 
         A node with NO stated class is included, because every survey written before the field
         existed omits it and silently dropping those nodes would be a worse failure than the one
-        this fixes. State the class to be refused.
+        this fixes. A PRESENT but unrecognised class is refused: a typo or a class that has not
+        been registered yet is not the same thing as "unstated".
         """
         from .. import nodeclass                       # local: keeps survey.py importable alone
         out = []
@@ -134,10 +135,8 @@ class Survey:
             if not c:
                 out.append(i)
                 continue
-            try:
-                if nodeclass.get(c).contributes_arrival():
-                    out.append(i)
-            except Exception:                          # unknown class name: unstated, not "no"
+            cls = nodeclass.CLASSES.get(c)
+            if cls is not None and cls.contributes_arrival():
                 out.append(i)
         return out
 

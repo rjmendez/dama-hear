@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 610989 B serialised; 611167 B of annotations against a 262144 B cap.
+# apply-mode server: 610997 B serialised; 611175 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '7553bda'
+    dama-hear/commit: '37386a9'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '610989'
+    dama-hear/serialised-bytes: '610997'
 data:
   hear__init__.py: |
     
@@ -4308,7 +4308,8 @@ data:
     
             A node with NO stated class is included, because every survey written before the field
             existed omits it and silently dropping those nodes would be a worse failure than the one
-            this fixes. State the class to be refused.
+            this fixes. A PRESENT but unrecognised class is refused: a typo or a class that has not
+            been registered yet is not the same thing as "unstated".
             """
             from .. import nodeclass                       # local: keeps survey.py importable alone
             out = []
@@ -4317,10 +4318,8 @@ data:
                 if not c:
                     out.append(i)
                     continue
-                try:
-                    if nodeclass.get(c).contributes_arrival():
-                        out.append(i)
-                except Exception:                          # unknown class name: unstated, not "no"
+                cls = nodeclass.CLASSES.get(c)
+                if cls is not None and cls.contributes_arrival():
                     out.append(i)
             return out
     
