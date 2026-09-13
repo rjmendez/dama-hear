@@ -48,6 +48,23 @@ BASIS_UTC = "utc"
 BASIS_SAMPLE = "sample"
 BASIS_NONE = "none"
 
+# Stable deployment names remain separate from versioned lane/artifact names.
+MODEL_BACKENDS = ("yamnet", "birdnet", "perch")
+MODEL_BACKEND_LANES = {
+    "yamnet": "mn10",
+    "birdnet": "birdnet_v24",
+    "perch": "perch_v2",
+}
+
+
+def backend_lane(name: str) -> str:
+    """Return the canonical tag lane for a public model backend name."""
+    try:
+        return MODEL_BACKEND_LANES[name]
+    except KeyError:
+        raise ValueError("unknown model backend %r; known: %s" %
+                         (name, ", ".join(MODEL_BACKENDS)))
+
 
 def tags_path(root: str, store: Optional[str] = None) -> str:
     """`clips/tags.jsonl` when `store` is None, `clips/tags-<store>.jsonl` otherwise.

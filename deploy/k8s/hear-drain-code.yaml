@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 258723 B serialised; 258907 B of annotations against a 262144 B cap.
+# apply-mode server: 258780 B serialised; 258964 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'a88af7b-dirty'
+    dama-hear/commit: '2777f93-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '258723'
+    dama-hear/serialised-bytes: '258780'
 data:
   hear__init__.py: |
     
@@ -171,14 +171,14 @@ data:
     
     
     def sketch(x: np.ndarray, fs: float, bands: int = MEL_BANDS, frames: int = FRAMES,
-               hop_s: float = HOP_S, nfft: int = NFFT,
-               layout: str = LAYOUT_NYQUIST) -> Tuple[np.ndarray, float]:
+               hop_s: float = HOP_S, nfft: int = NFFT, f_lo: float = F_LO,
+               f_hi: float = F_HI, layout: str = LAYOUT_NYQUIST) -> Tuple[np.ndarray, float]:
         """(int8 [bands x frames], ref_db). Frames start at the sample the caller passes as index 0.
     
         `layout` decides what band k MEANS -- see [mel_filterbank]. At any rate above
         LAYOUT_EQUIVALENT_ABOVE_HZ the two are the same bytes."""
         x = np.asarray(x, float)
-        fb = mel_filterbank(fs, nfft, bands, layout=layout)
+        fb = mel_filterbank(fs, nfft, bands, f_lo=f_lo, f_hi=f_hi, layout=layout)
         hop = max(1, int(hop_s * fs))
         win = np.hanning(nfft)
         out = np.zeros((bands, frames))
@@ -957,7 +957,7 @@ data:
     smaller descriptor.
     
     ⚠️THE SECOND AXIS IS `slices`, NOT `frames`, AND `frames` IS A ROW TOTAL. The column carries
-    `SCENE_FRAMES = SCENE_SLICES * SCENE_FRAMES_PER_SLICE` (hear_node.ino:1138-1140, written at
+    `SCENE_FRAMES = SCENE_SLICES * SCENE_FRAMES_PER_SLICE` (hear_node.ino:1569-1571, written at
     :1239) -- 64 for the whole row, at 4 slices of 16. The per-slice averaging divides by
     SCENE_FRAMES_PER_SLICE, so a reader that takes this column as the per-slice count is out by a
     factor of `slices`. Neither number is the shape. `frames_per_slice()` derives the per-slice count
@@ -2820,7 +2820,7 @@ data:
     
     ⚠️A CATCH-UP REFETCH IS DELIBERATELY ABSENT, AND THIS IS THE SECOND TIME THAT HAS BEEN DECIDED.
     The node has no offset argument and no Range header, so the only reach-back control is a bigger
-    `tail=` -- and `/sd` seeks against the size AT REFETCH TIME (hear_node.ino:1985-1986,
+    `tail=` -- and `/sd` seeks against the size AT REFETCH TIME (hear_node.ino:2899,
     `size_t remain = f.size(); if (tail > 0 && remain > (size_t)tail) f.seek(remain - tail)`). The
     file grows underneath for the whole of the first fetch (2 MB at the measured 40-135 KB/s is
     15-50 s, ~3.5-12 KB at ~235 B/s), so a tail sized against the pre-fetch `size_now` lands FORWARD
