@@ -1304,9 +1304,9 @@ static char ota_msg[96] = "idle";
 // no counter, no revert, and http.handleClient() never runs either, so the web server is begun but
 // deaf. The node sits powered, awake and unreachable until someone walks to it.
 //
-// The watchdog turns a hang into a reset, which the failback already knows how to handle. It is
-// armed only around the calls that touch hardware and can block, because the WiFi join above
-// deliberately spends up to 12 s and must not be killed for it.
+// The watchdog turns a hang into a reset, which the failback already knows how to handle. Arm it
+// as soon as Serial exists so an early stall does not sit forever, and let the WiFi join below
+// service it during its legitimate multi-network wait.
 static void boot_wdt_arm(uint32_t ms) {
   esp_task_wdt_config_t c = { .timeout_ms = ms, .idle_core_mask = 0, .trigger_panic = true };
   // Arduino may already have initialised the TWDT; reconfigure then, init if not.
@@ -2753,6 +2753,8 @@ void setup() {
   // longer than that. Must precede begin(), which keeps a queue that already exists.
   Serial.setRxBufferSize(HEAR_PROV_LINE_MAX + 64);
   Serial.begin(115200);
+  Serial.setTxTimeoutMs(50);
+  boot_wdt_arm(20000);
   delay(1500);
   boot_ms = millis();
   logf("boot  attempt %lu on partition %s\n", (unsigned long)hear_boot_try(),
@@ -2783,6 +2785,7 @@ void setup() {
                  : "      (not enrolled: run firmware/hear_node/enroll.py over USB)");
   }
   if (MDNS.begin(node_id)) logf("mdns  http://%s.local/\n", node_id);
+  boot_wdt_arm(15000);
 
   // PULLDOWN, not bare INPUT. An unconnected CMOS input floats and self-oscillates -- measured
   // ~3.4 kHz of phantom edges, which the rate maths happily turned into a plausible +626 ppm.
@@ -3551,11 +3554,10 @@ void setup() {
   // hang has run. Bringing them up before the server meant a node that failed here was never
   // reachable at all -- rankine, 2026-09-10.
   //
-  // ⚠️AND THEY RUN UNDER A WATCHDOG, because ordering alone does not save a HANG: handleClient()
-  // is called from loop(), so a setup() that never returns leaves the server begun but deaf, and
-  // boot_guard() counts resets that never happen. 15 s is far longer than either call has ever
-  // taken.
-  boot_wdt_arm(15000);
+  // ⚠️AND THEY RUN UNDER THE SAME BOOT WATCHDOG, because ordering alone does not save a HANG:
+  // handleClient() is called from loop(), so a setup() that never returns leaves the server begun
+  // but deaf, and boot_guard() counts resets that never happen. 15 s is far longer than either
+  // call has ever taken.
   i2s.setPinsPdmRx(PDM_CLK, PDM_DIN);
   if (!i2s.begin(I2S_MODE_PDM_RX, FS_ACQ, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
     logln("i2s   FAILED");
@@ -4252,7 +4254,7 @@ void loop() {
     if (millis() - retry > 15000) { retry = millis(); WiFi.reconnect(); }
   }
 
-  hear_boot_tick(sta_ok);          // reachability is the sketch's to answer, not the library's
+  if (prov.n > 0) hear_boot_tick(sta_ok);          // reachability is the sketch's to answer, not the library's
 
   static uint32_t last = 0;
   if (millis() - last > 30000) {
