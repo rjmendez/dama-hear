@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -157,15 +158,27 @@ def test_detection_batch_event_is_a_hint_not_the_csv_body(hb):
     assert "csv" not in json.dumps(got).lower()
 
 
-def test_transport_uses_a_single_short_connect_and_fire_and_forget_write():
+def test_transport_makes_a_single_short_connect_and_reads_the_status_line():
     body = _fn("push_post_json")
     assert "HTTPClient" not in CODE
     assert "client.connect(HEAR_PUSH_HOST, HEAR_PUSH_PORT, HEAR_PUSH_CONNECT_TIMEOUT_MS)" in body
     assert '"X-Hear-Token: %s\\r\\n"' in body
     assert "client.write((const uint8_t *)req, (size_t)n)" in body
+    assert "client.setTimeout(HEAR_PUSH_READ_TIMEOUT_MS);" in body
+    assert "client.readStringUntil('\\n');" in body
     assert "client.stop();" in body
     assert "boot_wdt_arm" not in body
     assert "while" not in body, "transport must not spin or retry inside one attempt"
+
+
+def test_transport_treats_a_written_request_as_pending_until_the_status_line_says_otherwise():
+    body = _fn("push_post_json")
+    # The old bug: *code_out = 204 was set unconditionally once client.write() returned, so a
+    # 401 from an auth-enabled receiver was invisible to the firmware. Only the parsed status
+    # line may decide the return value now.
+    assert "*code_out = 204;\n  return true;" not in body
+    assert "return code >= 200 && code < 300;" in body
+    assert 'status_line.startsWith("HTTP/1.")' in body
 
 
 def test_loop_only_attempts_one_pending_send_then_returns():
@@ -197,6 +210,31 @@ def test_firmware_uses_the_host_port_the_receiver_actually_exposes():
     dep = docs[0]
     ports = dep["spec"]["template"]["spec"]["containers"][0]["ports"]
     host_port = ports[0]["hostPort"]
-    assert '#define HEAR_PUSH_HOST              "mrpink"' in CODE
+    assert '#define HEAR_PUSH_HOST              "172.21.171.198"' in CODE
     assert '#define HEAR_PUSH_PORT              5051u' in CODE
     assert host_port == 5051
+
+
+def test_the_default_host_is_not_the_unresolvable_magicdns_name():
+    # "mrpink" is a Tailscale MagicDNS name; WiFiClient on this firmware has no MagicDNS
+    # resolver, so that default could never have delivered a single heartbeat.
+    assert '"mrpink"' not in CODE
+
+
+def test_gen_secrets_can_override_the_push_host_and_token_from_a_local_file(tmp_path, monkeypatch):
+    sys.path.insert(0, str((ROOT / "firmware" / "hear_node")))
+    import importlib
+    import gen_secrets
+    importlib.reload(gen_secrets)
+    push_file = tmp_path / "hear_push"
+    push_file.write_text("HEAR_PUSH_HOST=203.0.113.5\nHEAR_PUSH_TOKEN=deadbeefcafe\n")
+    cfg = gen_secrets.read_push_config(str(push_file))
+    assert cfg == {"HEAR_PUSH_HOST": "203.0.113.5", "HEAR_PUSH_TOKEN": "deadbeefcafe"}
+
+
+def test_gen_secrets_push_config_is_empty_when_no_local_file_exists(tmp_path):
+    sys.path.insert(0, str((ROOT / "firmware" / "hear_node")))
+    import importlib
+    import gen_secrets
+    importlib.reload(gen_secrets)
+    assert gen_secrets.read_push_config(str(tmp_path / "does-not-exist")) == {}
