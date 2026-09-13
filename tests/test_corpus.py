@@ -7,6 +7,7 @@ import pytest
 
 from hear import corpus as C
 from hear import sketch as SK
+from hear import wire as WR
 
 
 def _frame(fs=48000.0, flags=0, seed=1, ref_peak=500):
@@ -88,6 +89,25 @@ class TestPhone:
         r = C.from_phone({"sketch_b64": base64.b64encode(frame).decode()})
         assert r.retrigger is True
 
+    def test_v2_173_byte_phone_payload_decodes_correctly(self):
+        rng = np.random.default_rng(42)
+        q, ref = SK.sketch(rng.normal(0, 1000, 4096), 48000.0)
+        v2_frame = WR.pack_v2(us_of_day=12_345_678, node_id=42, seq=7, ref_db=ref, peak=600,
+                              q=q, profile_id=1)
+        assert len(v2_frame) == 173
+        p = {"sketch_b64": base64.b64encode(v2_frame).decode(),
+             "ts_utc_ms": 1788700000000 + int(12345.678),
+             "clock_tier": "gnss", "node_id": "phone-v2"}
+        r = C.from_phone(p)
+        assert r.source == "phone"
+        assert r.node_id == "phone-v2"
+        assert r.fs_hz == 48000.0
+        assert r.ref_db == pytest.approx(ref, abs=0.25)
+        assert r.extra["us_of_day"] == 12_345_678
+        assert r.extra["seq"] == 7
+        assert r.extra["profile_id"] == 1
+        assert np.array_equal(r.q, q)
+
 
 class TestNode:
     def test_node_us_alone_carries_no_absolute_time(self):
@@ -134,6 +154,26 @@ class TestNode:
             np.random.default_rng(5).normal(0, 1000, 4096), 48000.0)[0],
             fs=48000.0, layout=SK.LAYOUT_FIXED), "p")
         assert np.allclose(r16.band_edges_hz(), r48.band_edges_hz())
+
+    def test_v2_173_byte_node_frame_decodes_correctly(self):
+        rng = np.random.default_rng(99)
+        q, ref = SK.sketch(rng.normal(0, 1000, 4096), 48000.0)
+        v2_frame = WR.pack_v2(us_of_day=45_123_456, node_id=101, seq=55, ref_db=ref, peak=12000,
+                              q=q, profile_id=1)
+        assert len(v2_frame) == 173
+        rec = C.from_node(v2_frame, "node-101", second_utc_s=1788700000)
+        assert rec.source == "node"
+        assert rec.node_id == "node-101"
+        assert rec.fs_hz == 48000.0
+        assert rec.ref_db == pytest.approx(ref, abs=0.25)
+        assert rec.peak == 12000
+        assert rec.node_us == 123456
+        assert rec.ts_utc_s == pytest.approx(WR.unwrap_utc(45_123_456, 1788700000))
+        assert rec.extra["us_of_day"] == 45_123_456
+        assert rec.extra["seq"] == 55
+        assert rec.extra["profile_id"] == 1
+        assert rec.extra["layout"] == SK.LAYOUT_FIXED
+        assert np.array_equal(rec.q, q)
 
 
 class TestFeatureMatrix:

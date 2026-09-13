@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hear import detsfile as DF                                    # noqa: E402
 from hear import pool as P                                         # noqa: E402
 from hear import sketch as SK                                      # noqa: E402
+from hear import wire as WR                                        # noqa: E402
 from tools import hear_drain as HD                                 # noqa: E402
 
 
@@ -108,6 +109,52 @@ class TestOneDataset:
         assert all(isinstance(r, C.Record) for r in recs)
         X, kept = C.feature_matrix(recs, 16000.0)
         assert X.shape == (3, SK.MEL_BANDS * SK.FRAMES)
+
+    def test_v2_173_byte_node_frame_ingest_and_records(self, tmp_path):
+        from hear import corpus as C
+        pl = P.Pool(str(tmp_path / "pool"))
+        rng = np.random.default_rng(77)
+        q, ref = SK.sketch(rng.normal(0, 1000, 4096), 48000.0)
+        v2_frame = WR.pack_v2(us_of_day=50_000_123, node_id=202, seq=12, ref_db=ref, peak=1500,
+                              q=q, profile_id=1)
+        assert len(v2_frame) == 173
+        fh = binascii.hexlify(v2_frame).decode()
+        p = tmp_path / "dets_v2.csv"
+        lines = [",".join(DF.G5.declared),
+                 "node-202,1788763952000000,1234,5000000,42,123,1500,4608,48000.000,64,%s,," % fh]
+        p.write_text("\n".join(lines) + "\n")
+        res = pl.ingest_dets(str(p))
+        assert res["added"] == 1
+        recs = pl.records()
+        assert len(recs) == 1
+        assert isinstance(recs[0], C.Record)
+        assert recs[0].node_id == "node-202"
+        assert recs[0].fs_hz == 48000.0
+        assert recs[0].ref_db == pytest.approx(ref, abs=0.25)
+        assert np.array_equal(recs[0].q, q)
+
+    def test_v2_173_byte_mqtt_jsonl_ingest_and_records(self, tmp_path):
+        from hear import corpus as C
+        pl = P.Pool(str(tmp_path / "pool"))
+        rng = np.random.default_rng(88)
+        q, ref = SK.sketch(rng.normal(0, 1000, 4096), 48000.0)
+        v2_frame = WR.pack_v2(us_of_day=60_000_456, node_id=303, seq=20, ref_db=ref, peak=2500,
+                              q=q, profile_id=1)
+        assert len(v2_frame) == 173
+        p = tmp_path / "phone_v2.jsonl"
+        p.write_text(json.dumps({
+            "topic": "dama/phone-v2/acoustic_sketch",
+            "payload": {"sketch_b64": base64.b64encode(v2_frame).decode(),
+                        "ts_utc_ms": 1788763952189, "clock_tier": "gnss",
+                        "sync_sigma_ns": 105000.0, "clipped": False, "onset_found": True}}))
+        res = pl.ingest_mqtt_jsonl(str(p))
+        assert res["added"] == 1
+        recs = pl.records()
+        assert len(recs) == 1
+        assert isinstance(recs[0], C.Record)
+        assert recs[0].node_id == "phone-v2"
+        assert recs[0].fs_hz == 48000.0
+        assert np.array_equal(recs[0].q, q)
 
     def test_the_key_is_content_so_two_drains_of_one_detection_agree(self, tmp_path):
         frame = _frame()

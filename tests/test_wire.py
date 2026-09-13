@@ -176,14 +176,12 @@ class TestTheHeaderIsPinnedToBytesNotToItself:
     treatment here, or a v2 firmware author reading the docstring emits frames Python misreads."""
 
     # 13 B for us_of_day=12345678901, ref_db=-13.75, peak=0x1234, node_id=0xBEEF, seq=200,
-    # profile 0, retrigger. ts LE uint40 | ref4 <h> | peak <H> | node_id <H> | flags <H>.
-    GOLDEN = bytes.fromhex("351cdcdf02" "c9ff" "3412" "efbe" "41c8")
+    # profile 1 (DEFAULT_PROFILE), retrigger. ts LE uint40 | ref4 <h> | peak <H> | node_id <H> | flags <H>.
+    GOLDEN = bytes.fromhex("351cdcdf02" "c9ff" "3412" "efbe" "43c8")
+    # Legacy profile 0 frame (flags 0xC841) for unpack/read-only verification
+    GOLDEN_LEGACY_P0 = bytes.fromhex("351cdcdf02" "c9ff" "3412" "efbe" "41c8")
 
-    def _frame(self, profile_id=0):
-        # ⚠️profile 0 EXPLICITLY. It used to be what pack_v2 derived from the shape; the default
-        # is now DEFAULT_PROFILE (1, 48 kHz, fixed layout) because a frame must state its rate.
-        # These tests pin the header BYTES, so they name the profile they pin rather than
-        # inheriting whichever one is currently default.
+    def _frame(self, profile_id=WR.DEFAULT_PROFILE):
         return WR.pack_v2(us_of_day=12_345_678_901, node_id=0xBEEF, seq=200, ref_db=-13.75,
                           peak=0x1234, q=_q(), retrigger=True, profile_id=profile_id)
 
@@ -195,7 +193,7 @@ class TestTheHeaderIsPinnedToBytesNotToItself:
         assert h[5:7] == (-55).to_bytes(2, "little", signed=True)   # -13.75 dB at 0.25 dB
         assert h[7:9] == b"\x34\x12"                                # peak, not node_id
         assert h[9:11] == b"\xef\xbe"                               # node_id, not peak
-        assert h[11:13] == (0xC841).to_bytes(2, "little")           # seq 200|ver 2<<5|retrig
+        assert h[11:13] == (0xC843).to_bytes(2, "little")           # seq 200|ver 2<<5|pid 1<<1|retrig 1
 
     def test_peak_and_node_id_are_not_interchangeable(self):
         """Both are <H> and adjacent. Swapping them in pack AND unpack round-trips perfectly."""
@@ -203,19 +201,30 @@ class TestTheHeaderIsPinnedToBytesNotToItself:
         assert (got["peak"], got["node_id"]) == (0x1234, 0xBEEF)
         assert struct.unpack_from("<H", self._frame(), 7)[0] == 0x1234
 
+    def test_legacy_profile_0_cannot_be_packed_by_pack_v2(self):
+        with pytest.raises(ValueError, match="profile_id 0"):
+            WR.pack_v2(1, 1, 0, 0.0, 0, _q(), profile_id=0)
+
+    def test_legacy_profile_0_can_still_be_unpacked(self):
+        raw = self.GOLDEN_LEGACY_P0 + _q().tobytes()
+        got = WR.unpack_v2(raw)
+        assert got["profile_id"] == 0
+        assert got["version"] == 2
+        assert got["fs_hz"] is None
+
     def test_the_profile_field_starts_at_bit_1(self):
         """Force bit 1 on a profile-0 frame: if the field starts there, the id reads as 1.
 
         ⚠️This used to assert the frame was REFUSED, because profile 1 did not exist. It does now
         (20x8 at 48 kHz, fixed layout), so the same bit flip is observed by what it decodes to
         instead -- a stronger check, since it reads the field rather than only its absence."""
-        b = bytearray(self._frame(profile_id=0))
+        b = bytearray(self.GOLDEN_LEGACY_P0 + _q().tobytes())
         b[11] |= 0x02                                   # bit 1 -> profile 1 if the field is there
         got = WR.unpack_v2(bytes(b))
         assert got["profile_id"] == 1
         assert WR.profile_geometry(got["profile_id"]).fs_hz == 48000.0
         # and an id nothing defines is still refused, from the same base
-        b2 = bytearray(self._frame(profile_id=0))
+        b2 = bytearray(self.GOLDEN_LEGACY_P0 + _q().tobytes())
         b2[11] |= 0x08                                  # bit 3 -> profile 4
         with pytest.raises(ValueError, match="unknown profile id 4"):
             WR.unpack_v2(bytes(b2))
@@ -223,7 +232,7 @@ class TestTheHeaderIsPinnedToBytesNotToItself:
     def test_the_profile_field_is_4_bits_and_stops_below_the_version_field(self):
         """Profile ids 8-15 use bit 4. If profile and version overlap, an id in that half is read
         as a version bump and the frame is rejected for the wrong reason -- or accepted."""
-        b = bytearray(self._frame(profile_id=0))        # from a ZERO base, so bit 4 alone is id 8
+        b = bytearray(self.GOLDEN_LEGACY_P0 + _q().tobytes())  # from a ZERO base, so bit 4 alone is id 8
         b[11] |= 0x10                                   # bit 4 -> profile 8, version still 2
         with pytest.raises(ValueError, match="unknown profile id 8"):
             WR.unpack_v2(bytes(b))

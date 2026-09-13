@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 258723 B serialised; 258907 B of annotations against a 262144 B cap.
+# apply-mode server: 277540 B serialised; 277724 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,12 +8,349 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'a88af7b-dirty'
+    dama-hear/commit: '2777f93-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '258723'
+    dama-hear/serialised-bytes: '277540'
 data:
   hear__init__.py: |
+    
+  hear_wire.py: |
+    #!/usr/bin/env python3
+    """v2 frame: the sketch plus the three things a solver cannot work without.
+    
+    v1 (hear/sketch.py) carries no node id, no sequence number and no absolute time. Its 4 B stamp is
+    microseconds WITHIN the PPS second and delegates the second to the mesh clock (sketch.py:87-88),
+    so a one-second mislabel is 343 m of range error and nothing downstream can see it. v2 adds
+    node_id (2 B), microseconds-of-day (5 B, 37 bits) and an 8-bit sequence, and pays for them by
+    dropping v1's 2 B of bands+frames -- MEL_BANDS and FRAMES are compile-time constants
+    (sketch.py:26-27) re-sent on every frame forever -- in favour of a 4-bit profile id inside the
+    flags word v1 already spends 2 B on and uses one bit of. 173 B against the ~200 B usable in a
+    Meshtastic payload (sketch.py:31,107).
+    
+    ⚠️THE FLAGS WORD IS FULLY ALLOCATED: 8 bits seq, 3 version, 4 profile, 1 retrigger, zero spare.
+    A new per-detection flag (clipped, pps_locked, a class hint) costs a new profile id or a v3
+    frame. That is what 13 header bytes buys.
+    
+    ⚠️`us_of_day` IS NOT v1's `node_us`, AND THE TWO KEYS NEVER MEET. Both are microseconds; one is
+    sub-second, the other absolute within the day. Sharing a name is the 343 m mistake above waiting
+    to happen, so this module ships no alias and no compatibility shim.
+    
+    ⚠️A v2 FRAME CANNOT CARRY AN UNLISTED GEOMETRY. profile_for() raises rather than inventing an id.
+    That is the honest cost of spending 4 bits instead of 16 on the sketch shape.
+    
+    ⚠️A PROFILE NAMES THE WHOLE GEOMETRY, NOT JUST THE SHAPE. (bands, frames) does not say what a
+    byte MEANS: two 20x8 frames at different NFFT, different hop or different band layout are the
+    same shape and different measurements. v1 states its rate in flags bits 8-11 and its layout in
+    bit 12; the v2 flags word has no spare bit for either, so a v2 frame was LESS self-describing
+    than the v1 it replaced. PROFILE_GEOMETRY closes that -- the id names bands, frames, NFFT, hop,
+    rate, layout and the band edges together, which is what 4 bits are for.
+    
+    ⚠️AND THE COST: profiles 0, 1 and 2 share a shape, so a single bit flip in the profile field
+    relabels a frame's rate without changing its length, and nothing inside the frame can catch it.
+    The transport CRC is the only guard. That is worse than a length mismatch and better than a frame
+    that cannot say what its bands mean at all; test_backend_pipeline pins it so it is not assumed
+    away.
+    
+    This module refuses; it never masks. EVERY out-of-range input raises ValueError and nothing is
+    wrapped, clamped or coerced on the way to the wire -- v1's `int(node_us) & 0xFFFFFFFF`
+    (sketch.py:91) and its `min(int(peak), 0xFFFF)` (sketch.py:92) are precisely the bug class refused
+    here. That the refusals are all one exception type is contract: a caller wraps pack_v2 in
+    `except ValueError` and catches all of them. It imports hear/sketch.py and never edits it: v1
+    pack/unpack keep working untouched.
+    """
+    from __future__ import annotations
+    
+    import math
+    import struct
+    from typing import Dict, NamedTuple, Optional, Tuple
+    
+    import numpy as np
+    
+    from . import sketch as SK
+    
+    VERSION: int = 2
+    US_PER_DAY: int = 86_400_000_000        # 37 bits. Microseconds of day, the whole timestamp range.
+    HDR_V2: int = 13                        # bytes. 5 ts + 2 ref + 2 peak + 2 node_id + 2 flags.
+    
+    # profile_id -> (bands, frames). LITERAL AND FROZEN: if SK.MEL_BANDS/SK.FRAMES were ever edited,
+    # reading these from them would silently change the meaning of every deployed frame. A test
+    # compares the two so an edit forces a NEW profile id instead of a reinterpretation.
+    PROFILES: Dict[int, Tuple[int, int]] = {0: (20, 8), 1: (20, 8), 2: (20, 8)}
+    
+    
+    class Geometry(NamedTuple):
+        """Everything that decides what a byte of the sketch MEANS.
+    
+        ⚠️(bands, frames) IS NOT ENOUGH, WHICH IS WHY THIS EXISTS. Two 20x8 frames with different
+        NFFT, different hop or different band layout are the same SHAPE and different MEASUREMENTS.
+        v1 says so in its flags -- rate in bits 8-11, fixed-layout in bit 12 -- but the v2 flags word
+        is fully allocated (8 seq, 3 version, 4 profile, 1 retrigger), so v2 has nowhere to put them.
+        Folding them into the profile id is what 4 bits are FOR: the id then names the whole geometry
+        and a v2 frame is self-describing again instead of less so than the v1 it replaced.
+    
+        `fs_hz` None means the profile does not state a rate. That is only honest for the legacy id.
+        """
+        bands: int
+        frames: int
+        nfft: int
+        hop_s: float
+        fs_hz: Optional[float]
+        layout: str
+        f_lo: float
+        f_hi: float
+    
+    
+    #: profile_id -> the full geometry. ⚠️APPEND ONLY. Editing an entry reinterprets every frame ever
+    #: sent with that id; a changed geometry takes a NEW id. Ids are 4 bits, so there are 16.
+    PROFILE_GEOMETRY: Dict[int, Geometry] = {
+        # 0 is LEGACY and deliberately left as it was found: 20x8 with the rate and layout UNSTATED,
+        # which is what every frame already sent under it actually means. It is not selectable for a
+        # new frame -- see profile_for_geometry.
+        0: Geometry(20, 8, 256, 0.004, None, SK.LAYOUT_NYQUIST, 300.0, 20000.0),
+        1: Geometry(20, 8, 256, 0.004, 48000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
+        2: Geometry(20, 8, 256, 0.004, 16000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
+    }
+    
+    #: Ids a NEW frame may claim. 0 is excluded because a frame that cannot say its own rate is the
+    #: defect, not a choice.
+    LEGACY_PROFILES = frozenset({0})
+    
+    #: Valid profile ids for a NEW frame (excludes legacy/read-only profile 0).
+    NEW_PROFILE_IDS: frozenset[int] = frozenset(k for k in PROFILE_GEOMETRY if k not in LEGACY_PROFILES)
+    
+    #: What pack_v2 uses when the caller names no profile.
+    #:
+    #: ⚠️A DECLARED CONSTANT, NOT A DERIVATION. It used to derive the id from q.shape, which is how a
+    #: rate-unstated frame reached the wire: 20x8 matched exactly one id and that id said nothing
+    #: about rate or band layout. Shape can no longer select an id at all (profile_for refuses when
+    #: it is ambiguous, which 20x8 now is). A caller that does not care still gets a frame that
+    #: STATES what its bands mean; a caller that does passes profile_id.
+    DEFAULT_PROFILE: int = 1
+    
+    # 237 B Meshtastic payload minus 37 B protobuf/portnum, per sketch.py:31,107.
+    MESHTASTIC_USABLE: int = 200
+    
+    _SHAPES: Dict[Tuple[int, int], int] = {v: k for k, v in PROFILES.items()}
+    
+    _TS_BITS = 37
+    _TS_MASK = (1 << _TS_BITS) - 1
+    
+    _F_RETRIG = 0x0001
+    _F_PROFILE_SHIFT, _F_PROFILE_MASK = 1, 0x0F
+    _F_VERSION_SHIFT, _F_VERSION_MASK = 5, 0x07
+    _F_SEQ_SHIFT, _F_SEQ_MASK = 8, 0xFF
+    
+    _V1_HDR = 12                            # sketch.py:97, struct "<IhHBBH" -- bands at b[8], frames at b[9]
+    
+    
+    def profile_shape(profile_id: int) -> Tuple[int, int]:
+        """(bands, frames) for a profile id. Raises on an id this build does not know."""
+        try:
+            return PROFILES[int(profile_id)]
+        except KeyError:
+            raise ValueError("unknown profile id %d" % int(profile_id))
+    
+    
+    def profile_geometry(profile_id: int) -> Geometry:
+        """The full geometry a profile id names. Raises on an id this build does not know."""
+        try:
+            return PROFILE_GEOMETRY[int(profile_id)]
+        except KeyError:
+            raise ValueError("unknown profile id %d" % int(profile_id))
+    
+    
+    def profile_for(bands: int, frames: int) -> int:
+        """The profile id carrying this sketch SHAPE.
+    
+        ⚠️SHAPE ALONE NO LONGER IDENTIFIES A PROFILE, and this raises when it is ambiguous rather
+        than picking one. 20x8 is now three profiles differing in rate and band layout, and choosing
+        between them from the shape is exactly the guess that put unstated-rate frames on the wire in
+        the first place. Use profile_for_geometry.
+        """
+        key = (int(bands), int(frames))
+        ids = sorted(k for k, v in PROFILES.items() if v == key)
+        if not ids:
+            raise ValueError("no profile for %dx%d" % key)
+        if len(ids) > 1:
+            raise ValueError(
+                "%dx%d is ambiguous across profiles %s -- they differ in rate or band layout, which "
+                "the shape does not carry. Pass profile_id, or use profile_for_geometry(fs_hz=..., "
+                "layout=...)." % (key[0], key[1], ids))
+        return ids[0]
+    
+    
+    def profile_for_geometry(bands: int, frames: int, fs_hz: float, layout: str,
+                             nfft: int = SK.NFFT, hop_s: float = SK.HOP_S,
+                             f_lo: float = SK.F_LO, f_hi: float = SK.F_HI) -> int:
+        """The profile id for a COMPLETE geometry. Refuses anything unlisted and never invents an id.
+    
+        Refuses a legacy profile too: a new frame must be able to say what its bands mean.
+        """
+        want = Geometry(int(bands), int(frames), int(nfft), float(hop_s),
+                        float(fs_hz), str(layout), float(f_lo), float(f_hi))
+        for k, g in sorted(PROFILE_GEOMETRY.items()):
+            if g == want and k not in LEGACY_PROFILES:
+                return k
+        raise ValueError(
+            "no profile for %r. A geometry that is not listed cannot be encoded in 4 bits; allocate "
+            "a new id in PROFILE_GEOMETRY rather than reinterpreting an existing one." % (want,))
+    
+    
+    def wire_size_v2(profile_id: int = 0) -> int:
+        bands, frames = profile_shape(profile_id)
+        return HDR_V2 + bands * frames
+    
+    
+    def fits_meshtastic_v2(profile_id: int = 0, overhead: int = 37) -> bool:
+        """Mirrors sketch.fits_meshtastic against the same 237 B payload."""
+        return wire_size_v2(profile_id) <= SK.MESHTASTIC_PAYLOAD - overhead
+    
+    
+    def pack_v2(us_of_day: int, node_id: int, seq: int, ref_db: float, peak: int,
+                q: np.ndarray, retrigger: bool = False,
+                profile_id: Optional[int] = None) -> bytes:
+        """13 B header + bands*frames int8.
+    
+        `us_of_day` is integer MICROSECONDS OF DAY, UTC -- not v1's sub-second `node_us`.
+        `profile_id` None uses DEFAULT_PROFILE -- a declared id, not one derived from q.shape. The
+        shape is still checked against it, so a mismatched sketch raises rather than being relabelled.
+    
+        Refuses, never wraps and never clamps: an out-of-range timestamp, node id, sequence, peak or
+        ref_db raises ValueError rather than being masked into the field (the sketch.py:91-92 failure).
+        A non-2-D `q` raises ValueError too, not the IndexError the shape lookup would give.
+        """
+        us = int(us_of_day)
+        if not (0 <= us < US_PER_DAY):
+            raise ValueError("us_of_day %d outside 0..86399999999" % us)
+        nid = int(node_id)
+        if not (0 <= nid <= 0xFFFF):
+            raise ValueError("node_id %d outside 0..65535" % nid)
+        s = int(seq)
+        if not (0 <= s <= 0xFF):
+            raise ValueError("seq %d outside 0..255" % s)
+        pk = int(peak)
+        if not (0 <= pk <= 0xFFFF):
+            raise ValueError("peak %d outside 0..65535" % pk)
+        # ref_db lands in an <h> at 0.25 dB, so the field tops out at -8192..8191.75 dB. Absurd input
+        # either way -- the point is that it fails as a ValueError, not as a struct.error the caller's
+        # `except ValueError` walks straight past.
+        r4 = int(round(float(ref_db) * 4))
+        if not (-0x8000 <= r4 <= 0x7FFF):
+            raise ValueError("ref_db %r outside -8192..8191.75 dB" % (ref_db,))
+    
+        q = np.asarray(q)
+        if q.ndim != 2:
+            raise ValueError("q is %d-D; a sketch is 2-D (bands, frames)" % q.ndim)
+        pid = DEFAULT_PROFILE if profile_id is None else int(profile_id)
+        if pid not in NEW_PROFILE_IDS:
+            raise ValueError("profile_id %d is not a valid new profile id (valid: %s)"
+                             % (pid, sorted(NEW_PROFILE_IDS)))
+        bands, frames = profile_shape(pid)
+        if q.shape != (bands, frames):
+            raise ValueError("q shape %r does not match profile %d (%dx%d)"
+                             % (tuple(q.shape), pid, bands, frames))
+    
+        flags = ((_F_RETRIG if retrigger else 0)
+                 | ((pid & _F_PROFILE_MASK) << _F_PROFILE_SHIFT)
+                 | ((VERSION & _F_VERSION_MASK) << _F_VERSION_SHIFT)
+                 | ((s & _F_SEQ_MASK) << _F_SEQ_SHIFT))
+        hdr = (us.to_bytes(5, "little") + struct.pack("<hHHH", r4, pk, nid, flags))
+        return hdr + q.astype(np.int8).tobytes()
+    
+    
+    def unpack_v2(b: bytes) -> Dict:
+        """Decode a v2 frame. Raises on a length, version or timestamp-invariant violation rather
+        than reshaping whatever arrived."""
+        if len(b) < HDR_V2:
+            raise ValueError("v2 frame is %d bytes, header needs %d" % (len(b), HDR_V2))
+        flags = struct.unpack_from("<H", b, 11)[0]
+        pid = (flags >> _F_PROFILE_SHIFT) & _F_PROFILE_MASK
+        bands, frames = profile_shape(pid)
+        n = HDR_V2 + bands * frames
+        if len(b) != n:
+            raise ValueError("v2 frame is %d bytes, profile %d needs %d" % (len(b), pid, n))
+        version = (flags >> _F_VERSION_SHIFT) & _F_VERSION_MASK
+        if version != VERSION:
+            raise ValueError("frame version %d is not %d" % (version, VERSION))
+    
+        ts40 = int.from_bytes(b[0:5], "little")
+        # Second, independent check on the timestamp: the top 3 bits of the uint40 are a strict zero
+        # invariant, so a corrupted high byte cannot pass as a plausible time.
+        if ts40 >> _TS_BITS:
+            raise ValueError("ts40 bits 37-39 set (0x%010x): not a microseconds-of-day frame" % ts40)
+        us = ts40 & _TS_MASK
+        if us >= US_PER_DAY:
+            raise ValueError("us_of_day %d outside 0..86399999999" % us)
+    
+        ref4, peak, node_id, _ = struct.unpack_from("<hHHH", b, 5)
+        q = np.frombuffer(b[HDR_V2:n], dtype=np.int8).reshape(bands, frames)
+        geom = profile_geometry(pid)
+        fs = geom.fs_hz
+        layout = geom.layout
+        vb = None if fs is None else SK.valid_bands(fs, bands, layout=layout)
+        be = None if fs is None else SK.band_edges_hz(fs, bands, layout=layout)
+        return {"version": VERSION, "us_of_day": us,
+                "node_id": node_id, "seq": (flags >> _F_SEQ_SHIFT) & _F_SEQ_MASK,
+                "ref_db": ref4 / 4.0, "peak": peak,
+                "retrigger": bool(flags & _F_RETRIG), "profile_id": pid,
+                "bands": bands, "frames": frames, "flags": flags,
+                "fs_hz": fs, "layout": layout, "valid_bands": vb, "band_edges_hz": be,
+                "q": q, "db": q.astype(float) / 2.0 + ref4 / 4.0}
+    
+    
+    def version_of(b: bytes) -> int:
+        """1 or 2, by length plus self-consistency. v2 is tested FIRST and that order is contract.
+    
+        ⚠️THE DISCRIMINATION IS NOT EXACT AND NOTHING CAN MAKE IT SO: v1 has no version field to read
+        (sketch.py:97). A v1 frame whose bands*frames happened to equal a v2 profile's payload and
+        whose bytes 11-12 happened to spell version 2 would be misread. With MEL_BANDS 20 and
+        FRAMES 8 frozen (sketch.py:26-27) that collision does not exist in this repo, which is a
+        property of the constants and not of this function.
+        """
+        if len(b) >= HDR_V2:
+            flags = struct.unpack_from("<H", b, 11)[0]
+            pid = (flags >> _F_PROFILE_SHIFT) & _F_PROFILE_MASK
+            version = (flags >> _F_VERSION_SHIFT) & _F_VERSION_MASK
+            if version == VERSION and pid in PROFILES and len(b) == wire_size_v2(pid):
+                if not (int.from_bytes(b[0:5], "little") >> _TS_BITS):
+                    return VERSION
+        if len(b) >= _V1_HDR and 1 <= b[8] <= 64 and 1 <= b[9] <= 64 and len(b) == _V1_HDR + b[8] * b[9]:
+            return 1
+        raise ValueError("unrecognised frame: %d bytes" % len(b))
+    
+    
+    def decode(b: bytes) -> Dict:
+        """version_of() then the matching unpacker. A v1 result gains 'version': 1 from HERE --
+        sketch.py is read-only -- and keeps its own 'node_us' key. Nothing else is renamed."""
+        v = version_of(b)
+        if v == VERSION:
+            return unpack_v2(b)
+        d = SK.unpack(b)
+        d["version"] = 1
+        return d
+    
+    
+    def us_of_day_from_utc(t_utc_s: float) -> int:
+        return int(round((float(t_utc_s) % 86400.0) * 1e6)) % US_PER_DAY
+    
+    
+    def unwrap_utc(us_of_day: int, ref_utc_s: float) -> float:
+        """Absolute UTC seconds, nearest-wrap against `ref_utc_s`.
+    
+        THE MIDNIGHT RULE: `ref_utc_s` must be within 12 h of the true event time -- a frame's own
+        receive time always is. A receiver clock a whole day wrong shifts every node by the SAME
+        86400 s, which cancels in TDoA; the only case where the day reaches the geometry is a group
+        straddling midnight, and unwrapping each frame against its own receive time handles that.
+        Feeding one shared reference to a whole group is what breaks it.
+        """
+        ref = float(ref_utc_s)
+        t = math.floor(ref / 86400.0) * 86400.0 + int(us_of_day) / 1e6
+        while t - ref > 43200.0:
+            t -= 86400.0
+        while ref - t > 43200.0:
+            t += 86400.0
+        return t
     
   hear_sketch.py: |
     #!/usr/bin/env python3
@@ -287,6 +624,7 @@ data:
     import numpy as np
     
     from . import sketch as SK
+    from . import wire as WR
     
     #: Phone `clock_tier` values whose stamp is a UTC MEASUREMENT rather than a wall-clock reading.
     #: Copied deliberately, not invented: this is dama-gotchi's own
@@ -456,10 +794,10 @@ data:
     
     
     def _decode(frame: bytes) -> Dict:
-        """SK.unpack's ValueErrors become SkipReason: a malformed frame is a message this corpus
+        """hear.wire.decode's ValueErrors become SkipReason: a malformed frame is a message this corpus
         could not use, not a crash in the reader."""
         try:
-            return SK.unpack(frame)
+            return WR.decode(frame)
         except ValueError as e:
             raise SkipReason(str(e))
     
@@ -493,10 +831,26 @@ data:
             # An older phone build that packed no rate code but reported it alongside. Believable,
             # and recorded as coming from the JSON rather than the frame.
             fs = float(payload["fs"])
-        utc_us = phone_utc_us(payload.get("ts_utc_ms"), d["node_us"])
+        node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
+        utc_us = phone_utc_us(payload.get("ts_utc_ms"), node_us)
+        extra = dict({k: payload[k] for k in
+                    ("trigger_ts_utc_ms", "onset_offset_us", "onset_dated", "onset_found",
+                     "since_prev_s", "utc_trusted")
+                    if k in payload},
+                   # from the FRAME, not the JSON: it decides whether this row can be aligned
+                   # with a row from a sensor running at another rate.
+                   layout=d["layout"], valid_bands=d["valid_bands"])
+        if "us_of_day" in d:
+            extra["us_of_day"] = d["us_of_day"]
+        if "seq" in d:
+            extra["seq"] = d["seq"]
+        if "profile_id" in d:
+            extra["profile_id"] = d["profile_id"]
+        if "version" in d:
+            extra["version"] = d["version"]
         return Record(
             node_id=str(nid), source="phone", q=d["q"], ref_db=d["ref_db"], peak=d["peak"],
-            bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=d["node_us"],
+            bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=node_us,
             retrigger=bool(d["retrigger"]),
             ts_utc_s=None if utc_us is None else utc_us / 1e6,
             clipped=payload.get("clipped"),
@@ -507,13 +861,7 @@ data:
             # `Record.utc_trusted` -- so a Record that drops them cannot answer the gate's question
             # about itself. `onset_found` was being dropped here entirely
             # (AcousticRangingCollector.kt:3513 publishes it).
-            extra=dict({k: payload[k] for k in
-                        ("trigger_ts_utc_ms", "onset_offset_us", "onset_dated", "onset_found",
-                         "since_prev_s", "utc_trusted")
-                        if k in payload},
-                       # from the FRAME, not the JSON: it decides whether this row can be aligned
-                       # with a row from a sensor running at another rate.
-                       layout=d["layout"], valid_bands=d["valid_bands"]),
+            extra=extra,
         )
     
     
@@ -527,12 +875,26 @@ data:
         """
         d = _decode(frame)
         fs = d["fs_hz"] if d["fs_hz"] is not None else fs_hz
-        ts = None if second_utc_s is None else float(second_utc_s) + d["node_us"] / 1e6
+        if d.get("version", 1) >= 2:
+            node_us = d["us_of_day"] % 1_000_000
+            ts = None if second_utc_s is None else WR.unwrap_utc(d["us_of_day"], float(second_utc_s))
+        else:
+            node_us = d["node_us"]
+            ts = None if second_utc_s is None else float(second_utc_s) + d["node_us"] / 1e6
+        extra = {"layout": d["layout"], "valid_bands": d["valid_bands"]}
+        if "us_of_day" in d:
+            extra["us_of_day"] = d["us_of_day"]
+        if "seq" in d:
+            extra["seq"] = d["seq"]
+        if "profile_id" in d:
+            extra["profile_id"] = d["profile_id"]
+        if "version" in d:
+            extra["version"] = d["version"]
         return Record(
             node_id=str(node_id), source="node", q=d["q"], ref_db=d["ref_db"], peak=d["peak"],
-            bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=d["node_us"],
+            bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=node_us,
             retrigger=bool(d["retrigger"]), ts_utc_s=ts,
-            extra={"layout": d["layout"], "valid_bands": d["valid_bands"]},
+            extra=extra,
         )
     
     
@@ -805,8 +1167,9 @@ data:
     GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5, G6)
     LATEST = G6
     
-    # One packed v1 sketch is 172 bytes; the column holds it as hex.
+    # One packed v1 sketch is 172 bytes (344 hex); v2 is 173 bytes (346 hex).
     FRAME_HEX_LEN = 344
+    FRAME_HEX_LENS = frozenset({344, 346})
     
     
     class UnknownSchema(ValueError):
@@ -909,7 +1272,7 @@ data:
             if not fh:
                 out._skip(n, "no_frame")
                 continue
-            if len(fh) != FRAME_HEX_LEN:
+            if len(fh) not in FRAME_HEX_LENS:
                 out._skip(n, "frame_hex_len_%d" % len(fh))
                 continue
             if "node_id" in d and d["node_id"]:
@@ -957,7 +1320,7 @@ data:
     smaller descriptor.
     
     ⚠️THE SECOND AXIS IS `slices`, NOT `frames`, AND `frames` IS A ROW TOTAL. The column carries
-    `SCENE_FRAMES = SCENE_SLICES * SCENE_FRAMES_PER_SLICE` (hear_node.ino:1138-1140, written at
+    `SCENE_FRAMES = SCENE_SLICES * SCENE_FRAMES_PER_SLICE` (hear_node.ino:1569-1571, written at
     :1239) -- 64 for the whole row, at 4 slices of 16. The per-slice averaging divides by
     SCENE_FRAMES_PER_SLICE, so a reader that takes this column as the per-slice count is out by a
     factor of `slices`. Neither number is the shape. `frames_per_slice()` derives the per-slice count
@@ -1376,6 +1739,7 @@ data:
     from . import identity as ID
     from . import scenefile as SF
     from . import sketch as SK
+    from . import wire as WR
     
     SCHEMA_VERSION = 1
     
@@ -1558,14 +1922,17 @@ data:
     def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
         frame = binascii.unhexlify(row["frame_hex"])
-        d = SK.unpack(frame)
+        d = WR.decode(frame)
         utc_us = int(row.get("utc_us") or 0)
         node = row["node"]
         # fs: the FRAME is authoritative when it states a rate; the CSV column is only the node's
         # running estimate.
         fs_csv = row.get("fs_hz")
         fs_csv = float(fs_csv) if fs_csv not in (None, "") else None
-        return {
+        node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
+        event_flags = d.get("event_flags", 0)
+        no_context = bool(event_flags & SK.FLAG_NO_CONTEXT) if d.get("version", 1) == 1 else False
+        rec = {
             "schema_version": SCHEMA_VERSION,
             "key": key("node", node, utc_us, row.get("sample"), frame),
             "source": "node",
@@ -1587,11 +1954,11 @@ data:
             "frames": int(d["q"].shape[1]),
             "peak": d["peak"],
             "ref_db": d["ref_db"],
-            "node_us": d["node_us"],
+            "node_us": node_us,
             "retrigger": bool(d["retrigger"]),
             # event_flags, not the raw flags word: bit 1 is "no context" only in v1, and is a profile
             # bit in v2. Masking the raw word tags good v2 frames as broken.
-            "no_context": bool(d["event_flags"] & SK.FLAG_NO_CONTEXT),
+            "no_context": no_context,
             "sketch_back": (int(row["sketch_back"]) if row.get("sketch_back") not in (None, "")
                             else None),
             # ⚠️THE SAME KEY AND THE SAME UNIT AS THE PHONE PATH ABOVE (ingest_mqtt_jsonl), which is
@@ -1611,18 +1978,20 @@ data:
             # the node's own PPS edge counter. `utc_us == 0` says the node could not NAME the edge;
             # `pps_n` still says WHICH edge, and `us_since_pps` how far into it. Without the pair, a
             # row whose neighbours in the same boot ARE anchored cannot be placed even in principle,
-            # and 517 mach records were stored that way (2026-09-10, /pool/corpus/records).
-            # Keeping them does NOT make a row anchored -- see hear/unanchored.py for what may and
-            # may not be reconstructed from them, and why the pre-lock case is refused.
-            # ⚠️Records already written keep the shape they were written with: the pool is
-            # content-addressed and a re-fetch of the same row dedupes rather than rewrites. These
-            # fields appear on rows ingested from here on, not retroactively.
+            # so unanchored recovery (hear/pool.py:unanchored_window) would have had nothing to work on.
             "pps_n": row.get("pps_n"),
             "us_since_pps": row.get("us_since_pps"),
             "trigger": row.get("trigger"),
             "clip": row.get("clip") or None,
             "dets_schema": row.get("schema"),
         }
+        if "us_of_day" in d:
+            rec["us_of_day"] = d["us_of_day"]
+        if "seq" in d:
+            rec["seq"] = d["seq"]
+        if "profile_id" in d:
+            rec["profile_id"] = d["profile_id"]
+        return rec
     
     
     
@@ -1780,17 +2149,20 @@ data:
                     continue
                 try:
                     frame = base64.b64decode(b64)
-                    d = SK.unpack(frame)
+                    d = WR.decode(frame)
                 except Exception as e:
                     r = type(e).__name__
                     skips[r] = skips.get(r, 0) + 1
                     continue
                 ts_ms = payload.get("ts_utc_ms")
-                stated_utc_us = C.phone_utc_us(ts_ms, d["node_us"])
+                node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
+                stated_utc_us = C.phone_utc_us(ts_ms, node_us)
                 ts = None if stated_utc_us is None else stated_utc_us / 1e6
                 utc_us = 0 if stated_utc_us is None else stated_utc_us
                 node = str(nid or payload.get("node_id") or "?")
-                recs.append({
+                event_flags = d.get("event_flags", 0)
+                no_context = bool(event_flags & SK.FLAG_NO_CONTEXT) if d.get("version", 1) == 1 else False
+                rec = {
                     "schema_version": SCHEMA_VERSION,
                     "key": key("phone", node, utc_us, payload.get("trigger_ts_utc_ms"), frame),
                     "source": "phone", "node": node, "node_from": "topic" if nid else "payload",
@@ -1801,9 +2173,9 @@ data:
                                     ("json" if payload.get("fs") else None),
                     "layout": d["layout"], "valid_bands": d["valid_bands"],
                     "bands": int(d["q"].shape[0]), "frames": int(d["q"].shape[1]),
-                    "peak": d["peak"], "ref_db": d["ref_db"], "node_us": d["node_us"],
+                    "peak": d["peak"], "ref_db": d["ref_db"], "node_us": node_us,
                     "retrigger": bool(d["retrigger"]),
-                    "no_context": bool(d["event_flags"] & SK.FLAG_NO_CONTEXT),
+                    "no_context": no_context,
                     "sketch_back": None,
                     "clipped": payload.get("clipped"),
                     "clock_tier": payload.get("clock_tier"),
@@ -1818,7 +2190,14 @@ data:
                     # If a producer ever states it outright, it outranks the derivation. Absent is
                     # the normal case and stays absent, NOT False: see Record.utc_trusted.
                     "utc_trusted": payload.get("utc_trusted"),
-                })
+                }
+                if "us_of_day" in d:
+                    rec["us_of_day"] = d["us_of_day"]
+                if "seq" in d:
+                    rec["seq"] = d["seq"]
+                if "profile_id" in d:
+                    rec["profile_id"] = d["profile_id"]
+                recs.append(rec)
             added = self._append(recs)
             entry = {"kind": "mqtt.jsonl", "path": os.path.abspath(path), "origin": origin or path,
                      "sha256": sha, "bytes": len(raw), "rows": rows_seen, "decoded": len(recs),
@@ -2137,11 +2516,14 @@ data:
                 if usable_only and (r.get("fs_hz") is None or r.get("no_context")
                                     or r.get("layout") != SK.LAYOUT_FIXED):
                     continue
-                d = SK.unpack(base64.b64decode(r["frame_b64"]))
+                d = WR.decode(base64.b64decode(r["frame_b64"]))
+                node_us = r.get("node_us")
+                if node_us is None:
+                    node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
                 out.append(C.Record(
                     node_id=r["node"], source=r["source"], q=d["q"], ref_db=d["ref_db"],
                     peak=d["peak"], bands=d["q"].shape[0], frames=d["q"].shape[1],
-                    fs_hz=r.get("fs_hz"), node_us=d["node_us"], retrigger=bool(d["retrigger"]),
+                    fs_hz=r.get("fs_hz"), node_us=node_us, retrigger=bool(d["retrigger"]),
                     ts_utc_s=r.get("ts_utc_s"), clipped=r.get("clipped"),
                     clock_tier=r.get("clock_tier"), sync_sigma_ns=r.get("sync_sigma_ns"),
                     # ⚠️EVERYTHING THE STORE HELD THAT IS NOT ALREADY A FIELD. This was a fixed
@@ -2820,7 +3202,7 @@ data:
     
     ⚠️A CATCH-UP REFETCH IS DELIBERATELY ABSENT, AND THIS IS THE SECOND TIME THAT HAS BEEN DECIDED.
     The node has no offset argument and no Range header, so the only reach-back control is a bigger
-    `tail=` -- and `/sd` seeks against the size AT REFETCH TIME (hear_node.ino:1985-1986,
+    `tail=` -- and `/sd` seeks against the size AT REFETCH TIME (hear_node.ino:2899,
     `size_t remain = f.size(); if (tail > 0 && remain > (size_t)tail) f.seek(remain - tail)`). The
     file grows underneath for the whole of the first fetch (2 MB at the measured 40-135 KB/s is
     15-50 s, ~3.5-12 KB at ~235 B/s), so a tail sized against the pre-fetch `size_now` lands FORWARD

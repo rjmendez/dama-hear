@@ -25,6 +25,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 from . import sketch as SK
+from . import wire as WR
 
 #: Phone `clock_tier` values whose stamp is a UTC MEASUREMENT rather than a wall-clock reading.
 #: Copied deliberately, not invented: this is dama-gotchi's own
@@ -194,10 +195,10 @@ class SkipReason(Exception):
 
 
 def _decode(frame: bytes) -> Dict:
-    """SK.unpack's ValueErrors become SkipReason: a malformed frame is a message this corpus
+    """hear.wire.decode's ValueErrors become SkipReason: a malformed frame is a message this corpus
     could not use, not a crash in the reader."""
     try:
-        return SK.unpack(frame)
+        return WR.decode(frame)
     except ValueError as e:
         raise SkipReason(str(e))
 
@@ -231,10 +232,26 @@ def from_phone(payload: Dict[str, Any], node_id: Optional[str] = None) -> Record
         # An older phone build that packed no rate code but reported it alongside. Believable,
         # and recorded as coming from the JSON rather than the frame.
         fs = float(payload["fs"])
-    utc_us = phone_utc_us(payload.get("ts_utc_ms"), d["node_us"])
+    node_us = d.get("node_us", d.get("us_of_day", 0) % 1_000_000)
+    utc_us = phone_utc_us(payload.get("ts_utc_ms"), node_us)
+    extra = dict({k: payload[k] for k in
+                ("trigger_ts_utc_ms", "onset_offset_us", "onset_dated", "onset_found",
+                 "since_prev_s", "utc_trusted")
+                if k in payload},
+               # from the FRAME, not the JSON: it decides whether this row can be aligned
+               # with a row from a sensor running at another rate.
+               layout=d["layout"], valid_bands=d["valid_bands"])
+    if "us_of_day" in d:
+        extra["us_of_day"] = d["us_of_day"]
+    if "seq" in d:
+        extra["seq"] = d["seq"]
+    if "profile_id" in d:
+        extra["profile_id"] = d["profile_id"]
+    if "version" in d:
+        extra["version"] = d["version"]
     return Record(
         node_id=str(nid), source="phone", q=d["q"], ref_db=d["ref_db"], peak=d["peak"],
-        bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=d["node_us"],
+        bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=node_us,
         retrigger=bool(d["retrigger"]),
         ts_utc_s=None if utc_us is None else utc_us / 1e6,
         clipped=payload.get("clipped"),
@@ -245,13 +262,7 @@ def from_phone(payload: Dict[str, Any], node_id: Optional[str] = None) -> Record
         # `Record.utc_trusted` -- so a Record that drops them cannot answer the gate's question
         # about itself. `onset_found` was being dropped here entirely
         # (AcousticRangingCollector.kt:3513 publishes it).
-        extra=dict({k: payload[k] for k in
-                    ("trigger_ts_utc_ms", "onset_offset_us", "onset_dated", "onset_found",
-                     "since_prev_s", "utc_trusted")
-                    if k in payload},
-                   # from the FRAME, not the JSON: it decides whether this row can be aligned
-                   # with a row from a sensor running at another rate.
-                   layout=d["layout"], valid_bands=d["valid_bands"]),
+        extra=extra,
     )
 
 
@@ -265,12 +276,26 @@ def from_node(frame: bytes, node_id: str, second_utc_s: Optional[int] = None,
     """
     d = _decode(frame)
     fs = d["fs_hz"] if d["fs_hz"] is not None else fs_hz
-    ts = None if second_utc_s is None else float(second_utc_s) + d["node_us"] / 1e6
+    if d.get("version", 1) >= 2:
+        node_us = d["us_of_day"] % 1_000_000
+        ts = None if second_utc_s is None else WR.unwrap_utc(d["us_of_day"], float(second_utc_s))
+    else:
+        node_us = d["node_us"]
+        ts = None if second_utc_s is None else float(second_utc_s) + d["node_us"] / 1e6
+    extra = {"layout": d["layout"], "valid_bands": d["valid_bands"]}
+    if "us_of_day" in d:
+        extra["us_of_day"] = d["us_of_day"]
+    if "seq" in d:
+        extra["seq"] = d["seq"]
+    if "profile_id" in d:
+        extra["profile_id"] = d["profile_id"]
+    if "version" in d:
+        extra["version"] = d["version"]
     return Record(
         node_id=str(node_id), source="node", q=d["q"], ref_db=d["ref_db"], peak=d["peak"],
-        bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=d["node_us"],
+        bands=d["q"].shape[0], frames=d["q"].shape[1], fs_hz=fs, node_us=node_us,
         retrigger=bool(d["retrigger"]), ts_utc_s=ts,
-        extra={"layout": d["layout"], "valid_bands": d["valid_bands"]},
+        extra=extra,
     )
 
 
