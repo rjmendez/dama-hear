@@ -342,9 +342,10 @@ def feature_matrix(records: Iterable[Record], fs_hz: float,
     is unchanged here and only what is said about it is new.
 
     `aligned_matrix` -- whose ValueError tells the caller to "use feature_matrix() per rate" --
-    already returns an info dict. This one now does too, for the same reason and in the same
-    shape: the two are the only ways to build a training matrix here, and the loud one hands you
-    to this one.
+    already returns an info dict. This one now does too, for the same reason, with different keys
+    (`fs_hz`, `n_in`, `kept` and the `dropped_*` tally here; `bands`, `frames`, `rates_hz` there):
+    the two are the only ways to build a training matrix here, and the loud one hands you to this
+    one.
 
     mode "db"  -- absolute dB, ref_db restored. Amplitude alone was worth AUC 0.90 on the 2026-09-05
                   corpus, so this is the default.
