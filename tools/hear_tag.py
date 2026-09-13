@@ -97,7 +97,7 @@ from hear import clips as CLIPS                                            # noq
 from hear import tags as TAGS                                             # noqa: E402
 from hear import resample as RESAMPLE                                     # noqa: E402
 
-TAG_SCHEMA = "hear.clip_tag.v1"
+TAG_SCHEMA = "hear.clip_tag.v2"
 
 MODEL_NAME = "efficientat-mn10_as"
 #: Bumping this is what makes a re-tag a NEW row beside the old one rather than an overwrite.
@@ -205,6 +205,7 @@ BIRDNET_FS_HZ = 48000
 #: 3.0 s, the model's input. Windows at 0, 1 and 2 s cover the whole 5.0 s clip.
 BIRDNET_WINDOW = 144000
 BIRDNET_HOP = 48000
+BIRDNET_BANDPASS_HZ = (150.0, 12000.0)
 #: BirdNET-Analyzer's default cut on the range model's output.
 BIRDNET_LOCATION_THRESHOLD = 0.03
 #: A species enters the heard summary at this score. OBSERVATION only.
@@ -463,6 +464,17 @@ def prepare_birdnet(pcm: "Any", fs_hz: float, pad_to_s: Optional[float] = None) 
     if not len(x) or not np.any(x):
         raise ValueError("digital silence: every sample is zero")
     return x
+
+
+def birdnet_bandpass(pcm: "Any", fs_hz: float) -> "Any":
+    """Apply BirdNET V2.4's 150--12000 Hz band without changing the 48 kHz rate."""
+    import numpy as np
+    x = np.asarray(pcm, dtype=np.float32)
+    if not len(x):
+        return x
+    freqs = np.fft.rfftfreq(len(x), 1.0 / float(fs_hz))
+    mask = (freqs >= BIRDNET_BANDPASS_HZ[0]) & (freqs <= BIRDNET_BANDPASS_HZ[1])
+    return np.fft.irfft(np.fft.rfft(x) * mask, n=len(x)).astype(np.float32)
 
 
 def to_model_rate(pcm: "Any", header_fs: int, csv_fs: Optional[float] = None,
@@ -821,7 +833,7 @@ class BirdNETTagger:
 
     def tag(self, pcm: "Any", floor: float = SCORE_FLOOR, week: int = -1) -> Dict[str, Any]:
         np = self._np
-        x = np.asarray(pcm, dtype=np.float32)
+        x = birdnet_bandpass(pcm, BIRDNET_FS_HZ)
         starts = list(range(0, max(1, len(x) - BIRDNET_WINDOW + 1), BIRDNET_HOP)) or [0]
         probs = []
         for s in starts:
@@ -1029,6 +1041,14 @@ MODELS: Dict[str, Dict[str, Any]] = {
                     "prepare": prepare_birdnet, "embed_only": False, "fs_hz": BIRDNET_FS_HZ,
                     "group": birdnet_group, "species": True},
 }
+
+
+MODEL_BACKENDS = dict(TAGS.MODEL_BACKEND_LANES)
+
+
+def backend_lane(name: str) -> str:
+    """Resolve a stable CLI backend name to its compatibility lane."""
+    return TAGS.backend_lane(name)
 
 
 # ----------------------------------------------------------------- I/O
@@ -1684,7 +1704,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--pool", default="~/hear-pool",
                     help="pool root; clips/index.jsonl is read, clips/tags.jsonl is appended")
-    ap.add_argument("--model-dir", default="~/hear-pool/models/yamnet",
+    ap.add_argument("--model-dir", default=None,
                     help="directory holding %s and %s. ⚠️NOTHING HERE FETCHES THEM: both are "
                          "verified against a pinned sha256 and the run is refused otherwise"
                          % (MODEL_FILE, CLASSMAP_FILE))
@@ -1715,8 +1735,21 @@ def main(argv=None) -> int:
     ap.add_argument("--lane", action="append", choices=sorted(LANES),
                     help="lane to run; repeat for several, which share one model load. "
                          "--check reads exactly one. Default %s" % DEFAULT_LANE)
+    ap.add_argument("--model", choices=sorted(TAGS.MODEL_BACKENDS),
+                    help="model backend: yamnet, birdnet, or perch")
     a = ap.parse_args(argv)
-    lanes = a.lane or [DEFAULT_LANE]
+    selected_backend_lane = backend_lane(a.model) if a.model else None
+    if a.lane and selected_backend_lane:
+        selected_model = LANES[selected_backend_lane]["model"]
+        if any(LANES[lane]["model"] != selected_model for lane in a.lane):
+            print("--model %s conflicts with --lane %s" % (a.model, a.lane), file=sys.stderr)
+            return 2
+    lanes = a.lane or ([selected_backend_lane] if selected_backend_lane else [DEFAULT_LANE])
+    if a.model_dir is None:
+        default_dirs = {"mn10": "~/hear-pool/models/mn10_as",
+                        "birdnet_v24": "~/hear-pool/models/birdnet_v24",
+                        "perch_v2": "~/hear-pool/models/perch_v2"}
+        a.model_dir = default_dirs[LANES[lanes[0]]["model"]]
     models = sorted({LANES[lane]["model"] for lane in lanes})
     if len(models) != 1 and not a.check:
         print("one invocation runs one model; lanes %s use %s" % (lanes, models), file=sys.stderr)

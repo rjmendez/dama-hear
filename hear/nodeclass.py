@@ -730,6 +730,61 @@ register(NodeClass(
 ))
 
 
+register(NodeClass(
+    name="hugbot-array",
+    time_source="ntp",
+    # ⚠️HUGBOT IS NOT AN ARRIVAL SOURCE. measured live 2026-09-10 over the acoustic latency
+    # calibration rig (tools/hugbot_latency.py, testdata/hugbot_latency_trials.json):
+    # A Raspberry Pi 4 running the dama-gotchi orchestrator stack, with a 16-channel TDM I2S
+    # microphone array (ICS-52000 MEMS mics) on GPIO20/21 I2S at 48 kHz. The measurement caught
+    # one aligned channel (board 0, column 3) across 20 trials where both the hugbot and a
+    # co-located xiao-s3-pps ESP32 node played and recorded the same Chirp impulse. The latency
+    # between the ESP tap and the hugbot ring was 178.5 ms ± 11.3 ms. This is not a CLOCK issue --
+    # the Pi running chrony is near a PPS/GPS source on the mast and would pass the t_sigma gate
+    # if it had one. The latency is the AUDIO PATH: Bluetooth-connected USB audio card, ALSA ring
+    # buffer, DMA block boundaries, and the Android emulator + dama-gotchi stack. 178.5 ms is
+    # 61.2 m of pure bias; the arrival budget allows 91.5 us (31.4 mm). Hugbot is refused by a
+    # factor of nearly 2000x.
+    #
+    # That is conservative and it is the honest number: the Pi's local time is Stratum 3 at best,
+    # worse than the ntp-NTP figure below. But the real problem is the audio path, which will never
+    # align in a TDoA no matter how good the clock is.
+    #
+    # ⚠️BUT HUGBOT IS AN EXCELLENT SENSOR NODE. A 16-mic array beats any single-mic node on
+    # classification, direction finding, and bearing. The firmware reads the ring and ships snapshots
+    # to a pool, dama-gotchi processes them into tags, and those tags and raw audio are how hugbot
+    # contributes. It is excluded from arrivals; it is not excluded from the pool.
+    t_sigma_s=3e-3,  # Stratum 3 NTP / system time
+    # The entire budget is clock and no capture term has been measured to split it.
+    clock_sigma_s=3e-3,
+    # THE DISQUALIFYING TERM: hugbot's AUDIO PATH LATENCY. Measured and unmeasured variants both
+    # refuse it: the best-aligned board carried 178.5 ms = 61.2 m of bias, 670x over the 91.5 us
+    # (31.4 mm) bound. Even if that channel's per-trial scatter (11.3 ms = 3.88 m) is called a
+    # capture sigma, it is still a bias that does not average. The second board had no alignment at
+    # all (rho < 0.9), so the spread across boards exceeded the array's ability to explain it.
+    # A hugbot array measuring itself against itself might bridge that gap; against an ESP32 node
+    # it does not.
+    path_bias_s=0.1784917,
+    mic_count=16,
+    fs_hz=48000.0,
+    # Nyquist at 48 kHz is 24 kHz; the ICS-52000 datasheet (docs/node-hardware.md, HUGBOT5000 section)
+    # and the 3D mic array spec (docs/MIC_ARRAY_3D.md) do not state a lower edge. Empirically it is
+    # around 50 Hz. The datasheet says "low-passed above 24 kHz, NO ultrasonic content at any
+    # sample rate" which matches xiao-s3-i2s.
+    band_hz=(50.0, 24000.0),
+    env=("temp",),  # Pi ambient temp only; no HAL-anchored sensor suite
+    raw_retain_s=0.0,  # Audio is served on-demand by dama-gotchi, not retained locally
+    notes="Raspberry Pi 4 running dama-gotchi with 16-channel TDM I2S microphone array "
+          "(ICS-52000 MEMS mics). EXCELLENT platform for classification and bearing: 16 mics "
+          "for 3D DoA, low noise floor, 8+ s ring in dama-gotchi's memory for calibration and "
+          "training. Refused for arrivals on ONE count only: the 178.5 ms uncorrected audio-path "
+          "latency measured live 2026-09-10 against a co-located xiao-s3-pps, 61.2 m of pure bias "
+          "that no weight removes (1951x over the 31.4 mm arrival bias budget). The clock (Stratum "
+          "3 NTP at best) would ALSO refuse it by 87x on random sigma, but the audio path is the "
+          "load-bearing refusal.",
+))
+
+
 def strictest_arrival_class() -> NodeClass:
     """The admissible class with the LEAST room for a stated clock sigma.
 

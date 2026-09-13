@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 280393 B serialised; 280577 B of annotations against a 262144 B cap.
+# apply-mode server: 281145 B serialised; 281329 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: '7ab5bb6-dirty'
+    dama-hear/commit: '319b54b-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '280393'
+    dama-hear/serialised-bytes: '281145'
 data:
   hear__init__.py: |
     
@@ -76,7 +76,7 @@ data:
     # profile_id -> (bands, frames). LITERAL AND FROZEN: if SK.MEL_BANDS/SK.FRAMES were ever edited,
     # reading these from them would silently change the meaning of every deployed frame. A test
     # compares the two so an edit forces a NEW profile id instead of a reinterpretation.
-    PROFILES: Dict[int, Tuple[int, int]] = {0: (20, 8), 1: (20, 8), 2: (20, 8)}
+    PROFILES: Dict[int, Tuple[int, int]] = {0: (20, 8), 1: (20, 8), 2: (20, 8), 3: (20, 8), 4: (20, 8)}
     
     
     class Geometry(NamedTuple):
@@ -110,6 +110,9 @@ data:
         0: Geometry(20, 8, 256, 0.004, None, SK.LAYOUT_NYQUIST, 300.0, 20000.0),
         1: Geometry(20, 8, 256, 0.004, 48000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
         2: Geometry(20, 8, 256, 0.004, 16000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
+        # Schema 2.0 multi-rate profiles: 3 for 32 kHz (HUGBOT5000), 4 for 24 kHz
+        3: Geometry(20, 8, 256, 0.004, 32000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
+        4: Geometry(20, 8, 256, 0.004, 24000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
     }
     
     #: Ids a NEW frame may claim. 0 is excluded because a frame that cannot say its own rate is the
@@ -130,8 +133,6 @@ data:
     
     # 237 B Meshtastic payload minus 37 B protobuf/portnum, per sketch.py:31,107.
     MESHTASTIC_USABLE: int = 200
-    
-    _SHAPES: Dict[Tuple[int, int], int] = {v: k for k, v in PROFILES.items()}
     
     _TS_BITS = 37
     _TS_MASK = (1 << _TS_BITS) - 1
@@ -508,14 +509,14 @@ data:
     
     
     def sketch(x: np.ndarray, fs: float, bands: int = MEL_BANDS, frames: int = FRAMES,
-               hop_s: float = HOP_S, nfft: int = NFFT,
-               layout: str = LAYOUT_NYQUIST) -> Tuple[np.ndarray, float]:
+               hop_s: float = HOP_S, nfft: int = NFFT, f_lo: float = F_LO,
+               f_hi: float = F_HI, layout: str = LAYOUT_NYQUIST) -> Tuple[np.ndarray, float]:
         """(int8 [bands x frames], ref_db). Frames start at the sample the caller passes as index 0.
     
         `layout` decides what band k MEANS -- see [mel_filterbank]. At any rate above
         LAYOUT_EQUIVALENT_ABOVE_HZ the two are the same bytes."""
         x = np.asarray(x, float)
-        fb = mel_filterbank(fs, nfft, bands, layout=layout)
+        fb = mel_filterbank(fs, nfft, bands, f_lo=f_lo, f_hi=f_hi, layout=layout)
         hop = max(1, int(hop_s * fs))
         win = np.hanning(nfft)
         out = np.zeros((bands, frames))
@@ -4989,7 +4990,9 @@ data:
     
     It reports and does not gate. The exit code says whether every node ANSWERED, never whether the
     answers were good -- the same rule tools/validate_scene.py follows, and for the same reason: a
-    tool that exits non-zero on a node with no sky yet trains its operator to ignore it.
+    tool that exits non-zero on a node with no sky yet trains its operator to ignore it. It also never
+    declares a node offline from HTTP alone: use the OPNsense DHCP/ARP lookup, the node `/status`
+    probe, and the `hear-drain` ingestion heartbeat as the mandatory three-layer verification.
     
     ⚠️A `-dirty` build did not come from any commit. Two nodes both reporting the same -dirty string
     are NOT thereby on the same code; the string names the last tag, not the working tree.
@@ -5018,6 +5021,12 @@ data:
     # tools/hear_drain.py's LS_RETRY_BACKOFF_S, the other place this exact collision is measured and
     # waited out, so a future change to that number is one place to make, not two.
     RETRY_BACKOFF_S = 1.5
+    
+    OFFLINE_VERIFICATION = (
+        "1) confirm the node's DHCP lease and ARP entry on the OPNsense gateway; "
+        "2) probe the node HTTP /status endpoint; "
+        "3) verify hear-drain ingestion/heartbeat for that node"
+    )
     
     # MEASURED, not assumed: nyquist wrote 2,689,167 B of scene.csv across 8,018 rows = 335 B/row, at
     # one row per 1.024 s. Everything else on the card is bounded or negligible -- the clip budget is a
@@ -5126,7 +5135,8 @@ data:
                 # flash that landed the wrong identity is the failure this whole column exists for
                 print(row(got[n].get("node") or names[n], got[n]))
         for d in dead:
-            print("  UNREACHABLE  " + d)
+            print("  HTTP PROBE FAILED  " + d)
+            print("    OFFLINE UNCONFIRMED -- " + OFFLINE_VERIFICATION)
     
         if len(got) > 1:
             builds = {d.get("fw", "?") for d in got.values()}

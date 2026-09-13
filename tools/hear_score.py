@@ -153,12 +153,13 @@ R_LAYOUT_MISMATCH = "layout_mismatch"
 R_BANDS_FOR_RATE = "bands_insufficient_for_rate"
 R_MODEL_WEIGHTS = "model_weights_mismatch"
 R_FS_UNSTATED = "fs_unstated"
+R_FS_MISMATCH = "fs_mismatch"
 R_FRAME_UNDECODABLE = "frame_undecodable"
 R_LINE_UNPARSEABLE = "line_unparseable"
 R_UNCLASSIFIED = "mismatch_unclassified"
 
 REFUSAL_REASONS = (R_FRAMES, R_BANDS_SHORT, R_LAYOUT_UNSTATED, R_LAYOUT_MISMATCH,
-                   R_BANDS_FOR_RATE, R_MODEL_WEIGHTS, R_FS_UNSTATED, R_FRAME_UNDECODABLE,
+                   R_BANDS_FOR_RATE, R_MODEL_WEIGHTS, R_FS_UNSTATED, R_FS_MISMATCH, R_FRAME_UNDECODABLE,
                    R_LINE_UNPARSEABLE, R_UNCLASSIFIED)
 
 
@@ -228,6 +229,10 @@ def classify_refusal(frame: Dict[str, Any], model: Dict[str, Any]) -> str:
         return R_LAYOUT_UNSTATED
     if frame["layout"] != model.get("layout"):
         return R_LAYOUT_MISMATCH
+    model_fs = model.get("sample_rate_hz")
+    if model.get("wire_profile") == 3 and model_fs is not None:
+        if frame.get("fs_hz") != float(model_fs):
+            return R_FS_MISMATCH
     valid = frame.get("valid_bands")
     if valid is not None and valid < want_b:
         return R_BANDS_FOR_RATE
@@ -257,6 +262,10 @@ def model_block(model: Dict[str, Any], path: str, sha: str) -> Dict[str, Any]:
         "frames": int(model["frames"]),
         "order": model.get("order"),
         "layout": model.get("layout"),
+        "wire_profile": model.get("wire_profile"),
+        "sample_rate_hz": model.get("sample_rate_hz"),
+        "f_lo_hz": model.get("f_lo_hz"),
+        "f_hi_hz": model.get("f_hi_hz"),
         "min_fs_hz": model.get("min_fs_hz"),
         "n_train": model.get("n_train"),
         "auc_nested_grouped_cv": model.get("auc_nested_grouped_cv"),

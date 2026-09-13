@@ -158,8 +158,10 @@ def test_a_frame_with_those_flags_decodes_and_the_fleet_model_takes_it():
         d, _ = _load(path, prefix)
         fs = d("FS")
         flags = (int(d("FS_CODE")) << SK.FS_SHIFT) | int(d("LAYOUT_BIT")) | no_context_bit
-        q, ref = SK.sketch(np.random.default_rng(3).normal(0, 3000, 4096), fs, layout=SK.LAYOUT_FIXED)
-        raw = bytearray(SK.pack(1, ref, 800, q, fs=fs, layout=SK.LAYOUT_FIXED))
+        # Determine layout from flags: if LAYOUT_BIT is set, it's LAYOUT_FIXED, else LAYOUT_NYQUIST
+        layout = SK.LAYOUT_FIXED if int(d("LAYOUT_BIT")) else SK.LAYOUT_NYQUIST
+        q, ref = SK.sketch(np.random.default_rng(3).normal(0, 3000, 4096), fs, layout=layout)
+        raw = bytearray(SK.pack(1, ref, 800, q, fs=fs, layout=layout))
         raw[10], raw[11] = flags & 0xFF, (flags >> 8) & 0xFF      # the node writes flags verbatim
         return SK.unpack(bytes(raw))
 
