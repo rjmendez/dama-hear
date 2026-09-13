@@ -509,7 +509,8 @@ static uint32_t gps_sentences = 0;
 #define PMTK_CFG_300  0x02u
 #define PMTK_CFG_314  0x04u
 #define PMTK_CFG_255  0x08u
-#define PMTK_CFG_REQUIRED (PMTK_CFG_220 | PMTK_CFG_300 | PMTK_CFG_314)
+#define PMTK_CFG_285  0x10u
+#define PMTK_CFG_REQUIRED (PMTK_CFG_220 | PMTK_CFG_300 | PMTK_CFG_314 | PMTK_CFG_285)
 
 static bool nmea_checksum_ok(const char *s) {
   const char *star = strrchr(s, '*');
@@ -541,6 +542,7 @@ static uint8_t pmtk_cfg_bit(long cmd) {
   switch (cmd) {
     case 220: return PMTK_CFG_220;
     case 255: return PMTK_CFG_255;
+    case 285: return PMTK_CFG_285;
     case 300: return PMTK_CFG_300;
     case 314: return PMTK_CFG_314;
     default:  return 0;
@@ -619,6 +621,55 @@ static void pmtk_parse_rmc(const char *s) {
   }
 }
 
+static bool nmea_gga_position(const char *s) {
+  if (!nmea_checksum_ok(s)) return false;
+  char line[100];
+  size_t n = strcspn(s, "*");
+  if (n >= sizeof line || !s[n]) return false;
+  memcpy(line, s, n); line[n] = 0;
+  char *field[15] = {0}; int fields = 0;
+  char *p = line;
+  while (p && fields < 15) {
+    field[fields++] = p;
+    char *comma = strchr(p, 44);
+    if (comma) { *comma = 0; p = comma + 1; } else p = nullptr;
+  }
+  if (fields < 12) return false;
+  char *end = nullptr;
+  long fix = strtol(field[6], &end, 10);
+  if (!field[6][0] || *end || fix < 0 || fix > INT_MAX) return false;
+  long sats = strtol(field[7], &end, 10);
+  if (!field[7][0] || *end || sats < 0 || sats > INT_MAX) return false;
+  double lat_raw = strtod(field[2], &end);
+  if (!field[2][0] || *end || !isfinite(lat_raw) || (field[3][0] != 78 && field[3][0] != 83) || field[3][1]) return false;
+  double lon_raw = strtod(field[4], &end);
+  if (!field[4][0] || *end || !isfinite(lon_raw) || (field[5][0] != 69 && field[5][0] != 87) || field[5][1]) return false;
+  double hdop = strtod(field[8], &end);
+  if (!field[8][0] || *end || !isfinite(hdop) || hdop < 0.0) return false;
+  double hmsl_m = strtod(field[9], &end);
+  if (!field[9][0] || *end || !isfinite(hmsl_m)) return false;
+  double geoid_m = strtod(field[11], &end);
+  if (!field[11][0] || *end || !isfinite(geoid_m)) return false;
+  int lat_deg = (int)(lat_raw / 100.0), lon_deg = (int)(lon_raw / 100.0);
+  double lat = lat_deg + (lat_raw - lat_deg * 100.0) / 60.0;
+  double lon = lon_deg + (lon_raw - lon_deg * 100.0) / 60.0;
+  if (lat_deg > 90 || lon_deg > 180 || lat < 0.0 || lat > 90.0 || lon < 0.0 || lon > 180.0) return false;
+  int64_t lat_e7 = (int64_t)(lat * 10000000.0 + 0.5), lon_e7 = (int64_t)(lon * 10000000.0 + 0.5);
+  int64_t hmsl = (int64_t)(hmsl_m * 1000.0 + (hmsl_m < 0.0 ? -0.5 : 0.5));
+  int64_t geoid = (int64_t)(geoid_m * 1000.0 + (geoid_m < 0.0 ? -0.5 : 0.5));
+  int64_t hacc = (int64_t)(hdop * 2500.0 + 0.5), hell = hmsl + geoid;
+  if (lat_e7 > 900000000LL || lon_e7 > 1800000000LL || hmsl < INT32_MIN || hmsl > INT32_MAX || hell < INT32_MIN || hell > INT32_MAX || hacc < 0 || hacc > UINT32_MAX) return false;
+  pos_lat_e7 = field[3][0] == 83 ? -(int32_t)lat_e7 : (int32_t)lat_e7;
+  pos_lon_e7 = field[5][0] == 87 ? -(int32_t)lon_e7 : (int32_t)lon_e7;
+  pos_hmsl_mm = (int32_t)hmsl; pos_hell_mm = (int32_t)hell; pos_hacc_mm = (uint32_t)hacc; pos_vacc_mm = 0;
+  gps_fix = (int)fix; gps_sats = (int)sats;
+  if (gps_fix >= 1 && pos_hacc_mm && pos_hacc_mm < POS_HACC_MAX_MM) {
+    pos_sum_lat += (double)pos_lat_e7; pos_sum_lon += (double)pos_lon_e7;
+    pos_sum_hell += (double)pos_hell_mm; pos_sum_hmsl += (double)pos_hmsl_mm; pos_n++;
+  }
+  return true;
+}
+
 static void nmea_line(const char *s) {
   gps_sentences++;
   if (s[0] == '$' && s[1] >= 'A' && s[1] <= 'Z' && s[2] >= 'A' && s[2] <= 'Z') nmea_valid++;
@@ -626,24 +677,15 @@ static void nmea_line(const char *s) {
     pmtk_parse_ack(s);
     pmtk_parse_rmc(s);
   }
-  // $xxGGA,hhmmss.ss,lat,N,lon,E,fix,sats,...
+  // GGA: time, latitude, longitude, fix, satellites, HDOP, MSL altitude, geoid separation.
   if (ubx_pvt) return;                          // UBX is authoritative once it arrives
   if (!(s[0] == '$' && s[3] == 'G' && s[4] == 'G' && s[5] == 'A')) return;
-  int f = 0; const char *p = s; char tm[12] = {0};
-  while (*p && f < 8) {
-    if (*p == ',') {
-      f++; const char *v = p + 1;
-      if (f == 1) { int i = 0; while (v[i] && v[i] != ',' && i < 6) { tm[i] = v[i]; i++; } tm[i] = 0; }
-      if (f == 6) gps_fix = atoi(v);
-      if (f == 7) gps_sats = atoi(v);
-    }
-    p++;
-  }
-  if (strlen(tm) >= 6)
-    snprintf(gps_utc, sizeof gps_utc, "%c%c:%c%c:%c%c", tm[0], tm[1], tm[2], tm[3], tm[4], tm[5]);
+  if (!nmea_gga_position(s)) return;
+  const char *tm = strchr(s, 44);
+  if (tm && tm[1] && tm[2] && tm[3] && tm[4] && tm[5] && tm[6])
+    snprintf(gps_utc, sizeof gps_utc, "%c%c:%c%c:%c%c", tm[1], tm[2], tm[3], tm[4], tm[5], tm[6]);
+
 }
-
-
 
 // ---------------------------------------------------------------- I2C
 // Whatever is on the bus, named. A bare address list makes you go and look it up at 2 am; the
@@ -1052,6 +1094,7 @@ static void gps_configure() {
     pmtk_send("PMTK300,1000,0,0,0,0");
     pmtk_send("PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0");
     pmtk_send("PMTK255,1");
+    pmtk_send("PMTK285,4,100");
     return;
   }
   vs_begin();
