@@ -31,6 +31,7 @@ import json
 import math
 import os
 import re
+import zlib
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -105,13 +106,17 @@ class Survey:
                  names: Optional[Dict[int, str]] = None,
                  sigma_m: Optional[Dict[int, float]] = None,
                  origin: Optional[Dict] = None,
-                 classes: Optional[Dict[int, str]] = None) -> None:
+                 classes: Optional[Dict[int, str]] = None,
+                 position_sources: Optional[Dict[int, str]] = None) -> None:
         self.ids: List[int] = sorted(int(k) for k in positions)
         self._pos: Dict[int, np.ndarray] = {
             int(k): np.asarray(v, float).reshape(3) for k, v in positions.items()}
         self.names: Dict[int, str] = {i: (names or {}).get(i, "") for i in self.ids}
         self.sigma_m: Dict[int, float] = {i: float((sigma_m or {}).get(i, 0.0)) for i in self.ids}
         self.classes: Dict[int, str] = {i: (classes or {}).get(i, "") for i in self.ids}
+        # "survey" unless the position came from somewhere weaker; see augment_from_node_gps().
+        self.position_sources: Dict[int, str] = {
+            i: (position_sources or {}).get(i, "survey") for i in self.ids}
         self.origin: Optional[Dict] = origin
 
     def arrival_ids(self) -> List[int]:
@@ -290,8 +295,12 @@ def _read_node(entry, index: int, seen: Dict[int, int]) -> Dict:
     cls = entry.get("class")
     if cls is not None and not isinstance(cls, str):
         raise SurveyError("node %d has class %r, which is not a string" % (nid, cls))
+    src = entry.get("position_source", "survey")
+    if not isinstance(src, str) or not src:
+        raise SurveyError("node %d has position_source %r, which is not a non-empty string"
+                          % (nid, src))
     return {"node_id": nid, "xyz": xyz, "name": name, "sigma_m": float(sig),
-            "class": cls or ""}
+            "class": cls or "", "position_source": src}
 
 
 def from_dict(d: Dict, min_nodes: int = 3) -> Survey:
@@ -325,6 +334,7 @@ def from_dict(d: Dict, min_nodes: int = 3) -> Survey:
                 names={r["node_id"]: r["name"] for r in rows},
                 sigma_m={r["node_id"]: r["sigma_m"] for r in rows},
                 classes={r["node_id"]: r["class"] for r in rows},
+                position_sources={r["node_id"]: r["position_source"] for r in rows},
                 origin=d.get("origin"))
 
     P = sv.positions(sv.ids)
@@ -386,6 +396,125 @@ def from_wgs84_nodes(entries: Sequence[Dict], origin: Optional[Dict] = None,
                       "sigma_m": float(e.get("sigma_m", 0.0))})
     return from_dict({"frame": _FRAME, "units": _UNITS, "origin": origin, "nodes": nodes},
                      min_nodes=min_nodes)
+
+
+# ---------------------------------------------------------------- node GPS fallback
+# ⚠️A NODE WITH NO SURVEY ENTRY IS POSITIONED FROM ITS OWN GPS MEAN, AND SAYS SO. Refusing it
+# outright threw away a receiver the array could still use at a wider sigma. A surveyed position
+# always wins; the fallback only fills names the survey does not have.
+#
+# The floor is the upper end of what tools/node_survey.py measured for these receivers' mean
+# position ("sigma_d is between 0.61 m and about 2.1 m"); the node's own hAcc understates it, so
+# hAcc only ever widens the sigma. The reject bound is node_survey.py's HACC_REJECT_M.
+GPS_SIGMA_FLOOR_M: float = 2.1
+GPS_HACC_REJECT_M: float = 10.0
+GPS_MIN_FIXES: int = 60
+GPS_MAX_AGE_S: float = 86400.0
+#: GPS-positioned ids are derived from the NAME so they are stable across runs and do not shift
+#: when another node appears. Surveyed ids in this repo are small integers, below this base.
+GPS_NODE_ID_BASE: int = 1000
+POSITION_SOURCE_GPS = "gps_mean"
+
+
+def gps_node_id(name: str) -> int:
+    return GPS_NODE_ID_BASE + zlib.crc32(name.encode("utf-8")) % (_MAX_NODE_ID + 1 - GPS_NODE_ID_BASE)
+
+
+def _gps_refusal(p, now: float, max_hacc_m: float, min_fixes: int,
+                 max_age_s: float) -> Optional[str]:
+    """Why this node's reported GPS mean cannot place it, or None. States numbers, never lat/lon."""
+    if not isinstance(p, dict):
+        return "position entry is %s, not an object" % type(p).__name__
+    if p.get("h_ell_m") is None and p.get("hmsl_m") is not None:
+        return "only hmsl_m was reported. %s" % GEO.GEOID_NOTE
+    for k in ("lat_deg", "lon_deg", "h_ell_m"):
+        if not _is_number(p.get(k)) or not math.isfinite(float(p[k])):
+            return "no numeric %s in the node's GPS mean" % k
+    fix = p.get("fix")
+    if not _is_number(fix) or int(fix) < 3:
+        return "GPS fix %r is not a 3D fix" % (fix,)
+    fixes = p.get("fixes")
+    if not _is_number(fixes) or int(fixes) < int(min_fixes):
+        return "only %r fix(es) averaged, need %d" % (fixes, int(min_fixes))
+    hacc = p.get("hacc_m")
+    if not _is_number(hacc) or float(hacc) > float(max_hacc_m):
+        return "hAcc %r m is over the %.1f m reject bound" % (hacc, float(max_hacc_m))
+    at = p.get("at")
+    if not _is_number(at):
+        return "the position carries no timestamp, so its age is unknown"
+    age = float(now) - float(at)
+    if age > float(max_age_s):
+        return "the position is %.0f s old, over the %.0f s limit" % (age, float(max_age_s))
+    return None
+
+
+def augment_from_node_gps(sv: "Survey", positions, now: float,
+                          sigma_floor_m: float = GPS_SIGMA_FLOOR_M,
+                          max_hacc_m: float = GPS_HACC_REJECT_M,
+                          min_fixes: int = GPS_MIN_FIXES,
+                          max_age_s: float = GPS_MAX_AGE_S):
+    """(survey, report): `sv` plus every unsurveyed node whose GPS mean is usable.
+
+    `positions` is {name: {lat_deg, lon_deg, h_ell_m, hacc_m, fixes, fix, at, class}}, what
+    tools/hear_drain.py records from each node's /status. The report names every node considered
+    and why it was or was not used, with sigma and age but NEVER a coordinate.
+
+    Never raises for a bad entry: a node that cannot be placed is left out and reported, and if
+    adding the placeable ones would make the survey invalid, the original survey is returned.
+    """
+    report: List[Dict] = []
+    if not isinstance(positions, dict):
+        return sv, [{"name": None, "used": False,
+                     "why": "positions is %s, not an object" % type(positions).__name__}]
+    surveyed = {sv.names[i] for i in sv.ids if sv.names[i]}
+    o = sv.origin if isinstance(sv.origin, dict) else {}
+    origin_ok = (not sv.origin_is_fictional()
+                 and all(_is_number(o.get(k)) for k in ("lat_deg", "lon_deg", "h_ell_m")))
+    taken = set(sv.ids)
+    added: List[Dict] = []
+    for name in sorted(k for k in positions if isinstance(k, str)):
+        if name in surveyed:
+            continue
+        p = positions[name]
+        why = _gps_refusal(p, now, max_hacc_m, min_fixes, max_age_s)
+        if why is None and not origin_ok:
+            why = ("the survey origin is fictional or incomplete, so a lat/lon cannot be placed "
+                   "in its frame")
+        nid = gps_node_id(name)
+        if why is None and nid in taken:
+            why = "derived node_id %d is already taken" % nid
+        if why is not None:
+            report.append({"name": name, "used": False, "why": why})
+            continue
+        e, n, u = GEO.geodetic_to_enu(float(p["lat_deg"]), float(p["lon_deg"]),
+                                      float(p["h_ell_m"]), float(o["lat_deg"]),
+                                      float(o["lon_deg"]), float(o["h_ell_m"]))
+        sigma = max(float(p["hacc_m"]), float(sigma_floor_m))
+        cls = p.get("class") if isinstance(p.get("class"), str) else ""
+        taken.add(nid)
+        added.append({"node_id": nid, "name": name, "e_m": e, "n_m": n, "u_m": u,
+                      "sigma_m": sigma, "class": cls, "position_source": POSITION_SOURCE_GPS})
+        report.append({"name": name, "used": True, "node_id": nid, "sigma_m": sigma,
+                       "hacc_m": float(p["hacc_m"]), "fixes": int(p["fixes"]),
+                       "age_s": float(now) - float(p["at"]), "class": cls or "(unstated)"})
+    if not added:
+        return sv, report
+    rows = []
+    for i in sv.ids:
+        e, n, u = (float(x) for x in sv.position(i))
+        rows.append({"node_id": i, "name": sv.names[i], "e_m": e, "n_m": n, "u_m": u,
+                     "sigma_m": sv.sigma_m[i], "class": sv.classes.get(i, ""),
+                     "position_source": sv.position_sources.get(i, "survey")})
+    try:
+        out = from_dict({"frame": _FRAME, "units": _UNITS, "origin": sv.origin,
+                         "nodes": rows + added}, min_nodes=0)
+    except SurveyError as exc:
+        for r in report:
+            if r.get("used"):
+                r.update(used=False, why="adding the GPS-positioned nodes made the survey "
+                                          "invalid: %s" % exc)
+        return sv, report
+    return out, report
 
 
 def load_survey(path: str, min_nodes: int = 3, require_real_origin: bool = False) -> Survey:
