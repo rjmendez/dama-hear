@@ -20,9 +20,15 @@ new board, or one running anything else, needs BOOT held while it is plugged in.
 re-enumerates during the upload and on every reboot, so under WSL2 attach it with
 `usbipd attach --wsl --busid <id> --auto-attach`.
 
-After that, every update is the same public image for every node:
+After that, every update is the matching public image for that node's board class:
 
     python3 firmware/hear_node/flash.py <node> <ip> --release <tag>
+
+`flash.py --release` reads the node's live `/status`, refuses a class mismatch, and downloads the
+release asset whose name includes that class (`hear_node-xiao-s3-pps-<tag>.bin` or
+`hear_node-esp32s3-i2s-gps-<tag>.bin`). For a new board over USB, say the class explicitly:
+
+    python3 firmware/hear_node/enroll.py <node> /dev/ttyACM0 --class <board-class> --release <tag>
 
 `flash.py <node> <ip>` without `--release` still builds this tree with `secrets.h` compiled in.
 That build copies its credentials into NVS at boot, which is how a node flashed before enrollment

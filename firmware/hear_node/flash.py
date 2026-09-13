@@ -35,8 +35,11 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
+sys.path.insert(0, HERE)
+import board_profiles  # noqa: E402
+
 SKETCH = os.path.relpath(HERE, REPO)
-FQBN = "esp32:esp32:XIAO_ESP32S3:PSRAM=opi"
+FQBN = board_profiles.FQBN
 REPO_SLUG = "rjmendez/dama-hear"
 
 
@@ -51,10 +54,21 @@ def status(host, timeout=6):
         return json.load(r)
 
 
-def release_refusal(st, node):
+def release_refusal(st, node, board_class=None):
     """Why this node must not take a release image, or None."""
     if st.get("node") != node:
         return "it reports node=%r, not %r" % (st.get("node"), node)
+    live_class = st.get("class")
+    if board_class is not None:
+        if live_class != board_class:
+            return "it reports class=%r, not %r" % (live_class, board_class)
+    elif not live_class:
+        return "its /status has no class, so the correct release image cannot be chosen safely"
+    else:
+        try:
+            board_profiles.require_board_class(live_class)
+        except ValueError as e:
+            return str(e)
     prov = st.get("prov")
     if not isinstance(prov, dict):
         return ("its firmware predates NVS enrollment. Flash a build of this tree first "
@@ -64,19 +78,33 @@ def release_refusal(st, node):
     return None
 
 
-def release_image(tag, repo=REPO_SLUG):
-    """Download hear_node-<tag>.bin, refuse it unless SHA256SUMS vouches for it, return its path."""
-    sys.path.insert(0, HERE)
+def resolve_board_class(requested, live_status=None, require_live=False):
+    if requested is not None:
+        board_profiles.require_board_class(requested)
+    live_class = None if live_status is None else live_status.get("class")
+    if requested and live_class and live_class != requested:
+        die("refusing class=%r: %r currently reports class=%r" % (requested, live_status.get("node"), live_class))
+    chosen = requested or live_class or board_profiles.DEFAULT_BOARD_CLASS
+    try:
+        return board_profiles.require_board_class(chosen)
+    except ValueError as e:
+        if require_live or live_class:
+            die(str(e))
+        raise
+
+
+def release_image(tag, board_class, repo=REPO_SLUG):
+    """Download the board-class app image, refuse it unless SHA256SUMS vouches for it."""
     import enroll
     base = "https://github.com/%s/releases/download/%s/" % (repo, tag)
-    name = "hear_node-%s.bin" % tag
+    name = board_profiles.release_asset_name(tag, board_class, "app")
     try:
         sums = enroll.fetch(base + "SHA256SUMS").decode()
         data = enroll.fetch(base + name)
         enroll.check_sums(sums, name, data)
     except (OSError, ValueError) as e:
         die("release %s: %s" % (tag, e))
-    d = os.path.join(REPO, ".otabuild", "release-" + tag)
+    d = os.path.join(REPO, ".otabuild", "release-%s-%s" % (tag, board_class))
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, name)
     with open(path, "wb") as f:
@@ -86,12 +114,19 @@ def release_image(tag, repo=REPO_SLUG):
 
 
 def main(argv):
+    board_class = None
     release = None
     if "--release" in argv:
         i = argv.index("--release")
         if i + 1 >= len(argv):
             die("--release needs a tag")
         release = argv[i + 1]
+        argv = argv[:i] + argv[i + 2:]
+    if "--class" in argv:
+        i = argv.index("--class")
+        if i + 1 >= len(argv):
+            die("--class needs a board class")
+        board_class = argv[i + 1].strip()
         argv = argv[:i] + argv[i + 2:]
     pos = [a for a in argv[1:] if not a.startswith("--")]
     if len(pos) < 2:
@@ -102,7 +137,7 @@ def main(argv):
         die("node id must be lowercase letters, digits and dashes: %r" % node)
 
     is_serial = target.startswith("/dev/")
-    outdir = os.path.join(REPO, ".otabuild", node)
+    was = None
 
     if release:
         if is_serial:
@@ -112,36 +147,45 @@ def main(argv):
         except Exception as e:
             die("%s is not answering /status (%s); a release needs a running, enrolled node"
                 % (target, e))
-        why = release_refusal(was, node)
+        board_class = resolve_board_class(board_class, was, require_live=True)
+        why = release_refusal(was, node, board_class)
         if why:
             die("refusing to install %s on %s: %s" % (release, target, why))
-        bin_path = release_image(release)
+        bin_path = release_image(release, board_class)
     else:
         # 1. identity, for THIS node, immediately before the build that carries it
-        subprocess.run([sys.executable, os.path.join(HERE, "gen_secrets.py"), node],
+        if not is_serial:
+            try:
+                was = status(target)
+            except Exception:
+                was = None          # not up yet, or first flash. Not a reason to refuse.
+        board_class = resolve_board_class(board_class, was)
+        outdir = os.path.join(REPO, ".otabuild", "%s-%s" % (node, board_class))
+
+        subprocess.run([sys.executable, os.path.join(HERE, "gen_secrets.py"), node, board_class],
                        cwd=REPO, check=True)
 
         # 2. if the target is already reachable, refuse a target that is a DIFFERENT node.
         #    Flashing a node with someone else's identity is recoverable; doing it without
         #    noticing is not.
-        if not is_serial:
-            try:
-                was = status(target)
-                if was.get("node") not in (node, None):
-                    die("%s currently reports node=%r, not %r. Refusing: name the right target, "
-                        "or pass --force if you really are re-identifying this board."
-                        % (target, was.get("node"), node)
-                        if "--force" not in argv else "")
-            except Exception:
-                pass          # not up yet, or first flash. Not a reason to refuse.
+        if was is not None and was.get("node") not in (node, None):
+            die("%s currently reports node=%r, not %r. Refusing: name the right target, "
+                "or pass --force if you really are re-identifying this board."
+                % (target, was.get("node"), node)
+                if "--force" not in argv else "")
 
         # 3. build
-        print("flash: building %s for %s" % (node, target))
+        print("flash: building %s (%s) for %s" % (node, board_class, target))
         # --libraries: the shared platform code lives in firmware/lib/hear_platform and
         # arduino-cli will not find it otherwise.
-        r = subprocess.run(["arduino-cli", "compile", "--fqbn", FQBN,
-                            "--libraries", os.path.join(REPO, "firmware", "lib"),
-                            "--output-dir", outdir, SKETCH], cwd=REPO)
+        cmd = ["arduino-cli", "compile", "--fqbn", FQBN,
+               "--libraries", os.path.join(REPO, "firmware", "lib"),
+               "--output-dir", outdir]
+        flags = board_profiles.build_extra_flags(board_class)
+        if flags:
+            cmd += ["--build-property", "compiler.cpp.extra_flags=" + flags]
+        cmd += [SKETCH]
+        r = subprocess.run(cmd, cwd=REPO)
         if r.returncode:
             die("compile failed")
 

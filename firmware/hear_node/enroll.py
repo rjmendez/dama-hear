@@ -6,7 +6,7 @@
     python3 firmware/hear_node/enroll.py rankine /dev/ttyACM0 --no-flash
 
 The name and networks go into the node's NVS partition, which OTA never writes. After this, every
-update is the same public release image for every node:
+update is the matching public release image for that node's board class:
 
     python3 firmware/hear_node/flash.py <node> <ip> --release <tag>
 
@@ -25,7 +25,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
 import zlib
@@ -34,22 +33,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import deploy_gate  # noqa: E402
+import board_profiles  # noqa: E402
 import wifi_store  # noqa: E402
 
 REPO_SLUG = "rjmendez/dama-hear"
-# NOTE: this fleet's Gold/Kasami/Ageev nodes are esp32s3-i2s-gps boards, not the
-# XIAO PSRAM=opi profile below. That mismatch is harmless for --no-flash/--input-dir
-# uploads today, but --release would need a fleet-specific FQBN before using it here.
-FQBN = "esp32:esp32:XIAO_ESP32S3:PSRAM=opi"
+FQBN = board_profiles.FQBN
 SKETCH = "hear_node"
 ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,22}")
 MAX_NETS = 8          # HEAR_PROV_MAX_NETS
 LINE_MAX = 1024       # HEAR_PROV_LINE_MAX
 CHUNK = 64            # bytes per USB write, well under one CDC packet
-# release asset -> the name arduino-cli upload --input-dir expects
-UPLOAD_FILES = {"hear_node-{tag}.bin": SKETCH + ".ino.bin",
-                "hear_node-{tag}-bootloader.bin": SKETCH + ".ino.bootloader.bin",
-                "hear_node-{tag}-partitions.bin": SKETCH + ".ino.partitions.bin"}
 
 
 def die(msg, code=1):
@@ -102,16 +95,17 @@ def check_sums(sums_text, name, data):
         raise ValueError("%s sha256 %s, SHA256SUMS says %s" % (name, got, want))
 
 
-def release_files(tag, dest, repo=REPO_SLUG):
+def release_files(tag, dest, board_class, repo=REPO_SLUG):
+    board_profiles.require_board_class(board_class)
     base = "https://github.com/%s/releases/download/%s/" % (repo, tag)
     sums = fetch(base + "SHA256SUMS").decode()
-    for asset, local in UPLOAD_FILES.items():
-        name = asset.format(tag=tag)
+    for kind in ("app", "bootloader", "partitions"):
+        name = board_profiles.release_asset_name(tag, board_class, kind)
         data = fetch(base + name)
         check_sums(sums, name, data)
-        with open(os.path.join(dest, local), "wb") as f:
+        with open(os.path.join(dest, board_profiles.upload_filename(kind)), "wb") as f:
             f.write(data)
-    print("enroll: %s assets verified against SHA256SUMS" % tag)
+    print("enroll: %s %s assets verified against SHA256SUMS" % (tag, board_class))
 
 
 def upload(port, input_dir):
@@ -213,7 +207,8 @@ def main(argv=None):
     src.add_argument("--release", help="release tag to download and verify, e.g. v0.1.0")
     src.add_argument("--input-dir", help="an arduino-cli output dir holding hear_node.ino.bin et al.")
     src.add_argument("--no-flash", action="store_true", help="the board already runs a release image")
-    ap.add_argument("--class", dest="cls", default="xiao-s3-pps")
+    ap.add_argument("--class", dest="cls", default=board_profiles.DEFAULT_BOARD_CLASS,
+                    choices=board_profiles.known_board_classes())
     ap.add_argument("--wifi", default=wifi_store.PATH)
     ap.add_argument("--allow-gps-no-fix-indoors", action="store_true",
                     help="accept selftest gps=no-fix after enrollment (for indoor bench work only)")
@@ -230,12 +225,13 @@ def main(argv=None):
           % (a.node, a.cls, len(pairs), ", ".join(wifi_store.mask(s) for s, _ in pairs)))
 
     if a.release:
-        with tempfile.TemporaryDirectory() as d:
-            try:
-                release_files(a.release, d)
-            except (OSError, ValueError) as e:
-                die("release %s: %s" % (a.release, e))
-            upload(a.port, d)
+        d = os.path.join(REPO, ".otabuild", "release-%s-%s-usb" % (a.release, a.cls))
+        os.makedirs(d, exist_ok=True)
+        try:
+            release_files(a.release, d, a.cls)
+        except (OSError, ValueError) as e:
+            die("release %s (%s): %s" % (a.release, a.cls, e))
+        upload(a.port, d)
     elif a.input_dir:
         upload(a.port, a.input_dir)
 

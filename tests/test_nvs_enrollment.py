@@ -13,7 +13,9 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 INO = ROOT / "firmware" / "hear_node" / "hear_node.ino"
 sys.path.insert(0, str(ROOT / "firmware" / "hear_node"))
+import board_profiles  # noqa: E402
 import flash  # noqa: E402
+import enroll  # noqa: E402
 
 
 def _code(p=INO):
@@ -127,15 +129,30 @@ def test_the_argument_check_would_catch_a_leak():
 
 
 class TestReleaseRefusal:
-    GOOD = {"node": "nyquist", "prov": {"src": "compiled", "nets": 2, "nvs": True, "loaded": True}}
+    GOOD = {"node": "nyquist", "class": "xiao-s3-pps",
+            "prov": {"src": "compiled", "nets": 2, "nvs": True, "loaded": True}}
 
     def test_an_enrolled_node_is_accepted(self):
         assert flash.release_refusal(self.GOOD, "nyquist") is None
         assert flash.release_refusal(
-            {"node": "nyquist", "prov": {"src": "nvs", "nets": 1, "nvs": True}}, "nyquist") is None
+            {"node": "nyquist", "class": "xiao-s3-pps",
+             "prov": {"src": "nvs", "nets": 1, "nvs": True}}, "nyquist") is None
+
+    def test_a_release_requires_a_known_live_board_class(self):
+        why = flash.release_refusal({"node": "nyquist", "class": "", "prov": self.GOOD["prov"]}, "nyquist")
+        assert "no class" in why
+        why = flash.release_refusal(
+            {"node": "nyquist", "class": "mystery-board", "prov": self.GOOD["prov"]}, "nyquist")
+        assert "unknown board class" in why
+
+    def test_a_requested_board_class_must_match_live_status(self):
+        why = flash.release_refusal(
+            {"node": "gold", "class": "esp32s3-i2s-gps", "prov": self.GOOD["prov"]},
+            "gold", "xiao-s3-pps")
+        assert "esp32s3-i2s-gps" in why and "xiao-s3-pps" in why
 
     def test_firmware_that_predates_enrollment_is_refused_with_the_way_out(self):
-        why = flash.release_refusal({"node": "nyquist", "fw": "87eb4d3"}, "nyquist")
+        why = flash.release_refusal({"node": "nyquist", "class": "xiao-s3-pps", "fw": "87eb4d3"}, "nyquist")
         assert why and "predates" in why and "flash.py nyquist" in why
 
     @pytest.mark.parametrize("prov", [{"src": "compiled", "nets": 2, "nvs": False},
@@ -150,3 +167,61 @@ class TestReleaseRefusal:
     def test_a_release_is_never_sent_over_usb(self):
         with pytest.raises(SystemExit):
             flash.main(["flash.py", "nyquist", "/dev/ttyACM0", "--release", "v0.1.0"])
+
+
+class TestBoardClassSelection:
+    def test_default_xiao_release_asset_name_is_unchanged_for_existing_nodes(self):
+        assert board_profiles.release_asset_name("v0.1.3", "xiao-s3-pps", "app") \
+            == "hear_node-xiao-s3-pps-v0.1.3.bin"
+        assert board_profiles.build_extra_flags("xiao-s3-pps") == ""
+
+    def test_gps_board_uses_the_compile_define_and_its_own_release_asset(self):
+        assert board_profiles.build_extra_flags("esp32s3-i2s-gps") == "-DHEAR_BOARD_ESP32S3_I2S_GPS"
+        assert board_profiles.release_asset_name("v0.1.3", "esp32s3-i2s-gps", "app") \
+            == "hear_node-esp32s3-i2s-gps-v0.1.3.bin"
+
+    def test_release_path_refuses_a_wrong_requested_board_class(self, monkeypatch):
+        monkeypatch.setattr(flash, "status",
+                            lambda host: {"node": "gold", "class": "esp32s3-i2s-gps",
+                                          "prov": {"src": "nvs", "nets": 1, "nvs": True}})
+        with pytest.raises(SystemExit):
+            flash.main(["flash.py", "gold", "172.16.100.50", "--release", "v0.1.3", "--class", "xiao-s3-pps"])
+
+    def test_live_gps_node_build_adds_the_board_define(self, monkeypatch):
+        cmds = []
+        states = iter([
+            {"node": "gold", "class": "esp32s3-i2s-gps", "prov": {"src": "nvs", "nets": 1, "nvs": True}},
+            {"node": "gold", "class": "esp32s3-i2s-gps", "fw": "dirty",
+             "prov": {"src": "compiled", "nets": 1, "nvs": True}, "uptime_s": 3},
+        ])
+
+        monkeypatch.setattr(flash, "status", lambda host: next(states))
+        monkeypatch.setattr(flash.os.path, "exists", lambda path: path.endswith("hear_node.ino.bin"))
+        monkeypatch.setattr(flash.time, "sleep", lambda _: None)
+
+        def fake_run(cmd, **kwargs):
+            cmds.append(cmd)
+            return type("R", (), {"stdout": "OK", "stderr": "", "returncode": 0})()
+
+        monkeypatch.setattr(flash.subprocess, "run", fake_run)
+        assert flash.main(["flash.py", "gold", "172.16.100.50"]) == 0
+        compile_cmd = next(cmd for cmd in cmds if cmd[:3] == ["arduino-cli", "compile", "--fqbn"])
+        assert "--build-property" in compile_cmd
+        assert "compiler.cpp.extra_flags=-DHEAR_BOARD_ESP32S3_I2S_GPS" in compile_cmd
+
+    def test_enroll_release_files_download_the_requested_board_class(self, monkeypatch, tmp_path):
+        fetched = []
+
+        def fake_fetch(url, timeout=60):
+            fetched.append(url.rsplit("/", 1)[-1])
+            return b"deadbeef  *file\n" if url.endswith("SHA256SUMS") else url.encode()
+
+        monkeypatch.setattr(enroll, "fetch", fake_fetch)
+        monkeypatch.setattr(enroll, "check_sums", lambda *args: None)
+        enroll.release_files("v0.1.3", str(tmp_path), "esp32s3-i2s-gps")
+        assert fetched == [
+            "SHA256SUMS",
+            "hear_node-esp32s3-i2s-gps-v0.1.3.bin",
+            "hear_node-esp32s3-i2s-gps-v0.1.3-bootloader.bin",
+            "hear_node-esp32s3-i2s-gps-v0.1.3-partitions.bin",
+        ]
