@@ -3041,8 +3041,8 @@ static void h_dets() {
   uint32_t n = total < det_cap ? total : det_cap;
   if (n > DETS_HTTP_MAX) n = DETS_HTTP_MAX;
   uint32_t first = total - n;                 // ring: the newest n, oldest first
-  String o = "[";
-  o.reserve(n * (MELIMP_FRAME_BYTES * 2 + 280) + 64);
+  http.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  http.send(200, "application/json", "[");
   for (uint32_t k = first; k < total; k++) {
     const Det &d = dets[k % det_cap];
     char b[240];
@@ -3053,10 +3053,12 @@ static void h_dets() {
              (unsigned long)d.uptime_s, (unsigned long)d.sample,
              (unsigned long)d.pps_n, (long)d.us_since_pps, d.trigger, (unsigned)d.flags, d.fs_at,
              MELIMP_FRAME_BYTES);
-    o += b;
+    http.sendContent(b);
     static const char hx[] = "0123456789abcdef";
+    String frame;
+    frame.reserve(MELIMP_FRAME_BYTES * 2);
     for (int j = 0; j < MELIMP_FRAME_BYTES; j++) {
-      o += hx[d.frame[j] >> 4]; o += hx[d.frame[j] & 0xF];
+      frame += hx[d.frame[j] >> 4]; frame += hx[d.frame[j] & 0xF];
     }
     // ⚠️tools/hear_bridge.py's rows_from_detections() selects DETS_COLUMNS[:-1], so these two keys
     // are dropped on that path until that list grows. They are here anyway: /detections is also
@@ -3065,10 +3067,10 @@ static void h_dets() {
     char cp[80] = "";
     if (d.clip_st == CLIP_OK) clip_name(cp, sizeof cp, d.cseq, d.sample);
     snprintf(t, sizeof t, "\",\"clip\":\"%s\",\"clip_why\":\"%s\"}", cp, clip_why(d.clip_st));
-    o += t;
+    http.sendContent(frame + t);
   }
-  o += "]";
-  http.send(200, "application/json", o);
+  http.sendContent("]");
+  http.sendContent("");
 }
 
 // Hoisted above setup(): /format must close this before it unmounts, and the section that
