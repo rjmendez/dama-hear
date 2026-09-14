@@ -41,9 +41,10 @@ COMMA_FRACTION = re.compile(r",\d{4,}(?!\d)")
 ANY_RUN = re.compile(r"\d(?:[.,]|%(?:25){0,3}2[Cc])\d{4}")
 COMMA_RUN = re.compile(r"\d,\d{4}")
 DIGITS = frozenset("0123456789")
+# Lowercase letters are tolerated as separator text (main parity), never as coordinate context.
 SEPARATOR = re.compile(r"[ \t]*(?:[NSns°][ \t]*)?(?:[,;][ \t]*|[ \t]+)(?:[NSEWnsew°][ \t]*)?")
-# ISO 6709: "/" terminator, optionally after an altitude and a CRS.
-ISO_TAIL = re.compile(r"(?:[+-]\d+(?:\.\d+)?)?(?:CRS[^\s/]*)?/")
+# ISO 6709 "/" after an optional altitude and CRS, then end, space, quote, bracket or sign.
+ISO_TAIL = re.compile(r"(?:[+-]\d+\.\d+|[+-]\d+(?=CRS))?(?:CRS[^\s/]*)?/(?![^\s\"'`)\]}>,;<+-])")
 # ASCII signs plus true minus look-alikes; hyphens and en/em dashes are range punctuation.
 _ISO_SIGNS = "+-−﹣－"
 # Hemisphere letters: uppercase, one per number, suffix ("<n>N, <n>W") or prefix ("N<n> W<n>").
@@ -51,26 +52,40 @@ _HEMI = frozenset("NSEW")
 HEMI_SUFFIX_GAP = re.compile(r"[ \t]*°?[ \t]*([NSEW])[ \t]*[,;]?[ \t]*([+-]?)")
 HEMI_PREFIX_GAP = re.compile(r"[ \t]*°?[ \t]*[,;]?[ \t]*([NSEW])[ \t]*([+-]?)")
 HEMI_AFTER = re.compile(r"[ \t]*°?[ \t]*([NSEW])(?![A-Za-z])")
+HEMI_MIXED_GAP = re.compile(r"[ \t]*°?[ \t]*([NSEW])(?:[ \t]*[,;][ \t]*|[ \t]+)([NSEW])[ \t]*([+-]?)")
 # Every dash/minus look-alike Unicode offers, folded to ASCII "-": hyphen, non-breaking hyphen,
 # figure dash, en/em dash, two horizontal bars, minus sign, small hyphen-minus, small em dash,
 # fullwidth hyphen-minus. One code point each, so folding never shifts a later offset.
 _DASHES = "‐‑‒–—―−﹘﹣－"
-_UNICODE_MINUS = str.maketrans({c: "-" for c in _DASHES})
-# %2C/%3B under up to three extra %25 layers; %20 (or a form "+") only right after a separator.
+# Unicode spaces fold to " " and the ordinal/ring look-alikes to the degree sign, also one code
+# point each.
+_SPACES = "    "
+_UNICODE_MINUS = str.maketrans(dict([(c, "-") for c in _DASHES] + [(c, " ") for c in _SPACES]
+                                    + [("º", "°"), ("˚", "°")]))
+# %2C/%3B under up to three extra %25 layers. %20, %09, %2B or a form "+" is a space only right
+# after one of them (%20/%09 also after a literal comma). %2B/%2D/%2F decode to +, -, /.
 _PERCENT_SEPARATOR = re.compile(
-    r"%(?:25){0,3}(2[Cc]|3[Bb])((?:\+|%(?:25){0,3}20)*)|,((?:%(?:25){0,3}20)+)")
-_PERCENT_SPACE = re.compile(r"\+|%(?:25){0,3}20")
-_PERCENT_SEPARATOR_MAP = {"2c": ",", "3b": ";"}
+    r"%(?:25){0,3}(2[Cc]|3[Bb])((?:\+|%(?:25){0,3}(?:20|09|2[Bb]))*)"
+    r"|,((?:%(?:25){0,3}(?:20|09))+)|%(?:25){0,3}(2[BbDdFf])")
+_PERCENT_SPACE = re.compile(r"\+|%(?:25){0,3}(?:20|09|2[Bb])")
+_PERCENT_MAP = {"2c": ",", "3b": ";", "2b": "+", "2d": "-", "2f": "/"}
+_ENTITY = re.compile(r"&(nbsp|comma|semi|#(?:160|44|59|32)|#[xX](?:[aA]0|2[cC]|3[bB]|20));")
+_ENTITY_MAP = {"nbsp": " ", "#160": " ", "#xa0": " ", "#32": " ", "#x20": " ",
+               "comma": ",", "#44": ",", "#x2c": ",", "semi": ";", "#59": ";", "#x3b": ";"}
 
 
 def _percent_sub(m):
     if m.group(1):
-        return (_PERCENT_SEPARATOR_MAP[m.group(1).lower()]
-                + " " * len(_PERCENT_SPACE.findall(m.group(2))))
+        return _PERCENT_MAP[m.group(1).lower()] + " " * len(_PERCENT_SPACE.findall(m.group(2)))
+    if m.group(4):
+        return _PERCENT_MAP[m.group(4).lower()]
     return "," + " " * len(_PERCENT_SPACE.findall(m.group(3)))
 
 
 def _decode_percent(text):
+    """Decode separator HTML entities and percent-escapes. No newline is added or removed."""
+    if "&" in text:
+        text = _ENTITY.sub(lambda m: _ENTITY_MAP[m.group(1).lower()], text)
     return _PERCENT_SEPARATOR.sub(_percent_sub, text) if "%" in text else text
 
 
@@ -81,11 +96,15 @@ def _normalize(text):
     return text if text.isascii() else text.translate(_UNICODE_MINUS)
 
 
-_KEY = r"(?<![a-z])(lat(?:itude)?|lon(?:gitude)?|lng|long)" \
-       r"(?:[_-]?(?:deg(?:rees)?|dd|ref|0|1|2))?[\"']?[ \t]*[:=]?[ \t]*[\"']?"
+_KEY_SUFFIX = r"(?:[_-]?(?:deg(?:rees)?|dd|ref|0|1|2))?"
+_KEY_SEP = r"[\"']?[ \t]*(?:\((?:deg(?:rees)?|°)\)[ \t]*)?(?::=|=>|[:=>(])?[ \t]*[\"']?"
+_KEY = r"(?<![a-z])(?:gps)?(lat(?:itude?)?|lon(?:gitude?)?|lng|long)" + _KEY_SUFFIX + _KEY_SEP
 KEYED = re.compile(_KEY + _NUM_ANY)
 DIGEST = re.compile(r"[0-9a-f]{16}")
 KEYED_I = re.compile(KEYED.pattern, re.IGNORECASE)
+# camelCase: a lowercase letter, then Lat/Lon/Lng/Latitude/Longitude ending at a non-letter.
+CAMEL_KEYED = re.compile(r"(?<=[a-z])(Lat(?:itude)?|Lon(?:gitude)?|Lng)(?i:"
+                         + _KEY_SUFFIX + _KEY_SEP + ")" + _NUM_ANY)
 ARRAY = re.compile(r"\[\s*" + _NUM + r"\s*,\s*" + _NUM + r"\s*(?:,\s*-?\d+(?:\.\d+)?\s*)?\]")
 
 
@@ -235,10 +254,13 @@ class Guard:
         before = text[p1 - 1] if p1 > 0 else ""
         if before in DIGITS or before == ".":
             return None
-        strict = bool(ISO_TAIL.match(text, e2)) or (
-            len(text[p1 + 1:e1].partition(".")[0]) == 2
-            and len(text[p2 + 1:e2].partition(".")[0]) == 3)
-        if not strict and (before.isalpha() or before == "_" or min(abs(a), abs(b)) < 1.0):
+        slash = ISO_TAIL.match(text, e2) is not None
+        if before and (before.isalpha() or before in "_)]}"):
+            if not slash:
+                return None
+        elif not slash and min(abs(a), abs(b)) < 1.0 and not (
+                len(text[p1 + 1:e1].partition(".")[0]) == 2
+                and len(text[p2 + 1:e2].partition(".")[0]) == 3):
             return None
         if abs(a) <= 90.0 and abs(b) <= 180.0:
             far = self._far(a, b)
@@ -256,19 +278,23 @@ class Guard:
                 continue
             gap = text[e1:d2]
             got = None
+            s1 = text[d1 - 1] if d1 > 0 and text[d1 - 1] in "+-" else ""
+            q = d1 - len(s1)
+            glued = not s1 and q > 0 and (text[q - 1].isalnum() or text[q - 1] in "_.")
             m = HEMI_SUFFIX_GAP.fullmatch(gap)
-            if m:
+            if m and not glued:
                 after = HEMI_AFTER.match(text, e2)
-                s1 = text[d1 - 1] if d1 > 0 and text[d1 - 1] in "+-" else ""
-                q = d1 - len(s1)
-                glued = not s1 and q > 0 and (text[q - 1].isalnum() or text[q - 1] in "_.")
-                if after and not glued:
+                if after:
                     got = m.group(1), after.group(1), s1, m.group(2)
             if got is None:
                 m = HEMI_PREFIX_GAP.fullmatch(gap)
                 before = m and _hemi_before(text, d1)
                 if before:
                     got = before[0], m.group(1), before[1], m.group(2)
+            if got is None and not glued:
+                m = HEMI_MIXED_GAP.fullmatch(gap)
+                if m:
+                    got = m.group(1), m.group(2), s1, m.group(3)
             if got is None:
                 continue
             l1, l2, s1, s2 = got
@@ -319,14 +345,20 @@ class Guard:
                     out.append((line_of(m.start(1)), "array pair", pair_digest(a, b),
                                 self._pair_far(a, b)))
 
-        self._hemisphere(text, runs, line_of, out)
         has_comma = COMMA_RUN.search(text) is not None
-        if has_comma:
-            self._hemisphere(text, list(_runs(text, COMMA_FRACTION)), line_of, out)
+        self._hemisphere(text, sorted(runs + list(_runs(text, COMMA_FRACTION))) if has_comma
+                         else runs, line_of, out)
 
         keyed = {"lat": [], "lon": []}
         lowered = text.lower() if text.isascii() else None
-        for m in (KEYED.finditer(lowered) if lowered is not None else KEYED_I.finditer(text)):
+        matches = KEYED.finditer(lowered) if lowered is not None else KEYED_I.finditer(text)
+        if "Lat" in text or "Lon" in text or "Lng" in text:
+            matches = itertools.chain(matches, CAMEL_KEYED.finditer(text))
+        seen = set()
+        for m in matches:
+            if m.start(2) in seen:
+                continue
+            seen.add(m.start(2))
             axis = "lat" if m.group(1).lower().startswith("lat") else "lon"
             v = float(m.group(2).replace(",", ".")) if has_comma else float(m.group(2))
             keyed[axis].append((line_of(m.start(2)), v, m.start(2)))

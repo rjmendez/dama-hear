@@ -295,10 +295,11 @@ ISO_SHAPES = {
 
 DOT_HEMI_TEMPLATES = [
     "{a}°{ns}, {b}°{ew}", "{a}°{ns},{b}°{ew}", "{a}° {ns}, {b}° {ew}", "{a}°{ns} {b}°{ew}",
-    "{a}{ns}{b}{ew}", "{ns}{a} {ew}{b}", "{ns}{a}{ew}{b}", "{ns}{a}, {ew}{b}"]
+    "{a}{ns}{b}{ew}", "{ns}{a} {ew}{b}", "{ns}{a}{ew}{b}", "{ns}{a}, {ew}{b}",
+    "{b}{ew} {a}{ns}", "{b}°{ew}, {a}°{ns}", "{ew}{b} {ns}{a}", "{a}{ns} {ew}{b}", "{a}°{ns}, {ew}{b}"]
 COMMA_HEMI_TEMPLATES = [
     "{a} {ns} {b} {ew}", "{a}{ns}, {b}{ew}", "{a}°{ns} {b}°{ew}", "{a}° {ns}; {b}° {ew}",
-    "{ns} {a} {ew} {b}", "{ns}{a} {ew}{b}"]
+    "{ns} {a} {ew} {b}", "{ns}{a} {ew}{b}", "{b} {ew} {a} {ns}"]
 
 
 class TestGapDetection:
@@ -374,6 +375,7 @@ class TestGapDetection:
         assert lines(text) == [1]
 
     @pytest.mark.parametrize("sep", ["%2C%20", ",%20", "%2C+", "%2C%2520", "%3B%20", "%252C",
+                                     "%2C%2B", "%2C%09", ",%09",
                                      "%253B", "%25252C", "%2525252C", "%25253B"])
     @pytest.mark.parametrize("q", QUADRANTS)
     def test_detects_an_escaped_separator(self, q, sep):
@@ -386,8 +388,141 @@ class TestGapDetection:
         assert lines(text) == [3]
 
 
+
+    @pytest.mark.parametrize("q", QUADRANTS)
+    def test_detects_a_percent_encoded_decimal_comma(self, q):
+        la, lo = far_quadrant(q)
+        a, b = fmtc(abs(la)).replace(",", "%2C"), fmtc(abs(lo)).replace(",", "%2C")
+        assert lines("%s%s %s%s" % (a, q[0], b, q[1])) == [1]
+        assert lines("lat=" + fmtc(la).replace(",", "%2C")) == [1]
+
+    @pytest.mark.parametrize("tail", ["+12.5CRSWGS_84/", "+350CRSWGS_84/", "CRSWGS_84/"])
+    @pytest.mark.parametrize("q", QUADRANTS)
+    def test_detects_a_sub_degree_iso6709_pair_with_a_crs(self, q, tail):
+        la, lo = sub_degree_quadrant(q)
+        require_far(la, lo)
+        assert lines(sg(la) + sg(lo) + tail) == [1]
+
+    @pytest.mark.parametrize("wrap", ["{}", "{} next", '"{}"', "'{}'", "({})", "[{}]",
+                                      "<pos>{}</pos>", "{},", "{}{}"])
+    @pytest.mark.parametrize("q", QUADRANTS)
+    def test_detects_a_slash_terminated_sub_degree_iso6709_pair(self, q, wrap):
+        la, lo = sub_degree_quadrant(q)
+        require_far(la, lo)
+        iso = sg(la) + sg(lo) + "/"
+        assert lines(wrap.format(iso, iso)) == [1]
+
+    @pytest.mark.parametrize("prefix", ["pos", "p_", "geo"])
+    @pytest.mark.parametrize("q", QUADRANTS)
+    def test_detects_a_letter_glued_iso6709_pair_with_a_slash(self, q, prefix):
+        la, lo = far_quadrant(q)
+        assert lines(prefix + sg(la) + sg(lo) + "/") == [1]
+
+    @pytest.mark.parametrize("q", QUADRANTS)
+    def test_detects_a_percent_encoded_iso6709_pair(self, q):
+        la, lo = far_quadrant(q)
+        enc = lambda v: sg(v).replace("+", "%2B").replace("-", "%2D")
+        assert lines(enc(la) + enc(lo) + "%2F") == [1]
+        assert lines("x=" + enc(la) + sg(lo)) == [1]
+
+    @pytest.mark.parametrize("q", QUADRANTS)
+    def test_detects_a_prefix_letter_followed_by_spaces(self, q):
+        la, lo = sub_degree_quadrant(q)
+        require_far(la, lo)
+        assert lines("%s   %s %s   %s" % (q[0], fmt(abs(la), 4), q[1], fmt(abs(lo), 4))) == [1]
+
+    @pytest.mark.parametrize("q", QUADRANTS)
+    def test_detects_a_hemisphere_pair_mixing_dot_and_decimal_comma(self, q):
+        la, lo = far_quadrant(q)
+        assert lines("%s%s %s%s" % (fmtc(abs(la)), q[0], fmt(abs(lo)), q[1])) == [1]
+        assert lines("%s %s, %s %s" % (q[0], fmt(abs(la)), q[1], fmtc(abs(lo)))) == [1]
+
+    @pytest.mark.parametrize("template", [
+        "<lat>{a}</lat>\n<lon>{b}</lon>", "<latitude>{a}</latitude><longitude>{b}</longitude>",
+        "<lat>{a}</lat> <lng>{b}</lng>", "<geo:lat>{a}</geo:lat>\n<geo:long>{b}</geo:long>",
+        "homeLat: {a}\nhomeLon: {b}", "gpsLat={a}, gpsLng={b}", "gpslat {a}\ngpslon {b}",
+        "siteLatitude {a} siteLongitude {b}", "latitud {a}\nlongitud {b}",
+        "lat => {a}, lon => {b}", "lat := {a}\nlon := {b}",
+        "setLatitude({a}); setLongitude({b})", "lat (deg): {a}\nlon (deg): {b}"])
+    @pytest.mark.parametrize("q", QUADRANTS)
+    def test_detects_more_key_spellings(self, q, template):
+        la, lo = far_quadrant(q)
+        assert lines(template.format(a=fmt(la), b=fmt(lo))) == [1]
+
+    @pytest.mark.parametrize("template", [
+        "<latitude>{a}</latitude>", "<longitude>{b}</longitude>", "<lat>{a}</lat>",
+        "homeLat: {a}", "siteLongitude = {b}", "gpslon {b}", "trackLng=\"{b}\""])
+    @pytest.mark.parametrize("q", QUADRANTS)
+    def test_detects_a_lone_value_under_a_new_key_spelling(self, q, template):
+        la, lo = far_quadrant(q)
+        assert lines(template.format(a=fmt(la), b=fmt(lo))) == [1]
+
+    @pytest.mark.parametrize("space", ["\u00a0", "\u2007", "\u2009", "\u202f"])
+    @pytest.mark.parametrize("q", QUADRANTS)
+    def test_detects_a_pair_separated_by_a_unicode_space(self, q, space):
+        la, lo = far_quadrant(q)
+        assert lines(fmt(la) + "," + space + fmt(lo)) == [1]
+        assert lines(fmt(abs(la)) + space + q[0] + "," + space + fmt(abs(lo)) + space + q[1]) == [1]
+
+    def test_unicode_space_folding_keeps_line_numbers(self):
+        la, lo = far_quadrant("NE")
+        assert lines("a\u00a0b\n\u2009\u202f\n" + fmt(la) + ",\u2007" + fmt(lo)) == [3]
+
+    @pytest.mark.parametrize("deg", ["\u00ba", "\u02da"])
+    @pytest.mark.parametrize("q", QUADRANTS)
+    def test_detects_ordinal_and_ring_degree_signs(self, q, deg):
+        la, lo = far_quadrant(q)
+        assert lines("%s%s%s, %s%s%s" % (fmt(abs(la)), deg, q[0], fmt(abs(lo)), deg, q[1])) == [1]
+        assert lines("%s%s, %s%s" % (fmt(la), deg, fmt(lo), deg)) == [1]
+
+    @pytest.mark.parametrize("entity", ["&#44;", "&#x2C;", "&comma;", ",&nbsp;", "&nbsp;", "&#59;",
+                                        "&semi;", ",&#160;"])
+    @pytest.mark.parametrize("q", QUADRANTS)
+    def test_detects_an_html_entity_separator(self, q, entity):
+        la, lo = far_quadrant(q)
+        assert lines("<td>" + fmt(la) + entity + fmt(lo) + "</td>") == [1]
+
+    def test_html_entity_decoding_keeps_line_numbers(self):
+        la, lo = far_quadrant("SE")
+        text = "a&nbsp;b&#44;c\n&comma;\n<p>" + fmt(la) + "&#x2C;&nbsp;" + fmt(lo) + "</p>\n"
+        assert lines(text) == [3]
+
+
 class TestGapControls:
     """Shapes that must stay unflagged."""
+
+    def test_an_en_dash_first_sign_is_not_an_iso_sign(self):
+        assert lines("\u2013" + fmt(LAT_FAR) + "-" + fmt(LON_BIG)) == []
+        assert lines("x \u2013" + fmt(1.2345, 4) + "+" + fmt(2.3456, 4)) == []
+
+    def test_a_two_digit_latitude_with_a_sub_degree_longitude_is_not_strict(self):
+        assert lines(sg(LAT_FAR) + sg(-0.5678)) == []
+
+    @pytest.mark.parametrize("text", [
+        "y = x+0.1234-0.5678/2", "(+0.1234-0.5678)/2", "v = t+12.3456-123.4567/dt",
+        "z=k+12.3456-100.0001", "+0.1234-0.5678+1/", "(a)+12.3456-100.0001", "w_+0.1234-0.5678/2",
+        "r = +0.1234-0.5678/x", "id+12.3456-100.0001"])
+    def test_ignores_arithmetic_that_looks_like_strict_iso6709(self, text):
+        assert lines(text) == []
+
+    @pytest.mark.parametrize("template", ["v{a}N {b}W", "AN{a} W{b}", "{s}N {t}Wh", "{s}N{tabs}{t}W"])
+    def test_glued_or_distant_letters_do_not_make_a_hemisphere_pair(self, template):
+        text = template.format(a=fmt(LAT_FAR), b=fmt(LON_BIG), s=fmt(0.1234, 4), t=fmt(0.5678, 4),
+                               tabs="\t" * 20)
+        assert lines(text) == []
+
+    @pytest.mark.parametrize("word", ["getLatency", "isFlat", "flatten", "template", "colony", "salon",
+                                      "balloon", "Along", "belong", "prolong", "isLatest", "<plateau>",
+                                      "<late>", "slat", "Salon", "oblong"])
+    @pytest.mark.parametrize("sep", [": ", "=", " ", ">", "("])
+    def test_words_containing_a_key_are_not_keys(self, word, sep):
+        la, _ = far_quadrant("SW")
+        assert lines(word + sep + fmt(la)) == []
+
+    @pytest.mark.parametrize("template", ["{a}&amp;{b}", "{a}&#44{b}", "{a}&nbsp{b}", "{a}&#x2D;{b}"])
+    def test_other_entities_are_not_separators(self, template):
+        la, lo = far_quadrant("NE")
+        assert lines(template.format(a=fmt(la), b=fmt(lo))) == []
 
     def test_an_iso6709_near_pair_passes(self):
         la, lo = near_pair()
@@ -464,8 +599,10 @@ class TestGapControls:
         assert lines("%s / %s" % (fmt(la), fmt(lo))) == []
 
     def test_the_reverted_lowercase_zero_width_hemisphere_form_stays_unflagged(self):
-        assert lines("1.2345s-2.3456s") == []
-        assert lines("12.3456n-14.5678n") == []
+        # One latitude and one longitude letter, so accepting lowercase letters would flag these.
+        assert lines("1.2345s-2.3456w") == []
+        assert lines("12.3456n-14.5678e") == []
+        assert lines("0.1234 n, 0.5678 w") == []
 
     def test_a_single_hemisphere_letter_is_not_a_pair(self):
         la, lo = far_pair()
@@ -492,6 +629,12 @@ class TestGapControls:
 
 class TestGapRegressions:
     """Shapes main already catches; they must stay caught."""
+
+    @pytest.mark.parametrize("q", QUADRANTS)
+    def test_lowercase_letters_are_tolerated_as_separators_like_main(self, q):
+        la, lo = far_quadrant(q)
+        assert lines("%s n, %s w" % (fmt(abs(la)), fmt(abs(lo)))) == [1]
+        assert lines("%s s %s e" % (fmt(abs(la)), fmt(abs(lo)))) == [1]
 
     @pytest.mark.parametrize("template", ["{n}-{a}, {b}", "12:00:{n}-{a},{b}", "{n}-{m}-{a}, {b}"])
     @pytest.mark.parametrize("q", ["SE", "SW"])
