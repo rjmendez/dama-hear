@@ -28,6 +28,8 @@ __all__ = [
     "MonteCarloSweep",
     "PlacementOptimizer",
     "AcousticImpulseEvent", "CalibrationError", "CalibrationEstimate", "CalibrationRefusal", "LatencyCalibrator",
+    "ClapCalibrationError", "ClapCalibrationResult", "ClapCalibrator", "ClapObservation", "ClapSource",
 ]
 
 from .latency_calibrator import (AcousticImpulseEvent, CalibrationError, CalibrationEstimate, CalibrationRefusal, LatencyCalibrator)
+from .clap_calibrator import (ClapCalibrationError, ClapCalibrationResult, ClapCalibrator, ClapObservation, ClapSource)
