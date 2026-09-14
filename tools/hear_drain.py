@@ -859,6 +859,11 @@ def drain_context_file(pl: "P.Pool", node: str, ip: str, name: str, sizes: Optio
     if size_now is not None and prev is not None and header and int(size_now) == int(prev):
         out["files"].append({**entry, "bytes": 0, "skipped_unchanged": True, "size": int(size_now)})
         return False
+    if size_now is None and not header:
+        # A blind tail with no header would archive rows that are not a CSV on their own. The
+        # next listed run fetches the file whole, so nothing is lost by waiting for it.
+        out["files"].append({**entry, "bytes": 0, "skipped_unmeasured": True})
+        return False
     if size_now is not None and (prev is None or rolled or not header):
         tail, file_timeout = None, rolled_file_timeout(size_now, timeout)
     elif size_now is None:
