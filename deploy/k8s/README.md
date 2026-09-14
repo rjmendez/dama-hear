@@ -175,11 +175,10 @@ and the solvers read the pool with no adapter.
   Bundles now declare `data` files and the audit resolves every `.json` a shipped module opens
   against its own directory. ⚠️That `__file__`-relative path also **pins the mount layout** — the
   model must be a sibling `subPath` of `classify.py` or the default points at nothing.
-- **Nothing in `tests/` compared a code ConfigMap against the checkout**, which is why the
-  `hear-drain` drift went unnoticed until review. `tests/test_hear_score.py` now regenerates both
-  bundles and compares the `data` mapping — ⚠️`data` only: the commit annotation is
-  `git rev-parse --short HEAD` plus a `-dirty` flag, so it changes on every commit and flips in
-  any tree with uncommitted work, i.e. in the exact state a developer runs pytest in.
+- **`tests/test_configmap_sync.py` compares every code ConfigMap against its source commit.** It
+  rejects a committed `-dirty` stamp, an unreachable stamp, and embedded data that differs from
+  the files at that stamp. Land source changes first, then regenerate the bundles from the clean
+  tree in a separate `deploy:` commit; do not amend either commit after regeneration.
 - **`/pool/pylib` is shared between the two workloads.** A guard that only tests whether the
   numpy directory exists means whichever workload reaches an empty PVC first decides the version
   and the other silently uses what it finds — both pins then read as discipline while enforcing

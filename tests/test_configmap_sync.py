@@ -18,8 +18,9 @@ the fix is always the same one line, never an edit to the YAML:
 
     python3 deploy/k8s/gen_configmap.py <bundle> > deploy/k8s/<bundle>.yaml
 
-It deliberately does NOT check the `dama-hear/commit` annotation, which is a stamp of when the
-file was generated and legitimately says `-dirty` in a working tree (the committed copy did).
+The provenance guard below rejects a committed `-dirty` stamp and checks every embedded file
+against the commit named by the stamp. This makes the annotation useful for tracing a live pod
+even when a later source commit changes the checkout.
 """
 import json
 import os
@@ -510,42 +511,42 @@ class TestTheCommitStampCanActuallySayClean:
 
 
 class TestTheStampNamesACommitThatExists:
-    """⚠️A STAMP NAMING AN UNREACHABLE COMMIT IS WORSE THAN ONE SAYING "-dirty".
+    """A committed bundle must identify a reachable commit containing its exact payload."""
 
-    A file cannot contain the hash of the commit that contains it, so the stamp always names the
-    PARENT state. That is fine until someone regenerates the bundles and then `git commit
-    --amend`: the amend rewrites the SHA the bundles just recorded, and the stamp is left
-    pointing at a commit that is no longer in history. Observed exactly that way on 2026-09-11 --
-    stamp d7b2a0f, HEAD 79e0813, and `git merge-base --is-ancestor` said no.
-
-    The fix is two commits, not one amended commit: land the source, then regenerate. This test
-    is what says so out loud.
-
-    Skipped, not failed, when the tree is dirty -- mid-edit the stamp is expected to be stale,
-    and a test that fails during ordinary work is a test people learn to ignore.
-    """
-
-    def test_every_bundle_stamp_is_an_ancestor_of_head(self):
+    def test_every_bundle_stamp_is_clean_reachable_and_verifiable(self):
         import subprocess
         root = str(ROOT)
         if subprocess.run(["git", "-C", root, "rev-parse", "--git-dir"],
                           capture_output=True).returncode != 0:
             pytest.skip("not a git checkout")
-        porcelain = subprocess.check_output(
-            ["git", "-C", root, "status", "--porcelain"]).decode().splitlines()
-        generated = {"deploy/k8s/%s.yaml" % b for b in _gen()["BUNDLES"]}
-        if [ln for ln in porcelain if ln[3:].strip().strip('"') not in generated]:
-            pytest.skip("working tree has source changes; the stamp is expected to be stale")
         for bundle in sorted(_gen()["BUNDLES"]):
             path = ROOT / "deploy" / "k8s" / (bundle + ".yaml")
             if not path.exists():
                 continue
-            stamp = (yaml.safe_load(path.read_text())["metadata"]["annotations"]
+            document = yaml.safe_load(path.read_text())
+            stamp = (document.get("metadata", {}).get("annotations", {})
                      .get("dama-hear/commit") or "")
-            if not stamp or stamp.endswith("-dirty"):
-                continue
+            assert stamp and not stamp.endswith("-dirty"), (
+                "%s has no clean source commit stamp; regenerate it from a clean tree"
+                % path.name)
+            assert subprocess.run(
+                ["git", "-C", root, "cat-file", "-e", "%s^{commit}" % stamp],
+                capture_output=True).returncode == 0, (
+                "%s stamps %r, which is not a verifiable commit" % (path.name, stamp))
             assert subprocess.run(["git", "-C", root, "merge-base", "--is-ancestor", stamp, "HEAD"],
                                   capture_output=True).returncode == 0, (
                 "%s stamps %s, which is not an ancestor of HEAD. An --amend after regenerating "
                 "does this: the amend rewrites the SHA the bundle just recorded. Land the source "
                 "first, then regenerate in a second commit." % (path.name, stamp))
+            _app, code, data = _gen()["BUNDLES"][bundle]
+            embedded = _embedded(path)
+            for key, rel in list(code) + list(data):
+                expected = subprocess.run(
+                    ["git", "-C", root, "show", "%s:%s" % (stamp, rel)],
+                    capture_output=True, text=True)
+                assert expected.returncode == 0, (
+                    "%s stamps %s, but %s does not exist in that commit"
+                    % (path.name, stamp, rel))
+                assert embedded.get(key) == expected.stdout, (
+                    "%s/%s differs from the source at stamped commit %s; regenerate the bundle"
+                    % (bundle, key, stamp))
