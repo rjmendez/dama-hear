@@ -120,6 +120,17 @@ def test_the_loop_measures_its_own_period():
     assert "loop_max_boot_us" in b
 
 
+def test_the_since_boot_maximum_says_when_it_happened():
+    """#99 read a 62 s since-boot maximum as a boot stall; it was a drain transfer at uptime 465 s.
+    The uptime is taken in the same branch that raises the maximum, so the two cannot disagree."""
+    code = _code(INO)
+    b = _body(code, "void loop(")
+    assert re.search(r"if \(d > loop_max_boot_us\) \{\s*loop_max_boot_us = d;\s*"
+                     r"loop_max_boot_at_s = \(millis\(\) - boot_ms\) / 1000;\s*\}", b)
+    assert re.search(r'\\"loop_max_boot_ms\\":%lu,\\"loop_max_boot_at_s\\":%lu,', code)
+    assert re.search(r"\(loop_max_boot_us / 1000\),\s*\(unsigned long\)loop_max_boot_at_s,", code)
+
+
 def test_no_credential_reaches_a_log_line_in_the_join():
     s = LITERAL.sub('""', NET.read_text())
     s = re.sub(r"//[^\n]*", "", s)

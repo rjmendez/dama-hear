@@ -699,8 +699,9 @@ stalled loop.
   - `reset` is why the chip last reset (`poweron`, `sw`, `panic`, `task_wdt`, `brownout`, ...).
   - `heap_min` and `psram_min` are the lowest free memory since boot.
   - `loop_max_ms` is the longest `loop()` pass in the current health row, and `loop_max_boot_ms`
-    the longest since boot. A download in progress shows up here, because the handler runs inside
-    `loop()`.
+    the longest since boot, whenever it happened. `loop_max_boot_at_s` is the uptime at which that
+    pass ended, so a stall during boot reads as a small number and one during a later drain reads
+    as a large one. A download in progress shows up here, because the handler runs inside `loop()`.
   - `chip_c` is the chip temperature.
   - `stream_stalls` and `stream_gone` count `/sd`, `/ls`, `/audio` and `/perf` sends given up,
     either because the link stopped taking data for `STREAM_STALL_MS` (20 s) or because the client
