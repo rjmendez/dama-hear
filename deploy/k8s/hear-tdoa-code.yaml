@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 641633 B serialised; 641811 B of annotations against a 262144 B cap.
+# apply-mode server: 646669 B serialised; 646847 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '1d6f9e7'
+    dama-hear/commit: '405f05d'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '641633'
+    dama-hear/serialised-bytes: '646669'
 data:
   hear__init__.py: |
     
@@ -4392,6 +4392,13 @@ data:
     (hear/node/telemetry.py:55-58): an absent `u_m` defaulted to zero is a plausible-looking node at
     ground level and there is no later measurement that can catch it.
     
+    ⚠️A HEIGHT'S PROVENANCE IS PART OF THE HEIGHT. `u_m` alone cannot say whether it came from a
+    tape measure or from someone's idea of a storey. survey.json carries `u_source` and `sigma_u_m`
+    per node, and the loader used to ignore both while `to_dict()` did not write them, so the first
+    tool to load and rewrite the survey erased the only record that a number was a guess. They are
+    now carried, and `height_provenance()` reports them so an assumed height is visible in an answer
+    rather than only in a file nobody re-reads.
+    
     `origin` IS NOW USED. It was carried and ignored, which meant every WGS84-to-local conversion got
     hand-rolled by whoever needed one -- and the hand-rolled version was a sphere with the height
     thrown away. `enu_of()` and `from_wgs84_nodes()` do it through hear.geodesy instead. The origin's
@@ -4423,6 +4430,11 @@ data:
     # Vertical spread under which projecting to 2D is benign. JUDGEMENT, not measured -- the
     # 2026-09-05 session recorded no node heights at all.
     FLAT_TOL_M: float = 2.0
+    
+    # Vertical sigma past which `height_provenance()` calls a height out. JUDGEMENT: on the 16.6 m
+    # nyquist-mach pair, 1.0 m of height error moves the 3D baseline by 206 mm, 41x the ~5 mm the
+    # fleet's clock sync is worth; 0.25 m keeps that term under 15 mm, and a tape measure reaches it.
+    HEIGHT_SIGMA_TOL_M: float = 0.25
     
     _FRAME = "enu_local"
     _UNITS = "m"
@@ -4480,7 +4492,9 @@ data:
                      sigma_m: Optional[Dict[int, float]] = None,
                      origin: Optional[Dict] = None,
                      classes: Optional[Dict[int, str]] = None,
-                     position_sources: Optional[Dict[int, str]] = None) -> None:
+                     position_sources: Optional[Dict[int, str]] = None,
+                     u_source: Optional[Dict[int, str]] = None,
+                     sigma_u_m: Optional[Dict[int, float]] = None) -> None:
             self.ids: List[int] = sorted(int(k) for k in positions)
             self._pos: Dict[int, np.ndarray] = {
                 int(k): np.asarray(v, float).reshape(3) for k, v in positions.items()}
@@ -4490,6 +4504,11 @@ data:
             # "survey" unless the position came from somewhere weaker; see augment_from_node_gps().
             self.position_sources: Dict[int, str] = {
                 i: (position_sources or {}).get(i, "survey") for i in self.ids}
+            # `sigma_m` is HORIZONTAL (node_survey.py's east/north block scatter), so the vertical gets
+            # its own sigma. Both stay None when unstated: None is "nobody wrote it down", not 0.0.
+            self.u_source: Dict[int, Optional[str]] = {i: (u_source or {}).get(i) for i in self.ids}
+            self.sigma_u_m: Dict[int, Optional[float]] = {
+                i: (sigma_u_m or {}).get(i) for i in self.ids}
             self.origin: Optional[Dict] = origin
     
         def arrival_ids(self) -> List[int]:
@@ -4624,12 +4643,46 @@ data:
             d: Dict = {"frame": _FRAME, "units": _UNITS}
             if self.origin is not None:
                 d["origin"] = self.origin
-            d["nodes"] = [
-                {"node_id": i, "name": self.names[i],
-                 "e_m": float(self._pos[i][0]), "n_m": float(self._pos[i][1]),
-                 "u_m": float(self._pos[i][2]), "sigma_m": self.sigma_m[i]}
-                for i in self.ids]
+            nodes = []
+            for i in self.ids:
+                # ⚠️A ROUND TRIP MUST NOT LAUNDER A GUESS INTO A MEASUREMENT. Emitting only the six
+                # position keys dropped "nominal storey" and its sigma, so a rewritten file read as
+                # surveyed. Absent keys stay absent. (`class` is still not emitted; see
+                # tools/hear_tdoa.py arrival_survey and its regression test.)
+                e = {"node_id": i, "name": self.names[i],
+                     "e_m": float(self._pos[i][0]), "n_m": float(self._pos[i][1]),
+                     "u_m": float(self._pos[i][2]), "sigma_m": self.sigma_m[i]}
+                if self.u_source[i] is not None:
+                    e["u_source"] = self.u_source[i]
+                if self.sigma_u_m[i] is not None:
+                    e["sigma_u_m"] = float(self.sigma_u_m[i])
+                nodes.append(e)
+            d["nodes"] = nodes
             return d
+    
+        def height_provenance(self) -> Dict:
+            """Where each `u_m` came from and what the unmeasured ones cost, as data.
+    
+            An assumed height is a legitimate placeholder for a node nobody has reached with a tape,
+            so it is not refused -- but it must not be invisible. `unmeasured` lists ids with no
+            `u_source`, no `sigma_u_m`, or a `sigma_u_m` above `tol_m`; an unstated sigma counts as
+            unmeasured, never as zero. `sigma_m` does not cover this: it is horizontal only.
+            """
+            rows = [{"node_id": i, "name": self.names[i], "u_m": float(self._pos[i][2]),
+                     "u_source": self.u_source[i], "sigma_u_m": self.sigma_u_m[i],
+                     "stated": self.u_source[i] is not None} for i in self.ids]
+            unmeasured = [r["node_id"] for r in rows
+                          if not r["stated"] or r["sigma_u_m"] is None
+                          or r["sigma_u_m"] > HEIGHT_SIGMA_TOL_M]
+            known = [r["sigma_u_m"] for r in rows if r["sigma_u_m"] is not None]
+            return {"nodes": rows, "unmeasured": unmeasured,
+                    "n_unstated": sum(1 for r in rows if not r["stated"]),
+                    "worst_sigma_u_m": max(known) if known else None,
+                    "tol_m": HEIGHT_SIGMA_TOL_M,
+                    "note": None if not unmeasured else
+                            "node(s) %s carry a height that is assumed, unquantified, or worse than "
+                            "+/-%.2f m; every range through them inherits it, and sigma_m is "
+                            "horizontal only" % (unmeasured, HEIGHT_SIGMA_TOL_M)}
     
     
     def _read_node(entry, index: int, seen: Dict[int, int]) -> Dict:
@@ -4672,8 +4725,17 @@ data:
         if not isinstance(src, str) or not src:
             raise SurveyError("node %d has position_source %r, which is not a non-empty string"
                               % (nid, src))
+        usrc = entry.get("u_source")
+        if usrc is not None and not isinstance(usrc, str):
+            raise SurveyError("node %d has u_source %r, which is not a string" % (nid, usrc))
+        su = entry.get("sigma_u_m")
+        if su is not None:
+            if not _is_number(su) or not math.isfinite(float(su)) or float(su) < 0.0:
+                raise SurveyError("node %d has sigma_u_m %r: need a finite non-negative number"
+                                  % (nid, su))
+            su = float(su)
         return {"node_id": nid, "xyz": xyz, "name": name, "sigma_m": float(sig),
-                "class": cls or "", "position_source": src}
+                "class": cls or "", "position_source": src, "u_source": usrc, "sigma_u_m": su}
     
     
     def from_dict(d: Dict, min_nodes: int = 3) -> Survey:
@@ -4708,6 +4770,9 @@ data:
                     sigma_m={r["node_id"]: r["sigma_m"] for r in rows},
                     classes={r["node_id"]: r["class"] for r in rows},
                     position_sources={r["node_id"]: r["position_source"] for r in rows},
+                    u_source={r["node_id"]: r["u_source"] for r in rows if r["u_source"] is not None},
+                    sigma_u_m={r["node_id"]: r["sigma_u_m"] for r in rows
+                               if r["sigma_u_m"] is not None},
                     origin=d.get("origin"))
     
         P = sv.positions(sv.ids)
@@ -4764,9 +4829,15 @@ data:
         nodes = []
         for e, p in zip(entries, pts):
             en = GEO.geodetic_to_enu(p[0], p[1], p[2], *o)
-            nodes.append({"node_id": e["node_id"], "name": e.get("name", ""),
-                          "e_m": en[0], "n_m": en[1], "u_m": en[2],
-                          "sigma_m": float(e.get("sigma_m", 0.0))})
+            n = {"node_id": e["node_id"], "name": e.get("name", ""),
+                 "e_m": en[0], "n_m": en[1], "u_m": en[2],
+                 "sigma_m": float(e.get("sigma_m", 0.0))}
+            # Carried, not defaulted: this is how an RTK fix becomes a survey entry, and the sentence
+            # saying it was RTK is the difference between that and a nominal storey.
+            for k in ("u_source", "sigma_u_m"):
+                if e.get(k) is not None:
+                    n[k] = e[k]
+            nodes.append(n)
         return from_dict({"frame": _FRAME, "units": _UNITS, "origin": origin, "nodes": nodes},
                          min_nodes=min_nodes)
     
@@ -4869,7 +4940,8 @@ data:
             cls = p.get("class") if isinstance(p.get("class"), str) else ""
             taken.add(nid)
             added.append({"node_id": nid, "name": name, "e_m": e, "n_m": n, "u_m": u,
-                          "sigma_m": sigma, "class": cls, "position_source": POSITION_SOURCE_GPS})
+                          "sigma_m": sigma, "class": cls, "position_source": POSITION_SOURCE_GPS,
+                          "u_source": "the node's own GPS mean ellipsoid height, not surveyed"})
             report.append({"name": name, "used": True, "node_id": nid, "sigma_m": sigma,
                            "hacc_m": float(p["hacc_m"]), "fixes": int(p["fixes"]),
                            "age_s": float(now) - float(p["at"]), "class": cls or "(unstated)"})
@@ -4878,9 +4950,14 @@ data:
         rows = []
         for i in sv.ids:
             e, n, u = (float(x) for x in sv.position(i))
-            rows.append({"node_id": i, "name": sv.names[i], "e_m": e, "n_m": n, "u_m": u,
-                         "sigma_m": sv.sigma_m[i], "class": sv.classes.get(i, ""),
-                         "position_source": sv.position_sources.get(i, "survey")})
+            row = {"node_id": i, "name": sv.names[i], "e_m": e, "n_m": n, "u_m": u,
+                   "sigma_m": sv.sigma_m[i], "class": sv.classes.get(i, ""),
+                   "position_source": sv.position_sources.get(i, "survey")}
+            if sv.u_source.get(i) is not None:
+                row["u_source"] = sv.u_source[i]
+            if sv.sigma_u_m.get(i) is not None:
+                row["sigma_u_m"] = sv.sigma_u_m[i]
+            rows.append(row)
         try:
             out = from_dict({"frame": _FRAME, "units": _UNITS, "origin": sv.origin,
                              "nodes": rows + added}, min_nodes=0)
