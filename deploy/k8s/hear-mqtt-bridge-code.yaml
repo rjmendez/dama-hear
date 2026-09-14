@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-mqtt-bridge-code.yaml
-# apply-mode client: 22379 B serialised; 22556 B of annotations against a 262144 B cap.
+# apply-mode client: 22830 B serialised; 23007 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-mqtt-bridge
   annotations:
-    dama-hear/commit: '1d6f9e7'
+    dama-hear/commit: 'ec88e19'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '22379'
+    dama-hear/serialised-bytes: '22830'
 data:
   tools_hear_heartbeat_receiver.py: |
     #!/usr/bin/env python3
@@ -397,6 +397,7 @@ data:
     import logging
     import os
     import sys
+    from datetime import datetime, timezone
     from typing import Any, Callable, Dict, Optional, Tuple
     
     import paho.mqtt.client as mqtt
@@ -469,6 +470,12 @@ data:
         validator, writer_name = route
     
         try:
+            # batch_ingest/forwarder normalize the transport timestamp to numeric
+            # milliseconds. The Redis contract uses an RFC3339 string.
+            ts = payload.get("ts")
+            if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+                payload = dict(payload)
+                payload["ts"] = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
             body = validator(payload)
         except RequestError as exc:
             stats.rejected += 1
