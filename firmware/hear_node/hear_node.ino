@@ -101,7 +101,8 @@ static bool prov_loaded = false;    // ...and it was read back from NVS, not onl
 
 #include <hear_net.h>
 static hear_net_join_t net_join;
-static uint32_t loop_max_us = 0, loop_max_boot_us = 0;   // longest loop() pass: this health row, and boot
+static uint32_t loop_max_us = 0, loop_max_boot_us = 0;   // longest loop() pass: this health row, and since boot
+static uint32_t loop_max_boot_at_s = 0;                   // uptime at which the since-boot longest pass ended
 static uint32_t stream_stall_n = 0, stream_gone_n = 0;    // sends that gave up: stalled, client gone
 static const char *selftest_mic = "untested";
 static const char *selftest_gps = "untested";
@@ -2863,7 +2864,7 @@ static String status_json() {
     "\"net\":{\"connected\":%s,\"rssi\":%s,\"rssi_join\":%d,\"ch\":%d,\"bssid\":\"%s\",\"joined\":%d,"
       "\"seen\":%d,\"join_ms\":%lu,\"disc\":%lu,\"reconn\":%lu,\"reason\":%d,\"disc_age_s\":%s},"
     "\"sys\":{\"reset\":\"%s\",\"heap_min\":%lu,\"psram_min\":%lu,\"loop_max_ms\":%lu,"
-      "\"loop_max_boot_ms\":%lu,\"chip_c\":%.1f,\"stream_stalls\":%lu,\"stream_gone\":%lu},"
+      "\"loop_max_boot_ms\":%lu,\"loop_max_boot_at_s\":%lu,\"chip_c\":%.1f,\"stream_stalls\":%lu,\"stream_gone\":%lu},"
     "\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"pmtk_ack\":%lu,\"pmtk_nak\":%lu,\"pmtk_glitch\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
@@ -2938,7 +2939,8 @@ static String status_json() {
     (unsigned long)hear_net_disconnects(), (unsigned long)hear_net_reconnects(),
     hear_net_last_reason(), disc_age_json(),
     reset_reason_name(), (unsigned long)ESP.getMinFreeHeap(), (unsigned long)ESP.getMinFreePsram(),
-    (unsigned long)(loop_max_us / 1000), (unsigned long)(loop_max_boot_us / 1000), temperatureRead(),
+    (unsigned long)(loop_max_us / 1000), (unsigned long)(loop_max_boot_us / 1000),
+    (unsigned long)loop_max_boot_at_s, temperatureRead(),
     (unsigned long)stream_stall_n, (unsigned long)stream_gone_n,
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
@@ -4664,7 +4666,7 @@ void loop() {
     if (last_us) {
       uint32_t d = now - last_us;
       if (d > loop_max_us) loop_max_us = d;
-      if (d > loop_max_boot_us) loop_max_boot_us = d;
+      if (d > loop_max_boot_us) { loop_max_boot_us = d; loop_max_boot_at_s = (millis() - boot_ms) / 1000; }
     }
     last_us = now; }
   http.handleClient();
