@@ -152,26 +152,43 @@ class NodeClass:
                     speed moves 0.6 m/s per degree and biases every node the same way, so it
                     does NOT cancel in TDoA.
     raw_retain_s    Seconds of raw audio retrievable on request, 0 if none.
+    power_profile   "solar_duty_cycled" | "mains_continuous" | "battery_mobile". A SECOND
+                    hardware fact, orthogonal to timing: it declares which detector lanes this
+                    class can afford to run.
+    has_camera      Whether an image sensor is fitted, for multimodal event-fusion eligibility.
     notes           Free text for whoever reads a refusal message.
     """
 
     def __init__(self, name: str, time_source: str, t_sigma_s: float, mic_count: int,
                  fs_hz: float, band_hz: Sequence[float], env: Sequence[str] = (),
-                 raw_retain_s: float = 0.0, notes: str = "",
+                 raw_retain_s: float = 0.0, power_profile: str = "mains_continuous",
+                 has_camera: bool = False, notes: str = "",
                  path_bias_s: Optional[float] = None,
                  clock_sigma_s: Optional[float] = None) -> None:
+        if not isinstance(name, str) or not name.strip():
+            raise CapabilityError("class name must be a non-empty string")
         if time_source not in ("gps_pps", "ntp", "none"):
             raise CapabilityError("unknown time_source %r" % (time_source,))
-        if mic_count < 1:
+        if power_profile not in ("solar_duty_cycled", "mains_continuous", "battery_mobile"):
+            raise CapabilityError("unknown power_profile %r" % (power_profile,))
+        if isinstance(mic_count, bool) or not isinstance(mic_count, int) or mic_count < 1:
             raise CapabilityError("%s: mic_count must be >= 1" % name)
-        if fs_hz <= 0:
+        try:
+            t_sigma_s = float(t_sigma_s)
+            fs_hz = float(fs_hz)
+            raw_retain_s = float(raw_retain_s)
+            lo, hi = (float(v) for v in band_hz)
+        except (TypeError, ValueError, IndexError):
+            raise CapabilityError("%s: numeric fields are malformed" % name)
+        if not math.isfinite(fs_hz) or fs_hz <= 0:
             raise CapabilityError("%s: fs_hz must be positive" % name)
-        lo, hi = float(band_hz[0]), float(band_hz[1])
-        if not lo < hi:
+        if not math.isfinite(lo) or not math.isfinite(hi) or lo < 0 or not lo < hi:
             raise CapabilityError("%s: band_hz must be (lo, hi) with lo < hi" % name)
-        if t_sigma_s <= 0:
+        if not math.isfinite(t_sigma_s) or t_sigma_s <= 0:
             raise CapabilityError("%s: t_sigma_s must be positive -- a node with no timing error "
                                   "is a claim no hardware supports" % name)
+        if not math.isfinite(raw_retain_s) or raw_retain_s < 0:
+            raise CapabilityError("%s: raw_retain_s must be finite and non-negative" % name)
         if path_bias_s is not None:
             path_bias_s = float(path_bias_s)
             if not math.isfinite(path_bias_s) or path_bias_s <= 0.0:
@@ -196,6 +213,8 @@ class NodeClass:
                     % (name, clock_sigma_s * 1e6, float(t_sigma_s) * 1e6))
         self.name = name
         self.time_source = time_source
+        self.power_profile = power_profile
+        self.has_camera = bool(has_camera)
         self.t_sigma_s = float(t_sigma_s)
         self.clock_sigma_s = clock_sigma_s
         self.path_bias_s = path_bias_s
@@ -326,6 +345,15 @@ class NodeClass:
         geometry cannot detect.
         """
         return self.clock_admissible() and self.capture_bias_bounded()
+
+    def detector_lanes(self) -> frozenset:
+        """Which detector lanes this class's power and sensor budget admits."""
+        lanes = {"impulse_gate", "tonal_gate_duty"}
+        if self.power_profile in ("mains_continuous", "battery_mobile"):
+            lanes.add("tonal_gate_continuous")
+        if self.has_camera:
+            lanes.add("camera_fusion")
+        return frozenset(lanes)
 
     # ---- the same budget, per DETECTION ------------------------------------------------------
     # ⚠️WHY A CLASS-WIDE t_sigma_s IS NOT THE WHOLE ANSWER ANY MORE. `t_sigma_s` says what this
@@ -547,6 +575,7 @@ register(NodeClass(
     band_hz=(50.0, 10000.0),
     env=("temp", "press"),
     raw_retain_s=60.0,   # measured on all three nodes; 80 s only if 7.94 MB of PSRAM is contiguous
+    power_profile="solar_duty_cycled",
     notes="XIAO ESP32-S3 Sense + u-blox GPS on D0 PPS + BMP280 + microSD. nyquist, mach, rankine "
           "-- all three answered GET /status with this class 2026-09-10.",
 ))
@@ -569,6 +598,7 @@ register(NodeClass(
     band_hz=(50.0, 15000.0),
     env=("temp", "press"),
     raw_retain_s=80.0,   # same PSRAM budget, three times the rate
+    power_profile="solar_duty_cycled",
     notes="Planned I2S variant. Not built. Bandwidth-limited by the part, not by the sample rate. "
           "Refused for arrivals ONLY because its capture path has never been measured; its clock "
           "budget would pass.",
@@ -597,6 +627,7 @@ register(NodeClass(
     band_hz=(50.0, 15000.0),
     env=("temp", "humidity", "press", "voc", "co2", "light"),
     raw_retain_s=0.0,
+    power_profile="mains_continuous",
     notes="BirdWeather PUC, IF its GPS PPS is wired to the ESP32-S3. UNVERIFIED -- do not survey a "
           "PUC as this class until a scope or a teardown confirms the PPS pin, and do not expect "
           "arrivals from it until its capture-path delay is measured.",
@@ -629,6 +660,7 @@ register(NodeClass(
     band_hz=(50.0, 15000.0),
     env=("temp", "humidity", "press", "voc", "co2", "light"),
     raw_retain_s=0.0,
+    power_profile="mains_continuous",
     notes="BirdWeather PUC timed by NTP and its RTC. An RTC gives holdover, not sync. Excellent "
           "listener, not a ranging node.",
 ))
@@ -649,6 +681,7 @@ register(NodeClass(
     band_hz=(50.0, 15000.0),
     env=(),
     raw_retain_s=0.0,
+    power_profile="solar_duty_cycled",
     notes="Minimal ESP32-S3 + PMTK GPS/1PPS + I2S mic and NO SD card, so detections come from "
           "/detections only. gold, ageev, kasami answered /status with this class 2026-09-13. "
           "Refused for arrivals ONLY because its capture path has never been measured; "
@@ -740,6 +773,7 @@ register(NodeClass(
     band_hz=(50.0, 20000.0),
     env=("temp", "press"),
     raw_retain_s=8.0,
+    power_profile="battery_mobile",
     notes="dama-gotchi Android node. EXCELLENT sensor platform: a 48 kHz microphone wider than any "
           "XIAO node, an 8 s raw ring it will serve on request, a HAL-anchored frame axis and an "
           "onset that reaches the pool. Refused for arrivals on ONE count now: the uncorrected "
@@ -795,6 +829,7 @@ register(NodeClass(
     band_hz=(50.0, 24000.0),
     env=("temp",),  # Pi ambient temp only; no HAL-anchored sensor suite
     raw_retain_s=0.0,  # Audio is served on-demand by dama-gotchi, not retained locally
+    power_profile="mains_continuous",
     notes="Raspberry Pi 4 running dama-gotchi with 16-channel TDM I2S microphone array "
           "(ICS-52000 MEMS mics). EXCELLENT platform for classification and bearing: 16 mics "
           "for 3D DoA, low noise floor, 8+ s ring in dama-gotchi's memory for calibration and "
@@ -803,6 +838,21 @@ register(NodeClass(
           "that no weight removes (1951x over the 31.4 mm arrival bias budget). The clock (Stratum "
           "3 NTP at best) would ALSO refuse it by 87x on random sigma, but the audio path is the "
           "load-bearing refusal.",
+))
+
+register(NodeClass(
+    name="esp32s3-cam-mains",
+    time_source="gps_pps",
+    t_sigma_s=100e-6,
+    path_bias_s=None,
+    mic_count=1,
+    fs_hz=16000.0,
+    band_hz=(50.0, 10000.0),
+    env=("temp", "press"),
+    raw_retain_s=3600.0,
+    power_profile="mains_continuous",
+    has_camera=True,
+    notes="DESIGN TARGET, NOT BUILT. Mains-powered wildlife-camera profile with continuous audio and camera fusion.",
 ))
 
 
