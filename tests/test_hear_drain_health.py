@@ -190,6 +190,24 @@ def test_a_blind_listing_takes_a_bounded_tail_and_keeps_the_mark(tmp_path, node,
     assert _archived_rows(pl) == set(node.health_rows)
 
 
+def test_a_blind_tail_that_returns_the_whole_file_marks_the_served_length(tmp_path, node,
+                                                                         monkeypatch):
+    pl = P.Pool(str(tmp_path / "pool"))
+    node.grow_health(500)
+    _drain(pl, node, 1000)
+
+    def no_ls(ip, timeout=None):
+        raise ConnectionResetError(104, "Connection reset by peer")
+    monkeypatch.setattr(HD, "_ls_sizes", no_ls)
+    monkeypatch.setattr(HD.time, "sleep", lambda s: None)
+    node.roll_health().grow_health(3)
+    assert len(node.health) < HD.CONTEXT_BLIND_TAIL_BYTES
+    r = _drain(pl, node, 2000)
+    e = _entry(r)[0]
+    assert e["whole_response"] is True
+    assert HD.read_watermarks(pl.root)["nyquist"]["health.csv"]["size"] == len(node.health)
+
+
 def test_a_blind_first_run_archives_nothing_rather_than_a_headerless_fragment(tmp_path, node,
                                                                               monkeypatch):
     pl = P.Pool(str(tmp_path / "pool"))

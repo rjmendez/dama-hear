@@ -182,8 +182,9 @@ CONTEXT_FILES = ("health.csv",)
 # card nodes on 2026-09-13 and was pulled whole every 15 minutes, holding the node's single-client
 # HTTP loop for most of a minute per run (#99). A run now asks for the bytes past the last mark plus
 # CONTEXT_OVERLAP_BYTES, which covers more than one row (health rows measured <= 665 B), so the first
-# row kept is always complete. With no size from /ls the mark cannot move, so a bounded tail is
-# archived instead and the next listed run resumes from the old mark.
+# row kept is always complete. With no size from /ls a bounded tail is archived and the mark stays
+# where it was, so the next listed run resumes from it -- unless /sd answered with the whole file,
+# whose served length is then a size the mark can safely take.
 CONTEXT_OVERLAP_BYTES = 4096
 CONTEXT_BLIND_TAIL_BYTES = 64_000
 
