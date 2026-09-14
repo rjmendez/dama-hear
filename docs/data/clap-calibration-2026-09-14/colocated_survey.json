@@ -1,0 +1,10 @@
+{
+  "nodes": [
+    {"node_id": "nyquist", "position_m": [0.0, 0.0, 0.0]},
+    {"node_id": "mach", "position_m": [0.3, 0.1, 0.0]},
+    {"node_id": "rankine", "position_m": [-0.2, 0.4, 0.0]},
+    {"node_id": "gold", "position_m": [0.1, -0.3, 0.0]},
+    {"node_id": "kasami", "position_m": [-0.4, -0.1, 0.0]},
+    {"node_id": "ageev", "position_m": [0.2, 0.3, 0.0]}
+  ]
+}

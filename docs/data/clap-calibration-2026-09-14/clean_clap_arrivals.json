@@ -1,0 +1,169 @@
+{
+  "observations": [
+    {
+      "clap_id": "clap2",
+      "node_id": "rankine",
+      "timestamp_s": 1789406156.547536
+    },
+    {
+      "clap_id": "clap2",
+      "node_id": "nyquist",
+      "timestamp_s": 1789406156.553447
+    },
+    {
+      "clap_id": "clap2",
+      "node_id": "mach",
+      "timestamp_s": 1789406156.600214
+    },
+    {
+      "clap_id": "clap2",
+      "node_id": "gold",
+      "timestamp_s": 1789406156.093391
+    },
+    {
+      "clap_id": "clap2",
+      "node_id": "kasami",
+      "timestamp_s": 1789406156.919568
+    },
+    {
+      "clap_id": "clap3",
+      "node_id": "mach",
+      "timestamp_s": 1789406161.305464
+    },
+    {
+      "clap_id": "clap3",
+      "node_id": "nyquist",
+      "timestamp_s": 1789406161.307455
+    },
+    {
+      "clap_id": "clap3",
+      "node_id": "rankine",
+      "timestamp_s": 1789406161.310144
+    },
+    {
+      "clap_id": "clap3",
+      "node_id": "gold",
+      "timestamp_s": 1789406160.845979
+    },
+    {
+      "clap_id": "clap3",
+      "node_id": "kasami",
+      "timestamp_s": 1789406161.669218
+    },
+    {
+      "clap_id": "clap3",
+      "node_id": "ageev",
+      "timestamp_s": 1789406162.61466
+    },
+    {
+      "clap_id": "clap4",
+      "node_id": "nyquist",
+      "timestamp_s": 1789406164.692915
+    },
+    {
+      "clap_id": "clap4",
+      "node_id": "mach",
+      "timestamp_s": 1789406164.694136
+    },
+    {
+      "clap_id": "clap4",
+      "node_id": "rankine",
+      "timestamp_s": 1789406164.697599
+    },
+    {
+      "clap_id": "clap4",
+      "node_id": "gold",
+      "timestamp_s": 1789406164.231439
+    },
+    {
+      "clap_id": "clap4",
+      "node_id": "kasami",
+      "timestamp_s": 1789406165.055827
+    },
+    {
+      "clap_id": "clap4",
+      "node_id": "ageev",
+      "timestamp_s": 1789406166.000135
+    },
+    {
+      "clap_id": "clap5",
+      "node_id": "mach",
+      "timestamp_s": 1789406168.280281
+    },
+    {
+      "clap_id": "clap5",
+      "node_id": "nyquist",
+      "timestamp_s": 1789406168.28317
+    },
+    {
+      "clap_id": "clap5",
+      "node_id": "gold",
+      "timestamp_s": 1789406167.870516
+    },
+    {
+      "clap_id": "clap5",
+      "node_id": "kasami",
+      "timestamp_s": 1789406168.645054
+    },
+    {
+      "clap_id": "clap5",
+      "node_id": "ageev",
+      "timestamp_s": 1789406169.588479
+    },
+    {
+      "clap_id": "clap6",
+      "node_id": "mach",
+      "timestamp_s": 1789406171.302383
+    },
+    {
+      "clap_id": "clap6",
+      "node_id": "nyquist",
+      "timestamp_s": 1789406171.30701
+    },
+    {
+      "clap_id": "clap6",
+      "node_id": "gold",
+      "timestamp_s": 1789406170.904389
+    },
+    {
+      "clap_id": "clap6",
+      "node_id": "kasami",
+      "timestamp_s": 1789406171.669305
+    },
+    {
+      "clap_id": "clap6",
+      "node_id": "ageev",
+      "timestamp_s": 1789406172.612898
+    },
+    {
+      "clap_id": "clap7",
+      "node_id": "rankine",
+      "timestamp_s": 1789406174.469787
+    },
+    {
+      "clap_id": "clap7",
+      "node_id": "nyquist",
+      "timestamp_s": 1789406174.474538
+    },
+    {
+      "clap_id": "clap7",
+      "node_id": "mach",
+      "timestamp_s": 1789406174.569503
+    },
+    {
+      "clap_id": "clap7",
+      "node_id": "gold",
+      "timestamp_s": 1789406174.015917
+    },
+    {
+      "clap_id": "clap7",
+      "node_id": "kasami",
+      "timestamp_s": 1789406174.841183
+    },
+    {
+      "clap_id": "clap7",
+      "node_id": "ageev",
+      "timestamp_s": 1789406175.784766
+    }
+  ]
+}
