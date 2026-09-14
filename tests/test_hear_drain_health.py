@@ -156,7 +156,18 @@ def test_a_tail_answered_with_the_whole_file_keeps_that_files_own_header(tmp_pat
     e = _entry(r)[0]
     assert e["whole_response"] is True
     assert open(e["archived"], "rb").read() == node.health
-    assert HD.read_watermarks(pl.root)["nyquist"]["health.csv"]["header"] == new_header
+    mark = HD.read_watermarks(pl.root)["nyquist"]["health.csv"]
+    assert mark["header"] == new_header
+    assert mark["size"] == len(node.health) == e["size"], "the mark must be the file as served"
+
+    # The new file grows past the size /ls reported for the old one: no byte may be skipped.
+    monkeypatch.setattr(HD, "_ls_sizes", node.ls)
+    served = len(node.health)
+    while len(node.health) <= stale:
+        node.grow_health(10)
+    r = _drain(pl, node, 3000)
+    assert _health_calls(node)[-1] == len(node.health) - served + HD.CONTEXT_OVERLAP_BYTES
+    assert node.health[served:] in open(_entry(r)[0]["archived"], "rb").read()
 
 
 def test_a_blind_listing_takes_a_bounded_tail_and_keeps_the_mark(tmp_path, node, monkeypatch):
