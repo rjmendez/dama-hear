@@ -141,6 +141,23 @@ class TestDispatchMessage:
         assert record is not None and stats.accepted == 1 and stats.rejected == 0
         assert json.loads(fake.values["dama:hear:nyquist"])["ts"] == "2026-09-12T23:43:00Z"
 
+    def test_a_fractional_millisecond_ts_is_stored_to_the_second(self, store):
+        st, fake = store
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_heartbeat(ts=1789256580123.4))).encode()
+        assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats) is not None
+        assert json.loads(fake.values["dama:hear:nyquist"])["ts"] == "2026-09-12T23:43:00Z"
+
+    @pytest.mark.parametrize("bad_ts", [1e30, -1e30])
+    def test_an_unrepresentable_numeric_ts_is_rejected_without_raising(self, store, bad_ts):
+        st, fake = store
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_heartbeat(ts=bad_ts))).encode()
+        assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats) is None
+        assert stats.rejected == 1 and stats.accepted == 0
+        raw_ok = json.dumps(_batch_ingest_wrapped(_heartbeat())).encode()
+        assert B.dispatch_message(st, raw_ok, "dama/nyquist/telemetry", stats) is not None
+
     def test_a_boolean_ts_is_not_taken_for_a_number(self, store):
         st, _fake = store
         stats = B.BridgeStats()

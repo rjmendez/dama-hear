@@ -95,14 +95,23 @@ def dispatch_message(store: HeartbeatReceiverStore, raw: bytes, topic: str,
     try:
         # batch_ingest/forwarder normalize the transport timestamp to numeric
         # milliseconds. The Redis contract uses an RFC3339 string.
+        # Seconds, like the receiver's own timestamps; sub-second precision stays in ts_ms.
         ts = payload.get("ts")
         if isinstance(ts, (int, float)) and not isinstance(ts, bool):
             payload = dict(payload)
-            payload["ts"] = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+            payload["ts"] = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(
+                timespec="seconds").replace("+00:00", "Z")
         body = validator(payload)
     except RequestError as exc:
         stats.rejected += 1
         logger.warning("rejected %s message on %s: %s", payload.get("telemetry_path"), topic, exc)
+        return None
+    except (ValueError, OverflowError, OSError) as exc:
+        # A numeric ts outside what datetime can represent (inf, NaN, absurd magnitudes) is a bad
+        # message, not a reason to stop the bridge.
+        stats.rejected += 1
+        logger.warning("rejected %s message on %s: unusable numeric ts: %s",
+                       payload.get("telemetry_path"), topic, exc)
         return None
 
     writer: Callable[[Dict[str, Any]], Dict[str, Any]] = getattr(store, writer_name)
