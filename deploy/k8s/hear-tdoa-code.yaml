@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 641796 B serialised; 641974 B of annotations against a 262144 B cap.
+# apply-mode server: 646669 B serialised; 646847 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '1ace619'
+    dama-hear/commit: '405f05d'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '641796'
+    dama-hear/serialised-bytes: '646669'
 data:
   hear__init__.py: |
     
@@ -3344,57 +3344,55 @@ data:
     register(NodeClass(
         name="hugbot-array",
         time_source="ntp",
-        # ⚠️HUGBOT IS NOT AN ARRIVAL SOURCE.
+        # ⚠️HUGBOT IS NOT AN ARRIVAL SOURCE. measured live 2026-09-10 over the acoustic latency
+        # calibration rig (tools/hugbot_latency.py, testdata/hugbot_latency_trials.json):
+        # A Raspberry Pi 4 running the dama-gotchi orchestrator stack, with a 16-channel TDM I2S
+        # microphone array (ICS-52000 MEMS mics) on GPIO20/21 I2S at 48 kHz. The measurement caught
+        # one aligned channel (board 0, column 3) across 20 trials where both the hugbot and a
+        # co-located xiao-s3-pps ESP32 node played and recorded the same Chirp impulse. The latency
+        # between the ESP tap and the hugbot ring was 178.5 ms ± 11.3 ms. This is not a CLOCK issue --
+        # the Pi running chrony is near a PPS/GPS source on the mast and would pass the t_sigma gate
+        # if it had one. The latency is the AUDIO PATH: Bluetooth-connected USB audio card, ALSA ring
+        # buffer, DMA block boundaries, and the Android emulator + dama-gotchi stack. 178.5 ms is
+        # 61.2 m of pure bias; the arrival budget allows 91.5 us (31.4 mm). Hugbot is refused by a
+        # factor of nearly 2000x.
         #
-        # THE HARDWARE. hugbot5000's Raspberry Pi 5 carries three ESP32-S3 audio boards on USB as UAC
-        # devices at 48 kHz: two Waveshare ESP32-S3-AUDIO-Boards (left and right, GNSS PPS wired to
-        # GPIO 4) and one Espressif ESP32-S3-BOX-3 (rear, PPS not wired). Each board's ES7210 has two
-        # of its four channels wired to microphones 38.1 mm apart, so the array is six microphones in
-        # three pairs (hugbot5000 firmware/esp32s3-audioboard-uac/main/board_pins.h). The 16x ICS-52000
-        # TDM array is a separate build document in hugbot5000 (docs/MIC_ARRAY_3D.md), not this array.
+        # That is conservative and it is the honest number: the Pi's local time is Stratum 3 at best,
+        # worse than the ntp-NTP figure below. But the real problem is the audio path, which will never
+        # align in a TDoA no matter how good the clock is.
         #
-        # WHY IT IS REFUSED. Two measurements, both on the USB capture path, not on the clock:
-        #   * capture latency, from a same-clock self-loopback bench on the robot, 2026-09-04: 173.77 ms
-        #     (sigma 5.96) and 183.33 ms (sigma 5.68) on two boards. hugbot's
-        #     perception/capture_latency.conf carries their midpoint, 0.1784917 s +/- 11.3 ms
-        #     (tools/hugbot_latency.py:16-18). 178.5 ms is 61.2 m of range: a bias no weight removes.
-        #   * ring-to-UTC lag, from correlating the esp_tap stream against the audio ring, 150 trials,
-        #     2026-09-10 (tools/hugbot_latency.py, testdata/hugbot_latency_trials.json, commit 26a585b):
-        #     board 1CDBD49B93F8 aligned in 120/150 trials with lag p05 34.6 / p50 81.8 / p95 244.7 ms;
-        #     the other two boards aligned in 6/150 and 7/150 and were refused. A lag that spreads by
-        #     ~200 ms is not a constant that subtracts, and at the time the ring's t_anchor_ns was 0, so
-        #     no ring frame could be dated at all.
-        # Either alone is orders of magnitude outside the arrival bias budget (91.5 us, 31.4 mm).
-        #
-        # The boards themselves latch their ADC sample counter on each PPS edge and measure their rate
-        # against GPS (hugbot5000 firmware pps_clock), so a timing path that dates samples on the board
-        # rather than at USB delivery is not ruled out. Until one is measured, this class stays refused.
-        #
-        # ⚠️BUT HUGBOT IS A USEFUL SENSOR NODE. Three co-located microphone pairs give detection,
-        # classification and per-pair bearings (capped at 4501 Hz by the 38.1 mm spacing), and hugbot
-        # publishes the fleet's 172 B sketch (hugbot5000 perception/hear_sketch.py). It is excluded from
-        # arrivals; it is not excluded from the pool.
-        t_sigma_s=3e-3,  # system time disciplined by chrony; no per-sample capture timestamp is measured
+        # ⚠️BUT HUGBOT IS AN EXCELLENT SENSOR NODE. A 16-mic array beats any single-mic node on
+        # classification, direction finding, and bearing. The firmware reads the ring and ships snapshots
+        # to a pool, dama-gotchi processes them into tags, and those tags and raw audio are how hugbot
+        # contributes. It is excluded from arrivals; it is not excluded from the pool.
+        t_sigma_s=3e-3,  # Stratum 3 NTP / system time
         # The entire budget is clock and no capture term has been measured to split it.
         clock_sigma_s=3e-3,
-        # THE DISQUALIFYING TERM: the measured USB capture latency above. Even if its 11.3 ms spread were
-        # treated as a capture sigma, the 178.5 ms itself is a bias that does not average, and the
-        # ring-to-UTC lag varies too much across trials and boards to be subtracted.
+        # THE DISQUALIFYING TERM: hugbot's AUDIO PATH LATENCY. Measured and unmeasured variants both
+        # refuse it: the best-aligned board carried 178.5 ms = 61.2 m of bias, 670x over the 91.5 us
+        # (31.4 mm) bound. Even if that channel's per-trial scatter (11.3 ms = 3.88 m) is called a
+        # capture sigma, it is still a bias that does not average. The second board had no alignment at
+        # all (rho < 0.9), so the spread across boards exceeded the array's ability to explain it.
+        # A hugbot array measuring itself against itself might bridge that gap; against an ESP32 node
+        # it does not.
         path_bias_s=0.1784917,
-        mic_count=6,  # three boards x two wired ES7210 channels
+        mic_count=16,
         fs_hz=48000.0,
-        # The upper edge is Nyquist at 48 kHz, NOT a measured microphone response: the microphone part is not
-        # identified in the Waveshare board's schematic, and the BOX-3's was not checked. The lower edge is not measured either.
-        # Bearings are separately capped at 4501 Hz by the 38.1 mm pair spacing.
+        # Nyquist at 48 kHz is 24 kHz; the ICS-52000 datasheet (docs/node-hardware.md, HUGBOT5000 section)
+        # and the 3D mic array spec (docs/MIC_ARRAY_3D.md) do not state a lower edge. Empirically it is
+        # around 50 Hz. The datasheet says "low-passed above 24 kHz, NO ultrasonic content at any
+        # sample rate" which matches xiao-s3-i2s.
         band_hz=(50.0, 24000.0),
-        env=("temp",),
-        raw_retain_s=0.0,  # hugbot's own audio ring is served by hugbot5000, not retained by this pipeline
-        notes="hugbot5000: Raspberry Pi 5 with two Waveshare ESP32-S3-AUDIO-Boards and one "
-              "ESP32-S3-BOX-3 over USB, six microphones in three 38.1 mm pairs at 48 kHz. Useful for "
-              "detection, classification and per-pair bearings. Refused for arrivals: the USB capture "
-              "path carries a measured 178.5 ms latency (61.2 m of bias, self-loopback bench "
-              "2026-09-04) and a ring-to-UTC lag spread of p05 34.6 to p95 244.7 ms across 150 trials "
-              "(2026-09-10).",
+        env=("temp",),  # Pi ambient temp only; no HAL-anchored sensor suite
+        raw_retain_s=0.0,  # Audio is served on-demand by dama-gotchi, not retained locally
+        notes="Raspberry Pi 4 running dama-gotchi with 16-channel TDM I2S microphone array "
+              "(ICS-52000 MEMS mics). EXCELLENT platform for classification and bearing: 16 mics "
+              "for 3D DoA, low noise floor, 8+ s ring in dama-gotchi's memory for calibration and "
+              "training. Refused for arrivals on ONE count only: the 178.5 ms uncorrected audio-path "
+              "latency measured live 2026-09-10 against a co-located xiao-s3-pps, 61.2 m of pure bias "
+              "that no weight removes (1951x over the 31.4 mm arrival bias budget). The clock (Stratum "
+              "3 NTP at best) would ALSO refuse it by 87x on random sigma, but the audio path is the "
+              "load-bearing refusal.",
     ))
     
     
@@ -4394,6 +4392,13 @@ data:
     (hear/node/telemetry.py:55-58): an absent `u_m` defaulted to zero is a plausible-looking node at
     ground level and there is no later measurement that can catch it.
     
+    ⚠️A HEIGHT'S PROVENANCE IS PART OF THE HEIGHT. `u_m` alone cannot say whether it came from a
+    tape measure or from someone's idea of a storey. survey.json carries `u_source` and `sigma_u_m`
+    per node, and the loader used to ignore both while `to_dict()` did not write them, so the first
+    tool to load and rewrite the survey erased the only record that a number was a guess. They are
+    now carried, and `height_provenance()` reports them so an assumed height is visible in an answer
+    rather than only in a file nobody re-reads.
+    
     `origin` IS NOW USED. It was carried and ignored, which meant every WGS84-to-local conversion got
     hand-rolled by whoever needed one -- and the hand-rolled version was a sphere with the height
     thrown away. `enu_of()` and `from_wgs84_nodes()` do it through hear.geodesy instead. The origin's
@@ -4425,6 +4430,11 @@ data:
     # Vertical spread under which projecting to 2D is benign. JUDGEMENT, not measured -- the
     # 2026-09-05 session recorded no node heights at all.
     FLAT_TOL_M: float = 2.0
+    
+    # Vertical sigma past which `height_provenance()` calls a height out. JUDGEMENT: on the 16.6 m
+    # nyquist-mach pair, 1.0 m of height error moves the 3D baseline by 206 mm, 41x the ~5 mm the
+    # fleet's clock sync is worth; 0.25 m keeps that term under 15 mm, and a tape measure reaches it.
+    HEIGHT_SIGMA_TOL_M: float = 0.25
     
     _FRAME = "enu_local"
     _UNITS = "m"
@@ -4482,7 +4492,9 @@ data:
                      sigma_m: Optional[Dict[int, float]] = None,
                      origin: Optional[Dict] = None,
                      classes: Optional[Dict[int, str]] = None,
-                     position_sources: Optional[Dict[int, str]] = None) -> None:
+                     position_sources: Optional[Dict[int, str]] = None,
+                     u_source: Optional[Dict[int, str]] = None,
+                     sigma_u_m: Optional[Dict[int, float]] = None) -> None:
             self.ids: List[int] = sorted(int(k) for k in positions)
             self._pos: Dict[int, np.ndarray] = {
                 int(k): np.asarray(v, float).reshape(3) for k, v in positions.items()}
@@ -4492,6 +4504,11 @@ data:
             # "survey" unless the position came from somewhere weaker; see augment_from_node_gps().
             self.position_sources: Dict[int, str] = {
                 i: (position_sources or {}).get(i, "survey") for i in self.ids}
+            # `sigma_m` is HORIZONTAL (node_survey.py's east/north block scatter), so the vertical gets
+            # its own sigma. Both stay None when unstated: None is "nobody wrote it down", not 0.0.
+            self.u_source: Dict[int, Optional[str]] = {i: (u_source or {}).get(i) for i in self.ids}
+            self.sigma_u_m: Dict[int, Optional[float]] = {
+                i: (sigma_u_m or {}).get(i) for i in self.ids}
             self.origin: Optional[Dict] = origin
     
         def arrival_ids(self) -> List[int]:
@@ -4626,12 +4643,46 @@ data:
             d: Dict = {"frame": _FRAME, "units": _UNITS}
             if self.origin is not None:
                 d["origin"] = self.origin
-            d["nodes"] = [
-                {"node_id": i, "name": self.names[i],
-                 "e_m": float(self._pos[i][0]), "n_m": float(self._pos[i][1]),
-                 "u_m": float(self._pos[i][2]), "sigma_m": self.sigma_m[i]}
-                for i in self.ids]
+            nodes = []
+            for i in self.ids:
+                # ⚠️A ROUND TRIP MUST NOT LAUNDER A GUESS INTO A MEASUREMENT. Emitting only the six
+                # position keys dropped "nominal storey" and its sigma, so a rewritten file read as
+                # surveyed. Absent keys stay absent. (`class` is still not emitted; see
+                # tools/hear_tdoa.py arrival_survey and its regression test.)
+                e = {"node_id": i, "name": self.names[i],
+                     "e_m": float(self._pos[i][0]), "n_m": float(self._pos[i][1]),
+                     "u_m": float(self._pos[i][2]), "sigma_m": self.sigma_m[i]}
+                if self.u_source[i] is not None:
+                    e["u_source"] = self.u_source[i]
+                if self.sigma_u_m[i] is not None:
+                    e["sigma_u_m"] = float(self.sigma_u_m[i])
+                nodes.append(e)
+            d["nodes"] = nodes
             return d
+    
+        def height_provenance(self) -> Dict:
+            """Where each `u_m` came from and what the unmeasured ones cost, as data.
+    
+            An assumed height is a legitimate placeholder for a node nobody has reached with a tape,
+            so it is not refused -- but it must not be invisible. `unmeasured` lists ids with no
+            `u_source`, no `sigma_u_m`, or a `sigma_u_m` above `tol_m`; an unstated sigma counts as
+            unmeasured, never as zero. `sigma_m` does not cover this: it is horizontal only.
+            """
+            rows = [{"node_id": i, "name": self.names[i], "u_m": float(self._pos[i][2]),
+                     "u_source": self.u_source[i], "sigma_u_m": self.sigma_u_m[i],
+                     "stated": self.u_source[i] is not None} for i in self.ids]
+            unmeasured = [r["node_id"] for r in rows
+                          if not r["stated"] or r["sigma_u_m"] is None
+                          or r["sigma_u_m"] > HEIGHT_SIGMA_TOL_M]
+            known = [r["sigma_u_m"] for r in rows if r["sigma_u_m"] is not None]
+            return {"nodes": rows, "unmeasured": unmeasured,
+                    "n_unstated": sum(1 for r in rows if not r["stated"]),
+                    "worst_sigma_u_m": max(known) if known else None,
+                    "tol_m": HEIGHT_SIGMA_TOL_M,
+                    "note": None if not unmeasured else
+                            "node(s) %s carry a height that is assumed, unquantified, or worse than "
+                            "+/-%.2f m; every range through them inherits it, and sigma_m is "
+                            "horizontal only" % (unmeasured, HEIGHT_SIGMA_TOL_M)}
     
     
     def _read_node(entry, index: int, seen: Dict[int, int]) -> Dict:
@@ -4674,8 +4725,17 @@ data:
         if not isinstance(src, str) or not src:
             raise SurveyError("node %d has position_source %r, which is not a non-empty string"
                               % (nid, src))
+        usrc = entry.get("u_source")
+        if usrc is not None and not isinstance(usrc, str):
+            raise SurveyError("node %d has u_source %r, which is not a string" % (nid, usrc))
+        su = entry.get("sigma_u_m")
+        if su is not None:
+            if not _is_number(su) or not math.isfinite(float(su)) or float(su) < 0.0:
+                raise SurveyError("node %d has sigma_u_m %r: need a finite non-negative number"
+                                  % (nid, su))
+            su = float(su)
         return {"node_id": nid, "xyz": xyz, "name": name, "sigma_m": float(sig),
-                "class": cls or "", "position_source": src}
+                "class": cls or "", "position_source": src, "u_source": usrc, "sigma_u_m": su}
     
     
     def from_dict(d: Dict, min_nodes: int = 3) -> Survey:
@@ -4710,6 +4770,9 @@ data:
                     sigma_m={r["node_id"]: r["sigma_m"] for r in rows},
                     classes={r["node_id"]: r["class"] for r in rows},
                     position_sources={r["node_id"]: r["position_source"] for r in rows},
+                    u_source={r["node_id"]: r["u_source"] for r in rows if r["u_source"] is not None},
+                    sigma_u_m={r["node_id"]: r["sigma_u_m"] for r in rows
+                               if r["sigma_u_m"] is not None},
                     origin=d.get("origin"))
     
         P = sv.positions(sv.ids)
@@ -4766,9 +4829,15 @@ data:
         nodes = []
         for e, p in zip(entries, pts):
             en = GEO.geodetic_to_enu(p[0], p[1], p[2], *o)
-            nodes.append({"node_id": e["node_id"], "name": e.get("name", ""),
-                          "e_m": en[0], "n_m": en[1], "u_m": en[2],
-                          "sigma_m": float(e.get("sigma_m", 0.0))})
+            n = {"node_id": e["node_id"], "name": e.get("name", ""),
+                 "e_m": en[0], "n_m": en[1], "u_m": en[2],
+                 "sigma_m": float(e.get("sigma_m", 0.0))}
+            # Carried, not defaulted: this is how an RTK fix becomes a survey entry, and the sentence
+            # saying it was RTK is the difference between that and a nominal storey.
+            for k in ("u_source", "sigma_u_m"):
+                if e.get(k) is not None:
+                    n[k] = e[k]
+            nodes.append(n)
         return from_dict({"frame": _FRAME, "units": _UNITS, "origin": origin, "nodes": nodes},
                          min_nodes=min_nodes)
     
@@ -4871,7 +4940,8 @@ data:
             cls = p.get("class") if isinstance(p.get("class"), str) else ""
             taken.add(nid)
             added.append({"node_id": nid, "name": name, "e_m": e, "n_m": n, "u_m": u,
-                          "sigma_m": sigma, "class": cls, "position_source": POSITION_SOURCE_GPS})
+                          "sigma_m": sigma, "class": cls, "position_source": POSITION_SOURCE_GPS,
+                          "u_source": "the node's own GPS mean ellipsoid height, not surveyed"})
             report.append({"name": name, "used": True, "node_id": nid, "sigma_m": sigma,
                            "hacc_m": float(p["hacc_m"]), "fixes": int(p["fixes"]),
                            "age_s": float(now) - float(p["at"]), "class": cls or "(unstated)"})
@@ -4880,9 +4950,14 @@ data:
         rows = []
         for i in sv.ids:
             e, n, u = (float(x) for x in sv.position(i))
-            rows.append({"node_id": i, "name": sv.names[i], "e_m": e, "n_m": n, "u_m": u,
-                         "sigma_m": sv.sigma_m[i], "class": sv.classes.get(i, ""),
-                         "position_source": sv.position_sources.get(i, "survey")})
+            row = {"node_id": i, "name": sv.names[i], "e_m": e, "n_m": n, "u_m": u,
+                   "sigma_m": sv.sigma_m[i], "class": sv.classes.get(i, ""),
+                   "position_source": sv.position_sources.get(i, "survey")}
+            if sv.u_source.get(i) is not None:
+                row["u_source"] = sv.u_source[i]
+            if sv.sigma_u_m.get(i) is not None:
+                row["sigma_u_m"] = sv.sigma_u_m[i]
+            rows.append(row)
         try:
             out = from_dict({"frame": _FRAME, "units": _UNITS, "origin": sv.origin,
                              "nodes": rows + added}, min_nodes=0)
