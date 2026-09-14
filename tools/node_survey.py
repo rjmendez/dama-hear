@@ -112,6 +112,7 @@ HACC_REJECT_M = 10.0
 # Ratio of observed scatter to claimed accuracy past which the claim is called out. 2.0 is not a
 # physical constant; it is "twice as bad as advertised", which is worth a line of output.
 OPTIMISM_FLAG = 2.0
+PMTK_LIVE_FIXES = {1, 2, 3, 4, 5}
 
 
 def fetch(node: str, timeout: float = 300.0) -> str:
@@ -120,12 +121,30 @@ def fetch(node: str, timeout: float = 300.0) -> str:
         return r.read().decode("utf-8", "replace")
 
 
+def _as_int(v: object) -> Optional[int]:
+    try:
+        return int(str(v).strip())
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def epochs(text: str) -> List[Dict]:
-    """3D-fix rows with a usable position. Everything else is dropped and counted, never zeroed."""
+    """Protocol-valid position rows with a usable position. Everything else is dropped, never zeroed."""
+    rows = list(csv.DictReader(io.StringIO(text)))
+    have_ubx_pvt = bool(rows and "ubx_pvt" in (rows[0].keys() if rows[0] else ()))
+    # `health.csv` reuses the raw `fix` column for two GPS protocols. When the file carries the
+    # modern `ubx_pvt` column, any non-zero value proves a UBX log and only fixType 3 (3D) is a
+    # surveyable position, matching the firmware's own position mean. If the column exists but is
+    # zero throughout, this is a PMTK/NMEA log where GGA qualities 1-5 are live fixes and 6 is
+    # estimated/dead-reckoning. Old logs with no `ubx_pvt` column stay on the historical UBX-only
+    # rule rather than silently widening what an old fixture means.
+    is_pmtk = have_ubx_pvt and not any((_as_int(r.get("ubx_pvt")) or 0) > 0 for r in rows)
     out = []
-    for r in csv.DictReader(io.StringIO(text)):
+    for r in rows:
         try:
-            if r.get("fix") != "3" or not r.get("lat") or r["lat"] in ("", "0.0000000"):
+            fix = _as_int(r.get("fix"))
+            fix_ok = fix in PMTK_LIVE_FIXES if is_pmtk else fix == 3
+            if not fix_ok or not r.get("lat") or r["lat"] in ("", "0.0000000"):
                 continue
             ha = float(r["hacc_m"])
             if not (0.0 < ha <= HACC_REJECT_M):

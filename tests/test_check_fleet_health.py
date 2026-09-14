@@ -139,7 +139,11 @@ class TestStatusParsing:
         return base
 
     def test_gps_fix_and_satellites_are_read(self):
-        s = H.parse_status(self._status(gps={"fix": 3, "sats": 14, "tacc_ns": 40}))
+        s = H.parse_status(self._status(**{
+            "class": "xiao-s3-pps",
+            "gps": {"fix": 3, "sats": 14, "tacc_ns": 40},
+        }))
+        assert s["class"] == "xiao-s3-pps"
         assert s["fix"] == 3
         assert s["sats"] == 14
         assert s["tacc_ns"] == 40
@@ -178,6 +182,18 @@ class TestStatusParsing:
 
     def test_sd_free_space_is_read(self):
         assert H.parse_status(self._status(sd_free_mb=42))["sd_free_mb"] == 42
+
+    def test_gps_summary_carries_the_protocol_scale(self):
+        pmtk = H.parse_status(self._status(**{
+            "class": "esp32s3-i2s-gps",
+            "gps": {"fix": 1, "sats": 7, "tacc_ns": None},
+        }))
+        ubx = H.parse_status(self._status(**{
+            "class": "xiao-s3-pps",
+            "gps": {"fix": 3, "sats": 12, "tacc_ns": 26},
+        }))
+        assert H._gps_summary(pmtk) == "PMTK:1/7"
+        assert H._gps_summary(ubx) == "UBX:3/12"
 
 
 # ---------------------------------------------------------------- layered health evaluation
@@ -223,6 +239,32 @@ class TestHealthEvaluation:
         assert r["state"] == "degraded"
         assert any("fix" in why for why in r["reasons"])
 
+    def test_a_pmtk_fix_quality_of_one_is_not_flagged_as_bad_fix(self):
+        r = H.evaluate_health("gold", self._status(**{
+            "class": "esp32s3-i2s-gps",
+            "gps": {"fix": 1, "sats": 7, "tacc_ns": None},
+        }))
+        assert r["state"] == "online"
+        assert all("fix=" not in why for why in r["reasons"])
+
+    def test_a_box3_fix_quality_of_one_is_not_flagged_as_bad_fix(self):
+        r = H.evaluate_health("box", self._status(**{
+            "class": "esp32s3-box3",
+            "gps": {"fix": 1, "sats": 7, "tacc_ns": None},
+        }))
+        assert r["state"] == "online"
+        assert all("fix=" not in why for why in r["reasons"])
+
+    def test_an_ntp_only_puc_is_not_marked_degraded_for_missing_gps_or_pps(self):
+        r = H.evaluate_health("puc", self._status(**{
+            "class": "puc-ntp",
+            "gps": {},
+            "pps": {},
+        }))
+        assert r["state"] == "online"
+        assert all("fix=" not in why for why in r["reasons"])
+        assert all("timebase never locked" not in why for why in r["reasons"])
+
     def test_invalid_time_is_degraded(self):
         r = H.evaluate_health("n", self._status(time={"valid": False, "label_rejects": 4}))
         assert r["state"] == "degraded"
@@ -253,6 +295,16 @@ class TestHealthEvaluation:
         r = H.evaluate_health("n", self._status(sd=False, sd_free_mb=None))
         assert r["state"] == "degraded"
         assert "no SD card" in r["reasons"]
+
+    def test_a_minimal_i2s_node_is_not_degraded_for_lacking_sd(self):
+        r = H.evaluate_health("gold", self._status(**{
+            "class": "esp32s3-i2s-gps",
+            "sd": False,
+            "sd_free_mb": None,
+            "gps": {"fix": 1, "sats": 7, "tacc_ns": None},
+        }))
+        assert r["state"] == "online"
+        assert "no SD card" not in r["reasons"]
 
     def test_low_sd_free_space_is_degraded(self):
         r = H.evaluate_health("n", self._status(sd=True, sd_free_mb=10))
@@ -307,6 +359,15 @@ class TestFleetReport:
         rc, out = self._run(capsys, {url: self._status(node="good")}, monkeypatch)
         assert "ONLINE" in out
         assert rc == 0
+
+    def test_the_table_carries_the_gps_protocol_beside_the_fix_number(self, capsys, monkeypatch):
+        url = "http://gold/status"
+        rc, out = self._run(capsys, {url: self._status(node="gold", **{
+            "class": "esp32s3-i2s-gps",
+            "gps": {"fix": 1, "sats": 7, "tacc_ns": None},
+        })}, monkeypatch)
+        assert rc == 0
+        assert "PMTK:1/7" in out
 
     def test_an_unreachable_node_is_reported_offline(self, capsys, monkeypatch):
         def fetch_status(url):

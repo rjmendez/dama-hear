@@ -60,6 +60,31 @@ OFFLINE_VERIFICATION = (
 # cries wolf is worse than no tool.
 SCENE_MB_PER_H = 335 * (3600 / 1.024) / 1e6      # 1.18 MB/h
 SCENE_HEADROOM_H = 14.0                           # scene-row hours the card must hold if the drain stops
+PMTK_STATUS_CLASSES = {
+    "esp32s3-i2s-gps",
+    "esp32s3-speaker",
+    "esp32s3-box3",
+    "puc-pps",
+    "puc-ntp",
+}
+# Classes whose `/status` is EXPECTED to lack one capability entirely. Keeping these as named
+# sets, not inferred from the presence/absence of one JSON block, means the tool reports "this
+# class has no PPS" instead of treating "PPS missing" as a failed PPS on every status shape it
+# has not seen before.
+NO_GPS_STATUS_CLASSES = {"puc-ntp"}
+NO_PPS_STATUS_CLASSES = {"puc-ntp"}
+NO_SD_STATUS_CLASSES = {"esp32s3-i2s-gps"}
+
+
+def _gps_proto_label(d: Dict) -> str:
+    if not gps_expected(d):
+        return "NOGPS"
+    return "PMTK" if _status_class(d) in PMTK_STATUS_CLASSES else "UBX"
+
+
+def _gps_summary(d: Dict) -> str:
+    gps = d.get("gps") or {}
+    return "%s:%s/%s" % (_gps_proto_label(d), gps.get("fix", "?"), gps.get("sats", "?"))
 
 
 def split_target(node: str) -> tuple:
@@ -100,21 +125,59 @@ def fetch(node: str) -> Dict:
 
 
 def row(name: str, d: Dict) -> str:
-    g, p, t, a = d["gps"], d["pps"], d["time"], d["audio"]
+    g = d.get("gps") or {}
+    p = d.get("pps") or {}
+    t = d.get("time") or {}
+    a = d.get("audio") or {}
+    gate = d.get("gate") or {}
     # spread is a cumulative high-water mark, not a live figure: one long interval near boot pins
     # it for the life of the run. Shown with the edge count so a big number on a young node reads
     # as what it usually is.
     # rssi and disc are absent on firmware before v0.1.1, and rssi is null when not associated.
     n = d.get("net") or {}
     rssi = n.get("rssi")
-    return ("%-9s %-14s up %6ds  fix %d/%-2d tAcc %5s ns  pps %6d sp %5s us g%-3d  "
+    # Keep the raw fix number, but NEVER bare: PMTK GGA quality 1 and UBX fixType 3 are both
+    # healthy fixes on different scales, so the protocol travels with the number in the report.
+    return ("%-9s %-14s up %6ds  gps %-12s tAcc %5s ns  pps %6d sp %5s us g%-3d  "
             "utc %-5s rej %-4s  dets %4d floor %-5s amb %-5s  rssi %4s disc %-3s  sd %-5s %s"
-            % (name, d.get("fw", "?")[:14], d["uptime_s"], g["fix"], g["sats"], g["tacc_ns"],
-               p["edges"], p["spread_us"], p["glitches"],
-               "yes" if t["valid"] else "NO", t["label_rejects"],
-               a["detections"], d["gate"]["floor"], a["ambient"],
+            % (name, d.get("fw", "?")[:14], int(d.get("uptime_s") or 0),
+               _gps_summary(d), g.get("tacc_ns", "?"),
+               int(p.get("edges") or 0), p.get("spread_us", "?"), int(p.get("glitches") or 0),
+               "yes" if t.get("valid") else "NO", t.get("label_rejects", "?"),
+               int(a.get("detections") or 0), gate.get("floor", "?"), a.get("ambient", "?"),
                "?" if rssi is None else rssi, n.get("disc", "?"),
-               d.get("sd_free_mb", "?"), "" if d["sd"] else "NO CARD"))
+               d.get("sd_free_mb", "?"), "" if d.get("sd") else "NO CARD"))
+
+
+def _status_class(d: Dict) -> str:
+    return str(d.get("class") or "").strip().lower()
+
+
+def gps_expected(d: Dict) -> bool:
+    return _status_class(d) not in NO_GPS_STATUS_CLASSES
+
+
+def pps_expected(d: Dict) -> bool:
+    return _status_class(d) not in NO_PPS_STATUS_CLASSES
+
+
+def sd_expected(d: Dict) -> bool:
+    return _status_class(d) not in NO_SD_STATUS_CLASSES
+
+
+def gps_fix_ok(d: Dict) -> bool:
+    # `gps.fix` is not one scale fleet-wide: PMTK nodes report raw NMEA GGA fix quality
+    # (`esp32s3-i2s-gps`/`esp32s3-speaker`/PUC, 1 = a live fix) while UBX nodes report u-blox
+    # fixType (`xiao-s3-*`, 3 = 3D). A universal `fix != 3` warning falsely condemns healthy PMTK
+    # nodes even when the firmware itself would call them fixed.
+    if not gps_expected(d):
+        return True
+    gps = d.get("gps") or {}
+    try:
+        fix = int(gps.get("fix"))
+    except (TypeError, ValueError):
+        return False
+    return fix >= 1 if _status_class(d) in PMTK_STATUS_CLASSES else fix >= 3
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -174,13 +237,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for n, d in got.items():
             n = d.get("node") or names.get(n, n)
             why = []
-            if not d["time"]["valid"]:
+            if not (d.get("time") or {}).get("valid"):
                 why.append("no UTC anchor")
-            if d["gps"]["fix"] != 3:
-                why.append("fix %d" % d["gps"]["fix"])
-            if not d["sd"]:
+            if gps_expected(d) and not gps_fix_ok(d):
+                why.append("fix %s" % ((d.get("gps") or {}).get("fix", "?")))
+            if pps_expected(d) and not int(((d.get("pps") or {}).get("edges") or 0)):
+                why.append("no PPS lock")
+            if sd_expected(d) and not d.get("sd"):
                 why.append("no SD card")
-            elif isinstance(d.get("sd_free_mb"), int):
+            elif sd_expected(d) and isinstance(d.get("sd_free_mb"), int):
                 hours = d["sd_free_mb"] / SCENE_MB_PER_H
                 if hours < SCENE_HEADROOM_H:
                     why.append("%d MB free = %.1f h of scene rows, below the headroom floor"

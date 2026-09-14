@@ -51,6 +51,16 @@ DEFAULT_TIMEOUT_S = 15.0
 DEFAULT_RETRIES = 2
 DEFAULT_BACKOFF_S = 1.5
 DEFAULT_SINCE = "2h"
+PMTK_STATUS_CLASSES: Tuple[str, ...] = (
+    "esp32s3-i2s-gps",
+    "esp32s3-speaker",
+    "esp32s3-box3",
+    "puc-pps",
+    "puc-ntp",
+)
+NO_GPS_STATUS_CLASSES: Tuple[str, ...] = ("puc-ntp",)
+NO_PPS_STATUS_CLASSES: Tuple[str, ...] = ("puc-ntp",)
+NO_SD_STATUS_CLASSES: Tuple[str, ...] = ("esp32s3-i2s-gps",)
 
 ENV_CREDENTIAL_PAIRS: Tuple[Tuple[str, str], ...] = (
     ("OPNSENSE_USERNAME", "OPNSENSE_PASSWORD"),
@@ -360,6 +370,7 @@ def split_target(target: str, resolved_map: Optional[Mapping[str, str]] = None) 
 
 
 def parse_status(d: Mapping[str, Any]) -> Dict[str, Any]:
+    node_class = _first(d, (("class",), ("node_class",)))
     fix = _first(d, (("gps", "fix"), ("gps_fix",), ("fix",)))
     sats = _first(d, (("gps", "sats"), ("gps", "satellites"), ("gps_sats",), ("sats",)))
     tacc_ns = _first(d, (("gps", "tacc_ns"), ("gps_tacc_ns"), ("tacc_ns",)))
@@ -371,6 +382,7 @@ def parse_status(d: Mapping[str, Any]) -> Dict[str, Any]:
     sd = _first(d, (("sd",),))
     sd_free_mb = _first(d, (("sd_free_mb",),))
     return {
+        "class": node_class,
         "fix": fix,
         "sats": sats,
         "tacc_ns": tacc_ns,
@@ -384,6 +396,49 @@ def parse_status(d: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _status_class(p: Mapping[str, Any]) -> str:
+    return _norm_name(str(p.get("class") or ""))
+
+
+def _gps_expected(p: Mapping[str, Any]) -> bool:
+    return _status_class(p) not in NO_GPS_STATUS_CLASSES
+
+
+def _pps_expected(p: Mapping[str, Any]) -> bool:
+    return _status_class(p) not in NO_PPS_STATUS_CLASSES
+
+
+def _sd_expected(p: Mapping[str, Any]) -> bool:
+    return _status_class(p) not in NO_SD_STATUS_CLASSES
+
+
+def _gps_proto_label(p: Mapping[str, Any]) -> str:
+    if not _gps_expected(p):
+        return "NOGPS"
+    return "PMTK" if _status_class(p) in PMTK_STATUS_CLASSES else "UBX"
+
+
+def _gps_summary(p: Mapping[str, Any]) -> str:
+    return "%s:%s/%s" % (_gps_proto_label(p), _json_scalar(p.get("fix")), _json_scalar(p.get("sats")))
+
+
+def _gps_fix_ok(p: Mapping[str, Any]) -> bool:
+    # `gps.fix` is protocol-specific: PMTK boards report NMEA GGA fix quality (1 = a live fix)
+    # while UBX boards report u-blox fixType (3 = 3D). One shared `< 3` rule marks every healthy
+    # PMTK node degraded, which is exactly the bug PR #135 fixed in the firmware self-test.
+    if not _gps_expected(p):
+        return True
+    fix = p.get("fix")
+    if fix is None:
+        return False
+    try:
+        n = int(fix)
+    except (TypeError, ValueError):
+        return False
+    node_class = _status_class(p)
+    return n >= 1 if node_class in PMTK_STATUS_CLASSES else n >= 3
+
+
 def evaluate_health(target_name: str, status_data: Optional[Mapping[str, Any]],
                     err: Optional[Exception] = None) -> Dict[str, Any]:
     if status_data is None:
@@ -393,19 +448,19 @@ def evaluate_health(target_name: str, status_data: Optional[Mapping[str, Any]],
     reasons: List[str] = []
     p = parse_status(status_data)
 
-    if p["fix"] is None or p["fix"] < 3:
+    if _gps_expected(p) and not _gps_fix_ok(p):
         reasons.append("fix=%s" % p["fix"])
     if p["time_valid"] is not True:
         reasons.append("no UTC anchor")
-    if p["pps_edges"] is None or p["pps_edges"] == 0:
+    if _pps_expected(p) and (p["pps_edges"] is None or p["pps_edges"] == 0):
         reasons.append("timebase never locked")
-    if p["pps_glitches"] and p["pps_glitches"] > 0:
+    if _pps_expected(p) and p["pps_glitches"] and p["pps_glitches"] > 0:
         reasons.append("%d pps glitch(es)" % p["pps_glitches"])
     if p["rssi"] is not None and p["rssi"] < -80:
         reasons.append("rssi=%d dBm" % p["rssi"])
-    if p["sd"] is False:
+    if _sd_expected(p) and p["sd"] is False:
         reasons.append("no SD card")
-    elif p["sd_free_mb"] is not None and p["sd_free_mb"] < 100:
+    elif _sd_expected(p) and p["sd_free_mb"] is not None and p["sd_free_mb"] < 100:
         reasons.append("%d MB free" % p["sd_free_mb"])
 
     reported_node = str(status_data.get("node") or target_name)
@@ -540,9 +595,9 @@ def apply_status_fields(result: NodeResult, http: HttpResult) -> None:
     upf = _as_float(uptime)
     result.uptime = "?" if upf is None else "%.0fs" % upf
 
-    fix = _first(d, (("gps", "fix"), ("gps_fix",), ("fix",)))
-    sats = _first(d, (("gps", "sats"), ("gps", "satellites"), ("gps_sats",), ("sats",)))
-    result.gps = "%s/%s" % (_json_scalar(fix), _json_scalar(sats))
+    # Show the protocol beside the raw fix number so a PMTK `1` is not read against a UBX `3`
+    # as if they were the same quality scale.
+    result.gps = _gps_summary(parse_status(d))
 
     edges = _first(d, (("pps", "edges"), ("pps_edges",)))
     glitches = _first(d, (("pps", "glitches"), ("pps_glitches",)))
@@ -773,13 +828,13 @@ def parse_nodes(args: argparse.Namespace) -> List[str]:
 
 
 def print_table(results: Sequence[NodeResult]) -> None:
-    print("%-20s %-15s %-8s %-6s %-7s %-8s %-8s %-10s %-5s %-6s %-6s %-7s %s" % (
+    print("%-20s %-15s %-8s %-6s %-12s %-8s %-8s %-10s %-5s %-6s %-6s %-7s %s" % (
         "node", "ip", "net", "http", "gps", "ingest", "uptime", "pps", "utc", "rssi", "dets", "temp", "details"))
-    print("%-20s %-15s %-8s %-6s %-7s %-8s %-8s %-10s %-5s %-6s %-6s %-7s %s" % (
+    print("%-20s %-15s %-8s %-6s %-12s %-8s %-8s %-10s %-5s %-6s %-6s %-7s %s" % (
         "-" * 20, "-" * 15, "-" * 8, "-" * 6, "-" * 7, "-" * 8, "-" * 8,
         "-" * 10, "-" * 5, "-" * 6, "-" * 6, "-" * 7, "-" * 7))
     for r in results:
-        print("%-20s %-15s %-8s %-6s %-7s %-8s %-8s %-10s %-5s %-6s %-6s %-7s %s" % (
+        print("%-20s %-15s %-8s %-6s %-12s %-8s %-8s %-10s %-5s %-6s %-6s %-7s %s" % (
             r.node, r.ip, r.network, r.http, r.gps, r.ingestion, r.uptime, r.pps, r.utc,
             r.rssi, r.dets, r.temp, "; ".join(r.details)))
 
