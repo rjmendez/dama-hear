@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -246,6 +247,250 @@ def determines_speed(n_receivers: int, n_events: int = 1, dim: int = 2,
     return Determinacy(eq, unk, ok, reason)
 
 
+# ── fleet temperature averaging & TDoA variance propagation ───────────────────────────────────
+
+@dataclass(frozen=True)
+class FleetTemperatureEstimate:
+    """Aggregated temperature statistics across network nodes."""
+    mean_temp_c: float
+    variance_temp_c2: float
+    sigma_temp_c: float
+    node_count: int
+    source: str
+
+
+@dataclass(frozen=True)
+class EffectiveSoundSpeed:
+    """Effective acoustic wave speed and uncertainty bounds."""
+    c_mps: float
+    temp_c: float
+    variance_c: float          # (m/s)^2
+    sigma_c_mps: float         # m/s
+    is_local: bool
+    source: str
+
+    def range_variance_m2(self, tau_s: float, sigma_tau_s: float = 0.0) -> float:
+        """Propagate sound speed and timing uncertainty into range variance sigma_d^2.
+
+        d = c * tau
+        sigma_d^2 = tau^2 * sigma_c^2 + c^2 * sigma_tau^2
+        """
+        tau = float(tau_s)
+        st = float(sigma_tau_s)
+        return (tau * tau) * self.variance_c + (self.c_mps * self.c_mps) * (st * st)
+
+    def range_sigma_m(self, tau_s: float, sigma_tau_s: float = 0.0) -> float:
+        return math.sqrt(self.range_variance_m2(tau_s, sigma_tau_s))
+
+
+class FleetTemperatureProvider:
+    """Aggregates node temperature telemetry and computes effective speed of sound c and variance.
+
+    Formula: c = 331.3 + 0.606 * T
+    Variances: sigma_c = 0.606 * sigma_T,  sigma_c^2 = (0.606)^2 * sigma_T^2
+
+    Handles local sensor nodes, bare mic nodes (missing local sensors using fleet-wide average),
+    and fleet-wide default fallbacks when no sensor reports exist.
+    """
+    def __init__(self, fallback_temp_c: float = 20.0,
+                 fallback_sigma_temp_c: float = 5.0,
+                 default_sensor_sigma_c: float = 0.5,
+                 max_age_s: float = 600.0,
+                 min_variance_floor: float = 0.01):
+        self.fallback_temp_c = float(fallback_temp_c)
+        self.fallback_sigma_temp_c = float(fallback_sigma_temp_c)
+        self.default_sensor_sigma_c = float(default_sensor_sigma_c)
+        self.max_age_s = float(max_age_s)
+        self.min_variance_floor = float(min_variance_floor)
+        self._readings: Dict[str, Tuple[float, float, float]] = {}  # node_id -> (temp_c, ts_s, sigma_T)
+
+    def update_node_temperature(self, node_id: str, temp_c: float,
+                                timestamp_s: Optional[float] = None,
+                                sensor_sigma_temp_c: Optional[float] = None) -> bool:
+        """Record or update a node's temperature reading (in degC). Return True if accepted."""
+        try:
+            t = float(temp_c)
+        except (TypeError, ValueError):
+            return False
+        if not (-50.0 <= t <= 60.0):
+            return False
+        ts = time.time() if timestamp_s is None else float(timestamp_s)
+        sig = (self.default_sensor_sigma_c
+               if sensor_sigma_temp_c is None or sensor_sigma_temp_c <= 0
+               else float(sensor_sigma_temp_c))
+        self._readings[str(node_id)] = (t, ts, sig)
+        return True
+
+    def update_node_telemetry(self, node_id: str, telemetry: dict,
+                              timestamp_s: Optional[float] = None) -> bool:
+        """Extract temperature from node telemetry frame/payload dictionary."""
+        if not isinstance(telemetry, dict):
+            return False
+        t_val = telemetry.get("temp_c")
+        if t_val is None:
+            env = telemetry.get("env")
+            if isinstance(env, dict):
+                t_val = env.get("temp_c")
+        if t_val is None:
+            c_val = telemetry.get("sound_speed_mps")
+            if c_val is not None:
+                try:
+                    c_f = float(c_val)
+                    if 310.0 <= c_f <= 370.0:
+                        t_val = temperature_c(c_f)
+                except (TypeError, ValueError):
+                    pass
+        if t_val is None:
+            return False
+        ts = timestamp_s
+        if ts is None:
+            ts_ms = telemetry.get("ts_utc_ms")
+            if ts_ms is not None:
+                ts = float(ts_ms) / 1000.0
+        sig = telemetry.get("temp_sigma_c")
+        return self.update_node_temperature(node_id, t_val, ts, sig)
+
+    def get_fleet_temperature(self, now_s: Optional[float] = None) -> FleetTemperatureEstimate:
+        """Aggregate temperature statistics across fresh network node readings."""
+        now = time.time() if now_s is None else float(now_s)
+        fresh = [(t, ts, sig) for (t, ts, sig) in self._readings.values()
+                 if (now - ts) <= self.max_age_s]
+
+        if not fresh:
+            var_t = self.fallback_sigma_temp_c ** 2
+            return FleetTemperatureEstimate(
+                mean_temp_c=self.fallback_temp_c,
+                variance_temp_c2=var_t,
+                sigma_temp_c=self.fallback_sigma_temp_c,
+                node_count=0,
+                source="fallback_default"
+            )
+
+        temps = [f[0] for f in fresh]
+        sigmas = [f[2] for f in fresh]
+        n = len(temps)
+        mean_t = float(np.mean(temps))
+
+        if n == 1:
+            var_t = (sigmas[0] ** 2) + self.min_variance_floor
+            source = "measured_n1"
+        else:
+            sample_var = float(np.var(temps, ddof=1))
+            sensor_var_mean = float(np.mean([s ** 2 for s in sigmas])) / n
+            var_t = max(sample_var, sensor_var_mean) + self.min_variance_floor
+            source = f"measured_n{n}"
+
+        sigma_t = math.sqrt(var_t)
+        return FleetTemperatureEstimate(
+            mean_temp_c=mean_t,
+            variance_temp_c2=var_t,
+            sigma_temp_c=sigma_t,
+            node_count=n,
+            source=source
+        )
+
+    def get_effective_sound_speed(self, node_id: Optional[str] = None,
+                                  now_s: Optional[float] = None) -> EffectiveSoundSpeed:
+        """Compute effective speed of sound c and variance for a node or fleet default."""
+        now = time.time() if now_s is None else float(now_s)
+
+        if node_id is not None and str(node_id) in self._readings:
+            t, ts, sig_t = self._readings[str(node_id)]
+            if (now - ts) <= self.max_age_s:
+                c = sound_speed(t)
+                var_t = (sig_t ** 2) + self.min_variance_floor
+                sig_c = DC_DT * math.sqrt(var_t)
+                var_c = sig_c ** 2
+                return EffectiveSoundSpeed(
+                    c_mps=c,
+                    temp_c=t,
+                    variance_c=var_c,
+                    sigma_c_mps=sig_c,
+                    is_local=True,
+                    source=f"local_{node_id}"
+                )
+
+        fleet_est = self.get_fleet_temperature(now)
+        c = sound_speed(fleet_est.mean_temp_c)
+        sig_c = DC_DT * fleet_est.sigma_temp_c
+        var_c = sig_c ** 2
+        return EffectiveSoundSpeed(
+            c_mps=c,
+            temp_c=fleet_est.mean_temp_c,
+            variance_c=var_c,
+            sigma_c_mps=sig_c,
+            is_local=False,
+            source=fleet_est.source
+        )
+
+
+def propagate_tdoa_variance(tau_s: float, sigma_tau_s: float,
+                           c_mps: float = 343.0,
+                           sigma_c_mps: float = 0.0) -> Dict[str, float]:
+    """Propagate timing delay uncertainty and sound speed uncertainty into range/TDoA variance.
+
+    d = c * tau
+    sigma_d^2 = tau^2 * sigma_c^2 + c^2 * sigma_tau^2
+    """
+    tau = float(tau_s)
+    st = float(sigma_tau_s)
+    c = float(c_mps)
+    sc = float(sigma_c_mps)
+
+    var_d = (tau * tau) * (sc * sc) + (c * c) * (st * st)
+    sigma_d = math.sqrt(var_d)
+
+    var_tau_total = st * st + ((tau * sc / c) ** 2 if c > 0 else 0.0)
+    sigma_tau_total = math.sqrt(var_tau_total)
+
+    return {
+        "range_diff_m": c * tau,
+        "range_diff_var_m2": var_d,
+        "range_diff_sigma_m": sigma_d,
+        "tau_sigma_effective_s": sigma_tau_total,
+        "c_mps": c,
+        "sigma_c_mps": sc,
+    }
+
+
+def propagate_pairwise_tdoa_uncertainty(
+    node_a_id: str, node_b_id: str, tau_s: float, sigma_tau_s: float,
+    baseline_distance_m: Optional[float] = None,
+    provider: Optional[FleetTemperatureProvider] = None,
+    now_s: Optional[float] = None
+) -> Dict[str, float]:
+    """Propagate temperature and timing uncertainties across a pairwise baseline (Node A <-> Node B)."""
+    if provider is None:
+        provider = FleetTemperatureProvider()
+
+    eff_a = provider.get_effective_sound_speed(node_a_id, now_s)
+    eff_b = provider.get_effective_sound_speed(node_b_id, now_s)
+
+    c_eff = 0.5 * (eff_a.c_mps + eff_b.c_mps)
+    var_c_eff = 0.25 * (eff_a.variance_c + eff_b.variance_c)
+    sigma_c_eff = math.sqrt(var_c_eff)
+
+    res = propagate_tdoa_variance(tau_s, sigma_tau_s, c_eff, sigma_c_eff)
+    res.update({
+        "node_a_id": node_a_id,
+        "node_b_id": node_b_id,
+        "c_node_a_mps": eff_a.c_mps,
+        "c_node_b_mps": eff_b.c_mps,
+        "source_a": eff_a.source,
+        "source_b": eff_b.source,
+    })
+
+    if baseline_distance_m is not None and baseline_distance_m > 0:
+        d_base = float(baseline_distance_m)
+        max_tau_bound = d_base / c_eff if c_eff > 0 else 0.0
+        speed_bound_uncertainty_s = (d_base / (c_eff * c_eff)) * sigma_c_eff if c_eff > 0 else 0.0
+        res["baseline_distance_m"] = d_base
+        res["max_tdoa_bound_s"] = max_tau_bound
+        res["max_tdoa_sigma_s"] = speed_bound_uncertainty_s
+
+    return res
+
+
 # ── the honest top-level call ───────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -260,11 +505,21 @@ class SpeedVerdict:
     c_upper_mps: Optional[float] = None
     temp_upper_c: Optional[float] = None
     note: Optional[str] = None
+    variance_c_m2s2: Optional[float] = None
+    variance_temp_c2: Optional[float] = None
 
     def require_temperature(self) -> Tuple[float, float]:
         if not self.valid or self.temp_c is None:
             raise SoundSpeedUnrecoverable("; ".join(self.reasons) or "no usable inversion")
-        return self.temp_c, self.temp_sigma_c
+        return self.temp_c, self.temp_sigma_c or 0.0
+
+    def tdoa_variance_m2(self, tau_s: float, sigma_tau_s: float = 0.0) -> float:
+        if self.c_mps is None or self.c_sigma_mps is None:
+            raise ValueError("SpeedVerdict has no valid c_mps/c_sigma_mps")
+        sc = self.c_sigma_mps
+        c = self.c_mps
+        st = float(sigma_tau_s)
+        return (tau_s * tau_s) * (sc * sc) + (c * c) * (st * st)
 
     def summary(self) -> str:
         if self.valid:
@@ -301,8 +556,11 @@ def recover_from_baseline(tau_s: float, d_m: float, sigma_tau_s: float,
     c = speed_from_baseline(tau_s, d_m)
     frac = math.hypot(sigma_d_m / float(d_m), float(sigma_tau_s) / abs(float(tau_s)))
     sc = c * frac
+    tc = temperature_c(c)
+    st = temperature_sigma_c(c, sc)
     return SpeedVerdict(True, [], c_mps=c, c_sigma_mps=sc,
-                        temp_c=temperature_c(c), temp_sigma_c=temperature_sigma_c(c, sc))
+                        temp_c=tc, temp_sigma_c=st,
+                        variance_c_m2s2=sc * sc, variance_temp_c2=st * st)
 
 
 def recover_from_delays(taus: Dict[Tuple[int, int], float], receiver_positions,
@@ -369,5 +627,8 @@ def recover_from_delays(taus: Dict[Tuple[int, int], float], receiver_positions,
         return SpeedVerdict(False, reasons, c_upper_mps=ub, temp_upper_c=temperature_c(ub))
     sigma = (float(np.std(est, ddof=1)) if len(est) > 1 else
              c * float(sigma_tau_s) / max(abs(tau(*pairs[0])), 1e-12))
-    return SpeedVerdict(True, [], c_mps=c, c_sigma_mps=sigma, temp_c=temperature_c(c),
-                        temp_sigma_c=temperature_sigma_c(c, sigma))
+    tc = temperature_c(c)
+    st = temperature_sigma_c(c, sigma)
+    return SpeedVerdict(True, [], c_mps=c, c_sigma_mps=sigma, temp_c=tc,
+                        temp_sigma_c=st,
+                        variance_c_m2s2=sigma * sigma, variance_temp_c2=st * st)

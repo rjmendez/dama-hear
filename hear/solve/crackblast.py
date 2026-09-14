@@ -158,6 +158,13 @@ def band_power(x, fs: float, band: Tuple[float, float], frame_s: float = 0.004,
     Compare arrivals measured with the SAME frame_s wherever the difference matters.
     """
     x = np.asarray(x, dtype=np.float64)
+    fs = float(fs)
+    if x.ndim != 1:
+        raise ValueError("x must be one-dimensional")
+    if not np.isfinite(fs) or fs <= 0:
+        raise ValueError("fs must be finite and positive")
+    if not np.isfinite(x).all():
+        raise ValueError("x must contain only finite values")
     n = max(8, int(round(frame_s * fs)))
     h = max(1, int(round(hop_s * fs)))
     if len(x) < n:
@@ -190,9 +197,13 @@ def crack_onset(x, fs: float, search_s: Tuple[float, float], band=(2000.0, 10000
     j = i
     while j > 0 and p[j] > thr:
         j -= 1
-    a, b = p[j], p[j + 1]
-    f = 0.0 if b <= a else (thr - a) / (b - a)
-    return dict(t_s=float(t[j] + f * (t[j + 1] - t[j])), t_peak_s=float(t[i]),
+    if j >= len(p) - 1:
+        t_on = float(t[j])
+    else:
+        a, b = p[j], p[j + 1]
+        f = 0.0 if b <= a else (thr - a) / (b - a)
+        t_on = float(t[j] + f * (t[j + 1] - t[j]))
+    return dict(t_s=t_on, t_peak_s=float(t[i]),
                 peak=float(p[i]), floor=float(floor))
 
 

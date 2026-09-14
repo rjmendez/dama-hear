@@ -126,6 +126,10 @@ def test_sound_speed_moves_the_budget():
     {"fs_hz": 0.0},
     {"t_sigma_s": 0.0},
     {"band_hz": (8000.0, 50.0)},            # inverted
+    {"fs_hz": float("nan")},
+    {"t_sigma_s": float("inf")},
+    {"band_hz": (-1.0, 10000.0)},
+    {"raw_retain_s": -1.0},
 ])
 def test_bad_class_definitions_raise(kw):
     base = dict(name="bad", time_source="gps_pps", t_sigma_s=1e-4, mic_count=1,
@@ -139,6 +143,18 @@ def test_registering_a_duplicate_name_raises():
     with pytest.raises(nc.CapabilityError):
         nc.register(nc.get("xiao-s3-pps"))
 
+
+def test_range_sigma_rejects_non_positive_or_non_finite_sound_speed():
+    c = nc.get("xiao-s3-pps")
+    for speed in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(nc.CapabilityError):
+            c.range_sigma_m(speed)
+
+
+def test_invalid_requested_band_is_not_admitted():
+    c = nc.get("xiao-s3-pps")
+    assert not c.can_hear(float("nan"), 1000.0)
+    assert not c.can_hear(1000.0, 500.0)
 
 def test_describe_covers_every_class_and_states_the_limit():
     t = nc.describe()
@@ -186,3 +202,53 @@ class TestGotchiPhone:
         phone = nc.get("gotchi-phone")
         assert phone.usable_band_hz()[1] > nc.get("xiao-s3-pps").usable_band_hz()[1]
         assert phone.fs_hz > nc.get("xiao-s3-pps").fs_hz
+
+
+# ---------------------------------------------------------------- power profile / detector lanes
+def test_every_registered_class_declares_a_known_power_profile():
+    for name, c in nc.CLASSES.items():
+        assert c.power_profile in ("solar_duty_cycled", "mains_continuous", "battery_mobile"), name
+
+
+def test_bad_power_profile_raises():
+    with pytest.raises(nc.CapabilityError):
+        nc.NodeClass(name="bad", time_source="gps_pps", t_sigma_s=1e-4, mic_count=1,
+                     fs_hz=16000.0, band_hz=(50.0, 10000.0), power_profile="mains")
+
+
+def test_solar_class_gets_duty_cycled_lane_not_continuous_tonal():
+    c = nc.get("xiao-s3-pps")
+    assert c.power_profile == "solar_duty_cycled"
+    lanes = c.detector_lanes()
+    assert "impulse_gate" in lanes and "tonal_gate_duty" in lanes
+    assert "tonal_gate_continuous" not in lanes
+
+
+def test_mains_class_gets_continuous_tonal_lane():
+    c = nc.get("puc-ntp")
+    assert c.power_profile == "mains_continuous"
+    assert "tonal_gate_continuous" in c.detector_lanes()
+
+
+def test_battery_mobile_class_gets_continuous_tonal_lane_too():
+    """A phone is not solar-budgeted; while it is on it can afford what a mains node can."""
+    c = nc.get("gotchi-phone")
+    assert c.power_profile == "battery_mobile"
+    assert "tonal_gate_continuous" in c.detector_lanes()
+
+
+def test_only_the_camera_class_gets_camera_fusion():
+    assert "camera_fusion" not in nc.get("xiao-s3-pps").detector_lanes()
+    assert "camera_fusion" not in nc.get("puc-ntp").detector_lanes()
+    cam = nc.get("esp32s3-cam-mains")
+    assert cam.has_camera
+    assert "camera_fusion" in cam.detector_lanes()
+
+
+def test_no_built_class_has_a_camera_yet():
+    """esp32s3-cam-mains is the one and only design-target exception; guards against a future
+    edit accidentally flipping has_camera on a real, already-deployed class."""
+    built = [n for n in nc.CLASSES if n != "esp32s3-cam-mains"]
+    assert built  # sanity: the exclusion did not eat the whole registry
+    for name in built:
+        assert not nc.get(name).has_camera, name

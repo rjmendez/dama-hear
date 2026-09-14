@@ -25,6 +25,7 @@ node's own telemetry to decide what it did.
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Sequence
 
 # Speed of sound at 20 C, only used to turn a timing error into a distance for the messages below.
@@ -56,32 +57,57 @@ class NodeClass:
                     speed moves 0.6 m/s per degree and biases every node the same way, so it
                     does NOT cancel in TDoA.
     raw_retain_s    Seconds of raw audio retrievable on request, 0 if none.
+    power_profile   "solar_duty_cycled" | "mains_continuous" | "battery_mobile". A SECOND
+                    hardware fact, orthogonal to time_source: it says nothing about timing or
+                    ranging and everything about which DETECTOR LANE this class can run. A
+                    solar node's energy budget rules out running an FFT-based detector
+                    continuously; a mains node's does not. See docs/node-profiles.md, which is
+                    the design this field exists to make checkable rather than asserted per node.
+    has_camera      Whether an image sensor is fitted. Decides eligibility for the future
+                    webcam/wildlife-camera profile's multimodal event fusion -- see
+                    docs/node-profiles.md section on that profile. False for every class today;
+                    no such node has been built.
     notes           Free text for whoever reads a refusal message.
     """
 
     def __init__(self, name: str, time_source: str, t_sigma_s: float, mic_count: int,
                  fs_hz: float, band_hz: Sequence[float], env: Sequence[str] = (),
-                 raw_retain_s: float = 0.0, notes: str = "") -> None:
+                 raw_retain_s: float = 0.0, power_profile: str = "mains_continuous",
+                 has_camera: bool = False, notes: str = "") -> None:
+        if not isinstance(name, str) or not name.strip():
+            raise CapabilityError("class name must be a non-empty string")
         if time_source not in ("gps_pps", "ntp", "none"):
             raise CapabilityError("unknown time_source %r" % (time_source,))
-        if mic_count < 1:
+        if power_profile not in ("solar_duty_cycled", "mains_continuous", "battery_mobile"):
+            raise CapabilityError("unknown power_profile %r" % (power_profile,))
+        if isinstance(mic_count, bool) or not isinstance(mic_count, int) or mic_count < 1:
             raise CapabilityError("%s: mic_count must be >= 1" % name)
-        if fs_hz <= 0:
+        try:
+            t_sigma_s = float(t_sigma_s)
+            fs_hz = float(fs_hz)
+            raw_retain_s = float(raw_retain_s)
+            lo, hi = (float(v) for v in band_hz)
+        except (TypeError, ValueError, IndexError):
+            raise CapabilityError("%s: numeric fields are malformed" % name)
+        if not math.isfinite(fs_hz) or fs_hz <= 0:
             raise CapabilityError("%s: fs_hz must be positive" % name)
-        lo, hi = float(band_hz[0]), float(band_hz[1])
-        if not lo < hi:
+        if not math.isfinite(lo) or not math.isfinite(hi) or lo < 0 or not lo < hi:
             raise CapabilityError("%s: band_hz must be (lo, hi) with lo < hi" % name)
-        if t_sigma_s <= 0:
+        if not math.isfinite(t_sigma_s) or t_sigma_s <= 0:
             raise CapabilityError("%s: t_sigma_s must be positive -- a node with no timing error "
                                   "is a claim no hardware supports" % name)
+        if not math.isfinite(raw_retain_s) or raw_retain_s < 0:
+            raise CapabilityError("%s: raw_retain_s must be finite and non-negative" % name)
         self.name = name
         self.time_source = time_source
-        self.t_sigma_s = float(t_sigma_s)
-        self.mic_count = int(mic_count)
-        self.fs_hz = float(fs_hz)
+        self.power_profile = power_profile
+        self.has_camera = bool(has_camera)
+        self.t_sigma_s = t_sigma_s
+        self.mic_count = mic_count
+        self.fs_hz = fs_hz
         self.band_hz = (lo, hi)
         self.env = frozenset(env)
-        self.raw_retain_s = float(raw_retain_s)
+        self.raw_retain_s = raw_retain_s
         self.notes = notes
 
     # ---- what follows from the fields ------------------------------------------------------
@@ -104,10 +130,16 @@ class NodeClass:
 
     def range_sigma_m(self, c_mps: float = _C_NOMINAL_MPS) -> float:
         """The timestamp error expressed as distance. This is the honest cost of a class."""
-        return self.t_sigma_s * float(c_mps)
+        c_mps = float(c_mps)
+        if not math.isfinite(c_mps) or c_mps <= 0:
+            raise CapabilityError("sound speed must be finite and positive")
+        return self.t_sigma_s * c_mps
 
     def can_hear(self, f_lo_hz: float, f_hi_hz: float) -> bool:
         """Does the requested band lie wholly inside what this node delivers?"""
+        f_lo_hz, f_hi_hz = float(f_lo_hz), float(f_hi_hz)
+        if not math.isfinite(f_lo_hz) or not math.isfinite(f_hi_hz) or f_lo_hz < 0 or not f_lo_hz < f_hi_hz:
+            return False
         lo, hi, _ = self.usable_band_hz()
         return f_lo_hz >= lo and f_hi_hz <= hi
 
@@ -118,6 +150,39 @@ class NodeClass:
     def contributes_arrival(self) -> bool:
         """Is this node's timestamp admissible as a TDoA arrival at all?"""
         return self.time_source == "gps_pps"
+
+    def detector_lanes(self) -> frozenset:
+        """Which detector lanes this class's POWER budget admits, as a set of names.
+
+        This is a capability check, the same discipline as contributes_arrival() -- a lane a
+        class cannot afford is refused, not silently degraded. It says nothing about whether a
+        lane is currently WIRED (that is firmware state, exactly the distinction `can_hear`'s
+        docstring already draws between what a class HAS and what it is DOING); it says only
+        what a caller could ever ask this power budget to run.
+
+            "impulse_gate"   hear/node/detect.py's broadband amplitude gate. A 1 ms boxcar and a
+                              comparison, cheap enough for every profile including a duty-cycled
+                              solar node -- see docs/node-profiles.md.
+            "tonal_gate_duty" modules/bioacoustic/detect.py's TonalGate, run only during a
+                              node's already-awake windows rather than continuously. Available to
+                              every profile that has a microphone at all; it is what a solar node
+                              gets instead of a continuous tonal lane.
+            "tonal_gate_continuous" the same detector, run without duty-cycling. Needs a power
+                              budget that does not have to sleep to make its energy budget --
+                              mains and (for as long as the phone stays plugged in or awake)
+                              battery-mobile profiles only.
+            "camera_fusion"   correlating an image trigger with an audio burst tag. Needs
+                              has_camera; no class has it yet.
+
+        docs/node-profiles.md is the design; this method is what stops that design from
+        drifting out of sync with what NodeClass actually declares.
+        """
+        lanes = {"impulse_gate", "tonal_gate_duty"}
+        if self.power_profile in ("mains_continuous", "battery_mobile"):
+            lanes.add("tonal_gate_continuous")
+        if self.has_camera:
+            lanes.add("camera_fusion")
+        return frozenset(lanes)
 
     def __repr__(self) -> str:
         lo, hi, lim = self.usable_band_hz()
@@ -173,8 +238,27 @@ register(NodeClass(
     band_hz=(50.0, 10000.0),
     env=("temp", "press"),
     raw_retain_s=240.0,
+    # Tier-1 field design target is solar + LoRa (docs/node-hardware.md: "You supply the
+    # MCU, LoRa, battery and solar"). nyquist/mach are currently bench-run on a mains plug
+    # timer for validation, which is a TEST HARNESS choice, not the class this hardware was
+    # designed to. See docs/node-profiles.md for the duty-cycled detector lane this implies.
+    power_profile="solar_duty_cycled",
     notes="XIAO ESP32-S3 Sense + u-blox GPS on D0 PPS + BMP280 + microSD. nyquist, mach.",
 ))
+
+register(NodeClass(
+    name="esp32s3-i2s-gps",
+    time_source="gps_pps",
+    t_sigma_s=100e-6,
+    mic_count=1,
+    fs_hz=48000.0,
+    band_hz=(50.0, 15000.0),
+    env=("temp", "press"),
+    raw_retain_s=80.0,
+    power_profile="solar_duty_cycled",
+    notes="ESP32-S3-WROOM + Adafruit Ultimate GPS v3 (PPS GPIO4, UART 15/16) + ICS-43434 I2S mic (GPIO 41/42/1) + RGB GPIO48. Gold, Kasami, Ageev.",
+))
+
 
 register(NodeClass(
     name="xiao-s3-i2s",
@@ -188,6 +272,7 @@ register(NodeClass(
     band_hz=(50.0, 15000.0),
     env=("temp", "press"),
     raw_retain_s=80.0,   # same PSRAM budget, three times the rate
+    power_profile="solar_duty_cycled",
     notes="Planned I2S variant. Not built. Bandwidth-limited by the part, not by the sample rate.",
 ))
 
@@ -202,6 +287,9 @@ register(NodeClass(
     band_hz=(50.0, 15000.0),
     env=("temp", "humidity", "press", "voc", "co2", "light"),
     raw_retain_s=0.0,
+    # BirdWeather PUCs are USB/mains powered, WiFi-connected weather-station-style units --
+    # no battery budget to protect, hence no duty-cycled lane. See docs/node-profiles.md.
+    power_profile="mains_continuous",
     notes="BirdWeather PUC, IF its GPS PPS is wired to the ESP32-S3. UNVERIFIED -- do not survey a "
           "PUC as this class until a scope or a teardown confirms the PPS pin.",
 ))
@@ -218,6 +306,7 @@ register(NodeClass(
     band_hz=(50.0, 15000.0),
     env=("temp", "humidity", "press", "voc", "co2", "light"),
     raw_retain_s=0.0,
+    power_profile="mains_continuous",
     notes="BirdWeather PUC timed by NTP and its RTC. An RTC gives holdover, not sync. Excellent "
           "listener, not a ranging node.",
 ))
@@ -259,10 +348,53 @@ register(NodeClass(
     band_hz=(50.0, 20000.0),
     env=("temp", "press"),
     raw_retain_s=0.0,
+    # Charged intermittently, carried, screen/CPU shared with the rest of the phone -- not a
+    # duty-cycled sensor and not guaranteed always-on either. Own bucket rather than forced
+    # into "solar_duty_cycled" (it has no solar budget logic at all) or "mains_continuous"
+    # (it is not plugged in). See docs/node-profiles.md.
+    power_profile="battery_mobile",
     notes="dama-gotchi Android node. EXCELLENT sensor platform and a good clock; the audio path "
           "does not use either. Refused for arrivals until AcousticAntCollector stamps frames "
           "with AudioRecord.getTimestamp() converted through GPSTimingSync.toUtcMs(), and the "
           "impulse callback stops dropping the timestamp. Fixed, it would be ~2.8 ms (0.98 m).",
+))
+
+
+register(NodeClass(
+    name="hugbot-corroborator",
+    time_source="none",
+    t_sigma_s=100e-3,
+    mic_count=1,
+    fs_hz=44100.0,
+    band_hz=(50.0, 15000.0),
+    env=("temp", "press"),
+    raw_retain_s=0.0,
+    power_profile="battery_mobile",
+    notes="Hugbot mobile acoustic corroborator. External ground-truth / presence corroborator only. Refused for TDoA arrival solving.",
+))
+
+
+register(NodeClass(
+    name="esp32s3-cam-mains",
+    # UNBUILT. Every field below is a design target for docs/node-profiles.md's future
+    # webcam/wildlife-camera profile, not a measurement -- no such node exists yet, and this
+    # entry exists so a caller can be written and tested against the capability model before the
+    # hardware does. Do NOT survey a real node as this class; see puc-pps's identical caveat.
+    time_source="gps_pps",
+    # Same order as xiao-s3-pps IF a PPS line is wired; camera and TDoA timing are independent
+    # design choices and nothing here couples them. A build with no PPS wired is "none", not this.
+    t_sigma_s=100e-6,
+    mic_count=1,
+    fs_hz=16000.0,
+    band_hz=(50.0, 10000.0),
+    env=("temp", "press"),
+    raw_retain_s=3600.0,     # mains power and no LoRa payload cap: retention is an SD budget only
+    power_profile="mains_continuous",
+    has_camera=True,
+    notes="DESIGN TARGET, NOT BUILT. XIAO ESP32-S3 Sense in a mains-powered wildlife-camera "
+          "role: continuous audio (impulse_gate + tonal_gate_continuous) plus onboard OV2640 "
+          "motion/presence trigger, correlated by shared timestamp into one multimodal event. "
+          "See docs/node-profiles.md.",
 ))
 
 
