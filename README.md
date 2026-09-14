@@ -61,6 +61,17 @@ runners:
   build of `hear_node` and `puc_node` without it that must fail on the Wi-Fi guard. The images are
   kept as workflow artifacts for 14 days.
 
+Every push to any branch and every pull request also runs `.github/workflows/coord-guard.yml`.
+This repo is public and the site's real position must never be in it, so `tools/coord_guard.py`
+fails on any decimal latitude/longitude pair, or `lat`/`lon`-keyed value, with at least four
+decimal places that lies more than 25 km from `survey.json`'s fictional origin. It checks the
+tree and also every file each incoming commit adds or changes. A commit that adds a coordinate
+and a later one that removes it still fails, because the history is published too. It prints
+commit, path and line, never the value. Build test coordinates as offsets from the fictional
+origin. The real origin comes only from `HEAR_SITE_ORIGIN`. `tools/coord_guard_allow.txt`
+(`path digest  # reason`) is for numbers that are not coordinates at all. Take the digest from a
+local `--show-digests` run, never from CI.
+
 Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the `hear_node` images
 for each supported board class, their `.elf`, `build-info.json` and `SHA256SUMS` as a GitHub
 release. This repo is public, so the images carry no Wi-Fi credentials and no node name. Each
