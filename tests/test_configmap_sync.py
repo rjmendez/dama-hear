@@ -25,6 +25,7 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 
 import pytest
@@ -88,6 +89,37 @@ def test_every_bundle_has_a_checked_in_configmap():
     missing = [b for b in _gen()["BUNDLES"]
                if not (ROOT / "deploy" / "k8s" / (b + ".yaml")).exists()]
     assert not missing, "no checked-in ConfigMap for: %s" % ", ".join(sorted(missing))
+
+
+@pytest.mark.parametrize("bundle", sorted(_gen()["BUNDLES"]))
+def test_every_bundle_stamp_is_clean_and_matches_embedded_content(bundle):
+    """The provenance annotation must identify the exact committed source copied into the map."""
+    path = ROOT / "deploy" / "k8s" / (bundle + ".yaml")
+    doc = yaml.safe_load(path.read_text())
+    stamp = doc["metadata"]["annotations"].get("dama-hear/commit", "")
+    assert stamp and not stamp.endswith("-dirty"), (
+        "%s has an unusable provenance stamp %r; regenerate from a clean commit" %
+        (path.name, stamp))
+    try:
+        subprocess.check_call(
+            ["git", "-C", str(ROOT), "cat-file", "-e", "%s^{commit}" % stamp],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        pytest.fail("%s provenance stamp %r is not a commit in this checkout" %
+                    (path.name, stamp))
+
+    embedded = _embedded(path)
+    _app, code, data = _gen()["BUNDLES"][bundle]
+    for key, rel in list(code) + list(data):
+        want = subprocess.check_output(
+            ["git", "-C", str(ROOT), "show", "%s:%s" % (stamp, rel)],
+            text=True,
+        )
+        assert embedded[key] == want, (
+            "%s key %s does not match %s at %s; regenerate from that commit" %
+            (path.name, key, rel, stamp))
 
 
 @pytest.mark.parametrize("bundle", sorted(_gen()["BUNDLES"]))
