@@ -89,6 +89,25 @@ def test_the_confirmation_is_long_enough_for_the_rate_the_module_is_configured_a
         % (confirm, quorum, period_ms))
 
 
+def test_the_sweep_stops_at_the_first_confirmed_rate():
+    """The sweep used to dwell on every candidate after one had decoded: 15 rates x 1.2 s plus the
+    confirmation, ~20.5 s per call, measured on nyquist after 230400 had already shown 17 UBX
+    frames. A candidate that reaches the quorum is confirmed on the spot and ends the loop; a
+    sweep with no such candidate still confirms its best rate afterwards, so a module that scored
+    once in its dwell is not dropped."""
+    body = _body(_source(), "static bool gps_autobaud()", "\nstatic void gps_bringup()")
+    loop = body[body.index("for (unsigned k = 0; k < nc"):body.index("if (!confirmed) {")]
+    assert "k < nc && !confirmed" in loop, "a confirmed rate must end the sweep"
+    inline = re.search(r"if \(score >= GPS_DECODE_QUORUM\) \{(.*?)\n      \}", loop, flags=re.S)
+    assert inline, "only a candidate at the quorum may be confirmed inside the sweep"
+    assert "gps_listen(GPS_CONFIRM_MS" in inline.group(1)
+    assert re.search(r"confirmed = \(cnm \+ cub\) >= GPS_DECODE_QUORUM;", inline.group(1))
+    assert "if (!confirmed) Serial1.end();" in loop, "the confirmed rate must stay open"
+    tail = body[body.index("if (!confirmed) {"):]
+    assert "gps_listen(GPS_CONFIRM_MS" in tail
+    assert re.search(r"confirmed = best_b && \(cnm \+ cub\) >= GPS_DECODE_QUORUM;", tail)
+
+
 def test_the_pin_probe_outlasts_one_transmit_period():
     """⚠️250 ms WAS SHORTER THAN THE THING IT LOOKED FOR. At one solution per second the module
     bursts for a few tens of ms and is idle for the rest of the second, so a 250 ms window misses

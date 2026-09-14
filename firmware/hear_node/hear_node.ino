@@ -3169,24 +3169,40 @@ static bool gps_autobaud() {
       logf("gps   measured %lu us/bit -> %lu baud (%.1f%% off standard), trying it first\n",
            (unsigned long)bit_us, (unsigned long)measured, (double)snap_err);
     uint32_t best_b = 0; int best_score = 0; bool best_ubx = false;
-    for (unsigned k = 0; k < nc; k++) {
+    int cnm = 0, cub = 0;
+    bool confirmed = false;
+    for (unsigned k = 0; k < nc && !confirmed; k++) {
       Serial1.begin(cand[k], SERIAL_8N1, gps_rx_pin, gps_tx_pin);
       int nm = 0, ub = 0;
       gps_listen(1200, &nm, &ub);
       logf("gps   %6lu baud -> %d NMEA, %d UBX\n", (unsigned long)cand[k], nm, ub);
       int score = nm + ub;
       if (score > best_score) { best_score = score; best_b = cand[k]; best_ubx = (ub > nm); }
-      Serial1.end();
+      // A rate that already reaches the quorum is confirmed here, and a confirmed rate ends the
+      // sweep: the remaining dwells cannot beat a link that has decoded twice.
+      if (score >= GPS_DECODE_QUORUM) {
+        cnm = 0; cub = 0;
+        gps_listen(GPS_CONFIRM_MS, &cnm, &cub);
+        confirmed = (cnm + cub) >= GPS_DECODE_QUORUM;
+        if (confirmed) {
+          best_b = cand[k]; best_ubx = (ub > nm); gps_baud = cand[k];
+          logf("gps   %lu baud confirmed after %u of %u rates\n",
+               (unsigned long)cand[k], k + 1, nc);
+        }
+      }
+      if (!confirmed) Serial1.end();
       boot_wdt_service();
     }
-    gps_baud = best_b ? best_b : 9600;
-    Serial1.begin(gps_baud, SERIAL_8N1, gps_rx_pin, gps_tx_pin);
-    // Confirm the winner rather than trusting its sweep score. A rate that only ever scored
-    // once has not been distinguished from noise, and reporting it as a decoded link is what
-    // stops the caller trying the other pin order.
-    int cnm = 0, cub = 0;
-    gps_listen(GPS_CONFIRM_MS, &cnm, &cub);
-    bool confirmed = best_b && (cnm + cub) >= GPS_DECODE_QUORUM;
+    if (!confirmed) {
+      gps_baud = best_b ? best_b : 9600;
+      Serial1.begin(gps_baud, SERIAL_8N1, gps_rx_pin, gps_tx_pin);
+      // Confirm the winner rather than trusting its sweep score. A rate that only ever scored
+      // once has not been distinguished from noise, and reporting it as a decoded link is what
+      // stops the caller trying the other pin order.
+      cnm = 0; cub = 0;
+      gps_listen(GPS_CONFIRM_MS, &cnm, &cub);
+      confirmed = best_b && (cnm + cub) >= GPS_DECODE_QUORUM;
+    }
     logf("gps   using %lu baud (%s) -- confirm %d NMEA, %d UBX in %d ms: %s\n",
                   (unsigned long)gps_baud, best_ubx ? "UBX binary" : "NMEA",
                   cnm, cub, GPS_CONFIRM_MS,
