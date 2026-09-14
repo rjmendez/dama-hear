@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 661562 B serialised; 661746 B of annotations against a 262144 B cap.
+# apply-mode server: 669786 B serialised; 669970 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '772d403-dirty'
+    dama-hear/commit: '4a78410-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '661562'
+    dama-hear/serialised-bytes: '669786'
 data:
   hear__init__.py: |
     
@@ -2661,7 +2661,9 @@ data:
     """
     from __future__ import annotations
     
+    import json
     import math
+    from pathlib import Path
     from typing import Dict, List, Optional, Sequence
     
     # Speed of sound at 20 C, only used to turn a timing error into a distance for the messages below.
@@ -3451,6 +3453,49 @@ data:
         notes="DESIGN TARGET, NOT BUILT. Mains-powered wildlife-camera profile with continuous audio and camera fusion.",
     ))
     
+    register(NodeClass(
+        name="esp32s3-speaker",
+        time_source="gps_pps",
+        # Same bench-calibration-rig hardware as esp32s3-i2s-gps: PMTK GPS with 1PPS. The clock term
+        # is unmeasured on THIS board and inherits the family's unmeasured 100 us figure rather than
+        # a number taken from it directly -- see xiao-s3-i2s's note on why that transplant is only
+        # ever provisional.
+        t_sigma_s=100e-6,
+        # None: this class's capture path has never been measured against an external reference.
+        # tools/calibrate_claps.py drives a near-field clap rig that solves for exactly this number
+        # jointly with node geometry, and load_calibrated_biases() below is how its output --
+        # config/calibrated_node_biases.json -- reaches this field. Until that has run, this class
+        # is refused for arrivals the same as any other unmeasured board.
+        path_bias_s=None,
+        mic_count=1,
+        fs_hz=48000.0,
+        band_hz=(50.0, 15000.0),
+        env=(),
+        raw_retain_s=0.0,
+        power_profile="mains_continuous",
+        notes="Bench clap-calibration rig node co-located with a reference speaker. Refused for "
+              "arrivals ONLY because its capture path has never been measured; "
+              "tools/calibrate_claps.py + load_calibrated_biases() is how it gets measured.",
+    ))
+    
+    register(NodeClass(
+        name="esp32s3-box3",
+        time_source="gps_pps",
+        t_sigma_s=100e-6,
+        # None for the same reason as esp32s3-speaker above: a different enclosure is a different
+        # capture path, and nothing here has been measured against a co-located reference yet.
+        path_bias_s=None,
+        mic_count=1,
+        fs_hz=48000.0,
+        band_hz=(50.0, 15000.0),
+        env=(),
+        raw_retain_s=0.0,
+        power_profile="mains_continuous",
+        notes="Bench clap-calibration rig node, third enclosure variant. Refused for arrivals ONLY "
+              "because its capture path has never been measured; tools/calibrate_claps.py + "
+              "load_calibrated_biases() is how it gets measured.",
+    ))
+    
     
     def strictest_arrival_class() -> NodeClass:
         """The admissible class with the LEAST room for a stated clock sigma.
@@ -3530,6 +3575,111 @@ data:
         except KeyError:
             raise CapabilityError("unknown node class %r (have %s)"
                                   % (name, ", ".join(sorted(CLASSES))))
+    
+    
+    # ---------------------------------------------------------------- calibration ingestion
+    # tools/calibrate_claps.py and tools/hear_latency_cal.py both measure a class's capture-path
+    # delay against an external reference and write it out as config/calibrated_node_biases.json
+    # (schema "hear.calibrated_node_biases.v1"). Loading that file is how a class moves from
+    # `path_bias_s=None` -- NEVER MEASURED, a refusal -- to a stated bias that require_arrival() can
+    # admit. The confidence gate below is deliberately SEPARATE from ARRIVAL_PATH_BIAS_MAX_S: a
+    # calibration run can converge on a small bias with a large uncertainty, and a wide sigma_b_s is
+    # a reason not to trust the number yet, independent of whether the number itself would pass.
+    CALIBRATION_SIGMA_MAX_S = 30e-6   # 30 us: the confidence bound this module requires of a
+                                      # solved bias before it is trusted enough to apply automatically.
+    
+    _DEFAULT_CALIBRATION_PATH = "config/calibrated_node_biases.json"
+    
+    
+    def apply_calibration(node_class_name: str, path_bias_s: float, sigma_b_s: float,
+                          *, sigma_max_s: float = CALIBRATION_SIGMA_MAX_S) -> NodeClass:
+        """Apply ONE measured capture-path bias to an already-registered class.
+    
+        This is the single place `path_bias_s` is allowed to change after registration -- the
+        constructor validates it once, and this function re-validates the same way rather than
+        poking the attribute directly, so a bad calibration run cannot silently corrupt a class.
+    
+        `sigma_b_s` is the calibration solve's own uncertainty on the bias it produced (e.g.
+        `ClapCalibrationResult.sigma_b_s`), NOT `t_sigma_s` and NOT `ARRIVAL_PATH_BIAS_MAX_S` -- it
+        answers "how sure is this measurement", not "is the measured value small enough". A bias is
+        only applied when BOTH the measurement is trusted (`sigma_b_s <= sigma_max_s`) and the
+        resulting class subsequently passes `capture_bias_bounded()` on its own terms; this function
+        does the former and leaves the latter to `contributes_arrival()` / `require_arrival()`, so a
+        class can be measured-but-still-too-biased without this function lying about it.
+    
+        Raises CapabilityError, and leaves the class untouched, if the measurement is not trustworthy
+        or not a legal `path_bias_s` (see NodeClass.__init__ for what "legal" means -- finite,
+        positive, non-zero).
+        """
+        cls = get(node_class_name)
+        if sigma_b_s is None or not math.isfinite(sigma_b_s) or sigma_b_s < 0.0:
+            raise CapabilityError(
+                "%s: sigma_b_s must be a finite non-negative number of seconds, got %r"
+                % (node_class_name, sigma_b_s))
+        if sigma_b_s > sigma_max_s:
+            raise CapabilityError(
+                "%s: calibration sigma_b %.1f us exceeds the %.1f us confidence gate this module "
+                "requires before trusting a solved bias -- refusing to apply an uncertain "
+                "measurement rather than admit a class on a number that might move"
+                % (node_class_name, sigma_b_s * 1e6, sigma_max_s * 1e6))
+        if path_bias_s is None or not math.isfinite(path_bias_s):
+            raise CapabilityError(
+                "%s: path_bias_s must be a finite number of seconds, got %r"
+                % (node_class_name, path_bias_s))
+        # path_bias_s is stored as a MAGNITUDE (see NodeClass.__init__ / the module docstring); a
+        # calibration solve reports a signed offset (direction matters for correcting a timestamp),
+        # so the sign is dropped on the way in, exactly as every hand-written registration above does.
+        magnitude = abs(float(path_bias_s))
+        if magnitude == 0.0:
+            raise CapabilityError(
+                "%s: calibration solved path_bias_s == 0.0, which no capture hardware supports -- "
+                "treat this as a measurement error, not a perfect capture path" % (node_class_name,))
+        cls.path_bias_s = magnitude
+        return cls
+    
+    
+    def load_calibrated_biases(path: Optional[str] = None,
+                              *, sigma_max_s: float = CALIBRATION_SIGMA_MAX_S) -> List[str]:
+        """Read a `hear.calibrated_node_biases.v1` file and apply every trustworthy bias in it.
+    
+        `path` defaults to `config/calibrated_node_biases.json` at the repo root (the default output
+        of tools/calibrate_claps.py). Missing file -> no-op, returning `[]`, so importing this module
+        before a calibration run has ever produced anything is not an error.
+    
+        A node entry is applied only if ALL of the following hold, and is silently skipped (not
+        raised) otherwise -- a marginal or partial calibration run should leave a class exactly as
+        refused as it already was, not half-apply it:
+          * its `node_id` names a class already registered in CLASSES;
+          * its `status` is "admissible" (calibrate_claps.py's own tolerance gate), if present;
+          * it states both `path_bias_s` and `sigma_b_s`;
+          * `sigma_b_s <= sigma_max_s` and `path_bias_s` is a legal, non-zero, finite number.
+    
+        Returns the sorted list of class names actually updated.
+        """
+        if path is None:
+            path = str(Path(__file__).resolve().parents[1] / _DEFAULT_CALIBRATION_PATH)
+        p = Path(path)
+        if not p.exists():
+            return []
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        nodes = payload.get("nodes", {}) if isinstance(payload, dict) else {}
+        applied: List[str] = []
+        for node_id, entry in nodes.items():
+            if node_id not in CLASSES or not isinstance(entry, dict):
+                continue
+            status = entry.get("status")
+            if status is not None and status != "admissible":
+                continue
+            path_bias_s = entry.get("path_bias_s")
+            sigma_b_s = entry.get("sigma_b_s")
+            if path_bias_s is None or sigma_b_s is None:
+                continue
+            try:
+                apply_calibration(node_id, path_bias_s, sigma_b_s, sigma_max_s=sigma_max_s)
+            except CapabilityError:
+                continue
+            applied.append(node_id)
+        return sorted(applied)
     
     
     # ---------------------------------------------------------------- the door
