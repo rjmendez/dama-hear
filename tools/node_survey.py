@@ -228,19 +228,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "Survey.height_provenance().")
     a = ap.parse_args(argv)
 
-    def _kv(pairs, cast, what):
+    bad: List[str] = []
+
+    def _kv(pairs, cast, what, ok=lambda v: True, need=""):
         out = {}
         for kv in pairs:
             k, sep, v = kv.partition("=")
             if not sep or not k:
-                raise SystemExit("--%s wants NAME=VALUE, got %r" % (what, kv))
-            out[k] = cast(v)
+                bad.append("--%s %r: want NAME=VALUE" % (what, kv))
+                continue
+            try:
+                val = cast(v)
+            except ValueError:
+                bad.append("--%s %r: %r is not a valid value" % (what, kv, v))
+                continue
+            if not ok(val):
+                bad.append("--%s %r: need %s" % (what, kv, need))
+                continue
+            out[k] = val
         return out
 
-    heights = _kv(a.heights, float, "heights")
+    heights = _kv(a.heights, float, "heights", math.isfinite, "a finite number of metres")
     ids = _kv(a.ids, int, "ids")
     height_source = _kv(a.height_source, str, "height-source")
-    sigma_u = _kv(a.sigma_u, float, "sigma-u")
+    sigma_u = _kv(a.sigma_u, float, "sigma-u", lambda v: math.isfinite(v) and v >= 0.0,
+                  "a finite, non-negative number of metres")
+    if bad:
+        # A nan or a negative sigma would be written into a survey the loader then refuses, and
+        # json.dump emits NaN/Infinity as non-standard tokens; refuse here, naming every bad pair.
+        print("refusing: %s" % "; ".join(bad), file=sys.stderr)
+        return 3
 
     series = {}
     for name in a.nodes:
@@ -318,9 +335,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               "observed scatter" % a.out)
         bare = [n for n in a.nodes if n not in sigma_u or n not in height_source]
         if bare:
-            print("  ^ %s carry a height with no stated source and/or no --sigma-u. The survey "
-                  "loads, and Survey.height_provenance() reports them as unmeasured."
-                  % ", ".join(bare))
+            print("  ^ %s: no --height-source was given (the survey says 'provenance NOT "
+                  "stated') and/or no --sigma-u. The survey loads, and "
+                  "Survey.height_provenance() reports them as unmeasured." % ", ".join(bare))
     return 0
 
 

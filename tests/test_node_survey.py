@@ -238,3 +238,29 @@ class TestHeightProvenanceIsWritten:
         exactly the silent outcome this whole change exists to stop."""
         rc, d = self._run(tmp_path, ["--sigma-u", "mach=0.05"], monkeypatch)
         assert rc == 3 and d is None
+
+    @pytest.mark.parametrize("extra", [
+        ["--sigma-u", "b=-0.05"],
+        ["--sigma-u", "b=nan"],
+        ["--sigma-u", "b=inf"],
+        ["--sigma-u", "b0.05"],
+    ])
+    def test_a_bad_sigma_u_is_refused_with_a_return_code_not_an_exception(
+            self, tmp_path, monkeypatch, extra):
+        """A negative or non-finite sigma would be written into a survey the loader refuses (and
+        json.dump writes NaN/Infinity as non-standard tokens); a malformed pair must come back as
+        a status code from main(), not a SystemExit out of a library call."""
+        rc, d = self._run(tmp_path, extra, monkeypatch)
+        assert rc == 3 and d is None
+
+    def test_a_non_finite_height_is_refused(self, tmp_path, monkeypatch, capsys):
+        import json
+        s1, _ = _series(1_700_000_000_000_000, 400, 30.0, (0.0, 0.0), seed=1)
+        monkeypatch.setattr(NS, "fetch", lambda n, timeout=300.0: n)
+        monkeypatch.setattr(NS, "epochs", lambda text: s1)
+        out = tmp_path / "s.json"
+        rc = NS.main(["a", "b", "c", "--out", str(out), "--heights", "a=0", "b=nan", "c=inf"])
+        assert rc == 3 and not out.exists()
+        err = capsys.readouterr().err
+        assert "b=nan" in err and "c=inf" in err, "every bad pair is named"
+
