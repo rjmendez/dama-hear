@@ -271,9 +271,16 @@ def test_every_slot_is_addressed_through_the_runtime_capacity():
 
 
 def test_the_detections_endpoint_stays_bounded():
-    """/detections builds one String; a 1024-slot ring at ~620 B a row would not fit in it."""
+    """/detections caps the number of rows even though the body is streamed."""
     b = _fn("h_dets")
     m = re.search(r"if \(n > (\w+)\) n = \1;", b)
     assert m, "h_dets is not capped by a fixed count"
     assert _val(m.group(1)) <= OLD_RING
-    assert b.index(m.group(0)) < b.index("o.reserve(")
+
+
+def test_the_detections_endpoint_streams_without_one_growing_body():
+    b = _fn("h_dets")
+    assert "CONTENT_LENGTH_UNKNOWN" in b
+    assert b.count("sendContent") >= 3
+    assert "o.reserve(" not in b
+    assert "http.send(200, \"application/json\", o)" not in b
