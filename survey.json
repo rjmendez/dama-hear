@@ -49,6 +49,39 @@
       "sigma_m": 6.5,
       "u_source": "PROVISIONAL -- not installed. e/n from the PUC's own GPS mean over 18 fixes (4-6 sats, HDOP 1.3-3.9), which scattered 6.5 m rms / 10.0 m max while stationary; u is a placeholder, NOT measured. Re-survey when sited.",
       "sigma_u_m": 5.0
+    },
+    {
+      "node_id": 5,
+      "name": "gold",
+      "class": "esp32s3-i2s-gps",
+      "e_m": -4.056,
+      "n_m": 5.058,
+      "u_m": 0.0,
+      "sigma_m": 40.0,
+      "u_source": "PROVISIONAL -- e/n from this node's own GPS mean (2-sigma fix, 3 sats, hacc_m 40.0). u set to datum floor, NOT measured. NOT CLAP-CALIBRATION GRADE: see docs/findings-clap-calibration-2026-09-14.md -- sigma_m this large (40 m) makes this position unusable as a calibration anchor; re-survey when sited/antenna improved.",
+      "sigma_u_m": 3.0
+    },
+    {
+      "node_id": 6,
+      "name": "ageev",
+      "class": "esp32s3-i2s-gps",
+      "e_m": -11.096,
+      "n_m": 9.81,
+      "u_m": 0.0,
+      "sigma_m": 16.6,
+      "u_source": "PROVISIONAL -- e/n from this node's own GPS mean (weak fix, 3 sats, hacc_m 16.6). u set to datum floor, NOT measured. NOT CLAP-CALIBRATION GRADE: see docs/findings-clap-calibration-2026-09-14.md -- clock sync_sigma_ns also far over budget on this node; re-survey and re-check clock discipline before use.",
+      "sigma_u_m": 3.0
+    },
+    {
+      "node_id": 7,
+      "name": "kasami",
+      "class": "esp32s3-i2s-gps",
+      "e_m": 22.031,
+      "n_m": -9.599,
+      "u_m": 0.0,
+      "sigma_m": 250.0,
+      "u_source": "PROVISIONAL -- e/n from this node's own GPS mean (weak fix, 2 sats, hacc_m 249.97 -- essentially unconstrained). u set to datum floor, NOT measured. NOT CLAP-CALIBRATION GRADE: see docs/findings-clap-calibration-2026-09-14.md; this position is not usable for any purpose until re-surveyed.",
+      "sigma_u_m": 3.0
     }
   ]
 }
