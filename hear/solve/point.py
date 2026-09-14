@@ -294,7 +294,7 @@ def _report(s, P, t, c, n_eq, n_unk, rms_ms, t0, at_bound, source_class,
         # says outright whether the short name matches the solve. It is True only when the
         # height was DECLARED (fixed_up_m), which is the one case where the estimate really did
         # have two unknowns.
-        "dop": PL.dop(P, s)["dop"],
+        "dop": float("inf") if not obs else PL.dop(P, s)["dop"],
         "dop_unknowns": 2,
         "dop_prices_this_fit": fixed_up_m is not None,
         # hdop/vdop reported separately because they are not interchangeable: the vertical is the
