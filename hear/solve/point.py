@@ -183,7 +183,7 @@ def _report(s, P, t, c, n_eq, n_unk, rms_ms, t0, at_bound, source_class,
         "n_nodes": len(P), "n_equations": n_eq, "n_unknowns": n_unk,
         "up_assumed_m": float(fixed_up_m) if fixed_up_m is not None else None,
         "sound_speed_mps": c,
-        "dop": PL.dop(P, s)["dop"],
+        "dop": float("inf") if not obs else PL.dop(P, s)["dop"],
         # hdop/vdop reported separately because they are not interchangeable: the vertical is the
         # weak axis of a ground-based array by construction, and a single combined figure hides
         # exactly the component this project keeps getting wrong.
