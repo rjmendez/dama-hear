@@ -49,6 +49,7 @@ def calculate_gdop_bounds(
     sigma_t_s: float = 0.001,
     temp_c: float = 20.0,
     confidence_level: float = 0.95,
+    position_sigma_m: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     """Calculate GDOP (HDOP, VDOP, PDOP) and confidence ellipse / error radius for a 2D/3D solve.
 
@@ -58,6 +59,8 @@ def calculate_gdop_bounds(
         sigma_t_s: Arrival time uncertainty in seconds (1-sigma).
         temp_c: Air temperature in Celsius for sound speed.
         confidence_level: Confidence level for error ellipse (default 0.95 -> scale ~ 2.447).
+        position_sigma_m: Per-node horizontal position uncertainty (1-sigma), folded into
+            the range uncertainty. Omit for the legacy timing-only bound.
 
     Returns:
         Dict with hdop, vdop, pdop, error_radius_m, and confidence_ellipse details.
@@ -67,6 +70,15 @@ def calculate_gdop_bounds(
     s = np.array([s_arr[0], s_arr[1], s_arr[2] if len(s_arr) > 2 else 0.0])
     c = SW.sound_speed(temp_c)
     sigma_r = c * sigma_t_s
+    if position_sigma_m is None:
+        range_sigma_m = None
+    else:
+        position_sigma_m = np.asarray(position_sigma_m, float).ravel()
+        if len(position_sigma_m) != len(P):
+            raise ValueError("position_sigma_m must contain one value per node")
+        if not np.all(np.isfinite(position_sigma_m)) or np.any(position_sigma_m < 0.0):
+            raise ValueError("position_sigma_m values must be finite and non-negative")
+        range_sigma_m = np.hypot(sigma_r, position_sigma_m)
 
     d3 = PL.dop3(P, s)
     hdop = d3.get("hdop", float("inf"))
@@ -80,7 +92,8 @@ def calculate_gdop_bounds(
             hdop = d2["dop"]
 
     # Error radius (1-sigma horizontal position error bound)
-    error_radius_m = hdop * sigma_r if math.isfinite(hdop) else 0.0
+    bound_sigma_m = sigma_r if range_sigma_m is None else float(np.max(range_sigma_m))
+    error_radius_m = hdop * bound_sigma_m if math.isfinite(hdop) else 0.0
 
     # Calculate 2D covariance matrix in ENU for confidence ellipse
     n = len(P)
@@ -93,12 +106,20 @@ def calculate_gdop_bounds(
     }
 
     if G is not None and n >= 3:
-        M = np.eye(n) - np.ones((n, n)) / float(n)
-        F = G.T @ M @ G
+        if range_sigma_m is None:
+            M = np.eye(n) - np.ones((n, n)) / float(n)
+            F = G.T @ M @ G
+            covariance_scale = sigma_r ** 2
+        else:
+            inv_r = np.diag(1.0 / (range_sigma_m ** 2))
+            one = np.ones((n, 1))
+            M = inv_r - (inv_r @ one @ one.T @ inv_r) / (one.T @ inv_r @ one).item()
+            F = G.T @ M @ G
+            covariance_scale = 1.0
         try:
             if abs(float(np.linalg.det(F))) > 1e-12:
                 Q = np.linalg.inv(F)
-                C = Q * (sigma_r ** 2)
+                C = Q * covariance_scale
                 evals, evecs = np.linalg.eigh(C)
                 idx = np.argsort(evals)[::-1]
                 evals = np.maximum(evals[idx], 1e-12)
@@ -560,7 +581,13 @@ class SpatialEventPipeline:
             sigma_t_s = max(rms_ms / 1000.0 if rms_ms is not None else 0.001, 0.0001)
 
             gdop_bounds = calculate_gdop_bounds(
-                positions, enu, sigma_t_s=sigma_t_s, temp_c=self.temp_c
+                positions, enu, sigma_t_s=sigma_t_s, temp_c=self.temp_c,
+                position_sigma_m=[
+                    self.survey.sigma_m[node_id]
+                    if self.survey.position_sources.get(node_id, "survey") == SV.POSITION_SOURCE_GPS
+                    else 0.0
+                    for node_id in node_ids
+                ],
             )
 
             # Confidence score heuristic
@@ -585,6 +612,11 @@ class SpatialEventPipeline:
                 confidence_ellipse=gdop_bounds.get("confidence_ellipse"),
                 metadata={
                     "contributing_node_ids": node_ids,
+                    "position_sources": {
+                        self.survey.names[node_id] or str(node_id):
+                        self.survey.position_sources.get(node_id, "survey")
+                        for node_id in node_ids
+                    },
                     "n_nodes": ev["n_nodes"],
                     "point_source_possible": ev.get("point_source_possible", True),
                 },

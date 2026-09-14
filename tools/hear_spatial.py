@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from typing import Dict, Tuple
 
 import numpy as np
@@ -50,6 +51,22 @@ def load_survey_from_file_or_origin(survey_path: str, site_origin_str: str | Non
             data["origin"] = {"lat_deg": parts[0], "lon_deg": parts[1], "h_ell_m": parts[2]}
 
     return SV.from_dict(data)
+
+
+def augment_survey_from_gps(survey: SV.Survey, positions_path: str, now: float | None = None
+                            ) -> tuple[SV.Survey, list[dict]]:
+    """Add usable node GPS means from hear-drain without changing surveyed nodes."""
+    try:
+        with open(positions_path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return survey, [{"name": None, "used": False,
+                         "why": "no positions file at %s" % positions_path}]
+    except (OSError, ValueError) as exc:
+        return survey, [{"name": None, "used": False,
+                         "why": "positions file %s is unreadable: %s" % (positions_path, exc)}]
+    nodes = doc.get("nodes") if isinstance(doc, dict) else None
+    return SV.augment_from_node_gps(survey, nodes, time.time() if now is None else now)
 
 
 def load_audio_clips_dir(clips_dir: str) -> Tuple[Dict[int, Tuple[np.ndarray, float]], float]:
@@ -104,6 +121,9 @@ def main() -> int:
     parser.add_argument("--dets", help="Path to dets.csv detection file")
     parser.add_argument("--survey", required=True, help="Path to survey.json file")
     parser.add_argument("--site-origin", help="Site origin as 'lat,lon,h_ell_m'")
+    parser.add_argument("--gps-positions",
+                        help="node GPS means recorded by hear-drain; add usable means for "
+                             "nodes absent from --survey")
     parser.add_argument("--clips-dir", help="Directory containing node audio WAV clips")
     parser.add_argument(
         "--mode",
@@ -140,6 +160,11 @@ def main() -> int:
 
     fixed_up = None if args.fixed_up_m == -999 else args.fixed_up_m
     survey = load_survey_from_file_or_origin(args.survey, args.site_origin)
+    if args.gps_positions:
+        survey, gps_report = augment_survey_from_gps(survey, args.gps_positions)
+        for row in gps_report:
+            if not row["used"]:
+                sys.stderr.write("GPS position fallback not used: %s\n" % row["why"])
 
     pipeline = SpatialEventPipeline(
         survey=survey,
