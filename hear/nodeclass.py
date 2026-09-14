@@ -802,8 +802,9 @@ register(NodeClass(
     #     (sigma 5.96) and 183.33 ms (sigma 5.68) on two boards. hugbot's
     #     perception/capture_latency.conf carries their midpoint, 0.1784917 s +/- 11.3 ms
     #     (tools/hugbot_latency.py:16-18). 178.5 ms is 61.2 m of range. A constant latency is a bias
-    #     you subtract, not one a weight absorbs, so on its own it would not refuse the class; the lag
-    #     below is what does.
+    #     you subtract, not one a weight absorbs; but UNTIL it is actually subtracted from emitted
+    #     timestamps, that uncorrected bias itself refuses the class. The lag below shows the current
+    #     ring-to-UTC path is not even a stable constant.
     #   * ring-to-UTC lag, from correlating the esp_tap stream against the audio ring, 150 trials,
     #     2026-09-10 (tools/hugbot_latency.py, testdata/hugbot_latency_trials.json, commit 26a585b):
     #     board 1CDBD49B93F8 aligned in 120/150 trials with lag p05 34.6 / p50 81.8 / p95 244.7 ms;
