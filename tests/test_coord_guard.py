@@ -6,6 +6,7 @@ carries none and the guard passes over it.
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -245,6 +246,31 @@ class TestScanModes:
         with pytest.raises(SystemExit) as ei:
             run(capsys, repo, "tree")
         assert_not_printed(str(ei.value) + capsys.readouterr().out, LAT0, LON0)
+
+    @pytest.mark.parametrize("name", [
+        "a\n::warning::injected.txt", "b\r\n::error::injected.txt", "c%0A::error::x.txt",
+        "d,line=1::x.txt", "e::f,g:h.txt", "%25%3A.txt"])
+    def test_a_hostile_filename_cannot_add_a_workflow_command(self, repo, capsys, name):
+        base = _git(repo, "rev-parse", "HEAD")
+        la, lo = far_pair()
+        _commit(repo, name, "%s, %s\n" % (fmt(la), fmt(lo)), "hostile")
+        for args in (["tree"], ["range", base, "HEAD"], ["range", "", "HEAD"]):
+            rc, out = run(capsys, repo, *args)
+            assert rc == 1
+            rows = out.split("\n")
+            commands = [r for r in rows if r.startswith("::") or "\r" in r]
+            assert len(commands) == 1, rows
+            prop, _, message = commands[0][len("::error "):].partition("::")
+            assert commands[0].startswith("::error file=")
+            assert re.fullmatch(r"file=[^:,\r\n]*,line=1", prop), prop
+            assert CG.escape_property(name) in prop
+            assert "\r" not in message and CG.escape_data(name) in message
+            assert all(r.startswith("coord_guard: ") for r in rows[1:] if r)
+            assert_not_printed(out, la, lo)
+
+    def test_escaping_matches_the_workflow_command_rules(self):
+        assert CG.escape_data("%\r\n:,") == "%25%0D%0A:,"
+        assert CG.escape_property("%\r\n:,") == "%25%0D%0A%3A%2C"
 
     def test_an_empty_range_passes(self, repo, capsys):
         rc, out = run(capsys, repo, "range", "HEAD", "HEAD")

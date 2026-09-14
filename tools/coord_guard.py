@@ -66,6 +66,14 @@ class Finding:
     digest: str
 
 
+def escape_data(s):
+    return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def escape_property(s):
+    return escape_data(s).replace(":", "%3A").replace(",", "%2C")
+
+
 def pair_digest(*values):
     return hashlib.sha256(",".join("%.4f" % v for v in values).encode()).hexdigest()[:16]
 
@@ -288,8 +296,10 @@ def main(argv=None):
     for commit, f in results:
         at = "commit %s " % commit[:12] if commit else ""
         tail = " digest %s" % f.digest if args.show_digests else ""
-        print("::error file=%s,line=%d::%s%s:%d: %s more than %g km from the fictional origin%s"
-              % (f.path, f.line, at, f.path, f.line, f.kind, guard.radius_km, tail))
+        print("::error file=%s,line=%d::%s"
+              % (escape_property(f.path), f.line, escape_data(
+                  "%s%s:%d: %s more than %g km from the fictional origin%s"
+                  % (at, f.path, f.line, f.kind, guard.radius_km, tail))))
     print("coord_guard: %s: %d text blobs, %d finding(s)" % (what, nblobs, len(results)))
     if results:
         print("coord_guard: real-world coordinates must not enter this public repo. Build test "
