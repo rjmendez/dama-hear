@@ -767,7 +767,9 @@ register(NodeClass(
     #   * capture latency, from a same-clock self-loopback bench on the robot, 2026-09-04: 173.77 ms
     #     (sigma 5.96) and 183.33 ms (sigma 5.68) on two boards. hugbot's
     #     perception/capture_latency.conf carries their midpoint, 0.1784917 s +/- 11.3 ms
-    #     (tools/hugbot_latency.py:16-18). 178.5 ms is 61.2 m of range: a bias no weight removes.
+    #     (tools/hugbot_latency.py:16-18). 178.5 ms is 61.2 m of range. A constant latency is a bias
+    #     you subtract, not one a weight absorbs, so on its own it would not refuse the class; the lag
+    #     below is what does.
     #   * ring-to-UTC lag, from correlating the esp_tap stream against the audio ring, 150 trials,
     #     2026-09-10 (tools/hugbot_latency.py, testdata/hugbot_latency_trials.json, commit 26a585b):
     #     board 1CDBD49B93F8 aligned in 120/150 trials with lag p05 34.6 / p50 81.8 / p95 244.7 ms;
@@ -793,9 +795,10 @@ register(NodeClass(
     path_bias_s=0.1784917,
     mic_count=6,  # three boards x two wired ES7210 channels
     fs_hz=48000.0,
-    # The upper edge is Nyquist at 48 kHz, NOT a measured microphone response: the microphone part is not
-    # identified in the Waveshare board's schematic, and the BOX-3's was not checked. The lower edge is not measured either.
-    # Bearings are separately capped at 4501 Hz by the 38.1 mm pair spacing.
+    # Neither edge is a measured microphone response: the microphone part is not identified in the
+    # Waveshare board's schematic, and the BOX-3's was not checked. The upper edge is set equal to
+    # Nyquist, so usable_band_hz() reports its ceiling as "microphone"; that label is not evidence of a
+    # measured part. Bearings are separately capped at 4501 Hz by the 38.1 mm pair spacing.
     band_hz=(50.0, 24000.0),
     env=("temp",),
     raw_retain_s=0.0,  # hugbot's own audio ring is served by hugbot5000, not retained by this pipeline
