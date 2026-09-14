@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 641633 B serialised; 641811 B of annotations against a 262144 B cap.
+# apply-mode server: 641796 B serialised; 641974 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '1d6f9e7'
+    dama-hear/commit: '1ace619'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '641633'
+    dama-hear/serialised-bytes: '641796'
 data:
   hear__init__.py: |
     
@@ -3344,55 +3344,57 @@ data:
     register(NodeClass(
         name="hugbot-array",
         time_source="ntp",
-        # ⚠️HUGBOT IS NOT AN ARRIVAL SOURCE. measured live 2026-09-10 over the acoustic latency
-        # calibration rig (tools/hugbot_latency.py, testdata/hugbot_latency_trials.json):
-        # A Raspberry Pi 4 running the dama-gotchi orchestrator stack, with a 16-channel TDM I2S
-        # microphone array (ICS-52000 MEMS mics) on GPIO20/21 I2S at 48 kHz. The measurement caught
-        # one aligned channel (board 0, column 3) across 20 trials where both the hugbot and a
-        # co-located xiao-s3-pps ESP32 node played and recorded the same Chirp impulse. The latency
-        # between the ESP tap and the hugbot ring was 178.5 ms ± 11.3 ms. This is not a CLOCK issue --
-        # the Pi running chrony is near a PPS/GPS source on the mast and would pass the t_sigma gate
-        # if it had one. The latency is the AUDIO PATH: Bluetooth-connected USB audio card, ALSA ring
-        # buffer, DMA block boundaries, and the Android emulator + dama-gotchi stack. 178.5 ms is
-        # 61.2 m of pure bias; the arrival budget allows 91.5 us (31.4 mm). Hugbot is refused by a
-        # factor of nearly 2000x.
+        # ⚠️HUGBOT IS NOT AN ARRIVAL SOURCE.
         #
-        # That is conservative and it is the honest number: the Pi's local time is Stratum 3 at best,
-        # worse than the ntp-NTP figure below. But the real problem is the audio path, which will never
-        # align in a TDoA no matter how good the clock is.
+        # THE HARDWARE. hugbot5000's Raspberry Pi 5 carries three ESP32-S3 audio boards on USB as UAC
+        # devices at 48 kHz: two Waveshare ESP32-S3-AUDIO-Boards (left and right, GNSS PPS wired to
+        # GPIO 4) and one Espressif ESP32-S3-BOX-3 (rear, PPS not wired). Each board's ES7210 has two
+        # of its four channels wired to microphones 38.1 mm apart, so the array is six microphones in
+        # three pairs (hugbot5000 firmware/esp32s3-audioboard-uac/main/board_pins.h). The 16x ICS-52000
+        # TDM array is a separate build document in hugbot5000 (docs/MIC_ARRAY_3D.md), not this array.
         #
-        # ⚠️BUT HUGBOT IS AN EXCELLENT SENSOR NODE. A 16-mic array beats any single-mic node on
-        # classification, direction finding, and bearing. The firmware reads the ring and ships snapshots
-        # to a pool, dama-gotchi processes them into tags, and those tags and raw audio are how hugbot
-        # contributes. It is excluded from arrivals; it is not excluded from the pool.
-        t_sigma_s=3e-3,  # Stratum 3 NTP / system time
+        # WHY IT IS REFUSED. Two measurements, both on the USB capture path, not on the clock:
+        #   * capture latency, from a same-clock self-loopback bench on the robot, 2026-09-04: 173.77 ms
+        #     (sigma 5.96) and 183.33 ms (sigma 5.68) on two boards. hugbot's
+        #     perception/capture_latency.conf carries their midpoint, 0.1784917 s +/- 11.3 ms
+        #     (tools/hugbot_latency.py:16-18). 178.5 ms is 61.2 m of range: a bias no weight removes.
+        #   * ring-to-UTC lag, from correlating the esp_tap stream against the audio ring, 150 trials,
+        #     2026-09-10 (tools/hugbot_latency.py, testdata/hugbot_latency_trials.json, commit 26a585b):
+        #     board 1CDBD49B93F8 aligned in 120/150 trials with lag p05 34.6 / p50 81.8 / p95 244.7 ms;
+        #     the other two boards aligned in 6/150 and 7/150 and were refused. A lag that spreads by
+        #     ~200 ms is not a constant that subtracts, and at the time the ring's t_anchor_ns was 0, so
+        #     no ring frame could be dated at all.
+        # Either alone is orders of magnitude outside the arrival bias budget (91.5 us, 31.4 mm).
+        #
+        # The boards themselves latch their ADC sample counter on each PPS edge and measure their rate
+        # against GPS (hugbot5000 firmware pps_clock), so a timing path that dates samples on the board
+        # rather than at USB delivery is not ruled out. Until one is measured, this class stays refused.
+        #
+        # ⚠️BUT HUGBOT IS A USEFUL SENSOR NODE. Three co-located microphone pairs give detection,
+        # classification and per-pair bearings (capped at 4501 Hz by the 38.1 mm spacing), and hugbot
+        # publishes the fleet's 172 B sketch (hugbot5000 perception/hear_sketch.py). It is excluded from
+        # arrivals; it is not excluded from the pool.
+        t_sigma_s=3e-3,  # system time disciplined by chrony; no per-sample capture timestamp is measured
         # The entire budget is clock and no capture term has been measured to split it.
         clock_sigma_s=3e-3,
-        # THE DISQUALIFYING TERM: hugbot's AUDIO PATH LATENCY. Measured and unmeasured variants both
-        # refuse it: the best-aligned board carried 178.5 ms = 61.2 m of bias, 670x over the 91.5 us
-        # (31.4 mm) bound. Even if that channel's per-trial scatter (11.3 ms = 3.88 m) is called a
-        # capture sigma, it is still a bias that does not average. The second board had no alignment at
-        # all (rho < 0.9), so the spread across boards exceeded the array's ability to explain it.
-        # A hugbot array measuring itself against itself might bridge that gap; against an ESP32 node
-        # it does not.
+        # THE DISQUALIFYING TERM: the measured USB capture latency above. Even if its 11.3 ms spread were
+        # treated as a capture sigma, the 178.5 ms itself is a bias that does not average, and the
+        # ring-to-UTC lag varies too much across trials and boards to be subtracted.
         path_bias_s=0.1784917,
-        mic_count=16,
+        mic_count=6,  # three boards x two wired ES7210 channels
         fs_hz=48000.0,
-        # Nyquist at 48 kHz is 24 kHz; the ICS-52000 datasheet (docs/node-hardware.md, HUGBOT5000 section)
-        # and the 3D mic array spec (docs/MIC_ARRAY_3D.md) do not state a lower edge. Empirically it is
-        # around 50 Hz. The datasheet says "low-passed above 24 kHz, NO ultrasonic content at any
-        # sample rate" which matches xiao-s3-i2s.
+        # The upper edge is Nyquist at 48 kHz, NOT a measured microphone response: the microphone part is not
+        # identified in the Waveshare board's schematic, and the BOX-3's was not checked. The lower edge is not measured either.
+        # Bearings are separately capped at 4501 Hz by the 38.1 mm pair spacing.
         band_hz=(50.0, 24000.0),
-        env=("temp",),  # Pi ambient temp only; no HAL-anchored sensor suite
-        raw_retain_s=0.0,  # Audio is served on-demand by dama-gotchi, not retained locally
-        notes="Raspberry Pi 4 running dama-gotchi with 16-channel TDM I2S microphone array "
-              "(ICS-52000 MEMS mics). EXCELLENT platform for classification and bearing: 16 mics "
-              "for 3D DoA, low noise floor, 8+ s ring in dama-gotchi's memory for calibration and "
-              "training. Refused for arrivals on ONE count only: the 178.5 ms uncorrected audio-path "
-              "latency measured live 2026-09-10 against a co-located xiao-s3-pps, 61.2 m of pure bias "
-              "that no weight removes (1951x over the 31.4 mm arrival bias budget). The clock (Stratum "
-              "3 NTP at best) would ALSO refuse it by 87x on random sigma, but the audio path is the "
-              "load-bearing refusal.",
+        env=("temp",),
+        raw_retain_s=0.0,  # hugbot's own audio ring is served by hugbot5000, not retained by this pipeline
+        notes="hugbot5000: Raspberry Pi 5 with two Waveshare ESP32-S3-AUDIO-Boards and one "
+              "ESP32-S3-BOX-3 over USB, six microphones in three 38.1 mm pairs at 48 kHz. Useful for "
+              "detection, classification and per-pair bearings. Refused for arrivals: the USB capture "
+              "path carries a measured 178.5 ms latency (61.2 m of bias, self-loopback bench "
+              "2026-09-04) and a ring-to-UTC lag spread of p05 34.6 to p95 244.7 ms across 150 trials "
+              "(2026-09-10).",
     ))
     
     
