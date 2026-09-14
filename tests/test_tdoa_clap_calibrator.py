@@ -114,6 +114,52 @@ def test_noisy_solve_recovers_biases_within_covariance_error_bars():
         assert abs(result.bias_s(node_id) - truth) < 5.0 * sigma
 
 
+def test_sparse_reference_coverage_inflates_sigma_instead_of_hiding_it():
+    nodes = {
+        "nyquist": (0.00, 0.00, 0.00),
+        "mach": (0.62, 0.00, 0.05),
+        "rankine": (0.00, 0.58, -0.03),
+        "gold": (0.55, 0.52, 0.40),
+        "ageev": (-0.41, 0.28, 0.22),
+        "kasami": (0.20, -0.36, 0.18),
+    }
+    biases = {"gold": 180e-6, "ageev": -95e-6, "kasami": 40e-6}
+    refs = ("nyquist", "mach", "rankine")
+    claps = [(x, y, 0.10) for x, y, _ in CLAPS]
+    full = ClapCalibrator(nodes, reference_nodes=refs, clap_plane_z_m=0.10, max_clap_radius_m=1.0)
+    rendered = full.simulate_claps(
+        claps,
+        emission_times_s=EMISSIONS,
+        capture_biases_s=biases,
+        timing_noise_s=5e-6,
+        seed=2,
+        ingest=False,
+    )
+    full.ingest(rendered)
+    full_result = full.solve()
+
+    sparse = ClapCalibrator(nodes, reference_nodes=refs, clap_plane_z_m=0.10, max_clap_radius_m=1.0)
+    keep_ref = {
+        "clap-0": "nyquist",
+        "clap-1": "nyquist",
+        "clap-2": "mach",
+        "clap-3": "rankine",
+        "clap-4": "nyquist",
+        "clap-5": "nyquist",
+    }
+    sparse.ingest(
+        observation
+        for observation in rendered
+        if observation.node_id in biases or keep_ref.get(observation.clap_id) == observation.node_id
+    )
+    sparse_result = sparse.solve()
+
+    assert sparse_result.converged
+    for node_id, truth in biases.items():
+        assert abs(sparse_result.bias_s(node_id) - truth) < 5.0 * sparse_result.sigma_b_s(node_id)
+        assert sparse_result.sigma_b_s(node_id) > full_result.sigma_b_s(node_id)
+
+
 def test_covariance_is_square_symmetric_psd_and_named():
     result = _loaded(noise_s=5e-6).solve()
     cov = result.covariance
