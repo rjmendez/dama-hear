@@ -191,12 +191,16 @@ def read_origin(repo, rev):
     try:
         origin = json.loads(git("show", "%s:survey.json" % rev, repo=repo))["origin"]
         if origin.get("fictional") is not True:
-            raise ValueError("origin is not marked fictional")
-        lat, lon = float(origin["lat_deg"]), float(origin["lon_deg"])
-        if not (abs(lat) <= 90.0 and abs(lon) <= 180.0):
-            raise ValueError("origin is out of range")
+            raise SystemExit("coord_guard: survey.json at %s: origin is not marked fictional" % rev)
+        try:
+            lat, lon = float(origin["lat_deg"]), float(origin["lon_deg"])
+        except ValueError:
+            lat = lon = None
+        if lat is None or not (abs(lat) <= 90.0 and abs(lon) <= 180.0):
+            raise SystemExit("coord_guard: survey.json at %s: origin is not a valid lat/lon" % rev)
     except ValueError as e:
-        raise SystemExit("coord_guard: survey.json at %s: %s" % (rev, e))
+        raise SystemExit("coord_guard: cannot read survey.json origin at %s (%s)"
+                         % (rev, type(e).__name__))
     except (subprocess.CalledProcessError, KeyError, TypeError, AttributeError) as e:
         raise SystemExit("coord_guard: cannot read survey.json origin at %s (%s)"
                          % (rev, type(e).__name__))

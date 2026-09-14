@@ -247,6 +247,16 @@ class TestScanModes:
             run(capsys, repo, "tree")
         assert_not_printed(str(ei.value) + capsys.readouterr().out, LAT0, LON0)
 
+    @pytest.mark.parametrize("key", ["lat_deg", "lon_deg"])
+    def test_a_malformed_origin_value_is_refused_without_echoing_it(self, repo, capsys, key):
+        survey = json.loads((repo / "survey.json").read_text())
+        la, lo = far_pair()
+        survey["origin"][key] = "%s, %s x" % (fmt(la), fmt(lo))
+        _commit(repo, "survey.json", json.dumps(survey), "malformed origin")
+        with pytest.raises(SystemExit) as ei:
+            run(capsys, repo, "tree")
+        assert_not_printed(str(ei.value) + capsys.readouterr().out, la, lo)
+
     @pytest.mark.parametrize("name", [
         "a\n::warning::injected.txt", "b\r\n::error::injected.txt", "c%0A::error::x.txt",
         "d,line=1::x.txt", "e::f,g:h.txt", "%25%3A.txt"])
