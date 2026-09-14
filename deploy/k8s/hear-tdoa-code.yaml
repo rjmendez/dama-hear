@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 646832 B serialised; 647010 B of annotations against a 262144 B cap.
+# apply-mode server: 647059 B serialised; 647237 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '15f2665'
+    dama-hear/commit: '59a534c'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '646832'
+    dama-hear/serialised-bytes: '647059'
 data:
   hear__init__.py: |
     
@@ -3357,7 +3357,9 @@ data:
         #   * capture latency, from a same-clock self-loopback bench on the robot, 2026-09-04: 173.77 ms
         #     (sigma 5.96) and 183.33 ms (sigma 5.68) on two boards. hugbot's
         #     perception/capture_latency.conf carries their midpoint, 0.1784917 s +/- 11.3 ms
-        #     (tools/hugbot_latency.py:16-18). 178.5 ms is 61.2 m of range: a bias no weight removes.
+        #     (tools/hugbot_latency.py:16-18). 178.5 ms is 61.2 m of range. A constant latency is a bias
+        #     you subtract, not one a weight absorbs, so on its own it would not refuse the class; the lag
+        #     below is what does.
         #   * ring-to-UTC lag, from correlating the esp_tap stream against the audio ring, 150 trials,
         #     2026-09-10 (tools/hugbot_latency.py, testdata/hugbot_latency_trials.json, commit 26a585b):
         #     board 1CDBD49B93F8 aligned in 120/150 trials with lag p05 34.6 / p50 81.8 / p95 244.7 ms;
@@ -3383,9 +3385,10 @@ data:
         path_bias_s=0.1784917,
         mic_count=6,  # three boards x two wired ES7210 channels
         fs_hz=48000.0,
-        # The upper edge is Nyquist at 48 kHz, NOT a measured microphone response: the microphone part is not
-        # identified in the Waveshare board's schematic, and the BOX-3's was not checked. The lower edge is not measured either.
-        # Bearings are separately capped at 4501 Hz by the 38.1 mm pair spacing.
+        # Neither edge is a measured microphone response: the microphone part is not identified in the
+        # Waveshare board's schematic, and the BOX-3's was not checked. The upper edge is set equal to
+        # Nyquist, so usable_band_hz() reports its ceiling as "microphone"; that label is not evidence of a
+        # measured part. Bearings are separately capped at 4501 Hz by the 38.1 mm pair spacing.
         band_hz=(50.0, 24000.0),
         env=("temp",),
         raw_retain_s=0.0,  # hugbot's own audio ring is served by hugbot5000, not retained by this pipeline
