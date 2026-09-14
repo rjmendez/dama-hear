@@ -179,3 +179,62 @@ class TestReprIsTotal:
         from hear.backend import survey as SV
         s = SV.Survey({1: (0.0, 0.0, 0.0), 2: (-16.6, -0.3, 3.0), 3: (4.0, 12.0, 0.0)})
         assert "n/a" not in repr(s)
+
+
+class TestHeightProvenanceIsWritten:
+    """Re-running the tool must not launder a guess into a measurement.
+
+    survey.json carried mach at a nominal 3.0 m, and the only record of that was a `u_source`
+    sentence hand-edited into the file. The tool wrote six keys and none of them was that one, so
+    the next run would have overwritten the admission and left the number reading as surveyed. On
+    the measured 16.6 m pair, 1 m of height error is 206 mm of 3D baseline -- 41x what the fleet's
+    14.5 us clock sync is worth -- so this is a physical term, not bookkeeping.
+    """
+
+    def _run(self, tmp_path, extra, monkeypatch):
+        import json
+        s1, o = _series(1_700_000_000_000_000, 400, 30.0, (0.0, 0.0), seed=1)
+        s2, _ = _series(1_700_000_000_000_000, 400, 30.0, (-16.6, -0.3), seed=2)
+        s3, _ = _series(1_700_000_000_000_000, 400, 30.0, (4.0, 12.0), seed=3)
+        by = {"a": s1, "b": s2, "c": s3}
+        monkeypatch.setattr(NS, "fetch", lambda n, timeout=300.0: n)
+        monkeypatch.setattr(NS, "epochs", lambda text: by[text])
+        out = tmp_path / "s.json"
+        rc = NS.main(["a", "b", "c", "--out", str(out),
+                      "--heights", "a=0", "b=3.1", "c=0"] + extra)
+        return rc, (json.loads(out.read_text()) if out.exists() else None)
+
+    def test_a_stated_source_and_sigma_reach_the_file_and_the_loader(self, tmp_path, monkeypatch):
+        from hear.backend import survey as SV
+        rc, d = self._run(tmp_path, [
+            "--height-source", "a=datum", "b=tape from the sill", "c=datum",
+            "--sigma-u", "a=0.0", "b=0.05", "c=0.0"], monkeypatch)
+        assert rc == 0
+        b = [n for n in d["nodes"] if n["name"] == "b"][0]
+        assert b["u_source"] == "tape from the sill" and b["sigma_u_m"] == 0.05
+        sv = SV.from_dict(d)
+        assert sv.height_provenance()["unmeasured"] == []
+
+    def test_an_unqualified_height_says_so_in_the_file_rather_than_looking_surveyed(
+            self, tmp_path, monkeypatch):
+        from hear.backend import survey as SV
+        rc, d = self._run(tmp_path, [], monkeypatch)
+        assert rc == 0
+        b = [n for n in d["nodes"] if n["name"] == "b"][0]
+        assert "NOT stated" in b["u_source"], b
+        assert "sigma_u_m" not in b, "an unstated vertical sigma must not be written as 0.0"
+        assert SV.from_dict(d).height_provenance()["unmeasured"] == [1, 2, 3]
+
+    def test_the_horizontal_sigma_is_never_copied_into_the_vertical_one(
+            self, tmp_path, monkeypatch):
+        rc, d = self._run(tmp_path, ["--sigma-u", "b=0.05"], monkeypatch)
+        assert rc == 0
+        b = [n for n in d["nodes"] if n["name"] == "b"][0]
+        assert b["sigma_u_m"] == 0.05 and b["sigma_m"] != 0.05
+
+    def test_a_provenance_naming_a_node_not_being_surveyed_is_refused(
+            self, tmp_path, monkeypatch):
+        """A typo attaches the sentence to nothing and leaves the real node unlabelled, which is
+        exactly the silent outcome this whole change exists to stop."""
+        rc, d = self._run(tmp_path, ["--sigma-u", "mach=0.05"], monkeypatch)
+        assert rc == 3 and d is None

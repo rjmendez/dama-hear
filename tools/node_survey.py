@@ -35,6 +35,17 @@ The horizontal IS usable, at roughly +/-2 m, which is +/-6 ms of TDoA. Good enou
 on a site plan, not good enough to be the last word -- if you can measure the horizontal by hand
 too, do that instead and use this only to check it.
 
+⚠️SAY WHERE THE HEIGHT CAME FROM, NOT JUST WHAT IT IS. `--heights` is a bare number and a bare
+number cannot be audited: survey.json carried mach at 3.0 m for weeks with only a hand-edited
+sentence recording that it was a nominal storey, which this tool overwrote on its next run.
+`--height-source` and `--sigma-u` write that sentence and its metres INTO the survey, where
+`hear.backend.survey.Survey.height_provenance()` reports them.
+
+    python3 tools/node_survey.py nyquist mach --out survey.json \
+        --heights nyquist=0 mach=3.1 \
+        --height-source nyquist='datum' mach='tape from nyquist sill to mach sill' \
+        --sigma-u nyquist=0.0 mach=0.05
+
 RE-MEASURED 2026-09-08 over 22.3 h (health.csv off both cards, 2661 and 2647 rows, 8 reboots
 apiece). It confirms everything above and settles three questions that were being asked of the
 wrong number:
@@ -208,16 +219,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "Required to write a survey: GNSS height is refused.")
     ap.add_argument("--ids", nargs="*", default=[], metavar="NAME=ID",
                     help="node_id per node; defaults to 1..N in the order given")
+    ap.add_argument("--height-source", nargs="*", default=[], metavar="NAME=TEXT",
+                    help="how that node's --heights value was obtained, e.g. "
+                         "'tape from the sill' or 'RTK, 2 min static'. Free text.")
+    ap.add_argument("--sigma-u", nargs="*", default=[], metavar="NAME=METRES",
+                    help="1-sigma on that node's height, metres. OMITTED IS NOT ZERO: a node "
+                         "with no --sigma-u is reported as unmeasured by "
+                         "Survey.height_provenance().")
     a = ap.parse_args(argv)
 
-    heights = {}
-    for kv in a.heights:
-        k, _, v = kv.partition("=")
-        heights[k] = float(v)
-    ids = {}
-    for kv in a.ids:
-        k, _, v = kv.partition("=")
-        ids[k] = int(v)
+    def _kv(pairs, cast, what):
+        out = {}
+        for kv in pairs:
+            k, sep, v = kv.partition("=")
+            if not sep or not k:
+                raise SystemExit("--%s wants NAME=VALUE, got %r" % (what, kv))
+            out[k] = cast(v)
+        return out
+
+    heights = _kv(a.heights, float, "heights")
+    ids = _kv(a.ids, int, "ids")
+    height_source = _kv(a.height_source, str, "height-source")
+    sigma_u = _kv(a.sigma_u, float, "sigma-u")
 
     series = {}
     for name in a.nodes:
@@ -264,13 +287,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   "is worse than no survey, because nothing downstream can tell."
                   % (a.out, ", ".join(missing)), file=sys.stderr)
             return 3
+        stray = (set(height_source) | set(sigma_u)) - set(a.nodes)
+        if stray:
+            print("\nrefusing to write %s: --height-source/--sigma-u name %s, which is not "
+                  "being surveyed. A typo here attaches a provenance to nothing and leaves the "
+                  "real node unlabelled." % (a.out, ", ".join(sorted(stray))), file=sys.stderr)
+            return 3
         nodes = []
         for i, name in enumerate(a.nodes, 1):
             s = S[name]
-            nodes.append({"node_id": ids.get(name, i), "name": name,
-                          "e_m": round(s["e_m"], 3), "n_m": round(s["n_m"], 3),
-                          "u_m": heights[name],
-                          "sigma_m": round(s["horiz_sigma_m"], 3)})
+            # sigma_m is the east/north scatter only; it is never reused as the vertical sigma.
+            entry = {"node_id": ids.get(name, i), "name": name,
+                     "e_m": round(s["e_m"], 3), "n_m": round(s["n_m"], 3),
+                     "u_m": heights[name],
+                     "sigma_m": round(s["horiz_sigma_m"], 3),
+                     "u_source": height_source.get(
+                         name, "--heights argument; provenance NOT stated")}
+            if name in sigma_u:
+                entry["sigma_u_m"] = sigma_u[name]
+            nodes.append(entry)
         doc = {"frame": _FRAME, "units": _UNITS,
                "origin": {"lat_deg": origin[0], "lon_deg": origin[1], "h_ell_m": 0.0,
                           "source": "median of %s; height datum is the --heights argument, "
@@ -281,6 +316,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f.write("\n")
         print("\nwrote %s -- horizontal from GNSS medians, heights from --heights, sigma from "
               "observed scatter" % a.out)
+        bare = [n for n in a.nodes if n not in sigma_u or n not in height_source]
+        if bare:
+            print("  ^ %s carry a height with no stated source and/or no --sigma-u. The survey "
+                  "loads, and Survey.height_provenance() reports them as unmeasured."
+                  % ", ".join(bare))
     return 0
 
 
