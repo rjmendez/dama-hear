@@ -172,3 +172,102 @@ UBX PVT-qualified solution, so the PPS anchor never refreshes.
    `--survey`, reference-node-consensus clap association) to get a real mic-bias calibration.
 3. `survey.json`'s permanent (far-field) positions for these three nodes are unaffected by this
    correction and remain correctly disclaimed as provisional/not-calibration-grade.
+
+## Is this data recoverable, or do we need another test?
+
+I re-ran the corrected calibration inputs in `docs/data/clap-calibration-2026-09-14/` and got the
+same basic result as above: the solve converges, the recovered mean biases agree with the direct
+per-node offsets, and the remaining error floor is still far above the 30 µs admissibility gate.
+That points away from a solver bug and toward the timestamps themselves being too noisy for a
+usable mic-path-bias calibration.
+
+### What the 18 ms residual is, and is not
+
+- The reproduced all-clap solve stays at `residual_rms_s = 17.95 ms`.
+- Sample-rate quantisation is much smaller than that:
+  - 16 kHz: 62.5 µs per sample
+  - 48 kHz: 20.8 µs per sample
+  Even at the slower rate, one sample is about **290x smaller** than the 18 ms residual, so
+  sample quantisation is not the dominant term here.
+- The recovered mean biases still line up with the direct offsets (`gold` about -443 ms,
+  `kasami` about +363 ms, `ageev` about +1307 ms), so there is no evidence that a sign error or
+  offset-bookkeeping bug is what is leaving 18 ms behind.
+
+The strongest evidence that the residual is real measurement noise, not a recoverable logic bug,
+comes from the **reference nodes themselves**. In the co-located survey used for this run, the
+largest clean-reference baseline is `mach`↔`rankine` at 0.583 m, so the largest physically
+possible true acoustic arrival difference between those two nodes is only 1.70 ms
+(`0.583 / 343`). But the measured spreads among the clean-clock reference detections were:
+
+| clap_id | ref nodes present | measured spread | physical bound from this geometry |
+|---|---:|---:|---:|
+| clap2 | 3 | 52.7 ms | ≤ 1.70 ms |
+| clap3 | 3 | 4.68 ms | ≤ 1.70 ms |
+| clap4 | 3 | 4.68 ms | ≤ 1.70 ms |
+| clap5 | 2 (`mach`,`nyquist`) | 2.89 ms | ≤ 0.92 ms |
+| clap6 | 2 (`mach`,`nyquist`) | 4.63 ms | ≤ 0.92 ms |
+| clap7 | 3 | 99.7 ms | ≤ 1.70 ms |
+
+So even before asking the broken-clock nodes to agree, the clap picks already violate the
+array's own geometry by factors of about **3x to 59x**. That is exactly what you'd expect from a
+hand clap in a reflective room with onset-picking jitter / chatter, and not what you'd expect
+from a solvable constant-bias problem. The repo's earlier onset work also measured millisecond-ish
+scatter (`docs/findings-2026-09-06.md` cites "onset scatter near 2 ms"), which is the same order
+as the quieter claps here and still about **70x** over the 30 µs target.
+
+### What happens if the two noisy clap clusters are removed?
+
+The two "chatter"/reverb-heavy clusters are `clap2` and `clap7`: they are the only two confirmed
+claps whose clean-reference spreads are 52.7 ms and 99.7 ms respectively.
+
+Removing those two claps helps the residual, but **does not salvage the calibration**:
+
+| arrivals used | solver residual RMS | `sigma_b_s` gold | `sigma_b_s` kasami | `sigma_b_s` ageev |
+|---|---:|---:|---:|---:|
+| all 6 claps | 17.95 ms | 105 ms | 106 ms | 81.8 ms |
+| drop `clap2`,`clap7` | 10.20 ms | 4204 ms | 8738 ms | 5669 ms |
+
+Interpretation:
+
+- Yes, `clap2`/`clap7` are genuinely bad and do contribute to the 18 ms residual.
+- No, they are **not** the only problem: even after dropping them, the residual floor is still
+  10.2 ms, i.e. still about **340x** over the 30 µs gate.
+- The solver covariance actually gets much worse after removing them, because only 4 claps remain
+  and the near-co-located geometry is already weakly informative. So "just filter the two worst
+  claps" does not produce an admissible calibration.
+
+This is also visible in the direct-offset statistics. Using the corrected doc's own per-node
+offset spreads:
+
+| node | observed offset stdev | n claps | rough standard error `stdev/sqrt(n)` | vs 30 µs gate |
+|---|---:|---:|---:|---:|
+| gold | 23.6 ms | 8 | 8.34 ms | 278x over |
+| kasami | 13.3 ms | 8 | 4.70 ms | 157x over |
+| ageev | 2.7 ms | 5 | 1.21 ms | 40x over |
+
+Even the **best-case node** (`ageev`) is still about **1.2 ms**, not 30 µs. If this same noise
+process stayed stationary and unbiased, the number of independent claps needed to average down to
+30 µs would be on the order of:
+
+- `ageev`: about 8.1e3 claps
+- `kasami`: about 2.0e5 claps
+- `gold`: about 6.2e5 claps
+
+That is not a realistic "just collect a few more repetitions" gap. The per-clap noise floor
+itself has to come down.
+
+### Verdict
+
+**Not recoverable from this recorded dataset. A new, better-controlled test is required.**
+
+What this dataset can still tell us reliably is the coarse, stable clock-offset story: each bad
+GNSS node is free-running with a roughly constant offset of hundreds of milliseconds to seconds.
+What it cannot support is a **sub-30-µs mic capture-path-bias calibration**, because the floor is
+set by millisecond-scale onset/reverb/geometry uncertainty that is already visible on the
+clean-clock references. That floor is 2-3 orders of magnitude above the admissibility bar, so no
+plausible re-filtering of these six claps will turn it into a production-grade bias number.
+
+The next test should therefore focus on lowering the **per-clap noise floor**, not merely adding
+more claps of the same kind: fix GNSS PVT on the ESP32 nodes first, use a controlled impulse
+source or speaker rather than a hand clap, measure the co-located geometry more precisely, and
+prefer the highest practical sample rate / cleanest onset extraction available.
