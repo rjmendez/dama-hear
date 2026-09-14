@@ -90,8 +90,8 @@ def _decode_percent(text):
 
 
 def _normalize(text):
-    """Decode separator percent-escapes, then ASCII-fold dash look-alikes. Newlines are never
-    touched, so line numbers in the result match the input."""
+    """Decode separator HTML entities and percent-escapes, then fold Unicode dashes, spaces and
+    degree-sign look-alikes to ASCII. Newlines are never touched, so line numbers match."""
     text = _decode_percent(text)
     return text if text.isascii() else text.translate(_UNICODE_MINUS)
 

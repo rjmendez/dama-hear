@@ -64,7 +64,7 @@ runners:
 Every push to any branch and every pull request also runs `.github/workflows/coord-guard.yml`.
 This repo is public and the site's real position must never be in it, so `tools/coord_guard.py`
 fails on any decimal latitude/longitude pair, or `lat`/`lon`-keyed value, with at least four
-decimal places that lies more than 25 km from `survey.json`'s fictional origin. It reads:
+decimal places that lies more than 25 km from `survey.json`'s fictional origin.
 
 Before reading, Unicode spaces (no-break, figure, thin, narrow no-break) count as a space, `º` and
 `˚` as `°`, and the entities `&nbsp;`, `&#44;`, `&#x2C;`, `&comma;` and `&semi;` are decoded. It
