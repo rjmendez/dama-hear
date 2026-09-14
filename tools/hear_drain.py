@@ -878,7 +878,10 @@ def drain_context_file(pl: "P.Pool", node: str, ip: str, name: str, sizes: Optio
     if not body:
         return False
     fetched = len(body)
-    if tail:
+    # /sd serves the whole file when it is no longer than the tail asked for -- a small file, or
+    # one that rolled between /ls and /sd -- and then the first line is the file's own header.
+    whole_response = bool(tail) and (fetched < tail or body.startswith((b"node,", b"utc_us,")))
+    if tail and not whole_response:
         rows = body[body.index(b"\n") + 1:]
         body = (header.encode() + b"\n" + rows) if header else rows
     else:
@@ -887,6 +890,8 @@ def drain_context_file(pl: "P.Pool", node: str, ip: str, name: str, sizes: Optio
                   "archived": archive(pl.root, node, name, body, stamp)})
     if rolled:
         entry["rolled"] = True
+    if whole_response:
+        entry["whole_response"] = True
     out["files"].append(entry)
     if size_now is None:
         return False

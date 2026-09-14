@@ -33,8 +33,8 @@ class HealthNode(FakeNode):
             self.health += (row + "\n").encode()
         return self
 
-    def roll_health(self):
-        self.health = (HEADER + "\n").encode()
+    def roll_health(self, header=HEADER):
+        self.health = (header + "\n").encode()
         return self
 
     def sd(self, ip, name, timeout=None, tail=None):
@@ -137,6 +137,26 @@ def test_a_rolled_file_is_fetched_whole(tmp_path, node):
     r = _drain(pl, node, 2000)
     assert _health_calls(node)[-1] is None and _entry(r)[0]["rolled"] is True
     assert HD.read_watermarks(pl.root)["nyquist"]["health.csv"]["size"] == len(node.health)
+
+
+def test_a_tail_answered_with_the_whole_file_keeps_that_files_own_header(tmp_path, node,
+                                                                        monkeypatch):
+    """/ls saw the old file grow, then it rolled with a new schema before /sd was served: the tail
+    covers the whole new file, whose first line is the new header, not a fragment."""
+    pl = P.Pool(str(tmp_path / "pool"))
+    node.grow_health(100)
+    _drain(pl, node, 1000)
+    stale = len(node.health) + 500
+    monkeypatch.setattr(HD, "_ls_sizes", lambda ip, timeout=None: {**node.ls(ip), "health.csv": stale})
+    new_header = HEADER + ",rssi"
+    node.roll_health(new_header)
+    node.health += b"nyquist,1,2,3,4,5,x,-60\n"
+    r = _drain(pl, node, 2000)
+    assert _health_calls(node)[-1] == 500 + HD.CONTEXT_OVERLAP_BYTES
+    e = _entry(r)[0]
+    assert e["whole_response"] is True
+    assert open(e["archived"], "rb").read() == node.health
+    assert HD.read_watermarks(pl.root)["nyquist"]["health.csv"]["header"] == new_header
 
 
 def test_a_blind_listing_takes_a_bounded_tail_and_keeps_the_mark(tmp_path, node, monkeypatch):
