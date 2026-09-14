@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 311108 B serialised; 311286 B of annotations against a 262144 B cap.
+# apply-mode server: 314928 B serialised; 315106 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: '4c32277'
+    dama-hear/commit: '7d50fcf'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '311108'
+    dama-hear/serialised-bytes: '314928'
 data:
   hear__init__.py: |
     
@@ -3473,6 +3473,16 @@ data:
         return (), None
     CONTEXT_FILES = ("health.csv",)
     
+    # ⚠️CONTEXT FILES ARE TAILED FROM A WATERMARK, NOT FETCHED WHOLE. health.csv was 2.4-2.6 MB on the
+    # card nodes on 2026-09-13 and was pulled whole every 15 minutes, holding the node's single-client
+    # HTTP loop for most of a minute per run (#99). A run now asks for the bytes past the last mark plus
+    # CONTEXT_OVERLAP_BYTES, which covers more than one row (health rows measured <= 665 B), so the first
+    # row kept is always complete. With no size from /ls a bounded tail is archived and the mark stays
+    # where it was, so the next listed run resumes from it -- unless /sd answered with the whole file,
+    # whose served length is then a size the mark can safely take.
+    CONTEXT_OVERLAP_BYTES = 4096
+    CONTEXT_BLIND_TAIL_BYTES = 64_000
+    
     # ⚠️SCENE IS FETCHED BY TAIL, NOT WHOLE. It grows without bound (16,771,742 B on nyquist and
     # 16,435,916 B on mach in tests/fixtures/ls_*.txt, captured 2026-09-08; 2-7 minutes to pull at the
     # node's measured 40-135 KB/s) and re-fetching all of it every 15 minutes would spend the whole
@@ -4127,6 +4137,66 @@ data:
         return p
     
     
+    def drain_context_file(pl: "P.Pool", node: str, ip: str, name: str, sizes: Optional[Dict[str, int]],
+                           node_wm: Dict[str, Any], timeout: float, stamp: int,
+                           out: Dict[str, Any]) -> bool:
+        """Archive what one context file gained since the last run. True when `node_wm` moved.
+    
+        A first sighting, a mark with no header, and a file smaller than its mark (a roll) are fetched
+        whole and the header is kept. Otherwise only the bytes past the mark are asked for; the leading
+        fragment is dropped and the header prepended, so every archive is a CSV on its own and the rows
+        of consecutive archives overlap by a few rows rather than leaving a hole.
+        """
+        size_now = sizes.get(name) if sizes is not None else None
+        mark = node_wm.get(name) or {}
+        prev, header = mark.get("size"), mark.get("header")
+        entry: Dict[str, Any] = {"name": name, "ingested": False}
+        rolled = size_now is not None and prev is not None and int(size_now) < int(prev)
+        if size_now is not None and prev is not None and header and int(size_now) == int(prev):
+            out["files"].append({**entry, "bytes": 0, "skipped_unchanged": True, "size": int(size_now)})
+            return False
+        if size_now is None and not header:
+            # A blind tail with no header would archive rows that are not a CSV on their own. The
+            # next listed run fetches the file whole, so nothing is lost by waiting for it.
+            out["files"].append({**entry, "bytes": 0, "skipped_unmeasured": True})
+            return False
+        if size_now is not None and (prev is None or rolled or not header):
+            tail, file_timeout = None, rolled_file_timeout(size_now, timeout)
+        elif size_now is None:
+            tail, file_timeout = CONTEXT_BLIND_TAIL_BYTES, timeout
+        else:
+            tail, file_timeout = int(size_now) - int(prev) + CONTEXT_OVERLAP_BYTES, timeout
+        try:
+            body = fetch_sd(ip, name, file_timeout, tail=tail)
+        except Exception as e:
+            out["errors"].append("%s: %r" % (name, e))
+            return False
+        if not body:
+            return False
+        fetched = len(body)
+        # /sd serves the whole file when it is no longer than the tail asked for -- a small file, or
+        # one that rolled between /ls and /sd -- and then the first line is the file's own header.
+        whole_response = bool(tail) and (fetched < tail or body.startswith((b"node,", b"utc_us,")))
+        # A whole file as served IS its size; /ls may still describe the file it replaced.
+        mark_size = fetched if whole_response else size_now
+        if tail and not whole_response:
+            rows = body[body.index(b"\n") + 1:]
+            body = (header.encode() + b"\n" + rows) if header else rows
+        else:
+            header = body.split(b"\n", 1)[0].rstrip(b"\r").decode("utf-8", "replace")
+        entry.update({"bytes": fetched, "tail": tail, "size": mark_size,
+                      "archived": archive(pl.root, node, name, body, stamp)})
+        if rolled:
+            entry["rolled"] = True
+        if whole_response:
+            entry["whole_response"] = True
+        out["files"].append(entry)
+        if mark_size is None:
+            return False
+        node_wm[name] = {"size": int(mark_size), "at": stamp, "header": header}
+        return True
+    
+    
     # ---------------------------------------------------------------- the clip lane
     
     
@@ -4707,15 +4777,6 @@ data:
         if st.get("sd") is False:
             return _drain_live_ring(pl, node, ip, st, out, timeout, stamp)
     
-        for name in CONTEXT_FILES:
-            try:
-                body = fetch_sd(ip, name, timeout)
-                if body:
-                    out["files"].append({"name": name, "bytes": len(body), "ingested": False,
-                                         "archived": archive(pl.root, node, name, body, stamp)})
-            except Exception as e:
-                out["errors"].append("%s: %r" % (name, e))
-    
         # ⚠️SIZES ARE READ BEFORE THE BODY. That makes `size_now` a lower bound on the file at fetch
         # time, so the computed gap is biased towards zero rather than towards a false alarm, and it
         # makes the watermark a size the fetched body is guaranteed to have reached.
@@ -4741,6 +4802,9 @@ data:
         node_wm = dict(wm.get(node) or {})
         wm_dirty = False
         status_block = status_audit(st)
+    
+        for name in CONTEXT_FILES:
+            wm_dirty |= drain_context_file(pl, node, ip, name, sizes, node_wm, timeout, stamp, out)
     
         scene_fetch, scene_live = scene_names(sizes)
         out["scene_files"] = list(scene_fetch)
