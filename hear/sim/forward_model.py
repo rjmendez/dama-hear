@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Sequence
 import numpy as np
 from scipy.signal import fftconvolve, resample_poly
+from hear.solve import shockwave
 
 @dataclass(frozen=True, init=False)
 class SimNode:
@@ -47,7 +48,17 @@ def _class(value): return value.node_class if isinstance(value, SimNode) else va
 
 def simulate_forward_model(source_pos, node_positions, signal, *, node_classes=None, t0_s=0.0,
                            sound_speed_mps=343.0, c=None, add_clock_noise=True, rng=None,
-                           capture_path_bias_s=None, source_sample_rate_hz=None):
+                           capture_path_bias_s=None, source_sample_rate_hz=None,
+                           propagation_mode="spherical", trajectory_bearing_deg=None,
+                           trajectory_offset_m=0.0, projectile_speed_mps=900.0,
+                           temperature_c=20.0):
+    """Render arrivals for a point radiator or a supersonic Mach cone.
+
+    In ``mach_cone`` mode, ``source_pos`` is the trajectory origin at ``t0_s`` and
+    ``trajectory_offset_m`` is its signed offset along the trajectory normal. The
+    mode deliberately reuses :mod:`hear.solve.shockwave` so simulated crack timing
+    has the same physical model as the inverse solver.
+    """
     positions = _positions(node_positions)
     source = np.asarray(source_pos, dtype=float)
     if source.shape != (positions.shape[1],): raise ValueError("source and node positions must have matching dimensions")
@@ -58,7 +69,24 @@ def simulate_forward_model(source_pos, node_positions, signal, *, node_classes=N
     rates = tuple(float(getattr(item, "fs_hz", 16000.0)) for item in classes)
     source_rate = rates[0] if source_sample_rate_hz is None else float(source_sample_rate_hz)
     if not np.isfinite(source_rate) or source_rate <= 0: raise ValueError("source sample rate must be finite and positive")
-    delays = np.linalg.norm(positions-source, axis=1)/float(sound_speed_mps)
+    distances = np.linalg.norm(positions-source, axis=1)
+    if propagation_mode == "spherical":
+        delays = distances / float(sound_speed_mps)
+    elif propagation_mode == "mach_cone":
+        if trajectory_bearing_deg is None:
+            raise ValueError("trajectory_bearing_deg is required for mach_cone propagation")
+        cone_c = shockwave.sound_speed(temperature_c)
+        if not np.isfinite(projectile_speed_mps) or projectile_speed_mps <= cone_c:
+            raise ValueError("projectile_speed_mps must be supersonic for mach_cone propagation")
+        bearing = np.deg2rad(float(trajectory_bearing_deg))
+        local_positions = positions[:, :2] - source[:2]
+        delays = np.asarray([
+            shockwave.shock_time(position, bearing, float(trajectory_offset_m),
+                                 float(projectile_speed_mps), cone_c)
+            for position in local_positions
+        ])
+    else:
+        raise ValueError("propagation_mode must be 'spherical' or 'mach_cone'")
     arrivals = float(t0_s)+delays
     if capture_path_bias_s is not None: arrivals += np.asarray(capture_path_bias_s, float)
     if add_clock_noise:
@@ -69,7 +97,7 @@ def simulate_forward_model(source_pos, node_positions, signal, *, node_classes=N
     if source_signal.ndim == 1: source_signal = source_signal[None, :]
     if source_signal.ndim != 2 or source_signal.shape[1] == 0 or not np.isfinite(source_signal).all(): raise ValueError("signal must be finite and non-empty")
     audio=[]
-    for delay, rate, distance in zip(delays, rates, np.linalg.norm(positions-source,axis=1)):
+    for delay, rate, distance in zip(delays, rates, distances):
         rendered = source_signal if rate == source_rate else np.stack([resample_poly(ch, rate, source_rate) for ch in source_signal])
         taps=33; integer=int(np.ceil(max(0.0, delay*rate))); frac=max(0.0, delay*rate)-integer
         kernel=np.sinc(np.arange(taps)-(taps-1)/2-frac)*np.hanning(taps); kernel/=kernel.sum()
@@ -79,7 +107,7 @@ def simulate_forward_model(source_pos, node_positions, signal, *, node_classes=N
             filtered=filtered[(taps-1)//2:(taps-1)//2+channel.size]
             delayed.append(np.concatenate((np.zeros(integer), filtered)))
         audio.append(np.asarray(delayed)/max(float(distance),1.0))
-    return ForwardModelResult(np.linalg.norm(positions-source,axis=1), delays, arrivals, tuple(audio), rates)
+    return ForwardModelResult(distances, delays, arrivals, tuple(audio), rates)
 
 def simulate(source_pos, nodes, signal, **kwargs):
     return simulate_forward_model(source_pos, nodes, signal, **kwargs)

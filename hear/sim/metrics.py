@@ -176,9 +176,19 @@ def _gdop(self, true_position, node_positions):
         raise ValueError("need >= 2 nodes")
     if nodes.shape[0] < 3:
         return {"gdop": float("inf"), "hdop": float("inf"), "geometry_matrix": None}
-    if nodes.shape[1] < 3 or np.allclose(nodes[:, 2], nodes[0, 2]):
-        result = placement.dop(nodes, truth[:2])
-        dop_value = float(result["dop"])
+    if placement.linearity(nodes) < placement.COLLINEAR_LINEARITY:
+        return {"gdop": float("inf"), "hdop": float("inf"), "geometry_matrix": None}
+    if nodes.shape[1] < 3:
+        try:
+            dop_value = float(placement.dop(nodes, truth[:2])["dop"])
+        except (ValueError, IndexError, np.linalg.LinAlgError):
+            dop_value = float("inf")
+        return {"gdop": dop_value, "hdop": dop_value, "geometry_matrix": None}
+    if np.allclose(nodes[:, 2], nodes[0, 2]):
+        try:
+            dop_value = float(placement.dop(nodes, truth[:2])["dop"])
+        except (ValueError, IndexError, np.linalg.LinAlgError):
+            dop_value = float("inf")
         return {"gdop": dop_value, "hdop": dop_value, "geometry_matrix": None}
     distances = np.linalg.norm(nodes-truth, axis=1)
     if np.any(distances == 0): raise ValueError("true position cannot coincide with a node")
