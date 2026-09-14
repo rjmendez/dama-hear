@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import paho.mqtt.client as mqtt
@@ -92,6 +93,12 @@ def dispatch_message(store: HeartbeatReceiverStore, raw: bytes, topic: str,
     validator, writer_name = route
 
     try:
+        # batch_ingest/forwarder normalize the transport timestamp to numeric
+        # milliseconds. The Redis contract uses an RFC3339 string.
+        ts = payload.get("ts")
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+            payload = dict(payload)
+            payload["ts"] = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
         body = validator(payload)
     except RequestError as exc:
         stats.rejected += 1

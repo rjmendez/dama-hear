@@ -131,6 +131,23 @@ class TestDispatchMessage:
         assert record is None
         assert stats.rejected == 1
 
+    def test_a_numeric_millisecond_ts_is_converted_to_rfc3339_and_accepted(self, store):
+        # What the forwarder actually sends: "ts" normalised to numeric milliseconds. The receiver
+        # contract wants an RFC3339 string, and without the conversion every message was rejected.
+        st, fake = store
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_heartbeat(ts=1789256580000))).encode()
+        record = B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats)
+        assert record is not None and stats.accepted == 1 and stats.rejected == 0
+        assert json.loads(fake.values["dama:hear:nyquist"])["ts"] == "2026-09-12T23:43:00Z"
+
+    def test_a_boolean_ts_is_not_taken_for_a_number(self, store):
+        st, _fake = store
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_heartbeat(ts=True))).encode()
+        assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats) is None
+        assert stats.rejected == 1
+
     def test_a_bad_message_does_not_block_the_next_good_one(self, store):
         st, fake = store
         stats = B.BridgeStats()
