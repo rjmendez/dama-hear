@@ -122,6 +122,18 @@ class TestTheSplitGate(TestDriftReport):
         }}, monkeypatch)
         assert "\n  gold      fix 1" not in out
 
+    def test_a_box3_fix_quality_of_one_is_not_called_out(self, capsys, monkeypatch):
+        out = self._run(capsys, {"box=1": self._status("8b9d5b1", "box", sats=6, fix=1) | {
+            "class": "esp32s3-box3"
+        }}, monkeypatch)
+        assert "\n  box       fix 1" not in out
+
+    def test_a_minimal_i2s_node_is_not_called_out_for_lacking_sd(self, capsys, monkeypatch):
+        out = self._run(capsys, {"gold=1": self._status("8b9d5b1", "gold") | {
+            "class": "esp32s3-i2s-gps", "sd": False, "sd_free_mb": None
+        }}, monkeypatch)
+        assert "\n  gold      no SD card" not in out
+
     def test_an_unreachable_node_makes_the_gate_inconclusive(self, capsys, monkeypatch):
         # ⚠️THE REGRESSION. A split/canary build hidden behind a refused /status must not pass as
         # "all one build" by omission. With the invariant flag set, a missing answer is UNKNOWN
