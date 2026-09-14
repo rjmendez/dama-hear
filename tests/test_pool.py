@@ -156,6 +156,34 @@ class TestOneDataset:
         assert recs[0].fs_hz == 48000.0
         assert np.array_equal(recs[0].q, q)
 
+    def test_live_ring_and_dets_csv_rows_land_with_one_raw_scalar_schema(self, tmp_path):
+        """Tonight's mixed fleet drains XIAO rows from dets.csv and esp32s3-i2s-gps rows from
+        `/detections`. The pooled node-record schema must not change types by node class."""
+        pl = P.Pool(str(tmp_path / "pool"))
+        frame = binascii.hexlify(_frame(fs=48000.0, seed=41, node_us=123456)).decode()
+        csv = tmp_path / "mach.csv"
+        csv.write_text(",".join(DF.G6.declared) + "\n"
+                       + "mach,1788763952189911,1234,5000000,42,597174,-1140,5889,16000.000,192,"
+                         f"{frame},,dedupe,40705\n")
+        live = tmp_path / "gold.json"
+        live.write_text(json.dumps([{
+            "i": 7, "utc_us": 1788763952189912, "uptime_s": 1235, "sample": 5000001,
+            "pps_n": 43, "us_since_pps": 597175, "trigger": -1141, "flags": 5888,
+            "fs_hz": 16000.0, "frame_len": len(frame) // 2, "frame": frame,
+            "clip": "", "clip_why": "nocard"}]))
+        assert pl.ingest_dets(str(csv))["added"] == 1
+        assert pl.ingest_detections_json(str(live), default_node="gold")["added"] == 1
+        rows = {r["node"]: r for r in pl.raw()}
+        for node in ("mach", "gold"):
+            got = rows[node]
+            assert got["fs_hz"] == 48000.0
+            assert got["fs_csv_hz"] == 16000.0
+            assert got["fs_stated_by"] == "frame"
+            for key in ("sample", "uptime_s", "pps_n", "us_since_pps", "trigger"):
+                assert isinstance(got[key], str), (node, key, got[key], type(got[key]))
+        assert rows["mach"]["trigger"] == "-1140"
+        assert rows["gold"]["trigger"] == "-1141"
+
     def test_the_key_is_content_so_two_drains_of_one_detection_agree(self, tmp_path):
         frame = _frame()
         a = P.key("node", "nyquist", 1788763952189911, "5000000", frame)
