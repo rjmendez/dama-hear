@@ -170,31 +170,34 @@ class TestSignParsing:
         assert_not_printed(out, la, lo)
 
     @staticmethod
-    def _unicode_minus(v):
+    def _with_dash(v, dash):
         # The same signed decimal string numbers() would otherwise see, with just its leading
-        # ASCII "-" swapped for U+2212 MINUS SIGN -- everything else about the text is identical
-        # to the ASCII-minus form already covered elsewhere in this file.
-        return fmt(v).replace("-", "−", 1)
+        # ASCII "-" swapped for one Unicode dash/minus look-alike -- everything else about the
+        # text is identical to the ASCII-minus form already covered elsewhere in this file.
+        return fmt(v).replace("-", dash, 1)
 
-    def test_a_unicode_minus_sign_is_recognized_in_an_inline_pair(self):
+    @pytest.mark.parametrize("dash", list(CG._DASHES))
+    def test_a_unicode_minus_sign_is_recognized_in_an_inline_pair(self, dash):
         la, lo = far_pair()
-        far = "%s, %s" % (self._unicode_minus(lo), fmt(la))
+        far = "%s, %s" % (self._with_dash(lo, dash), fmt(la))
         la_n, lo_n = near_pair()
-        near = "%s, %s" % (self._unicode_minus(lo_n), fmt(la_n))
+        near = "%s, %s" % (self._with_dash(lo_n, dash), fmt(la_n))
         assert lines(far) == [1]
         assert lines(near) == []
 
-    def test_a_unicode_minus_sign_is_recognized_in_a_keyed_value(self):
-        far = '"lon_deg": %s' % self._unicode_minus(LON0 - FAR)
-        near = '"lon_deg": %s' % self._unicode_minus(LON0 - NEAR)
+    @pytest.mark.parametrize("dash", list(CG._DASHES))
+    def test_a_unicode_minus_sign_is_recognized_in_a_keyed_value(self, dash):
+        far = '"lon_deg": %s' % self._with_dash(LON0 - FAR, dash)
+        near = '"lon_deg": %s' % self._with_dash(LON0 - NEAR, dash)
         assert lines(far) == [1]
         assert lines(near) == []
 
-    def test_a_unicode_minus_sign_is_recognized_in_an_array_pair(self):
+    @pytest.mark.parametrize("dash", list(CG._DASHES))
+    def test_a_unicode_minus_sign_is_recognized_in_an_array_pair(self, dash):
         la, lo = far_pair()
-        far = "[%s, %s]" % (self._unicode_minus(lo), fmt(la))
+        far = "[%s, %s]" % (self._with_dash(lo, dash), fmt(la))
         la_n, lo_n = near_pair()
-        near = "[%s, %s]" % (self._unicode_minus(lo_n), fmt(la_n))
+        near = "[%s, %s]" % (self._with_dash(lo_n, dash), fmt(la_n))
         assert lines(far) == [1]
         assert lines(near) == []
 
@@ -206,24 +209,35 @@ class TestSignParsing:
         assert lines(far) == [1]
         assert lines(near) == []
 
-    def test_a_bare_hemisphere_letter_alone_separates_a_sign_glued_pair(self):
-        # "<lat>N-<lon>W": no comma or space between the numbers at all, just the hemisphere
-        # letter, with the second number's sign now glued directly onto that letter.
+    def test_percent_decoding_does_not_shift_a_later_line_number(self):
+        # %2C decodes to one byte, "," -- shorter than the three bytes it replaces, so an
+        # earlier decode on an earlier line must not throw off line counting for a pair further
+        # down. line_of() and numbers()/candidates() both work off the one already-normalized
+        # text, so this should already hold; this test pins that down explicitly.
         la, lo = far_pair()
-        far = "%sN%sW" % (fmt(la), fmt(lo))
-        near_la, near_lo = near_pair()
-        near = "%sN%sW" % (fmt(near_la), fmt(near_lo))
-        assert lines(far) == [1]
-        assert lines(near) == []
+        text = "q=1%%2C2\nkeep\n%s%%2C%s" % (fmt(la), fmt(lo))
+        assert lines(text) == [3]
 
-    def test_a_small_magnitude_array_pair_is_still_detected(self):
-        # Both axes under 1 degree in magnitude: still genuinely far via the fictional origin
-        # (tens of thousands of km away at these magnitudes), and array syntax is unambiguous
-        # enough not to need the >=1.0 floor the loose inline-pair form uses.
-        a, b = 0.5, 0.6
-        assert lines("[%s, %s]" % (fmt(a, 4), fmt(b, 4))) == [1]
-        # the equivalent bare (non-bracketed) pair intentionally keeps the floor
-        assert lines("%s, %s" % (fmt(a, 4), fmt(b, 4))) == []
+    @pytest.mark.parametrize("template", ["took %ss-%ss", "cap %sn-%sn"])
+    def test_a_unit_suffixed_range_is_not_a_coordinate_pair(self, template):
+        # A zero-width separator right after a bare N/S/n/s letter used to turn a plain
+        # timing/measurement range into a pair, because "-" glued to the second value already
+        # reads as its sign: "took 1.2345s-2.3456s" and "cap 12.3456n-14.5678n" both got flagged.
+        # SEPARATOR is back to requiring an actual comma/semicolon/space between values, so a
+        # bare unit letter no longer counts. Two separate assignments, not one literal tuple, so
+        # this file's own source never carries the two numbers comma-adjacent.
+        a = 1.2345
+        b = 2.3456
+        assert lines(template % (a, b)) == []
+
+    def test_a_small_magnitude_array_pair_is_not_flagged(self):
+        # Both axes under 1 degree: the array branch keeps the same >=1.0 magnitude floor as
+        # the loose inline-pair form, because a bracketed 2-3 element float array this small is
+        # a common DSP/ML config shape (a normalized bounding box, a clip range, ...), not a
+        # coordinate -- flagging it blocks an unrelated PR on a required, admins-included check.
+        assert lines("[%s, %s]" % (fmt(0.25, 4), fmt(0.75, 4))) == []
+        assert lines("bounds = [%s, %s, 1]" % (fmt(0.1234), fmt(0.5678))) == []
+        assert lines("clip: [%s, %s]" % (fmt(-0.0125), fmt(0.0125))) == []
 
 
 class TestAllowlist:
@@ -380,15 +394,16 @@ class TestScanModes:
     def test_an_oversized_blob_is_reported_as_skipped_not_silently_passed(self, repo, capsys):
         # A blob over MAX_BLOB_BYTES is still not scanned (the cap exists to bound memory/CPU on
         # an accidentally-huge blob), but that must never look identical to "nothing was there
-        # to find" -- the summary line now says a blob was excluded so a human reviewing a
-        # REQUIRED, admins-included check can see coverage was incomplete.
+        # to find" -- an unscanned blob can't be certified clean, so the run now fails closed
+        # over it, naming the commit and path, instead of reporting a silent pass.
         base = _git(repo, "rev-parse", "HEAD")
         far = "%s, %s" % tuple(fmt(v) for v in far_pair())
         padding = "x" * (CG.MAX_BLOB_BYTES + 1 - len(far))
         _commit(repo, "huge.txt", padding + far, "oversized")
         rc, out = run(capsys, repo, "range", base, "HEAD")
-        assert rc == 0, out
+        assert rc == 1, out
         assert "1 blob(s) over %d bytes not scanned" % CG.MAX_BLOB_BYTES in out
+        assert "huge.txt" in out and "blob over" in out
         assert_not_printed(out, *far_pair())
 
     def test_moving_the_origin_is_judged_against_the_base(self, repo, capsys):

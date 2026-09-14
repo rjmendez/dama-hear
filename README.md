@@ -72,7 +72,8 @@ origin. The real origin comes only from `HEAR_SITE_ORIGIN`. `tools/coord_guard_a
 (`path digest  # reason`) is for numbers that are not coordinates at all. Take the digest from a
 local `--show-digests` run, never from CI. Every file under a couple of megabytes is scanned as
 text, binary-looking content included, so a stray non-text byte in front of a coordinate can't
-hide it; only a blob over that size is skipped, and the run says so instead of passing silently.
+hide it. A blob over that size is never scanned, and the run fails over it, naming the commit and
+path but never its content, rather than passing on incomplete coverage.
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the `hear_node` images
 for each supported board class, their `.elf`, `build-info.json` and `SHA256SUMS` as a GitHub

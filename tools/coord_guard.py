@@ -33,21 +33,21 @@ ALLOW_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coord_gua
 _NUM = r"(-?\d{1,3}\.\d{4,})(?!\d|[eE][-+]?\d)"
 FRACTION = re.compile(r"\.\d{4,}(?!\d|[eE][-+]?\d)")
 DIGITS = frozenset("0123456789")
-# The mandatory middle alternative also accepts a zero-width gap right after a bare hemisphere
-# letter (no comma/space), so a pair written "12.345N-67.891W" (three fractional digits here so
-# this comment can't itself look like a coordinate) separates on "N" alone once the "-" has been
-# folded into the second number as its sign.
-SEPARATOR = re.compile(
-    r"[ \t]*(?:[NSns°][ \t]*)?(?:[,;][ \t]*|[ \t]+|(?<=[NSns°]))(?:[NSEWnsew°][ \t]*)?")
-_UNICODE_MINUS = str.maketrans({"−": "-"})
-_PERCENT_SEPARATOR = re.compile(r"%(2[Cc]|3[Bb]|20)")
-_PERCENT_SEPARATOR_MAP = {"2c": ",", "3b": ";", "20": " "}
+SEPARATOR = re.compile(r"[ \t]*(?:[NSns°][ \t]*)?(?:[,;][ \t]*|[ \t]+)(?:[NSEWnsew°][ \t]*)?")
+# Every dash/minus look-alike Unicode offers, folded to ASCII "-": hyphen, non-breaking hyphen,
+# figure dash, en/em dash, two horizontal bars, minus sign, small hyphen-minus, small em dash,
+# fullwidth hyphen-minus. One code point each, so folding never shifts a later offset.
+_DASHES = "‐‑‒–—―−﹘﹣－"
+_UNICODE_MINUS = str.maketrans({c: "-" for c in _DASHES})
+_PERCENT_SEPARATOR = re.compile(r"%(2[Cc]|3[Bb])")
+_PERCENT_SEPARATOR_MAP = {"2c": ",", "3b": ";"}
 
 
 def _normalize(text):
-    """ASCII-fold the one Unicode minus look-alike and the percent-encoded separators a URL
-    query string would carry, so tokenizing never has to special-case them. Deliberately narrow:
-    only U+2212 and the three delimiter escapes, nothing that could shift unrelated text."""
+    """ASCII-fold dash/minus look-alikes and the %2C/%3B separator escapes a URL query string
+    would carry, so tokenizing never has to special-case them. Called once, from candidates();
+    numbers() takes text as given and never renormalizes it, so positions it returns are always
+    relative to whatever text its caller passed in."""
     text = text.translate(_UNICODE_MINUS)
     return _PERCENT_SEPARATOR.sub(lambda m: _PERCENT_SEPARATOR_MAP[m.group(1).lower()], text)
 
@@ -74,8 +74,8 @@ def numbers(text):
     "positive" is exactly the guess that hides a leak, so this no longer guesses: any adjacent
     "-" is the sign. A number glued to a letter/digit/underscore/dot with no sign in between is
     still excluded, as before (that's what keeps ordinary identifiers and version strings
-    quiet)."""
-    text = _normalize(text)
+    quiet). Operates on `text` exactly as given -- no normalization here; candidates() is the
+    one caller and normalizes first, so positions returned are relative to its normalized text."""
     for m in FRACTION.finditer(text):
         dot = start = m.start()
         while start > 0 and dot - start < 4 and text[start - 1] in DIGITS:
@@ -161,7 +161,10 @@ class Guard:
         return abs(dl) * deg_km * math.cos(math.radians(self.lat0)) > self.radius_km
 
     def candidates(self, text):
-        """(line, kind, digest, far) for every coordinate-shaped pair or keyed value in `text`."""
+        """(line, kind, digest, far) for every coordinate-shaped pair or keyed value in `text`.
+
+        The sole normalization point: `text` is folded here, once, before anything below reads
+        it (including numbers(), which itself normalizes nothing)."""
         text = _normalize(text)
         nums = list(numbers(text))
         if not nums:
@@ -181,11 +184,9 @@ class Guard:
         if "[" in text:
             for m in ARRAY.finditer(text):
                 a, b = float(m.group(1)), float(m.group(2))
-                # No >=1.0 magnitude floor here, unlike the loose inline-pair form below: a
-                # bracketed "[a, b]" is already an unambiguous pair syntax, so small-magnitude
-                # axes (both under a degree, still genuinely far from the origin) are not
-                # exempted from detection the way two bare loose numbers are.
-                if _orders(a, b):
+                # Same >=1.0 floor as the loose inline-pair form: a sub-degree 2-3 element
+                # bracketed float array is common DSP/ML config shape, not a coordinate.
+                if self._pair_valid(a, b):
                     out.append((line_of(m.start(1)), "array pair", pair_digest(a, b),
                                 self._pair_far(a, b)))
         keyed = {"lat": [], "lon": []}
@@ -244,7 +245,7 @@ def read_origin(repo, rev):
 
 
 def read_blobs(repo, oids):
-    """({oid: text}, oversized_count) for blobs among `oids` no larger than MAX_BLOB_BYTES.
+    """({oid: text}, {oversized oid}) for blobs among `oids`, split on MAX_BLOB_BYTES.
 
     Every blob at or under the size cap is decoded and scanned, full stop -- a blob is never
     excluded because it merely contains a NUL byte. That NUL-presence heuristic used to be the
@@ -255,16 +256,16 @@ def read_blobs(repo, oids):
     below need a specific run of ASCII digits and a literal '.', which garbled bytes essentially
     never produce by chance -- and it closes that gap outright instead of tuning where the
     boundary sits. The size cap stays: it exists to bound memory/CPU on a huge accidental blob,
-    not to classify text vs. binary, and blobs it excludes are counted here so the caller can
-    report that scanning was incomplete rather than passing silently."""
+    not to classify text vs. binary; a blob over it is never scanned, and the caller fails the
+    run closed over it rather than passing silently on incomplete coverage."""
     oids = list(dict.fromkeys(oids))
     if not oids:
-        return {}, 0
+        return {}, set()
     checks = git("cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)",
                  repo=repo, data=("\n".join(oids) + "\n").encode()).decode().split("\n")
     rows = [p for p in (row.split() for row in checks) if len(p) == 3 and p[1] == "blob"]
     wanted = [p[0] for p in rows if int(p[2]) <= MAX_BLOB_BYTES]
-    oversized = sum(1 for p in rows if int(p[2]) > MAX_BLOB_BYTES)
+    oversized = {p[0] for p in rows if int(p[2]) > MAX_BLOB_BYTES}
     if not wanted:
         return {}, oversized
     out = git("cat-file", "--batch", repo=repo, data=("\n".join(wanted) + "\n").encode())
@@ -309,14 +310,20 @@ def range_entries(repo, base, head):
 
 
 def scan(guard, repo, entries):
+    """(findings, blob_count, oversized_count, oversized_hits): oversized_hits is the
+    deduplicated (commit, path) pairs pointing at a blob over MAX_BLOB_BYTES -- never scanned,
+    so the caller must fail the run over them rather than reporting a clean pass."""
     entries = list(entries)
     blobs, oversized = read_blobs(repo, [oid for _, _, oid in entries])
     cands = {oid: guard.candidates(text) for oid, text in blobs.items()}
-    results = []
+    results, oversized_hits = [], []
     for commit, path, oid in entries:
         if oid in cands:
             results.extend((commit, f) for f in guard.findings(path, cands[oid]))
-    return list(dict.fromkeys(results)), len(blobs), oversized
+        elif oid in oversized:
+            oversized_hits.append((commit, path))
+    return (list(dict.fromkeys(results)), len(blobs), len(oversized),
+            list(dict.fromkeys(oversized_hits)))
 
 
 def main(argv=None):
@@ -344,7 +351,7 @@ def main(argv=None):
         what = ("every commit reachable from %s" % args.head if full
                 else "every commit in %s..%s" % (args.base, args.head))
     guard = Guard(read_origin(args.repo, origin_rev), args.radius_km, load_allow(args.allow))
-    results, nblobs, oversized = scan(guard, args.repo, entries)
+    results, nblobs, oversized, oversized_hits = scan(guard, args.repo, entries)
     for commit, f in results:
         at = "commit %s " % commit[:12] if commit else ""
         tail = " digest %s" % f.digest if args.show_digests else ""
@@ -352,14 +359,22 @@ def main(argv=None):
               % (escape_property(f.path), f.line, escape_data(
                   "%s%s:%d: %s more than %g km from the fictional origin%s"
                   % (at, f.path, f.line, f.kind, guard.radius_km, tail))))
+    for commit, path in oversized_hits:
+        at = "commit %s " % commit[:12] if commit else ""
+        print("::error file=%s::%s"
+              % (escape_property(path), escape_data(
+                  "%s%s: blob over %d bytes, not scanned" % (at, path, MAX_BLOB_BYTES))))
     skip = (" (%d blob(s) over %d bytes not scanned)" % (oversized, MAX_BLOB_BYTES)
             if oversized else "")
-    print("coord_guard: %s: %d text blobs, %d finding(s)%s" % (what, nblobs, len(results), skip))
+    print("coord_guard: %s: %d blobs, %d finding(s)%s" % (what, nblobs, len(results), skip))
     if results:
         print("coord_guard: real-world coordinates must not enter this public repo. Build test "
               "values from survey.json's fictional origin; the real site comes from "
               "HEAR_SITE_ORIGIN. Values are deliberately not printed.")
-    return 1 if results else 0
+    if oversized_hits:
+        print("coord_guard: an unscanned blob over the size cap cannot be certified clean; "
+              "raise MAX_BLOB_BYTES or add an explicit exception.")
+    return 1 if results or oversized_hits else 0
 
 
 if __name__ == "__main__":
