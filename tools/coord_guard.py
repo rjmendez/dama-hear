@@ -33,7 +33,25 @@ ALLOW_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coord_gua
 _NUM = r"(-?\d{1,3}\.\d{4,})(?!\d|[eE][-+]?\d)"
 FRACTION = re.compile(r"\.\d{4,}(?!\d|[eE][-+]?\d)")
 DIGITS = frozenset("0123456789")
-SEPARATOR = re.compile(r"[ \t]*(?:[NSns°][ \t]*)?(?:[,;][ \t]*|[ \t]+)(?:[NSEWnsew°][ \t]*)?")
+# The mandatory middle alternative also accepts a zero-width gap right after a bare hemisphere
+# letter (no comma/space), so a pair written "12.345N-67.891W" (three fractional digits here so
+# this comment can't itself look like a coordinate) separates on "N" alone once the "-" has been
+# folded into the second number as its sign.
+SEPARATOR = re.compile(
+    r"[ \t]*(?:[NSns°][ \t]*)?(?:[,;][ \t]*|[ \t]+|(?<=[NSns°]))(?:[NSEWnsew°][ \t]*)?")
+_UNICODE_MINUS = str.maketrans({"−": "-"})
+_PERCENT_SEPARATOR = re.compile(r"%(2[Cc]|3[Bb]|20)")
+_PERCENT_SEPARATOR_MAP = {"2c": ",", "3b": ";", "20": " "}
+
+
+def _normalize(text):
+    """ASCII-fold the one Unicode minus look-alike and the percent-encoded separators a URL
+    query string would carry, so tokenizing never has to special-case them. Deliberately narrow:
+    only U+2212 and the three delimiter escapes, nothing that could shift unrelated text."""
+    text = text.translate(_UNICODE_MINUS)
+    return _PERCENT_SEPARATOR.sub(lambda m: _PERCENT_SEPARATOR_MAP[m.group(1).lower()], text)
+
+
 KEYED = re.compile(
     r"(?<![a-z])(lat(?:itude)?|lon(?:gitude)?|lng|long)"
     r"(?:[_-]?(?:deg(?:rees)?|dd|ref|0|1|2))?[\"']?[ \t]*[:=]?[ \t]*[\"']?" + _NUM)
@@ -43,15 +61,28 @@ ARRAY = re.compile(r"\[\s*" + _NUM + r"\s*,\s*" + _NUM + r"\s*(?:,\s*-?\d+(?:\.\
 
 
 def numbers(text):
-    """(start, end, value) of each decimal with 1-3 integer digits and >= 4 fractional digits."""
+    """(start, end, value) of each decimal with 1-3 integer digits and >= 4 fractional digits.
+
+    A "-" directly against the digit run is always its sign, no matter what precedes the "-"
+    itself (start of text, whitespace, punctuation, or an identifier character glued straight
+    against it: "a-12.345", "5-12.345", "x_1-12.345" all read as negative -- three fractional
+    digits here on purpose, so this docstring never itself looks like a coordinate). Earlier
+    this guard tried to tell a "real" sign apart from a hyphen that merely happened to sit next
+    to a number, and on the glued cases it neither consumed nor rejected the "-": it silently
+    reported the unsigned value instead, turning a real far coordinate into a near-looking
+    positive one. There is no reliable text-only signal for that distinction, and guessing
+    "positive" is exactly the guess that hides a leak, so this no longer guesses: any adjacent
+    "-" is the sign. A number glued to a letter/digit/underscore/dot with no sign in between is
+    still excluded, as before (that's what keeps ordinary identifiers and version strings
+    quiet)."""
+    text = _normalize(text)
     for m in FRACTION.finditer(text):
         dot = start = m.start()
         while start > 0 and dot - start < 4 and text[start - 1] in DIGITS:
             start -= 1
         if not 1 <= dot - start <= 3:
             continue
-        if start > 0 and text[start - 1] == "-" and \
-                (start < 2 or not (text[start - 2].isalnum() or text[start - 2] in "_.")):
+        if start > 0 and text[start - 1] == "-":
             start -= 1
         elif start > 0 and (text[start - 1].isalnum() or text[start - 1] in "_."):
             continue
@@ -131,6 +162,7 @@ class Guard:
 
     def candidates(self, text):
         """(line, kind, digest, far) for every coordinate-shaped pair or keyed value in `text`."""
+        text = _normalize(text)
         nums = list(numbers(text))
         if not nums:
             return []
@@ -149,7 +181,11 @@ class Guard:
         if "[" in text:
             for m in ARRAY.finditer(text):
                 a, b = float(m.group(1)), float(m.group(2))
-                if self._pair_valid(a, b):
+                # No >=1.0 magnitude floor here, unlike the loose inline-pair form below: a
+                # bracketed "[a, b]" is already an unambiguous pair syntax, so small-magnitude
+                # axes (both under a degree, still genuinely far from the origin) are not
+                # exempted from detection the way two bare loose numbers are.
+                if _orders(a, b):
                     out.append((line_of(m.start(1)), "array pair", pair_digest(a, b),
                                 self._pair_far(a, b)))
         keyed = {"lat": [], "lon": []}
@@ -208,16 +244,29 @@ def read_origin(repo, rev):
 
 
 def read_blobs(repo, oids):
-    """{oid: text} for the text blobs among `oids` no larger than MAX_BLOB_BYTES."""
+    """({oid: text}, oversized_count) for blobs among `oids` no larger than MAX_BLOB_BYTES.
+
+    Every blob at or under the size cap is decoded and scanned, full stop -- a blob is never
+    excluded because it merely contains a NUL byte. That NUL-presence heuristic used to be the
+    sole test for "this is binary, skip it", and it takes exactly one incidental NUL anywhere in
+    the first 8KB (or, previously, a single leading one) to blind the guard to a real coordinate
+    sitting right after it, with no trace in the output that anything was skipped. Decoding with
+    errors="replace" costs nothing extra for genuine binaries -- the coordinate-shaped regexes
+    below need a specific run of ASCII digits and a literal '.', which garbled bytes essentially
+    never produce by chance -- and it closes that gap outright instead of tuning where the
+    boundary sits. The size cap stays: it exists to bound memory/CPU on a huge accidental blob,
+    not to classify text vs. binary, and blobs it excludes are counted here so the caller can
+    report that scanning was incomplete rather than passing silently."""
     oids = list(dict.fromkeys(oids))
     if not oids:
-        return {}
+        return {}, 0
     checks = git("cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)",
                  repo=repo, data=("\n".join(oids) + "\n").encode()).decode().split("\n")
-    wanted = [p[0] for p in (row.split() for row in checks)
-              if len(p) == 3 and p[1] == "blob" and int(p[2]) <= MAX_BLOB_BYTES]
+    rows = [p for p in (row.split() for row in checks) if len(p) == 3 and p[1] == "blob"]
+    wanted = [p[0] for p in rows if int(p[2]) <= MAX_BLOB_BYTES]
+    oversized = sum(1 for p in rows if int(p[2]) > MAX_BLOB_BYTES)
     if not wanted:
-        return {}
+        return {}, oversized
     out = git("cat-file", "--batch", repo=repo, data=("\n".join(wanted) + "\n").encode())
     blobs, pos = {}, 0
     while pos < len(out):
@@ -225,9 +274,8 @@ def read_blobs(repo, oids):
         oid, _typ, size = out[pos:nl].split()
         body = out[nl + 1:nl + 1 + int(size)]
         pos = nl + 1 + int(size) + 1
-        if b"\0" not in body[:8192]:
-            blobs[oid.decode()] = body.decode("utf-8", "replace")
-    return blobs
+        blobs[oid.decode()] = body.decode("utf-8", "replace")
+    return blobs, oversized
 
 
 def tree_entries(repo, rev):
@@ -262,13 +310,13 @@ def range_entries(repo, base, head):
 
 def scan(guard, repo, entries):
     entries = list(entries)
-    blobs = read_blobs(repo, [oid for _, _, oid in entries])
+    blobs, oversized = read_blobs(repo, [oid for _, _, oid in entries])
     cands = {oid: guard.candidates(text) for oid, text in blobs.items()}
     results = []
     for commit, path, oid in entries:
         if oid in cands:
             results.extend((commit, f) for f in guard.findings(path, cands[oid]))
-    return list(dict.fromkeys(results)), len(blobs)
+    return list(dict.fromkeys(results)), len(blobs), oversized
 
 
 def main(argv=None):
@@ -296,7 +344,7 @@ def main(argv=None):
         what = ("every commit reachable from %s" % args.head if full
                 else "every commit in %s..%s" % (args.base, args.head))
     guard = Guard(read_origin(args.repo, origin_rev), args.radius_km, load_allow(args.allow))
-    results, nblobs = scan(guard, args.repo, entries)
+    results, nblobs, oversized = scan(guard, args.repo, entries)
     for commit, f in results:
         at = "commit %s " % commit[:12] if commit else ""
         tail = " digest %s" % f.digest if args.show_digests else ""
@@ -304,7 +352,9 @@ def main(argv=None):
               % (escape_property(f.path), f.line, escape_data(
                   "%s%s:%d: %s more than %g km from the fictional origin%s"
                   % (at, f.path, f.line, f.kind, guard.radius_km, tail))))
-    print("coord_guard: %s: %d text blobs, %d finding(s)" % (what, nblobs, len(results)))
+    skip = (" (%d blob(s) over %d bytes not scanned)" % (oversized, MAX_BLOB_BYTES)
+            if oversized else "")
+    print("coord_guard: %s: %d text blobs, %d finding(s)%s" % (what, nblobs, len(results), skip))
     if results:
         print("coord_guard: real-world coordinates must not enter this public repo. Build test "
               "values from survey.json's fictional origin; the real site comes from "

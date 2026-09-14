@@ -7,10 +7,12 @@ import json
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import sys
 
 import pytest
+import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -84,9 +86,12 @@ class TestDetection:
         la, lo = far_pair()
         assert lines("[\n  %s,\n  %s\n]" % (fmt(la), fmt(lo))) == [2]
 
-    def test_a_lone_keyed_longitude_is_enough(self):
-        assert lines('"lon_deg": %s' % fmt(LON0 - FAR)) == [1]
-        assert lines('"lon_deg": %s' % fmt(LON0 - NEAR)) == []
+    @pytest.mark.parametrize("key,axis", [("lat_deg", "lat"), ("lon_deg", "lon")])
+    def test_a_lone_keyed_value_is_enough(self, key, axis):
+        far = LAT0 + FAR if axis == "lat" else LON0 - FAR
+        near = LAT0 + NEAR if axis == "lat" else LON0 - NEAR
+        assert lines('"%s": %s' % (key, fmt(far))) == [1]
+        assert lines('"%s": %s' % (key, fmt(near))) == []
 
     @pytest.mark.parametrize("template", [
         "{a3}, {b3}", "{a} / {b}", "v1.{a}", "{a}e-3, {b}", "latency: {a}", "{a}\n{b}",
@@ -106,6 +111,119 @@ class TestDetection:
         g = guard()
         for rel in ("tools/coord_guard.py", "tests/test_coord_guard.py", "README.md"):
             assert g.scan_text(rel, (ROOT / rel).read_text()) == [], rel
+
+    @pytest.mark.parametrize("a,b", [(90.0, 0.0), (-90.0, 0.0), (0.0, 180.0), (0.0, -180.0)])
+    def test_a_pole_or_antimeridian_boundary_pair_is_detected(self, a, b):
+        # 90/-90/180/-180 exactly are valid lat/lon values in their own right, not just invalid
+        # values that happen to be rejected -- confirm the boundary itself is still a candidate.
+        assert lines("%s, %s" % (fmt(a, 4), fmt(b, 4))) == [1]
+
+    def test_a_value_invalid_on_both_axes_at_once_is_rejected(self):
+        # 190.0 is invalid as a latitude (>90) and as a longitude (>180), so no ordering of the
+        # pair is ever valid -- unlike e.g. (90.0001, 0.0), which is invalid as a latitude but a
+        # perfectly good longitude under the swapped order, and so *is* still detected.
+        assert lines("%s, %s" % (fmt(190.0, 4), fmt(0.0, 4))) == []
+
+    def test_a_near_pole_value_is_still_a_pair_via_the_swapped_order(self):
+        # 90.0001 is invalid as a latitude but valid as a longitude, so _orders' swapped-order
+        # ambiguity still finds a valid reading -- this is intended, not a rejection case.
+        assert lines("%s, %s" % (fmt(90.0001, 4), fmt(0.0, 4))) == [1]
+
+
+class TestSignParsing:
+    """numbers(): a '-' directly against the digit run is always its sign, whatever precedes
+    the '-' itself -- see tools/coord_guard.py's numbers() docstring for the reasoning."""
+
+    @pytest.mark.parametrize("prefix", ["a", "id", "5", "x_1", "v9"])
+    def test_a_minus_glued_to_a_letter_or_digit_is_the_sign_not_dropped(self, prefix):
+        v = -(LAT0 + FAR)
+        toks = list(CG.numbers("%s%s" % (prefix, fmt(v))))
+        assert len(toks) == 1
+        assert toks[0][2] == pytest.approx(v)
+
+    @pytest.mark.parametrize("context", [" ", "\n", "=", ":", ",", "(", "[", '"'])
+    def test_a_signed_value_after_a_separator_keeps_its_sign(self, context):
+        v = -(LAT0 + FAR)
+        toks = list(CG.numbers("head%s%s" % (context, fmt(v))))
+        assert len(toks) == 1
+        assert toks[0][2] == pytest.approx(v)
+
+    def test_a_signed_value_at_the_start_of_text_keeps_its_sign(self):
+        v = -(LAT0 + FAR)
+        toks = list(CG.numbers(fmt(v)))
+        assert len(toks) == 1
+        assert toks[0][2] == pytest.approx(v)
+
+    @pytest.mark.parametrize("prefix", ["a", "id", "5", "x_1", "v9"])
+    def test_a_far_pair_glued_to_an_identifier_minus_is_still_flagged(self, prefix):
+        la, lo = far_pair()  # lo is negative here (west of the fictional origin)
+        assert lines("%s%s, %s" % (prefix, fmt(lo), fmt(la))) == [1]
+
+    @pytest.mark.parametrize("prefix", ["a", "id", "5", "x_1", "v9"])
+    def test_a_near_pair_glued_to_an_identifier_minus_is_not_flagged(self, prefix):
+        la, lo = near_pair()
+        assert lines("%s%s, %s" % (prefix, fmt(lo), fmt(la))) == []
+
+    def test_the_glued_value_never_appears_in_output(self):
+        la, lo = far_pair()
+        out = repr(guard().scan_text("x.txt", "id%s, %s" % (fmt(lo), fmt(la))))
+        assert_not_printed(out, la, lo)
+
+    @staticmethod
+    def _unicode_minus(v):
+        # The same signed decimal string numbers() would otherwise see, with just its leading
+        # ASCII "-" swapped for U+2212 MINUS SIGN -- everything else about the text is identical
+        # to the ASCII-minus form already covered elsewhere in this file.
+        return fmt(v).replace("-", "−", 1)
+
+    def test_a_unicode_minus_sign_is_recognized_in_an_inline_pair(self):
+        la, lo = far_pair()
+        far = "%s, %s" % (self._unicode_minus(lo), fmt(la))
+        la_n, lo_n = near_pair()
+        near = "%s, %s" % (self._unicode_minus(lo_n), fmt(la_n))
+        assert lines(far) == [1]
+        assert lines(near) == []
+
+    def test_a_unicode_minus_sign_is_recognized_in_a_keyed_value(self):
+        far = '"lon_deg": %s' % self._unicode_minus(LON0 - FAR)
+        near = '"lon_deg": %s' % self._unicode_minus(LON0 - NEAR)
+        assert lines(far) == [1]
+        assert lines(near) == []
+
+    def test_a_unicode_minus_sign_is_recognized_in_an_array_pair(self):
+        la, lo = far_pair()
+        far = "[%s, %s]" % (self._unicode_minus(lo), fmt(la))
+        la_n, lo_n = near_pair()
+        near = "[%s, %s]" % (self._unicode_minus(lo_n), fmt(la_n))
+        assert lines(far) == [1]
+        assert lines(near) == []
+
+    def test_a_percent_encoded_comma_separator_is_recognized(self):
+        la, lo = far_pair()
+        far = "q=%s%%2C%s" % (fmt(la), fmt(lo))
+        near_la, near_lo = near_pair()
+        near = "q=%s%%2C%s" % (fmt(near_la), fmt(near_lo))
+        assert lines(far) == [1]
+        assert lines(near) == []
+
+    def test_a_bare_hemisphere_letter_alone_separates_a_sign_glued_pair(self):
+        # "<lat>N-<lon>W": no comma or space between the numbers at all, just the hemisphere
+        # letter, with the second number's sign now glued directly onto that letter.
+        la, lo = far_pair()
+        far = "%sN%sW" % (fmt(la), fmt(lo))
+        near_la, near_lo = near_pair()
+        near = "%sN%sW" % (fmt(near_la), fmt(near_lo))
+        assert lines(far) == [1]
+        assert lines(near) == []
+
+    def test_a_small_magnitude_array_pair_is_still_detected(self):
+        # Both axes under 1 degree in magnitude: still genuinely far via the fictional origin
+        # (tens of thousands of km away at these magnitudes), and array syntax is unambiguous
+        # enough not to need the >=1.0 floor the loose inline-pair form uses.
+        a, b = 0.5, 0.6
+        assert lines("[%s, %s]" % (fmt(a, 4), fmt(b, 4))) == [1]
+        # the equivalent bare (non-bracketed) pair intentionally keeps the floor
+        assert lines("%s, %s" % (fmt(a, 4), fmt(b, 4))) == []
 
 
 class TestAllowlist:
@@ -145,6 +263,18 @@ class TestAllowlist:
         assert list(CG.numbers(text)) == []
         allow = CG.load_allow(CG.ALLOW_FILE)
         assert allow and all(digests for digests in allow.values())
+
+    def test_the_allowlist_still_matches_a_value_written_with_a_glued_minus(self, tmp_path):
+        # The digest is computed from the parsed float value, not from the source text, so an
+        # entry keyed by a value that happens to have been written with a glued minus still
+        # matches once numbers() parses that value correctly.
+        la, lo = far_pair()
+        digest = CG.pair_digest(lo, la)
+        allow = tmp_path / "allow.txt"
+        allow.write_text("docs/x.md %s  # synthetic, not a coordinate\n" % digest)
+        g = CG.Guard((LAT0, LON0), allow=CG.load_allow(str(allow)))
+        assert g.scan_text("docs/x.md", "id%s, %s" % (fmt(lo), fmt(la))) == []
+        assert [f.line for f in g.scan_text("docs/y.md", "id%s, %s" % (fmt(lo), fmt(la)))] == [1]
 
 
 def _git(repo, *args):
@@ -220,14 +350,46 @@ class TestScanModes:
         assert rc == 1 and "a.txt:1:" in out
         assert_not_printed(out, la, lo)
 
-    def test_near_origin_values_and_binaries_pass(self, repo, capsys):
+    def test_near_origin_values_and_genuine_binaries_pass(self, repo, capsys):
         base = _git(repo, "rev-parse", "HEAD")
         la, lo = near_pair()
         _commit(repo, "near.txt", "%s, %s\n" % (fmt(la), fmt(lo)), "near")
-        far = "%s, %s" % tuple(fmt(v) for v in far_pair())
-        _commit(repo, "blob.bin", "\0" + far, "binary")
+        # Genuinely binary: dense NUL/high-byte content with no ASCII digit run anywhere in it,
+        # so this is a control for "binary content doesn't false-positive", not a test of the
+        # (removed) NUL-presence skip -- decoded with errors="replace" it has nothing
+        # coordinate-shaped for the regexes to find.
+        random_bytes = bytes((n * 137 + 41) % 256 for n in range(4096))
+        (repo / "blob.bin").write_bytes(random_bytes)
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", "binary")
         rc, out = run(capsys, repo, "range", base, "HEAD")
         assert rc == 0, out
+
+    def test_a_leading_nul_byte_no_longer_hides_a_far_pair(self, repo, capsys):
+        # A blob used to be dropped from scanning entirely on the mere presence of one NUL byte
+        # anywhere in its first 8KB, so a single stray/leading NUL in front of a real coordinate
+        # was a total, silent bypass. It no longer is: the NUL-presence heuristic was removed, so
+        # every blob under the size cap is scanned regardless of stray NUL bytes in it.
+        base = _git(repo, "rev-parse", "HEAD")
+        far = "%s, %s" % tuple(fmt(v) for v in far_pair())
+        _commit(repo, "blob.bin", "\0" + far, "one leading NUL, then a far pair")
+        rc, out = run(capsys, repo, "range", base, "HEAD")
+        assert rc == 1 and "blob.bin:1:" in out
+        assert_not_printed(out, *far_pair())
+
+    def test_an_oversized_blob_is_reported_as_skipped_not_silently_passed(self, repo, capsys):
+        # A blob over MAX_BLOB_BYTES is still not scanned (the cap exists to bound memory/CPU on
+        # an accidentally-huge blob), but that must never look identical to "nothing was there
+        # to find" -- the summary line now says a blob was excluded so a human reviewing a
+        # REQUIRED, admins-included check can see coverage was incomplete.
+        base = _git(repo, "rev-parse", "HEAD")
+        far = "%s, %s" % tuple(fmt(v) for v in far_pair())
+        padding = "x" * (CG.MAX_BLOB_BYTES + 1 - len(far))
+        _commit(repo, "huge.txt", padding + far, "oversized")
+        rc, out = run(capsys, repo, "range", base, "HEAD")
+        assert rc == 0, out
+        assert "1 blob(s) over %d bytes not scanned" % CG.MAX_BLOB_BYTES in out
+        assert_not_printed(out, *far_pair())
 
     def test_moving_the_origin_is_judged_against_the_base(self, repo, capsys):
         base = _git(repo, "rev-parse", "HEAD")
@@ -285,6 +447,49 @@ class TestScanModes:
     def test_an_empty_range_passes(self, repo, capsys):
         rc, out = run(capsys, repo, "range", "HEAD", "HEAD")
         assert rc == 0, out
+
+
+class TestWorkflow:
+    """Runs the coord-guard.yml step's actual shell script (bash -e, matching how GitHub Actions
+    invokes a `run:` block), not a re-typed copy of its logic, so this fails if the workflow's
+    behavior changes even without changing its wording."""
+
+    @staticmethod
+    def _step_script():
+        wf = yaml.safe_load((ROOT / ".github/workflows/coord-guard.yml").read_text())
+        for step in wf["jobs"]["coordinates"]["steps"]:
+            if step.get("name") == "every commit this event brings in":
+                return step["run"]
+        raise AssertionError("step not found")
+
+    def test_a_ref_deletion_push_exits_before_any_python_invocation(self, tmp_path):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        sentinel = tmp_path / "python-called"
+        stub = bin_dir / "python"
+        stub.write_text('#!/bin/sh\ntouch "%s"\nexit 9\n' % sentinel)
+        stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+        env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ.get("PATH", "")),
+                   EVENT="push", BEFORE="f" * 40, AFTER="0" * 40, PR_BASE="", PR_HEAD="")
+        proc = subprocess.run(["bash", "-e", "-c", self._step_script()],
+                              cwd=ROOT, env=env, capture_output=True, text=True)
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        assert not sentinel.exists(), "the guard's python entry point ran on a ref-deletion push"
+        assert "nothing to scan" in proc.stdout
+
+    def test_a_normal_push_still_reaches_python(self, tmp_path):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        sentinel = tmp_path / "python-called"
+        stub = bin_dir / "python"
+        stub.write_text('#!/bin/sh\ntouch "%s"\nexit 0\n' % sentinel)
+        stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+        env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ.get("PATH", "")),
+                   EVENT="push", BEFORE="", AFTER="f" * 40, PR_BASE="", PR_HEAD="")
+        proc = subprocess.run(["bash", "-e", "-c", self._step_script()],
+                              cwd=ROOT, env=env, capture_output=True, text=True)
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        assert sentinel.exists()
 
 
 @pytest.mark.skipif(not (ROOT / ".git").exists(), reason="not a git checkout")

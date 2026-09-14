@@ -47,6 +47,10 @@ jobs:
               python tools/coord_guard.py range "$PR_BASE" "$PR_HEAD"
               ;;
             push)
+              if [ "$AFTER" = "0000000000000000000000000000000000000000" ]; then
+                echo "coord_guard: ref deleted, nothing to scan"
+                exit 0
+              fi
               if have "$BEFORE" && git merge-base --is-ancestor "$BEFORE" "$AFTER"; then
                 python tools/coord_guard.py range "$BEFORE" "$AFTER"
               else
