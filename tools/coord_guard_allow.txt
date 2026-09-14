@@ -1,0 +1,24 @@
+# path digest  # reason. One exact value per entry: sha256 of the value(s) at 4 decimal places,
+# first 16 hex (tools/coord_guard.py --show-digests, locally). Never a whole path, never a value.
+tests/test_field_log.py 17cd00bd712f2758  # synthetic fixture
+tests/test_field_log.py 32a67b92c80af913  # synthetic fixture
+tests/test_field_log.py 8ef9c4e9cdd1943d  # synthetic fixture
+tests/test_geodesy.py eb9cc0b2ac77fc27  # public landmark round-trip
+tests/test_hear_tag_birdnet.py 3bd3f8a05479b510  # synthetic fixture
+tests/test_no_site_coordinates.py 0c0e80dc66ca22ad  # synthetic fixture
+tests/test_point.py 0839f33faf1f1008  # ENU metres, not degrees
+tests/test_point.py 42d0f72cb67f2d83  # ENU metres, not degrees
+tests/test_point.py 6ce0822bad179685  # ENU metres, not degrees
+tests/test_point.py ad7fcc0fff709f1b  # ENU metres, not degrees
+tests/test_point.py c91961ab944621d3  # ENU metres, not degrees
+tests/test_point.py cebf7d87e8ca0886  # ENU metres, not degrees
+tests/test_site_origin.py 3bd3f8a05479b510  # synthetic fixture
+tests/test_site_origin.py eb9cc0b2ac77fc27  # public landmark, synthetic site override
+tests/test_soundspeed.py 3e2dcc5e735b330c  # ENU metres, not degrees
+tests/test_soundspeed.py 6989857cd821664c  # ENU metres, not degrees
+tests/test_soundspeed.py 79e8a3c1b49169a9  # ENU metres, not degrees
+tests/test_spatial_pipeline.py 7c775a1810a5e505  # synthetic fixture
+tests/test_spatial_pipeline.py e564988a20ad606a  # synthetic fixture
+tests/test_spatial_pipeline.py ec0b9f68cb50f451  # synthetic fixture
+tests/test_survey.py cf16610c7217ee96  # synthetic fixture
+tools/field_log.py 814ed4d4cc5d6fdc  # synthetic fixture

@@ -1,0 +1,60 @@
+name: coordinate guard
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  coordinates:
+    name: no real-world coordinates in tree or history
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: tree
+        run: python tools/coord_guard.py tree
+
+      - name: every commit this event brings in
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after || github.sha }}
+        run: |
+          have() {
+            [ -n "$1" ] && [ "$1" != "0000000000000000000000000000000000000000" ] &&
+              git cat-file -e "$1^{commit}" 2>/dev/null
+          }
+          case "$EVENT" in
+            pull_request)
+              have "$PR_BASE" || git fetch --no-tags origin "$PR_BASE"
+              have "$PR_HEAD" || git fetch --no-tags origin "$PR_HEAD"
+              python tools/coord_guard.py range "$PR_BASE" "$PR_HEAD"
+              ;;
+            push)
+              if have "$BEFORE" && git merge-base --is-ancestor "$BEFORE" "$AFTER"; then
+                python tools/coord_guard.py range "$BEFORE" "$AFTER"
+              else
+                echo "no usable before-commit (new branch or forced push): scanning all history"
+                python tools/coord_guard.py range "" "$AFTER"
+              fi
+              ;;
+            *)
+              python tools/coord_guard.py range "" "$AFTER"
+              ;;
+          esac
