@@ -54,9 +54,13 @@ DEFAULT_SINCE = "2h"
 PMTK_STATUS_CLASSES: Tuple[str, ...] = (
     "esp32s3-i2s-gps",
     "esp32s3-speaker",
+    "esp32s3-box3",
     "puc-pps",
     "puc-ntp",
 )
+NO_GPS_STATUS_CLASSES: Tuple[str, ...] = ("puc-ntp",)
+NO_PPS_STATUS_CLASSES: Tuple[str, ...] = ("puc-ntp",)
+NO_SD_STATUS_CLASSES: Tuple[str, ...] = ("esp32s3-i2s-gps",)
 
 ENV_CREDENTIAL_PAIRS: Tuple[Tuple[str, str], ...] = (
     ("OPNSENSE_USERNAME", "OPNSENSE_PASSWORD"),
@@ -392,10 +396,28 @@ def parse_status(d: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _status_class(p: Mapping[str, Any]) -> str:
+    return _norm_name(str(p.get("class") or ""))
+
+
+def _gps_expected(p: Mapping[str, Any]) -> bool:
+    return _status_class(p) not in NO_GPS_STATUS_CLASSES
+
+
+def _pps_expected(p: Mapping[str, Any]) -> bool:
+    return _status_class(p) not in NO_PPS_STATUS_CLASSES
+
+
+def _sd_expected(p: Mapping[str, Any]) -> bool:
+    return _status_class(p) not in NO_SD_STATUS_CLASSES
+
+
 def _gps_fix_ok(p: Mapping[str, Any]) -> bool:
     # `gps.fix` is protocol-specific: PMTK boards report NMEA GGA fix quality (1 = a live fix)
     # while UBX boards report u-blox fixType (3 = 3D). One shared `< 3` rule marks every healthy
     # PMTK node degraded, which is exactly the bug PR #135 fixed in the firmware self-test.
+    if not _gps_expected(p):
+        return True
     fix = p.get("fix")
     if fix is None:
         return False
@@ -403,7 +425,7 @@ def _gps_fix_ok(p: Mapping[str, Any]) -> bool:
         n = int(fix)
     except (TypeError, ValueError):
         return False
-    node_class = _norm_name(str(p.get("class") or ""))
+    node_class = _status_class(p)
     return n >= 1 if node_class in PMTK_STATUS_CLASSES else n >= 3
 
 
@@ -416,19 +438,19 @@ def evaluate_health(target_name: str, status_data: Optional[Mapping[str, Any]],
     reasons: List[str] = []
     p = parse_status(status_data)
 
-    if not _gps_fix_ok(p):
+    if _gps_expected(p) and not _gps_fix_ok(p):
         reasons.append("fix=%s" % p["fix"])
     if p["time_valid"] is not True:
         reasons.append("no UTC anchor")
-    if p["pps_edges"] is None or p["pps_edges"] == 0:
+    if _pps_expected(p) and (p["pps_edges"] is None or p["pps_edges"] == 0):
         reasons.append("timebase never locked")
-    if p["pps_glitches"] and p["pps_glitches"] > 0:
+    if _pps_expected(p) and p["pps_glitches"] and p["pps_glitches"] > 0:
         reasons.append("%d pps glitch(es)" % p["pps_glitches"])
     if p["rssi"] is not None and p["rssi"] < -80:
         reasons.append("rssi=%d dBm" % p["rssi"])
-    if p["sd"] is False:
+    if _sd_expected(p) and p["sd"] is False:
         reasons.append("no SD card")
-    elif p["sd_free_mb"] is not None and p["sd_free_mb"] < 100:
+    elif _sd_expected(p) and p["sd_free_mb"] is not None and p["sd_free_mb"] < 100:
         reasons.append("%d MB free" % p["sd_free_mb"])
 
     reported_node = str(status_data.get("node") or target_name)

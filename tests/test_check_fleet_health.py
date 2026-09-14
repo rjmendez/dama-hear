@@ -235,6 +235,24 @@ class TestHealthEvaluation:
         assert r["state"] == "online"
         assert all("fix=" not in why for why in r["reasons"])
 
+    def test_a_box3_fix_quality_of_one_is_not_flagged_as_bad_fix(self):
+        r = H.evaluate_health("box", self._status(**{
+            "class": "esp32s3-box3",
+            "gps": {"fix": 1, "sats": 7, "tacc_ns": None},
+        }))
+        assert r["state"] == "online"
+        assert all("fix=" not in why for why in r["reasons"])
+
+    def test_an_ntp_only_puc_is_not_marked_degraded_for_missing_gps_or_pps(self):
+        r = H.evaluate_health("puc", self._status(**{
+            "class": "puc-ntp",
+            "gps": {},
+            "pps": {},
+        }))
+        assert r["state"] == "online"
+        assert all("fix=" not in why for why in r["reasons"])
+        assert all("timebase never locked" not in why for why in r["reasons"])
+
     def test_invalid_time_is_degraded(self):
         r = H.evaluate_health("n", self._status(time={"valid": False, "label_rejects": 4}))
         assert r["state"] == "degraded"
@@ -265,6 +283,16 @@ class TestHealthEvaluation:
         r = H.evaluate_health("n", self._status(sd=False, sd_free_mb=None))
         assert r["state"] == "degraded"
         assert "no SD card" in r["reasons"]
+
+    def test_a_minimal_i2s_node_is_not_degraded_for_lacking_sd(self):
+        r = H.evaluate_health("gold", self._status(**{
+            "class": "esp32s3-i2s-gps",
+            "sd": False,
+            "sd_free_mb": None,
+            "gps": {"fix": 1, "sats": 7, "tacc_ns": None},
+        }))
+        assert r["state"] == "online"
+        assert "no SD card" not in r["reasons"]
 
     def test_low_sd_free_space_is_degraded(self):
         r = H.evaluate_health("n", self._status(sd=True, sd_free_mb=10))

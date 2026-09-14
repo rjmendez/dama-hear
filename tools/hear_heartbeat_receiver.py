@@ -149,7 +149,7 @@ def _require_bool(payload: Mapping[str, Any], key: str) -> bool:
     return value
 
 
-def _validate_common(payload: Any, telemetry_path: str) -> Dict[str, Any]:
+def _validate_common(payload: Any, telemetry_path: str, *, require_gps: bool = True) -> Dict[str, Any]:
     body = _require_object(payload, "payload")
     if body.get("telemetry_path") != telemetry_path:
         raise RequestError(f"telemetry_path must be {telemetry_path!r}")
@@ -160,8 +160,13 @@ def _validate_common(payload: Any, telemetry_path: str) -> Dict[str, Any]:
     _require_ident(body, "fw_version", _FW_RE, "firmware id")
     _require_int(body, "uptime_s")
 
-    gps = _require_object(body.get("gps"), "gps")
-    _require_int(gps, "fix")
+    # Heartbeats carry the node's current GPS-fix figure; advisory event payloads do NOT, and the
+    # firmware serializer in hear_push_payload.h intentionally keeps them that small. Reading
+    # `gps.fix` out of every telemetry path therefore rejects the event shape the fleet actually
+    # emits, which is exactly the "field exists everywhere" bug this receiver exists to keep out.
+    if require_gps:
+        gps = _require_object(body.get("gps"), "gps")
+        _require_int(gps, "fix")
 
     time_state = _require_object(body.get("time"), "time")
     time_valid = _require_bool(time_state, "valid")
@@ -176,7 +181,7 @@ def _validate_common(payload: Any, telemetry_path: str) -> Dict[str, Any]:
 
 
 def validate_heartbeat_payload(payload: Any) -> Dict[str, Any]:
-    body = _validate_common(payload, "hear/heartbeat")
+    body = _validate_common(payload, "hear/heartbeat", require_gps=True)
     counters = _require_object(body.get("counters"), "counters")
     for key in ("scene_rows_written", "dets_rows_written", "clips_written", "clips_evicted"):
         _require_int(counters, key)
@@ -188,7 +193,7 @@ def validate_heartbeat_payload(payload: Any) -> Dict[str, Any]:
 
 
 def validate_event_payload(payload: Any) -> Dict[str, Any]:
-    body = _validate_common(payload, "hear/event")
+    body = _validate_common(payload, "hear/event", require_gps=False)
     event_type = _require_string(body, "event_type")
     if event_type not in _EVENT_TYPES:
         raise RequestError("event_type must be one of %s" % ", ".join(sorted(_EVENT_TYPES)))

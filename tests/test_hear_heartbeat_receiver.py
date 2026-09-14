@@ -84,7 +84,6 @@ class TestValidation:
             "class": "xiao-s3-pps",
             "fw_version": "7f84d29",
             "uptime_s": 12349,
-            "gps": {"fix": 3},
             "time": {"valid": True},
             "event_type": "clip_written",
             "event_seq": 234,
@@ -127,6 +126,10 @@ class TestValidation:
     def test_event_requires_a_nested_event_object(self):
         with pytest.raises(HR.RequestError, match="event must be an object"):
             HR.validate_event_payload(self._event(event="clip_written"))
+
+    def test_event_payload_does_not_require_a_gps_block(self):
+        got = HR.validate_event_payload(self._event())
+        assert got["event_type"] == "clip_written"
 
     def test_unknown_event_type_is_rejected(self):
         with pytest.raises(HR.RequestError, match="event_type"):
