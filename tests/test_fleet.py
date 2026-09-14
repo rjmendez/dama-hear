@@ -44,7 +44,8 @@ class TestDriftReport:
 
     @staticmethod
     def _status(fw, node="n", sats=20, fix=3):
-        return {"node": node, "fw": fw, "uptime_s": 100, "sd": True, "sd_free_mb": 30000,
+        return {"node": node, "class": "xiao-s3-pps", "fw": fw, "uptime_s": 100, "sd": True,
+                "sd_free_mb": 30000,
                 "gps": {"fix": fix, "sats": sats, "tacc_ns": 26},
                 "pps": {"edges": 99, "spread_us": 4, "glitches": 0},
                 "time": {"valid": True, "label_rejects": 0},
@@ -114,6 +115,12 @@ class TestTheSplitGate(TestDriftReport):
         # ⚠️the gate is for the split ALONE. A node still acquiring must not fail a scheduled run.
         assert self._rc({"a=1": self._status("x", "a"),
                          "b=2": self._status("x", "b", sats=0, fix=0)}, monkeypatch) == 0
+
+    def test_a_pmtk_fix_quality_of_one_is_not_called_out(self, capsys, monkeypatch):
+        out = self._run(capsys, {"gold=1": self._status("8b9d5b1", "gold", sats=6, fix=1) | {
+            "class": "esp32s3-i2s-gps"
+        }}, monkeypatch)
+        assert "\n  gold      fix 1" not in out
 
     def test_an_unreachable_node_makes_the_gate_inconclusive(self, capsys, monkeypatch):
         # ⚠️THE REGRESSION. A split/canary build hidden behind a refused /status must not pass as

@@ -51,6 +51,12 @@ DEFAULT_TIMEOUT_S = 15.0
 DEFAULT_RETRIES = 2
 DEFAULT_BACKOFF_S = 1.5
 DEFAULT_SINCE = "2h"
+PMTK_STATUS_CLASSES: Tuple[str, ...] = (
+    "esp32s3-i2s-gps",
+    "esp32s3-speaker",
+    "puc-pps",
+    "puc-ntp",
+)
 
 ENV_CREDENTIAL_PAIRS: Tuple[Tuple[str, str], ...] = (
     ("OPNSENSE_USERNAME", "OPNSENSE_PASSWORD"),
@@ -360,6 +366,7 @@ def split_target(target: str, resolved_map: Optional[Mapping[str, str]] = None) 
 
 
 def parse_status(d: Mapping[str, Any]) -> Dict[str, Any]:
+    node_class = _first(d, (("class",), ("node_class",)))
     fix = _first(d, (("gps", "fix"), ("gps_fix",), ("fix",)))
     sats = _first(d, (("gps", "sats"), ("gps", "satellites"), ("gps_sats",), ("sats",)))
     tacc_ns = _first(d, (("gps", "tacc_ns"), ("gps_tacc_ns"), ("tacc_ns",)))
@@ -371,6 +378,7 @@ def parse_status(d: Mapping[str, Any]) -> Dict[str, Any]:
     sd = _first(d, (("sd",),))
     sd_free_mb = _first(d, (("sd_free_mb",),))
     return {
+        "class": node_class,
         "fix": fix,
         "sats": sats,
         "tacc_ns": tacc_ns,
@@ -384,6 +392,21 @@ def parse_status(d: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _gps_fix_ok(p: Mapping[str, Any]) -> bool:
+    # `gps.fix` is protocol-specific: PMTK boards report NMEA GGA fix quality (1 = a live fix)
+    # while UBX boards report u-blox fixType (3 = 3D). One shared `< 3` rule marks every healthy
+    # PMTK node degraded, which is exactly the bug PR #135 fixed in the firmware self-test.
+    fix = p.get("fix")
+    if fix is None:
+        return False
+    try:
+        n = int(fix)
+    except (TypeError, ValueError):
+        return False
+    node_class = _norm_name(str(p.get("class") or ""))
+    return n >= 1 if node_class in PMTK_STATUS_CLASSES else n >= 3
+
+
 def evaluate_health(target_name: str, status_data: Optional[Mapping[str, Any]],
                     err: Optional[Exception] = None) -> Dict[str, Any]:
     if status_data is None:
@@ -393,7 +416,7 @@ def evaluate_health(target_name: str, status_data: Optional[Mapping[str, Any]],
     reasons: List[str] = []
     p = parse_status(status_data)
 
-    if p["fix"] is None or p["fix"] < 3:
+    if not _gps_fix_ok(p):
         reasons.append("fix=%s" % p["fix"])
     if p["time_valid"] is not True:
         reasons.append("no UTC anchor")

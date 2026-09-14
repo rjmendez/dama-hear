@@ -60,6 +60,7 @@ OFFLINE_VERIFICATION = (
 # cries wolf is worse than no tool.
 SCENE_MB_PER_H = 335 * (3600 / 1.024) / 1e6      # 1.18 MB/h
 SCENE_HEADROOM_H = 14.0                           # scene-row hours the card must hold if the drain stops
+PMTK_STATUS_CLASSES = {"esp32s3-i2s-gps", "esp32s3-speaker", "puc-pps", "puc-ntp"}
 
 
 def split_target(node: str) -> tuple:
@@ -115,6 +116,19 @@ def row(name: str, d: Dict) -> str:
                a["detections"], d["gate"]["floor"], a["ambient"],
                "?" if rssi is None else rssi, n.get("disc", "?"),
                d.get("sd_free_mb", "?"), "" if d["sd"] else "NO CARD"))
+
+
+def gps_fix_ok(d: Dict) -> bool:
+    # `gps.fix` is not one scale fleet-wide: PMTK nodes report raw NMEA GGA fix quality
+    # (`esp32s3-i2s-gps`/`esp32s3-speaker`/PUC, 1 = a live fix) while UBX nodes report u-blox
+    # fixType (`xiao-s3-*`, 3 = 3D). A universal `fix != 3` warning falsely condemns healthy PMTK
+    # nodes even when the firmware itself would call them fixed.
+    gps = d.get("gps") or {}
+    try:
+        fix = int(gps.get("fix"))
+    except (TypeError, ValueError):
+        return False
+    return fix >= 1 if str(d.get("class") or "").strip().lower() in PMTK_STATUS_CLASSES else fix >= 3
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -176,7 +190,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             why = []
             if not d["time"]["valid"]:
                 why.append("no UTC anchor")
-            if d["gps"]["fix"] != 3:
+            if not gps_fix_ok(d):
                 why.append("fix %d" % d["gps"]["fix"])
             if not d["sd"]:
                 why.append("no SD card")

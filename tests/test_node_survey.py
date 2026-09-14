@@ -48,6 +48,14 @@ class TestEpochFiltering:
                "2,3,20,40.1,-76.1,200,234,1.0,1.5\n")
         assert len(NS.epochs(csv)) == 1
 
+    def test_pmtk_health_uses_gga_fix_quality_not_ubx_fix_type(self):
+        csv = ("utc_us,fix,sats,lat,lon,hell_m,hmsl_m,hacc_m,vacc_m,ubx_pvt\n"
+               "1,1,8,40.1,-76.1,200,234,1.0,1.5,0\n"
+               "2,6,8,40.2,-76.2,200,234,1.0,1.5,0\n")
+        rows = NS.epochs(csv)
+        assert len(rows) == 1
+        assert rows[0]["lat"] == pytest.approx(40.1)
+
 
 class TestSigmaIsNotTheEpochScatter:
     """The heart of it. 8 hours of 30 s epochs with a slow 2 m wander and no white noise.
@@ -263,4 +271,3 @@ class TestHeightProvenanceIsWritten:
         assert rc == 3 and not out.exists()
         err = capsys.readouterr().err
         assert "b=nan" in err and "c=inf" in err, "every bad pair is named"
-

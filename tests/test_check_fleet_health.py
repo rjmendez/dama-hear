@@ -139,7 +139,11 @@ class TestStatusParsing:
         return base
 
     def test_gps_fix_and_satellites_are_read(self):
-        s = H.parse_status(self._status(gps={"fix": 3, "sats": 14, "tacc_ns": 40}))
+        s = H.parse_status(self._status(**{
+            "class": "xiao-s3-pps",
+            "gps": {"fix": 3, "sats": 14, "tacc_ns": 40},
+        }))
+        assert s["class"] == "xiao-s3-pps"
         assert s["fix"] == 3
         assert s["sats"] == 14
         assert s["tacc_ns"] == 40
@@ -222,6 +226,14 @@ class TestHealthEvaluation:
         r = H.evaluate_health("n", self._status(gps={"fix": 0, "sats": 0, "tacc_ns": None}))
         assert r["state"] == "degraded"
         assert any("fix" in why for why in r["reasons"])
+
+    def test_a_pmtk_fix_quality_of_one_is_not_flagged_as_bad_fix(self):
+        r = H.evaluate_health("gold", self._status(**{
+            "class": "esp32s3-i2s-gps",
+            "gps": {"fix": 1, "sats": 7, "tacc_ns": None},
+        }))
+        assert r["state"] == "online"
+        assert all("fix=" not in why for why in r["reasons"])
 
     def test_invalid_time_is_degraded(self):
         r = H.evaluate_health("n", self._status(time={"valid": False, "label_rejects": 4}))
