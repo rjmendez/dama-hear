@@ -29,6 +29,11 @@ def fmt(v, places=6):
     return "%.*f" % (places, v)
 
 
+def fmtc(v, places=4):
+    """European decimal-comma spelling of fmt()."""
+    return fmt(v, places).replace(".", ",")
+
+
 def far_pair():
     return LAT0 + FAR / 3, LON0 - FAR
 
@@ -43,6 +48,10 @@ def guard(**kw):
 
 def lines(text, **kw):
     return [f.line for f in guard(**kw).scan_text("x.txt", text)]
+
+
+def kinds(text, **kw):
+    return [f.kind for f in guard(**kw).scan_text("x.txt", text)]
 
 
 def assert_not_printed(out, *values):
@@ -238,6 +247,202 @@ class TestSignParsing:
         assert lines("[%s, %s]" % (fmt(0.25, 4), fmt(0.75, 4))) == []
         assert lines("bounds = [%s, %s, 1]" % (fmt(0.1234), fmt(0.5678))) == []
         assert lines("clip: [%s, %s]" % (fmt(-0.0125), fmt(0.0125))) == []
+
+
+def iso_num(v, int_width=None):
+    """"+DD.DDDD" / "-DD.DDDD" -- an ISO 6709-style signed number, optionally zero-padded to
+    `int_width` integer digits (for the zero-padded-longitude form)."""
+    s = fmt(abs(v))
+    if int_width:
+        intpart, _, frac = s.partition(".")
+        s = intpart.zfill(int_width) + "." + frac
+    return ("+" if v >= 0 else "-") + s
+
+
+class TestRemainingGaps:
+    """Each of gaps 1-8 from the coord_guard follow-up: a detection test and, where the gap is
+    about narrowing rather than widening detection, a false-positive control."""
+
+    # -- gap 1: ISO 6709 strings ---------------------------------------------
+
+    def test_an_iso6709_pair_is_detected(self):
+        la, lo = far_pair()
+        assert kinds("%s%s/" % (iso_num(la), iso_num(lo))) == ["iso 6709 pair"]
+
+    def test_an_iso6709_pair_with_an_altitude_is_detected_once(self):
+        la, lo = far_pair()
+        text = "%s%s+123.456/" % (iso_num(la), iso_num(lo))
+        assert kinds(text) == ["iso 6709 pair"]
+
+    def test_an_iso6709_altitude_with_four_decimals_does_not_form_a_second_pair(self):
+        # The altitude in the previous test has only 3 fractional digits, below this guard's own
+        # 4-digit floor, so it is never even tokenized as a number -- this pins down that a 4+
+        # decimal third component still doesn't pair a second time against the longitude.
+        la, lo = far_pair()
+        alt = LAT0 + 5.0
+        text = "%s%s%s/" % (iso_num(la), iso_num(lo), iso_num(alt))
+        assert kinds(text) == ["iso 6709 pair"]
+
+    def test_an_iso6709_pair_with_a_zero_padded_longitude_is_detected(self):
+        la, lo = far_pair()
+        assert kinds("%s%s/" % (iso_num(la), iso_num(lo, int_width=3))) == ["iso 6709 pair"]
+
+    def test_an_iso6709_near_pair_passes(self):
+        la, lo = near_pair()
+        assert lines("%s%s/" % (iso_num(la), iso_num(lo))) == []
+
+    def test_an_unsigned_first_number_is_not_read_as_iso6709(self):
+        # The glued "-" is still the second number's sign (numbers()'s rule), but with no
+        # explicit sign on the FIRST number this is a hyphenated range, not ISO 6709 -- gap 8
+        # covers what happens to it, not an "iso 6709 pair" finding here.
+        la, lo = far_pair()
+        text = "%s%s" % (fmt(abs(la)), iso_num(-abs(lo)))
+        assert "iso 6709 pair" not in kinds(text)
+
+    # -- gap 2: a leading '+' is a sign, unless glued to an identifier --------
+
+    def test_a_leading_plus_is_a_sign_in_an_inline_pair(self):
+        la, lo = far_pair()
+        assert lines("+%s, %s" % (fmt(la), fmt(lo))) == [1]
+        la, lo = near_pair()
+        assert lines("+%s, %s" % (fmt(la), fmt(lo))) == []
+
+    def test_a_leading_plus_is_a_sign_in_a_keyed_value(self):
+        la, lo = far_pair()
+        assert lines("lat: +%s\nlon: +%s" % (fmt(la), fmt(lo))) == [1]
+
+    def test_a_leading_plus_is_a_sign_in_an_array_pair(self):
+        la, lo = far_pair()
+        assert lines("[+%s, %s]" % (fmt(la), fmt(lo))) == [1]
+
+    def test_a_plus_glued_to_an_identifier_is_not_consumed_as_a_sign(self):
+        # "+" only counts as a sign when it is not itself glued to a preceding
+        # letter/digit/underscore/dot -- unlike "-", which always does (numbers()'s rule).
+        la, _ = far_pair()
+        v = abs(la)
+        unglued = list(CG.numbers(" +%s" % fmt(v)))
+        glued = list(CG.numbers("x+%s" % fmt(v)))
+        assert unglued[0][0] == 1  # "+" consumed: the token starts at the sign
+        assert glued[0][0] == 2  # "+" left alone: the token starts at the digit
+
+    # -- gap 3: '|' and '_' separators; '/' stays excluded --------------------
+
+    @pytest.mark.parametrize("sep", ["|", "_"])
+    def test_a_pipe_or_underscore_separator_is_recognized(self, sep):
+        la, lo = far_pair()
+        assert lines("%s%s%s" % (fmt(la), sep, fmt(lo))) == [1]
+        la, lo = near_pair()
+        assert lines("%s%s%s" % (fmt(la), sep, fmt(lo))) == []
+
+    def test_a_slash_separator_stays_excluded(self):
+        # Measured and rejected: adding '/' introduced far-candidate-only findings scanning this
+        # repo's own history (ratios/fractions in prose) as well as two external corpora -- see
+        # the PR body for the counts. This pins the existing "{a} / {b}" exclusion to a gap-3
+        # decision, not just an untouched default.
+        la, lo = far_pair()
+        assert lines("%s / %s" % (fmt(la), fmt(lo))) == []
+
+    # -- gap 4: glued hemisphere form <lat>N<lon>E -----------------------------
+
+    def test_a_glued_hemisphere_pair_is_detected(self):
+        la, lo = far_pair()
+        ns, ew = ("N" if la >= 0 else "S"), ("E" if lo >= 0 else "W")
+        assert lines("%s%s%s%s" % (fmt(abs(la)), ns, fmt(abs(lo)), ew)) == [1]
+        la, lo = near_pair()
+        ns, ew = ("N" if la >= 0 else "S"), ("E" if lo >= 0 else "W")
+        assert lines("%s%s%s%s" % (fmt(abs(la)), ns, fmt(abs(lo)), ew)) == []
+
+    def test_the_reverted_lowercase_zero_width_hemisphere_form_stays_unflagged(self):
+        # Gap 4 is uppercase-only and needs BOTH hemisphere letters -- this is the form that was
+        # tried and reverted before: a lowercase unit-suffix letter must not turn a plain range
+        # into a pair.
+        assert lines("1.2345s-2.3456s") == []
+        assert lines("12.3456n-14.5678n") == []
+
+    def test_a_single_hemisphere_letter_is_not_the_glued_form(self):
+        la, lo = far_pair()
+        assert "glued hemisphere pair" not in kinds("%sN%s" % (fmt(abs(la)), fmt(abs(lo))))
+
+    # -- gap 5: decimal-comma coordinates --------------------------------------
+
+    def test_a_decimal_comma_keyed_pair_is_detected(self):
+        la, lo = far_pair()
+        assert lines("lat: %s\nlon: %s" % (fmtc(la), fmtc(lo))) == [1]
+        la, lo = near_pair()
+        assert lines("lat: %s\nlon: %s" % (fmtc(la), fmtc(lo))) == []
+
+    @pytest.mark.parametrize("template", ["{a}N {b}E", "N{a} E{b}"])
+    def test_a_decimal_comma_hemisphere_pair_is_detected(self, template):
+        la, lo = far_pair()
+        text = template.format(a=fmtc(abs(la)), b=fmtc(abs(lo)))
+        assert lines(text) == [1]
+
+    @pytest.mark.parametrize("sep", [";", "\t", " "])
+    def test_a_decimal_comma_pair_joined_by_separator_is_detected(self, sep):
+        la, lo = far_pair()
+        assert lines("%s%s%s" % (fmtc(la), sep, fmtc(lo))) == [1]
+        la, lo = near_pair()
+        assert lines("%s%s%s" % (fmtc(la), sep, fmtc(lo))) == []
+
+    def test_bare_decimal_comma_lists_stay_unflagged(self):
+        # No coordinate context (no key, no hemisphere letter, no ;/tab/whitespace pairing) --
+        # these must read as plain integer/CSV lists, not coordinates.
+        assert lines("[12,3456]") == []
+        assert lines("12,3456,7890") == []
+        la, lo = far_pair()
+        assert lines("%s,%s" % (fmtc(la), fmtc(lo))) == []
+
+    def test_a_capitalized_word_after_a_decimal_comma_number_is_not_a_hemisphere_letter(self):
+        # The hemisphere letter must be a bare letter, not the first letter of a longer word --
+        # this false positive was found scanning an external corpus during development.
+        la, _ = far_pair()
+        assert lines("%s North" % fmtc(abs(la))) == []
+        assert lines("West %s" % fmtc(abs(la))) == []
+
+    # -- gap 6: double percent-encoding ----------------------------------------
+
+    @pytest.mark.parametrize("double", ["%252C", "%253B"])
+    def test_a_double_percent_encoded_separator_is_recognized(self, double):
+        la, lo = far_pair()
+        assert lines("q=%s%s%s" % (fmt(la), double, fmt(lo))) == [1]
+        near_la, near_lo = near_pair()
+        assert lines("q=%s%s%s" % (fmt(near_la), double, fmt(near_lo))) == []
+
+    def test_double_percent_decoding_does_not_shift_a_later_line_number(self):
+        la, lo = far_pair()
+        text = "q=1%%252C2\nkeep\n%s%%252C%s" % (fmt(la), fmt(lo))
+        assert lines(text) == [3]
+
+    # -- gap 7: sub-degree pairs need a coordinate context ---------------------
+
+    def test_a_sub_degree_keyed_pair_is_detected(self):
+        # Confirms keyed values already skip the >=1.0 magnitude floor that array/inline pairs
+        # keep (test_a_small_magnitude_array_pair_is_not_flagged) -- no code change needed here,
+        # just this test.
+        assert lines("lat: %s\nlon: %s" % (fmt(0.1234), fmt(0.5678))) == [1]
+
+    def test_a_sub_degree_pair_with_a_hemisphere_letter_is_detected(self):
+        assert lines("%sN %sW" % (fmt(0.1234), fmt(0.5678))) == [1]
+
+    def test_a_sub_degree_iso6709_pair_is_detected(self):
+        assert lines("+%s-%s/" % (fmt(0.1234), fmt(0.5678))) == [1]
+
+    def test_a_bare_sub_degree_inline_pair_is_not_flagged(self):
+        # No key, no hemisphere letter, no ISO sign -- same >=1.0 floor as the array form, just
+        # without brackets.
+        assert lines("%s, %s" % (fmt(0.1234), fmt(0.5678))) == []
+
+    # -- gap 8: a hyphenated range must not also pair with what follows -------
+
+    def test_a_hyphenated_range_does_not_pair_with_a_following_number(self):
+        la, lo = far_pair()
+        extra = LAT0 + 0.7
+        text = "%s-%s, %s" % (fmt(abs(la)), fmt(abs(lo)), fmt(extra))
+        assert lines(text) == []
+
+    def test_a_three_number_hyphen_chain_does_not_over_pair(self):
+        a, b, c = LAT0 + 10.0, LAT0 + 11.0, LAT0 + 12.0
+        assert lines("%s-%s-%s" % (fmt(a), fmt(b), fmt(c))) == []
 
 
 class TestAllowlist:

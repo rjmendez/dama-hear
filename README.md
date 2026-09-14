@@ -64,16 +64,26 @@ runners:
 Every push to any branch and every pull request also runs `.github/workflows/coord-guard.yml`.
 This repo is public and the site's real position must never be in it, so `tools/coord_guard.py`
 fails on any decimal latitude/longitude pair, or `lat`/`lon`-keyed value, with at least four
-decimal places that lies more than 25 km from `survey.json`'s fictional origin. It checks the
-tree and also every file each incoming commit adds or changes. A commit that adds a coordinate
-and a later one that removes it still fails, because the history is published too. It prints
-commit, path and line, never the value. Build test coordinates as offsets from the fictional
-origin. The real origin comes only from `HEAR_SITE_ORIGIN`. `tools/coord_guard_allow.txt`
-(`path digest  # reason`) is for numbers that are not coordinates at all. Take the digest from a
-local `--show-digests` run, never from CI. Every file under a couple of megabytes is scanned as
-text, binary-looking content included, so a stray non-text byte in front of a coordinate can't
-hide it. A blob over that size is never scanned, and the run fails over it, naming the commit and
-path but never its content, rather than passing on incomplete coverage.
+decimal places that lies more than 25 km from `survey.json`'s fictional origin. Besides a plain
+`lat, lon` pair it also reads: an ISO 6709 string (`+DD.DDDD-DDD.DDDD/`, altitude and zero-padded
+longitude included); a leading `+` sign, not just `-`; `|` and `_` as pair separators alongside
+`,`/`;`/whitespace (`/` stays excluded -- it matches ratios and fractions in ordinary prose too
+often, measured against this repo's own history and two external corpora); the glued hemisphere
+form `<lat>N<lon>E`/`<lat>S<lon>W` (uppercase only, both letters required); European decimal-comma
+coordinates (`DD,DDDD`), but only next to a key, a hemisphere letter, or a `;`/tab/whitespace pair
+-- a bare `12,3456` stays a CSV/list value; and a doubly percent-encoded separator (`%252C`,
+`%253B`). A sub-degree pair (both axes under 1) is only flagged with one of those same coordinate
+contexts -- a key, a hemisphere letter, or an ISO 6709 sign -- so a bare config array or inline
+pair like `[0.25, 0.75]` still passes. It checks the tree and also every file each incoming commit
+adds or changes. A commit that adds a coordinate and a later one that removes it still fails,
+because the history is published too. It prints commit, path and line, never the value. Build test
+coordinates as offsets from the fictional origin. The real origin comes only from
+`HEAR_SITE_ORIGIN`. `tools/coord_guard_allow.txt` (`path digest  # reason`) is for numbers that
+are not coordinates at all. Take the digest from a local `--show-digests` run, never from CI.
+Every file under a couple of megabytes is scanned as text, binary-looking content included, so a
+stray non-text byte in front of a coordinate can't hide it. A blob over that size is never
+scanned, and the run fails over it, naming the commit and path but never its content, rather than
+passing on incomplete coverage.
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the `hear_node` images
 for each supported board class, their `.elf`, `build-info.json` and `SHA256SUMS` as a GitHub
