@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 314295 B serialised; 314473 B of annotations against a 262144 B cap.
+# apply-mode server: 314684 B serialised; 314862 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'ac96fa8'
+    dama-hear/commit: '2e1d2e2'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '314295'
+    dama-hear/serialised-bytes: '314684'
 data:
   hear__init__.py: |
     
@@ -4173,7 +4173,10 @@ data:
         if not body:
             return False
         fetched = len(body)
-        if tail:
+        # /sd serves the whole file when it is no longer than the tail asked for -- a small file, or
+        # one that rolled between /ls and /sd -- and then the first line is the file's own header.
+        whole_response = bool(tail) and (fetched < tail or body.startswith((b"node,", b"utc_us,")))
+        if tail and not whole_response:
             rows = body[body.index(b"\n") + 1:]
             body = (header.encode() + b"\n" + rows) if header else rows
         else:
@@ -4182,6 +4185,8 @@ data:
                       "archived": archive(pl.root, node, name, body, stamp)})
         if rolled:
             entry["rolled"] = True
+        if whole_response:
+            entry["whole_response"] = True
         out["files"].append(entry)
         if size_now is None:
             return False
