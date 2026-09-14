@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-mqtt-bridge-code.yaml
-# apply-mode client: 22379 B serialised; 22556 B of annotations against a 262144 B cap.
+# apply-mode client: 23369 B serialised; 23546 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-mqtt-bridge
   annotations:
-    dama-hear/commit: '1d6f9e7'
+    dama-hear/commit: '7bb1627'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '22379'
+    dama-hear/serialised-bytes: '23369'
 data:
   tools_hear_heartbeat_receiver.py: |
     #!/usr/bin/env python3
@@ -397,6 +397,7 @@ data:
     import logging
     import os
     import sys
+    from datetime import datetime, timezone
     from typing import Any, Callable, Dict, Optional, Tuple
     
     import paho.mqtt.client as mqtt
@@ -469,10 +470,25 @@ data:
         validator, writer_name = route
     
         try:
+            # batch_ingest/forwarder normalize the transport timestamp to numeric
+            # milliseconds. The Redis contract uses an RFC3339 string.
+            # Seconds, like the receiver's own timestamps; sub-second precision stays in ts_ms.
+            ts = payload.get("ts")
+            if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+                payload = dict(payload)
+                payload["ts"] = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(
+                    timespec="seconds").replace("+00:00", "Z")
             body = validator(payload)
         except RequestError as exc:
             stats.rejected += 1
             logger.warning("rejected %s message on %s: %s", payload.get("telemetry_path"), topic, exc)
+            return None
+        except (ValueError, OverflowError, OSError) as exc:
+            # A numeric ts outside what datetime can represent (inf, NaN, absurd magnitudes) is a bad
+            # message, not a reason to stop the bridge.
+            stats.rejected += 1
+            logger.warning("rejected %s message on %s: unusable numeric ts: %s",
+                           payload.get("telemetry_path"), topic, exc)
             return None
     
         writer: Callable[[Dict[str, Any]], Dict[str, Any]] = getattr(store, writer_name)
