@@ -153,15 +153,21 @@ def clamp_band(band: Tuple[float, float], d: float, c: float,
     return (lo, min(hi, limit))
 
 
-def physically_possible(tau: float, d: float, c: float, tol_s: float = 0.0) -> bool:
+def physically_possible(tau: float, d: float, c: float, tol_s: float = 0.0,
+                        sigma_c: float = 0.0) -> bool:
     """|tau| <= d/c. The bound a plane wave cannot exceed, whatever the direction of arrival.
 
     `tol_s` allows for the correlator's own quantisation (half a sample) so that a true endfire
     arrival, which sits exactly on the bound, is not rejected for a rounding.
+    `sigma_c` expands the timing bound by (d / c^2) * sigma_c to account for speed of sound uncertainty.
     """
     if d <= 0.0:
         raise ValueError("spacing must be > 0 m (got %r)" % d)
-    return abs(float(tau)) <= float(d) / float(c) + float(tol_s)
+    c_val = float(c)
+    bound_s = float(d) / c_val + float(tol_s)
+    if sigma_c > 0.0:
+        bound_s += (float(d) / (c_val * c_val)) * float(sigma_c)
+    return abs(float(tau)) <= bound_s
 
 
 # ── geometry helpers ────────────────────────────────────────────────────────────────────────────
