@@ -30,63 +30,133 @@ EARTH_KM = 6371.0088
 ZERO_SHA = "0" * 40
 ALLOW_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coord_guard_allow.txt")
 
-_NUM = r"(-?\d{1,3}\.\d{4,})(?!\d|[eE][-+]?\d)"
-FRACTION = re.compile(r"\.\d{4,}(?!\d|[eE][-+]?\d)")
+_SIGN = r"(?:-|(?<![A-Za-z0-9_.])\+)?"
+_NUM = r"(" + _SIGN + r"\d{1,3}\.\d{4,})(?!\d|[eE][-+]?\d)"
+_NUM_ANY = r"(" + _SIGN + r"\d{1,3}[.,]\d{4,})(?!\d|[eE][-+]?\d)"
+# No exponent lookahead here: hemisphere forms need "N<lat>E<lon>"; numbers() drops exponents.
+FRACTION = re.compile(r"\.\d{4,}(?!\d)")
+EXPONENT = re.compile(r"[eE][-+]?\d")
+COMMA_FRACTION = re.compile(r",\d{4,}(?!\d)")
+# Every candidate needs one of these; checked before any other work.
+ANY_RUN = re.compile(r"\d(?:[.,]|%(?:25){0,3}2[Cc]|&(?:#44|#[xX]2[cC]|comma);)\d{4}")
+COMMA_RUN = re.compile(r"\d,\d{4}")
 DIGITS = frozenset("0123456789")
+# Lowercase letters are tolerated as separator text (main parity), never as coordinate context.
 SEPARATOR = re.compile(r"[ \t]*(?:[NSns°][ \t]*)?(?:[,;][ \t]*|[ \t]+)(?:[NSEWnsew°][ \t]*)?")
+# ISO 6709 "/" after an optional altitude and CRS, then end, space, quote, bracket or sign.
+ISO_TAIL = re.compile(r"(?:[+-]\d+\.\d+|[+-]\d+(?=CRS))?(?:CRS[^\s/]*)?/(?![^\s\"'`)\]}>,;<+-])")
+# ASCII signs plus true minus look-alikes; hyphens and en/em dashes are range punctuation.
+_ISO_SIGNS = "+-−﹣－"
+# Hemisphere letters: uppercase, one per number, suffix ("<n>N, <n>W") or prefix ("N<n> W<n>").
+_HEMI = frozenset("NSEW")
+HEMI_SUFFIX_GAP = re.compile(r"[ \t]*°?[ \t]*([NSEW])[ \t]*[,;]?[ \t]*([+-]?)")
+HEMI_PREFIX_GAP = re.compile(r"[ \t]*°?[ \t]*[,;]?[ \t]*([NSEW])[ \t]*([+-]?)")
+HEMI_AFTER = re.compile(r"[ \t]*°?[ \t]*([NSEW])(?![A-Za-z])")
+HEMI_MIXED_GAP = re.compile(r"[ \t]*°?[ \t]*([NSEW])(?:[ \t]*[,;][ \t]*|[ \t]+)([NSEW])[ \t]*([+-]?)")
 # Every dash/minus look-alike Unicode offers, folded to ASCII "-": hyphen, non-breaking hyphen,
 # figure dash, en/em dash, two horizontal bars, minus sign, small hyphen-minus, small em dash,
 # fullwidth hyphen-minus. One code point each, so folding never shifts a later offset.
 _DASHES = "‐‑‒–—―−﹘﹣－"
-_UNICODE_MINUS = str.maketrans({c: "-" for c in _DASHES})
-_PERCENT_SEPARATOR = re.compile(r"%(2[Cc]|3[Bb])")
-_PERCENT_SEPARATOR_MAP = {"2c": ",", "3b": ";"}
+# Unicode spaces fold to " " and the ordinal/ring look-alikes to the degree sign, also one code
+# point each.
+_SPACES = "    "
+_UNICODE_MINUS = str.maketrans(dict([(c, "-") for c in _DASHES] + [(c, " ") for c in _SPACES]
+                                    + [("º", "°"), ("˚", "°")]))
+# %2C/%3B under up to three extra %25 layers. %20, %09, %2B or a form "+" is a space only right
+# after one of them (%20/%09 also after a literal comma). %2B/%2D/%2F decode to +, -, /.
+_PERCENT_SEPARATOR = re.compile(
+    r"%(?:25){0,3}(2[Cc]|3[Bb])((?:\+|%(?:25){0,3}(?:20|09|2[Bb]))*)"
+    r"|,((?:%(?:25){0,3}(?:20|09))+)|%(?:25){0,3}(2[BbDdFf])")
+_PERCENT_SPACE = re.compile(r"\+|%(?:25){0,3}(?:20|09|2[Bb])")
+_PERCENT_MAP = {"2c": ",", "3b": ";", "2b": "+", "2d": "-", "2f": "/"}
+_ENTITY = re.compile(r"&(nbsp|comma|semi|#(?:160|44|59|32)|#[xX](?:[aA]0|2[cC]|3[bB]|20));")
+_ENTITY_MAP = {"nbsp": " ", "#160": " ", "#xa0": " ", "#32": " ", "#x20": " ",
+               "comma": ",", "#44": ",", "#x2c": ",", "semi": ";", "#59": ";", "#x3b": ";"}
+
+
+def _percent_sub(m):
+    if m.group(1):
+        return _PERCENT_MAP[m.group(1).lower()] + " " * len(_PERCENT_SPACE.findall(m.group(2)))
+    if m.group(4):
+        return _PERCENT_MAP[m.group(4).lower()]
+    return "," + " " * len(_PERCENT_SPACE.findall(m.group(3)))
+
+
+def _decode_percent(text):
+    """Decode separator HTML entities and percent-escapes. No newline is added or removed."""
+    if "&" in text:
+        text = _ENTITY.sub(lambda m: _ENTITY_MAP[m.group(1).lower()], text)
+    return _PERCENT_SEPARATOR.sub(_percent_sub, text) if "%" in text else text
 
 
 def _normalize(text):
-    """ASCII-fold dash/minus look-alikes and the %2C/%3B separator escapes a URL query string
-    would carry, so tokenizing never has to special-case them. Called once, from candidates();
-    numbers() takes text as given and never renormalizes it, so positions it returns are always
-    relative to whatever text its caller passed in."""
-    text = text.translate(_UNICODE_MINUS)
-    return _PERCENT_SEPARATOR.sub(lambda m: _PERCENT_SEPARATOR_MAP[m.group(1).lower()], text)
+    """Decode separator HTML entities and percent-escapes, then fold Unicode dashes, spaces and
+    degree-sign look-alikes to ASCII. Newlines are never touched, so line numbers match."""
+    text = _decode_percent(text)
+    return text if text.isascii() else text.translate(_UNICODE_MINUS)
 
 
-KEYED = re.compile(
-    r"(?<![a-z])(lat(?:itude)?|lon(?:gitude)?|lng|long)"
-    r"(?:[_-]?(?:deg(?:rees)?|dd|ref|0|1|2))?[\"']?[ \t]*[:=]?[ \t]*[\"']?" + _NUM)
+_KEY_SUFFIX = r"(?:[_-]?(?:deg(?:rees)?|dd|ref|0|1|2))?"
+_KEY_SEP = r"[\"']?[ \t]*(?:\((?:deg(?:rees)?|°)\)[ \t]*)?(?::=|=>|[:=>(])?[ \t]*[\"']?"
+_KEY = r"(?<![a-z])(?:gps)?(lat(?:itude?)?|lon(?:gitude?)?|lng|long)" + _KEY_SUFFIX + _KEY_SEP
+KEYED = re.compile(_KEY + _NUM_ANY)
 DIGEST = re.compile(r"[0-9a-f]{16}")
 KEYED_I = re.compile(KEYED.pattern, re.IGNORECASE)
+# camelCase: a lowercase letter, then Lat/Lon/Lng/Latitude/Longitude ending at a non-letter.
+CAMEL_KEYED = re.compile(r"(?<=[a-z])(Lat(?:itude)?|Lon(?:gitude)?|Lng)(?i:"
+                         + _KEY_SUFFIX + _KEY_SEP + ")" + _NUM_ANY)
 ARRAY = re.compile(r"\[\s*" + _NUM + r"\s*,\s*" + _NUM + r"\s*(?:,\s*-?\d+(?:\.\d+)?\s*)?\]")
 
 
-def numbers(text):
-    """(start, end, value) of each decimal with 1-3 integer digits and >= 4 fractional digits.
+def _extend_sign(text, start):
+    """Extend a digit run's `start` left across a glued sign, or reject the run (`None`).
 
-    A "-" directly against the digit run is always its sign, no matter what precedes the "-"
-    itself (start of text, whitespace, punctuation, or an identifier character glued straight
-    against it: "a-12.345", "5-12.345", "x_1-12.345" all read as negative -- three fractional
-    digits here on purpose, so this docstring never itself looks like a coordinate). Earlier
-    this guard tried to tell a "real" sign apart from a hyphen that merely happened to sit next
-    to a number, and on the glued cases it neither consumed nor rejected the "-": it silently
-    reported the unsigned value instead, turning a real far coordinate into a near-looking
-    positive one. There is no reliable text-only signal for that distinction, and guessing
-    "positive" is exactly the guess that hides a leak, so this no longer guesses: any adjacent
-    "-" is the sign. A number glued to a letter/digit/underscore/dot with no sign in between is
-    still excluded, as before (that's what keeps ordinary identifiers and version strings
-    quiet). Operates on `text` exactly as given -- no normalization here; candidates() is the
-    one caller and normalizes first, so positions returned are relative to its normalized text."""
-    for m in FRACTION.finditer(text):
+    A "-" against the digits is always the sign, whatever precedes it: guessing "positive" is
+    the guess that hides a leak. A "+" counts only when not glued to a letter/digit/"_"/".".
+    Digits glued to a letter/digit/"_"/"." with no sign between are rejected, which keeps
+    identifiers and version strings quiet."""
+    if start > 0 and text[start - 1] == "-":
+        return start - 1
+    if start > 0 and text[start - 1] == "+" and not (
+            start > 1 and (text[start - 2].isalnum() or text[start - 2] in "_.")):
+        return start - 1
+    if start > 0 and (text[start - 1].isalnum() or text[start - 1] in "_."):
+        return None
+    return start
+
+
+def _runs(text, fraction):
+    """(digit_start, end) of each unsigned 1-3 integer digit, >= 4 fractional digit run."""
+    for m in fraction.finditer(text):
         dot = start = m.start()
         while start > 0 and dot - start < 4 and text[start - 1] in DIGITS:
             start -= 1
-        if not 1 <= dot - start <= 3:
+        if 1 <= dot - start <= 3:
+            yield start, m.end()
+
+
+def numbers(text, runs=None):
+    """(start, end, value) of each decimal with 1-3 integer digits and >= 4 fractional digits,
+    no exponent, signed per _extend_sign(). Positions are relative to `text` as given."""
+    for start, end in (_runs(text, FRACTION) if runs is None else runs):
+        if EXPONENT.match(text, end):
             continue
-        if start > 0 and text[start - 1] == "-":
-            start -= 1
-        elif start > 0 and (text[start - 1].isalnum() or text[start - 1] in "_."):
-            continue
-        yield start, m.end(), float(text[start:m.end()])
+        start = _extend_sign(text, start)
+        if start is not None:
+            yield start, end, float(text[start:end])
+
+
+def _hemi_before(text, d):
+    """(letter, sign) for a prefix hemisphere letter ending just before digit start `d`."""
+    p, sign = d, ""
+    if p > 0 and text[p - 1] in "+-":
+        p -= 1
+        sign = text[p]
+    while p > 0 and d - p < 6 and text[p - 1] in " \t":
+        p -= 1
+    if p > 0 and text[p - 1] in _HEMI and not (p > 1 and text[p - 2].isalpha()):
+        return text[p - 1], sign
+    return None
 
 
 @dataclass(frozen=True)
@@ -148,6 +218,8 @@ class Guard:
 
     @staticmethod
     def _pair_valid(a, b):
+        # The >= 1.0 floor keeps sub-degree DSP/ML config pairs quiet when nothing else says
+        # "coordinate".
         return bool(_orders(a, b)) and max(abs(a), abs(b)) >= 1.0
 
     def _pair_far(self, a, b):
@@ -160,15 +232,94 @@ class Guard:
         dl = (v - self.lon0 + 180.0) % 360.0 - 180.0
         return abs(dl) * deg_km * math.cos(math.radians(self.lat0)) > self.radius_km
 
-    def candidates(self, text):
-        """(line, kind, digest, far) for every coordinate-shaped pair or keyed value in `text`.
+    def _iso(self, raw, text, first, second):
+        """An ISO 6709 candidate from two glued numbers, or None."""
+        (s1, e1, a), (s2, e2, b) = first, second
+        if s2 == e1 and text[s2] in "+-":
+            p2 = s2
+        elif s2 == e1 + 1 and text[e1] == "+":
+            p2 = e1
+        else:
+            return None
+        if raw[p2] not in _ISO_SIGNS or (e2 < len(text) and text[e2] in "ijIJ"):
+            return None
+        if text[s1] in "+-":
+            p1 = s1
+        elif s1 > 0 and text[s1 - 1] == "+":
+            p1 = s1 - 1
+        else:
+            return None
+        if raw[p1] not in _ISO_SIGNS:
+            return None
+        before = text[p1 - 1] if p1 > 0 else ""
+        if before in DIGITS or before == ".":
+            return None
+        slash = ISO_TAIL.match(text, e2) is not None
+        if before and (before.isalpha() or before in "_)]}"):
+            if not slash:
+                return None
+        elif not slash and min(abs(a), abs(b)) < 1.0 and not (
+                len(text[p1 + 1:e1].partition(".")[0]) == 2
+                and len(text[p2 + 1:e2].partition(".")[0]) == 3):
+            return None
+        if abs(a) <= 90.0 and abs(b) <= 180.0:
+            far = self._far(a, b)
+        elif abs(b) <= 90.0 and abs(a) <= 180.0:
+            far = self._far(b, a)
+        else:
+            return None
+        return "iso 6709 pair", pair_digest(a, b), far
 
-        The sole normalization point: `text` is folded here, once, before anything below reads
-        it (including numbers(), which itself normalizes nothing)."""
-        text = _normalize(text)
-        nums = list(numbers(text))
-        if not nums:
+    def _hemisphere(self, text, runs, line_of, out):
+        """Pairs where one number carries N/S and the other E/W. Digest uses the numbers as
+        written; far if either the written sign or the letter's sign reads far."""
+        for (d1, e1), (d2, e2) in zip(runs, runs[1:]):
+            if d2 - e1 > 12 or not any(c in _HEMI for c in text[e1:d2]):
+                continue
+            gap = text[e1:d2]
+            got = None
+            s1 = text[d1 - 1] if d1 > 0 and text[d1 - 1] in "+-" else ""
+            q = d1 - len(s1)
+            glued = not s1 and q > 0 and (text[q - 1].isalnum() or text[q - 1] in "_.")
+            m = HEMI_SUFFIX_GAP.fullmatch(gap)
+            if m and not glued:
+                after = HEMI_AFTER.match(text, e2)
+                if after:
+                    got = m.group(1), after.group(1), s1, m.group(2)
+            if got is None:
+                m = HEMI_PREFIX_GAP.fullmatch(gap)
+                before = m and _hemi_before(text, d1)
+                if before:
+                    got = before[0], m.group(1), before[1], m.group(2)
+            if got is None and not glued:
+                m = HEMI_MIXED_GAP.fullmatch(gap)
+                if m:
+                    got = m.group(1), m.group(2), s1, m.group(3)
+            if got is None:
+                continue
+            l1, l2, s1, s2 = got
+            if (l1 in "NS") == (l2 in "NS"):
+                continue
+            v1 = float(text[d1:e1].replace(",", "."))
+            v2 = float(text[d2:e2].replace(",", "."))
+            digest = pair_digest(-v1 if s1 == "-" else v1, -v2 if s2 == "-" else v2)
+            h1, h2 = (-v1 if l1 in "SW" else v1), (-v2 if l2 in "SW" else v2)
+            w1 = (-v1 if s1 == "-" else v1) if s1 else h1
+            w2 = (-v2 if s2 == "-" else v2) if s2 else h2
+            if l1 not in "NS":
+                v1, v2, w1, w2, h1, h2 = v2, v1, w2, w1, h2, h1
+            if v1 <= 90.0 and v2 <= 180.0:
+                out.append((line_of(d1), "hemisphere pair", digest,
+                            self._far(h1, h2) or self._far(w1, w2)))
+
+    def candidates(self, text):
+        """(line, kind, digest, far) for every coordinate-shaped pair or keyed value in `text`."""
+        if not ANY_RUN.search(text):
             return []
+        raw = _decode_percent(text)
+        text = raw if raw.isascii() else raw.translate(_UNICODE_MINUS)
+        runs = list(_runs(text, FRACTION))
+        nums = list(numbers(text, runs))
         starts = []
 
         def line_of(pos):
@@ -178,22 +329,39 @@ class Guard:
             return bisect.bisect_right(starts, pos)
 
         out = []
-        for (s1, e1, a), (s2, _e2, b) in zip(nums, nums[1:]):
-            if SEPARATOR.fullmatch(text, e1, s2) and self._pair_valid(a, b):
+        for first, second in zip(nums, nums[1:]):
+            s1, e1, a = first
+            s2, _e2, b = second
+            iso = self._iso(raw, text, first, second) if s2 - e1 <= 1 else None
+            if iso:
+                out.append((line_of(s1),) + iso)
+            elif SEPARATOR.fullmatch(text, e1, s2) and self._pair_valid(a, b):
                 out.append((line_of(s1), "inline pair", pair_digest(a, b), self._pair_far(a, b)))
+
         if "[" in text:
             for m in ARRAY.finditer(text):
                 a, b = float(m.group(1)), float(m.group(2))
-                # Same >=1.0 floor as the loose inline-pair form: a sub-degree 2-3 element
-                # bracketed float array is common DSP/ML config shape, not a coordinate.
                 if self._pair_valid(a, b):
                     out.append((line_of(m.start(1)), "array pair", pair_digest(a, b),
                                 self._pair_far(a, b)))
+
+        has_comma = COMMA_RUN.search(text) is not None
+        self._hemisphere(text, sorted(runs + list(_runs(text, COMMA_FRACTION))) if has_comma
+                         else runs, line_of, out)
+
         keyed = {"lat": [], "lon": []}
         lowered = text.lower() if text.isascii() else None
-        for m in (KEYED.finditer(lowered) if lowered is not None else KEYED_I.finditer(text)):
+        matches = KEYED.finditer(lowered) if lowered is not None else KEYED_I.finditer(text)
+        if "Lat" in text or "Lon" in text or "Lng" in text:
+            matches = itertools.chain(matches, CAMEL_KEYED.finditer(text))
+        seen = set()
+        for m in matches:
+            if m.start(2) in seen:
+                continue
+            seen.add(m.start(2))
             axis = "lat" if m.group(1).lower().startswith("lat") else "lon"
-            keyed[axis].append((line_of(m.start(2)), float(m.group(2)), m.start(2)))
+            v = float(m.group(2).replace(",", ".")) if has_comma else float(m.group(2))
+            keyed[axis].append((line_of(m.start(2)), v, m.start(2)))
         paired = set()
         for la_line, la, la_pos in keyed["lat"]:
             for lo_line, lo, lo_pos in keyed["lon"]:
