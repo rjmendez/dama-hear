@@ -368,12 +368,12 @@ class TestScanModes:
         base = _git(repo, "rev-parse", "HEAD")
         la, lo = near_pair()
         _commit(repo, "near.txt", "%s, %s\n" % (fmt(la), fmt(lo)), "near")
-        # Genuinely binary: dense NUL/high-byte content with no ASCII digit run anywhere in it,
-        # so this is a control for "binary content doesn't false-positive", not a test of the
-        # (removed) NUL-presence skip -- decoded with errors="replace" it has nothing
-        # coordinate-shaped for the regexes to find.
-        random_bytes = bytes((n * 137 + 41) % 256 for n in range(4096))
-        (repo / "blob.bin").write_bytes(random_bytes)
+        # A control for "binary content doesn't false-positive": every byte value except ASCII
+        # digits, '.', '-' and newlines, so nothing in it can be coordinate-shaped.
+        excluded = set(b"0123456789.-\n\r")
+        payload = bytes(b for b in ((n * 137 + 41) % 256 for n in range(4096)) if b not in excluded)
+        assert b"\0" in payload and not excluded & set(payload)
+        (repo / "blob.bin").write_bytes(payload)
         _git(repo, "add", "-A")
         _git(repo, "commit", "-q", "-m", "binary")
         rc, out = run(capsys, repo, "range", base, "HEAD")
