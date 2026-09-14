@@ -64,17 +64,34 @@ runners:
 Every push to any branch and every pull request also runs `.github/workflows/coord-guard.yml`.
 This repo is public and the site's real position must never be in it, so `tools/coord_guard.py`
 fails on any decimal latitude/longitude pair, or `lat`/`lon`-keyed value, with at least four
-decimal places that lies more than 25 km from `survey.json`'s fictional origin. Besides a plain
-`lat, lon` pair it also reads: an ISO 6709 string (`+DD.DDDD-DDD.DDDD/`, altitude and zero-padded
-longitude included); a leading `+` sign, not just `-`; `|` and `_` as pair separators alongside
-`,`/`;`/whitespace (`/` stays excluded -- it matches ratios and fractions in ordinary prose too
-often, measured against this repo's own history and two external corpora); the glued hemisphere
-form `<lat>N<lon>E`/`<lat>S<lon>W` (uppercase only, both letters required); European decimal-comma
-coordinates (`DD,DDDD`), but only next to a key, a hemisphere letter, or a `;`/tab/whitespace pair
--- a bare `12,3456` stays a CSV/list value; and a doubly percent-encoded separator (`%252C`,
-`%253B`). A sub-degree pair (both axes under 1) is only flagged with one of those same coordinate
-contexts -- a key, a hemisphere letter, or an ISO 6709 sign -- so a bare config array or inline
-pair like `[0.25, 0.75]` still passes. It checks the tree and also every file each incoming commit
+decimal places that lies more than 25 km from `survey.json`'s fictional origin. It reads:
+
+- a pair separated by `,`, `;` or whitespace, or a two- or three-element `[lat, lon]` array, with
+  a `-` or `+` sign on either number;
+- a `lat`/`latitude`/`lon`/`longitude`/`lng`-keyed value, alone or paired within three lines,
+  with a `.` or a decimal comma (`DD,DDDD`);
+- an ISO 6709 string: two explicitly signed numbers glued together (`+DD.DDDD-DDD.DDDD`), a `+`
+  straight after the first number's last digit included. A trailing `/` (after an optional
+  altitude and CRS), or a two-digit latitude with a three-digit longitude integer part, is enough
+  on its own. Without either, both numbers must be at least 1, the first sign must not be glued
+  to a letter, and an en dash or hyphen is not a sign. A number followed by `i` or `j` is a
+  complex number, never ISO 6709;
+- one uppercase latitude letter (`N`/`S`) and one longitude letter (`E`/`W`), with a `.` or a
+  decimal comma: after each number (`DD.DDDDN, DDD.DDDDW`, with or without `°` and spaces, or
+  glued as `DD.DDDDNDDD.DDDDW`) or before it (`NDD.DDDD EDDD.DDDD`, `NDD.DDDDWDDD.DDDD`). The letter
+  gives the sign; an explicit sign that disagrees with it is checked both ways;
+- separator escapes: `%2C`/`%3B` under up to three extra `%25` layers, and `%20` or `+` only
+  directly after a comma or one of those escapes.
+
+A sub-degree pair (both axes under 1) needs a key, both hemisphere letters, or the strict ISO 6709
+shape, so a bare config array or inline pair like `[0.25, 0.75]` still passes. Not read, on
+purpose: `_` and `|` as separators (they would flag filenames such as `model_a_b.pt` and markdown
+or pipe-delimited float tables, and cannot catch a positive second number without doing so); `/`
+(ratios and fractions in prose); lowercase or single hemisphere letters; a decimal-comma pair with
+only a separator between (semicolon CSV, TSV, SVG points); `%20` anywhere but after a separator.
+Known false positives, which the allowlist below handles: a hyphenated range followed by a number
+(`a-b, c` pairs `-b` with `c`, because skipping it would also skip a glued negative latitude), and
+values that happen to carry `N`/`S` next to `E`/`W`. It checks the tree and also every file each incoming commit
 adds or changes. A commit that adds a coordinate and a later one that removes it still fails,
 because the history is published too. It prints commit, path and line, never the value. Build test
 coordinates as offsets from the fictional origin. The real origin comes only from
