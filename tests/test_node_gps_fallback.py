@@ -98,6 +98,19 @@ class TestSurveyFallback:
         assert "lat" not in text and "lon" not in text
         assert ("%.5f" % p["lat_deg"]) not in text
 
+    def test_augmenting_keeps_surveyed_height_provenance_and_labels_the_gps_height(self):
+        """Rebuilding the survey to add a GPS node must not strip the surveyed nodes' height
+        provenance, and a GNSS mean height is unmeasured until someone states its sigma."""
+        d = survey_dict()
+        first = d["nodes"][0]
+        first.update(u_source="tape from the sill", sigma_u_m=0.05)
+        sv, _ = SV.augment_from_node_gps(SV.from_dict(d), {"gold": gps_entry(25.0, -20.0, 1.0)},
+                                         NOW)
+        fid, gid = first["node_id"], SV.gps_node_id("gold")
+        assert sv.u_source[fid] == "tape from the sill" and sv.sigma_u_m[fid] == 0.05
+        assert "GPS" in sv.u_source[gid] and sv.sigma_u_m[gid] is None
+        assert gid in sv.height_provenance()["unmeasured"]
+
     def test_ids_are_stable_per_name_and_above_the_surveyed_range(self):
         assert SV.gps_node_id("gold") == SV.gps_node_id("gold")
         assert SV.gps_node_id("gold") != SV.gps_node_id("ageev")

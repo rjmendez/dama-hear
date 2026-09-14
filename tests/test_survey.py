@@ -339,3 +339,84 @@ class TestTheSurveyStatesWhichNodesCanRange:
             "the PUC is PROVISIONAL and NTP-timed -- it must not be a TDoA arrival"
         assert s.sigma_m[by["puc"]] >= 5.0, \
             "its sigma must record that the position came from a 6.5 m rms GPS scatter"
+
+
+class TestHeightProvenance:
+    """`u_m` alone cannot be audited, and the survey used to lose the sentence that said so.
+
+    survey.json carried mach at a NOMINAL 3.0 m with `u_source` and `sigma_u_m` hand-edited in;
+    `_read_node` ignored both and `to_dict()` did not write them, so the first tool to load the
+    file and write it back turned an admitted guess into an unqualified number. Nothing
+    downstream could tell, which is the whole reason this is pinned.
+    """
+
+    HP = [(1, 0.0, 0.0, 0.0), (2, 40.0, 0.0, 3.0), (3, 0.0, 40.0, 0.0)]
+
+    def _doc(self, per_node=None):
+        d = doc(self.HP)
+        for node in d["nodes"]:
+            node.update((per_node or {}).get(node["node_id"], {}))
+        return d
+
+    def test_u_source_and_sigma_u_survive_a_round_trip(self):
+        d = self._doc({2: {"u_source": "nominal storey, +/-1.0 m assumed", "sigma_u_m": 1.0}})
+        sv = SV.from_dict(d)
+        assert sv.u_source[2] == "nominal storey, +/-1.0 m assumed"
+        assert sv.sigma_u_m[2] == 1.0
+        again = SV.from_dict(sv.to_dict())
+        assert again.u_source[2] == sv.u_source[2]
+        assert again.sigma_u_m[2] == sv.sigma_u_m[2]
+
+    def test_an_absent_sigma_u_is_none_and_never_zero(self):
+        """0.0 would assert an exact height. Absent means nobody wrote one down."""
+        sv = SV.from_dict(self._doc({2: {"u_source": "tape"}}))
+        assert sv.sigma_u_m[2] is None
+        assert "sigma_u_m" not in sv.to_dict()["nodes"][1]
+
+    def test_a_height_with_no_stated_sigma_counts_as_unmeasured(self):
+        sv = SV.from_dict(self._doc({2: {"u_source": "tape from the sill"}}))
+        hp = sv.height_provenance()
+        assert 2 in hp["unmeasured"], "a stated source without a sigma is not a measured height"
+        assert hp["n_unstated"] == 2, "nodes 1 and 3 state nothing at all"
+
+    def test_a_tape_measured_height_is_not_flagged(self):
+        sv = SV.from_dict(self._doc({
+            1: {"u_source": "datum", "sigma_u_m": 0.0},
+            2: {"u_source": "tape from the sill", "sigma_u_m": 0.05},
+            3: {"u_source": "datum", "sigma_u_m": 0.0}}))
+        hp = sv.height_provenance()
+        assert hp["unmeasured"] == [] and hp["note"] is None
+        assert hp["worst_sigma_u_m"] == 0.05
+
+    def test_a_metre_of_assumed_height_is_reported_not_refused(self):
+        """A node that has not been reached with a tape is a legitimate entry. It must load --
+        and it must be visible in an answer, not only in a file nobody re-reads."""
+        sv = SV.from_dict(self._doc({2: {"u_source": "nominal storey", "sigma_u_m": 1.0}}))
+        hp = sv.height_provenance()
+        assert hp["worst_sigma_u_m"] == 1.0
+        assert 2 in hp["unmeasured"] and "assumed" in hp["note"]
+
+    def test_the_horizontal_sigma_is_not_reused_as_the_vertical_one(self):
+        """sigma_m comes from east/north block scatter; the height did not come from GNSS at all,
+        so borrowing the number would quote a vertical accuracy nothing measured."""
+        sv = SV.from_dict(self._doc({2: {"sigma_m": 0.521}}))
+        assert sv.sigma_m[2] == 0.521
+        assert sv.sigma_u_m[2] is None
+
+    @pytest.mark.parametrize("bad", [{"u_source": 3.0}, {"sigma_u_m": "0.1"},
+                                     {"sigma_u_m": -0.1}, {"sigma_u_m": float("nan")}])
+    def test_a_malformed_provenance_is_refused_at_load(self, bad):
+        with pytest.raises(SV.SurveyError):
+            SV.from_dict(self._doc({2: bad}))
+
+    def test_from_wgs84_nodes_carries_the_provenance_through(self):
+        """This path is how an RTK fix becomes a survey entry; dropping the sentence that says it
+        was RTK makes it indistinguishable from a floor plan."""
+        ent = [{"node_id": 1, "lat_deg": 10.0, "lon_deg": 20.0, "h_ell_m": 100.0,
+                "u_source": "RTK 2 min static", "sigma_u_m": 0.02},
+               {"node_id": 2, "lat_deg": 10.0004, "lon_deg": 20.0, "h_ell_m": 100.0},
+               {"node_id": 3, "lat_deg": 10.0, "lon_deg": 20.0004, "h_ell_m": 100.0}]
+        sv = SV.from_wgs84_nodes(ent)
+        assert sv.u_source[1] == "RTK 2 min static" and sv.sigma_u_m[1] == 0.02
+        assert sv.u_source[2] is None and sv.sigma_u_m[2] is None
+        assert sv.height_provenance()["unmeasured"] == [2, 3]
