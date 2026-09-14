@@ -183,6 +183,18 @@ class TestStatusParsing:
     def test_sd_free_space_is_read(self):
         assert H.parse_status(self._status(sd_free_mb=42))["sd_free_mb"] == 42
 
+    def test_gps_summary_carries_the_protocol_scale(self):
+        pmtk = H.parse_status(self._status(**{
+            "class": "esp32s3-i2s-gps",
+            "gps": {"fix": 1, "sats": 7, "tacc_ns": None},
+        }))
+        ubx = H.parse_status(self._status(**{
+            "class": "xiao-s3-pps",
+            "gps": {"fix": 3, "sats": 12, "tacc_ns": 26},
+        }))
+        assert H._gps_summary(pmtk) == "PMTK:1/7"
+        assert H._gps_summary(ubx) == "UBX:3/12"
+
 
 # ---------------------------------------------------------------- layered health evaluation
 
@@ -347,6 +359,15 @@ class TestFleetReport:
         rc, out = self._run(capsys, {url: self._status(node="good")}, monkeypatch)
         assert "ONLINE" in out
         assert rc == 0
+
+    def test_the_table_carries_the_gps_protocol_beside_the_fix_number(self, capsys, monkeypatch):
+        url = "http://gold/status"
+        rc, out = self._run(capsys, {url: self._status(node="gold", **{
+            "class": "esp32s3-i2s-gps",
+            "gps": {"fix": 1, "sats": 7, "tacc_ns": None},
+        })}, monkeypatch)
+        assert rc == 0
+        assert "PMTK:1/7" in out
 
     def test_an_unreachable_node_is_reported_offline(self, capsys, monkeypatch):
         def fetch_status(url):

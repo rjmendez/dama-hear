@@ -82,6 +82,12 @@ class TestDriftReport:
                         monkeypatch)
         assert "nyquist" in out
 
+    def test_the_row_carries_the_gps_protocol_beside_the_fix_number(self, capsys, monkeypatch):
+        out = self._run(capsys, {"gold=1": self._status("8b9d5b1", "gold", sats=6, fix=1) | {
+            "class": "esp32s3-i2s-gps"
+        }}, monkeypatch)
+        assert "PMTK:1/6" in out
+
 
 class TestTheSplitGate(TestDriftReport):
     """`--require-one-build` — opt-in, and ONLY for the split.

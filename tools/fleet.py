@@ -76,6 +76,17 @@ NO_PPS_STATUS_CLASSES = {"puc-ntp"}
 NO_SD_STATUS_CLASSES = {"esp32s3-i2s-gps"}
 
 
+def _gps_proto_label(d: Dict) -> str:
+    if not gps_expected(d):
+        return "NOGPS"
+    return "PMTK" if _status_class(d) in PMTK_STATUS_CLASSES else "UBX"
+
+
+def _gps_summary(d: Dict) -> str:
+    gps = d.get("gps") or {}
+    return "%s:%s/%s" % (_gps_proto_label(d), gps.get("fix", "?"), gps.get("sats", "?"))
+
+
 def split_target(node: str) -> tuple:
     """`name`, `name=host`, or a bare URL -> (display name, status URL).
 
@@ -125,10 +136,12 @@ def row(name: str, d: Dict) -> str:
     # rssi and disc are absent on firmware before v0.1.1, and rssi is null when not associated.
     n = d.get("net") or {}
     rssi = n.get("rssi")
-    return ("%-9s %-14s up %6ds  fix %d/%-2d tAcc %5s ns  pps %6d sp %5s us g%-3d  "
+    # Keep the raw fix number, but NEVER bare: PMTK GGA quality 1 and UBX fixType 3 are both
+    # healthy fixes on different scales, so the protocol travels with the number in the report.
+    return ("%-9s %-14s up %6ds  gps %-12s tAcc %5s ns  pps %6d sp %5s us g%-3d  "
             "utc %-5s rej %-4s  dets %4d floor %-5s amb %-5s  rssi %4s disc %-3s  sd %-5s %s"
             % (name, d.get("fw", "?")[:14], int(d.get("uptime_s") or 0),
-               int(g.get("fix") or 0), int(g.get("sats") or 0), g.get("tacc_ns", "?"),
+               _gps_summary(d), g.get("tacc_ns", "?"),
                int(p.get("edges") or 0), p.get("spread_us", "?"), int(p.get("glitches") or 0),
                "yes" if t.get("valid") else "NO", t.get("label_rejects", "?"),
                int(a.get("detections") or 0), gate.get("floor", "?"), a.get("ambient", "?"),

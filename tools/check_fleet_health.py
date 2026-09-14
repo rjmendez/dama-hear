@@ -412,6 +412,16 @@ def _sd_expected(p: Mapping[str, Any]) -> bool:
     return _status_class(p) not in NO_SD_STATUS_CLASSES
 
 
+def _gps_proto_label(p: Mapping[str, Any]) -> str:
+    if not _gps_expected(p):
+        return "NOGPS"
+    return "PMTK" if _status_class(p) in PMTK_STATUS_CLASSES else "UBX"
+
+
+def _gps_summary(p: Mapping[str, Any]) -> str:
+    return "%s:%s/%s" % (_gps_proto_label(p), _json_scalar(p.get("fix")), _json_scalar(p.get("sats")))
+
+
 def _gps_fix_ok(p: Mapping[str, Any]) -> bool:
     # `gps.fix` is protocol-specific: PMTK boards report NMEA GGA fix quality (1 = a live fix)
     # while UBX boards report u-blox fixType (3 = 3D). One shared `< 3` rule marks every healthy
@@ -585,9 +595,9 @@ def apply_status_fields(result: NodeResult, http: HttpResult) -> None:
     upf = _as_float(uptime)
     result.uptime = "?" if upf is None else "%.0fs" % upf
 
-    fix = _first(d, (("gps", "fix"), ("gps_fix",), ("fix",)))
-    sats = _first(d, (("gps", "sats"), ("gps", "satellites"), ("gps_sats",), ("sats",)))
-    result.gps = "%s/%s" % (_json_scalar(fix), _json_scalar(sats))
+    # Show the protocol beside the raw fix number so a PMTK `1` is not read against a UBX `3`
+    # as if they were the same quality scale.
+    result.gps = _gps_summary(parse_status(d))
 
     edges = _first(d, (("pps", "edges"), ("pps_edges",)))
     glitches = _first(d, (("pps", "glitches"), ("pps_glitches",)))
@@ -818,13 +828,13 @@ def parse_nodes(args: argparse.Namespace) -> List[str]:
 
 
 def print_table(results: Sequence[NodeResult]) -> None:
-    print("%-20s %-15s %-8s %-6s %-7s %-8s %-8s %-10s %-5s %-6s %-6s %-7s %s" % (
+    print("%-20s %-15s %-8s %-6s %-12s %-8s %-8s %-10s %-5s %-6s %-6s %-7s %s" % (
         "node", "ip", "net", "http", "gps", "ingest", "uptime", "pps", "utc", "rssi", "dets", "temp", "details"))
-    print("%-20s %-15s %-8s %-6s %-7s %-8s %-8s %-10s %-5s %-6s %-6s %-7s %s" % (
+    print("%-20s %-15s %-8s %-6s %-12s %-8s %-8s %-10s %-5s %-6s %-6s %-7s %s" % (
         "-" * 20, "-" * 15, "-" * 8, "-" * 6, "-" * 7, "-" * 8, "-" * 8,
         "-" * 10, "-" * 5, "-" * 6, "-" * 6, "-" * 7, "-" * 7))
     for r in results:
-        print("%-20s %-15s %-8s %-6s %-7s %-8s %-8s %-10s %-5s %-6s %-6s %-7s %s" % (
+        print("%-20s %-15s %-8s %-6s %-12s %-8s %-8s %-10s %-5s %-6s %-6s %-7s %s" % (
             r.node, r.ip, r.network, r.http, r.gps, r.ingestion, r.uptime, r.pps, r.utc,
             r.rssi, r.dets, r.temp, "; ".join(r.details)))
 
