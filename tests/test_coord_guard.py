@@ -109,22 +109,41 @@ class TestDetection:
 
 class TestAllowlist:
 
-    def test_an_entry_allows_that_value_in_that_path_only(self, tmp_path):
+    @pytest.fixture
+    def allowed(self, tmp_path):
         la, lo = far_pair()
-        text = "%s, %s" % (fmt(la), fmt(lo))
         allow = tmp_path / "allow.txt"
         allow.write_text("docs/x.md %s  # not a coordinate\n" % CG.pair_digest(la, lo))
-        g = CG.Guard((LAT0, LON0), allow=CG.load_allow(str(allow)))
-        assert g.scan_text("docs/x.md", text) == []
-        assert [f.line for f in g.scan_text("docs/y.md", text)] == [1]
-        la2, lo2 = la + NEAR, lo
-        assert [f.line for f in g.scan_text("docs/x.md", "%s, %s" % (fmt(la2), fmt(lo2)))] == [1]
+        return CG.Guard((LAT0, LON0), allow=CG.load_allow(str(allow))), la, lo
 
-    def test_an_entry_without_a_reason_is_refused(self, tmp_path):
+    def test_the_entry_allows_its_value_in_its_path(self, allowed):
+        g, la, lo = allowed
+        assert g.scan_text("docs/x.md", "%s, %s" % (fmt(la), fmt(lo))) == []
+
+    def test_a_different_value_in_the_allowlisted_path_is_still_found(self, allowed):
+        g, la, lo = allowed
+        text = "%s, %s\n%s, %s" % (fmt(la), fmt(lo), fmt(la + NEAR), fmt(lo))
+        out = g.scan_text("docs/x.md", text)
+        assert [f.line for f in out] == [2]
+        assert_not_printed(repr(out), la, lo)
+
+    def test_the_same_value_in_a_different_path_is_still_found(self, allowed):
+        g, la, lo = allowed
+        assert [f.line for f in g.scan_text("docs/y.md", "%s, %s" % (fmt(la), fmt(lo)))] == [1]
+
+    @pytest.mark.parametrize("entry", ["docs/x.md 0123abcd0123abcd\n", "docs/x.md  # a whole path\n",
+                                       "docs/x.md 0123abcd  # short digest\n"])
+    def test_an_entry_that_is_not_path_digest_reason_is_refused(self, tmp_path, entry):
         allow = tmp_path / "allow.txt"
-        allow.write_text("docs/x.md 0123abcd\n")
+        allow.write_text(entry)
         with pytest.raises(SystemExit):
             CG.load_allow(str(allow))
+
+    def test_the_committed_allowlist_holds_digests_only(self):
+        text = CG.ALLOW_FILE and pathlib.Path(CG.ALLOW_FILE).read_text()
+        assert list(CG.numbers(text)) == []
+        allow = CG.load_allow(CG.ALLOW_FILE)
+        assert allow and all(digests for digests in allow.values())
 
 
 def _git(repo, *args):

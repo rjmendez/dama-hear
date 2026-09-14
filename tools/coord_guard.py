@@ -37,6 +37,7 @@ SEPARATOR = re.compile(r"[ \t]*(?:[NSns°][ \t]*)?(?:[,;][ \t]*|[ \t]+)(?:[NSEWn
 KEYED = re.compile(
     r"(?<![a-z])(lat(?:itude)?|lon(?:gitude)?|lng|long)"
     r"(?:[_-]?(?:deg(?:rees)?|dd|ref|0|1|2))?[\"']?[ \t]*[:=]?[ \t]*[\"']?" + _NUM)
+DIGEST = re.compile(r"[0-9a-f]{16}")
 KEYED_I = re.compile(KEYED.pattern, re.IGNORECASE)
 ARRAY = re.compile(r"\[\s*" + _NUM + r"\s*,\s*" + _NUM + r"\s*(?:,\s*-?\d+(?:\.\d+)?\s*)?\]")
 
@@ -80,7 +81,7 @@ def load_allow(path):
             if not body.strip():
                 continue
             fields = body.split()
-            if len(fields) != 2 or not reason.strip():
+            if len(fields) != 2 or not DIGEST.fullmatch(fields[1]) or not reason.strip():
                 raise SystemExit("coord_guard: %s:%d must be 'path digest  # reason'" % (path, n))
             allow.setdefault(fields[0], set()).add(fields[1])
     return allow
