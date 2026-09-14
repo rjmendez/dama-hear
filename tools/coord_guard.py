@@ -38,7 +38,7 @@ FRACTION = re.compile(r"\.\d{4,}(?!\d)")
 EXPONENT = re.compile(r"[eE][-+]?\d")
 COMMA_FRACTION = re.compile(r",\d{4,}(?!\d)")
 # Every candidate needs one of these; checked before any other work.
-ANY_RUN = re.compile(r"\d(?:[.,]|%(?:25){0,3}2[Cc])\d{4}")
+ANY_RUN = re.compile(r"\d(?:[.,]|%(?:25){0,3}2[Cc]|&(?:#44|#[xX]2[cC]|comma);)\d{4}")
 COMMA_RUN = re.compile(r"\d,\d{4}")
 DIGITS = frozenset("0123456789")
 # Lowercase letters are tolerated as separator text (main parity), never as coordinate context.

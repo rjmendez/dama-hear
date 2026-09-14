@@ -482,6 +482,14 @@ class TestGapDetection:
         la, lo = far_quadrant(q)
         assert lines("<td>" + fmt(la) + entity + fmt(lo) + "</td>") == [1]
 
+    @pytest.mark.parametrize("entity", ["&#44;", "&#x2C;", "&#X2c;", "&comma;"])
+    @pytest.mark.parametrize("q", QUADRANTS)
+    def test_detects_an_html_entity_decimal_comma_with_no_other_decimal_run(self, q, entity):
+        la, lo = far_quadrant(q)
+        a, b = (fmtc(abs(v)).replace(",", entity) for v in (la, lo))
+        assert lines("<td>%s%s %s%s</td>" % (a, q[0], b, q[1])) == [1]
+        assert lines("<p>lat: %s</p>" % fmtc(la).replace(",", entity)) == [1]
+
     def test_html_entity_decoding_keeps_line_numbers(self):
         la, lo = far_quadrant("SE")
         text = "a&nbsp;b&#44;c\n&comma;\n<p>" + fmt(la) + "&#x2C;&nbsp;" + fmt(lo) + "</p>\n"

@@ -75,8 +75,8 @@ reads:
 - a keyed value, alone or paired within three lines, with a `.` or a decimal comma (`DD,DDDD`).
   Keys are `lat`, `latitude`, `latitud`, `lon`, `long`, `longitude`, `longitud` and `lng`, also
   glued after `gps` or after a lowercase letter in camelCase (`homeLat`, `siteLongitude`). The key
-  ends at a non-letter and is followed by `:`, `=`, `:=`, `=>`, `(`, an XML `>` (`<lat>`) or
-  `(deg)`;
+  ends at a non-letter and is followed by `:`, `=`, `:=`, `=>`, `(`, an XML `>` (`<lat>`),
+  `(deg)`, or whitespace alone;
 - an ISO 6709 string: two explicitly signed numbers glued together (`+DD.DDDD-DDD.DDDD`),
   including a `+` straight after the first number's last digit and `%2B`/`%2D`/`%2F` escapes. The
   first sign never follows a digit or `.`, and an en dash or hyphen is never a sign. A `/`
