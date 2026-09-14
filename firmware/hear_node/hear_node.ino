@@ -3185,7 +3185,7 @@ static bool gps_autobaud() {
         gps_listen(GPS_CONFIRM_MS, &cnm, &cub);
         confirmed = (cnm + cub) >= GPS_DECODE_QUORUM;
         if (confirmed) {
-          best_b = cand[k]; best_ubx = (ub > nm); gps_baud = cand[k];
+          best_b = cand[k]; best_ubx = (cub > cnm); gps_baud = cand[k];
           logf("gps   %lu baud confirmed after %u of %u rates\n",
                (unsigned long)cand[k], k + 1, nc);
         }
@@ -3202,6 +3202,7 @@ static bool gps_autobaud() {
       cnm = 0; cub = 0;
       gps_listen(GPS_CONFIRM_MS, &cnm, &cub);
       confirmed = best_b && (cnm + cub) >= GPS_DECODE_QUORUM;
+      if (cnm + cub) best_ubx = (cub > cnm);
     }
     logf("gps   using %lu baud (%s) -- confirm %d NMEA, %d UBX in %d ms: %s\n",
                   (unsigned long)gps_baud, best_ubx ? "UBX binary" : "NMEA",
