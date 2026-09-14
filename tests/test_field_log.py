@@ -390,3 +390,27 @@ class TestAFictionalOriginPlacesNothing:
         FL.append_record(log, _place())
         sv, _ = FL.build_survey(FL.read_log(log), base_path=self._fictional_base(tmp_path))
         assert 3 in sv.ids
+
+
+class TestCoordinatesAreCheckedWhenRecorded:
+    """A bad lat/lon typed in the field is refused at record time, before it can reach a survey
+    or an analysis."""
+
+    @pytest.mark.parametrize("lat,lon,word", [
+        (float("nan"), 20.0, "finite"), (10.0, float("inf"), "finite"),
+        (91.0, 20.0, "outside"), (10.0, -181.0, "outside"), (0.0, 0.0, "0,0"),
+    ])
+    def test_a_bad_placement_coordinate_is_refused(self, lat, lon, word):
+        with pytest.raises(FL.FieldLogError) as e:
+            _place(ref=None, range_m=None, bearing_deg=None, lat_deg=lat, lon_deg=lon)
+        assert word in str(e.value)
+
+    @pytest.mark.parametrize("lat,lon", [(float("nan"), 20.0), (95.0, 20.0), (0.0, 0.0)])
+    def test_a_bad_mark_coordinate_is_refused(self, lat, lon):
+        with pytest.raises(FL.FieldLogError):
+            FL.mark_record(1789256587, "shot", lat_deg=lat, lon_deg=lon)
+
+    def test_a_valid_mark_coordinate_is_kept(self):
+        rec = FL.mark_record(1789256587, "shot", lat_deg=SITE_LAT, lon_deg=SITE_LON)
+        assert rec["lat_deg"] == SITE_LAT and rec["lon_deg"] == SITE_LON
+

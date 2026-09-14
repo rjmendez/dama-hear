@@ -134,7 +134,10 @@ def now_utc_second() -> int:
 # ---------------------------------------------------------------------------- the log
 
 def append_record(path: str, rec: Dict) -> Dict:
-    """Append one record as one JSON line and fsync it. NEVER opens the log for writing."""
+    """Append one record as one JSON line and fsync it.
+
+    The file is opened in append mode only: existing bytes are never truncated, rewritten or
+    reordered."""
     line = json.dumps(rec, sort_keys=True, separators=(",", ":"))
     if "\n" in line:
         raise FieldLogError("record serialises to more than one line: %r" % (rec,))
@@ -168,6 +171,19 @@ def read_log(path: str) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------- records
+
+def check_lat_lon(lat_deg, lon_deg, what: str) -> None:
+    """Refuse a coordinate that cannot be a place: non-numeric, non-finite, out of range, or the
+    0,0 a failed GPS read produces. Bad field input is refused when it is recorded, not later."""
+    for label, v, lim in (("--lat", lat_deg, 90.0), ("--lon", lon_deg, 180.0)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+            raise FieldLogError("%s %s %r is not a finite number" % (what, label, v))
+        if abs(float(v)) > lim:
+            raise FieldLogError("%s %s %r is outside +/-%g degrees" % (what, label, v, lim))
+    if float(lat_deg) == 0.0 and float(lon_deg) == 0.0:
+        raise FieldLogError("%s --lat/--lon 0,0 is what a failed GPS read gives, not a place"
+                            % (what,))
+
 
 def placement_record(name: str, node_id: int, height_m: Optional[float],
                      sigma_m: float,
@@ -218,6 +234,7 @@ def placement_record(name: str, node_id: int, height_m: Optional[float],
     elif has_geod:
         if lat_deg is None or lon_deg is None:
             raise FieldLogError("--lat needs --lon and vice versa")
+        check_lat_lon(lat_deg, lon_deg, "placement")
     else:
         raise FieldLogError("placement needs --range/--bearing or --lat/--lon")
     if sigma_m is None or not math.isfinite(float(sigma_m)) or float(sigma_m) < 0.0:
@@ -290,6 +307,8 @@ def mark_record(t_utc_s: int, cls: str, lat_deg: Optional[float] = None,
         raise FieldLogError("mark time must be an integer UTC second, got %r" % (t_utc_s,))
     if (lat_deg is None) != (lon_deg is None):
         raise FieldLogError("--lat needs --lon and vice versa")
+    if lat_deg is not None:
+        check_lat_lon(lat_deg, lon_deg, "mark")
     rec = {"type": "mark", "v": RECORD_VERSION, "t_utc_s": int(t_utc_s), "class": cls,
            "lat_deg": None if lat_deg is None else float(lat_deg),
            "lon_deg": None if lon_deg is None else float(lon_deg),
