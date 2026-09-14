@@ -22,7 +22,9 @@ metadata:
   annotations:
     dama-hear/what: >-
       Drains the ESP32-S3 hear nodes into the pooled sketch corpus on the hear-pool PVC.
-      Content-addressed and idempotent, so overlapping runs and re-fetched files cost nothing.
+      Pool ingest is content-addressed and re-fetched files dedupe, but the nodes themselves
+      serve one client at a time, so do not overlap another drain or any other card-reading
+      workload against the same nodes.
 spec:
   # ⚠️`--phone-corpus /pool/sketch_corpus` IS HALF OF A CROSS-REPO CONTRACT. The other half is
   # dama-gotchi's dama-sketch-corpus Deployment, whose SKETCH_CORPUS_OUT_DIR writes that same path
