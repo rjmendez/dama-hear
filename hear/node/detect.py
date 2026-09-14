@@ -53,6 +53,16 @@ def envelope(x: np.ndarray, fs: float, ms: float = 1.0) -> np.ndarray:
     zero crossing and reports ~0.1 ms for everything, which is how a whole feature set was
     silently wrong once already.
     """
+    x = np.asarray(x, float)
+    fs = float(fs)
+    if x.ndim != 1:
+        raise ValueError("x must be one-dimensional")
+    if not np.isfinite(fs) or fs <= 0:
+        raise ValueError("fs must be finite and positive")
+    if not np.isfinite(x).all():
+        raise ValueError("x must contain only finite values")
+    if x.size == 0:
+        return np.empty(0, dtype=float)
     n = max(1, int(ms * 1e-3 * fs))
     return np.convolve(np.abs(x), np.ones(n) / n, mode="same")
 
@@ -116,6 +126,16 @@ def onset_index_checked(e: np.ndarray, peak: int, frac: float = ONSET_FRAC,
     `found` is False only when no crossing exists even against the floor (an empty window, or a
     peak at its very edge). Callers must not treat the index as measured when it is False.
     """
+    e = np.asarray(e, float)
+    if e.ndim != 1 or not np.isfinite(e).all():
+        raise ValueError("e must be a finite one-dimensional array")
+    if e.size == 0:
+        return 0.0, False
+    if int(peak) != peak or peak < 0 or peak >= len(e):
+        raise ValueError("peak must be an index within e")
+    if not 0.0 <= frac <= 1.0 or back < 0:
+        raise ValueError("frac must be in [0, 1] and back must be non-negative")
+    peak = int(peak)
     lo = max(0, peak - back) if back > 0 else 0
     if peak <= lo:
         return float(lo), False
@@ -182,6 +202,8 @@ class Gate:
         here.
         """
         self.fs = float(fs)
+        if not np.isfinite(self.fs) or self.fs <= 0:
+            raise ValueError("fs must be finite and positive")
         self.ratio = float(ratio)
         self.floor = float(floor)
         self.guard = max(1, int(guard_s * fs))
@@ -213,6 +235,11 @@ class Gate:
         time. Timestamping it costs the rise time of the round, which grows with range, so the
         bias is per-node and does not cancel in TDoA -- against a 183 us budget (node-hardware.md).
         """
+        block = np.asarray(block, float)
+        if block.ndim != 1:
+            raise ValueError("block must be one-dimensional")
+        if block.size == 0:
+            return []
         e = envelope(block, self.fs)
         out: List[Dict] = []
         i = 0

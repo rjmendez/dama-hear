@@ -33,7 +33,16 @@ DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.
 
 def load_model(path: str = DEFAULT_MODEL) -> Dict[str, Any]:
     with open(os.path.abspath(path)) as fh:
-        return json.load(fh)
+        model = json.load(fh)
+    features = model.get("features")
+    weights = model.get("w")
+    if features is not None and (not isinstance(features, list) or not isinstance(weights, list) or len(features) != len(weights)):
+        raise ValueError("model features and weights must be lists of equal length")
+    if not math.isfinite(float(model.get("b"))):
+        raise ValueError("model bias must be finite")
+    if not all(math.isfinite(float(weight)) for weight in weights):
+        raise ValueError("model weights must be finite")
+    return model
 
 
 def score(feat: Dict[str, float], model: Dict[str, Any]) -> Optional[float]:
@@ -42,12 +51,16 @@ def score(feat: Dict[str, float], model: Dict[str, Any]) -> Optional[float]:
     None rather than a default: a missing feature substituted with 0 scores a silent event as a
     confident shot, and the caller cannot tell that from a real one.
     """
+    if len(model["features"]) != len(model["w"]):
+        raise ValueError("model features and weights must have equal lengths")
     z = float(model["b"])
     logs = set(model.get("log10", ()))
     for name, w in zip(model["features"], model["w"]):
         if name not in feat or feat[name] is None:
             return None
         v = float(feat[name])
+        if not math.isfinite(v):
+            return None
         if name in logs:
             v = math.log10(max(v, 1e-3))
         z += float(w) * v
@@ -86,6 +99,8 @@ def score_sketch(frame, model: Dict[str, Any]) -> float:
         from hear import sketch as _sk
         frame = _sk.unpack(bytes(frame))
     q, ref = frame["q"], float(frame["ref_db"])
+    if not math.isfinite(ref):
+        raise SketchMismatch("frame reference level must be finite")
     bands, frames = len(q), len(q[0])
     want_b, want_f = int(model["bands"]), int(model["frames"])
     if frames != want_f:
@@ -110,6 +125,8 @@ def score_sketch(frame, model: Dict[str, Any]) -> float:
     w = model["w"]
     if len(w) != want_b * want_f:
         raise SketchMismatch("model has %d weights for a %dx%d sketch" % (len(w), want_b, want_f))
+    if not all(math.isfinite(float(weight)) for weight in w):
+        raise SketchMismatch("model weights must be finite")
     z = float(model["b"])
     i = 0
     for b in range(want_b):                       # band-major, matching model["order"]

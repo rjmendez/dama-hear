@@ -14,6 +14,13 @@ longest to get right and would be the worst to have three slightly-different ver
 
 Roughly 2000 of those 2702 lines are platform. About 700 are board. This is the seam.
 
+## The profiles
+
+| file | board | state |
+|---|---|---|
+| `xiao_s3_sense.h` | Seeed XIAO ESP32-S3 Sense | built — compiled by `night_node.ino` for the `xiao-s3-pps` class. |
+| `puc.h` | BirdWeather PUC | reference profile — `puc_node.ino` currently carries its own pin copy; keep the two definitions aligned. |
+
 ## What a profile must state, and how it must state it
 
 Every field is **measured or datasheet, never assumed**, and carries how it is known. A profile is

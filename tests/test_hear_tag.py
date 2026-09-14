@@ -43,7 +43,7 @@ CLIP_SAMPLES = (CLIPS.CLIP_BYTES - 44) // 2
 
 # ----------------------------------------------------------------- fixtures
 
-def wav_bytes(pcm: np.ndarray, fs: int = 16000) -> bytes:
+def wav_bytes(pcm: np.ndarray, fs: int = 48000) -> bytes:
     """The canonical 44-byte header the firmware writes, plus int16 samples.
 
     Built here rather than with `wave` so a test can state a header rate that disagrees with the
@@ -92,8 +92,8 @@ VERIFIED = {"ok": True, "model_sha256": HT.YAMNET_SHA256, "class_map_sha256": HT
 
 
 def store_clip(root, *, node="nyquist", boot="db21acd5", sample=1082421378, ts=1788997850.8,
-               pcm=None, fs=16000, outcome="stored", anchored=True, write_audio=True,
-               fs_csv=16000.169, extra=None):
+               pcm=None, fs=48000, outcome="stored", anchored=True, write_audio=True,
+               fs_csv=48000.169, extra=None):
     """One index row plus (optionally) its WAV, laid out exactly as hear-drain leaves them."""
     base = "%s-%s-%010d.wav" % (node, boot, sample)
     clip = "/clips/" + base
@@ -101,7 +101,13 @@ def store_clip(root, *, node="nyquist", boot="db21acd5", sample=1082421378, ts=1
     body = None
     rel = None
     if outcome == "stored":
-        body = wav_bytes(quiet_noise() if pcm is None else pcm, fs=fs)
+        if pcm is None:
+            try:
+                samples = (CLIPS.expected_clip_bytes(fs) - 44) // 2
+            except ValueError:
+                samples = CLIP_SAMPLES
+            pcm = quiet_noise(n=samples)
+        body = wav_bytes(pcm, fs=fs)
         day = CLIPS._day(ts if anchored else None)
         p = CLIPS.store_path(str(root), day, node, base)
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -627,7 +633,7 @@ class TestTheSceneJoinIsReadOnlyAndSaysHowStrongItIs:
         w = TAGS.sample_window(row)
         assert w["start_sample"] == 1082421378 - 16000
         assert w["end_sample"] == 1082421378 + 48000
-        assert w["end_sample"] - w["start_sample"] == CLIP_SAMPLES
+        assert w["end_sample"] - w["start_sample"] == int(4.0 * TAGS.FS_NOMINAL_HZ)
 
     def test_the_clip_geometry_in_tags_matches_hear_clips(self):
         """tags.py restates CLIP_PRE_S so it can ship without clips.py. The two must agree."""

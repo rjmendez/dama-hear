@@ -142,6 +142,12 @@ class TestArrivalQuality:
         assert AS.arrival_is_usable({}) is True
         assert AS.arrival_is_usable({"onset_found": False}) is False
 
+    def test_an_explicit_unknown_class_is_refused(self):
+        assert AS.arrival_is_usable({"node_class": "no-such-class"}) is False
+
+    def test_an_explicit_non_arrival_class_is_refused(self):
+        assert AS.arrival_is_usable({"node_class": "puc-ntp"}) is False
+
     def test_the_three_values_utc_trusted_can_actually_take(self):
         """⚠️PINS THE OTHER HALF OF THE CONTRACT. `hear.corpus.Record.utc_trusted` returns
         exactly True / False / None -- None for "the producer did not say", which includes every

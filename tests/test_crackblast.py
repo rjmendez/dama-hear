@@ -121,6 +121,21 @@ def _click(fs, n, at_s, amp, f0, f1, dur_s, rng):
     return x
 
 
+def test_band_power_rejects_invalid_rate_and_audio():
+    with pytest.raises(ValueError, match="finite and positive"):
+        band_power(np.zeros(32), 0.0, (100.0, 1000.0))
+    with pytest.raises(ValueError, match="finite"):
+        band_power(np.array([np.nan] * 32), 48000.0, (100.0, 1000.0))
+
+
+def test_crack_onset_handles_a_peak_in_the_last_frame():
+    # A one-frame signal has no interpolation successor; timing the frame edge is the
+    # only bounded answer and must not index past the power array.
+    out = crack_onset(np.ones(8), 1000.0, (0.0, 0.01), band=(100.0, 400.0),
+                      frame_s=0.008, hop_s=0.001)
+    assert np.isfinite(out["t_s"])
+
+
 def test_band_power_measures_in_band_and_ignores_out_of_band():
     fs = 48000.0
     t = np.arange(int(0.2 * fs)) / fs

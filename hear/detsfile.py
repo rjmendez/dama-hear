@@ -9,6 +9,7 @@ drains, and one of them writes a header that does not describe its own rows:
     G3  12 cols DECLARED, 11 WRITTEN  ⚠️ header says `node,` and the writer never emits it
     G4  12 cols   node_id, ...                               fs/layout build, node_id populated
     G5  13 cols   + sketch_back before frame_hex             the window fix
+    G6  14 cols   + sync_sigma_ns                            the declared-uncertainty stamp
 
 ⚠️G3 IS THE WHOLE REASON THIS MODULE EXISTS. `csv.DictReader` on a G3 file silently shifts every
 value one column left of its name: `utc_us` gets the node name, `uptime_s` gets the timestamp,
@@ -65,9 +66,18 @@ G4 = Generation("G4", ("node_id",) + _BASE + ("frame_hex", "clip", "clip_why"),
                 ("node_id",) + _BASE + ("frame_hex", "clip", "clip_why"))
 G5 = Generation("G5", ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why"),
                 ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why"))
+# ⚠️`sync_sigma_ns` IS THE PHONE'S KEY AND THE PHONE'S UNIT, on purpose. hear/pool.py already
+# reads `sync_sigma_ns` off an MQTT payload as the uncertainty of that producer's clock-to-UTC
+# anchor, 1-sigma, NANOSECONDS. A node now states the same quantity in the same unit under the
+# same name, so one measurement has one spelling across both sensors.
+# ⚠️EMPTY IS "NOT STATED", AND 0 IS NOT A VALUE THIS COLUMN CAN CARRY. A row the node could not
+# stamp at all (utc_us == 0) has no anchor to be uncertain about, and writing 0 there would read
+# as a perfect clock -- which hear/nodeclass.py refuses as a claim no hardware supports.
+_G6 = ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why", "sync_sigma_ns")
+G6 = Generation("G6", _G6, _G6)
 
-GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5)
-LATEST = G5
+GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5, G6)
+LATEST = G6
 
 # One packed v1 sketch is 172 bytes; the column holds it as hex.
 FRAME_HEX_LEN = 344
@@ -120,6 +130,28 @@ def identify(header: Sequence[str]) -> Generation:
                         % (list(h), ", ".join(g.name for g in GENERATIONS)))
 
 
+def stated_sigma_ns(cell: Any) -> Optional[float]:
+    """A G6 `sync_sigma_ns` cell as a positive number of nanoseconds, or None for "not stated".
+
+    ⚠️A LITERAL "0" IS NOT STATED, AND THE TRUTHINESS TEST THIS REPLACES MISSED IT. The reader
+    used `if not d.get("sync_sigma_ns")`, and "0" is a non-empty string: a firmware that ever
+    wrote 0 into that column produced the row `nodeclass.stamp_admissible` reads as a PERFECT
+    clock -- sqrt(100 us^2 + 0) = 100 us, inside the 129.4 us per-node bound -- which is the one
+    reading every comment in this module says must be impossible. It was invisible because
+    hear/pool.py, the only consumer, re-checked and compensated.
+
+    Unparseable is None for the same reason as non-positive: a producer this version does not
+    understand is not one to take a number from.
+    """
+    if cell is None or (isinstance(cell, str) and not cell.strip()):
+        return None
+    try:
+        f = float(cell)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0.0 else None
+
+
 def read_text(text: str, default_node: Optional[str] = None) -> DetsRead:
     """Parse a dets.csv's text. Never returns [] for a file that had no header.
 
@@ -166,6 +198,10 @@ def read_text(text: str, default_node: Optional[str] = None) -> DetsRead:
         # the pre-fix value -- the pre-fix builds took the window at a `back` this file cannot
         # know. None travels; nothing here invents 736.
         d.setdefault("sketch_back", None)
+        # G1-G5 never stated it, and an EMPTY G6 cell is the node saying it had no anchor. Both
+        # are None -- "not stated" -- and neither is 0. See hear/pool.py's record builder and
+        # hear/backend/associate.py, where absent means usable and a number is a claim.
+        d["sync_sigma_ns"] = stated_sigma_ns(d.get("sync_sigma_ns"))
         out.rows.append(d)
     return out
 

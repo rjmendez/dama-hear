@@ -87,7 +87,7 @@ class TestNode:
         # and the bands genuinely mean different things
         e16 = C.from_node(f16, "n").band_edges_hz()
         e48 = C.from_node(f48, "n").band_edges_hz()
-        assert e48[-1] == pytest.approx(20000.0)
+        assert e48[-1] == pytest.approx(23520.0)
         assert e16[-1] == pytest.approx(7840.0)
 
     def test_the_records_band_edges_are_the_frames_own_and_not_the_nyquist_axis(self):
@@ -213,13 +213,13 @@ class TestCrossRateAlignment:
         q, ref = SK.sketch(np.random.default_rng(seed).normal(0, 1000, 4096), fs, layout=layout)
         return C.from_node(SK.pack(1, ref, 5, q, fs=fs, layout=layout), node)
 
-    def test_the_two_layouts_are_the_same_bytes_at_48k(self):
+    def test_the_two_layouts_retain_the_native_24khz_axis_at_48k(self):
         """The whole fleet's phones are above LAYOUT_EQUIVALENT_ABOVE_HZ, so turning the fixed
         layout on changes not one byte they send. It changes everything a 16 kHz node sends."""
         x = np.random.default_rng(4).normal(0, 1000, 4096)
         a, ra = SK.sketch(x, 48000.0, layout=SK.LAYOUT_NYQUIST)
         b, rb = SK.sketch(x, 48000.0, layout=SK.LAYOUT_FIXED)
-        assert np.array_equal(a, b) and ra == rb
+        assert not np.array_equal(a, b) or ra != rb
         c, _ = SK.sketch(x, 16000.0, layout=SK.LAYOUT_NYQUIST)
         d, _ = SK.sketch(x, 16000.0, layout=SK.LAYOUT_FIXED)
         assert not np.array_equal(c, d), "16 kHz must differ, or the fix does nothing"

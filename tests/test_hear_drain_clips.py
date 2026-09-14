@@ -50,7 +50,7 @@ def _dets_csv(rows):
     return (",".join(DF.G5.declared) + "\n" + "\n".join(rows) + "\n").encode()
 
 
-def _wav(fs=16000, samples=64000, channels=1, bits=16):
+def _wav(fs=48000, samples=192000, channels=1, bits=16):
     """A canonical 44-byte-header WAV, byte-for-byte the shape night_node.ino writes."""
     data = b"\x11\x22" * samples
     return (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt "
@@ -159,7 +159,7 @@ class TestAClipIsNotACsv:
             "sniff changed and the CSV lane's absent-file detection changed with it")
         body, reason = HD.fetch_clip("10.0.0.1", CLIP_A)
         assert reason is None and body is not None
-        assert len(body) == CL.CLIP_BYTES == 128044
+        assert len(body) == len(_wav())
         assert body[:4] == b"RIFF"
 
     def test_a_zero_byte_200_is_a_refusal_not_a_clip(self, wired):
@@ -319,8 +319,8 @@ class TestTheIndexIsTheDedupKey:
         assert row["path"] == "clips/2025-09-09/nyquist/nyquist-db21acd5-900.wav", row["path"]
         assert not os.path.isabs(row["path"]), "the index must not pin an absolute pod path"
         on_disk = os.path.join(pl.root, row["path"])
-        assert os.path.getsize(on_disk) == CL.CLIP_BYTES
-        assert row["bytes"] == CL.CLIP_BYTES and len(row["sha256"]) == 64
+        assert os.path.getsize(on_disk) == len(_wav())
+        assert row["bytes"] == len(_wav()) and len(row["sha256"]) == 64
 
     def test_both_rate_readings_travel_side_by_side(self, tmp_path, wired):
         # ⚠️A SHIPPED CONDITION ON MACH: a whole boot headed 22624 Hz while the CSV said 16000.
@@ -602,8 +602,9 @@ class TestItReachesTheGate:
                         "clip_store_max_bytes": 123}
 
     def test_the_defaults_are_the_measured_card_ceiling(self):
-        # 6291456 / 128044 = 49 exactly, and all three nodes report budget_left_clips 0.
-        assert HD.CLIP_MAX_PER_NODE_DEFAULT == 6291456 // CL.CLIP_BYTES == 49
+        # Native 48 kHz clips are 384044 B, so the same measured card budget holds 16.
+        assert HD.CLIP_MAX_PER_NODE_DEFAULT == 6291456 // CL.CLIP_BYTES == 16
+        assert 6291456 // CL.LEGACY_CLIP_BYTES == 49
         assert HD.DEFAULT_MAX_CLIPS_DEFERRED == 0, "deferral is a design invariant, not a range"
         assert HD.DEFAULT_MAX_CLIPS_LOST == -1, (
             "666 clips are already destroyed and still named in current dets.csv files; a gate "
@@ -676,7 +677,7 @@ class TestTheIndexIsNeverBehindTheBytes:
         assert len(idx) == 2, "the ledger must not lag the bytes; got %d row(s)" % len(idx)
         assert {r["outcome"] for r in idx.values()} == {"stored"}
         for r in idx.values():
-            assert os.path.getsize(os.path.join(pl.root, r["path"])) == CL.CLIP_BYTES
+            assert os.path.getsize(os.path.join(pl.root, r["path"])) == len(_wav())
 
     def test_the_next_run_does_not_call_the_node_destroyed_a_clip_it_holds(self, tmp_path, wired,
                                                                           monkeypatch):

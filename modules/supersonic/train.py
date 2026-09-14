@@ -29,10 +29,12 @@ LOG10 = ["rise", "decay", "peak"]          # heavy-tailed; a linear model cannot
 
 def load(labels_glob, items_path):
     L = {}
-    for p in glob.glob(labels_glob):
-        d = json.load(open(p))
+    for p in glob.glob(os.path.expanduser(labels_glob)):
+        with open(p) as fh:
+            d = json.load(fh)
         L[d["id"]] = d["label"]
-    items = {i["id"]: i for i in json.load(open(items_path))}
+    with open(os.path.expanduser(items_path)) as fh:
+        items = {i["id"]: i for i in json.load(fh)}
     return L, items
 
 
@@ -62,6 +64,19 @@ def prep(X, features):
 
 
 def fit_and_score(X, y, g, features, splits=5):
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y)
+    g = np.asarray(g)
+    if X.ndim != 2 or len(X) == 0:
+        raise ValueError("training data must be a non-empty 2-D feature matrix")
+    if len(y) != len(X) or len(g) != len(X):
+        raise ValueError("features, labels, and groups must have the same length")
+    if not np.isfinite(X).all():
+        raise ValueError("training features must be finite")
+    if not np.isin(y, [0, 1]).all() or np.unique(y).size < 2:
+        raise ValueError("training labels must contain both classes 0 and 1")
+    if np.unique(g).size < splits:
+        raise ValueError("grouped CV needs at least %d distinct groups" % splits)
     Z = prep(X, features)
     m = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000))
     p = cross_val_predict(m, Z, y, cv=GroupKFold(n_splits=splits), groups=g, method="predict_proba")[:, 1]

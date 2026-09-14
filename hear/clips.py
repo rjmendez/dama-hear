@@ -31,15 +31,31 @@ import shutil
 from typing import Any, Dict, Iterable, List, Optional
 
 CLIP_SCHEMA_VERSION = 1
-#: 44-byte canonical header + 64000 samples * 2 bytes. night_node.ino CLIP_BYTES.
-CLIP_BYTES = 128044
+#: Native node clips are 4.0 s of mono signed-16 PCM at 48 kHz.
+NATIVE_FS_HZ = 48000.0
+NATIVE_CLIP_SAMPLES = 192000
+CLIP_BYTES = 44 + NATIVE_CLIP_SAMPLES * 2
+#: Kept for reading the pre-48 kHz archive; new clips must not be truncated to this size.
+LEGACY_FS_HZ = 16000.0
+LEGACY_CLIP_BYTES = 44 + int(4.0 * LEGACY_FS_HZ) * 2
 CLIP_PRE_S = 1.0
 CLIP_POST_S = 3.0
 CLIP_DIR = "/clips"
 INDEX_NAME = "index.jsonl"
-FS_NOMINAL_HZ = 16000.0
-#: Measured header spread is 15986-16000 Hz; 64 Hz is 4x the observed 14 Hz.
+# Clip names and scene rows remain indexed by the decimated sample counter.
+FS_NOMINAL_HZ = LEGACY_FS_HZ
+#: Allow the measured clock spread around either supported stream rate.
 FS_TOLERANCE_HZ = 64.0
+
+
+def expected_clip_bytes(fs_hz: float) -> int:
+    """Expected canonical WAV size for a supported four-second stream."""
+    fs = float(fs_hz)
+    if abs(fs - NATIVE_FS_HZ) <= FS_TOLERANCE_HZ:
+        return CLIP_BYTES
+    if abs(fs - LEGACY_FS_HZ) <= FS_TOLERANCE_HZ:
+        return LEGACY_CLIP_BYTES
+    raise ValueError("unsupported clip rate %.1f Hz" % fs)
 
 #: Every terminal and non-terminal state one clip can be in. `index_row` refuses anything else --
 #: an outcome that is not on this list cannot be counted, and an uncounted refusal is the failure
@@ -182,9 +198,6 @@ def wav_probe(body: bytes) -> Dict[str, Any]:
         return out
     if 44 + out["data_bytes"] != len(body):
         out["reason"] = "data_len_%d_body_%d" % (out["data_bytes"], len(body))
-        return out
-    if len(body) != CLIP_BYTES:
-        out["reason"] = "total_%d_expected_%d" % (len(body), CLIP_BYTES)
         return out
     out["ok"] = True
     return out

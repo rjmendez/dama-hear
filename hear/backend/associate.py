@@ -94,11 +94,54 @@ _QUALITY_FLAGS = ("onset_found", "utc_trusted")
 
 
 def arrival_is_usable(d: Dict) -> bool:
-    """True unless a producer has explicitly said its own timestamp is not a measurement."""
+    """True unless a producer, event contract, or node identity has explicitly said its timestamp is not a TDoA measurement."""
+    if d.get("corroboration_only", False):
+        return False
+    if d.get("tdoa_capable") is False:
+        return False
+    domain = d.get("timestamp_domain")
+    if domain and domain != "utc_gps_pps":
+        return False
+    node_id = str(d.get("node_id") or d.get("node") or "")
+    if node_id:
+        try:
+            from .. import nodeidentity
+            ident = nodeidentity.get(node_id)
+            if ident.corroboration_only or not ident.tdoa_eligible():
+                return False
+        except KeyError:
+            pass
+    node_cls = d.get("node_class")
+    if node_cls:
+        try:
+            from .. import nodeclass
+            cls = nodeclass.get(str(node_cls))
+            if not cls.contributes_arrival():
+                return False
+        except nodeclass.CapabilityError:
+            return False
     return all(d.get(k, True) is not False for k in _QUALITY_FLAGS)
 
 
 def _unusable_reason(d: Dict) -> str:
+    node_id = d.get("node_id") or d.get("node") or "unknown"
+    t_utc = float(d.get("t_utc_s", d.get("timestamp_s", 0.0)))
+    if d.get("corroboration_only", False):
+        return f"node {node_id} at {t_utc:.6f} s: corroboration_only=True (external corroborator e.g. Hugbot)"
+    if d.get("tdoa_capable") is False:
+        return f"node {node_id} at {t_utc:.6f} s: tdoa_capable=False"
+    domain = d.get("timestamp_domain")
+    if domain and domain != "utc_gps_pps":
+        return f"node {node_id} at {t_utc:.6f} s: timestamp_domain={domain!r} is not 'utc_gps_pps'"
+    node_cls = d.get("node_class")
+    if node_cls:
+        try:
+            from .. import nodeclass
+            cls = nodeclass.get(str(node_cls))
+        except nodeclass.CapabilityError:
+            return f"node {node_id} at {t_utc:.6f} s: unknown node_class={node_cls!r}"
+        if not cls.contributes_arrival():
+            return f"node {node_id} at {t_utc:.6f} s: node_class={node_cls!r} is not GPS-PPS timed"
     bad = [k for k in _QUALITY_FLAGS if d.get(k, True) is False]
     detail = {
         "onset_found": "the constant-fraction onset was never crossed even against the local "
@@ -107,9 +150,11 @@ def _unusable_reason(d: Dict) -> str:
         "utc_trusted": "no HAL audio timestamp or no fresh GPS anchor, so the stamp still "
                        "carries the input-buffer and HAL latency",
     }
-    return "node %d at %.6f s: %s" % (
-        int(d["node_id"]), float(d["t_utc_s"]),
-        "; ".join("%s=false -- %s" % (k, detail[k]) for k in bad))
+    if bad:
+        return "node %s at %.6f s: %s" % (
+            str(node_id), t_utc,
+            "; ".join("%s=false -- %s" % (k, detail[k]) for k in bad))
+    return f"node {node_id} at {t_utc:.6f} s: ineligible for TDoA arrival solving"
 
 
 def _xyz(p) -> np.ndarray:

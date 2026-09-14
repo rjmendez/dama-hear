@@ -189,6 +189,24 @@ def _node_mismatch(row: Dict[str, Any], expect: Optional[str]) -> Optional[str]:
     return None if node == expect else str(node)
 
 
+def _sync_sigma_ns(v: Any) -> Optional[float]:
+    """A dets.csv G6 cell -> a stated clock sigma in nanoseconds, or None for \"not stated\".
+
+    ⚠️NON-POSITIVE IS NOT STATED. The firmware writes an EMPTY cell for a row it could not stamp,
+    but a 0 that reached here from any source must not become a claim of a perfect clock --
+    hear/nodeclass.py refuses `t_sigma_s <= 0` at construction for exactly that reason, and this
+    value is fed to the same budget. Unparseable is None for the same reason: a producer this
+    version does not understand is not one to take a number from.
+    """
+    if v in (None, ""):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0.0 else None
+
+
 def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
     frame = binascii.unhexlify(row["frame_hex"])
@@ -225,6 +243,7 @@ def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "no_context": bool(d["event_flags"] & SK.FLAG_NO_CONTEXT),
         "sketch_back": (int(row["sketch_back"]) if row.get("sketch_back") not in (None, "")
                         else None),
+        "sync_sigma_ns": _sync_sigma_ns(row.get("sync_sigma_ns")),
         "sample": row.get("sample"),
         "uptime_s": row.get("uptime_s"),
         "trigger": row.get("trigger"),

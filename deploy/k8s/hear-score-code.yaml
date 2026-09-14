@@ -6,7 +6,7 @@ metadata:
   labels:
     app: hear-score
   annotations:
-    dama-hear/commit: '7f84d29-dirty'
+    dama-hear/commit: '87eb4d3-dirty'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
 data:
   hear__init__.py: |
@@ -39,7 +39,10 @@ data:
     
     MEL_BANDS = 20
     FRAMES = 8
-    F_LO, F_HI = 300.0, 20000.0
+    # The native acquisition stream is 48 kHz, whose Nyquist limit is 24 kHz. Keep the
+    # feature axis wide enough to retain that bandwidth; 16 kHz frames remain readable as
+    # explicitly rate-limited legacy inputs.
+    F_LO, F_HI = 300.0, 24000.0
     HOP_S = 0.004
     NFFT = 256
     MESHTASTIC_PAYLOAD = 237
@@ -68,8 +71,9 @@ data:
     LAYOUT_BIT = 1 << 12            # flags bit 12 set => LAYOUT_FIXED
     
     #: Above this rate the two layouts are IDENTICAL, because min(F_HI, fs/2*0.98) == F_HI.
-    #: Every 48 kHz sensor in this fleet is above it, so the flag changes not one byte a phone sends.
-    LAYOUT_EQUIVALENT_ABOVE_HZ = F_HI / 0.49    # 40816.3 Hz at F_HI = 20 kHz
+    #: A 48 kHz stream is intentionally just below this threshold: fixed layout is the native
+    #: profile and preserves the full 24 kHz Nyquist edge, while legacy nyquist remains distinct.
+    LAYOUT_EQUIVALENT_ABOVE_HZ = F_HI / 0.49
     
     
     
@@ -88,6 +92,9 @@ data:
                       layout: str = LAYOUT_NYQUIST) -> np.ndarray:
         """The bands+2 triangle edges this fs and layout produce. What a consumer needs to know
         whether two frames are comparable at all."""
+        fs = _valid_fs(fs)
+        if bands <= 0:
+            raise ValueError("bands must be positive")
         hi = f_hi if layout == LAYOUT_FIXED else min(f_hi, fs / 2.0 * 0.98)
         return _mel_to_hz(np.linspace(_hz_to_mel(f_lo), _hz_to_mel(hi), bands + 2))
     
@@ -102,6 +109,9 @@ data:
         a bin below Nyquist, so the TOP one is partially covered and reads systematically low. That
         band is still worth more than nothing on this corpus; `strict=True` drops it if you would
         rather have fewer, cleaner bands."""
+        fs = _valid_fs(fs)
+        if bands <= 0:
+            raise ValueError("bands must be positive")
         if layout == LAYOUT_NYQUIST:
             return int(bands)
         e = band_edges_hz(fs, bands, f_lo, f_hi, LAYOUT_FIXED)
@@ -115,7 +125,17 @@ data:
     
     def common_bands(rates: "Sequence[float]", bands: int = MEL_BANDS, **kw) -> int:
         """Bands usable by EVERY rate in `rates` -- the width of a matrix they can share."""
+        rates = list(rates)
+        if not rates:
+            raise ValueError("rates must not be empty")
         return min(valid_bands(float(r), bands, layout=LAYOUT_FIXED, **kw) for r in rates)
+    
+    
+    def _valid_fs(fs: float) -> float:
+        fs = float(fs)
+        if not np.isfinite(fs) or fs <= 0:
+            raise ValueError("fs must be finite and positive")
+        return fs
     
     
     def _hz_to_mel(f):
@@ -147,6 +167,9 @@ data:
         resolves its own spectrum more coarsely than the rescaled bank would. That is the trade -- one
         model across the fleet, against per-node resolution.
         """
+        fs = _valid_fs(fs)
+        if nfft <= 0 or bands <= 0:
+            raise ValueError("nfft and bands must be positive")
         if layout not in (LAYOUT_NYQUIST, LAYOUT_FIXED):
             raise ValueError("layout must be %r or %r" % (LAYOUT_NYQUIST, LAYOUT_FIXED))
         hi = f_hi if layout == LAYOUT_FIXED else min(f_hi, fs / 2.0 * 0.98)
@@ -174,6 +197,14 @@ data:
         `layout` decides what band k MEANS -- see [mel_filterbank]. At any rate above
         LAYOUT_EQUIVALENT_ABOVE_HZ the two are the same bytes."""
         x = np.asarray(x, float)
+        if x.ndim != 1:
+            raise ValueError("x must be one-dimensional")
+        if not np.isfinite(x).all():
+            raise ValueError("x must contain only finite values")
+        if frames <= 0:
+            raise ValueError("frames must be positive")
+        if not np.isfinite(hop_s) or hop_s < 0:
+            raise ValueError("hop_s must be finite and non-negative")
         fb = mel_filterbank(fs, nfft, bands, layout=layout)
         hop = max(1, int(hop_s * fs))
         win = np.hanning(nfft)
@@ -291,7 +322,16 @@ data:
     
     def load_model(path: str = DEFAULT_MODEL) -> Dict[str, Any]:
         with open(os.path.abspath(path)) as fh:
-            return json.load(fh)
+            model = json.load(fh)
+        features = model.get("features")
+        weights = model.get("w")
+        if features is not None and (not isinstance(features, list) or not isinstance(weights, list) or len(features) != len(weights)):
+            raise ValueError("model features and weights must be lists of equal length")
+        if not math.isfinite(float(model.get("b"))):
+            raise ValueError("model bias must be finite")
+        if not all(math.isfinite(float(weight)) for weight in weights):
+            raise ValueError("model weights must be finite")
+        return model
     
     
     def score(feat: Dict[str, float], model: Dict[str, Any]) -> Optional[float]:
@@ -300,12 +340,16 @@ data:
         None rather than a default: a missing feature substituted with 0 scores a silent event as a
         confident shot, and the caller cannot tell that from a real one.
         """
+        if len(model["features"]) != len(model["w"]):
+            raise ValueError("model features and weights must have equal lengths")
         z = float(model["b"])
         logs = set(model.get("log10", ()))
         for name, w in zip(model["features"], model["w"]):
             if name not in feat or feat[name] is None:
                 return None
             v = float(feat[name])
+            if not math.isfinite(v):
+                return None
             if name in logs:
                 v = math.log10(max(v, 1e-3))
             z += float(w) * v
@@ -344,6 +388,8 @@ data:
             from hear import sketch as _sk
             frame = _sk.unpack(bytes(frame))
         q, ref = frame["q"], float(frame["ref_db"])
+        if not math.isfinite(ref):
+            raise SketchMismatch("frame reference level must be finite")
         bands, frames = len(q), len(q[0])
         want_b, want_f = int(model["bands"]), int(model["frames"])
         if frames != want_f:
@@ -368,6 +414,8 @@ data:
         w = model["w"]
         if len(w) != want_b * want_f:
             raise SketchMismatch("model has %d weights for a %dx%d sketch" % (len(w), want_b, want_f))
+        if not all(math.isfinite(float(weight)) for weight in w):
+            raise SketchMismatch("model weights must be finite")
         z = float(model["b"])
         i = 0
         for b in range(want_b):                       # band-major, matching model["order"]
@@ -503,7 +551,11 @@ data:
     from hear import sketch as SK                                              # noqa: E402
     from modules.supersonic import classify as CL                              # noqa: E402
     
-    SCORE_SCHEMA = "hear.sketch_score.v1"
+    SCORE_SCHEMA = "hear.sketch_score.v2"
+    
+    #: Native scoring axis. Legacy 16 kHz frames are accepted only when a caller explicitly selects
+    #: the compatibility model; the default scorer must not silently discard their high-frequency bands.
+    PRIMARY_FS_HZ = 48000.0
     
     #: The rate the shipped sketch models were FITTED at. Not inferred from the file: hear/sketch.py
     #: :124 states it in as many words -- "a model trained on 48 kHz sketches and applied to the same
@@ -1258,7 +1310,7 @@ data:
         ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
         ap.add_argument("--pool", default="~/hear-pool", help="pool root; records/ is read, "
                                                               "scores/ and state/ are written")
-        ap.add_argument("--model", default=CL.FLEET_SKETCH_MODEL,
+        ap.add_argument("--model", default=CL.DEFAULT_SKETCH_MODEL,
                         help="⚠️the fleet model by default. The 20-band model refused 1690 of 1690 "
                              "pooled records for wanting 20 bands where a 16 kHz node carries 15")
         ap.add_argument("--hydrate-fs", action="store_true",

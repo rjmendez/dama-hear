@@ -27,6 +27,22 @@ def _shot(n=48000, at=8000, amp=25000.0):
     return x
 
 
+class TestSignalEdgeCases:
+    def test_empty_buffers_are_quiet_and_safe(self):
+        assert DT.envelope(np.array([]), FS).size == 0
+        assert DT.Gate(FS).process(np.array([]), 0) == []
+
+    def test_invalid_onset_inputs_are_rejected(self):
+        with pytest.raises(ValueError, match="within e"):
+            DT.onset_index_checked(np.array([0.0, 1.0]), 2)
+        with pytest.raises(ValueError, match="finite"):
+            DT.onset_index_checked(np.array([0.0, np.nan, 1.0]), 2)
+
+    def test_nonfinite_audio_is_rejected(self):
+        with pytest.raises(ValueError, match="finite"):
+            DT.envelope(np.array([np.inf]), FS)
+
+
 class TestEnvelope:
     def test_rise_uses_an_envelope_not_raw_samples(self):
         # THE REGRESSION. Walking raw |x| from the peak stops at the first zero crossing and

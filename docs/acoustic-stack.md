@@ -1,5 +1,7 @@
 # The acoustic classification stack
 
+> **Native-rate policy (2026-09-12):** The primary ingestion, sketch pooling, and model feature-extraction path is 48 kHz with a 24 kHz upper acoustic feature edge. The 16 kHz measurements retained in this document are legacy hardware/history or explicit compatibility models, not a downsampling target.
+
 **Status: design.** Nothing in section 5 is built. Every number is either measured — with the
 date and the command — or marked ASSUMPTION or UNMEASURED. Where the design was revised because
 a critique falsified a premise, the falsified premise is kept and struck through rather than
@@ -92,7 +94,7 @@ so a wrong-denominator implementation fails immediately instead of reading perma
 > **`docs/clip-pipeline.md`**. Read that before quoting anything out of `clips/tags.jsonl`.
 
 Measured across the fleet on **2026-09-09**. Every node writes 4.0 s WAVs (1.0 s pre-trigger +
-3.0 s post, 16 kHz 16-bit mono, 128,044 B) into `/clips` against a 6,291,456 B budget — exactly
+3.0 s post, 48 kHz 16-bit mono, 384,044 B) into `/clips` against a 6,291,456 B budget — exactly
 49 files — and evicts oldest-by-name when it is full. nyquist wrote 274 and evicted ~225; mach
 wrote 102 and evicted ~53; rankine wrote 249 and evicted ~200. **625 written, ~478 destroyed, 0
 collected.** `tools/hear_drain.py` contained zero mentions of clips, and the `/ls` handler
@@ -444,7 +446,7 @@ The system refuses to:
    `X-Audio-Fs-Hz` **per file** — `fs_clean` was observed at 15,912.4 and 16,042.7 Hz on
    requests seconds apart, and the WAV header cannot represent it.
 5. **Pool across band axes.** `pool._geom_str()` keys on `(bands, slices, f_lo_hz, f_hi_hz)` and
-   refuses the sketch's `[300, 20000]` against the scene's `[62.5, 7812.5]`. That guard is
+   refuses the sketch's `[300, 24000]` against the scene's `[62.5, 7812.5]`. That guard is
    correct and must not be relaxed.
 6. **Score a cross-rate frame without `layout=fixed`.** Measured cost of getting it wrong on
    identical audio: AUC 0.9473 → 0.9141.
@@ -758,7 +760,7 @@ is not evidence the head works.
 
 ### 6.4 The representations must not be unified
 
-- **Sketch** (172 B, 20×8, `[300, 20000]` Hz, event-gated) — the **index** and the pull trigger.
+- **Sketch** (172 B, 20×8, `[300, 24000]` Hz, event-gated, native 48 kHz) — the **index** and the pull trigger.
   Three producers, one byte contract, golden vectors on both sides. It is ~1/1700th of what
   Perch eats and must never try to feed a classifier.
 - **Scene** (20×4, `[62.5, 7812.5]` Hz, ungated, 1.024 s) — the **context**: ambient state,

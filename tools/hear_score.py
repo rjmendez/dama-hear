@@ -99,7 +99,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hear import sketch as SK                                              # noqa: E402
 from modules.supersonic import classify as CL                              # noqa: E402
 
-SCORE_SCHEMA = "hear.sketch_score.v1"
+SCORE_SCHEMA = "hear.sketch_score.v2"
+
+#: Native scoring axis. Legacy 16 kHz frames are accepted only when a caller explicitly selects
+#: the compatibility model; the default scorer must not silently discard their high-frequency bands.
+PRIMARY_FS_HZ = 48000.0
 
 #: The rate the shipped sketch models were FITTED at. Not inferred from the file: hear/sketch.py
 #: :124 states it in as many words -- "a model trained on 48 kHz sketches and applied to the same
@@ -854,7 +858,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--pool", default="~/hear-pool", help="pool root; records/ is read, "
                                                           "scores/ and state/ are written")
-    ap.add_argument("--model", default=CL.FLEET_SKETCH_MODEL,
+    ap.add_argument("--model", default=CL.DEFAULT_SKETCH_MODEL,
                     help="⚠️the fleet model by default. The 20-band model refused 1690 of 1690 "
                          "pooled records for wanting 20 bands where a 16 kHz node carries 15")
     ap.add_argument("--hydrate-fs", action="store_true",

@@ -83,6 +83,7 @@ from typing import Any, Dict, List, Optional, Tuple
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hear import clips as CLIPS                                            # noqa: E402
+from hear import resample as RESAMPLE                                       # noqa: E402
 from hear import tags as TAGS                                             # noqa: E402
 
 TAG_SCHEMA = "hear.clip_tag.v1"
@@ -177,7 +178,7 @@ class WeightsRefused(RuntimeError):
 
 
 class RateRefused(ValueError):
-    """The WAV header states a rate YAMNet's fixed 16 kHz frontend cannot be fed."""
+    """The WAV header is neither native 48 kHz nor a supported legacy stream."""
 
 
 # ----------------------------------------------------------------- PURE
@@ -275,20 +276,21 @@ def normalise(x: "Any", target_dbfs: float = TARGET_DBFS) -> Tuple["Any", float]
 
 
 def assert_rate(header_fs: int, csv_fs: Optional[float] = None) -> None:
-    """Raise unless the WAV header is within clips.FS_TOLERANCE_HZ of 16 kHz.
+    """Raise unless the WAV header is a supported native or legacy stream rate.
 
     ⚠️THE HEADER IS AUTHORITATIVE, NOT THE CSV. `fs_hz` in dets.csv is the node's own estimate and
     has disagreed with the file it describes by 6,624 Hz for a whole boot on mach. The header is
     what the samples were written at; the CSV value is carried into the tag row beside it so the
     disagreement stays visible, but it is never what is checked.
     """
-    if abs(float(header_fs) - CLIPS.FS_NOMINAL_HZ) > CLIPS.FS_TOLERANCE_HZ:
+    valid = (abs(float(header_fs) - CLIPS.NATIVE_FS_HZ) <= CLIPS.FS_TOLERANCE_HZ or
+             abs(float(header_fs) - CLIPS.LEGACY_FS_HZ) <= CLIPS.FS_TOLERANCE_HZ)
+    if not valid:
         raise RateRefused(
-            "WAV header states %d Hz; YAMNet's frontend is fixed at %d Hz and does not resample, "
-            "so this would degrade silently towards Silence rather than fail. Tolerance is "
-            "+/-%.0f Hz (measured header spread is 15986-16000; mach shipped a boot at 22624). "
-            "The dets CSV said %s Hz."
-            % (int(header_fs), int(CLIPS.FS_NOMINAL_HZ), CLIPS.FS_TOLERANCE_HZ, csv_fs))
+            "WAV header states %d Hz; supported stream rates are %d Hz native and %d Hz legacy "
+            "+/-%.0f Hz. The dets CSV said %s Hz."
+            % (int(header_fs), int(CLIPS.NATIVE_FS_HZ), int(CLIPS.LEGACY_FS_HZ),
+               CLIPS.FS_TOLERANCE_HZ, csv_fs))
 
 
 class Tagger:
@@ -304,6 +306,7 @@ class Tagger:
     the converter. 521 is the class count, 1024 the embedding width, 64 the mel bins; each is
     required to appear exactly once or the model is refused as not-this-model.
     """
+    input_fs_hz = 16000.0
 
     def __init__(self, model_path: str, class_map_path: str):
         from ai_edge_litert.interpreter import Interpreter        # lazy: absent in the test env
@@ -376,7 +379,7 @@ def model_block(verified: Dict[str, Any]) -> Dict[str, Any]:
     return {"name": MODEL_NAME, "version": MODEL_VERSION,
             "file": MODEL_FILE, "sha256": verified.get("model_sha256"),
             "class_map_file": CLASSMAP_FILE, "class_map_sha256": verified.get("class_map_sha256"),
-            "runtime": "ai-edge-litert", "input_fs_hz": int(CLIPS.FS_NOMINAL_HZ),
+            "runtime": "ai-edge-litert", "input_fs_hz": int(Tagger.input_fs_hz),
             "n_classes": YAMNET_CLASSES, "embed_dim": YAMNET_EMBED_DIM,
             "target_dbfs": TARGET_DBFS, "score_floor": SCORE_FLOOR,
             "card": "tag_model_card.json"}
@@ -424,10 +427,9 @@ def model_card(verified: Dict[str, Any]) -> Dict[str, Any]:
             "pipeline without this step emits Silence for every clip and exits 0."
             % TARGET_DBFS),
         "rate_policy": (
-            "the WAV header rate is asserted within +/-%.0f Hz of %d and REFUSED otherwise. No "
-            "resampling anywhere: YAMNet neither validates nor resamples its input, so a wrong "
-            "rate degrades silently. mach shipped a boot headed 22624 Hz."
-            % (CLIPS.FS_TOLERANCE_HZ, int(CLIPS.FS_NOMINAL_HZ))),
+            "native WAVs are retained at %d Hz; YAMNet receives a dedicated %d Hz resampled view. "
+            "Unsupported headers are refused rather than silently interpreted."
+            % (int(CLIPS.NATIVE_FS_HZ), int(Tagger.input_fs_hz))),
         "score_floor": SCORE_FLOOR,
         "score_floor_note": (
             "a STORAGE bound, not a decision threshold. Classes below it are summarised by "
@@ -614,21 +616,28 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
     except Exception as exc:
         return {"ok": False, "reason": R_WAV_UNREADABLE,
                 "detail": "%s: %s" % (type(exc).__name__, exc)}
-    if len(pcm) * 2 + 44 != CLIPS.CLIP_BYTES:
-        return {"ok": False, "reason": R_WAV_SAMPLES,
-                "detail": "%d samples; a clip is %d (%.1f s pre + %.1f s post at %d Hz)"
-                          % (len(pcm), (CLIPS.CLIP_BYTES - 44) // 2, CLIPS.CLIP_PRE_S,
-                             CLIPS.CLIP_POST_S, int(CLIPS.FS_NOMINAL_HZ))}
     try:
         assert_rate(header_fs, row.get("fs_hz"))
     except RateRefused as exc:
         return {"ok": False, "reason": R_RATE_REFUSED, "detail": str(exc)}
     try:
+        expected_bytes = CLIPS.expected_clip_bytes(header_fs)
+    except ValueError:
+        expected_bytes = None
+    if expected_bytes is None or len(pcm) * 2 + 44 != expected_bytes:
+        expected_samples = ((expected_bytes - 44) // 2) if expected_bytes else 0
+        return {"ok": False, "reason": R_WAV_SAMPLES,
+                "detail": "%d samples; this rate expects %d (%.1f s pre + %.1f s post at %d Hz)"
+                          % (len(pcm), expected_samples, CLIPS.CLIP_PRE_S, CLIPS.CLIP_POST_S,
+                             int(header_fs))}
+    try:
         pcm, pre_db = normalise(pcm)
     except ValueError as exc:
         return {"ok": False, "reason": R_DIGITAL_SILENCE, "detail": str(exc)}
+    model_fs = float(getattr(tagger, "input_fs_hz", header_fs))
+    model_pcm = RESAMPLE.prepare(pcm, header_fs, model_fs)
     try:
-        got = tagger.tag(pcm, floor=floor)
+        got = tagger.tag(model_pcm, floor=floor)
     except Exception as exc:
         return {"ok": False, "reason": R_MODEL_ERROR,
                 "detail": "%s: %s" % (type(exc).__name__, exc)}

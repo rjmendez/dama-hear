@@ -37,6 +37,8 @@ TAGS_NAME = "tags.jsonl"
 #: against each other by tests/test_hear_tag.py.
 CLIP_PRE_S = 1.0
 CLIP_POST_S = 3.0
+# The clip name and scene rows use the decimated 16 kHz sample counter even when the WAV and
+# detection sketch are captured from the native 48 kHz stream.
 FS_NOMINAL_HZ = 16000.0
 
 #: How many scene rows one overlap query will return before it says it truncated. A 4.0 s clip

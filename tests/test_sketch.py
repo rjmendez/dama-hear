@@ -73,6 +73,22 @@ class TestQuantisation:
         q, ref = S.sketch(np.zeros(4096), FS)
         assert np.isfinite(ref) and np.isfinite(q).all()
 
+    def test_empty_input_is_padded_without_nonfinite_output(self):
+        q, ref = S.sketch(np.array([]), FS)
+        assert q.shape == (S.MEL_BANDS, S.FRAMES)
+        assert np.isfinite(ref) and np.isfinite(q).all()
+
+    def test_nonfinite_audio_is_rejected_before_fft(self):
+        for value in (np.nan, np.inf, -np.inf):
+            with pytest.raises(ValueError, match="finite"):
+                S.sketch(np.array([value]), FS)
+
+    def test_zero_frames_and_invalid_rate_are_rejected(self):
+        with pytest.raises(ValueError, match="frames"):
+            S.sketch(np.zeros(16), FS, frames=0)
+        with pytest.raises(ValueError, match="finite and positive"):
+            S.mel_filterbank(0.0)
+
 
 class TestFilterbank:
     def test_bands_are_normalised_and_ordered(self):

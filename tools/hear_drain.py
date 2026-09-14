@@ -115,6 +115,9 @@ from hear import clips as CL                                        # noqa: E402
 from hear import detsfile as DF                                     # noqa: E402
 from hear import pool as P                                          # noqa: E402
 
+#: Native audio and sketch records are preserved at their stated rate; the drain never resamples.
+PRIMARY_FS_HZ = 48000.0
+
 # The card files worth pulling every run. `dets.csv` and its rolled predecessor carry the
 # sketches; `health.csv` carries the PPS/fs context a later reader needs to judge them and is
 # archived but NOT ingested -- the pool holds sketches, and mixing a second row shape into it
@@ -213,8 +216,8 @@ DEFAULT_MAX_STALE_S = 7200.0
 # 6291456 / 128044 = 49 exactly, and all three nodes report `budget_left_b 17300`,
 # `budget_left_clips 0` -- 6291456 - 17300 = 6274156 = 49 x 128044. So a backlog is BOUNDED at 49
 # per node however long the drain was down, which is the crucial difference from scene.csv.
-CLIP_MAX_PER_NODE_DEFAULT = 49
-# 3 x 49 clips is 18.8 MB: 112 s at the measured 168 KB/s, 470 s at the 40 KB/s contended floor.
+CLIP_MAX_PER_NODE_DEFAULT = 16
+# 3 x 16 native clips is 18.4 MB: 112 s at the measured 168 KB/s, 470 s at the 40 KB/s contended floor.
 # 307 + 470 = 777 s of a 900 s interval is too tight, so the per-node deadline binds instead of
 # the schedule. At 40 KB/s this buys 37 clips and nyquist's worst 15-minute burst was 43 -- the
 # cap CAN bind below a burst, which is exactly why `clips_cap_hit` reaches the heartbeat ring.
@@ -665,7 +668,10 @@ def fetch_clip(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S
         return None, "empty"
     if body[:4] != b"RIFF":
         return None, "not_riff"
-    if len(body) < CL.CLIP_BYTES:
+    if len(body) < 44:
+        return None, "short"
+    declared_bytes = int.from_bytes(body[40:44], "little")
+    if len(body) < 44 + declared_bytes:
         return None, "short"
     return body, None
 

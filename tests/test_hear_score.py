@@ -125,9 +125,9 @@ class TestTheModelIsActuallyWired:
     def test_the_shipped_goldens_score_exactly_these_values(self, model):
         """Measured on this checkout, pinned to 1e-9 relative. Any of the three defects below
         moves every one of them, which is what a `< 0.5` assertion would not notice."""
-        for name, want in (("noise_16k_fixed", 1.930663816381e-02),
-                           ("impulse_16k_fixed", 4.876290010415e-13),
-                           ("impulse_48k_fixed", 1.412061804705e-12)):
+        for name, want in (("noise_16k_fixed", 1.208179700206e-02),
+                           ("impulse_16k_fixed", 2.834584373771e-13),
+                           ("impulse_48k_fixed", 1.860150091948e-14)):
             got = CL.score_sketch(self._golden(name), model)
             assert got == pytest.approx(want, rel=1e-9), "%s = %.12e" % (name, got)
 

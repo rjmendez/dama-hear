@@ -94,12 +94,7 @@
 #define SD_CMD_PIN     -1
 #define SD_D0_PIN      -1        // bus width not yet established (1-bit or 4-bit)
 
-// ---- I2C ---------------------------------------------------------------------------------
-// DS3231 RTC plus temperature, humidity, pressure, VOC, eCO2, IAQ, a 3-axis magnetometer, a 3-axis
-// accelerometer and an 11-channel spectral light sensor -- read off the vendor's own CSV header.
-// ⚠️Bus pins NOT yet known.
-#define I2C_SDA_PIN    -1
-#define I2C_SCL_PIN    -1
+// ---- fitted sensors ------------------------------------------------------------------------
 #define HAS_BARO       1
 #define HAS_HUMIDITY   1
 #define HAS_MAG        1
@@ -110,7 +105,9 @@
 // ---- reserved ------------------------------------------------------------------------------
 // 19,20 USB D-/D+ -- reconfiguring these killed the console once already and cost a replug caught
 // inside a four-second window. 26-32 SPI flash. 33-37 octal PSRAM. Never touch any of them.
-#define FREE_PADS      {15, 16, 17, 18, 21, 38, 39}
+// GPIO18 and GPIO39 are externally driven, GPIO38 is the RTC square wave, and GPIO21 was not
+// observed in the scan; only the three measured floating pads are listed as free.
+#define FREE_PADS      {15, 16, 17}
 
 // ---- I2C ------------------------------------------------------------------------------------
 // Found 2026-09-08 by /i2c. /scan alone never could: an idle bus does not toggle. The narrowing is

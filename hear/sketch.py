@@ -25,7 +25,10 @@ import numpy as np
 
 MEL_BANDS = 20
 FRAMES = 8
-F_LO, F_HI = 300.0, 20000.0
+# The native acquisition stream is 48 kHz, whose Nyquist limit is 24 kHz. Keep the
+# feature axis wide enough to retain that bandwidth; 16 kHz frames remain readable as
+# explicitly rate-limited legacy inputs.
+F_LO, F_HI = 300.0, 24000.0
 HOP_S = 0.004
 NFFT = 256
 MESHTASTIC_PAYLOAD = 237
@@ -54,8 +57,9 @@ LAYOUT_FIXED = "fixed"          # edges always over [F_LO, F_HI]; bands above Ny
 LAYOUT_BIT = 1 << 12            # flags bit 12 set => LAYOUT_FIXED
 
 #: Above this rate the two layouts are IDENTICAL, because min(F_HI, fs/2*0.98) == F_HI.
-#: Every 48 kHz sensor in this fleet is above it, so the flag changes not one byte a phone sends.
-LAYOUT_EQUIVALENT_ABOVE_HZ = F_HI / 0.49    # 40816.3 Hz at F_HI = 20 kHz
+#: A 48 kHz stream is intentionally just below this threshold: fixed layout is the native
+#: profile and preserves the full 24 kHz Nyquist edge, while legacy nyquist remains distinct.
+LAYOUT_EQUIVALENT_ABOVE_HZ = F_HI / 0.49
 
 
 
@@ -74,6 +78,9 @@ def band_edges_hz(fs: float, bands: int = MEL_BANDS,
                   layout: str = LAYOUT_NYQUIST) -> np.ndarray:
     """The bands+2 triangle edges this fs and layout produce. What a consumer needs to know
     whether two frames are comparable at all."""
+    fs = _valid_fs(fs)
+    if bands <= 0:
+        raise ValueError("bands must be positive")
     hi = f_hi if layout == LAYOUT_FIXED else min(f_hi, fs / 2.0 * 0.98)
     return _mel_to_hz(np.linspace(_hz_to_mel(f_lo), _hz_to_mel(hi), bands + 2))
 
@@ -88,6 +95,9 @@ def valid_bands(fs: float, bands: int = MEL_BANDS, f_lo: float = F_LO, f_hi: flo
     a bin below Nyquist, so the TOP one is partially covered and reads systematically low. That
     band is still worth more than nothing on this corpus; `strict=True` drops it if you would
     rather have fewer, cleaner bands."""
+    fs = _valid_fs(fs)
+    if bands <= 0:
+        raise ValueError("bands must be positive")
     if layout == LAYOUT_NYQUIST:
         return int(bands)
     e = band_edges_hz(fs, bands, f_lo, f_hi, LAYOUT_FIXED)
@@ -101,7 +111,17 @@ def valid_bands(fs: float, bands: int = MEL_BANDS, f_lo: float = F_LO, f_hi: flo
 
 def common_bands(rates: "Sequence[float]", bands: int = MEL_BANDS, **kw) -> int:
     """Bands usable by EVERY rate in `rates` -- the width of a matrix they can share."""
+    rates = list(rates)
+    if not rates:
+        raise ValueError("rates must not be empty")
     return min(valid_bands(float(r), bands, layout=LAYOUT_FIXED, **kw) for r in rates)
+
+
+def _valid_fs(fs: float) -> float:
+    fs = float(fs)
+    if not np.isfinite(fs) or fs <= 0:
+        raise ValueError("fs must be finite and positive")
+    return fs
 
 
 def _hz_to_mel(f):
@@ -133,6 +153,9 @@ def mel_filterbank(fs: float, nfft: int = NFFT, bands: int = MEL_BANDS,
     resolves its own spectrum more coarsely than the rescaled bank would. That is the trade -- one
     model across the fleet, against per-node resolution.
     """
+    fs = _valid_fs(fs)
+    if nfft <= 0 or bands <= 0:
+        raise ValueError("nfft and bands must be positive")
     if layout not in (LAYOUT_NYQUIST, LAYOUT_FIXED):
         raise ValueError("layout must be %r or %r" % (LAYOUT_NYQUIST, LAYOUT_FIXED))
     hi = f_hi if layout == LAYOUT_FIXED else min(f_hi, fs / 2.0 * 0.98)
@@ -160,6 +183,14 @@ def sketch(x: np.ndarray, fs: float, bands: int = MEL_BANDS, frames: int = FRAME
     `layout` decides what band k MEANS -- see [mel_filterbank]. At any rate above
     LAYOUT_EQUIVALENT_ABOVE_HZ the two are the same bytes."""
     x = np.asarray(x, float)
+    if x.ndim != 1:
+        raise ValueError("x must be one-dimensional")
+    if not np.isfinite(x).all():
+        raise ValueError("x must contain only finite values")
+    if frames <= 0:
+        raise ValueError("frames must be positive")
+    if not np.isfinite(hop_s) or hop_s < 0:
+        raise ValueError("hop_s must be finite and non-negative")
     fb = mel_filterbank(fs, nfft, bands, layout=layout)
     hop = max(1, int(hop_s * fs))
     win = np.hanning(nfft)

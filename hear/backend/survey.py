@@ -95,9 +95,18 @@ class Survey:
         existed omits it and silently dropping those nodes would be a worse failure than the one
         this fixes. State the class to be refused.
         """
-        from .. import nodeclass                       # local: keeps survey.py importable alone
+        from .. import nodeclass, nodeidentity         # local: keeps survey.py importable alone
         out = []
         for i in self.ids:
+            name = self.names.get(i, str(i)).lower()
+            try:
+                ident = nodeidentity.get(name)
+                if ident.corroboration_only:
+                    continue
+                if not ident.tdoa_eligible() and ident.hardware_profile in ("gotchi-phone", "hugbot-corroborator"):
+                    continue
+            except KeyError:
+                pass
             c = self.classes.get(i, "")
             if not c:
                 out.append(i)

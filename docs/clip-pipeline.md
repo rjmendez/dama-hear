@@ -1,5 +1,9 @@
 # The clip pipeline
 
+> **Native-rate policy (2026-09-12):** Active ingestion, sketch pooling, and model feature extraction use 48 kHz samples and preserve features through 24 kHz. Any 16 kHz references below describe deployed legacy hardware, compatibility fixtures, or the separate YAMNet tagger; they are not a permission to downsample the native path.
+
+> **Native-rate policy (2026-09-12):** Active ingestion, sketch pooling, and model feature extraction use 48 kHz samples and preserve features through 24 kHz. Any 16 kHz references below describe deployed legacy hardware, compatibility fixtures, or the separate YAMNet tagger; they are not a permission to downsample the native path.
+
 Detection audio, from the node's SD card to the pool, and — once a human gate opens — to a set of
 model-generated tags. This is the operator page for what actually ships. The design argument is in
 `docs/acoustic-stack.md` §0.3 and §0.4.
@@ -16,7 +20,7 @@ false}`. Those fields are there so the refusal travels with the data instead of 
 page. A YAMNet score is a hypothesis about a 4-second clip. It is not an observation, it is not an
 annotation, and three models agreeing is corroboration, not ground truth.
 
-**2. The audio is 16 kHz, so everything above 8 kHz is simply not present.** Bat calls, most insect
+**2. Native clips are 48 kHz, preserving acoustic content through the 24 kHz Nyquist edge.** The separate YAMNet tagger remains a legacy 16 kHz compatibility consumer. Bat calls, most insect
 stridulation detail, and the upper half of many bird songs are outside the recording, not merely
 missed by the model. A confident "no bird" from this pipeline is a statement about 0–8 kHz.
 
@@ -57,7 +61,7 @@ Measured on the live fleet 2026-09-09:
 | **fleet** | **625** | **~478** |
 
 **Not one clip had ever left a node.** Each node writes 4.0 s WAVs (1.0 s pre-trigger + 3.0 s post,
-16 kHz 16-bit mono, 128,044 B) into `/clips` under a 6,291,456 B budget — exactly 49 clips
+48 kHz 16-bit mono, 384,044 B) into `/clips` under a 6,291,456 B budget — exactly 49 clips
 (`6291456 / 128044 = 49`, confirmed live: all three nodes report `budget_left_clips 0` and
 `6291456 - 17300 = 6274156 = 49 × 128044`). The 50th evicts the oldest.
 
@@ -264,13 +268,13 @@ Measured on this fleet's own audio, two real clips pulled off nyquist:
 Clips are recorded at −49 to −62 dBFS. **A pipeline that skips `normalise()` is green forever and
 emits Silence for every clip.**
 
-**No resampling.** `assert_rate()` refuses anything more than `FS_TOLERANCE_HZ = 64.0` from 16000.
-The measured spread is 15986–16000, which is harmless; mach's 22624 Hz boot is not, and a resampler
-would quietly launder it into plausible-looking tags. YAMNet does not validate its input rate and
+**The tagger is a legacy 16 kHz consumer, not the native acoustic pipeline.** `assert_rate()` keeps its
+strict 16 kHz refusal because YAMNet has a fixed 16 kHz frontend. Native ingestion and sketch scoring
+never pass through this adapter: 48 kHz samples and their 24 kHz feature axis remain untouched. YAMNet does not validate its input rate and
 does not resample — feeding it the wrong rate degrades **silently** to Silence.
 
 The 1024-d embedding is stored with every tag. It is free (same forward pass), it is a fixed
-16 kHz-native axis — unlike the scene.csv (20×4, 62.5–7812.5 Hz) / sketch (20×8, 300–20000 Hz) band
+native-rate embedding axis — unlike the scene.csv (20×4, 62.5–7812.5 Hz) / sketch (20×8, 300–20000 Hz) band
 split that `hear/pool.py` refuses to pool across — and it is what makes any later clustering possible
 without re-fetching audio the node has long since destroyed.
 
@@ -364,7 +368,9 @@ Two known-open items, both now *visible* rather than fixed: rankine's 25 `clip_w
 clips that never reached the card at all, countable from the index once this ships — and the
 anchored/unanchored split of the 228,251 scene rows, which nothing here is sized from.
 
-## Acquisition at 48 kHz, decimated to 16 kHz
+## Acquisition at 48 kHz; legacy 16 kHz scene lane
+
+The native clip and sketch lanes remain 48 kHz end-to-end. The scene descriptor and sample-counter health lane below are legacy 16 kHz products kept for deployed firmware compatibility; they must not be used as the primary acoustic feature axis.
 
 The microphone runs at `FS_ACQ` (48 kHz) and everything downstream of the decimator runs at
 `FS_NOMINAL` (16 kHz). Two rates, on purpose, because the two consumers want different things:

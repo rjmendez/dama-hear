@@ -58,7 +58,7 @@ HDR_V2: int = 13                        # bytes. 5 ts + 2 ref + 2 peak + 2 node_
 # profile_id -> (bands, frames). LITERAL AND FROZEN: if SK.MEL_BANDS/SK.FRAMES were ever edited,
 # reading these from them would silently change the meaning of every deployed frame. A test
 # compares the two so an edit forces a NEW profile id instead of a reinterpretation.
-PROFILES: Dict[int, Tuple[int, int]] = {0: (20, 8), 1: (20, 8), 2: (20, 8)}
+PROFILES: Dict[int, Tuple[int, int]] = {0: (20, 8), 1: (20, 8), 2: (20, 8), 3: (20, 8)}
 
 
 class Geometry(NamedTuple):
@@ -90,8 +90,12 @@ PROFILE_GEOMETRY: Dict[int, Geometry] = {
     # which is what every frame already sent under it actually means. It is not selectable for a
     # new frame -- see profile_for_geometry.
     0: Geometry(20, 8, 256, 0.004, None, SK.LAYOUT_NYQUIST, 300.0, 20000.0),
+    # Historical 48 kHz profile. Keep it append-only: profile ids are persisted on the wire.
     1: Geometry(20, 8, 256, 0.004, 48000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
     2: Geometry(20, 8, 256, 0.004, 16000.0, SK.LAYOUT_FIXED, 300.0, 20000.0),
+    # Native 48 kHz profile. Its upper edge reaches the 24 kHz Nyquist limit instead of
+    # truncating the acquisition stream to the legacy 20 kHz axis.
+    3: Geometry(20, 8, 256, 0.004, 48000.0, SK.LAYOUT_FIXED, 300.0, 24000.0),
 }
 
 #: Ids a NEW frame may claim. 0 is excluded because a frame that cannot say its own rate is the
@@ -105,7 +109,7 @@ LEGACY_PROFILES = frozenset({0})
 #: about rate or band layout. Shape can no longer select an id at all (profile_for refuses when
 #: it is ambiguous, which 20x8 now is). A caller that does not care still gets a frame that
 #: STATES what its bands mean; a caller that does passes profile_id.
-DEFAULT_PROFILE: int = 1
+DEFAULT_PROFILE: int = 3
 
 # 237 B Meshtastic payload minus 37 B protobuf/portnum, per sketch.py:31,107.
 MESHTASTIC_USABLE: int = 200

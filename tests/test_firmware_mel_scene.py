@@ -173,11 +173,9 @@ def test_the_scene_bank_is_not_the_detection_bank():
     ⚠️THIS CAN NO LONGER BE DECIDED IN BINS. The banks used to share a rate, so an equal
     (first bin, bin count) pair meant an equal band and the test was a set intersection. The sketch
     bank moved to FS_ACQ and the scene bank did not, so a bin index now means 187.5 Hz on one and
-    62.5 Hz on the other: bins (9, 5) occur in BOTH banks and are 562.5-843.75 Hz on the scene row
-    against 1687.5-2531.25 Hz on the sketch frame. Comparing bins would now pass for the wrong
-    reason. The comparison is in Hz, and where a span DOES coincide -- scene bins (24, 9) and sketch
-    bins (8, 3) are both 1500.0-2062.5 Hz -- the resolutions still differ 3:1, which is what makes
-    them different measurements of the same span rather than the same band."""
+    62.5 Hz on the other. The regenerated 48 kHz fixed-layout bank currently shares neither an
+    exact bin pair nor an exact frequency span with the 16 kHz scene bank; both facts are pinned so
+    a future regeneration cannot quietly make the measurements interchangeable."""
     d_s, _ = _load(SCENE_H)
     d_i, _ = _load(IMPULSE_H)
     fs_s, fs_i = d_s("MELS_FS"), d_i("MELIMP_FS")
@@ -196,9 +194,8 @@ def test_the_scene_bank_is_not_the_detection_bank():
             assert not (a[0] == b[0] and a[1] == b[1] and a[2] == b[2]), \
                 "a scene band and a sketch band are the same band: %.1f-%.1f Hz over %d bins" % a
 
-    # The two coincidences named in the docstring, asserted so a rate change cannot quietly move
-    # them and leave the prose describing a bank that is gone.
+    # Pin the regenerated banks' lack of exact coincidences in both coordinate systems.
     bins_shared = set(_pairs(SCENE_H, "MELS")) & set(p for p in _pairs(IMPULSE_H, "MELIMP") if p[1])
-    assert bins_shared == {(9, 5)}, "the bin coincidence moved: %s" % sorted(bins_shared)
+    assert bins_shared == set(), "the bin coincidence moved: %s" % sorted(bins_shared)
     hz_shared = sorted(set((a[0], a[1]) for a in scene) & set((b[0], b[1]) for b in det))
-    assert hz_shared == [(1500.0, 2062.5)], "the frequency coincidence moved: %s" % hz_shared
+    assert hz_shared == [], "the frequency coincidence moved: %s" % hz_shared

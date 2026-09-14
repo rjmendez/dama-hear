@@ -1,4 +1,4 @@
-"""The five dets.csv generations, and the one whose header lies about its own rows."""
+"""The six dets.csv generations, and the one whose header lies about its own rows."""
 import binascii
 
 import numpy as np
@@ -48,7 +48,7 @@ class TestIdentify:
         # G5 inserted a column BEFORE frame_hex. So "starts with a known generation" does not
         # imply the frame is where that generation puts it, and extension cannot be waved through.
         with pytest.raises(DF.UnknownSchema, match="temp_c"):
-            DF.identify(list(DF.G5.declared) + ["temp_c"])
+            DF.identify(list(DF.G6.declared) + ["temp_c"])
 
 
 class TestG3:
@@ -102,30 +102,77 @@ class TestG5:
         assert r.rows[0]["sketch_back"] is None
 
 
+class TestG6:
+    def test_the_node_comes_from_the_file_and_sync_sigma_survives(self):
+        header = DF.G6.declared
+        row = "mach,%s,64,%s,,,105000.0" % (_BODY, _frame_hex())
+        r = DF.read_text(_csv(header, [row]))
+        assert r.generation is DF.G6
+        assert r.rows[0]["node"] == "mach" and r.rows[0]["node_from"] == "file"
+        assert r.rows[0]["sketch_back"] == "64"
+        assert r.rows[0]["sync_sigma_ns"] == 105000.0
+
+    def test_an_empty_sigma_cell_is_none_not_zero(self):
+        header = DF.G6.declared
+        row = "mach,%s,64,%s,,," % (_BODY, _frame_hex())
+        r = DF.read_text(_csv(header, [row]))
+        assert r.generation is DF.G6
+        assert r.rows[0]["sync_sigma_ns"] is None
+
+    def test_a_zero_or_negative_sigma_is_none_not_perfect_clock(self):
+        header = DF.G6.declared
+        for val in ("0", "0.0", "-1000", "-1.5"):
+            row = "mach,%s,64,%s,,,%s" % (_BODY, _frame_hex(), val)
+            r = DF.read_text(_csv(header, [row]))
+            assert r.rows[0]["sync_sigma_ns"] is None, "val %r should resolve to None" % val
+
+    def test_an_unparseable_sigma_is_none(self):
+        header = DF.G6.declared
+        row = "mach,%s,64,%s,,,corrupt" % (_BODY, _frame_hex())
+        r = DF.read_text(_csv(header, [row]))
+        assert r.rows[0]["sync_sigma_ns"] is None
+
+    def test_earlier_generations_state_no_sync_sigma(self):
+        for gen in (DF.G1, DF.G2, DF.G3, DF.G4, DF.G5):
+            fh = _frame_hex()
+            if gen is DF.G1:
+                row = "%s,%s" % (_BODY, fh)
+            elif gen is DF.G2:
+                row = "%s,%s,," % (_BODY, fh)
+            elif gen is DF.G3:
+                row = "%s,%s,," % (_BODY, fh)
+            elif gen is DF.G4:
+                row = "nyquist,%s,%s,," % (_BODY, fh)
+            elif gen is DF.G5:
+                row = "nyquist,%s,64,%s,," % (_BODY, fh)
+            r = DF.read_text(_csv(gen.declared, [row]), default_node="nyquist")
+            assert r.rows[0]["sync_sigma_ns"] is None, "%s should have sync_sigma_ns=None" % gen.name
+
+
 class TestRefusals:
     def test_an_empty_file_is_an_error_not_a_quiet_night(self):
         with pytest.raises(ValueError, match="empty"):
             DF.read_text("")
 
     def test_a_short_row_is_counted_with_its_width_not_silently_dropped(self):
-        text = _csv(DF.G5.declared, ["mach,%s,64,%s" % (_BODY, _frame_hex())])
+        text = _csv(DF.G6.declared, ["mach,%s,64,%s,," % (_BODY, _frame_hex())])
         r = DF.read_text(text)
         assert r.rows == []
-        assert list(r.counts) == ["row_width_11_expected_13"]
+        assert list(r.counts) == ["row_width_13_expected_14"]
 
     def test_a_truncated_frame_is_counted_by_its_length(self):
-        text = _csv(DF.G5.declared, ["mach,%s,64,dead,," % _BODY])
+        text = _csv(DF.G6.declared, ["mach,%s,64,dead,,,105000.0" % _BODY])
         r = DF.read_text(text)
         assert r.counts == {"frame_hex_len_4": 1}
 
     def test_a_blank_frame_column_is_its_own_reason(self):
-        text = _csv(DF.G5.declared, ["mach,%s,64,,," % _BODY])
+        text = _csv(DF.G6.declared, ["mach,%s,64,,,,105000.0" % _BODY])
         assert DF.read_text(text).counts == {"no_frame": 1}
 
     def test_the_summary_reports_what_was_dropped(self):
-        text = _csv(DF.G5.declared,
-                    ["mach,%s,64,%s,," % (_BODY, _frame_hex()),
-                     "mach,%s,64,dead,," % _BODY])
+        text = _csv(DF.G6.declared,
+                    ["mach,%s,64,%s,,,105000.0" % (_BODY, _frame_hex()),
+                     "mach,%s,64,dead,,,105000.0" % _BODY])
         s = DF.read_text(text).summary()
-        assert s == {"generation": "G5", "rows": 1, "skipped": 1,
+        assert s == {"generation": "G6", "rows": 1, "skipped": 1,
                      "reasons": {"frame_hex_len_4": 1}}

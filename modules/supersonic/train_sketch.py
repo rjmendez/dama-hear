@@ -125,6 +125,19 @@ def nested_auc(X, y, g, outer=5, inner=4):
     from sklearn.model_selection import GroupKFold
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y)
+    g = np.asarray(g)
+    if X.ndim != 2 or len(X) == 0:
+        raise ValueError("training data must be a non-empty 2-D feature matrix")
+    if len(y) != len(X) or len(g) != len(X):
+        raise ValueError("features, labels, and groups must have the same length")
+    if not np.isfinite(X).all():
+        raise ValueError("training features must be finite")
+    if not np.isin(y, [0, 1]).all() or np.unique(y).size < 2:
+        raise ValueError("training labels must contain both classes 0 and 1")
+    if np.unique(g).size < max(outer, inner):
+        raise ValueError("nested grouped CV needs at least %d distinct groups" % max(outer, inner))
     p = np.zeros(len(y))
     for tr, te in GroupKFold(n_splits=outer).split(X, y, g):
         best, bestC = -1.0, GRID[0]
@@ -178,6 +191,8 @@ def export(X, y, g, auc, layout, bands, frames):
         "nfft": int(SK.NFFT), "hop_s": float(SK.HOP_S),
         "window_start": "constant_fraction_onset_minus_one_hop",
         "layout": layout, "bands": int(bands), "frames": int(frames),
+        "feature_fs_hz": 48000.0,
+        "feature_band_hi_hz": float(SK.F_HI),
         "order": "band_major",          # x[b*frames + t], matching SK.sketch's own reshape
         "w": w.tolist(), "b": b,
         "auc_nested_grouped_cv": float(auc), "n_train": int(len(y)),
@@ -197,10 +212,12 @@ def main(argv=None):
     ap.add_argument("--layout", default=SK.LAYOUT_FIXED,
                     choices=[SK.LAYOUT_NYQUIST, SK.LAYOUT_FIXED])
     ap.add_argument("--bands", type=int, default=SK.MEL_BANDS,
-                    help="keep only the lowest N bands. A model that must score a 16 kHz node "
-                         "cannot use bands that node does not have: SK.valid_bands(16000)=15.")
+                    help="keep only the lowest N bands. Native training uses the full 48 kHz "
+                         "axis; reducing this is an explicit legacy compatibility choice.")
     ap.add_argument("--out")
     a = ap.parse_args(argv)
+    if not 1 <= a.bands <= SK.MEL_BANDS:
+        ap.error("--bands must be between 1 and %d" % SK.MEL_BANDS)
 
     X, y, g, ids = load(a.labels, a.items, a.layout)
     if a.bands < SK.MEL_BANDS:
