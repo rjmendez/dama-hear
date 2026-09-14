@@ -241,6 +241,42 @@ def test_source_keeps_gga_validation_before_state_and_mean_updates():
     assert "int64_t hacc = (int64_t)(hdop * 2500.0 + 0.5)" in gga
 
 
+def test_pmtk_rmc_snapshots_the_pending_pps_pair_once():
+    src = _source()
+    assert "static void pending_pps_label(uint64_t *local_us, uint32_t *edge_n)" in src
+    body = _body(src, "static void pmtk_parse_rmc", "\nstatic bool nmea_gga_position")
+    assert "uint64_t pend_local = 0; uint32_t pend_edge = 0;" in body
+    assert "pending_pps_label(&pend_local, &pend_edge);" in body
+    for required in (
+        "if (pend_edge && (now_us - pend_local) < 900000ULL)",
+        "long long d_edge = (long long)pend_edge - (long long)prev_edge_n;",
+        "edge_local_us = pend_local;",
+        "prev_unix_s = unix_s; prev_edge_n = pend_edge;",
+    ):
+        assert required in body
+    tail = body[body.index("pending_pps_label(&pend_local, &pend_edge);"):]
+    assert "pend_edge_n" not in tail
+    assert "pend_local_us" not in tail
+
+
+def test_ubx_nav_pvt_uses_the_same_snapshot_for_check_and_commit():
+    src = _source()
+    ubx = _body(src, "static void ubx_msg()", "\nstatic void ubx_feed")
+    nav = ubx[ubx.index("if (ux_cls == 0x01 && ux_id == 0x07 && ux_len >= 24)"):ubx.index("gps_tacc_ns =")]
+    assert "uint64_t pend_local = 0; uint32_t pend_edge = 0;" in nav
+    assert "pending_pps_label(&pend_local, &pend_edge);" in nav
+    for required in (
+        "if (pend_edge && (now_us - pend_local) < 900000ULL)",
+        "long long d_edge = (long long)pend_edge - (long long)prev_edge_n;",
+        "edge_local_us = pend_local;",
+        "prev_unix_s = unix_s; prev_edge_n = pend_edge;",
+    ):
+        assert required in nav
+    tail = nav[nav.index("pending_pps_label(&pend_local, &pend_edge);"):]
+    assert "pend_edge_n" not in tail
+    assert "pend_local_us" not in tail
+
+
 def test_the_gps_selftest_reads_a_pmtk_fix_as_a_fix():
     """gold, ageev, kasami on 2026-09-13: gps.fix 1 with 390-550 averaged GGA fixes, selftest
     "no-fix". gps_fix is GGA quality on PMTK (1 = a fix) and UBX fixType on u-blox (3 = 3D)."""

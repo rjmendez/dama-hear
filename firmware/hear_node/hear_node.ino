@@ -402,6 +402,15 @@ static volatile uint32_t time_glitch   = 0;    // labellings rejected as inconsi
 static volatile uint32_t pmtk_glitch = 0; // same check, PMTK RMC branch -- its own name, not shared
 static int64_t  prev_unix_s = 0;               // last accepted label, for the +1s/edge check
 static uint32_t prev_edge_n = 0;
+static void pending_pps_label(uint64_t *local_us, uint32_t *edge_n) {
+  // The PPS ISR can advance between any two volatile reads here. Snapshot the pair once so the
+  // consistency check and the commit talk about the SAME edge rather than whichever one happened
+  // to be current at each read.
+  noInterrupts();
+  *local_us = pend_local_us;
+  *edge_n = pend_edge_n;
+  interrupts();
+}
 // millis() at the end of setup's first statement. It lived below, in the `state` block, and is
 // here now because the UBX parser above needs it to stamp first_label_s.
 static uint32_t boot_ms = 0;
@@ -607,16 +616,18 @@ static void pmtk_parse_rmc(const char *s) {
   int dy = nmea_dec2(dt), mo = nmea_dec2(dt + 2), yy = nmea_dec2(dt + 4);
   if (hh < 0 || mi < 0 || ss < 0 || dy < 1 || mo < 1 || mo > 12 || yy < 0) return;
   long long unix_s = civil_to_unix_s(2000 + yy, mo, dy, hh, mi, ss);
+  uint64_t pend_local = 0; uint32_t pend_edge = 0;
+  pending_pps_label(&pend_local, &pend_edge);
   uint64_t now_us = (uint64_t)esp_timer_get_time();
-  if (pend_edge_n && (now_us - pend_local_us) < 900000ULL) {
+  if (pend_edge && (now_us - pend_local) < 900000ULL) {
     bool ok = true;
     if (prev_edge_n && prev_unix_s) {
       long long d_sec = unix_s - prev_unix_s;
-      long long d_edge = (long long)pend_edge_n - (long long)prev_edge_n;
+      long long d_edge = (long long)pend_edge - (long long)prev_edge_n;
       if (d_sec != d_edge) { ok = false; pmtk_glitch++; }
     }
     if (ok) {
-      edge_local_us = pend_local_us;
+      edge_local_us = pend_local;
       edge_unix_us = (int64_t)unix_s * 1000000LL;
       time_valid = true;
       if (!first_label_s) {
@@ -624,7 +635,7 @@ static void pmtk_parse_rmc(const char *s) {
         first_label_s = up ? up : 1;
       }
     }
-    prev_unix_s = unix_s; prev_edge_n = pend_edge_n;
+    prev_unix_s = unix_s; prev_edge_n = pend_edge;
   }
 }
 
@@ -1138,11 +1149,13 @@ static void ubx_msg() {
         unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
         long long days = (long long)era * 146097 + (long long)doe - 719468;
         long long unix_s = days * 86400LL + hh * 3600LL + mi * 60LL + ss;
+        uint64_t pend_local = 0; uint32_t pend_edge = 0;
+        pending_pps_label(&pend_local, &pend_edge);
         uint64_t now_us = (uint64_t)esp_timer_get_time();
         // Only label an edge we actually saw, and only if this solution is for THAT second: the
         // report follows its own epoch by well under a second. Outside that window we do not
         // guess -- an unlabelled edge is honest, a mislabelled one is 343 m of lie.
-        if (pend_edge_n && (now_us - pend_local_us) < 900000ULL) {
+        if (pend_edge && (now_us - pend_local) < 900000ULL) {
           // The time window alone is not enough. NAV-PVT's own epoch sits ~200 ms past the second
           // here, so a LATE report can arrive just after the NEXT edge and land inside the window
           // -- labelling that edge with the previous second. That is the 343 m error, and it looks
@@ -1150,11 +1163,11 @@ static void ubx_msg() {
           bool ok = true;
           if (prev_edge_n && prev_unix_s) {
             long long d_sec = (long long)unix_s - prev_unix_s;
-            long long d_edge = (long long)pend_edge_n - (long long)prev_edge_n;
+            long long d_edge = (long long)pend_edge - (long long)prev_edge_n;
             if (d_sec != d_edge) { ok = false; time_glitch++; }
           }
           if (ok) {                                   // commit local+utc as one matched pair
-            edge_local_us = pend_local_us;
+            edge_local_us = pend_local;
             edge_unix_us = (int64_t)unix_s * 1000000LL;
             time_valid = true;
             // Latched once. The gap between this and 0 is the node's real time-to-first-label,
@@ -1165,7 +1178,7 @@ static void ubx_msg() {
               first_label_s = up ? up : 1;            // 0 stays reserved for "never"
             }
           }
-          prev_unix_s = unix_s; prev_edge_n = pend_edge_n;   // re-sync either way
+          prev_unix_s = unix_s; prev_edge_n = pend_edge;   // re-sync either way
         }
       }
     }
@@ -3041,8 +3054,8 @@ static void h_dets() {
   uint32_t n = total < det_cap ? total : det_cap;
   if (n > DETS_HTTP_MAX) n = DETS_HTTP_MAX;
   uint32_t first = total - n;                 // ring: the newest n, oldest first
-  http.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  http.send(200, "application/json", "[");
+  String o = "[";
+  o.reserve(n * (MELIMP_FRAME_BYTES * 2 + 280) + 64);
   for (uint32_t k = first; k < total; k++) {
     const Det &d = dets[k % det_cap];
     char b[240];
@@ -3053,12 +3066,10 @@ static void h_dets() {
              (unsigned long)d.uptime_s, (unsigned long)d.sample,
              (unsigned long)d.pps_n, (long)d.us_since_pps, d.trigger, (unsigned)d.flags, d.fs_at,
              MELIMP_FRAME_BYTES);
-    http.sendContent(b);
+    o += b;
     static const char hx[] = "0123456789abcdef";
-    String frame;
-    frame.reserve(MELIMP_FRAME_BYTES * 2);
     for (int j = 0; j < MELIMP_FRAME_BYTES; j++) {
-      frame += hx[d.frame[j] >> 4]; frame += hx[d.frame[j] & 0xF];
+      o += hx[d.frame[j] >> 4]; o += hx[d.frame[j] & 0xF];
     }
     // ⚠️tools/hear_bridge.py's rows_from_detections() selects DETS_COLUMNS[:-1], so these two keys
     // are dropped on that path until that list grows. They are here anyway: /detections is also
@@ -3067,10 +3078,10 @@ static void h_dets() {
     char cp[80] = "";
     if (d.clip_st == CLIP_OK) clip_name(cp, sizeof cp, d.cseq, d.sample);
     snprintf(t, sizeof t, "\",\"clip\":\"%s\",\"clip_why\":\"%s\"}", cp, clip_why(d.clip_st));
-    http.sendContent(frame + t);
+    o += t;
   }
-  http.sendContent("]");
-  http.sendContent("");
+  o += "]";
+  http.send(200, "application/json", o);
 }
 
 // Hoisted above setup(): /format must close this before it unmounts, and the section that
