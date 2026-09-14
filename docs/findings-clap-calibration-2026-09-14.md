@@ -8,6 +8,14 @@
 > understood far more precisely (stale PPS/GPS anchor + free-running crystal, not merely "weak
 > antenna siting"), and the earlier non-convergence was largely an artifact of feeding the
 > solver the wrong node geometry, not proof the clock issue alone made it unsolvable.
+>
+> **Correction (third follow-up):** the first correction's own root-cause paragraph made a new
+> mistake, citing `gps.ubx_pvt: 0` as proof these nodes never got a valid GPS fix. That's the
+> wrong metric for this hardware class (`esp32s3-i2s-gps` speaks PMTK, not UBX, so `ubx_pvt` is
+> structurally always 0 regardless of GPS health). See the "### Real root cause" section's own
+> inline correction note for the PMTK-appropriate metrics and the corrected diagnosis: `gold`/
+> `ageev` do have a real (if weak) autonomous fix; `kasami` is in dead-reckoning/estimated mode
+> (`gps.fix == 6`), which is worse and distinct.
 
 ## What was attempted
 
@@ -141,13 +149,43 @@ these three nodes should go into `config/calibrated_node_biases.json` from this 
 
 ### Real root cause: stale PPS/GPS anchor, not "weak antenna siting"
 
-Live `/status` on all three nodes shows `gps.ubx_pvt: 0` — **zero valid UBX PVT fixes have ever
-been received since boot** — alongside `time.ubx_silent_s` approximately equal to `uptime_s`
-(i.e., the node has *never* gotten a GNSS-qualified time solution in its entire uptime, not just
-"currently weak"). Each node instead free-runs on its ESP32 crystal from a frozen/never-refreshed
-PPS anchor, drifting at its own measured `esp_clock.ppm_vs_gps` rate. That rate, multiplied by
-time since the last anchor (`time.since_edge_us`), predicts the observed bias sign and order of
-magnitude for all three nodes:
+> **Correction (second follow-up):** the paragraph originally here cited `gps.ubx_pvt: 0` as
+> "zero valid GNSS PVT fixes ever received" and treated that as proof these nodes never get a
+> real GPS solution. That's wrong for this specific class: `gold`/`ageev`/`kasami` are
+> `esp32s3-i2s-gps` boards, which speak **PMTK** (MediaTek), not UBX (u-blox) —
+> `firmware/boards/esp32s3_i2s_gps.h` sets `GPS_PROTO GPS_PMTK`. `ubx_pvt` only ever increments
+> on the UBX code path (`firmware/hear_node/hear_node.ino`); it is **structurally always 0** on
+> a PMTK node regardless of GPS health, the same way `mach`/`nyquist`/`rankine` (class
+> `xiao-s3-pps`, genuinely UBX) show a real, informative `ubx_pvt` count. Citing it here as
+> evidence of failure was citing a metric that doesn't apply to this hardware at all — see the
+> corrected version below using the metrics that actually mean something for a PMTK node.
+
+The PMTK-side equivalents of `ubx_pvt` are: `gps.fix` (raw NMEA GGA fix-quality field —
+firmware treats any value `>= 1` as "has fix" for PMTK, per `gps_has_fix()` in
+`hear_node.ino`), `gps.pmtk_ack`/`gps.pmtk_nak` (module accepted/rejected our config — both show
+`pmtk_ack: 5, pmtk_nak: 0` on all three nodes, so the module itself is alive and talking), and
+`gps.pmtk_glitch` (increments when an RMC sentence's decoded UTC-second delta doesn't match the
+PPS pulse-count delta since the last accepted anchor — the PMTK equivalent of a PPS/time
+consistency check, see `pmtk_parse_rmc()`). Re-reading live `/status` with the *correct* fields:
+
+| node | `gps.fix` | `gps.sats` | `gps.pmtk_ack`/`nak` | `gps.pmtk_glitch` |
+|---|---|---|---|---|
+| gold | 1 (a real, weak, autonomous fix) | 3 | 5 / 0 | 188 |
+| ageev | 1 (a real, weak, autonomous fix) | 3 | 5 / 0 | 70 |
+| kasami | **6 (estimated / dead-reckoning per NMEA GGA fix-quality semantics — not a live satellite solution at all)** | 2 | 5 / 0 | 424 |
+
+So `gold` and `ageev` do have a genuine (if weak, 3-satellite) autonomous GPS fix — they are not
+"never fixed." `kasami` is a distinct and worse case: fix quality 6 means its last accepted
+position is extrapolated/dead-reckoned, not derived from live satellites, consistent with it
+having the fewest satellites (2) and the highest `pmtk_glitch` count (424) of the three.
+
+The large `pmtk_glitch` counts (70-424) are the real explanation for the stale-anchor behavior:
+each glitch is a rejected RMC/PPS-edge pair (the anchor-update code only accepts a pair when the
+decoded UTC-second delta matches the counted PPS-edge delta exactly), so a high glitch rate means
+accepted anchor updates are rare even though the check logic itself is sound — the anchor can sit
+stale for a long time between the infrequent pairs that do pass. This still predicts the observed
+bias sign and order of magnitude via each node's own measured crystal drift rate
+(`esp_clock.ppm_vs_gps`) times time since the last accepted anchor (`time.since_edge_us`):
 
 | node | `ppm_vs_gps` | `since_edge_us` | predicted drift | measured offset |
 |---|---|---|---|---|
@@ -155,18 +193,24 @@ magnitude for all three nodes:
 | ageev | +22.897 | 68,263.48 s | +1.563 s | +1.307 s |
 | kasami | +26.136 | 25,653.66 s | +0.670 s | +0.363 s |
 
-This is exactly the failure mode already anticipated in `hear/nodeclass.py`'s docstring for this
-class (a node whose GPS UART/module has effectively died continues stamping from a frozen PPS
-anchor and free-runs on the ESP crystal). It is a firmware/GNSS-communication problem (the module
-is not delivering usable PVT fixes at all, on any of the three nodes), not a matter of improving
-antenna placement — `gps.sats`/`gps.fix` still report *some* signal, but it's never reaching a
-UBX PVT-qualified solution, so the PPS anchor never refreshes.
+This is the failure mode already anticipated in `hear/nodeclass.py`'s docstring for this class (a
+node whose GPS UART/module has effectively died, or whose fix is too weak/glitchy to pass the
+anchor-consistency check often enough, continues stamping from a stale PPS anchor and free-runs
+on the ESP crystal in between). The module itself is communicating (`pmtk_ack`/`nak` prove that),
+and `gold`/`ageev` do get a real (if weak) autonomous fix — the problem is specifically that fix
+is weak/glitchy enough (low satellite count, high `pmtk_glitch`) that anchor updates are too rare
+to keep the PPS-derived clock disciplined, and for `kasami` the fix itself has degraded to
+dead-reckoning. This still points at antenna/reception quality and possibly firmware anchor-retry
+behavior, not a dead/miswired module — a real correction to the previous (also already-corrected)
+claim that this was "not a matter of improving antenna placement."
 
 ### Updated "what would unblock it"
 
-1. Investigate GNSS module communication on `gold`/`ageev`/`kasami` directly (wiring, baud rate,
-   UBX-vs-NMEA protocol configuration, module firmware) — the goal is a nonzero `gps.ubx_pvt`
-   count and `time.ubx_silent_s` that resets to a small number, not just more satellites in view.
+1. Investigate GPS reception quality on `gold`/`ageev`/`kasami` directly (antenna siting/view of
+   sky, satellite count) — the goal is `gps.sats` high enough and `gps.pmtk_glitch` growing slowly
+   enough that anchor updates happen often enough to keep `time.since_edge_us` small, and for
+   `kasami` specifically, `gps.fix` reaching 1 or 2 (a live solution) instead of 6
+   (dead-reckoning/estimated).
 2. Once `time.sync_sigma_ns` is back under `MAX_SYNC_SIGMA_NS` (0.5 ms), repeat the co-located
    clap procedure using the corrected methodology above (near-field node geometry passed to
    `--survey`, reference-node-consensus clap association) to get a real mic-bias calibration.
