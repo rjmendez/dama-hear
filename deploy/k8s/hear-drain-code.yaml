@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 313962 B serialised; 314140 B of annotations against a 262144 B cap.
+# apply-mode server: 314295 B serialised; 314473 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: '5778e04'
+    dama-hear/commit: 'ac96fa8'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '313962'
+    dama-hear/serialised-bytes: '314295'
 data:
   hear__init__.py: |
     
@@ -4153,6 +4153,11 @@ data:
         rolled = size_now is not None and prev is not None and int(size_now) < int(prev)
         if size_now is not None and prev is not None and header and int(size_now) == int(prev):
             out["files"].append({**entry, "bytes": 0, "skipped_unchanged": True, "size": int(size_now)})
+            return False
+        if size_now is None and not header:
+            # A blind tail with no header would archive rows that are not a CSV on their own. The
+            # next listed run fetches the file whole, so nothing is lost by waiting for it.
+            out["files"].append({**entry, "bytes": 0, "skipped_unmeasured": True})
             return False
         if size_now is not None and (prev is None or rolled or not header):
             tail, file_timeout = None, rolled_file_timeout(size_now, timeout)
