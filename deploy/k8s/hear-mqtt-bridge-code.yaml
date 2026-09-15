@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-mqtt-bridge-code.yaml
-# apply-mode client: 63072 B serialised; 63336 B of annotations against a 262144 B cap.
+# apply-mode client: 79483 B serialised; 79747 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-mqtt-bridge
   annotations:
-    dama-hear/commit: '308c993'
-    dama-hear/source-sha256: 'e3294e559e9182476eb456f1fc6ae94042fcca4ada36cc0a9f445acdb89dc2a6'
+    dama-hear/commit: '60cbdc1'
+    dama-hear/source-sha256: '16ae297a18dd21a9dbd7840c5ed1bfd4fd34b460eb9724c1ac0e3d27bff4a9fc'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '63072'
+    dama-hear/serialised-bytes: '79483'
 data:
   tools_hear_heartbeat_receiver.py: |
     #!/usr/bin/env python3
@@ -33,6 +33,7 @@ data:
     import socket
     import sqlite3
     import threading
+    from contextlib import contextmanager
     from dataclasses import dataclass
     from datetime import datetime, timedelta, timezone
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -60,7 +61,21 @@ data:
     # keeps the phase-0 outbox's previous "grows forever" behavior for anyone not yet opted in.
     DURABLE_RETENTION_DAYS = int(os.environ.get("HEAR_DURABLE_RETENTION_DAYS", "30"))
     DURABLE_PRUNE_INTERVAL_S = float(os.environ.get("HEAR_DURABLE_PRUNE_INTERVAL_S", "3600"))
+    # Seconds a writer may hold the exclusive right to publish one durable record to Redis before
+    # another writer (usually the background replay worker) may take it over. Bounded so a process
+    # that dies mid-publish cannot strand a record forever; long enough that a slow-but-alive Redis
+    # write is not raced by a second publisher.
+    DURABLE_CLAIM_LEASE_S = int(os.environ.get("HEAR_DURABLE_CLAIM_LEASE_S", "60"))
+    # Durable *generation*: 1 is this SQLite ledger, 2 is the Postgres schema in
+    # deploy/postgres/migrations (see tools/hear_durable_pg.py). Deliberately unchanged here -- the
+    # identity fix below is a revision of the SQLite generation, not a new generation, and a row
+    # stamped 2 must keep meaning "written by the Postgres store".
     DURABLE_SCHEMA_VERSION = 1
+    # Revision of *how record_uid is computed* for this SQLite ledger, tracked per database file in
+    # durable_meta rather than per row. 1 = the bare idempotency_key (collided across devices),
+    # 2 = scoped by (telemetry_path, device_id, idempotency_key). See _record_uid.
+    DURABLE_IDENTITY_VERSION = 2
+    DURABLE_IDENTITY_META_KEY = "record_uid_identity_version"
     
     
     def _configured_auth_token(token: Optional[str]) -> str:
@@ -115,6 +130,13 @@ data:
         body_json: str
         record: Dict[str, Any]
         cached: bool
+        # True when *this* caller holds the exclusive right to publish the record to Redis. A second
+        # concurrent caller carrying the identical record gets claimed=False and must not publish,
+        # which is what keeps one durable row from producing several Redis writes.
+        claimed: bool = True
+        # durable_records.id of the stored row (0 when durability is disabled). Used to order replay
+        # and to detect that a newer record for the same device already reached the cache.
+        row_id: int = 0
     
     
     class DurableRecordStore:
@@ -125,11 +147,20 @@ data:
         def persist(self, record_uid: str, record: Dict[str, Any], body_json: str) -> DurableEntry:
             return DurableEntry(record_uid, str(record["telemetry_path"]), body_json, dict(record), False)
     
+        def claim(self, record_uid: str) -> bool:
+            return True
+    
         def note_cache_success(self, record_uid: str, cache_target: str) -> None:
+            return
+    
+        def note_cache_superseded(self, record_uid: str, cache_target: str) -> None:
             return
     
         def note_cache_failure(self, record_uid: str, cache_target: str, exc: BaseException) -> None:
             return
+    
+        def is_superseded(self, entry: DurableEntry) -> bool:
+            return False
     
         def pending_records(self, limit: int) -> list[DurableEntry]:
             return []
@@ -153,25 +184,60 @@ data:
         backend = "sqlite"
         enabled = True
     
-        def __init__(self, path: str):
+        def __init__(self, path: str, claim_lease_s: int = DURABLE_CLAIM_LEASE_S):
             if not path or not path.strip():
                 raise ValueError("HEAR_DURABLE_DB / --durable-db must be set for sqlite durability")
             self.path = os.path.abspath(path)
+            self.claim_lease_s = max(1, int(claim_lease_s))
             self._lock = threading.Lock()
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             self._init_db()
     
-        def _connect(self) -> sqlite3.Connection:
-            con = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
+        def _connect(self, foreign_keys: bool = True) -> sqlite3.Connection:
+            con = sqlite3.connect(self.path, check_same_thread=False, timeout=30,
+                                  isolation_level=None)
             con.row_factory = sqlite3.Row
             con.execute("PRAGMA journal_mode=WAL")
             con.execute("PRAGMA synchronous=FULL")
-            con.execute("PRAGMA foreign_keys=ON")
+            con.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys else 'OFF'}")
             con.execute("PRAGMA busy_timeout=5000")
             return con
     
+        @contextmanager
+        def _transaction(self, foreign_keys: bool = True):
+            """One explicit BEGIN IMMEDIATE transaction on its own (closed) connection.
+    
+            BEGIN IMMEDIATE takes SQLite's write lock up front, so a read-then-write sequence inside
+            (``did anyone already publish / claim this record?`` then ``claim it``) is atomic against
+            every other writer -- including a second process sharing the same PVC file, which an
+            in-process ``threading.Lock`` alone cannot cover.
+            """
+            con = self._connect(foreign_keys=foreign_keys)
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                try:
+                    yield con
+                except BaseException:
+                    try:
+                        con.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        # Never mask the real failure with a rollback-of-nothing error.
+                        logger.debug("rollback after a failed durable transaction was a no-op")
+                    raise
+                con.execute("COMMIT")
+            finally:
+                con.close()
+    
+        @contextmanager
+        def _reading(self):
+            con = self._connect()
+            try:
+                yield con
+            finally:
+                con.close()
+    
         def _init_db(self) -> None:
-            with self._connect() as con:
+            with self._transaction() as con:
                 con.execute(
                     """
                     CREATE TABLE IF NOT EXISTS durable_records (
@@ -209,9 +275,93 @@ data:
                     "CREATE INDEX IF NOT EXISTS cache_attempts_record_outcome "
                     "ON cache_attempts(record_uid, outcome, id)"
                 )
+                # /healthz is probed every ~10s and counts succeeded/failed attempts plus the newest
+                # failure. Without this index each probe is three full table scans of an append-only
+                # ledger that only grows between prunes; with it they are bounded index scans. Purely
+                # additive -- no column, constraint or query result changes, so an older receiver
+                # binary reading or writing the same file is unaffected.
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS cache_attempts_outcome_id "
+                    "ON cache_attempts(outcome, id)"
+                )
+                # Publish claims are deliberately a *separate* table with no foreign key: an older
+                # receiver binary rolled back onto this same file neither reads nor writes it, and
+                # its own FK-enforcing writes stay valid because nothing here references it.
+                con.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS cache_claims (
+                        record_uid TEXT PRIMARY KEY,
+                        claimed_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL
+                    )
+                    """
+                )
+                con.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS durable_meta (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    )
+                    """
+                )
+            self._migrate_record_uids()
+    
+        def _migrate_record_uids(self) -> None:
+            """Rewrites identity-v1 rows whose record_uid was the bare (device-agnostic) idempotency key.
+    
+            v1 stored ``record_uid = idempotency_key``, so two devices reporting the same key collided:
+            the second device's payload was silently dropped as a duplicate. v2 scopes the identity by
+            telemetry_path + device_id (see _record_uid). Existing rows already carry both columns, so
+            the correct new identity is computable in place and no record is dropped or rewritten in
+            content. Gated on durable_meta so it runs once per database file, and the whole rewrite is
+            one transaction, so an interrupted process leaves the file wholly un-migrated, never half.
+    
+            Foreign keys are disabled for this transaction only: cache_attempts references
+            durable_records(record_uid) and both sides are renamed together here.
+            """
+            with self._transaction(foreign_keys=False) as con:
+                row = con.execute("SELECT value FROM durable_meta WHERE key = ?",
+                                  (DURABLE_IDENTITY_META_KEY,)).fetchone()
+                previous = int(row["value"]) if row is not None else 1
+                # The scan runs on every open rather than being gated on ``previous``: if an older
+                # binary is rolled back onto a migrated file and writes bare-key rows, the next
+                # start-up still scopes them. The predicate is self-limiting -- a scoped uid is a
+                # sha256 hex digest and can never equal the device's own key -- so a fully migrated
+                # ledger matches no rows and the scan is a one-off cost at start-up.
+                rows = con.execute(
+                    "SELECT record_uid, telemetry_path, device_id, idempotency_key "
+                    "FROM durable_records "
+                    "WHERE idempotency_key IS NOT NULL AND record_uid = idempotency_key"
+                ).fetchall()
+                for row in rows:
+                    old_uid = str(row["record_uid"])
+                    new_uid = _scoped_record_uid(
+                        str(row["telemetry_path"]), str(row["device_id"]), str(row["idempotency_key"]))
+                    collision = con.execute(
+                        "SELECT 1 FROM durable_records WHERE record_uid = ?", (new_uid,)
+                    ).fetchone()
+                    if collision is not None:
+                        # Cannot happen from a v1 ledger (the colliding write was dropped), but a
+                        # rolled-back-then-forward mixed-version file could produce it. Leave the
+                        # legacy row exactly as it is rather than lose it to a UNIQUE violation.
+                        logger.warning(
+                            "durable record %s already migrated under %s; leaving legacy row",
+                            old_uid, new_uid)
+                        continue
+                    con.execute("UPDATE cache_attempts SET record_uid = ? WHERE record_uid = ?",
+                                (new_uid, old_uid))
+                    con.execute("UPDATE cache_claims SET record_uid = ? WHERE record_uid = ?",
+                                (new_uid, old_uid))
+                    con.execute("UPDATE durable_records SET record_uid = ? WHERE record_uid = ?",
+                                (new_uid, old_uid))
+                con.execute("INSERT OR REPLACE INTO durable_meta (key, value) VALUES (?, ?)",
+                            (DURABLE_IDENTITY_META_KEY, str(DURABLE_IDENTITY_VERSION)))
+                if rows:
+                    logger.info("scoped %d durable record identit(ies) from identity v%d to v%d",
+                                len(rows), previous, DURABLE_IDENTITY_VERSION)
     
         def persist(self, record_uid: str, record: Dict[str, Any], body_json: str) -> DurableEntry:
-            with self._lock, self._connect() as con:
+            with self._lock, self._transaction() as con:
                 con.execute(
                     """
                     INSERT OR IGNORE INTO durable_records
@@ -232,13 +382,17 @@ data:
                     ),
                 )
                 row = con.execute(
-                    "SELECT telemetry_path, payload_json FROM durable_records WHERE record_uid = ?",
+                    "SELECT id, telemetry_path, payload_json FROM durable_records WHERE record_uid = ?",
                     (record_uid,),
                 ).fetchone()
                 cached = con.execute(
                     "SELECT 1 FROM cache_attempts WHERE record_uid = ? AND outcome = 'succeeded' LIMIT 1",
                     (record_uid,),
                 ).fetchone() is not None
+                # Claiming inside the same transaction is what makes "one durable row -> one Redis
+                # publish" true under concurrency: N simultaneous identical requests serialize here
+                # and exactly one of them leaves holding the claim.
+                claimed = False if cached else self._claim_locked(con, record_uid)
             if row is None:
                 raise DurableStoreError(f"durable record {record_uid} disappeared after insert")
             try:
@@ -248,13 +402,64 @@ data:
             if not isinstance(stored_record, dict):
                 raise DurableStoreError(f"durable record {record_uid} stored a non-object payload")
             return DurableEntry(record_uid, str(row["telemetry_path"]), str(row["payload_json"]),
-                                stored_record, cached)
+                                stored_record, cached, claimed, int(row["id"]))
+    
+        def _claim_locked(self, con: sqlite3.Connection, record_uid: str) -> bool:
+            now = datetime.now(timezone.utc)
+            con.execute("DELETE FROM cache_claims WHERE record_uid = ? AND expires_at <= ?",
+                        (record_uid, _iso(now)))
+            cur = con.execute(
+                "INSERT OR IGNORE INTO cache_claims (record_uid, claimed_at, expires_at) "
+                "VALUES (?, ?, ?)",
+                (record_uid, _iso(now), _iso(now + timedelta(seconds=self.claim_lease_s))),
+            )
+            return cur.rowcount == 1
+    
+        def claim(self, record_uid: str) -> bool:
+            with self._lock, self._transaction() as con:
+                return self._claim_locked(con, record_uid)
     
         def note_cache_success(self, record_uid: str, cache_target: str) -> None:
             self._append_attempt(record_uid, cache_target, "succeeded", None)
     
+        def note_cache_superseded(self, record_uid: str, cache_target: str) -> None:
+            # Recorded as a normal success (the cache already holds strictly newer state for this
+            # device) with a note, rather than as a new outcome value: the outcome CHECK constraint
+            # and every existing pending/health query keep their exact v1 meaning.
+            self._append_attempt(record_uid, cache_target, "succeeded",
+                                 "superseded by a newer cache-synced record for this device")
+    
         def note_cache_failure(self, record_uid: str, cache_target: str, exc: BaseException) -> None:
             self._append_attempt(record_uid, cache_target, "failed", _error_text(exc))
+    
+        def is_superseded(self, entry: DurableEntry) -> bool:
+            """True when a *newer* heartbeat for the same device already reached the cache.
+    
+            Replaying an old heartbeat body would SET/SETEX it back over that newer snapshot, so the
+            fleet view would go backwards (stale uptime/counters) purely because of a retry. Only the
+            last-writer-wins heartbeat keys can be stale-overwritten this way; the event path is an
+            append-only stream with its own Redis-side dedupe, so it is never skipped here.
+            """
+            if entry.telemetry_path != "hear/heartbeat" or entry.row_id <= 0:
+                return False
+            device_id = entry.record.get("device_id")
+            if not isinstance(device_id, str):
+                return False
+            with self._lock, self._reading() as con:
+                row = con.execute(
+                    """
+                    SELECT 1
+                    FROM durable_records r
+                    WHERE r.telemetry_path = ? AND r.device_id = ? AND r.id > ?
+                      AND EXISTS (
+                          SELECT 1 FROM cache_attempts a
+                          WHERE a.record_uid = r.record_uid AND a.outcome = 'succeeded'
+                      )
+                    LIMIT 1
+                    """,
+                    (entry.telemetry_path, device_id, int(entry.row_id)),
+                ).fetchone()
+            return row is not None
     
         def prune_acknowledged(self, retention_days: int) -> int:
             """Deletes durable_records (and their cache_attempts) older than ``retention_days``.
@@ -269,7 +474,7 @@ data:
                 return 0
             cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat(
                 timespec="seconds").replace("+00:00", "Z")
-            with self._lock, self._connect() as con:
+            with self._lock, self._transaction() as con:
                 rows = con.execute(
                     """
                     SELECT r.record_uid
@@ -289,12 +494,14 @@ data:
                 con.execute(
                     f"DELETE FROM cache_attempts WHERE record_uid IN ({placeholders})", uids)
                 con.execute(
+                    f"DELETE FROM cache_claims WHERE record_uid IN ({placeholders})", uids)
+                con.execute(
                     f"DELETE FROM durable_records WHERE record_uid IN ({placeholders})", uids)
             return len(uids)
     
         def _append_attempt(self, record_uid: str, cache_target: str,
                             outcome: str, error_text: Optional[str]) -> None:
-            with self._lock, self._connect() as con:
+            with self._lock, self._transaction() as con:
                 con.execute(
                     """
                     INSERT INTO cache_attempts (record_uid, cache_target, outcome, error_text, created_at)
@@ -302,14 +509,17 @@ data:
                     """,
                     (record_uid, cache_target, outcome, error_text, utc_now()),
                 )
+                # The publish attempt is over either way, so release the claim immediately instead of
+                # waiting out the lease: a failed record becomes replayable on the very next sweep.
+                con.execute("DELETE FROM cache_claims WHERE record_uid = ?", (record_uid,))
     
         def pending_records(self, limit: int) -> list[DurableEntry]:
             if limit <= 0:
                 return []
-            with self._lock, self._connect() as con:
+            with self._lock, self._reading() as con:
                 rows = con.execute(
                     """
-                    SELECT r.record_uid, r.telemetry_path, r.payload_json
+                    SELECT r.id, r.record_uid, r.telemetry_path, r.payload_json
                     FROM durable_records r
                     WHERE NOT EXISTS (
                         SELECT 1 FROM cache_attempts a
@@ -331,11 +541,12 @@ data:
                     raise DurableStoreError(
                         f"pending durable record {row['record_uid']} stored a non-object payload")
                 out.append(DurableEntry(str(row["record_uid"]), str(row["telemetry_path"]),
-                                        str(row["payload_json"]), record, False))
+                                        str(row["payload_json"]), record, False, False,
+                                        int(row["id"])))
             return out
     
         def health(self) -> Dict[str, Any]:
-            with self._lock, self._connect() as con:
+            with self._lock, self._reading() as con:
                 pending = con.execute(
                     """
                     SELECT COUNT(*)
@@ -520,6 +731,13 @@ data:
             body_json = encode_json(record)
             stored = self.durable_store.persist(_record_uid(payload), record, body_json)
             if stored.cached:
+                self._refresh_cached(stored)
+                return stored.record
+            if not stored.claimed:
+                # A concurrent caller carrying this exact record already holds the publish claim and
+                # is writing the identical body to Redis right now. Publishing again here is what
+                # turned one durable row into several Redis writes; the durable record is committed
+                # either way, and the replay worker repairs it if that other caller fails.
                 return stored.record
             try:
                 self.cache.write(stored.record, stored.body_json, stored.record_uid)
@@ -528,6 +746,33 @@ data:
                 raise
             self.durable_store.note_cache_success(stored.record_uid, self.redis_target)
             return stored.record
+    
+        def _refresh_cached(self, stored: DurableEntry) -> None:
+            """Re-arms the TTL for a heartbeat whose durable record was already cached.
+    
+            A retried/duplicate heartbeat used to short-circuit before Redis, so during a reboot or
+            retry loop the node's ``dama:hear:<id>`` key could expire and the node would read as
+            offline even though it was still reporting. Re-writing the same stored body is a pure
+            overwrite (identical bytes, fresh TTL), so it stays idempotent. Events are excluded: the
+            stream is append-only and already deduped Redis-side, so a duplicate must stay a no-op.
+            """
+            if stored.telemetry_path != "hear/heartbeat":
+                return
+            if self.durable_store.is_superseded(stored):
+                # An *older* heartbeat can be redelivered after a newer one was already cached (MQTT
+                # QoS-1 redelivery, a node draining its local outbox, an out-of-order retry). Writing
+                # its body back would roll dama:hear:<id> and dama:hear:latest backwards, which is the
+                # same hazard replay_pending refuses. The newer record already armed this device's TTL
+                # with current state, so the correct refresh here is none at all.
+                return
+            try:
+                self.cache.write(stored.record, stored.body_json, stored.record_uid)
+            except Exception as exc:
+                # The record is already durable and already acknowledged by Redis once, so this is
+                # not a pending-replay condition -- but the caller must still learn the TTL was not
+                # re-armed instead of getting a false 204.
+                self.durable_store.note_cache_failure(stored.record_uid, self.redis_target, exc)
+                raise
     
         def replay_pending(self, limit: int = DURABLE_REPLAY_LIMIT) -> Dict[str, Any]:
             summary = {
@@ -539,9 +784,18 @@ data:
             }
             if not self.durable_store.enabled or limit <= 0:
                 return summary
-            pending = self.durable_store.pending_records(limit)
+            # Oldest-first (pending_records orders by id) and claimed one at a time, so two replay
+            # sweeps -- or a sweep racing a live request for the same record -- cannot both publish.
+            pending = [entry for entry in self.durable_store.pending_records(limit)
+                       if self.durable_store.claim(entry.record_uid)]
             summary["attempted"] = len(pending)
             for entry in pending:
+                if self.durable_store.is_superseded(entry):
+                    # Counted as synced: the cache already holds strictly newer state for this
+                    # device, so there is nothing left to publish and nothing left pending.
+                    self.durable_store.note_cache_superseded(entry.record_uid, self.redis_target)
+                    summary["synced"] += 1
+                    continue
                 try:
                     self.cache.write(entry.record, entry.body_json, entry.record_uid)
                 except Exception as exc:
@@ -673,17 +927,41 @@ data:
     
     
     def utc_now() -> str:
-        return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        return _iso(datetime.now(timezone.utc))
+    
+    
+    def _iso(when: datetime) -> str:
+        return when.isoformat(timespec="seconds").replace("+00:00", "Z")
     
     
     def encode_json(data: Mapping[str, Any]) -> str:
         return json.dumps(data, separators=(",", ":"), sort_keys=True)
     
     
+    def _scoped_record_uid(telemetry_path: str, device_id: str, idempotency_key: str) -> str:
+        """Device-scoped durable identity for an idempotency-keyed payload.
+    
+        ``idempotency_key`` is only unique *within* a device (nodes mint it locally, e.g. from a boot
+        id plus a counter), so using it as the whole identity made two devices that happened to pick
+        the same key collide: the second device's payload was silently dropped as a duplicate and the
+        caller got a 204 for a record that was never stored. Hashing the tuple keeps the identity a
+        single opaque string -- no schema, transport or Redis contract changes -- while making it
+        impossible for one device's key to shadow another's.
+        """
+        scope = "\x1f".join(("v2", telemetry_path, device_id, idempotency_key))
+        return hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    
+    
     def _record_uid(payload: Mapping[str, Any]) -> str:
         key = _idempotency_key(payload)
         if key is not None:
-            return key
+            return _scoped_record_uid(
+                str(payload.get("telemetry_path") or ""),
+                str(payload.get("device_id") or ""),
+                key,
+            )
+        # Unkeyed payloads already hash the whole body, device_id included, so they were never
+        # cross-device ambiguous and their identity is deliberately left byte-for-byte unchanged.
         return hashlib.sha256(encode_json(payload).encode("utf-8")).hexdigest()
     
     

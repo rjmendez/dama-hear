@@ -583,7 +583,10 @@ class TestDurableSqlite(TestValidation):
         # is still retained has silently lost its dedupe marker.
         retained_seqs = {json.loads(entry["payload"])["event_seq"] for entry in stream}
         assert retained_seqs == {7, 8, 9}
-        assert set(dedupe_zset) == {f"evt-{seq}" for seq in retained_seqs}
+        assert set(dedupe_zset) == {
+            HR._record_uid(self._event(event_seq=seq, idempotency_key=f"evt-{seq}"))
+            for seq in retained_seqs
+        }
 
     def test_event_dedupe_script_keys_are_fully_declared_and_share_one_cluster_slot(self):
         # Regression guard for the original bug: a key built by string concatenation inside the
@@ -916,3 +919,390 @@ class TestStartupConfig:
     def test_make_durable_store_rejects_postgres_until_it_is_implemented(self):
         with pytest.raises(ValueError, match="postgres"):
             HR.make_durable_store("postgres", "postgresql://db.example/dama_hear")
+
+
+class TestDurableOutboxCorrectness(TestValidation):
+    """Regression guards for the three reproduced durable-outbox defects (D1/D2/D3) plus the
+    replay-ordering hazard they exposed. Every one of these failed before the fix."""
+
+    @staticmethod
+    def _store(db_path, fake, **kwargs):
+        return HR.HeartbeatReceiverStore(
+            fake,
+            heartbeat_ttl_s=30,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db_path)),
+            **kwargs,
+        )
+
+    @staticmethod
+    def _rows(db_path, sql, params=()):
+        con = sqlite3.connect(db_path)
+        try:
+            con.row_factory = sqlite3.Row
+            return [dict(row) for row in con.execute(sql, params).fetchall()]
+        finally:
+            con.close()
+
+    # --- D1: record_uid must be device-scoped -------------------------------------------------
+    def test_two_devices_reusing_one_idempotency_key_are_both_stored_and_published(self, tmp_path):
+        # D1: node-local idempotency keys are only unique within a device. With the bare key as
+        # the durable identity, the second device's heartbeat was dropped as a duplicate and the
+        # node never appeared in Redis at all, while its firmware saw a 204 "accepted".
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis()
+        store = self._store(db, fake)
+        store.write_heartbeat(self._heartbeat(device_id="nyquist", idempotency_key="boot-1:7"))
+        store.write_heartbeat(self._heartbeat(device_id="shannon", idempotency_key="boot-1:7"))
+
+        rows = self._rows(db, "SELECT device_id, record_uid FROM durable_records ORDER BY id")
+        assert [row["device_id"] for row in rows] == ["nyquist", "shannon"]
+        assert len({row["record_uid"] for row in rows}) == 2
+        assert json.loads(fake.values["dama:hear:nyquist"])["device_id"] == "nyquist"
+        assert json.loads(fake.values["dama:hear:shannon"])["device_id"] == "shannon"
+        assert fake.sets["dama:hear:devices"] == {"nyquist", "shannon"}
+
+    def test_the_same_device_repeating_its_key_is_still_one_durable_record(self, tmp_path):
+        # The other half of D1: scoping must not weaken same-device idempotency.
+        db = tmp_path / "heartbeats.sqlite3"
+        store = self._store(db, FakeRedis())
+        store.write_event(self._event(idempotency_key="boot-1:7"))
+        store.write_event(self._event(idempotency_key="boot-1:7"))
+        assert len(self._rows(db, "SELECT id FROM durable_records")) == 1
+
+    def test_one_telemetry_path_key_does_not_shadow_the_other_path(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        store = self._store(db, FakeRedis())
+        store.write_heartbeat(self._heartbeat(idempotency_key="boot-1:7"))
+        store.write_event(self._event(idempotency_key="boot-1:7"))
+        paths = [row["telemetry_path"]
+                 for row in self._rows(db, "SELECT telemetry_path FROM durable_records ORDER BY id")]
+        assert paths == ["hear/heartbeat", "hear/event"]
+
+    def test_a_v1_ledger_is_migrated_in_place_without_losing_records_or_replaying_them(self, tmp_path):
+        # Forward-compatibility: an existing PVC holds schema-v1 rows keyed by the bare
+        # idempotency_key. Opening it with this version must rewrite the identity (records and
+        # their cache_attempts together), keep every row, and still treat an in-flight retry of
+        # the same payload as a duplicate rather than re-publishing it.
+        db = tmp_path / "heartbeats.sqlite3"
+        payload = self._event(idempotency_key="legacy-1")
+        legacy = HR.encode_json({**payload, "received_at": "2026-09-01T00:00:00Z",
+                                 "receiver_schema_version": 1})
+        con = sqlite3.connect(db)
+        with con:
+            con.execute(
+                "CREATE TABLE durable_records (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "record_uid TEXT NOT NULL UNIQUE, telemetry_path TEXT NOT NULL, "
+                "device_id TEXT NOT NULL, idempotency_key TEXT, payload_json TEXT NOT NULL, "
+                "received_at TEXT NOT NULL, receiver_schema_version INTEGER NOT NULL, "
+                "created_at TEXT NOT NULL, durable_schema_version INTEGER NOT NULL)")
+            con.execute(
+                "CREATE TABLE cache_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "record_uid TEXT NOT NULL, cache_target TEXT NOT NULL, outcome TEXT NOT NULL "
+                "CHECK (outcome IN ('succeeded', 'failed')), error_text TEXT, "
+                "created_at TEXT NOT NULL, "
+                "FOREIGN KEY(record_uid) REFERENCES durable_records(record_uid))")
+            con.execute(
+                "INSERT INTO durable_records (record_uid, telemetry_path, device_id, "
+                "idempotency_key, payload_json, received_at, receiver_schema_version, "
+                "created_at, durable_schema_version) VALUES (?,?,?,?,?,?,?,?,1)",
+                ("legacy-1", "hear/event", "nyquist", "legacy-1", legacy,
+                 "2026-09-01T00:00:00Z", 1, "2026-09-01T00:00:00Z"))
+            con.execute(
+                "INSERT INTO cache_attempts (record_uid, cache_target, outcome, error_text, "
+                "created_at) VALUES (?,?,?,?,?)",
+                ("legacy-1", "fake:6379", "succeeded", None, "2026-09-01T00:00:00Z"))
+        con.close()
+
+        fake = FakeRedis()
+        store = self._store(db, fake)
+        migrated_uid = HR._record_uid(payload)
+        records = self._rows(db, "SELECT record_uid, durable_schema_version, payload_json "
+                                 "FROM durable_records")
+        attempts = self._rows(db, "SELECT record_uid, outcome FROM cache_attempts")
+        assert [row["record_uid"] for row in records] == [migrated_uid]
+        assert records[0]["durable_schema_version"] == HR.DURABLE_SCHEMA_VERSION == 1, (
+            "the SQLite generation stamp is not what changed; identity revision is tracked "
+            "in durable_meta so a row stamped 2 keeps meaning 'written by the Postgres store'")
+        assert records[0]["payload_json"] == legacy, "record content must never be rewritten"
+        assert attempts == [{"record_uid": migrated_uid, "outcome": "succeeded"}]
+        assert self._rows(db, "SELECT value FROM durable_meta WHERE key = ?",
+                          (HR.DURABLE_IDENTITY_META_KEY,)) == [
+            {"value": str(HR.DURABLE_IDENTITY_VERSION)}]
+        assert store.health_snapshot()["durable_store"]["pending_records"] == 0
+
+        store.write_event(payload)
+        assert len(self._rows(db, "SELECT id FROM durable_records")) == 1
+        assert fake.execute_calls == 0, "an already-synced legacy record must not be republished"
+
+    def test_a_bare_key_row_written_by_a_rolled_back_binary_is_scoped_on_the_next_start(
+            self, tmp_path):
+        # Rollback/forward safety: an older receiver rolled back onto a migrated file writes rows
+        # keyed by the bare idempotency_key again. The next start-up must still scope them rather
+        # than skip the sweep because the file was already stamped.
+        db = tmp_path / "heartbeats.sqlite3"
+        payload = self._event(idempotency_key="rolled-back")
+        store = self._store(db, FakeRedis())
+        body = HR.encode_json({**payload, "received_at": "2026-09-01T00:00:00Z",
+                               "receiver_schema_version": 1})
+        con = sqlite3.connect(db)
+        with con:
+            con.execute(
+                "INSERT INTO durable_records (record_uid, telemetry_path, device_id, "
+                "idempotency_key, payload_json, received_at, receiver_schema_version, "
+                "created_at, durable_schema_version) VALUES (?,?,?,?,?,?,?,?,1)",
+                ("rolled-back", "hear/event", "nyquist", "rolled-back", body,
+                 "2026-09-01T00:00:00Z", 1, "2026-09-01T00:00:00Z"))
+        con.close()
+        assert self._rows(db, "SELECT value FROM durable_meta WHERE key = ?",
+                          (HR.DURABLE_IDENTITY_META_KEY,)) == [
+            {"value": str(HR.DURABLE_IDENTITY_VERSION)}]
+
+        self._store(db, FakeRedis())
+
+        assert [row["record_uid"] for row in
+                self._rows(db, "SELECT record_uid FROM durable_records")] == [
+            HR._record_uid(payload)]
+        del store
+
+    def test_migration_is_idempotent_across_repeated_opens(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        self._store(db, FakeRedis()).write_event(self._event(idempotency_key="k-1"))
+        before = self._rows(db, "SELECT record_uid, durable_schema_version FROM durable_records")
+        self._store(db, FakeRedis())
+        self._store(db, FakeRedis())
+        assert self._rows(db, "SELECT record_uid, durable_schema_version "
+                              "FROM durable_records") == before
+
+    # --- D2: one durable row must produce exactly one cache publish ---------------------------
+    def test_concurrent_identical_events_publish_to_redis_exactly_once(self, tmp_path):
+        # D2: eight simultaneous retries of one event produced a single durable row but four
+        # Redis script invocations, because every caller read "not cached yet" before any of
+        # them recorded success. The publish right is now claimed inside the same transaction.
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis()
+        store = self._store(db, fake)
+        payload = self._event(idempotency_key="concurrent-1")
+        start = threading.Barrier(8)
+        errors = []
+
+        def _writer():
+            start.wait(timeout=5)
+            try:
+                store.write_event(payload)
+            except Exception as exc:  # pragma: no cover - a failure here fails the assert below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_writer) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert errors == []
+        assert len(self._rows(db, "SELECT id FROM durable_records")) == 1
+        assert fake.execute_calls == 1
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+        assert len(self._rows(
+            db, "SELECT id FROM cache_attempts WHERE outcome='succeeded'")) == 1
+        assert store.health_snapshot()["durable_store"]["pending_records"] == 0
+
+    def test_concurrent_identical_heartbeats_publish_to_redis_exactly_once(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis()
+        store = self._store(db, fake)
+        payload = self._heartbeat(idempotency_key="concurrent-hb")
+        start = threading.Barrier(8)
+
+        def _writer():
+            start.wait(timeout=5)
+            store.write_heartbeat(payload)
+
+        threads = [threading.Thread(target=_writer) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert len(self._rows(db, "SELECT id FROM durable_records")) == 1
+        # Exactly one caller won the claim and published: a second recorded success would mean a
+        # single durable row fanned out into several Redis writes, which is D2 itself.
+        assert len(self._rows(
+            db, "SELECT id FROM cache_attempts WHERE outcome='succeeded'")) == 1
+        assert fake.ttls["dama:hear:nyquist"] == 30
+        assert store.health_snapshot()["durable_store"]["pending_records"] == 0
+
+    def test_a_claim_is_released_when_the_publish_fails_so_replay_can_take_it(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        store = self._store(db, FakeRedis(failures_before_success=1))
+        with pytest.raises(RuntimeError, match="simulated redis outage"):
+            store.write_event(self._event(idempotency_key="claim-release"))
+        assert self._rows(db, "SELECT record_uid FROM cache_claims") == []
+        assert store.durable_store.claim(HR._record_uid(
+            self._event(idempotency_key="claim-release"))) is True
+
+    def test_an_expired_claim_can_be_taken_over_so_a_dead_publisher_cannot_strand_a_record(
+            self, tmp_path):
+        # A process that dies between claiming and publishing must not pin the record forever.
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        assert durable.claim("orphan-uid") is True
+        assert durable.claim("orphan-uid") is False
+        con = sqlite3.connect(db)
+        with con:
+            con.execute("UPDATE cache_claims SET expires_at = '2000-01-01T00:00:00Z'")
+        con.close()
+        assert durable.claim("orphan-uid") is True
+
+    # --- D3: a deduped heartbeat must still re-arm the cache TTL ------------------------------
+    def test_a_duplicate_heartbeat_re_arms_the_ttl_instead_of_skipping_redis(self, tmp_path):
+        # D3: during a reboot/retry loop the node resends the same heartbeat. The durable store
+        # recognized it and returned before Redis, so dama:hear:<id> quietly expired and the node
+        # read as offline while it was in fact reporting.
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis()
+        store = self._store(db, fake)
+        payload = self._heartbeat(idempotency_key="reboot-loop-1")
+        store.write_heartbeat(payload)
+        # Simulate the TTL running out between the original and the retry.
+        del fake.values["dama:hear:nyquist"]
+        del fake.ttls["dama:hear:nyquist"]
+
+        store.write_heartbeat(payload)
+
+        assert json.loads(fake.values["dama:hear:nyquist"])["device_id"] == "nyquist"
+        assert fake.ttls["dama:hear:nyquist"] == 30
+        # Still exactly one durable record and one recorded success: the refresh is a pure cache
+        # overwrite, not a second ledger entry.
+        assert len(self._rows(db, "SELECT id FROM durable_records")) == 1
+        assert len(self._rows(
+            db, "SELECT id FROM cache_attempts WHERE outcome='succeeded'")) == 1
+
+    def test_a_redelivered_older_heartbeat_does_not_roll_the_cache_backwards(self, tmp_path):
+        # The D3 refresh must not become a stale-overwrite of its own: an older heartbeat can be
+        # redelivered (MQTT QoS-1, a node draining its local outbox, an out-of-order retry) after
+        # a newer one was cached. Re-arming the TTL with that older body would walk the fleet
+        # view backwards, so a superseded duplicate refreshes nothing.
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis()
+        store = self._store(db, fake)
+        older = self._heartbeat(uptime_s=100, idempotency_key="hb-old")
+        store.write_heartbeat(older)
+        store.write_heartbeat(self._heartbeat(uptime_s=200, idempotency_key="hb-new"))
+        assert json.loads(fake.values["dama:hear:nyquist"])["uptime_s"] == 200
+
+        store.write_heartbeat(older)
+
+        assert json.loads(fake.values["dama:hear:nyquist"])["uptime_s"] == 200
+        assert json.loads(fake.values["dama:hear:latest"])["uptime_s"] == 200
+
+    def test_a_duplicate_heartbeat_surfaces_a_cache_outage_instead_of_a_false_ack(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis()
+        store = self._store(db, fake)
+        payload = self._heartbeat(idempotency_key="reboot-loop-2")
+        store.write_heartbeat(payload)
+        fake.failures_before_success = 1
+        with pytest.raises(RuntimeError, match="simulated redis outage"):
+            store.write_heartbeat(payload)
+        assert len(self._rows(db, "SELECT id FROM cache_attempts WHERE outcome='failed'")) == 1
+
+    def test_a_duplicate_event_is_still_a_no_op_and_never_re_touches_the_stream(self, tmp_path):
+        # The D3 refresh is heartbeat-only on purpose: the event stream is append-only.
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis()
+        store = self._store(db, fake)
+        payload = self._event(idempotency_key="evt-dupe")
+        store.write_event(payload)
+        store.write_event(payload)
+        assert fake.execute_calls == 1
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+
+    # --- replay ordering ----------------------------------------------------------------------
+    def test_replay_does_not_overwrite_a_newer_heartbeat_with_a_stale_pending_one(self, tmp_path):
+        # A heartbeat stranded by a cache outage is strictly older than whatever the node has
+        # reported since. Replaying it would SETEX the stale body back over the fresh snapshot,
+        # so the fleet view would jump backwards because of a retry. It is marked synced (the
+        # cache already holds newer state) instead of being published or left pending forever.
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis(failures_before_success=1)
+        store = self._store(db, fake)
+        with pytest.raises(RuntimeError, match="simulated redis outage"):
+            store.write_heartbeat(self._heartbeat(uptime_s=100, idempotency_key="hb-old"))
+        store.write_heartbeat(self._heartbeat(uptime_s=200, idempotency_key="hb-new"))
+        assert json.loads(fake.values["dama:hear:nyquist"])["uptime_s"] == 200
+
+        summary = store.replay_pending(limit=10)
+
+        assert summary["attempted"] == 1
+        assert summary["synced"] == 1
+        assert summary["failed"] == 0
+        assert summary["remaining_pending"] == 0
+        assert json.loads(fake.values["dama:hear:nyquist"])["uptime_s"] == 200
+        assert json.loads(fake.values["dama:hear:latest"])["uptime_s"] == 200
+
+    def test_a_stale_heartbeat_for_another_device_is_still_replayed(self, tmp_path):
+        # Supersession is per device: a newer heartbeat from node A must not suppress node B's
+        # pending record.
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis(failures_before_success=1)
+        store = self._store(db, fake)
+        with pytest.raises(RuntimeError, match="simulated redis outage"):
+            store.write_heartbeat(self._heartbeat(device_id="shannon", idempotency_key="hb-b"))
+        store.write_heartbeat(self._heartbeat(device_id="nyquist", idempotency_key="hb-a"))
+
+        summary = store.replay_pending(limit=10)
+
+        assert summary == {"backend": "sqlite", "attempted": 1, "synced": 1, "failed": 0,
+                           "remaining_pending": 0}
+        assert json.loads(fake.values["dama:hear:shannon"])["device_id"] == "shannon"
+
+    def test_replay_is_bounded_by_its_limit_and_drains_oldest_first(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis(failures_before_success=4)
+        store = self._store(db, fake)
+        for seq in range(4):
+            with pytest.raises(RuntimeError, match="simulated redis outage"):
+                store.write_event(self._event(event_seq=seq, idempotency_key=f"evt-{seq}"))
+
+        first = store.replay_pending(limit=2)
+        assert first["attempted"] == 2 and first["synced"] == 2
+        assert first["remaining_pending"] == 2
+        assert [json.loads(entry["payload"])["event_seq"]
+                for entry in fake.streams[HR.EVENT_STREAM_KEY]] == [0, 1]
+
+        second = store.replay_pending(limit=2)
+        assert second["synced"] == 2 and second["remaining_pending"] == 0
+        assert [json.loads(entry["payload"])["event_seq"]
+                for entry in fake.streams[HR.EVENT_STREAM_KEY]] == [0, 1, 2, 3]
+
+    def test_pruning_reclaims_claim_rows_too(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        store = self._store(db, FakeRedis())
+        store.write_event(self._event(idempotency_key="pruned"))
+        con = sqlite3.connect(db)
+        with con:
+            con.execute("UPDATE durable_records SET created_at = '2000-01-01T00:00:00Z'")
+            con.execute("INSERT INTO cache_claims (record_uid, claimed_at, expires_at) "
+                        "SELECT record_uid, created_at, created_at FROM durable_records")
+        con.close()
+        assert store.durable_store.prune_acknowledged(1) == 1
+        assert self._rows(db, "SELECT record_uid FROM cache_claims") == []
+
+    def test_health_counts_are_index_backed_rather_than_full_table_scans(self, tmp_path):
+        # /healthz is probed every ~10s; its three counts must not degrade into full scans of an
+        # append-only ledger as it grows.
+        db = tmp_path / "heartbeats.sqlite3"
+        store = self._store(db, FakeRedis())
+        store.write_event(self._event(idempotency_key="health-1"))
+        con = sqlite3.connect(db)
+        try:
+            plans = [
+                " ".join(str(part) for part in row)
+                for row in con.execute(
+                    "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM cache_attempts "
+                    "WHERE outcome = 'succeeded'").fetchall()
+            ]
+        finally:
+            con.close()
+        assert any("cache_attempts_outcome_id" in plan for plan in plans), plans
