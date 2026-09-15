@@ -90,15 +90,30 @@ def _get(url, timeout=5.0):
         return resp.status, json.loads(resp.read().decode())
 
 
-def _post(url, payload, token=TOKEN):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json",
-                                          "X-Hear-Token": token}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30.0) as resp:
-            return resp.status, resp.read()
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.read()
+def _post(url, payload, token=TOKEN, attempts=3):
+    """POST, retrying a transport timeout.
+
+    ⚠️A TIMEOUT HERE IS THE RUNNER, NOT THE RECEIVER. The handler sets a per-connection socket
+    timeout from HEAR_HEARTBEAT_SOCKET_TIMEOUT_S, which exists to stop a slow *node* from holding
+    a thread on a LAN -- on a shared CI runner a scheduling stall can trip it on a loopback
+    request that the fleet would never have delayed. Retrying is also what a node does: the
+    durable ledger is idempotent, which is the property the retry test is about.
+    """
+    body = json.dumps(payload).encode()
+    last = None
+    for attempt in range(attempts):
+        req = urllib.request.Request(url, data=body,
+                                     headers={"Content-Type": "application/json",
+                                              "X-Hear-Token": token}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30.0) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+        except (TimeoutError, socket.timeout, urllib.error.URLError, ConnectionError) as exc:
+            last = exc
+            time.sleep(0.5 * (attempt + 1))
+    raise AssertionError("POST %s never completed: %r" % (url, last))
 
 
 @pytest.fixture
@@ -120,6 +135,11 @@ def receiver(tmp_path):
     # ⚠️Nothing listens here. See the module docstring: the cache being down is the point.
     env["REDIS_HOST"] = "127.0.0.1"
     env["REDIS_PORT"] = str(_free_port())
+    # ⚠️NOT THE MANIFEST'S 0.5 s. That value defends a hostNetwork receiver against a slow node
+    # holding a request thread on the LAN; a shared CI runner can stall a loopback request past
+    # it for reasons that have nothing to do with the image. Everything else on this env is the
+    # manifest's, verbatim -- this one line is the only place the smoke test is not the pod.
+    env["HEAR_HEARTBEAT_SOCKET_TIMEOUT_S"] = "5.0"
     # The two secretKeyRef values the cluster injects. The token is required, so a smoke test
     # that did not set it would be testing an unauthenticated receiver.
     env["HEAR_HEARTBEAT_TOKEN"] = TOKEN
