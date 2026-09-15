@@ -60,6 +60,15 @@ FIRMWARE_METADATA_FILES = (
     "requirements/ci-pods.txt",
 )
 
+#: Published, generated contract artifacts (`docs/decisions/0002-contract-repository-layout.md`).
+#: The freeze inventories them; `tools/gen_ingest_contracts.py` remains the only thing that
+#: writes them and `tools/check_contract_layout.py` remains the only thing that rules on layout.
+CONTRACTS_ROOT = ROOT / "contracts"
+#: Deliberately not named `*SCHEMA*`: `schema_identifiers()` harvests contract ids from
+#: `[A-Z_]*SCHEMA[A-Z_]* = "..."` assignments, so that name would register ".schema.json"
+#: as a contract of this very tool.
+PUBLISHED_SUFFIX = ".schema.json"
+
 SAFE_FIXTURE_ROOTS = (
     ROOT / "docs" / "data",
     ROOT / "testdata",
@@ -578,6 +587,87 @@ def corpus_fixture_metadata() -> Dict[str, Any]:
     })
 
 
+def _published_contract_ids() -> List[str]:
+    ids: set[str] = set()
+    schemas = CONTRACTS_ROOT / "schemas"
+    if schemas.is_dir():
+        for path in schemas.glob("*" + PUBLISHED_SUFFIX):
+            ids.add(path.name[: -len(PUBLISHED_SUFFIX)])
+    fixtures = CONTRACTS_ROOT / "fixtures"
+    if fixtures.is_dir():
+        for path in fixtures.iterdir():
+            if path.is_dir():
+                ids.add(path.name)
+    return sorted(ids)
+
+
+def published_contracts() -> Dict[str, Any]:
+    """Freeze the generated contract artifacts: bytes digests plus declared manifest metadata.
+
+    This is an inventory, not a validator. Drift between a manifest declaration and the
+    generator that produced it is `tools/gen_ingest_contracts.py --check`'s job; the freeze
+    only guarantees that any edit to a published artifact moves the baseline hash, so a
+    generated schema, fixture or manifest cannot be altered while the freeze still passes.
+    """
+    if not CONTRACTS_ROOT.is_dir():
+        return with_hash({"published_root": "contracts", "present": False, "contracts": [],
+                          "other_files": []})
+
+    claimed: set[str] = set()
+    contracts: List[Dict[str, Any]] = []
+    for contract_id in _published_contract_ids():
+        row: Dict[str, Any] = {"contract_id": contract_id}
+
+        schema_path = CONTRACTS_ROOT / "schemas" / (contract_id + PUBLISHED_SUFFIX)
+        row["schema_file"] = file_record(relpath(schema_path)) if schema_path.is_file() else None
+        if schema_path.is_file():
+            claimed.add(relpath(schema_path))
+
+        fixture_dir = CONTRACTS_ROOT / "fixtures" / contract_id
+        manifest_path = fixture_dir / "manifest.json"
+        row["manifest_file"] = (
+            file_record(relpath(manifest_path)) if manifest_path.is_file() else None
+        )
+        declared: Any = None
+        if manifest_path.is_file():
+            claimed.add(relpath(manifest_path))
+            try:
+                declared = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                declared = None
+        row["manifest_declared"] = declared
+
+        fixture_files = []
+        if fixture_dir.is_dir():
+            for path in sorted(fixture_dir.rglob("*")):
+                if not path.is_file() or path == manifest_path:
+                    continue
+                fixture_files.append(file_record(relpath(path)))
+                claimed.add(relpath(path))
+        row["fixture_files"] = fixture_files
+
+        row["contract_hash"] = object_hash(row)
+        contracts.append(row)
+
+    other_files = [
+        file_record(relpath(path))
+        for path in sorted(CONTRACTS_ROOT.rglob("*"))
+        if path.is_file() and relpath(path) not in claimed
+    ]
+    return with_hash({
+        "published_root": "contracts",
+        "present": True,
+        "generated_only": True,
+        "authority_note": (
+            "Generated artifacts are written by their tools/gen_*.py generator and ruled on by "
+            "tools/check_contract_layout.py. This section freezes their bytes so a published "
+            "schema, fixture or manifest cannot change without moving the baseline hash."
+        ),
+        "contracts": contracts,
+        "other_files": other_files,
+    })
+
+
 def build_snapshot() -> Dict[str, Any]:
     snapshot = {
         "baseline_version": VERSION,
@@ -612,6 +702,7 @@ def build_snapshot() -> Dict[str, Any]:
         "wire_profiles": wire_profiles(),
         "firmware_build_metadata": firmware_build_metadata(),
         "schemas": schemas(),
+        "published_contracts": published_contracts(),
         "mqtt_topics": mqtt_topics(),
         "redis_keys": redis_keys(),
         "kubernetes_and_pvc_layout": k8s_layout(),
@@ -652,6 +743,7 @@ def render_markdown(snapshot: Mapping[str, Any]) -> str:
                 ["wire_profiles", snapshot["wire_profiles"]["section_hash"]],
                 ["firmware_build_metadata", snapshot["firmware_build_metadata"]["section_hash"]],
                 ["schemas", snapshot["schemas"]["section_hash"]],
+                ["published_contracts", snapshot["published_contracts"]["section_hash"]],
                 ["mqtt_topics", snapshot["mqtt_topics"]["section_hash"]],
                 ["redis_keys", snapshot["redis_keys"]["section_hash"]],
                 ["kubernetes_and_pvc_layout", snapshot["kubernetes_and_pvc_layout"]["section_hash"]],
@@ -768,6 +860,56 @@ def render_markdown(snapshot: Mapping[str, Any]) -> str:
             [[item["schema"], "<br>".join(item["source_paths"])] for item in sc["schema_identifiers"]],
         ),
     ])
+
+    pc = snapshot["published_contracts"]
+    lines.extend([
+        "",
+        "## Published contract artifacts",
+        "",
+        pc.get("authority_note", "(no contracts/ directory in this checkout)"),
+        "",
+    ])
+    if pc.get("present"):
+        lines.extend([
+            md_table(
+                ["contract", "schema sha256", "manifest sha256", "fixtures", "contract hash"],
+                [[
+                    row["contract_id"],
+                    (row["schema_file"] or {}).get("sha256", "(none)"),
+                    (row["manifest_file"] or {}).get("sha256", "(none)"),
+                    len(row["fixture_files"]),
+                    row["contract_hash"],
+                ] for row in pc["contracts"]],
+            ),
+            "",
+            "### Declared fixture outcomes",
+            "",
+            md_table(
+                ["contract", "fixture", "expect_status", "dispatchable", "reasons", "sha256"],
+                [[
+                    row["contract_id"],
+                    fixture.get("name", fixture.get("file")),
+                    fixture.get("expect_status"),
+                    "yes" if fixture.get("expect_dispatchable") else "no",
+                    ", ".join(fixture.get("expect_reasons") or []) or "(none)",
+                    fixture.get("sha256", "(none)"),
+                ] for row in pc["contracts"]
+                    for fixture in ((row["manifest_declared"] or {}).get("fixtures") or [])],
+            ),
+            "",
+            "### Artifact hashes",
+            "",
+            md_table(
+                ["path", "size_bytes", "sha256"],
+                [[f["path"], f["size_bytes"], f["sha256"]] for f in sorted(
+                    [f for row in pc["contracts"]
+                     for f in ([row["schema_file"]] if row["schema_file"] else [])
+                     + ([row["manifest_file"]] if row["manifest_file"] else [])
+                     + row["fixture_files"]] + pc["other_files"],
+                    key=lambda item: item["path"],
+                )],
+            ),
+        ])
 
     mt = snapshot["mqtt_topics"]
     lines.extend([
