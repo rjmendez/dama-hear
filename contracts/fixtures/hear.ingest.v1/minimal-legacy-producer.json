@@ -1,0 +1,27 @@
+{
+  "event_id": "3aa5740c-407d-817d-a53a-ca8153979804",
+  "source": "node-mqtt",
+  "site_id": "site-quarry-north",
+  "device_id": "nyquist",
+  "device_class": "esp32s3-i2s-gps",
+  "firmware_version": "hear-node-2026.09.1",
+  "observed_at": "2026-09-14T18:03:11.250000Z",
+  "received_at": "2026-09-14T18:03:11.984000Z",
+  "clock": {
+    "valid": true,
+    "tier": "gps_pps",
+    "sigma_ns": 420000
+  },
+  "kind": "heartbeat",
+  "schema_version": 1,
+  "payload": {
+    "uptime_s": 86412,
+    "gps_fix": 1,
+    "clock_state": "LOCKED"
+  },
+  "raw_ref": null,
+  "adapter": {
+    "name": "node-mqtt",
+    "version": "0.9.3"
+  }
+}

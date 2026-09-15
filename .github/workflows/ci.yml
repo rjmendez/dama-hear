@@ -60,6 +60,7 @@ jobs:
           python firmware/gen_mel.py
           python firmware/gen_mel_scene.py
           python firmware/gen_golden.py
+          python tools/gen_ingest_contracts.py
       - name: nothing changed
         run: |
           if ! git diff --quiet; then
