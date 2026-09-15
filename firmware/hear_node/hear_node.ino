@@ -94,6 +94,20 @@
 #ifndef FW_BUILD
 #define FW_BUILD "unset"
 #endif
+#ifndef HEAR_ADMIN_TOKEN
+#define HEAR_ADMIN_TOKEN ""
+#endif
+#ifndef HEAR_PUSH_HOST
+// "mrpink" was a Tailscale MagicDNS name unresolvable by this firmware's plain DNS stack, and
+// a raw LAN IP (172.21.171.198) turned out unreachable inbound from the fleet's subnet -- no
+// heartbeat ever completed under either default. This one is dama-gotchi's existing public
+// ingest API (AWS API Gateway, already wired to SQS -> the home MQTT bridge -> Redis), which the
+// fleet reaches the same way it reaches the internet for anything else.
+#define HEAR_PUSH_HOST              "api.botnet.floppydicks.net"
+#endif
+#ifndef HEAR_PUSH_TOKEN
+#define HEAR_PUSH_TOKEN             ""
+#endif
 // Identity and Wi-Fi come from NVS (written by enroll.py), or from secrets.h in a build that has
 // one. Compiled-in credentials win and are copied into NVS, so a later release image finds them
 // there. With neither, the id comes from the MAC and the node is its own AP.
@@ -185,6 +199,12 @@ static void node_identity() {
   // compiled-secrets image would silently erase a previously enrolled per-device AP password.
   if (have_nv) snprintf(prov.ap_pass, sizeof prov.ap_pass, "%s", nv.ap_pass);
 #endif
+  if (HEAR_PUSH_HOST[0]) snprintf(prov.push_host, sizeof prov.push_host, "%s", HEAR_PUSH_HOST);
+  else if (have_nv) snprintf(prov.push_host, sizeof prov.push_host, "%s", nv.push_host);
+  if (HEAR_PUSH_TOKEN[0]) snprintf(prov.push_token, sizeof prov.push_token, "%s", HEAR_PUSH_TOKEN);
+  else if (have_nv) snprintf(prov.push_token, sizeof prov.push_token, "%s", nv.push_token);
+  if (HEAR_ADMIN_TOKEN[0]) snprintf(prov.admin_token, sizeof prov.admin_token, "%s", HEAR_ADMIN_TOKEN);
+  else if (have_nv) snprintf(prov.admin_token, sizeof prov.admin_token, "%s", nv.admin_token);
   prov_src = "compiled";
   prov_loaded = have_nv && hear_prov_same(&nv, &prov);
   if (hear_prov_id_ok(prov.node))
@@ -211,6 +231,20 @@ static void ap_password(char *out, size_t cap) {
   if (prov.ap_pass[0]) { snprintf(out, cap, "%s", prov.ap_pass); return; }
   uint8_t m[6]; esp_efuse_mac_get_default(m);
   snprintf(out, cap, "hear-%02x%02x%02x%02x%02x%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+static const char *push_host_runtime() {
+  return prov.push_host[0] ? prov.push_host : HEAR_PUSH_HOST;
+}
+static const char *push_token_runtime() {
+  return prov.push_token[0] ? prov.push_token : HEAR_PUSH_TOKEN;
+}
+static const char *admin_token_runtime() {
+  return prov.admin_token[0] ? prov.admin_token : HEAR_ADMIN_TOKEN;
+}
+static const char *runtime_secret_src(const char *nvs_value, const char *compiled_value) {
+  if (nvs_value && nvs_value[0]) return "nvs";
+  if (compiled_value && compiled_value[0]) return "compiled";
+  return "missing";
 }
 #define AP_SSID   "dama-hear-node"
 
@@ -1724,7 +1758,7 @@ static bool hear_auth_ok() {
 #if !HEAR_REQUIRE_ADMIN_AUTH
   return true;
 #else
-  static const char *want = HEAR_ADMIN_TOKEN;
+  static const char *want = admin_token_runtime();
   size_t wn = strlen(want);
   if (!wn) return false;
   String given = http.hasHeader("X-Hear-Auth") ? http.header("X-Hear-Auth")
@@ -2468,23 +2502,12 @@ static uint32_t clip_last_sample = 0;
 static bool     clip_have_last = false;
 static char clip_rand[CLIP_RAND_HEX + 1] = "000000";
 
-#ifndef HEAR_PUSH_HOST
-// "mrpink" was a Tailscale MagicDNS name unresolvable by this firmware's plain DNS stack, and
-// a raw LAN IP (172.21.171.198) turned out unreachable inbound from the fleet's subnet -- no
-// heartbeat ever completed under either default. This one is dama-gotchi's existing public
-// ingest API (AWS API Gateway, already wired to SQS -> the home MQTT bridge -> Redis), which the
-// fleet reaches the same way it reaches the internet for anything else.
-#define HEAR_PUSH_HOST              "api.botnet.floppydicks.net"
-#endif
 #ifndef HEAR_PUSH_PORT
 #define HEAR_PUSH_PORT              443u
 #endif
 #ifndef HEAR_PUSH_TLS
 // The API Gateway custom domain is HTTPS-only (ACM cert): there is no plaintext fallback.
 #define HEAR_PUSH_TLS               1
-#endif
-#ifndef HEAR_PUSH_TOKEN
-#define HEAR_PUSH_TOKEN             ""
 #endif
 #ifndef HEAR_PUSH_AUTH_BEARER
 // dama-gotchi's ingest Lambda reads a standard `Authorization: Bearer <key>` header, not the
@@ -2529,8 +2552,8 @@ static char clip_rand[CLIP_RAND_HEX + 1] = "000000";
 #define HEAR_PUSH_ENVELOPE_OVERHEAD (sizeof "{\"device_id\":\"\",\"messages\":[]}" + sizeof node_id)
 #define HEAR_PUSH_WRAPPED_MAX       (HEAR_PUSH_BODY_MAX + HEAR_PUSH_ENVELOPE_OVERHEAD)
 // Request line + Host + Content-Type + Connection + auth header + Content-Length + blank line,
-// each at the widest its own compiled-in argument can be, then the whole wrapped body inline.
-#define HEAR_PUSH_REQ_HEADER_MAX    (160u + sizeof HEAR_PUSH_HOST + sizeof HEAR_PUSH_TOKEN + \
+// each at the widest NVS-provisioned runtime argument can be, then the whole wrapped body inline.
+#define HEAR_PUSH_REQ_HEADER_MAX    (160u + HEAR_PROV_HOST_MAX + HEAR_PROV_TOKEN_MAX + \
                                      sizeof HEAR_PUSH_HEARTBEAT_PATH + sizeof HEAR_PUSH_EVENT_PATH)
 #define HEAR_PUSH_REQ_MAX           (HEAR_PUSH_WRAPPED_MAX + HEAR_PUSH_REQ_HEADER_MAX)
 #define HEAR_PUSH_CONNECT_TIMEOUT_MS 3000u
@@ -2556,6 +2579,9 @@ static struct HearPushEvent push_dets_event = {};
 static uint32_t push_next_heartbeat_ms = 0;
 static uint32_t push_failures = 0;
 static uint32_t push_last_fail_log_ms = 0;
+static int push_last_code = 0;
+static uint32_t push_last_attempt_s = 0;
+static uint32_t push_last_ok_s = 0;
 
 static uint32_t push_backoff_ms() {
   uint32_t cap = HEAR_PUSH_RETRY_BASE_MS;
@@ -2570,16 +2596,18 @@ static void push_schedule_heartbeat(uint32_t delay_ms) {
   push_next_heartbeat_ms = millis() + delay_ms;
 }
 
+static unsigned long push_uptime_s() {
+  return (unsigned long)((millis() - boot_ms) / 1000);
+}
+
 static void push_note_failure(const char *what, int code) {
+  push_last_code = code;
+  push_last_attempt_s = push_uptime_s();
   uint32_t now = millis();
   if (!push_last_fail_log_ms || (uint32_t)(now - push_last_fail_log_ms) >= HEAR_PUSH_FAIL_LOG_MS) {
     logf("push  %s failed (%d)\n", what, code);
     push_last_fail_log_ms = now;
   }
-}
-
-static unsigned long push_uptime_s() {
-  return (unsigned long)((millis() - boot_ms) / 1000);
 }
 
 static bool push_now_utc(int64_t *utc_us) {
@@ -2681,11 +2709,13 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
 #endif
   client.setNoDelay(true);
   boot_wdt_service();
-  if (!client.connect(HEAR_PUSH_HOST, HEAR_PUSH_PORT, HEAR_PUSH_CONNECT_TIMEOUT_MS)) {
+  const char *push_host = push_host_runtime();
+  const char *push_token = push_token_runtime();
+  if (!client.connect(push_host, HEAR_PUSH_PORT, HEAR_PUSH_CONNECT_TIMEOUT_MS)) {
     if (code_out) *code_out = -4;
     return false;
   }
-  const bool have_token = HEAR_PUSH_TOKEN[0];
+  const bool have_token = push_token[0];
   // Sized from the wrapped body it carries inline plus its own headers, not independently: the
   // envelope fix below would otherwise just move the truncation (-3) one buffer downstream.
   static char req[HEAR_PUSH_REQ_MAX];
@@ -2700,7 +2730,7 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
                  "Connection: close\r\n"
                  "Authorization: Bearer %s\r\n"
                  "Content-Length: %u\r\n\r\n%.*s",
-                 path, HEAR_PUSH_HOST, (unsigned)HEAR_PUSH_PORT, HEAR_PUSH_TOKEN,
+                 path, push_host, (unsigned)HEAR_PUSH_PORT, push_token,
                  (unsigned)body_len, (int)body_len, body);
   } else if (have_token) {
     n = snprintf(req, sizeof req,
@@ -2710,7 +2740,7 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
                  "Connection: close\r\n"
                  "X-Hear-Token: %s\r\n"
                  "Content-Length: %u\r\n\r\n%.*s",
-                 path, HEAR_PUSH_HOST, (unsigned)HEAR_PUSH_PORT, HEAR_PUSH_TOKEN,
+                 path, push_host, (unsigned)HEAR_PUSH_PORT, push_token,
                  (unsigned)body_len, (int)body_len, body);
   } else {
     n = snprintf(req, sizeof req,
@@ -2719,7 +2749,7 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
                  "Content-Type: application/json\r\n"
                  "Connection: close\r\n"
                  "Content-Length: %u\r\n\r\n%.*s",
-                 path, HEAR_PUSH_HOST, (unsigned)HEAR_PUSH_PORT,
+                 path, push_host, (unsigned)HEAR_PUSH_PORT,
                  (unsigned)body_len, (int)body_len, body);
   }
   if (n <= 0 || n >= (int)sizeof req) {
@@ -2783,6 +2813,9 @@ static bool push_send_heartbeat() {
   int code = 0;
   if (push_post_json(HEAR_PUSH_HEARTBEAT_PATH, body, strlen(body), &code)) {
     push_failures = 0;
+    push_last_code = code;
+    push_last_attempt_s = push_uptime_s();
+    push_last_ok_s = push_last_attempt_s;
     push_schedule_heartbeat(HEAR_PUSH_HEARTBEAT_MS);
     return true;
   }
@@ -2801,7 +2834,12 @@ static bool push_send_event(const struct HearPushEvent *src) {
     return false;
   }
   int code = 0;
-  if (push_post_json(HEAR_PUSH_EVENT_PATH, body, strlen(body), &code)) return true;
+  if (push_post_json(HEAR_PUSH_EVENT_PATH, body, strlen(body), &code)) {
+    push_last_code = code;
+    push_last_attempt_s = push_uptime_s();
+    push_last_ok_s = push_last_attempt_s;
+    return true;
+  }
   push_note_failure("event", code);
   return false;
 }
@@ -2811,6 +2849,9 @@ static void push_init() {
   memset(&push_dets_event, 0, sizeof push_dets_event);
   push_failures = 0;
   push_last_fail_log_ms = 0;
+  push_last_code = 0;
+  push_last_attempt_s = 0;
+  push_last_ok_s = 0;
   push_schedule_heartbeat(HEAR_PUSH_HEARTBEAT_MS);
 }
 
@@ -3249,6 +3290,9 @@ static String status_json() {
     // ever be its own AP. prov says where they came from; nvs:true is what a release image needs.
     "{\"node\":\"%s\",\"class\":\"%s\",\"fw\":\"%s\",\"wifi_configured\":%s,"
     "\"prov\":{\"src\":\"%s\",\"nets\":%d,\"nvs\":%s,\"loaded\":%s},"
+    "\"auth\":{\"push\":{\"configured\":%s,\"src\":\"%s\",\"last_code\":%d,"
+      "\"last_attempt_s\":%lu,\"last_ok_s\":%lu},"
+      "\"admin\":{\"configured\":%s,\"src\":\"%s\"}},"
     "\"selftest\":{\"mic\":\"%s\",\"mic_state\":\"%s\",\"mic_reason\":\"%s\","
       "\"mic_stats\":{\"samples\":%lu,\"lo\":%d,\"hi\":%d,\"span\":%lu,\"mean\":%ld,"
         "\"mean_abs\":%lu,\"zero_cross_pct\":%lu,\"same_adj_pct\":%lu,\"unique\":%lu,"
@@ -3333,6 +3377,11 @@ static String status_json() {
       "\"last_evicted\":\"%s\"},\"i2c\":\"%s\"}",
     node_id, node_class, FW_BUILD, prov.n > 0 ? "true" : "false",
     prov_src, prov.n, prov_nvs ? "true" : "false", prov_loaded ? "true" : "false",
+    push_token_runtime()[0] ? "true" : "false",
+    runtime_secret_src(prov.push_token, HEAR_PUSH_TOKEN), push_last_code,
+    (unsigned long)push_last_attempt_s, (unsigned long)push_last_ok_s,
+    admin_token_runtime()[0] ? "true" : "false",
+    runtime_secret_src(prov.admin_token, HEAR_ADMIN_TOKEN),
     selftest_mic, selftest_mic_diag.state_name, selftest_mic_diag.reason,
     (unsigned long)selftest_mic_diag.samples, (int)selftest_mic_diag.lo, (int)selftest_mic_diag.hi,
     (unsigned long)selftest_mic_diag.span, (long)selftest_mic_diag.mean,
@@ -5352,8 +5401,10 @@ static void audio_pump() {
 // whether it joined.
 static void prov_serial_line(const char *s) {
   if (!strcmp(s, "PROV?")) {
-    Serial.printf("PROV STATE src=%s node=%s nets=%d fw=%s ip=%s selftest=mic:%s,gps:%s,pps:%s,wifi:%s\n",
-                  prov_src, node_id, prov.n, FW_BUILD,
+    Serial.printf("PROV STATE src=%s node=%s nets=%d push=%s admin=%s fw=%s ip=%s selftest=mic:%s,gps:%s,pps:%s,wifi:%s\n",
+                  prov_src, node_id, prov.n,
+                  push_token_runtime()[0] ? "yes" : "no",
+                  admin_token_runtime()[0] ? "yes" : "no", FW_BUILD,
                   sta_ok ? WiFi.localIP().toString().c_str() : "none",
                   selftest_mic, selftest_gps_now(), selftest_pps_now(), selftest_wifi_now());
     return;

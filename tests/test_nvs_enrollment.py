@@ -20,6 +20,9 @@ import flash  # noqa: E402
 import enroll  # noqa: E402
 import release_manifest  # noqa: E402
 
+AUTH_STATUS = {"push": {"configured": True, "src": "nvs", "last_code": 204},
+               "admin": {"configured": True, "src": "nvs"}}
+
 
 def _code(p=INO):
     s = re.sub(r"/\*.*?\*/", "", p.read_text(), flags=re.S)
@@ -50,6 +53,8 @@ def test_compiled_credentials_are_copied_into_nvs_and_nvs_is_used_without_them()
     compiled, nvs_only = _branches(b)
     assert "hear_prov_save(" in compiled and "hear_prov_same(" in compiled
     assert "prov = nv" in nvs_only and "hear_prov_save" not in nvs_only
+    assert "prov.push_token" in compiled and "HEAR_PUSH_TOKEN" in compiled
+    assert "prov.admin_token" in compiled and "HEAR_ADMIN_TOKEN" in compiled
 
 
 def test_loaded_is_only_a_record_read_back_and_never_one_just_written():
@@ -71,6 +76,8 @@ def test_wifi_joins_from_the_loaded_record_not_the_compiled_arrays():
 def test_status_says_where_the_credentials_came_from():
     assert re.search(r'\\"prov\\":\{\\"src\\":\\"%s\\",\\"nets\\":%d,\\"nvs\\":%s,'
                      r'\\"loaded\\":%s\}', _code())
+    assert '\\"auth\\":{\\"push\\":{\\"configured\\":%s,\\"src\\":\\"%s\\",\\"last_code\\":%d,' in _code()
+    assert '\\"admin\\":{\\"configured\\":%s,\\"src\\":\\"%s\\"}}' in _code()
 
 
 def test_status_and_prov_report_the_boot_selftest():
@@ -78,7 +85,8 @@ def test_status_and_prov_report_the_boot_selftest():
     assert '\\"selftest\\":{\\"mic\\":\\"%s\\",\\"mic_state\\":\\"%s\\",\\"mic_reason\\":\\"%s\\",' in code
     assert '\\"mic_stats\\":{\\"samples\\":%lu,\\"lo\\":%d,\\"hi\\":%d,\\"span\\":%lu,' in code
     assert '\\"gps\\":\\"%s\\",\\"pps\\":\\"%s\\",\\"wifi\\":\\"%s\\"}' in code
-    assert "PROV STATE" in code and "selftest=mic:%s,gps:%s,pps:%s,wifi:%s" in code
+    assert "PROV STATE" in code and "push=%s admin=%s" in code
+    assert "selftest=mic:%s,gps:%s,pps:%s,wifi:%s" in code
 
 
 def test_setup_logs_one_concise_selftest_summary_and_keeps_the_watchdog_around_boot_probes():
@@ -209,13 +217,15 @@ def _release_manifest_text(tag, board_class, assets, dirty=False, psram_mode="oc
 
 class TestReleaseRefusal:
     GOOD = {"node": "nyquist", "class": "xiao-s3-pps",
-            "prov": {"src": "compiled", "nets": 2, "nvs": True, "loaded": True}}
+            "prov": {"src": "compiled", "nets": 2, "nvs": True, "loaded": True},
+            "auth": AUTH_STATUS}
 
     def test_an_enrolled_node_is_accepted(self):
         assert flash.release_refusal(self.GOOD, "nyquist") is None
         assert flash.release_refusal(
             {"node": "nyquist", "class": "xiao-s3-pps",
-             "prov": {"src": "nvs", "nets": 1, "nvs": True}}, "nyquist") is None
+             "prov": {"src": "nvs", "nets": 1, "nvs": True, "loaded": True},
+             "auth": AUTH_STATUS}, "nyquist") is None
 
     def test_a_release_requires_a_known_live_board_class(self):
         why = flash.release_refusal({"node": "nyquist", "class": "", "prov": self.GOOD["prov"]}, "nyquist")
@@ -236,9 +246,19 @@ class TestReleaseRefusal:
 
     @pytest.mark.parametrize("prov", [{"src": "compiled", "nets": 2, "nvs": False},
                                       {"src": "none", "nets": 0, "nvs": False},
-                                      {"src": "nvs", "nets": 0, "nvs": True}])
+                                      {"src": "nvs", "nets": 0, "nvs": True},
+                                      {"src": "nvs", "nets": 1, "nvs": True, "loaded": False}])
     def test_a_node_without_an_nvs_record_is_refused(self, prov):
-        assert flash.release_refusal({"node": "nyquist", "prov": prov}, "nyquist")
+        assert flash.release_refusal({"node": "nyquist", "prov": prov, "auth": AUTH_STATUS}, "nyquist")
+
+    @pytest.mark.parametrize("auth", [
+        {"push": {"configured": False, "src": "missing"}, "admin": {"configured": True, "src": "nvs"}},
+        {"push": {"configured": True, "src": "nvs"}, "admin": {"configured": False, "src": "missing"}},
+        {"push": {"configured": True, "src": "compiled"}, "admin": {"configured": True, "src": "nvs"}},
+    ])
+    def test_a_release_requires_push_and_admin_credentials_in_nvs(self, auth):
+        why = flash.release_refusal(dict(self.GOOD, auth=auth), "nyquist")
+        assert why and ("auth." in why or "secret-free release" in why)
 
     def test_another_node_is_refused(self):
         assert "mach" in flash.release_refusal(dict(self.GOOD, node="mach"), "nyquist")
@@ -316,15 +336,37 @@ class TestPostFlashVersionCheck:
 
     def test_the_release_path_still_verifies_against_the_release_tag(self, monkeypatch):
         # Untouched: a release image's version is the tag, and its prov must come from NVS.
-        good = {"node": "mach", "class": "xiao-s3-pps", "prov": {"src": "nvs", "nets": 1, "nvs": True}}
+        good = {"node": "mach", "class": "xiao-s3-pps",
+                "prov": {"src": "nvs", "nets": 1, "nvs": True, "loaded": True},
+                "auth": AUTH_STATUS}
         states = iter([good] + [dict(good, fw="v0.1.4-122-g794e3f5", uptime_s=90)] * 200)
         monkeypatch.setattr(flash, "status", lambda host: next(states))
         monkeypatch.setattr(flash.time, "sleep", lambda _: None)
         monkeypatch.setattr(flash, "release_image", lambda tag, board_class, psram_mode=None: "/x/app.bin")
+        monkeypatch.setattr(flash, "ota_post", lambda host, bin_path, token: ("OK", "200", ""))
+        monkeypatch.setattr(flash, "admin_token", lambda path=None: "admin-token")
         monkeypatch.setattr(flash.subprocess, "run", lambda cmd, **kw: type(
             "R", (), {"stdout": "OK", "stderr": "", "returncode": 0})())
         with pytest.raises(SystemExit):
             flash.main(["flash.py", "mach", "172.16.100.50", "--release", "v0.1.5"])
+
+    def test_release_post_flash_401_is_a_loud_failure(self, monkeypatch, capsys):
+        before = {"node": "mach", "class": "xiao-s3-pps",
+                  "prov": {"src": "nvs", "nets": 1, "nvs": True, "loaded": True},
+                  "auth": AUTH_STATUS}
+        after = {"node": "mach", "class": "xiao-s3-pps", "fw": "v0.1.6", "uptime_s": 20,
+                 "prov": {"src": "nvs", "nets": 1, "nvs": True, "loaded": True},
+                 "auth": {"push": {"configured": True, "src": "nvs", "last_code": 401},
+                          "admin": {"configured": True, "src": "nvs"}}}
+        states = iter([before, after])
+        monkeypatch.setattr(flash, "status", lambda host: next(states))
+        monkeypatch.setattr(flash.time, "sleep", lambda _: None)
+        monkeypatch.setattr(flash, "release_image", lambda tag, board_class, psram_mode=None: "/x/app.bin")
+        monkeypatch.setattr(flash, "ota_post", lambda host, bin_path, token: ("OK", "200", ""))
+        monkeypatch.setattr(flash, "admin_token", lambda path=None: "admin-token")
+        with pytest.raises(SystemExit):
+            flash.main(["flash.py", "mach", "172.16.100.50", "--release", "v0.1.6"])
+        assert "401" in capsys.readouterr().err
 
 
 class TestBoardClassSelection:
@@ -343,7 +385,8 @@ class TestBoardClassSelection:
     def test_release_path_refuses_a_wrong_requested_board_class(self, monkeypatch):
         monkeypatch.setattr(flash, "status",
                             lambda host: {"node": "gold", "class": "esp32s3-i2s-gps",
-                                          "prov": {"src": "nvs", "nets": 1, "nvs": True}})
+                                          "prov": {"src": "nvs", "nets": 1, "nvs": True, "loaded": True},
+                                          "auth": AUTH_STATUS})
         with pytest.raises(SystemExit):
             flash.main(["flash.py", "gold", "172.16.100.50", "--release", "v0.1.3", "--class", "xiao-s3-pps"])
 
@@ -351,12 +394,15 @@ class TestBoardClassSelection:
         called = []
         good = {"node": "gold", "class": "esp32s3-i2s-gps",
                 "sys": {"psram_bus": "quad"},
-                "prov": {"src": "nvs", "nets": 1, "nvs": True}}
+                "prov": {"src": "nvs", "nets": 1, "nvs": True, "loaded": True},
+                "auth": AUTH_STATUS}
         states = iter([good, dict(good, fw="v0.1.3", uptime_s=3)])
         monkeypatch.setattr(flash, "status", lambda host: next(states))
         monkeypatch.setattr(flash.time, "sleep", lambda _: None)
         monkeypatch.setattr(flash.subprocess, "run", lambda cmd, **kw: type(
             "R", (), {"stdout": "OK", "stderr": "", "returncode": 0})())
+        monkeypatch.setattr(flash, "ota_post", lambda host, bin_path, token: ("OK", "200", ""))
+        monkeypatch.setattr(flash, "admin_token", lambda path=None: "admin-token")
 
         def fake_release_image(tag, board_class, psram_mode=None):
             called.append((tag, board_class, psram_mode))
@@ -370,14 +416,16 @@ class TestBoardClassSelection:
         monkeypatch.setattr(flash, "status",
                             lambda host: {"node": "gold", "class": "esp32s3-i2s-gps",
                                           "sys": {"psram_bus": "octal"},
-                                          "prov": {"src": "nvs", "nets": 1, "nvs": True}})
+                                          "prov": {"src": "nvs", "nets": 1, "nvs": True, "loaded": True},
+                                          "auth": AUTH_STATUS})
         with pytest.raises(SystemExit):
             flash.main(["flash.py", "gold", "172.16.100.50", "--release", "v0.1.3"])
 
     def test_live_gps_node_build_adds_the_board_define(self, monkeypatch):
         cmds = []
         states = iter([
-            {"node": "gold", "class": "esp32s3-i2s-gps", "prov": {"src": "nvs", "nets": 1, "nvs": True}},
+            {"node": "gold", "class": "esp32s3-i2s-gps",
+             "prov": {"src": "nvs", "nets": 1, "nvs": True, "loaded": True}, "auth": AUTH_STATUS},
             {"node": "gold", "class": "esp32s3-i2s-gps", "fw": "dirty",
              "prov": {"src": "compiled", "nets": 1, "nvs": True}, "uptime_s": 3},
         ])
@@ -395,6 +443,8 @@ class TestBoardClassSelection:
             return type("R", (), {"stdout": "OK", "stderr": "", "returncode": 0})()
 
         monkeypatch.setattr(flash.subprocess, "run", fake_run)
+        monkeypatch.setattr(flash, "ota_post", lambda host, bin_path, token: ("OK", "200", ""))
+        monkeypatch.setattr(flash, "admin_token", lambda path=None: "admin-token")
         assert flash.main(["flash.py", "gold", "172.16.100.50"]) == 0
         compile_cmd = next(cmd for cmd in cmds if cmd[:3] == ["arduino-cli", "compile", "--fqbn"])
         assert "--build-property" in compile_cmd

@@ -11,6 +11,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "firmware" / "hear_node"))
 import enroll  # noqa: E402
 
+AUTH_STATUS = {"push": {"configured": True, "src": "nvs", "last_code": 204},
+               "admin": {"configured": True, "src": "nvs"}}
 
 GATE_CHECK = (pathlib.Path.home() / ".copilot" / "session-state"
               / "0c8a4016-1534-4cf6-ba62-c47c4e09d282" / "files"
@@ -71,7 +73,9 @@ def test_a_stale_evidence_file_is_rejected(tmp_path, gate_mod):
 def test_an_unhealthy_live_selftest_blocks_enrollment_ready(monkeypatch):
     monkeypatch.setattr(enroll.wifi_store, "read_pairs", lambda _: [("field-net", "correcthorse")])
     monkeypatch.setattr(enroll, "exchange", lambda *args, **kwargs: "172.16.100.50")
-    bad = {"node": "gold", "fw": "v0.1.0", "prov": {"src": "nvs", "nets": 1, "nvs": True},
+    bad = {"node": "gold", "fw": "v0.1.0",
+           "prov": {"src": "nvs", "nets": 1, "nvs": True, "loaded": True},
+           "auth": AUTH_STATUS,
            "selftest": {"mic": "silent", "gps": "ok", "pps": "ok", "wifi": "ok"}}
     monkeypatch.setattr(enroll.urllib.request, "urlopen",
                         lambda *args, **kwargs: _Resp(json.dumps(bad).encode()))
@@ -82,7 +86,9 @@ def test_an_unhealthy_live_selftest_blocks_enrollment_ready(monkeypatch):
 def test_a_fully_healthy_fresh_live_report_passes(monkeypatch):
     monkeypatch.setattr(enroll.wifi_store, "read_pairs", lambda _: [("field-net", "correcthorse")])
     monkeypatch.setattr(enroll, "exchange", lambda *args, **kwargs: "172.16.100.50")
-    good = {"node": "gold", "fw": "v0.1.0", "prov": {"src": "nvs", "nets": 1, "nvs": True},
+    good = {"node": "gold", "fw": "v0.1.0",
+            "prov": {"src": "nvs", "nets": 1, "nvs": True, "loaded": True},
+            "auth": AUTH_STATUS,
             "selftest": {"mic": "ok", "gps": "ok", "pps": "ok", "wifi": "ok"}}
     monkeypatch.setattr(enroll.urllib.request, "urlopen",
                         lambda *args, **kwargs: _Resp(json.dumps(good).encode()))
@@ -92,7 +98,9 @@ def test_a_fully_healthy_fresh_live_report_passes(monkeypatch):
 def test_a_quiet_mic_state_is_accepted_during_the_compatibility_window(monkeypatch):
     monkeypatch.setattr(enroll.wifi_store, "read_pairs", lambda _: [("field-net", "correcthorse")])
     monkeypatch.setattr(enroll, "exchange", lambda *args, **kwargs: "172.16.100.50")
-    quiet = {"node": "gold", "fw": "v0.1.0", "prov": {"src": "nvs", "nets": 1, "nvs": True},
+    quiet = {"node": "gold", "fw": "v0.1.0",
+             "prov": {"src": "nvs", "nets": 1, "nvs": True, "loaded": True},
+             "auth": AUTH_STATUS,
              "selftest": {"mic": "ok", "mic_state": "quiet", "mic_reason": "low_variation",
                            "gps": "ok", "pps": "ok", "wifi": "ok"}}
     monkeypatch.setattr(enroll.urllib.request, "urlopen",

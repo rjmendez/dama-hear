@@ -114,6 +114,45 @@ def status_reasons(status, node=None, require_nvs=True, allow_gps_no_fix_indoors
     return reasons
 
 
+def auth_reasons(status, require_nvs_credentials=False, require_push_success=False):
+    """Return reasons a node is not safe to leave on a generic release image.
+
+    /status health alone is not enough: a node can be recording, serving HTTP and passing
+    self-tests while every backend push is 401 because the release image has no token.
+    """
+    auth = status.get("auth")
+    if not isinstance(auth, dict):
+        return ["status has no auth block; cannot prove backend/admin credentials are provisioned"]
+    reasons = []
+    push = auth.get("push")
+    admin = auth.get("admin")
+    if not isinstance(push, dict):
+        reasons.append("status has no auth.push block")
+    else:
+        if not push.get("configured"):
+            reasons.append("auth.push.configured is false; backend pushes will be unauthenticated")
+        if require_nvs_credentials and push.get("src") != "nvs":
+            reasons.append("auth.push.src=%r, not 'nvs'; a secret-free release would lose it" %
+                           push.get("src"))
+        if require_push_success:
+            code = push.get("last_code")
+            if code is None or int(code or 0) == 0:
+                reasons.append("auth.push.last_code is missing; no post-flash backend push has completed")
+            elif int(code) == 401:
+                reasons.append("auth.push.last_code=401; backend rejected the token")
+            elif int(code) < 200 or int(code) >= 300:
+                reasons.append("auth.push.last_code=%r; backend push is not succeeding" % code)
+    if not isinstance(admin, dict):
+        reasons.append("status has no auth.admin block")
+    else:
+        if not admin.get("configured"):
+            reasons.append("auth.admin.configured is false; /update and /reboot will fail closed")
+        if require_nvs_credentials and admin.get("src") != "nvs":
+            reasons.append("auth.admin.src=%r, not 'nvs'; a secret-free release would lose it" %
+                           admin.get("src"))
+    return reasons
+
+
 def _parse_timestamp(value):
     if value is None:
         raise ValueError("missing timestamp")
