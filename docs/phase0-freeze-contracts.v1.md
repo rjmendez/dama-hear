@@ -14,13 +14,13 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | b4682b2fb5a5dcfed04f9e9d26258d82b6be277edd306b00a54d9819a97d12eb |
+| baseline | a9916d092c01ccda9f0000996d2c732a00e066a706b3417ff1f46cd29528bf31 |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
 | firmware_build_metadata | fd6917fb9e119d34570a6d393be9c3b11fbd0f7bd409c2fd69fd65e49e39d526 |
 | schemas | 427c86937d28bd12b6de71c3b4604eae609d2b24edfd4f1a761256bc74a6b580 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |
 | redis_keys | d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03 |
-| kubernetes_and_pvc_layout | 63890192afc8d4fd368a1e8887152977cd245769df9a4675f84ea373762a6f15 |
+| kubernetes_and_pvc_layout | 9ec4c936083033a3238a047532214784492b665fb2c5d8de9898cda19300b525 |
 | corpus_fixture_metadata | 5a27ffc150822a94847095b765d20e4f0299ec4d9e58f2ea1af05d6ecf470d77 |
 
 ## Compatibility
@@ -138,7 +138,7 @@ Manifest hashes:
 
 | path | size_bytes | sha256 |
 | --- | --- | --- |
-| deploy/k8s/hear-annotate.yaml | 32877 | 07444be208e7d6e8b96b82f8ebd363f2b62eb197955f4b272d6de3f926cf2a8d |
+| deploy/k8s/hear-annotate.yaml | 32871 | 3160298b27e45596ad5a46527502a5566185f777045bfa197a67bc2e6e139661 |
 | deploy/k8s/hear-birdnet.yaml | 7474 | 9a4265e78c5c03e10a563b1a178582492e3f0aeef0c47f630f56fe23c06c6aa5 |
 | deploy/k8s/hear-drain.yaml | 13594 | 38e02f09e8b124e5d321a7c51a97e93b898b03e27de6d19a0d38fb9b00cedf4e |
 | deploy/k8s/hear-embed.yaml | 9190 | 1f3e86e8d5d1f57f4bc5d8d4ca6adb958671f5a65c7db7b21e47225916d465ad |
