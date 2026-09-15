@@ -2035,6 +2035,44 @@ struct RawMark { int64_t utc_us; uint32_t sample; };
 static RawMark  praw_mark[PRAW_MARKS];
 static uint32_t praw_mark_n = 0;            // total ever recorded; slot is n % PRAW_MARKS
 
+// ⚠️THE TIERS, LARGEST FIRST, AND WHY THERE ARE TWO GROUPS OF THEM.
+// 80/60/45/30 s are the tiers this node has always had, and the test applied to them below is
+// UNCHANGED: a board that takes 80 s today takes 80 s after this, from the same arithmetic on the
+// same two numbers. What they cannot do is fit a small PSRAM part. 30 s x FS_ACQ x 2 B = 2.88 MB
+// against a 2 MiB part, so on gold -- 8MB flash / 2MB QUAD PSRAM, docs/REDESIGN-LESSONS.md item 8
+// -- every one of them fails even once its quad image is installed and psramFound() is finally
+// true: praw stays NULL, /audio stays 503, and the one way to prove that node's microphone with
+// PCM rather than with a summary statistic does not exist. 20/15/10 s are for exactly that board.
+//
+// ⚠️THE TIER IS CHOSEN AT RUNTIME FROM THE LARGEST FREE BLOCK, NOT FROM A PER-NODE BUILD FLAG.
+// A compile-time tier would have to name each physical node, and kasami is the same board class
+// as gold and ageev with NO bare-board scan anywhere in the record (board_profiles.py,
+// NODE_PSRAM_MODES) -- naming it would be the Ageev-class guess again. Sizing from what the part
+// actually answers with needs no such guess and stays right if a board is re-populated.
+//
+// This cannot shrink anybody's ring: a tier below 30 s is only ever reached on a board where
+// every tier at or above 30 s already failed, i.e. a board that gets NO ring at all today.
+static constexpr uint32_t PRAW_TIERS_S[] = {80, 60, 45, 30, 20, 15, 10};
+static constexpr unsigned PRAW_TIER_N = sizeof PRAW_TIERS_S / sizeof PRAW_TIERS_S[0];
+// ⚠️A SMALL TIER ALSO HAS TO LEAVE THE DETECTION RING ITS PSRAM. dets[] is allocated from PSRAM
+// immediately after praw. On a part big enough for the tiers at or above this one, what praw
+// leaves behind covers dets[] with room to spare; on a part small enough to reach the tiers below
+// it does not, and praw would take the PSRAM dets[] needs -- pushing ~135 kB of detection ring
+// onto MALLOC_CAP_INTERNAL, which is precisely the class of load that drove gold to heap_min
+// 108 B. So tiers strictly below PRAW_DET_RESERVE_BELOW_S hold DET_RING_MIN slots back on top of
+// PSRAM_KEEP_B. The tiers at or above it do NOT: adding a term to their test could move a board
+// that holds 80 s today down to 60 s, and no working peer's buffer may shrink for gold's sake.
+static constexpr uint32_t PRAW_DET_RESERVE_BELOW_S = 30;
+static constexpr size_t   PRAW_DET_RESERVE_B = (size_t)DET_RING_MIN * sizeof(Det);
+static constexpr bool praw_tiers_descend() {
+  for (unsigned i = 1; i < PRAW_TIER_N; i++)
+    if (PRAW_TIERS_S[i] >= PRAW_TIERS_S[i - 1]) return false;
+  return true;
+}
+static_assert(praw_tiers_descend(), "the ring is asked for largest-first, so the tiers must fall");
+static_assert(PRAW_TIERS_S[0] <= PRAW_MARKS,
+              "one mark per GPS second: PRAW_MARKS must cover the longest ring that can allocate");
+
 // ⚠️TWO DOMAINS, NAMED. praw_cap is the ARRAY LENGTH, in acquisition samples, because that is
 // what the ring physically holds. Every OTHER quantity here -- g_samples, dets, watermarks, the
 // praw marks, every span in /status and /audio -- is in DECIMATED samples, because that is the
@@ -2540,6 +2578,14 @@ static_assert(DET_RING_MIN >= DET_BURST_HZ * CLIP_WAIT_MAX_S,
 static_assert((0x100000000ULL % DET_RING_MAX) == 0 && (0x100000000ULL % DET_RING_MIN) == 0 &&
               (0x100000000ULL % DET_RING_INT) == 0 && (0x100000000ULL % DET_RING_BOOT) == 0,
               "det_n % det_cap must not jump when det_n wraps");
+// ⚠️THE SMALLEST RING TIER IS A FLOOR ON THE CLIP WRITER, NOT JUST ON /audio. clip_pump refuses a
+// window that has fallen off the ring (CLIP_RING) and drops a clip the head laps mid-write, so a
+// tier that could not hold one whole clip would not corrupt anything -- it would silently make
+// every clip a skip. The smallest tier has to stay big enough that the 5 s window plus the time
+// it takes to write is inside the ring, which is what keeps the small-PSRAM path a smaller node
+// rather than a differently-broken one.
+static_assert((uint64_t)PRAW_TIERS_S[PRAW_TIER_N - 1] * (uint64_t)FS_ACQ > (uint64_t)CLIP_SAMPLES,
+              "the smallest raw-ring tier must still hold one whole clip window");
 
 static uint32_t clip_written = 0;        // advances ONLY after the full CLIP_BYTES landed
 static uint32_t clip_evicted = 0;        // oldest clips deleted to make room
@@ -3382,7 +3428,7 @@ static String status_json() {
       // i.e. the binary's PSRAM bus mode does not match this board. Everything that wanted PSRAM
       // is now on the internal heap and this node is on its way to an allocation failure.
       "\"loop_max_boot_ms\":%lu,\"loop_max_boot_at_s\":%lu,\"chip_c\":%.1f,\"stream_stalls\":%lu,\"stream_gone\":%lu,\"psram_fault\":%s,\"psram_bus\":\"%s\"},"
-    "\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
+    "\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,\"psram_total\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"pmtk_ack\":%lu,\"pmtk_nak\":%lu,\"pmtk_glitch\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
     // hell_m is height above the WGS84 ELLIPSOID and is the field a geodetic transform wants;
@@ -3432,7 +3478,10 @@ static String status_json() {
     "\"write_fail\":%lu,"
     // raw: what /audio can actually serve. span_s is what was allocated, held_s what has been
     // written into it so far -- they differ only for the first few minutes after a boot.
-    "\"raw\":{\"span_s\":%.1f,\"cap_samples\":%lu,\"held_samples\":%lu,\"fill_pct\":%.1f,"
+    // want_s is the TIER the allocator landed on (PRAW_TIERS_S), a whole number of seconds and 0
+    // when no ring allocated; span_s is that capacity divided by the MEASURED rate, so the two
+    // disagree by the node's ppm and only want_s can be compared against the tier table.
+    "\"raw\":{\"span_s\":%.1f,\"want_s\":%lu,\"cap_samples\":%lu,\"held_samples\":%lu,\"fill_pct\":%.1f,"
     "\"from_utc_us\":%lld,\"to_utc_us\":%lld,\"marks\":%lu,\"bytes\":%lu},"
     // scene: fft_us_per_row is MEASURED on this part, summed over the 64 frames of one row.
     // bands/f_lo_hz/f_hi_hz: the scene bank is NOT the detection bank any more, and a reader
@@ -3481,6 +3530,11 @@ static String status_json() {
     psram_fault ? "true" : "false", psram_bus,
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
+    // psram_total is the part this board actually answers with, and it is what makes a short ring
+    // readable as a fact about the silicon rather than as a fault: 2 MiB cannot hold the 2.88 MB
+    // a 30 s ring needs no matter how healthy the node is. 0 with psram_fault true is the wrong
+    // bus mode; 0 with psram_fault false is a build with no PSRAM at all.
+    (unsigned long)ESP.getPsramSize(),
     gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences,
     (unsigned long)nmea_valid, (unsigned long)gps_baud,
     (unsigned long)gps_tacc_ns, (long)gps_qerr_ps, (unsigned long)ubx_pvt,
@@ -3518,6 +3572,7 @@ static String status_json() {
     g_floor, FLOOR_DEFAULT, FLOOR_MIN, FLOOR_MAX, g_floor_src, floor_saved,
     (unsigned long)det_write_fail,
     praw_cap ? (double)praw_cap_d() / fs_timebase() : 0.0,
+    (unsigned long)praw_want_s,
     (unsigned long)praw_cap_d(), (unsigned long)r_held,
     praw_cap ? 100.0 * (double)r_held / (double)praw_cap_d() : 0.0,
     (long long)r_from, (long long)r_to, (unsigned long)praw_mark_n,
@@ -5068,19 +5123,26 @@ void setup() {
 #endif
   boot_wdt_service();
 
-  // Raw ring. Ask for 80 s (7.68 MB of the 8.34 MB free) and step down rather than fail: what
-  // matters is largest CONTIGUOUS free block, which total-free does not report. Log the span that
-  // was actually obtained -- a silent failure here would look identical to a quiet period, which is
-  // the failure class env_e_max_win already exists to rule out.
+  // Raw ring. Ask for the largest tier (80 s = 7.68 MB of the 8.34 MB free on an octal part) and
+  // step down rather than fail: what matters is largest CONTIGUOUS free block, which total-free
+  // does not report. The tier table and the reason it reaches below 30 s are at PRAW_TIERS_S. Log
+  // the span that was actually obtained -- a silent failure here would look identical to a quiet
+  // period, which is the failure class env_e_max_win already exists to rule out.
   {
-    static const uint32_t want_s[] = {80, 60, 45, 30};
-    for (unsigned k = 0; k < sizeof(want_s) / sizeof(want_s[0]) && !praw; k++) {
-      size_t want = (size_t)want_s[k] * FS_ACQ * sizeof(int16_t);
+    size_t largest = 0, need = 0;
+    for (unsigned k = 0; k < PRAW_TIER_N && !praw; k++) {
+      size_t want = (size_t)PRAW_TIERS_S[k] * FS_ACQ * sizeof(int16_t);
       // Leave 256 kB of PSRAM behind: WiFi buffers and the web server allocate from it too, and a
-      // ring that takes the last byte would trade audio for a node that cannot be reached.
-      if (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) < want + PSRAM_KEEP_B) continue;
+      // ring that takes the last byte would trade audio for a node that cannot be reached. A tier
+      // below PRAW_DET_RESERVE_BELOW_S leaves the detection ring's PSRAM behind as well, so a
+      // small part does not buy /audio by pushing dets[] onto the internal heap.
+      size_t keep = PSRAM_KEEP_B +
+                    (PRAW_TIERS_S[k] < PRAW_DET_RESERVE_BELOW_S ? PRAW_DET_RESERVE_B : 0);
+      largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+      need = want + keep;
+      if (largest < need) continue;
       praw = (int16_t *)ps_malloc(want);
-      if (praw) { praw_cap = want_s[k] * FS_ACQ; praw_want_s = want_s[k]; }
+      if (praw) { praw_cap = PRAW_TIERS_S[k] * FS_ACQ; praw_want_s = PRAW_TIERS_S[k]; }
     }
     if (praw)
       logf("praw  raw ring %lu s = %lu kB PSRAM, %lu kB PSRAM still free\n",
@@ -5090,7 +5152,15 @@ void setup() {
       logln("praw  NO PSRAM ring -- this board has no usable PSRAM at all (see psram FAULT above); "
             "/audio is disabled");
     else
-      logln("praw  NO PSRAM ring -- /audio is disabled; capture, gate and logging are unaffected");
+      // ⚠️SAY WHAT WAS SHORT, BY HOW MUCH. "NO PSRAM ring" alone is what made gold's fault take
+      // weeks: it reads the same whether the part is absent, too small, or merely fragmented, and
+      // the numbers that tell those apart are gone by the time anyone asks. need/largest are the
+      // SMALLEST tier's, i.e. the closest this boot came.
+      logf("praw  NO PSRAM ring -- /audio is disabled; capture, gate and logging are unaffected. "
+           "The smallest tier is %lu s and needs %lu kB contiguous; the largest free PSRAM block "
+           "is %lu kB, of %lu kB fitted.\n",
+           (unsigned long)PRAW_TIERS_S[PRAW_TIER_N - 1], (unsigned long)(need / 1024UL),
+           (unsigned long)(largest / 1024UL), (unsigned long)(ESP.getPsramSize() / 1024UL));
   }
   {
     static const uint32_t want_n[] = {DET_RING_MAX, DET_RING_MIN};

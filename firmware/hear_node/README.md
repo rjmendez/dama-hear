@@ -223,6 +223,29 @@ keeps 256 kB of PSRAM back for WiFi. **A failed allocation is not an error** —
 and capture, gating and logging are untouched. The boot log says which span was obtained, because a
 silent failure here would look exactly like a quiet period.
 
+**Below 30 s: the small-PSRAM tiers.** 30 s is still 2.88 MB, and `gold` is an 8MB flash / **2 MiB
+quad** PSRAM part (`docs/REDESIGN-LESSONS.md` item 8) — so on that board every tier above failed
+even with the quad image installed and `psramFound()` true, and it had no ring, no `/audio`, and
+no way to prove its microphone with PCM instead of a summary statistic. `PRAW_TIERS_S` therefore
+continues 20/15/10 s. Three properties make that safe rather than a fleet-wide shrink:
+
+* The test applied to 80/60/45/30 is **unchanged**, so a board holding 80 s today still holds 80 s.
+  A tier below 30 s is only reachable where every tier above it already failed, i.e. where the node
+  gets no ring at all today. `tests/test_firmware_raw_ring_tiers.py` sweeps every free-block size
+  and asserts the old and new allocators agree wherever the old one returned anything.
+* The tier is chosen at **runtime from the largest free block**, not from a per-node build flag.
+  `kasami` is the same board class as `gold` and `ageev` and nobody has scanned its part
+  (`board_profiles.py`, `NODE_PSRAM_MODES`), so a compile-time table would have to guess for it.
+* A tier below `PRAW_DET_RESERVE_BELOW_S` also holds `DET_RING_MIN` slots of PSRAM back, on top of
+  the 256 kB. Otherwise a small part would buy `/audio` by pushing ~135 kB of detection ring onto
+  the internal heap — the load that drove gold to `heap_min` 108 B in the first place.
+
+`/status` says which tier landed (`raw.want_s`, whole seconds, 0 when no ring) and how big the part
+is (`sys.psram_total`), so a short ring on healthy silicon and a broken ring on sick silicon do not
+read the same. When nothing allocates, the boot log now names the smallest tier's requirement and
+the largest free block against it, because `praw  NO PSRAM ring` alone reads identically whether the
+part is absent, too small, or merely fragmented.
+
 It holds the **DC-blocked** samples, not the raw ones: the pedestal drifted 1093.9 → 1439.6 over
 the capture, so raw audio carries a moving offset a consumer would only have to remove again, and the
 ring would not match what the gate and the sketch saw. `gate.dc` / `sig_dc` recovers the pedestal if
@@ -388,7 +411,8 @@ and reporting that unsigned would put the event 999 ms — 343 m — from where 
 
 ## A WAV per detection
 
-The PSRAM ring holds the last 60–80 s, whichever allocated, and `/audio` can serve any window of it. What it cannot do is outlive
+The PSRAM ring holds the last 60–80 s on an 8 MB part, 10–20 s on a 2 MiB one, whichever allocated,
+and `/audio` can serve any window of it. What it cannot do is outlive
 that span. Each
 detection now also gets a fixed-length WAV on the card, so the audio is still there when
 the drain comes to identify it.

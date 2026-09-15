@@ -673,9 +673,10 @@ def audio_pointer(node: str, utc_us: int, sample: Optional[int], fs_hz: float,
 
     `retention_s` is how long the ring holds a window before overwriting it, and it has NO
     default. The ring does now exist in the firmware, but its size is decided at boot: the node
-    asks for 80 s and steps down through 60/45/30 until one fits the largest contiguous free
-    PSRAM block (80 x 48000 x 2 B = 7.68 MB of int16), so only that boot's /status -- `audio.raw.
-    span_s` -- says which it got. A number invented here would be read as a promise.
+    asks for 80 s and steps down through 60/45/30 -- and on a PSRAM part too small for any of
+    those, through 20/15/10 -- until one fits the largest contiguous free PSRAM block (80 x 48000
+    x 2 B = 7.68 MB of int16), so only that boot's /status -- `audio.raw.span_s`, or `raw.want_s`
+    for the tier itself -- says which it got. A number invented here would be read as a promise.
     """
     fs = float(fs_hz) if float(fs_hz) > 1000.0 else NOMINAL_FS
     pre = max(int(round(float(pre_s) * fs)), 0)

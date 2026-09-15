@@ -288,7 +288,13 @@ constraint is one ESP32 core and its pull duty cycle.
 
 **The ring is the architectural licence.** The 60 s ring the nodes run, less the 16 s overwrite
 guard, gives a central classifier ~44 s to decide it wants audio (~64 s if the 80 s ring allocates).
-That is the entire reason a battery node is allowed to stay dumb. Pulled audio is 48 kHz, so a
+That is the entire reason a battery node is allowed to stay dumb. A 2 MiB PSRAM part cannot hold
+any of those tiers at all — `gold` — and steps down to 20/15/10 s instead (`PRAW_TIERS_S`,
+`firmware/hear_node/README.md`); the overwrite guard is capped at a third of the ring, so a 10 s
+ring still leaves ~6.7 s addressable. That is enough to hear an event and not enough to deliberate
+over one, so such a node is a listener of last resort, not a licence to stay dumb. `raw.want_s` in
+`/status` says which tier a node actually landed on; never assume 60 or 80.
+Pulled audio is 48 kHz, so a
 pull moves three times the bytes per second of audio that the transport measurements below were
 taken at.
 
