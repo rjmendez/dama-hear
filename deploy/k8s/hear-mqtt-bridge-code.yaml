@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-mqtt-bridge-code.yaml
-# apply-mode client: 23857 B serialised; 24034 B of annotations against a 262144 B cap.
+# apply-mode client: 38325 B serialised; 38502 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,21 +8,31 @@ metadata:
   labels:
     app: hear-mqtt-bridge
   annotations:
-    dama-hear/commit: 'b27817a'
+    dama-hear/commit: '5ed1dfc'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '23857'
+    dama-hear/serialised-bytes: '38325'
 data:
   tools_hear_heartbeat_receiver.py: |
     #!/usr/bin/env python3
-    """Tiny hear_node heartbeat/event receiver that writes short-TTL Redis state."""
+    """Tiny hear_node heartbeat/event receiver that writes Redis state.
+    
+    With ``HEAR_DURABLE_STORE=sqlite`` every accepted heartbeat/event is first committed to a local
+    append-only SQLite ledger and only then reflected into Redis. Redis stays the mixed-version cache
+    surface, and pending cache publishes can be replayed after a crash or cache outage.
+    """
     from __future__ import annotations
     
     import argparse
+    import hashlib
     import json
+    import logging
     import os
     import re
     import socket
+    import sqlite3
+    import threading
+    from dataclasses import dataclass
     from datetime import datetime, timezone
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from typing import Any, Callable, Dict, Mapping, Optional
@@ -30,10 +40,19 @@ data:
     
     import redis
     
+    logger = logging.getLogger("hear-heartbeat")
+    
     REDIS_HOST = os.environ.get("REDIS_HOST", "audit-redis.infra.svc.cluster.local")
     REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
     REDIS_PASS = os.environ.get("REDIS_PASS")
     AUTH_TOKEN = os.environ.get("HEAR_HEARTBEAT_TOKEN")
+    
+    
+    DURABLE_BACKENDS = ("none", "sqlite", "postgres")
+    DURABLE_STORE = (os.environ.get("HEAR_DURABLE_STORE", "none") or "none").strip().lower()
+    DURABLE_DB = os.environ.get("HEAR_DURABLE_DB", "/state/heartbeats.sqlite3")
+    DURABLE_REPLAY_LIMIT = int(os.environ.get("HEAR_DURABLE_REPLAY_LIMIT", "256"))
+    DURABLE_SCHEMA_VERSION = 1
     
     
     def _configured_auth_token(token: Optional[str]) -> str:
@@ -75,43 +94,327 @@ data:
             self.status = status
     
     
+    class DurableStoreError(RuntimeError):
+        """The durable ledger could not record or replay a record."""
+    
+    
+    @dataclass(frozen=True)
+    class DurableEntry:
+        record_uid: str
+        telemetry_path: str
+        body_json: str
+        record: Dict[str, Any]
+        cached: bool
+    
+    
+    class DurableRecordStore:
+        backend = "none"
+        enabled = False
+        path: Optional[str] = None
+    
+        def persist(self, record_uid: str, record: Dict[str, Any], body_json: str) -> DurableEntry:
+            return DurableEntry(record_uid, str(record["telemetry_path"]), body_json, dict(record), False)
+    
+        def note_cache_success(self, record_uid: str, cache_target: str) -> None:
+            return
+    
+        def note_cache_failure(self, record_uid: str, cache_target: str, exc: BaseException) -> None:
+            return
+    
+        def pending_records(self, limit: int) -> list[DurableEntry]:
+            return []
+    
+        def health(self) -> Dict[str, Any]:
+            return {
+                "backend": self.backend,
+                "enabled": self.enabled,
+                "path": self.path,
+                "pending_records": 0,
+                "cache_successes": 0,
+                "cache_failures": 0,
+                "last_cache_failure_at": None,
+            }
+    
+    
+    class SqliteDurableRecordStore(DurableRecordStore):
+        backend = "sqlite"
+        enabled = True
+    
+        def __init__(self, path: str):
+            if not path or not path.strip():
+                raise ValueError("HEAR_DURABLE_DB / --durable-db must be set for sqlite durability")
+            self.path = os.path.abspath(path)
+            self._lock = threading.Lock()
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            self._init_db()
+    
+        def _connect(self) -> sqlite3.Connection:
+            con = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
+            con.row_factory = sqlite3.Row
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA synchronous=FULL")
+            con.execute("PRAGMA foreign_keys=ON")
+            con.execute("PRAGMA busy_timeout=5000")
+            return con
+    
+        def _init_db(self) -> None:
+            with self._connect() as con:
+                con.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS durable_records (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        record_uid TEXT NOT NULL UNIQUE,
+                        telemetry_path TEXT NOT NULL,
+                        device_id TEXT NOT NULL,
+                        idempotency_key TEXT,
+                        payload_json TEXT NOT NULL,
+                        received_at TEXT NOT NULL,
+                        receiver_schema_version INTEGER NOT NULL,
+                        created_at TEXT NOT NULL,
+                        durable_schema_version INTEGER NOT NULL
+                    )
+                    """
+                )
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS durable_records_path_device "
+                    "ON durable_records(telemetry_path, device_id, id)"
+                )
+                con.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS cache_attempts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        record_uid TEXT NOT NULL,
+                        cache_target TEXT NOT NULL,
+                        outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'failed')),
+                        error_text TEXT,
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY(record_uid) REFERENCES durable_records(record_uid)
+                    )
+                    """
+                )
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS cache_attempts_record_outcome "
+                    "ON cache_attempts(record_uid, outcome, id)"
+                )
+    
+        def persist(self, record_uid: str, record: Dict[str, Any], body_json: str) -> DurableEntry:
+            with self._lock, self._connect() as con:
+                con.execute(
+                    """
+                    INSERT OR IGNORE INTO durable_records
+                    (record_uid, telemetry_path, device_id, idempotency_key, payload_json,
+                     received_at, receiver_schema_version, created_at, durable_schema_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record_uid,
+                        record["telemetry_path"],
+                        record["device_id"],
+                        _idempotency_key(record),
+                        body_json,
+                        record["received_at"],
+                        int(record["receiver_schema_version"]),
+                        record["received_at"],
+                        DURABLE_SCHEMA_VERSION,
+                    ),
+                )
+                row = con.execute(
+                    "SELECT telemetry_path, payload_json FROM durable_records WHERE record_uid = ?",
+                    (record_uid,),
+                ).fetchone()
+                cached = con.execute(
+                    "SELECT 1 FROM cache_attempts WHERE record_uid = ? AND outcome = 'succeeded' LIMIT 1",
+                    (record_uid,),
+                ).fetchone() is not None
+            if row is None:
+                raise DurableStoreError(f"durable record {record_uid} disappeared after insert")
+            try:
+                stored_record = json.loads(row["payload_json"])
+            except ValueError as exc:
+                raise DurableStoreError(f"durable record {record_uid} stored malformed JSON") from exc
+            if not isinstance(stored_record, dict):
+                raise DurableStoreError(f"durable record {record_uid} stored a non-object payload")
+            return DurableEntry(record_uid, str(row["telemetry_path"]), str(row["payload_json"]),
+                                stored_record, cached)
+    
+        def note_cache_success(self, record_uid: str, cache_target: str) -> None:
+            self._append_attempt(record_uid, cache_target, "succeeded", None)
+    
+        def note_cache_failure(self, record_uid: str, cache_target: str, exc: BaseException) -> None:
+            self._append_attempt(record_uid, cache_target, "failed", _error_text(exc))
+    
+        def _append_attempt(self, record_uid: str, cache_target: str,
+                            outcome: str, error_text: Optional[str]) -> None:
+            with self._lock, self._connect() as con:
+                con.execute(
+                    """
+                    INSERT INTO cache_attempts (record_uid, cache_target, outcome, error_text, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (record_uid, cache_target, outcome, error_text, utc_now()),
+                )
+    
+        def pending_records(self, limit: int) -> list[DurableEntry]:
+            if limit <= 0:
+                return []
+            with self._lock, self._connect() as con:
+                rows = con.execute(
+                    """
+                    SELECT r.record_uid, r.telemetry_path, r.payload_json
+                    FROM durable_records r
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM cache_attempts a
+                        WHERE a.record_uid = r.record_uid AND a.outcome = 'succeeded'
+                    )
+                    ORDER BY r.id
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                ).fetchall()
+            out: list[DurableEntry] = []
+            for row in rows:
+                try:
+                    record = json.loads(row["payload_json"])
+                except ValueError as exc:
+                    raise DurableStoreError(
+                        f"pending durable record {row['record_uid']} stored malformed JSON") from exc
+                if not isinstance(record, dict):
+                    raise DurableStoreError(
+                        f"pending durable record {row['record_uid']} stored a non-object payload")
+                out.append(DurableEntry(str(row["record_uid"]), str(row["telemetry_path"]),
+                                        str(row["payload_json"]), record, False))
+            return out
+    
+        def health(self) -> Dict[str, Any]:
+            with self._lock, self._connect() as con:
+                pending = con.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM durable_records r
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM cache_attempts a
+                        WHERE a.record_uid = r.record_uid AND a.outcome = 'succeeded'
+                    )
+                    """
+                ).fetchone()[0]
+                successes = con.execute(
+                    "SELECT COUNT(*) FROM cache_attempts WHERE outcome = 'succeeded'"
+                ).fetchone()[0]
+                failures = con.execute(
+                    "SELECT COUNT(*) FROM cache_attempts WHERE outcome = 'failed'"
+                ).fetchone()[0]
+                last_failure = con.execute(
+                    "SELECT created_at FROM cache_attempts WHERE outcome = 'failed' "
+                    "ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            return {
+                "backend": self.backend,
+                "enabled": self.enabled,
+                "path": self.path,
+                "pending_records": int(pending),
+                "cache_successes": int(successes),
+                "cache_failures": int(failures),
+                "last_cache_failure_at": None if last_failure is None else last_failure[0],
+            }
+    
+    
+    class RedisHeartbeatCache:
+        def __init__(self, client: Any, heartbeat_ttl_s: int = HEARTBEAT_TTL_S,
+                     event_stream_key: str = EVENT_STREAM_KEY,
+                     event_stream_maxlen: int = EVENT_STREAM_MAXLEN):
+            self.client = client
+            self.heartbeat_ttl_s = heartbeat_ttl_s
+            self.event_stream_key = event_stream_key
+            self.event_stream_maxlen = event_stream_maxlen
+    
+        def write(self, record: Dict[str, Any], body_json: str) -> None:
+            telemetry_path = record["telemetry_path"]
+            node_id = record["device_id"]
+            pipe = self.client.pipeline(transaction=False)
+            if telemetry_path == "hear/heartbeat":
+                pipe.setex(f"dama:hear:{node_id}", self.heartbeat_ttl_s, body_json)
+                pipe.sadd("dama:hear:devices", node_id)
+                pipe.set("dama:hear:latest", body_json)
+            elif telemetry_path == "hear/event":
+                pipe.sadd("dama:hear:devices", node_id)
+                pipe.set(f"dama:hear:event:{node_id}", body_json)
+                pipe.xadd(self.event_stream_key, {"device_id": node_id, "payload": body_json},
+                          maxlen=self.event_stream_maxlen, approximate=True)
+            else:  # pragma: no cover - validators own this in practice.
+                raise ValueError(f"unsupported telemetry_path {telemetry_path!r}")
+            pipe.execute()
+    
+    
     class HeartbeatReceiverStore:
         def __init__(self, client: Any, heartbeat_ttl_s: int = HEARTBEAT_TTL_S,
                      event_stream_key: str = EVENT_STREAM_KEY,
                      event_stream_maxlen: int = EVENT_STREAM_MAXLEN,
-                     redis_target: Optional[str] = None):
+                     redis_target: Optional[str] = None,
+                     durable_store: Optional[DurableRecordStore] = None):
             self.client = client
             self.heartbeat_ttl_s = heartbeat_ttl_s
             self.event_stream_key = event_stream_key
             self.event_stream_maxlen = event_stream_maxlen
             self.redis_target = redis_target or "unknown"
+            self.durable_store = durable_store or DurableRecordStore()
+            self.cache = RedisHeartbeatCache(
+                client,
+                heartbeat_ttl_s=heartbeat_ttl_s,
+                event_stream_key=event_stream_key,
+                event_stream_maxlen=event_stream_maxlen,
+            )
     
         def write_heartbeat(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-            record = dict(payload)
-            record["received_at"] = utc_now()
-            record["receiver_schema_version"] = RECEIVER_SCHEMA_VERSION
-            body = encode_json(record)
-            node_id = record["device_id"]
-            pipe = self.client.pipeline(transaction=False)
-            pipe.setex(f"dama:hear:{node_id}", self.heartbeat_ttl_s, body)
-            pipe.sadd("dama:hear:devices", node_id)
-            pipe.set("dama:hear:latest", body)
-            pipe.execute()
-            return record
+            return self._write(payload)
     
         def write_event(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+            return self._write(payload)
+    
+        def _write(self, payload: Dict[str, Any]) -> Dict[str, Any]:
             record = dict(payload)
             record["received_at"] = utc_now()
             record["receiver_schema_version"] = RECEIVER_SCHEMA_VERSION
-            body = encode_json(record)
-            node_id = record["device_id"]
-            pipe = self.client.pipeline(transaction=False)
-            pipe.sadd("dama:hear:devices", node_id)
-            pipe.set(f"dama:hear:event:{node_id}", body)
-            pipe.xadd(self.event_stream_key, {"device_id": node_id, "payload": body},
-                      maxlen=self.event_stream_maxlen, approximate=True)
-            pipe.execute()
-            return record
+            body_json = encode_json(record)
+            stored = self.durable_store.persist(_record_uid(payload), record, body_json)
+            if stored.cached:
+                return stored.record
+            try:
+                self.cache.write(stored.record, stored.body_json)
+            except Exception as exc:
+                self.durable_store.note_cache_failure(stored.record_uid, self.redis_target, exc)
+                raise
+            self.durable_store.note_cache_success(stored.record_uid, self.redis_target)
+            return stored.record
+    
+        def replay_pending(self, limit: int = DURABLE_REPLAY_LIMIT) -> Dict[str, Any]:
+            summary = {
+                "backend": self.durable_store.backend,
+                "attempted": 0,
+                "synced": 0,
+                "failed": 0,
+                "remaining_pending": 0,
+            }
+            if not self.durable_store.enabled or limit <= 0:
+                return summary
+            pending = self.durable_store.pending_records(limit)
+            summary["attempted"] = len(pending)
+            for entry in pending:
+                try:
+                    self.cache.write(entry.record, entry.body_json)
+                except Exception as exc:
+                    self.durable_store.note_cache_failure(entry.record_uid, self.redis_target, exc)
+                    summary["failed"] += 1
+                    continue
+                self.durable_store.note_cache_success(entry.record_uid, self.redis_target)
+                summary["synced"] += 1
+            summary["remaining_pending"] = int(self.durable_store.health()["pending_records"])
+            return summary
+    
+        def health_snapshot(self) -> Dict[str, Any]:
+            return {
+                "redis_target": self.redis_target,
+                "durable_store": self.durable_store.health(),
+            }
     
     
     class ReceiverServer(ThreadingHTTPServer):
@@ -129,6 +432,46 @@ data:
     
     def encode_json(data: Mapping[str, Any]) -> str:
         return json.dumps(data, separators=(",", ":"), sort_keys=True)
+    
+    
+    def _record_uid(payload: Mapping[str, Any]) -> str:
+        key = _idempotency_key(payload)
+        if key is not None:
+            return key
+        return hashlib.sha256(encode_json(payload).encode("utf-8")).hexdigest()
+    
+    
+    def _idempotency_key(payload: Mapping[str, Any]) -> Optional[str]:
+        raw = payload.get("idempotency_key")
+        if not isinstance(raw, str):
+            return None
+        raw = raw.strip()
+        return raw or None
+    
+    
+    def _error_text(exc: BaseException) -> str:
+        return f"{exc.__class__.__name__}: {exc}"[:512]
+    
+    
+    def add_durable_store_args(ap: argparse.ArgumentParser) -> None:
+        ap.add_argument("--durable-store", default=DURABLE_STORE, choices=DURABLE_BACKENDS)
+        ap.add_argument("--durable-db", default=DURABLE_DB)
+        ap.add_argument("--durable-replay-limit", type=int, default=DURABLE_REPLAY_LIMIT)
+    
+    
+    def make_durable_store(kind: str = DURABLE_STORE,
+                           path: str = DURABLE_DB) -> DurableRecordStore:
+        backend = (kind or "none").strip().lower()
+        if backend == "none":
+            return DurableRecordStore()
+        if backend == "sqlite":
+            return SqliteDurableRecordStore(path)
+        if backend == "postgres":
+            raise ValueError(
+                "HEAR_DURABLE_STORE=postgres is not implemented in phase 0; keep the sqlite outbox "
+                "or add psycopg and explicit DDL first"
+            )
+        raise ValueError(f"unknown durable store {kind!r}; expected one of {', '.join(DURABLE_BACKENDS)}")
     
     
     def _require_object(payload: Any, label: str) -> Dict[str, Any]:
@@ -176,10 +519,6 @@ data:
         _require_ident(body, "fw_version", _FW_RE, "firmware id")
         _require_int(body, "uptime_s")
     
-        # Heartbeats carry the node's current GPS-fix figure; advisory event payloads do NOT, and the
-        # firmware serializer in hear_push_payload.h intentionally keeps them that small. Reading
-        # `gps.fix` out of every telemetry path therefore rejects the event shape the fleet actually
-        # emits, which is exactly the "field exists everywhere" bug this receiver exists to keep out.
         if require_gps:
             gps = _require_object(body.get("gps"), "gps")
             _require_int(gps, "fix")
@@ -240,10 +579,12 @@ data:
                 if urlparse(self.path).path != "/healthz":
                     self.send_error(404)
                     return
+                snapshot = store.health_snapshot()
                 self.send_json({
                     "status": "ok",
                     "service": "hear-heartbeat-receiver",
-                    "redis_target": store.redis_target,
+                    "redis_target": snapshot["redis_target"],
+                    "durable_store": snapshot["durable_store"],
                 })
     
             def do_POST(self) -> None:
@@ -355,6 +696,7 @@ data:
         ap.add_argument("--event-stream-maxlen", type=int, default=EVENT_STREAM_MAXLEN)
         ap.add_argument("--auth-token", default=AUTH_TOKEN)
         ap.add_argument("--socket-timeout-s", type=float, default=SOCKET_TIMEOUT_S)
+        add_durable_store_args(ap)
         return ap.parse_args(argv)
     
     
@@ -368,8 +710,15 @@ data:
             event_stream_key=args.event_stream_key,
             event_stream_maxlen=args.event_stream_maxlen,
             redis_target=target,
+            durable_store=make_durable_store(args.durable_store, args.durable_db),
         )
+        replay = store.replay_pending(limit=args.durable_replay_limit)
         print(f"[hear-heartbeat] Redis target configured -> {target}")
+        print(f"[hear-heartbeat] durable backend={store.durable_store.backend} path={store.durable_store.path}")
+        if replay["attempted"] or replay["failed"]:
+            print("[hear-heartbeat] replay pending attempted=%d synced=%d failed=%d remaining=%d"
+                  % (replay["attempted"], replay["synced"], replay["failed"],
+                     replay["remaining_pending"]))
         print(f"[hear-heartbeat] Listening on http://{args.bind}:{args.port}")
         create_server(args.bind, args.port, store, max_body_bytes=args.max_body_bytes,
                       auth_token=auth_token, socket_timeout_s=args.socket_timeout_s).serve_forever()
@@ -411,6 +760,8 @@ data:
     from tools.hear_heartbeat_receiver import (  # noqa: E402
         HeartbeatReceiverStore,
         RequestError,
+        add_durable_store_args,
+        make_durable_store,
         make_redis_client,
         validate_event_payload,
         validate_heartbeat_payload,
@@ -428,9 +779,6 @@ data:
     REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
     REDIS_PASS = os.environ.get("REDIS_PASS")
     
-    # telemetry_path -> (validator, HeartbeatReceiverStore method name). Kept as a lookup table
-    # (not if/elif) so adding a third hear_node message kind is one line here, not a new branch
-    # in dispatch_message().
     _ROUTES: Dict[str, Tuple[Callable[[Any], Dict[str, Any]], str]] = {
         "hear/heartbeat": (validate_heartbeat_payload, "write_heartbeat"),
         "hear/event": (validate_event_payload, "write_event"),
@@ -448,14 +796,8 @@ data:
     
     
     def dispatch_message(store: HeartbeatReceiverStore, raw: bytes, topic: str,
-                          stats: Optional[BridgeStats] = None) -> Optional[Dict[str, Any]]:
-        """Decode and route one MQTT message payload; never raises.
-    
-        A malformed payload, a message for a device that isn't a hear_node (this topic
-        pattern also carries dama-gotchi's own telemetry), or one that fails schema
-        validation must not crash the bridge or block the messages behind it -- so every
-        failure path here logs and returns None instead of propagating.
-        """
+                         stats: Optional[BridgeStats] = None) -> Optional[Dict[str, Any]]:
+        """Decode and route one MQTT message payload; never raises."""
         stats = stats if stats is not None else BridgeStats()
         try:
             payload = json.loads(raw.decode("utf-8"))
@@ -475,9 +817,6 @@ data:
         validator, writer_name = route
     
         try:
-            # batch_ingest/forwarder normalize the transport timestamp to numeric
-            # milliseconds. The Redis contract uses an RFC3339 string.
-            # Seconds, like the receiver's own timestamps; sub-second precision stays in ts_ms.
             ts = payload.get("ts")
             if isinstance(ts, (int, float)) and not isinstance(ts, bool):
                 payload = dict(payload)
@@ -489,8 +828,6 @@ data:
             logger.warning("rejected %s message on %s: %s", payload.get("telemetry_path"), topic, exc)
             return None
         except (ValueError, OverflowError, OSError) as exc:
-            # A numeric ts outside what datetime can represent (inf, NaN, absurd magnitudes) is a bad
-            # message, not a reason to stop the bridge.
             stats.rejected += 1
             logger.warning("rejected %s message on %s: unusable numeric ts: %s",
                            payload.get("telemetry_path"), topic, exc)
@@ -539,6 +876,7 @@ data:
         ap.add_argument("--redis-host", default=REDIS_HOST)
         ap.add_argument("--redis-port", type=int, default=REDIS_PORT)
         ap.add_argument("--redis-pass", default=REDIS_PASS)
+        add_durable_store_args(ap)
         return ap.parse_args(argv)
     
     
@@ -549,10 +887,17 @@ data:
         store = HeartbeatReceiverStore(
             make_redis_client(args.redis_host, args.redis_port, args.redis_pass),
             redis_target=redis_target,
+            durable_store=make_durable_store(args.durable_store, args.durable_db),
         )
-        client = make_client(store, topic=args.mqtt_topic, client_id=args.mqtt_client_id)
+        replay = store.replay_pending(limit=args.durable_replay_limit)
         logger.info("Redis target -> %s", redis_target)
+        logger.info("durable backend=%s path=%s", store.durable_store.backend, store.durable_store.path)
+        if replay["attempted"] or replay["failed"]:
+            logger.info("replay pending attempted=%d synced=%d failed=%d remaining=%d",
+                        replay["attempted"], replay["synced"], replay["failed"],
+                        replay["remaining_pending"])
         logger.info("MQTT broker -> %s:%s topic=%s", args.mqtt_host, args.mqtt_port, args.mqtt_topic)
+        client = make_client(store, topic=args.mqtt_topic, client_id=args.mqtt_client_id)
         client.connect(args.mqtt_host, args.mqtt_port, keepalive=args.mqtt_keepalive_s)
         client.loop_forever()
         return 0
