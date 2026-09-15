@@ -22,7 +22,8 @@ import enroll  # noqa: E402
 class Prov(ctypes.Structure):
     _fields_ = [("node", ctypes.c_char * 24), ("cls", ctypes.c_char * 24), ("n", ctypes.c_int),
                 ("ssid", (ctypes.c_char * 33) * 8), ("psk", (ctypes.c_char * 65) * 8),
-                ("ap_pass", ctypes.c_char * 65)]
+                ("ap_pass", ctypes.c_char * 65), ("push_host", ctypes.c_char * 96),
+                ("push_token", ctypes.c_char * 129), ("admin_token", ctypes.c_char * 129)]
 
 
 @pytest.fixture(scope="module")
@@ -78,6 +79,25 @@ def test_what_enroll_sends_the_firmware_reads_back_exactly(lib):
     for k, (s, k2) in enumerate(PAIRS):
         assert p.ssid[k].value == s.encode() and p.psk[k].value == k2.encode()
     assert p.ap_pass == b"", "no ap_pass was sent; the record must not invent one"
+    assert p.push_token == b"" and p.admin_token == b""
+
+
+def test_runtime_credentials_round_trip_through_the_signed_line(lib):
+    err, p = parse(lib, enroll.prov_line(
+        "rankine", "xiao-s3-pps", PAIRS,
+        push_host="api.example.test", push_token="push-token", admin_token="admin-token"))
+    assert err is None
+    assert p.push_host == b"api.example.test"
+    assert p.push_token == b"push-token"
+    assert p.admin_token == b"admin-token"
+
+
+def test_same_treats_credentials_as_part_of_the_record(lib):
+    _, a = parse(lib, enroll.prov_line("a", "c", PAIRS, push_token="one", admin_token="adm"))
+    _, b = parse(lib, enroll.prov_line("a", "c", PAIRS, push_token="one", admin_token="adm"))
+    _, c = parse(lib, enroll.prov_line("a", "c", PAIRS, push_token="two", admin_token="adm"))
+    assert lib.w_same(ctypes.byref(a), ctypes.byref(b)) == 1
+    assert lib.w_same(ctypes.byref(a), ctypes.byref(c)) == 0
 
 
 class TestFallbackApPassword:
@@ -163,6 +183,8 @@ def test_the_limits_agree_on_both_sides(lib):
     ("PROV v=1 node=a net=7:70617373776f7264", "bad ssid"),
     ("PROV v=1 node=a net=zz:70617373776f7264", "bad ssid"),
     ("PROV v=1 node=a net=%s:70617373776f7264" % (b"s" * 33).hex(), "bad ssid"),
+    ("PROV v=1 node=a " + NET + " ptoken=", "bad push token"),
+    ("PROV v=1 node=a " + NET + " atoken=" + (b"x" * 129).hex(), "bad admin token"),
     ("PROV v=1 node=a net=78", "net without ':'"),
     ("PROV v=1 node=a bogus=1 " + NET, "unknown key"),
     ("PROV v=1 node=a loose " + NET, "token without '='"),
@@ -175,7 +197,7 @@ def test_a_refused_line_leaves_nothing_behind(lib, body, why):
 
 def test_not_a_prov_line_and_overlong_are_refused_before_anything_else(lib):
     assert parse(lib, "PROVv=1")[0] == "not a PROV line"
-    assert parse(lib, signed("PROV v=1 node=a " + NET) + " " * 1100)[0] == "line too long"
+    assert parse(lib, signed("PROV v=1 node=a " + NET) + " " * 1600)[0] == "line too long"
 
 
 def test_same_compares_every_network(lib):

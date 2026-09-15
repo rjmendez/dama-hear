@@ -1,4 +1,4 @@
-# 0002 - Phase 2 durable-outbox cut-over: dual-write, backfill and reversal
+# 0003 - Phase 2 durable-outbox cut-over: dual-write, backfill and reversal
 
 - Status: accepted
 - Date: 2026-09-15

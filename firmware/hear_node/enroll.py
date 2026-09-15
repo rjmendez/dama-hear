@@ -34,6 +34,7 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import deploy_gate  # noqa: E402
 import board_profiles  # noqa: E402
+import gen_secrets  # noqa: E402
 import release_manifest  # noqa: E402
 import wifi_store  # noqa: E402
 
@@ -42,7 +43,9 @@ FQBN = board_profiles.FQBN
 SKETCH = "hear_node"
 ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,22}")
 MAX_NETS = 8          # HEAR_PROV_MAX_NETS
-LINE_MAX = 1024       # HEAR_PROV_LINE_MAX
+LINE_MAX = 1536       # HEAR_PROV_LINE_MAX
+TOKEN_MAX = 128       # HEAR_PROV_TOKEN_MAX
+HOST_MAX = 95         # HEAR_PROV_HOST_MAX
 CHUNK = 64            # bytes per USB write, well under one CDC packet
 
 
@@ -55,7 +58,18 @@ def sign(line):
     return "%s crc=%08x" % (line, zlib.crc32(line.encode()) & 0xFFFFFFFF)
 
 
-def prov_line(node, cls, pairs, ap_pass=None):
+def _hex_field(name, value, max_len, required=False):
+    if value is None or value == "":
+        if required:
+            raise ValueError("%s is required" % name)
+        return None
+    raw = value.encode()
+    if not 1 <= len(raw) <= max_len or b"\0" in raw:
+        raise ValueError("%s must be 1-%d bytes with no embedded NUL" % (name, max_len))
+    return raw.hex()
+
+
+def prov_line(node, cls, pairs, ap_pass=None, push_host=None, push_token=None, admin_token=None):
     """The signed PROV line hear_prov_line.h parses. Raises ValueError for anything it would refuse.
 
     ap_pass is the node's OWN fallback-AP password (Alert 5 -- see hear_prov_line.h's "ap" token).
@@ -81,6 +95,15 @@ def prov_line(node, cls, pairs, ap_pass=None):
         if not 8 <= len(a) <= 64 or b"\0" in a:
             raise ValueError("ap_pass must be 8-64 bytes with no embedded NUL")
         toks.append("ap=" + a.hex())
+    ph = _hex_field("HEAR_PUSH_HOST", push_host, HOST_MAX)
+    pt = _hex_field("HEAR_PUSH_TOKEN", push_token, TOKEN_MAX)
+    at = _hex_field("HEAR_ADMIN_TOKEN", admin_token, TOKEN_MAX)
+    if ph:
+        toks.append("phost=" + ph)
+    if pt:
+        toks.append("ptoken=" + pt)
+    if at:
+        toks.append("atoken=" + at)
     line = sign(" ".join(toks))
     if len(line) >= LINE_MAX:
         raise ValueError("the PROV line is %d bytes; the node reads at most %d" % (len(line), LINE_MAX - 1))
@@ -243,6 +266,9 @@ def main(argv=None):
     ap.add_argument("--class", dest="cls", default=board_profiles.DEFAULT_BOARD_CLASS,
                     choices=board_profiles.known_board_classes())
     ap.add_argument("--wifi", default=wifi_store.PATH)
+    ap.add_argument("--push-config", default=os.path.expanduser("~/.hear_push"),
+                    help="local KEY=value file for HEAR_PUSH_HOST, HEAR_PUSH_TOKEN and "
+                         "HEAR_ADMIN_TOKEN; values are provisioned to NVS and never printed")
     ap.add_argument("--allow-gps-no-fix-indoors", action="store_true",
                     help="accept selftest gps=no-fix after enrollment (for indoor bench work only)")
     ap.add_argument("--allow-pps-absent", action="store_true",
@@ -264,11 +290,20 @@ def main(argv=None):
 
     try:
         pairs = wifi_store.read_pairs(a.wifi)
-        line = prov_line(a.node, a.cls, pairs, ap_pass=ap_pass)
+        push_cfg = gen_secrets.read_push_config(a.push_config)
+        line = prov_line(
+            a.node, a.cls, pairs, ap_pass=ap_pass,
+            push_host=push_cfg.get("HEAR_PUSH_HOST"),
+            push_token=push_cfg.get("HEAR_PUSH_TOKEN"),
+            admin_token=push_cfg.get("HEAR_ADMIN_TOKEN"))
     except (OSError, ValueError) as e:
         die(str(e))
     print("enroll: %s (%s) with %d network(s): %s"
           % (a.node, a.cls, len(pairs), ", ".join(wifi_store.mask(s) for s, _ in pairs)))
+    print("enroll: credentials in NVS: push=%s admin=%s%s" % (
+        "yes" if push_cfg.get("HEAR_PUSH_TOKEN") else "no",
+        "yes" if push_cfg.get("HEAR_ADMIN_TOKEN") else "no",
+        " host=override" if push_cfg.get("HEAR_PUSH_HOST") else ""))
 
     # The FQBN follows the NODE, not just its class: a quad-PSRAM board in an octal class takes a
     # different binary, and the class release image is not it. Resolved only when an image is
@@ -310,6 +345,7 @@ def main(argv=None):
         allow_gps_no_fix_indoors=a.allow_gps_no_fix_indoors,
         allow_pps_absent=a.allow_pps_absent,
     )
+    reasons.extend(deploy_gate.auth_reasons(st, require_nvs_credentials=True))
     if reasons:
         die("%s failed the live readiness gate: %s" % (ip, "; ".join(reasons)))
     print("enroll: OK -- %s reports node=%r fw=%r prov=%r %s"

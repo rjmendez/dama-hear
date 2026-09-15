@@ -13,6 +13,9 @@ bool hear_prov_load(hear_prov_t *p) {
     ok = pr.getString("node", p->node, sizeof p->node) > 0;
     pr.getString("class", p->cls, sizeof p->cls);
     pr.getString("appass", p->ap_pass, sizeof p->ap_pass);   // absent -> stays "", handled by caller
+    pr.getString("phost", p->push_host, sizeof p->push_host);
+    pr.getString("ptoken", p->push_token, sizeof p->push_token);
+    pr.getString("atoken", p->admin_token, sizeof p->admin_token);
     for (int k = 0; ok && k < n; k++) {
       char ks[16], kp[16];
       snprintf(ks, sizeof ks, "s%d", k);
@@ -40,6 +43,9 @@ bool hear_prov_save(const hear_prov_t *p) {
   ok = ok && pr.putString("node", p->node) == strlen(p->node);
   if (ok && p->cls[0]) ok = pr.putString("class", p->cls) == strlen(p->cls);
   if (ok && p->ap_pass[0]) ok = pr.putString("appass", p->ap_pass) == strlen(p->ap_pass);
+  if (ok && p->push_host[0]) ok = pr.putString("phost", p->push_host) == strlen(p->push_host);
+  if (ok && p->push_token[0]) ok = pr.putString("ptoken", p->push_token) == strlen(p->push_token);
+  if (ok && p->admin_token[0]) ok = pr.putString("atoken", p->admin_token) == strlen(p->admin_token);
   for (int k = 0; ok && k < p->n; k++) {
     char ks[16], kp[16];
     snprintf(ks, sizeof ks, "s%d", k);

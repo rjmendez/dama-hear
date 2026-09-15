@@ -1,7 +1,8 @@
 // A node's enrolled identity and Wi-Fi, and the one-line USB command that sets it. Plain C, no
 // Arduino, so tests/test_prov_line.py compiles it with cc and drives it with what enroll.py sends.
 //
-//   PROV v=1 node=<id> [class=<id>] net=<ssid hex>:<psk hex> [net=...] crc=<8 hex>
+//   PROV v=1 node=<id> [class=<id>] net=<ssid hex>:<psk hex> [net=...]
+//        [phost=<host hex>] [ptoken=<push-token hex>] [atoken=<admin-token hex>] crc=<8 hex>
 //
 // Hex because an SSID may contain spaces, '=' or ':'. crc is CRC-32 (zlib's) of everything before
 // " crc=", and must be the last token: the USB CDC receive path drops the rest of a packet when
@@ -13,7 +14,9 @@
 
 #define HEAR_PROV_MAX_NETS 8
 #define HEAR_PROV_ID_MAX   23
-#define HEAR_PROV_LINE_MAX 1024
+#define HEAR_PROV_LINE_MAX 1536
+#define HEAR_PROV_HOST_MAX 95
+#define HEAR_PROV_TOKEN_MAX 128
 
 typedef struct {
   char node[HEAR_PROV_ID_MAX + 1];
@@ -27,6 +30,12 @@ typedef struct {
   // WPA2 requires 8-63 chars, and 65 holds 64 plus the NUL this parser and hear_prov.cpp both
   // expect.
   char ap_pass[65];
+  // Runtime credentials. They are deliberately provisioned into NVS rather than compiled into a
+  // release binary: a public release image must not contain fleet/backend secrets, and a generic
+  // image must still be able to authenticate after OTA.
+  char push_host[HEAR_PROV_HOST_MAX + 1];
+  char push_token[HEAR_PROV_TOKEN_MAX + 1];
+  char admin_token[HEAR_PROV_TOKEN_MAX + 1];
 } hear_prov_t;
 
 // The node-id grammar gen_secrets.py enforces: [a-z0-9][a-z0-9-]{0,22}.
@@ -127,6 +136,15 @@ static inline const char *hear_prov_parse_(const char *line, hear_prov_t *p) {
       // one from its own MAC instead of reusing a fleet-wide default.
       int al = hear_prov_unhex(v, vn, p->ap_pass, sizeof p->ap_pass);
       if (al < 8 || al > 64) return "bad ap password";
+    } else if (kn == 5 && !strncmp(s, "phost", 5)) {
+      int hl = hear_prov_unhex(v, vn, p->push_host, sizeof p->push_host);
+      if (hl < 1 || hl > HEAR_PROV_HOST_MAX) return "bad push host";
+    } else if (kn == 6 && !strncmp(s, "ptoken", 6)) {
+      int tl = hear_prov_unhex(v, vn, p->push_token, sizeof p->push_token);
+      if (tl < 1 || tl > HEAR_PROV_TOKEN_MAX) return "bad push token";
+    } else if (kn == 6 && !strncmp(s, "atoken", 6)) {
+      int tl = hear_prov_unhex(v, vn, p->admin_token, sizeof p->admin_token);
+      if (tl < 1 || tl > HEAR_PROV_TOKEN_MAX) return "bad admin token";
     } else {
       return "unknown key";
     }
@@ -149,6 +167,9 @@ static inline const char *hear_prov_parse(const char *line, hear_prov_t *p) {
 static inline int hear_prov_same(const hear_prov_t *a, const hear_prov_t *b) {
   if (a->n != b->n || strcmp(a->node, b->node) || strcmp(a->cls, b->cls)) return 0;
   if (strcmp(a->ap_pass, b->ap_pass)) return 0;
+  if (strcmp(a->push_host, b->push_host)) return 0;
+  if (strcmp(a->push_token, b->push_token)) return 0;
+  if (strcmp(a->admin_token, b->admin_token)) return 0;
   for (int k = 0; k < a->n; k++)
     if (strcmp(a->ssid[k], b->ssid[k]) || strcmp(a->psk[k], b->psk[k])) return 0;
   return 1;

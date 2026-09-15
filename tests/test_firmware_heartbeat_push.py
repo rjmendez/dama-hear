@@ -226,7 +226,8 @@ def test_detection_batch_event_is_a_hint_not_the_csv_body(hb):
 def test_transport_makes_a_single_short_connect_and_reads_the_status_line():
     body = _fn("push_post_json")
     assert "HTTPClient" not in CODE
-    assert "client.connect(HEAR_PUSH_HOST, HEAR_PUSH_PORT, HEAR_PUSH_CONNECT_TIMEOUT_MS)" in body
+    assert "client.connect(push_host, HEAR_PUSH_PORT, HEAR_PUSH_CONNECT_TIMEOUT_MS)" in body
+    assert "push_token_runtime()" in body
     assert '"X-Hear-Token: %s\\r\\n"' in body
     assert "client.write((const uint8_t *)req, (size_t)n)" in body
     assert "client.setTimeout(HEAR_PUSH_READ_TIMEOUT_MS);" in body
@@ -296,6 +297,8 @@ def test_the_receiver_manifest_still_exposes_its_own_port_for_a_lan_only_build()
 
 def test_push_post_json_uses_tls_and_wraps_the_batch_envelope_for_the_ingest_api():
     body = _fn("push_post_json")
+    assert "push_host_runtime()" in body
+    assert "push_token_runtime()" in body
     assert "WiFiClientSecure client;" in body
     # Alert 3 remediation: the default path verifies the chain against a pinned root CA
     # rather than calling setInsecure(). setInsecure() only appears at all behind the
@@ -335,6 +338,12 @@ def test_the_push_buffers_are_derived_from_what_they_hold_not_from_magic_numbers
     assert CODE.count("static char body[HEAR_PUSH_BODY_MAX];") == 2
     assert not re.search(r"char (body|wrapped|req)\[\d+\];", CODE)
     assert "static char req[HEAR_PUSH_REQ_MAX];" in _fn("push_post_json")
+
+
+def test_status_exposes_push_authentication_state_without_secret_values():
+    assert '\\"auth\\":{\\"push\\":{\\"configured\\":%s,\\"src\\":\\"%s\\",\\"last_code\\":%d,' in CODE
+    assert "runtime_secret_src(prov.push_token, HEAR_PUSH_TOKEN)" in CODE
+    assert "push_last_ok_s" in CODE
 
 
 def test_the_firmware_static_asserts_the_envelope_can_hold_a_full_size_body():

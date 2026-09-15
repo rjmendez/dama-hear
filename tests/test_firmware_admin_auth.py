@@ -231,6 +231,10 @@ class TestPucNodeAdminAuth:
     def test_puc_admin_auth_defaults_on(self):
         assert "#define HEAR_REQUIRE_ADMIN_AUTH 1" in self.PUC_SRC
 
+    def test_puc_status_reports_admin_auth_configured_without_value(self):
+        assert '\\"auth\\":{\\"admin\\":{\\"configured\\":%s,\\"src\\":\\"%s\\"}}' in self.PUC_SRC
+        assert 'HEAR_ADMIN_TOKEN[0] ? "true" : "false"' in self.PUC_SRC
+
     def test_puc_privileged_handlers_call_auth(self):
         for marker in (
             'http.on("/reboot", HTTP_POST',
@@ -259,4 +263,3 @@ class TestPucNodeAdminAuth:
         assert 'http.collectHeaders(auth_headers, 1);' in SRC
         assert 'const char *auth_headers[] = {"X-Hear-Auth"};' in self.PUC_SRC
         assert 'http.collectHeaders(auth_headers, 1);' in self.PUC_SRC
-
