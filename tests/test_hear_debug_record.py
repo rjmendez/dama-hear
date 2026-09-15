@@ -134,9 +134,32 @@ class TestEphemeralCapture:
         monkeypatch.setattr(DR.HD, "fetch_status", lambda ip, timeout: {"node": "mach"})
         monkeypatch.setattr(DR.HD, "fetch_clip",
                             lambda *args, **kwargs: called.append(args))
-        with pytest.raises(DR.DebugRecordingError, match="reported node identity"):
+        with pytest.raises(DR.DebugRecordingError, match="reported node identity") as raised:
             DR.run(_args(tmp_path))
+        assert raised.value.audit["result"] == "failed"
+        assert raised.value.audit["cleanup"]["workspace_deleted"] is True
         assert called == []
+
+    def test_malformed_clip_name_is_audited_without_fetching(self, tmp_path, monkeypatch):
+        when = dt.datetime(2026, 9, 15, 18, 2, tzinfo=dt.timezone.utc).timestamp()
+        candidate = _candidate(100, when)
+        candidate.update({"parts": None, "bad_name": "bad clip name"})
+        called = []
+        monkeypatch.setattr(DR.HD, "fetch_status",
+                            lambda ip, timeout: {"node": "nyquist"})
+        monkeypatch.setattr(DR, "_candidate_rows",
+                            lambda node, ip, start, end, timeout: [candidate])
+        monkeypatch.setattr(DR.HD, "fetch_clip",
+                            lambda *args, **kwargs: called.append(args))
+
+        audit = DR.run(_args(tmp_path))
+
+        assert called == []
+        assert audit["refusals"] == [{
+            "clip": candidate["clip"],
+            "reason": "invalid_clip_name",
+            "detail": "bad clip name",
+        }]
 
     def test_main_writes_only_json_derived_output(self, tmp_path, monkeypatch):
         audit = {
@@ -164,3 +187,27 @@ class TestEphemeralCapture:
         assert rc == 0
         assert json.loads(out.read_text())["result"] == "complete"
         assert not list(tmp_path.rglob("*.wav"))
+
+    def test_main_writes_a_failure_audit(self, tmp_path, monkeypatch):
+        def fail(_args):
+            raise DR.DebugRecordingError("node unavailable")
+
+        monkeypatch.setattr(DR, "run", fail)
+        out = tmp_path / "failure.json"
+        rc = DR.main([
+            "--grant-id", "grant-123",
+            "--operator", "operator@example",
+            "--reason", "debug unexpected impulse",
+            "--ack", DR.ACK,
+            "--node", "nyquist",
+            "--window-start", "2026-09-15T18:00:00Z",
+            "--window-end", "2026-09-15T18:05:00Z",
+            "--clip-count", "1",
+            "--ttl-s", "300",
+            "--byte-cap", "1000000",
+            "--output", str(out),
+        ])
+        assert rc == 2
+        failure = json.loads(out.read_text())
+        assert failure["result"] == "failed"
+        assert failure["authorization"]["grant_id"] == "grant-123"

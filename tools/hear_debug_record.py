@@ -44,7 +44,9 @@ GRANT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$")
 
 
 class DebugRecordingError(RuntimeError):
-    pass
+    def __init__(self, message: str, audit: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.audit = audit
 
 
 def parse_utc(value: str) -> dt.datetime:
@@ -208,61 +210,79 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     }
     workspace_path: Optional[str] = None
     cleanup_rows: List[Dict[str, Any]] = []
-    with tempfile.TemporaryDirectory(prefix="hear-debug-recording-") as workspace:
-        workspace_path = workspace
-        os.chmod(workspace, 0o700)
-        status = HD.fetch_status(ip, _remaining(deadline, args.timeout))
-        reported = str(status.get("node") or "").strip()
-        if reported != node and ID.alias_of(reported) != node:
-            raise DebugRecordingError(
-                "allowlisted target %s reported node identity %r" % (node, reported))
-        candidates = _candidate_rows(
-            node, ip, args.window_start.timestamp(), args.window_end.timestamp(),
-            _remaining(deadline, args.timeout))
-        audit["candidates_in_window"] = len(candidates)
-        raw_bytes = 0
-        for candidate in candidates[:args.clip_count]:
-            if time.time() >= deadline:
-                audit["refusals"].append({"clip": candidate["clip"], "reason": "ttl"})
-                break
-            body, reason = HD.fetch_clip(
-                ip, candidate["clip"], _remaining(deadline, args.timeout),
-                max_bytes=args.byte_cap - raw_bytes)
-            if reason is not None:
-                audit["refusals"].append({
-                    "clip": candidate["clip"],
-                    "reason": "raw_byte_cap" if reason == "byte_cap" else reason,
-                })
-                if reason == "byte_cap":
+    raw_bytes = 0
+    failure: Optional[BaseException] = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="hear-debug-recording-") as workspace:
+            workspace_path = workspace
+            os.chmod(workspace, 0o700)
+            status = HD.fetch_status(ip, _remaining(deadline, args.timeout))
+            reported = str(status.get("node") or "").strip()
+            if reported != node and ID.alias_of(reported) != node:
+                raise DebugRecordingError(
+                    "allowlisted target %s reported node identity %r" % (node, reported))
+            candidates = _candidate_rows(
+                node, ip, args.window_start.timestamp(), args.window_end.timestamp(),
+                _remaining(deadline, args.timeout))
+            audit["candidates_in_window"] = len(candidates)
+            for candidate in candidates[:args.clip_count]:
+                if time.time() >= deadline:
+                    audit["refusals"].append({"clip": candidate["clip"], "reason": "ttl"})
                     break
-                continue
-            raw_bytes += len(body)
-            derived, proof = extract_and_delete(
-                workspace, body, candidate["parts"]["basename"])
-            cleanup_rows.append(proof)
-            audit["clips"].append({
-                "clip": candidate["clip"],
-                "clip_key": candidate["clip_key"],
-                "captured_utc": utc_text(dt.datetime.fromtimestamp(
-                    float(candidate["ts_utc_s"]), dt.timezone.utc)),
-                "derived": derived,
-            })
-        audit["raw_bytes_processed"] = raw_bytes
-        remaining = sorted(os.listdir(workspace))
-        if remaining:
-            raise DebugRecordingError(
-                "temporary workspace not empty after extraction: %r" % remaining)
+                if candidate.get("parts") is None:
+                    audit["refusals"].append({
+                        "clip": candidate["clip"],
+                        "reason": "invalid_clip_name",
+                        "detail": candidate.get("bad_name"),
+                    })
+                    continue
+                body, reason = HD.fetch_clip(
+                    ip, candidate["clip"], _remaining(deadline, args.timeout),
+                    max_bytes=args.byte_cap - raw_bytes)
+                if reason is not None:
+                    audit["refusals"].append({
+                        "clip": candidate["clip"],
+                        "reason": "raw_byte_cap" if reason == "byte_cap" else reason,
+                    })
+                    if reason == "byte_cap":
+                        break
+                    continue
+                raw_bytes += len(body)
+                derived, proof = extract_and_delete(
+                    workspace, body, candidate["parts"]["basename"])
+                cleanup_rows.append(proof)
+                audit["clips"].append({
+                    "clip": candidate["clip"],
+                    "clip_key": candidate["clip_key"],
+                    "captured_utc": utc_text(dt.datetime.fromtimestamp(
+                        float(candidate["ts_utc_s"]), dt.timezone.utc)),
+                    "derived": derived,
+                })
+            remaining = sorted(os.listdir(workspace))
+            if remaining:
+                raise DebugRecordingError(
+                    "temporary workspace not empty after extraction: %r" % remaining)
+    except (DebugRecordingError, OSError, ValueError) as e:
+        failure = e
 
+    audit["raw_bytes_processed"] = raw_bytes
     audit["completed_utc"] = utc_text(dt.datetime.now(dt.timezone.utc))
     audit["elapsed_s"] = round(time.time() - started, 6)
+    workspace_deleted = bool(workspace_path) and not os.path.exists(workspace_path)
     audit["cleanup"] = {
         "storage_class": "private temporary workspace (Kubernetes emptyDir compatible)",
         "per_clip": cleanup_rows,
-        "workspace_deleted": bool(workspace_path) and not os.path.exists(workspace_path),
-        "raw_files_remaining": 0,
+        "workspace_deleted": workspace_deleted,
+        "raw_files_remaining": 0 if workspace_deleted else None,
     }
-    if not audit["cleanup"]["workspace_deleted"]:
-        raise DebugRecordingError("temporary workspace still exists after cleanup")
+    if failure is not None:
+        audit["result"] = "failed"
+        audit["error"] = "%s: %s" % (type(failure).__name__, failure)
+        raise DebugRecordingError(str(failure), audit) from failure
+    if not workspace_deleted:
+        audit["result"] = "failed"
+        audit["error"] = "temporary workspace still exists after cleanup"
+        raise DebugRecordingError(audit["error"], audit)
     audit["result"] = "complete"
     return audit
 
@@ -300,7 +320,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         audit = run(args)
     except DebugRecordingError as e:
-        ap.error(str(e))
+        audit = e.audit or {
+            "schema": SCHEMA,
+            "authorization": {
+                "grant_id": args.grant_id,
+                "operator": args.operator,
+                "reason": args.reason,
+                "ack": args.ack,
+            },
+            "request": {"node": args.node},
+            "result": "failed",
+            "error": str(e),
+            "cleanup": {
+                "storage_class": "private temporary workspace (Kubernetes emptyDir compatible)",
+                "workspace_deleted": None,
+                "raw_files_remaining": None,
+            },
+        }
+        write_audit(args.output, audit)
+        print("hear_debug_record: %s; audit=%s" % (e, os.path.abspath(args.output)),
+              file=sys.stderr)
+        return 2
     write_audit(args.output, audit)
     print(json.dumps({
         "result": audit["result"],
