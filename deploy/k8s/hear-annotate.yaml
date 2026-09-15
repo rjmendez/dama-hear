@@ -739,6 +739,10 @@ spec:
     metadata:
       labels:
         app: hear-annotate
+      annotations:
+        # Forces a new ReplicaSet whenever hear-annotate-code changes. server.py is
+        # mounted with subPath, which kubelet's ConfigMap sync does not live-update.
+        checksum/hear-annotate-code: '99d253a90d5fadc8ccef9e2ad3e506f464a898d21f2b5cd4813f344a39e057fd'
     spec:
       containers:
         - name: web

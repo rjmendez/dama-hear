@@ -342,6 +342,10 @@ def test_the_proposed_manifest_changes_only_packaging(workload):
         c["volumeMounts"] = [m for m in c["volumeMounts"] if m["name"] not in drop]
         spec = old_norm["spec"]["template"]["spec"]
         spec["volumes"] = [v for v in spec["volumes"] if v["name"] not in drop]
+        annotations = old_norm["spec"]["template"]["metadata"].get("annotations", {})
+        annotations.pop("checksum/%s" % BUNDLE_FOR[workload], None)
+        if not annotations:
+            old_norm["spec"]["template"]["metadata"].pop("annotations", None)
 
         new_norm = yaml.safe_load(yaml.safe_dump(new))
         container(new_norm).pop("image", None)

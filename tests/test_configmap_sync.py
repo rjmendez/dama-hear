@@ -794,11 +794,46 @@ class TestTheDeploymentChecksumForcesARestart:
     apply -f <manifest>` actually roll the pod instead of only rewriting the ConfigMap object.
     """
 
+    @staticmethod
+    def _bundle_parts(gen, bundle):
+        if bundle in gen["BUNDLES"]:
+            _app, code, data = gen["BUNDLES"][bundle]
+            return code, data
+        _manifest, _app, code, data = gen["EMBEDDED_BUNDLES"][bundle]
+        return code, data
+
+    def test_every_deployment_subpath_mounting_generated_code_has_a_checksum_target(self):
+        gen = _gen()
+        generated = set(gen["BUNDLES"]) | set(gen["EMBEDDED_BUNDLES"])
+        missing = []
+        for manifest in sorted((ROOT / "deploy" / "k8s").glob("*.yaml")):
+            rel = str(manifest.relative_to(ROOT))
+            for doc in yaml.safe_load_all(manifest.read_text()):
+                if not doc or doc.get("kind") != "Deployment":
+                    continue
+                spec = doc["spec"]["template"]["spec"]
+                volumes = {v["name"]: (v.get("configMap") or {}).get("name")
+                           for v in spec.get("volumes", [])}
+                used = set()
+                for container in spec.get("containers", []):
+                    for mount in container.get("volumeMounts", []) or []:
+                        bundle = volumes.get(mount.get("name"))
+                        if bundle in generated and "subPath" in mount:
+                            used.add(bundle)
+                for bundle in sorted(used):
+                    if gen["DEPLOYMENT_CHECKSUM_TARGETS"].get(bundle) != rel:
+                        missing.append("%s Deployment/%s subPath-mounts %s"
+                                       % (rel, doc["metadata"]["name"], bundle))
+        assert not missing, (
+            "generated ConfigMap subPath mounts in long-running Deployments need a "
+            "checksum/<bundle> pod-template annotation synced by gen_configmap.py: %s"
+            % "; ".join(missing))
+
     @pytest.mark.parametrize("bundle", sorted(_gen()["DEPLOYMENT_CHECKSUM_TARGETS"]))
     def test_the_checksum_annotation_matches_the_bundles_source_digest(self, bundle):
         gen = _gen()
         manifest = gen["DEPLOYMENT_CHECKSUM_TARGETS"][bundle]
-        _app, code, data = gen["BUNDLES"][bundle]
+        code, data = self._bundle_parts(gen, bundle)
         want = gen["source_digest"](code, data)
         docs = list(yaml.safe_load_all((ROOT / manifest).read_text()))
         dep = next(d for d in docs if d["kind"] == "Deployment")
@@ -808,8 +843,9 @@ class TestTheDeploymentChecksumForcesARestart:
             "%s's checksum/%s annotation (%r) does not match the current source digest (%r) -- "
             "the pod template will not change on the next regeneration, so an already-running "
             "pod would not restart. Regenerate:\n"
-            "    python3 deploy/k8s/gen_configmap.py %s > deploy/k8s/%s.yaml"
-            % (manifest, bundle, got, want, bundle, bundle))
+            "    python3 deploy/k8s/gen_configmap.py %s%s"
+            % (manifest, bundle, got, want, bundle,
+               "" if bundle in gen["EMBEDDED_BUNDLES"] else " > deploy/k8s/%s.yaml" % bundle))
 
     @pytest.mark.parametrize("bundle", sorted(_gen()["DEPLOYMENT_CHECKSUM_TARGETS"]))
     def test_syncing_an_unchanged_digest_touches_nothing(self, bundle, tmp_path):
@@ -821,7 +857,7 @@ class TestTheDeploymentChecksumForcesARestart:
         # sync_deployment_checksum() resolves paths under gen_configmap.py's own ROOT, so point
         # it at a scratch copy directly rather than trying to relocate ROOT itself.
         before = work.read_text()
-        _app, code, data = gen["BUNDLES"][bundle]
+        code, data = self._bundle_parts(gen, bundle)
         digest = gen["source_digest"](code, data)
         real_root, real_targets = gen["ROOT"], gen["DEPLOYMENT_CHECKSUM_TARGETS"]
         gen["ROOT"] = str(tmp_path)
