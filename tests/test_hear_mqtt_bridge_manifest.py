@@ -32,6 +32,7 @@ def test_the_bridge_runs_the_expected_entrypoint_and_mounts_code_and_state():
     assert mounts[("code", "tools_hear_heartbeat_receiver.py")] == "/app/tools/hear_heartbeat_receiver.py"
     assert mounts[("code", "tools_hear_mqtt_bridge.py")] == "/app/tools/hear_mqtt_bridge.py"
     assert mounts[("state", "/state")] == "/state"
+    assert mounts[("tls", "/tls")] == "/tls"
 
 
 def test_it_declares_the_expected_environment_and_durable_sqlite_outbox():
@@ -39,7 +40,7 @@ def test_it_declares_the_expected_environment_and_durable_sqlite_outbox():
     spec = dep["spec"]["template"]["spec"]
     env = {item["name"]: item for item in spec["containers"][0]["env"]}
     assert env["MQTT_HOST"]["value"] == "127.0.0.1"
-    assert env["MQTT_PORT"]["value"] == "31883"
+    assert env["MQTT_PORT"]["value"] == "8883"
     assert env["MQTT_TOPIC"]["value"] == "dama/+/telemetry"
     assert env["REDIS_HOST"]["value"] == "audit-redis.infra.svc.cluster.local"
     assert env["REDIS_PORT"]["value"] == "6379"
@@ -53,6 +54,22 @@ def test_it_declares_the_expected_environment_and_durable_sqlite_outbox():
     }
     volumes = {v["name"]: v for v in spec["volumes"]}
     assert volumes["state"]["persistentVolumeClaim"] == {"claimName": "hear-mqtt-bridge-state"}
+
+
+def test_it_declares_mtls_material_mounted_from_a_dedicated_secret():
+    dep = _doc("Deployment")
+    spec = dep["spec"]["template"]["spec"]
+    env = {item["name"]: item for item in spec["containers"][0]["env"]}
+    assert env["MQTT_CA_CERTS"]["value"] == "/tls/ca.crt"
+    assert env["MQTT_CERTFILE"]["value"] == "/tls/tls.crt"
+    assert env["MQTT_KEYFILE"]["value"] == "/tls/tls.key"
+    assert env["MQTT_TLS_INSECURE"]["value"] == "false"
+    assert env["MQTT_TLS_VERSION"]["value"] == "tlsv1_2"
+    volumes = {v["name"]: v for v in spec["volumes"]}
+    assert volumes["tls"]["secret"] == {"secretName": "hear-mqtt-bridge-tls"}
+    mounts = {m["name"]: m for m in spec["containers"][0]["volumeMounts"]}
+    assert mounts["tls"]["mountPath"] == "/tls"
+    assert mounts["tls"]["readOnly"] is True
 
 
 def test_it_declares_a_dedicated_state_pvc():

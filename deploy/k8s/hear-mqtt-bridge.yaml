@@ -55,7 +55,9 @@ spec:
               exec python /app/tools/hear_mqtt_bridge.py
           env:
             - { name: MQTT_HOST, value: "127.0.0.1" }
-            - { name: MQTT_PORT, value: "31883" }
+            # TLS port. The broker on 31883/1883 plaintext must be retired once every
+            # publisher (hear_node fleet + this bridge) has been cut over to mTLS.
+            - { name: MQTT_PORT, value: "8883" }
             - { name: MQTT_TOPIC, value: "dama/+/telemetry" }
             - { name: MQTT_CLIENT_ID, value: "hear-mqtt-bridge" }
             - { name: HEAR_DURABLE_STORE, value: "sqlite" }
@@ -69,11 +71,20 @@ spec:
                   name: dama-redis-secret
                   key: REDIS_PASS
                   optional: true
+            # mTLS: broker CA bundle (to verify the broker) plus this bridge's own client
+            # cert/key (so the broker can verify and authorize *this* client). All three
+            # come from the hear-mqtt-bridge-tls Secret mounted below.
+            - { name: MQTT_CA_CERTS, value: "/tls/ca.crt" }
+            - { name: MQTT_CERTFILE, value: "/tls/tls.crt" }
+            - { name: MQTT_KEYFILE, value: "/tls/tls.key" }
+            - { name: MQTT_TLS_INSECURE, value: "false" }
+            - { name: MQTT_TLS_VERSION, value: "tlsv1_2" }
           volumeMounts:
             - { name: code, mountPath: /app/tools/hear_heartbeat_receiver.py, subPath: tools_hear_heartbeat_receiver.py }
             - { name: code, mountPath: /app/tools/hear_mqtt_bridge.py, subPath: tools_hear_mqtt_bridge.py }
             - { name: deps, mountPath: /deps }
             - { name: state, mountPath: /state }
+            - { name: tls, mountPath: /tls, readOnly: true }
           resources:
             requests: { cpu: 100m, memory: 128Mi }
             limits:   { cpu: "1",  memory: 256Mi }
@@ -86,3 +97,9 @@ spec:
         - name: state
           persistentVolumeClaim:
             claimName: hear-mqtt-bridge-state
+        # Populate with: ca.crt (broker's CA bundle), tls.crt + tls.key (this bridge's own
+        # client certificate/key, issued by the same CA, CN/SAN scoped to this bridge's
+        # identity so the broker's ACLs can restrict it to subscribing only).
+        - name: tls
+          secret:
+            secretName: hear-mqtt-bridge-tls
