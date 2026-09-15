@@ -376,16 +376,22 @@ def _parse_csv(text: str, columns: Sequence[str], src: str) -> List[Dict]:
     return out
 
 
-def rows_from_detections(obj: Sequence[Dict]) -> List[Dict]:
+def rows_from_detections(obj: Any) -> List[Dict]:
     """Rows from the node's /detections JSON, normalised to the dets.csv column names.
 
     /detections is the live ring (hear_node.ino: h_dets()): the newest MAXDET=128, oldest first,
-    in RAM. It carries `frame` and `frame_len` where the card carries `frame_hex`; frame_len is
-    checked against the hex it came with, because a truncated JSON body is otherwise
+    in RAM on legacy firmware and a cursor-paged `{"contract":"cursor-v1","rows":[...]}` object
+    on new firmware. It carries `frame` and `frame_len` where the card carries `frame_hex`;
+    frame_len is checked against the hex it came with, because a truncated JSON body is otherwise
     indistinguishable from a short frame and would decode as a smaller sketch.
 
     There is no scene feature here: /scene.csv has no live-ring endpoint, it is read off the card.
     """
+    if isinstance(obj, dict):
+        obj = obj.get("rows")
+    if not isinstance(obj, Sequence):
+        raise ValueError("/detections JSON is %s, not a list or cursor page"
+                         % type(obj).__name__)
     out = []
     for d in obj:
         r = {k: d[k] for k in DETS_COLUMNS[:-1] if k in d}

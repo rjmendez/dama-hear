@@ -265,6 +265,18 @@ class TestDetectionsJson:
         a.pop("src"), b.pop("src")
         assert a == b
 
+    def test_the_cursor_page_wrapper_is_ignored_and_its_rows_still_convert(self):
+        r = _row()
+        page = {"contract": "cursor-v1", "boot_id": "00000000000000a1",
+                "next_cursor": "00000000000000a1:1", "until_cursor": "00000000000000a1:1",
+                "rows": [{"i": 1, "utc_us": r["utc_us"], "uptime_s": r["uptime_s"],
+                          "sample": r["sample"], "pps_n": r["pps_n"],
+                          "us_since_pps": r["us_since_pps"], "trigger": r["trigger"],
+                          "flags": r["flags"], "fs_hz": r["fs_hz"], "frame_len": 172,
+                          "frame": r["frame_hex"]}]}
+        b = BR.to_record(BR.rows_from_detections(page)[0], NODE)
+        assert b["utc_us"] == r["utc_us"]
+
 
 class TestTimestamp:
     def test_the_microsecond_is_not_rounded_away(self):

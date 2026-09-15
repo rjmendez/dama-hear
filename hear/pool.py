@@ -470,17 +470,29 @@ class Pool:
         """Ingest one archived `/detections` body, the live ring of a node with no card.
 
         Idempotent like ingest_dets: consecutive runs overlap and re-reading a row adds 0. The
-        body carries no node name, so `default_node` is required and every row is filed under it.
+        body carries no per-row node name, so `default_node` is required and every row is filed
+        under it. Cursor-paged firmware wraps the rows in a `{"contract":"cursor-v1", ...}`
+        envelope; the legacy bare array stays accepted for mixed-version rollout and rollback.
         """
         with open(path, "rb") as fh:
             raw = fh.read()
         sha = hashlib.sha256(raw).hexdigest()
         obj = json.loads(raw.decode("utf-8", "replace"))
-        if not isinstance(obj, list):
-            raise ValueError("%s: /detections body is %s, not a list" % (path, type(obj).__name__))
+        if isinstance(obj, dict):
+            rows = obj.get("rows")
+            if not isinstance(rows, list):
+                raise ValueError("%s: /detections object carries rows=%r, not a list"
+                                 % (path, type(rows).__name__))
+            generation = str(obj.get("contract") or "live")
+        elif isinstance(obj, list):
+            rows = obj
+            generation = "live"
+        else:
+            raise ValueError("%s: /detections body is %s, not a list or object"
+                             % (path, type(obj).__name__))
         recs: List[Dict[str, Any]] = []
         bad: Dict[str, int] = {}
-        for d in obj:
+        for d in rows:
             if not isinstance(d, dict):
                 bad["not_an_object"] = bad.get("not_an_object", 0) + 1
                 continue
@@ -507,7 +519,7 @@ class Pool:
         added = self._append(recs)
         entry = {"kind": "detections.json", "path": os.path.abspath(path),
                  "origin": origin or path, "sha256": sha, "bytes": len(raw),
-                 "generation": "live", "rows": len(obj), "decoded": len(recs), "added": added,
+                 "generation": generation, "rows": len(rows), "decoded": len(recs), "added": added,
                  "duplicate": len(recs) - added, "skipped": sum(bad.values()),
                  "skip_reasons": bad, "schema_version": SCHEMA_VERSION}
         assert entry["rows"] == added + entry["duplicate"] + entry["skipped"], entry

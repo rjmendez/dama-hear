@@ -549,11 +549,20 @@ neither is true today.**
 `/pool/corpus` is 15–22× too late to address the audio that produced it: the drain is `*/15`
 (900 s) plus 53–78 s of job wall time, against a ~64 s addressable ring (~44 s on the 60 s ring
 the nodes run today). S0.2 makes it
-*worse*. **The pull trigger must be driven from `/detections`** — the live 128-deep RAM ring,
+*worse*. **The pull trigger must be driven from `/detections`** — the live ring in RAM,
 ~600 B/event, ~35 ms measured, including still-`PENDING` clips — polled well inside that window, with
-`hear-drain` left doing archival only. Then the cadence cut in S0.2 is free rather than
-self-defeating. State the end-to-end latency as a number against the addressable window. Unanchored sketches
-(26.2 %) route to a lane that is explicitly not pullable.
+`hear-drain` left doing archival only. The mixed-version-safe contract is now:
+
+* bare `/detections` = the legacy newest-128 array, for older tooling and rollback;
+* `/detections?cursor=...&limit=...&until=...` = cursor-v1 paging across the full retained ring,
+  with `oldest/newest/next` cursors, `boot_id`, `boot_epoch_us` when available, and explicit
+  `gap.kind = overrun|reboot` instead of silent loss.
+
+**Roll forward:** deploy the cursor-aware drainer first, then roll firmware. **Roll back:** revert
+either side independently; the drainer accepts both shapes and the bare endpoint did not change.
+Then the cadence cut in S0.2 is free rather than self-defeating. State the end-to-end latency as
+a number against the addressable window. Unanchored sketches (26.2 %) route to a lane that is
+explicitly not pullable.
 
 **Gate 2 — closed.** It asked for the penalty of upsampling 16 kHz audio into Perch's 32 kHz input to
 be measured first. The nodes acquire at 48 kHz, so nothing is upsampled: Perch's input is a

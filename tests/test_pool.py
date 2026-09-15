@@ -184,6 +184,32 @@ class TestOneDataset:
         assert rows["mach"]["trigger"] == "-1140"
         assert rows["gold"]["trigger"] == "-1141"
 
+    def test_cursor_paged_detections_json_is_ingested_like_the_legacy_array(self, tmp_path):
+        pl = P.Pool(str(tmp_path / "pool"))
+        frame = binascii.hexlify(_frame(fs=48000.0, seed=51, node_us=123456)).decode()
+        live = tmp_path / "gold.json"
+        live.write_text(json.dumps({
+            "contract": "cursor-v1",
+            "boot_id": "00000000000000a1",
+            "boot_epoch_us": 1788763950000000,
+            "cursor": "00000000000000a1:0",
+            "oldest_cursor": "00000000000000a1:0",
+            "newest_cursor": "00000000000000a1:0",
+            "next_cursor": "00000000000000a1:1",
+            "until_cursor": "00000000000000a1:1",
+            "limit": 128,
+            "returned": 1,
+            "has_more": False,
+            "gap": None,
+            "rows": [{
+                "i": 0, "utc_us": 1788763952189912, "uptime_s": 1235, "sample": 5000001,
+                "pps_n": 43, "us_since_pps": 597175, "trigger": -1141, "flags": 5888,
+                "fs_hz": 16000.0, "frame_len": len(frame) // 2, "frame": frame,
+                "clip": "", "clip_why": "nocard"}],
+        }))
+        got = pl.ingest_detections_json(str(live), default_node="gold")
+        assert got["generation"] == "cursor-v1" and got["added"] == 1
+
     def test_the_key_is_content_so_two_drains_of_one_detection_agree(self, tmp_path):
         frame = _frame()
         a = P.key("node", "nyquist", 1788763952189911, "5000000", frame)

@@ -208,8 +208,12 @@ SCENE_STATE_FILE = "scene_fetch.json"
 # `<pool>/state/node_positions.json`: each node's own GPS mean as /status last reported it, read by
 # hear-tdoa to position a node with no survey entry (hear/backend/survey.py: augment_from_node_gps).
 NODE_POSITIONS_FILE = "node_positions.json"
-# hear_node.ino DETS_HTTP_MAX: /detections serves only the newest this many rows.
+# hear_node.ino DETS_HTTP_MAX: bare `/detections` keeps the legacy "newest N rows" contract, and
+# cursor mode uses the same bound per PAGE so one response stays small while the drain can walk the
+# whole ring with repeated requests.
 LIVE_RING_HTTP_MAX = 128
+LIVE_RING_CURSOR_CONTRACT = "cursor-v1"
+LIVE_RING_CURSOR_RE = re.compile(r"^([0-9a-f]{16}):(\d{1,10})$")
 
 # --check fails above this many unfetched bytes. Zero is the right default because `scene_gap()`
 # has already clamped anything smaller than one row to zero: what survives to the heartbeat is a
@@ -304,32 +308,175 @@ def fetch_audio_status(ip: str, timeout: float = DEFAULT_TIMEOUT_S) -> Dict[str,
     return json.loads(_get("http://%s/audio" % ip, timeout).decode("utf-8", "replace"))
 
 
-def fetch_detections(ip: str, timeout: float = DEFAULT_TIMEOUT_S) -> bytes:
-    return _get("http://%s/detections" % ip, timeout)
+def live_ring_cursor(boot_id: str, pos: int) -> str:
+    """One opaque cursor string the firmware and the drain both understand.
+
+    `boot_id` names WHICH boot the ring indices belong to. `pos` is the next unread detection
+    index in that boot, not the last one already seen, so retrying the same cursor is idempotent:
+    the same rows begin at the same place until they genuinely age out of the ring.
+    """
+    boot = str(boot_id or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{16}", boot):
+        raise ValueError("boot_id %r is not 16 lowercase hex digits" % boot_id)
+    try:
+        pos = int(pos)
+    except (TypeError, ValueError):
+        raise ValueError("cursor position %r is not an integer" % (pos,))
+    if pos < 0 or pos > 0xFFFFFFFF:
+        raise ValueError("cursor position %r is out of range" % (pos,))
+    return "%s:%d" % (boot, pos)
 
 
-def parse_live_ring(body: bytes) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-    """(rows, truncated body length or None): the /detections array, or its whole-row prefix.
+def parse_live_cursor(cur: Any) -> Tuple[str, int]:
+    """(boot_id, next unread index) from a `/detections` cursor string."""
+    if not isinstance(cur, str):
+        raise ValueError("cursor %r is %s, not a string" % (cur, type(cur).__name__))
+    m = LIVE_RING_CURSOR_RE.fullmatch(cur.strip().lower())
+    if not m:
+        raise ValueError("cursor %r is not <16 hex boot id>:<uint32>" % (cur,))
+    pos = int(m.group(2))
+    if pos > 0xFFFFFFFF:
+        raise ValueError("cursor %r is out of uint32 range" % (cur,))
+    return m.group(1), pos
 
-    ⚠️A TRUNCATED BODY IS THE NODE OUT OF HEAP, NOT A BAD RUN. h_dets() builds the whole array in
-    one String, and on gold (psram 0, heap_min 5684 B, 2026-09-13) it stopped growing and the node
-    sent a 200 cut mid-row at 37,199 B, twice in a row. The rows are oldest first, so the whole
-    ones before the cut are good and the newest simply arrive on a later run.
+
+def fetch_detections(ip: str, timeout: float = DEFAULT_TIMEOUT_S,
+                     cursor: Optional[str] = None,
+                     limit: Optional[int] = None,
+                     until: Optional[str] = None) -> bytes:
+    params = []
+    if cursor is not None:
+        params.append(("cursor", cursor))
+    if until is not None:
+        params.append(("until", until))
+    if limit is not None:
+        params.append(("limit", str(int(limit))))
+    url = "http://%s/detections" % ip
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    return _get(url, timeout)
+
+
+def _parse_live_ring_object(obj: Dict[str, Any], truncated: Optional[int]) -> Dict[str, Any]:
+    if obj.get("contract") != LIVE_RING_CURSOR_CONTRACT:
+        raise ValueError("/detections object contract is %r, expected %r"
+                         % (obj.get("contract"), LIVE_RING_CURSOR_CONTRACT))
+    rows = obj.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError("/detections %s body carries rows=%r, not a list"
+                         % (LIVE_RING_CURSOR_CONTRACT, type(rows).__name__))
+    boot_id = str(obj.get("boot_id") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{16}", boot_id):
+        raise ValueError("/detections boot_id %r is not 16 lowercase hex digits"
+                         % obj.get("boot_id"))
+    next_cursor = str(obj.get("next_cursor") or "")
+    until_cursor = str(obj.get("until_cursor") or "")
+    next_boot, next_pos = parse_live_cursor(next_cursor)
+    until_boot, until_pos = parse_live_cursor(until_cursor)
+    if next_boot != boot_id or until_boot != boot_id:
+        raise ValueError("/detections cursors do not belong to boot %s" % boot_id)
+    cursor = obj.get("cursor")
+    if cursor is not None:
+        parse_live_cursor(cursor)
+    oldest_cursor = obj.get("oldest_cursor")
+    newest_cursor = obj.get("newest_cursor")
+    if oldest_cursor is None:
+        oldest_boot, oldest_pos = boot_id, None
+    else:
+        oldest_boot, oldest_pos = parse_live_cursor(oldest_cursor)
+    if newest_cursor is None:
+        newest_boot, newest_pos = boot_id, None
+    else:
+        newest_boot, newest_pos = parse_live_cursor(newest_cursor)
+    if oldest_pos is None or newest_pos is None:
+        if oldest_pos is not None or newest_pos is not None:
+            raise ValueError("/detections names only one of oldest/newest cursor")
+        if rows or next_pos or until_pos:
+            raise ValueError("/detections names no oldest/newest cursor on a non-empty boot")
+    else:
+        if oldest_boot != boot_id or newest_boot != boot_id:
+            raise ValueError("/detections oldest/newest cursor boot does not match %s" % boot_id)
+        if not (oldest_pos <= next_pos <= until_pos):
+            raise ValueError("/detections next_cursor %r is outside oldest=%r until=%r"
+                             % (next_cursor, oldest_cursor, until_cursor))
+        if newest_pos + 1 < next_pos and rows:
+            raise ValueError("/detections next_cursor %r skips beyond newest %r"
+                             % (next_cursor, newest_cursor))
+    returned = obj.get("returned", len(rows))
+    if int(returned) != len(rows):
+        raise ValueError("/detections returned=%r but rows has length %d" % (returned, len(rows)))
+    has_more = bool(obj.get("has_more"))
+    if has_more != (next_pos < until_pos):
+        raise ValueError("/detections has_more=%r but next=%r until=%r"
+                         % (has_more, next_cursor, until_cursor))
+    gap = obj.get("gap")
+    if gap is not None:
+        if not isinstance(gap, dict):
+            raise ValueError("/detections gap is %s, not an object" % type(gap).__name__)
+        if gap.get("kind") not in ("overrun", "reboot"):
+            raise ValueError("/detections gap kind %r is unknown" % gap.get("kind"))
+        if not isinstance(gap.get("lost_rows"), int) or gap["lost_rows"] < 0:
+            raise ValueError("/detections gap lost_rows %r is not a non-negative integer"
+                             % gap.get("lost_rows"))
+        if gap.get("resume_cursor") is not None:
+            rb, _ = parse_live_cursor(gap["resume_cursor"])
+            if rb != boot_id:
+                raise ValueError("/detections gap resume_cursor %r is not on boot %s"
+                                 % (gap["resume_cursor"], boot_id))
+        if gap.get("requested_cursor") is not None:
+            parse_live_cursor(gap["requested_cursor"])
+    boot_epoch_us = obj.get("boot_epoch_us")
+    if boot_epoch_us is not None and not isinstance(boot_epoch_us, int):
+        raise ValueError("/detections boot_epoch_us %r is not an integer or null" % boot_epoch_us)
+    return {
+        "contract": LIVE_RING_CURSOR_CONTRACT,
+        "rows": rows,
+        "truncated": truncated,
+        "boot_id": boot_id,
+        "boot_epoch_us": boot_epoch_us,
+        "cursor": cursor,
+        "oldest_cursor": oldest_cursor,
+        "newest_cursor": newest_cursor,
+        "next_cursor": next_cursor,
+        "until_cursor": until_cursor,
+        "returned": len(rows),
+        "has_more": has_more,
+        "gap": gap,
+        "limit": obj.get("limit"),
+    }
+
+
+def parse_live_ring(body: bytes) -> Dict[str, Any]:
+    """The `/detections` response, legacy or cursor-paged, or its whole-row prefix if truncated.
+
+    Legacy firmware returns a bare array of the newest rows. Cursor-aware firmware returns
+    `{"contract":"cursor-v1", ... , "rows":[...]}` and keeps `rows` last so a body cut mid-row
+    can still be salvaged to a valid prefix. In either mode, a truncated body is the node running
+    out of room while streaming, not a reason to discard the whole prefix it already served.
     """
     text = body.decode("utf-8", "replace")
+    truncated: Optional[int] = None
     try:
         obj = json.loads(text)
     except ValueError:
         end = text.rfind("}")
-        if end < 0 or not text.lstrip().startswith("["):
+        if end < 0:
             raise
-        obj = json.loads(text[:end + 1] + "]")
-        truncated: Optional[int] = len(body)
-    else:
-        truncated = None
-    if not isinstance(obj, list):
-        raise ValueError("/detections body is %s, not a list" % type(obj).__name__)
-    return obj, truncated
+        stripped = text.lstrip()
+        if stripped.startswith("["):
+            obj = json.loads(text[:end + 1] + "]")
+            truncated = len(body)
+        else:
+            m = re.search(r'"rows"\s*:\s*\[', text)
+            if not stripped.startswith("{") or not m or end < m.end():
+                raise
+            obj = json.loads(text[:end + 1] + "]}")
+            truncated = len(body)
+    if isinstance(obj, list):
+        return {"contract": "legacy", "rows": obj, "truncated": truncated}
+    if isinstance(obj, dict):
+        return _parse_live_ring_object(obj, truncated)
+    raise ValueError("/detections body is %s, not a list or object" % type(obj).__name__)
 
 
 def fetch_sd(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S,
@@ -1361,24 +1508,55 @@ def live_ring_loss(prev: Dict[str, Any], served: Sequence[int], total: Optional[
     return max(0, first - last - 1), None
 
 
-def _drain_live_ring(pl: "P.Pool", node: str, ip: str, st: Dict[str, Any], out: Dict[str, Any],
-                     timeout: float, stamp: int) -> Dict[str, Any]:
-    """A node reporting `sd: false` has no card files, so its detections exist only in the live
-    ring. Scene and clips are NOT APPLICABLE to it, which is a different answer from UNKNOWN."""
-    out["no_card"] = True
-    out["unfetched_unknown"] = False
-    out["unfetched_reason"] = "the node reports no card, so it writes no scene file"
-    out["clips_unknown"] = False
-    out["clips_reason"] = "the node reports no card, so it writes no clips"
-    out["live_ring_rows"] = None
-    out["live_ring_lost"] = None
-    try:
-        body = fetch_detections(ip, timeout)
-        ring, truncated = parse_live_ring(body)
-    except Exception as e:
-        out["errors"].append("detections: %r" % (e,))
-        out["live_ring_reason"] = "/detections could not be fetched, so nothing was measured"
-        return out
+def _live_ring_gap_loss(prev: Dict[str, Any],
+                        page: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
+    """Loss accounting for a cursor-aware `/detections` page.
+
+    The firmware already names the gap or reboot explicitly; this helper turns that contract into
+    the same `(lost, reason)` pair the legacy path reports.
+    """
+    gap = page.get("gap")
+    if not prev:
+        _, total = parse_live_cursor(page["until_cursor"])
+        if total == 0:
+            return 0, None
+        return None, ("first sighting of this node's live ring cursor, so unread rows before this "
+                      "run are unmeasured")
+    if not gap:
+        return 0, None
+    lost = int(gap.get("lost_rows") or 0)
+    if gap.get("kind") == "overrun":
+        return lost, ("the stored live-ring cursor aged behind the node's ring by %d row(s); the "
+                      "drain resumed at %s" % (lost, gap.get("resume_cursor")))
+    return lost, ("the node rebooted since the stored live-ring cursor; %d row(s) from the new "
+                  "boot had already aged out, and unread rows from the previous boot are "
+                  "unmeasured" % lost)
+
+
+def _write_live_ring_watermark(root: str, wm: Dict[str, Any], node: str,
+                               node_wm: Dict[str, Any], page: Dict[str, Any],
+                               uptime_s: Optional[int], stamp: int) -> None:
+    """Advance the cursor watermark only through pages that were actually ingested."""
+    _, pos = parse_live_cursor(page["next_cursor"])
+    node_wm["live_ring"] = {
+        "mode": page["contract"],
+        "next_cursor": page["next_cursor"],
+        "boot_id": page.get("boot_id"),
+        "boot_epoch_us": page.get("boot_epoch_us"),
+        "last_i": pos - 1,
+        "uptime_s": uptime_s,
+        "at": stamp,
+    }
+    wm[node] = node_wm
+    write_watermarks(root, wm)
+
+
+def _drain_live_ring_legacy(pl: "P.Pool", node: str, st: Dict[str, Any], out: Dict[str, Any],
+                            stamp: int, body: bytes, ring: Sequence[Dict[str, Any]],
+                            truncated: Optional[int], wm: Dict[str, Any],
+                            node_wm: Dict[str, Any], prev: Dict[str, Any]) -> Dict[str, Any]:
+    out["live_ring_mode"] = "legacy"
+    out["live_ring_pages"] = 1
     out["live_ring_truncated_bytes"] = truncated
     if truncated is not None:
         archive(pl.root, node, "detections-truncated.raw", body, stamp)
@@ -1401,9 +1579,6 @@ def _drain_live_ring(pl: "P.Pool", node: str, ip: str, st: Dict[str, Any], out: 
     audio = st.get("audio") if isinstance(st.get("audio"), dict) else {}
     total = audio.get("detections") if isinstance(audio.get("detections"), int) else None
     up = st.get("uptime_s")
-    wm = read_watermarks(pl.root)
-    node_wm = dict(wm.get(node) or {})
-    prev = node_wm.get("live_ring") or {}
     lost, why = live_ring_loss(prev, served, total, up, stamp)
     out["live_ring_rows"] = len(served)
     out["live_ring_lost"] = lost
@@ -1412,11 +1587,128 @@ def _drain_live_ring(pl: "P.Pool", node: str, ip: str, st: Dict[str, Any], out: 
                                 if total is not None and served else None)
     same_boot = _same_boot(prev, up, total, stamp)
     last_i = max(served) if served else (int(prev.get("last_i", -1)) if same_boot else -1)
-    node_wm["live_ring"] = {"last_i": last_i, "uptime_s": up, "at": stamp}
+    node_wm["live_ring"] = {"last_i": last_i, "uptime_s": up, "at": stamp, "mode": "legacy"}
     wm[node] = node_wm
     write_watermarks(pl.root, wm)
     out["ok"] = not out["errors"]
     return out
+
+
+def _drain_live_ring_cursor(pl: "P.Pool", node: str, ip: str, st: Dict[str, Any],
+                            out: Dict[str, Any], timeout: float, stamp: int,
+                            body: bytes, first_page: Dict[str, Any],
+                            wm: Dict[str, Any], node_wm: Dict[str, Any],
+                            prev: Dict[str, Any], cursor: Optional[str]) -> Dict[str, Any]:
+    up = st.get("uptime_s")
+    page = first_page
+    page_body = body
+    page_n = 0
+    total_rows = 0
+    snapshot = None
+    truncated_pages = 0
+    truncated_bytes = 0
+    while True:
+        page_n += 1
+        if page["contract"] != LIVE_RING_CURSOR_CONTRACT:
+            out["errors"].append("detections: cursor request returned %r, not %r"
+                                 % (page["contract"], LIVE_RING_CURSOR_CONTRACT))
+            out["live_ring_reason"] = "the cursor /detections response changed shape mid-run"
+            out["live_ring_pending"] = None
+            return out
+        if snapshot is None:
+            snapshot = page["until_cursor"]
+            lost, why = _live_ring_gap_loss(prev, page)
+            out["live_ring_lost"] = lost
+            out["live_ring_reason"] = why
+            out["live_ring_gap"] = page.get("gap")
+            out["live_ring_oldest_cursor"] = page.get("oldest_cursor")
+            out["live_ring_boot_id"] = page.get("boot_id")
+            out["live_ring_boot_epoch_us"] = page.get("boot_epoch_us")
+            out["live_ring_snapshot_cursor"] = snapshot
+        total_rows += len([d for d in page["rows"] if isinstance(d, dict) and isinstance(d.get("i"), int)])
+        if page["truncated"] is not None:
+            archive(pl.root, node, "detections-%04d-truncated.raw" % page_n, page_body, stamp)
+            truncated_pages += 1
+            truncated_bytes += int(page["truncated"])
+            page_body = json.dumps({k: v for k, v in page.items()
+                                    if k in ("contract", "boot_id", "boot_epoch_us", "cursor",
+                                             "oldest_cursor", "newest_cursor", "next_cursor",
+                                             "until_cursor", "returned", "has_more", "gap",
+                                             "limit", "rows")}).encode()
+        path = archive(pl.root, node, "detections-%04d.json" % page_n, page_body, stamp)
+        try:
+            entry = pl.ingest_detections_json(path, default_node=node,
+                                              origin="%s:/detections" % node)
+        except Exception as e:
+            out["errors"].append("detections: ingest: %r" % (e,))
+            out["live_ring_reason"] = "a /detections page did not ingest, so the cursor stopped"
+            break
+        out["added"] += entry["added"]
+        out["files"].append({"name": "/detections", "page": page_n, "bytes": len(page_body),
+                             "ingested": True, "live_ring": True, "archived": path,
+                             **{k: entry[k] for k in ("generation", "rows", "added",
+                                                      "duplicate", "skipped", "skip_reasons")}})
+        _write_live_ring_watermark(pl.root, wm, node, node_wm, page, up, stamp)
+        out["live_ring_cursor"] = page["next_cursor"]
+        out["live_ring_newest_cursor"] = page.get("newest_cursor")
+        if not page["has_more"]:
+            break
+        cursor = page["next_cursor"]
+        try:
+            page_body = fetch_detections(ip, timeout, cursor=cursor, until=snapshot,
+                                         limit=LIVE_RING_HTTP_MAX)
+            page = parse_live_ring(page_body)
+        except Exception as e:
+            out["errors"].append("detections: %r" % (e,))
+            out["live_ring_reason"] = "the cursor /detections walk ended before the snapshot did"
+            break
+    out["live_ring_mode"] = LIVE_RING_CURSOR_CONTRACT
+    out["live_ring_pages"] = page_n
+    out["live_ring_rows"] = total_rows
+    out["live_ring_pending"] = None
+    if snapshot and out.get("live_ring_cursor"):
+        _, stop = parse_live_cursor(snapshot)
+        _, cur = parse_live_cursor(out["live_ring_cursor"])
+        out["live_ring_pending"] = max(0, stop - cur)
+    if truncated_pages:
+        out["live_ring_truncated_bytes"] = truncated_bytes
+        out["live_ring_truncated_pages"] = truncated_pages
+    else:
+        out["live_ring_truncated_bytes"] = None
+    out["ok"] = not out["errors"]
+    return out
+
+
+def _drain_live_ring(pl: "P.Pool", node: str, ip: str, st: Dict[str, Any], out: Dict[str, Any],
+                     timeout: float, stamp: int) -> Dict[str, Any]:
+    """A node reporting `sd: false` has no card files, so its detections exist only in the live
+    ring. Scene and clips are NOT APPLICABLE to it, which is a different answer from UNKNOWN."""
+    out["no_card"] = True
+    out["unfetched_unknown"] = False
+    out["unfetched_reason"] = "the node reports no card, so it writes no scene file"
+    out["clips_unknown"] = False
+    out["clips_reason"] = "the node reports no card, so it writes no clips"
+    out["live_ring_rows"] = None
+    out["live_ring_lost"] = None
+    out["live_ring_pending"] = None
+    out["live_ring_mode"] = None
+    out["live_ring_pages"] = None
+    try:
+        wm = read_watermarks(pl.root)
+        node_wm = dict(wm.get(node) or {})
+        prev = node_wm.get("live_ring") or {}
+        cursor = prev.get("next_cursor") if isinstance(prev.get("next_cursor"), str) else None
+        body = fetch_detections(ip, timeout, cursor=cursor, limit=LIVE_RING_HTTP_MAX)
+        page = parse_live_ring(body)
+    except Exception as e:
+        out["errors"].append("detections: %r" % (e,))
+        out["live_ring_reason"] = "/detections could not be fetched, so nothing was measured"
+        return out
+    if page["contract"] == "legacy":
+        return _drain_live_ring_legacy(pl, node, st, out, stamp, body, page["rows"],
+                                       page["truncated"], wm, node_wm, prev)
+    return _drain_live_ring_cursor(pl, node, ip, st, out, timeout, stamp, body, page,
+                                   wm, node_wm, prev, cursor)
 
 
 def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOUT_S,
@@ -1874,6 +2166,8 @@ def write_heartbeat(root: str, results: List[Dict[str, Any]], phone: Optional[Di
                 lring = []
             lring.append({"at": now, "rows": r.get("live_ring_rows"), "added": r.get("added"),
                           "lost": r.get("live_ring_lost"), "reason": r.get("live_ring_reason"),
+                          "mode": r.get("live_ring_mode"), "pages": r.get("live_ring_pages"),
+                          "gap_kind": (r.get("live_ring_gap") or {}).get("kind"),
                           "truncated": r.get("live_ring_truncated_bytes") is not None})
             s["live_recent"] = lring[-UNFETCHED_RING:]
         if r["ok"]:
@@ -2031,11 +2325,19 @@ def _live_ring_note(s: Dict[str, Any], now: float, window_s: float) -> Tuple[str
     added = sum(int(e.get("added") or 0) for e in recent)
     lost = sum(int(e["lost"]) for e in recent if e.get("lost") is not None)
     unknown = [e for e in recent if e.get("lost") is None]
+    modes = sorted({e.get("mode") for e in recent if e.get("mode")})
+    pages = sum(int(e.get("pages") or 0) for e in recent)
     note = "  live ring %d row(s) read, +%d new over %d run(s)" % (rows, added, len(recent))
+    if pages:
+        note += " / %d page(s)" % pages
+    if modes:
+        note += " (%s)" % ", ".join(modes)
     bad = False
     if lost > 0:
-        note += ("  ⚠️LIVE RING LOST %d detection(s) the drain never read (/detections serves only "
-                 "the newest %d)" % (lost, LIVE_RING_HTTP_MAX))
+        kinds = sorted({e.get("gap_kind") for e in recent if e.get("gap_kind")})
+        detail = " (%s)" % ", ".join(kinds) if kinds else ""
+        note += ("  ⚠️LIVE RING LOST %d detection(s) before the drain's cursor reached them%s"
+                 % (lost, detail))
         bad = True
     cut = [e for e in recent if e.get("truncated")]
     if cut:
@@ -2228,13 +2530,26 @@ def main(argv=None) -> int:
                 "" if r["ok"] else "  " + "; ".join(r["errors"])))
             if r.get("no_card"):
                 lost = r.get("live_ring_lost")
-                print("    no card: live ring %s row(s) read, %s%s"
+                mode = r.get("live_ring_mode")
+                pages = r.get("live_ring_pages")
+                trunc = ""
+                if r.get("live_ring_truncated_bytes") is not None:
+                    if r.get("live_ring_truncated_pages", 0) > 1:
+                        trunc = ("  body TRUNCATED by the node on %d page(s), %d B total, %s row(s) "
+                                 "left in this snapshot"
+                                 % (r.get("live_ring_truncated_pages"),
+                                    r["live_ring_truncated_bytes"], r.get("live_ring_pending")))
+                    else:
+                        trunc = ("  body TRUNCATED by the node at %d B, %s newer row(s) left for a "
+                                 "later run" % (r["live_ring_truncated_bytes"],
+                                                r.get("live_ring_pending")))
+                print("    no card: live ring %s row(s) read%s%s, %s%s"
                       % (r.get("live_ring_rows"),
+                         "" if pages in (None, 1) else " across %d page(s)" % pages,
+                         "" if not mode else " (%s)" % mode,
                          "%d lost" % lost if lost is not None
                          else "loss UNMEASURED (%s)" % r.get("live_ring_reason"),
-                         "  body TRUNCATED by the node at %d B, %s newer row(s) left for a later "
-                         "run" % (r["live_ring_truncated_bytes"], r.get("live_ring_pending"))
-                         if r.get("live_ring_truncated_bytes") is not None else ""))
+                         trunc))
             if r.get("clips_unknown"):
                 print("    clips UNMEASURED this run, not clean: %s" % r.get("clips_reason"))
             elif r.get("clips_seen"):

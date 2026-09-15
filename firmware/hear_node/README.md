@@ -78,8 +78,24 @@ LED swings: through an LED and series resistor only one side is a usable edge.
 
 ## Reading it
 
-`http://damahear.local/` or the printed IP. The page refreshes every 2 s; `/status` is JSON,
-`/detections` lists what the gate fired on.
+`http://damahear.local/` or the printed IP. The page refreshes every 2 s; `/status` is JSON.
+`/detections` has two contracts on purpose:
+
+* **Legacy compatibility:** bare `GET /detections` is still the old JSON array of the newest
+  128 rows, oldest first. Mixed fleets and older tooling keep working unchanged.
+* **Cursor paging:** `GET /detections?cursor=<boot:id>&limit=<n>[&until=<boot:id>]` returns
+  `{"contract":"cursor-v1", ... , "rows":[...]}` with `boot_id`, `boot_epoch_us` when the clock
+  is anchored, `oldest_cursor`, `newest_cursor`, `next_cursor`, `until_cursor`, and `gap=null` or
+  `{"kind":"overrun"|"reboot", ...}`. `cursor` and `next_cursor` are the NEXT unread row, so a
+  caller stores `next_cursor` only after its rows land and can retry the same request idempotently.
+  `until_cursor` freezes the first page's high-water mark so a later page does not chase rows that
+  arrived after the walk began. `rows` is LAST in the object so a body cut mid-row can still be
+  salvaged to a whole-row prefix.
+
+**Roll forward:** deploy the cursor-aware `hear-drain` first, then flash nodes gradually; the
+drain asks for cursor paging and falls back to the legacy array automatically when a node ignores
+the query args. **Roll back:** either side can be reverted independently, because the legacy bare
+endpoint is unchanged and the new drain still accepts old and new `/detections` bodies.
 
 The SD card is the actual record. WiFi is a convenience and a run must not depend on
 it. Everything below is fetchable over the same link with `/sd?file=/dets.csv&tail=20000`:

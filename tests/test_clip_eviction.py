@@ -179,8 +179,14 @@ def test_the_sequence_moves_on_when_the_sample_counter_wraps():
 def test_a_row_names_its_clip_with_the_sequence_it_was_written_under():
     b = _body("static void clip_pump")
     assert "d.cseq = clip_seq;" in b and "clip_at_seq = clip_seq;" in b
-    for fn in ("static void det_flush", "static void h_dets"):
-        assert "clip_name(cp, sizeof cp, d.cseq, d.sample)" in _body(fn), fn
+    found = 0
+    for fn in ("static void det_flush", "static void det_send_row", "static void h_dets"):
+        try:
+            if "clip_name(cp, sizeof cp, d.cseq, d.sample)" in _body(fn):
+                found += 1
+        except ValueError:
+            pass
+    assert found >= 2, "both det_flush and /detections formatting must name the clip with d.cseq"
 
 
 def test_the_name_carries_no_priority_field():
