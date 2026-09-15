@@ -8,7 +8,7 @@ metadata:
   labels:
     app: hear-tag
   annotations:
-    dama-hear/commit: 'b54798f'
+    dama-hear/commit: 'e89c500'
     dama-hear/source-sha256: 'abf20f41904cad4ac8929cf1d2d2dafe12dc1933b05ee0fc917b40fa85d2e64e'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client

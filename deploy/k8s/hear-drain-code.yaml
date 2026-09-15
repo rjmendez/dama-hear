@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 337084 B serialised; 337349 B of annotations against a 262144 B cap.
+# apply-mode server: 347190 B serialised; 347455 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'b54798f'
-    dama-hear/source-sha256: '666930629fc59a7ed02279f98062cab82022648d552df2f4cc6d1b1f13138640'
+    dama-hear/commit: 'e89c500'
+    dama-hear/source-sha256: 'f10303425ba3a2f87164af2c0045b6d95e53479b2d547b03b8fcb2a4e1e4c1f4'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '337084'
+    dama-hear/serialised-bytes: '347190'
 data:
   hear__init__.py: |
     
@@ -3702,6 +3702,43 @@ data:
         return _get(url, timeout)
     
     
+    def _page_start_pos(page: Dict[str, Any]) -> int:
+        """The index the first row of this page carries, from the page itself.
+    
+        The echoed `cursor` is the REQUEST, so on a reboot page it names the previous boot and says
+        nothing about where these rows start; the node's oldest held row does.
+        """
+        cur = page.get("cursor")
+        if isinstance(cur, str) and cur:
+            boot, pos = parse_live_cursor(cur)
+            if boot == page.get("boot_id"):
+                return pos
+        old = page.get("oldest_cursor")
+        if isinstance(old, str) and old:
+            return parse_live_cursor(old)[1]
+        return 0
+    
+    
+    def _salvaged_rows(rows: Sequence[Any], start_pos: Optional[int]) -> Tuple[List[Any], int]:
+        """(the rows a truncated page actually proved, how far they carry the cursor).
+    
+        ⚠️A TRUNCATED PAGE'S OWN HEADER STILL CLAIMS THE WHOLE PAGE. `returned`, `has_more` and
+        `next_cursor` are written before the first row is streamed, so they describe the page the node
+        MEANT to send, not the prefix that arrived. Only rows that are present AND contiguous from the
+        page's start count: a hole would otherwise be walked past by a cursor that trusts the header.
+        """
+        kept: List[Any] = []
+        pos = int(start_pos or 0)
+        for d in rows:
+            if not isinstance(d, dict) or not isinstance(d.get("i"), int):
+                break
+            if start_pos is not None and int(d["i"]) != pos:
+                break
+            kept.append(d)
+            pos += 1
+        return kept, pos
+    
+    
     def _parse_live_ring_object(obj: Dict[str, Any], truncated: Optional[int]) -> Dict[str, Any]:
         if obj.get("contract") != LIVE_RING_CURSOR_CONTRACT:
             raise ValueError("/detections object contract is %r, expected %r"
@@ -3721,8 +3758,13 @@ data:
         if next_boot != boot_id or until_boot != boot_id:
             raise ValueError("/detections cursors do not belong to boot %s" % boot_id)
         cursor = obj.get("cursor")
+        start_pos: Optional[int] = None
         if cursor is not None:
-            parse_live_cursor(cursor)
+            # The echoed request cursor belongs to the PREVIOUS boot when the node reports a reboot
+            # gap, so it is parsed but only names a position when it is this boot's namespace.
+            cur_boot, cur_pos = parse_live_cursor(cursor)
+            if cur_boot == boot_id:
+                start_pos = cur_pos
         oldest_cursor = obj.get("oldest_cursor")
         newest_cursor = obj.get("newest_cursor")
         if oldest_cursor is None:
@@ -3738,7 +3780,23 @@ data:
                 raise ValueError("/detections names only one of oldest/newest cursor")
             if rows or next_pos or until_pos:
                 raise ValueError("/detections names no oldest/newest cursor on a non-empty boot")
-        else:
+        # ⚠️A SALVAGED PAGE IS RE-DESCRIBED FROM ITS ROWS, NEVER FROM ITS HEADER. The header is
+        # streamed before the rows, so `returned`/`has_more`/`next_cursor` promise the page the node
+        # MEANT to send; a body cut mid-row keeps those promises and would walk the cursor past rows
+        # that never arrived. `until_cursor` and the oldest/newest pair describe the snapshot the node
+        # was serving and stay usable; everything that counts rows is recomputed from what parsed.
+        claimed: Optional[Dict[str, Any]] = None
+        if truncated is not None:
+            claimed = {"next_cursor": next_cursor, "returned": obj.get("returned", len(rows)),
+                       "has_more": bool(obj.get("has_more"))}
+            if start_pos is None:
+                start_pos = oldest_pos if oldest_pos is not None else 0
+            rows, next_pos = _salvaged_rows(rows, start_pos)
+            if next_pos > until_pos:
+                raise ValueError("/detections salvaged %d row(s) past until=%r"
+                                 % (len(rows), until_cursor))
+            next_cursor = live_ring_cursor(boot_id, next_pos)
+        if oldest_pos is not None and newest_pos is not None:
             if oldest_boot != boot_id or newest_boot != boot_id:
                 raise ValueError("/detections oldest/newest cursor boot does not match %s" % boot_id)
             if not (oldest_pos <= next_pos <= until_pos):
@@ -3747,13 +3805,17 @@ data:
             if newest_pos + 1 < next_pos and rows:
                 raise ValueError("/detections next_cursor %r skips beyond newest %r"
                                  % (next_cursor, newest_cursor))
-        returned = obj.get("returned", len(rows))
-        if int(returned) != len(rows):
-            raise ValueError("/detections returned=%r but rows has length %d" % (returned, len(rows)))
-        has_more = bool(obj.get("has_more"))
-        if has_more != (next_pos < until_pos):
-            raise ValueError("/detections has_more=%r but next=%r until=%r"
-                             % (has_more, next_cursor, until_cursor))
+        if claimed is None:
+            returned = obj.get("returned", len(rows))
+            if int(returned) != len(rows):
+                raise ValueError("/detections returned=%r but rows has length %d"
+                                 % (returned, len(rows)))
+            has_more = bool(obj.get("has_more"))
+            if has_more != (next_pos < until_pos):
+                raise ValueError("/detections has_more=%r but next=%r until=%r"
+                                 % (has_more, next_cursor, until_cursor))
+        else:
+            has_more = next_pos < until_pos
         gap = obj.get("gap")
         if gap is not None:
             if not isinstance(gap, dict):
@@ -3788,6 +3850,8 @@ data:
             "has_more": has_more,
             "gap": gap,
             "limit": obj.get("limit"),
+            "salvaged": claimed is not None,
+            "claimed": claimed,
         }
     
     
@@ -4870,9 +4934,19 @@ data:
         if not gap:
             return 0, None
         lost = int(gap.get("lost_rows") or 0)
+        legacy = gap.get("source") == "legacy_watermark"
         if gap.get("kind") == "overrun":
+            if legacy:
+                return lost, ("the stored legacy row-index watermark (last_i=%s) sat %d row(s) below "
+                              "the node's oldest held row; the drain resumed at %s"
+                              % (gap.get("legacy_last_i"), lost, gap.get("resume_cursor")))
             return lost, ("the stored live-ring cursor aged behind the node's ring by %d row(s); the "
                           "drain resumed at %s" % (lost, gap.get("resume_cursor")))
+        if legacy:
+            return lost, ("the node rebooted since the stored legacy row-index watermark "
+                          "(last_i=%s); %d row(s) from the new boot had already aged out, and unread "
+                          "rows from the previous boot are unmeasured"
+                          % (gap.get("legacy_last_i"), lost))
         return lost, ("the node rebooted since the stored live-ring cursor; %d row(s) from the new "
                       "boot had already aged out, and unread rows from the previous boot are "
                       "unmeasured" % lost)
@@ -4881,8 +4955,17 @@ data:
     def _write_live_ring_watermark(root: str, wm: Dict[str, Any], node: str,
                                    node_wm: Dict[str, Any], page: Dict[str, Any],
                                    uptime_s: Optional[int], stamp: int) -> None:
-        """Advance the cursor watermark only through pages that were actually ingested."""
+        """Advance the cursor watermark only through pages that were actually ingested.
+    
+        ⚠️THE WATERMARK NEVER MOVES BACKWARDS INSIDE ONE BOOT. `page["next_cursor"]` is the position
+        this run PROVED it ingested -- recomputed from the rows for a salvaged page -- so a later page
+        that names an earlier position must not un-read rows already in the pool.
+        """
         _, pos = parse_live_cursor(page["next_cursor"])
+        was = node_wm.get("live_ring") or {}
+        if (was.get("boot_id") == page.get("boot_id")
+                and isinstance(was.get("last_i"), int) and was["last_i"] + 1 > pos):
+            return
         node_wm["live_ring"] = {
             "mode": page["contract"],
             "next_cursor": page["next_cursor"],
@@ -4899,14 +4982,22 @@ data:
     def _drain_live_ring_legacy(pl: "P.Pool", node: str, st: Dict[str, Any], out: Dict[str, Any],
                                 stamp: int, body: bytes, ring: Sequence[Dict[str, Any]],
                                 truncated: Optional[int], wm: Dict[str, Any],
-                                node_wm: Dict[str, Any], prev: Dict[str, Any]) -> Dict[str, Any]:
+                                node_wm: Dict[str, Any], prev: Dict[str, Any],
+                                raw_path: Optional[str] = None) -> Dict[str, Any]:
         out["live_ring_mode"] = "legacy"
         out["live_ring_pages"] = 1
         out["live_ring_truncated_bytes"] = truncated
+        # The raw body is already archived by the fetch, cut or not; only a salvage needs a second
+        # file, because what is ingested is then the prefix that parsed rather than what arrived.
         if truncated is not None:
-            archive(pl.root, node, "detections-truncated.raw", body, stamp)
+            if raw_path is None:
+                archive(pl.root, node, "detections-truncated.raw", body, stamp)
             body = json.dumps(ring).encode()
-        path = archive(pl.root, node, "detections.json", body, stamp)
+            path = archive(pl.root, node, "detections.json", body, stamp)
+        elif raw_path is not None:
+            path = raw_path
+        else:
+            path = archive(pl.root, node, "detections.json", body, stamp)
         try:
             entry = pl.ingest_detections_json(path, default_node=node,
                                               origin="%s:/detections" % node)
@@ -4939,11 +5030,52 @@ data:
         return out
     
     
+    def _legacy_watermark_resume(prev: Dict[str, Any], page: Dict[str, Any], st: Dict[str, Any],
+                                 stamp: float) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """(the cursor a pre-cursor `last_i` watermark must resume from, the gap that resume exposes).
+    
+        ⚠️A LEGACY WATERMARK IS A ROW INDEX, NOT A CURSOR, AND A CURSORLESS PAGE REQUEST HIDES THAT.
+        A node drained before this migration -- or rolled back to legacy firmware and forward again --
+        stores `last_i` with no `next_cursor`. Asking for a page without a cursor makes the firmware
+        serve from its OLDEST held row and report `gap: null`, because from its side nothing was asked
+        to be skipped. Everything between `last_i + 1` and that oldest row then reads as a measured
+        zero when it is in fact a loss, so the resume point is derived here and the hole is reported
+        as the overrun it is. A watermark from another boot is a reboot, not an overrun.
+        """
+        if prev.get("next_cursor") or not isinstance(prev.get("last_i"), int):
+            return None, None
+        boot_id = page["boot_id"]
+        oldest_cursor = page.get("oldest_cursor")
+        _, until_pos = parse_live_cursor(page["until_cursor"])
+        last_i = int(prev["last_i"])
+        audio = st.get("audio") if isinstance(st.get("audio"), dict) else {}
+        total = audio.get("detections") if isinstance(audio.get("detections"), int) else None
+        if not _same_boot(prev, st.get("uptime_s"), total, stamp):
+            oldest_pos = parse_live_cursor(oldest_cursor)[1] if oldest_cursor else 0
+            return None, {"kind": "reboot", "lost_rows": int(oldest_pos),
+                          "resume_cursor": oldest_cursor or live_ring_cursor(boot_id, until_pos),
+                          "previous_boot_unmeasured": True,
+                          "source": "legacy_watermark", "legacy_last_i": last_i}
+        if oldest_cursor is None:
+            return None, None
+        _, oldest_pos = parse_live_cursor(oldest_cursor)
+        resume = min(max(last_i + 1, 0), until_pos)
+        if resume < oldest_pos:
+            return None, {"kind": "overrun", "lost_rows": int(oldest_pos - resume),
+                          "requested_cursor": live_ring_cursor(boot_id, resume),
+                          "resume_cursor": oldest_cursor,
+                          "source": "legacy_watermark", "legacy_last_i": last_i}
+        if resume > oldest_pos:
+            return live_ring_cursor(boot_id, resume), None
+        return None, None
+    
+    
     def _drain_live_ring_cursor(pl: "P.Pool", node: str, ip: str, st: Dict[str, Any],
                                 out: Dict[str, Any], timeout: float, stamp: int,
                                 body: bytes, first_page: Dict[str, Any],
                                 wm: Dict[str, Any], node_wm: Dict[str, Any],
-                                prev: Dict[str, Any], cursor: Optional[str]) -> Dict[str, Any]:
+                                prev: Dict[str, Any], cursor: Optional[str],
+                                raw_path: Optional[str] = None) -> Dict[str, Any]:
         up = st.get("uptime_s")
         page = first_page
         page_body = body
@@ -4952,6 +5084,27 @@ data:
         snapshot = None
         truncated_pages = 0
         truncated_bytes = 0
+        fetches = [1]                     # the caller already fetched and archived this body
+    
+        def fetch_page(cur: Optional[str],
+                       until: Optional[str]) -> Tuple[str, bytes, Dict[str, Any]]:
+            """One page, with its raw bytes archived BEFORE anything tries to parse them."""
+            fetches[0] += 1
+            raw = fetch_detections(ip, timeout, cursor=cur, until=until, limit=LIVE_RING_HTTP_MAX)
+            p = archive(pl.root, node, "detections-%04d.raw" % fetches[0], raw, stamp)
+            return p, raw, parse_live_ring(raw)
+    
+        legacy_gap = None
+        resume, legacy_gap = _legacy_watermark_resume(prev, page, st, stamp)
+        if resume is not None:
+            try:
+                raw_path, page_body, page = fetch_page(resume, None)
+                cursor = resume
+            except Exception as e:
+                out["errors"].append("detections: %r" % (e,))
+                out["live_ring_reason"] = ("the legacy row-index watermark could not be resumed as a "
+                                           "cursor, so nothing was measured")
+                return out
         while True:
             page_n += 1
             if page["contract"] != LIVE_RING_CURSOR_CONTRACT:
@@ -4962,6 +5115,8 @@ data:
                 return out
             if snapshot is None:
                 snapshot = page["until_cursor"]
+                if legacy_gap is not None and not page.get("gap"):
+                    page["gap"] = legacy_gap
                 lost, why = _live_ring_gap_loss(prev, page)
                 out["live_ring_lost"] = lost
                 out["live_ring_reason"] = why
@@ -4970,17 +5125,27 @@ data:
                 out["live_ring_boot_id"] = page.get("boot_id")
                 out["live_ring_boot_epoch_us"] = page.get("boot_epoch_us")
                 out["live_ring_snapshot_cursor"] = snapshot
-            total_rows += len([d for d in page["rows"] if isinstance(d, dict) and isinstance(d.get("i"), int)])
+            total_rows += len([d for d in page["rows"]
+                               if isinstance(d, dict) and isinstance(d.get("i"), int)])
+            _, next_pos = parse_live_cursor(page["next_cursor"])
+            start_pos = _page_start_pos(page)
             if page["truncated"] is not None:
-                archive(pl.root, node, "detections-%04d-truncated.raw" % page_n, page_body, stamp)
                 truncated_pages += 1
                 truncated_bytes += int(page["truncated"])
-                page_body = json.dumps({k: v for k, v in page.items()
-                                        if k in ("contract", "boot_id", "boot_epoch_us", "cursor",
-                                                 "oldest_cursor", "newest_cursor", "next_cursor",
-                                                 "until_cursor", "returned", "has_more", "gap",
-                                                 "limit", "rows")}).encode()
-            path = archive(pl.root, node, "detections-%04d.json" % page_n, page_body, stamp)
+                # ⚠️WHAT IS INGESTED IS THE SALVAGE, DESCRIBED BY THE SALVAGE. The raw body is already
+                # on the disk; this copy carries only the rows that parsed and the cursors recomputed
+                # from them, so nothing downstream inherits the cut header's claims.
+                page_body = json.dumps({k: page[k] for k in
+                                        ("contract", "boot_id", "boot_epoch_us", "cursor",
+                                         "oldest_cursor", "newest_cursor", "next_cursor",
+                                         "until_cursor", "returned", "has_more", "gap", "limit",
+                                         "rows")}).encode()
+                path = archive(pl.root, node, "detections-%04d-salvaged.json" % page_n, page_body,
+                               stamp)
+            elif raw_path is not None:
+                path = raw_path
+            else:
+                path = archive(pl.root, node, "detections-%04d.json" % page_n, page_body, stamp)
             try:
                 entry = pl.ingest_detections_json(path, default_node=node,
                                                   origin="%s:/detections" % node)
@@ -4991,6 +5156,7 @@ data:
             out["added"] += entry["added"]
             out["files"].append({"name": "/detections", "page": page_n, "bytes": len(page_body),
                                  "ingested": True, "live_ring": True, "archived": path,
+                                 "salvaged": bool(page.get("salvaged")),
                                  **{k: entry[k] for k in ("generation", "rows", "added",
                                                           "duplicate", "skipped", "skip_reasons")}})
             _write_live_ring_watermark(pl.root, wm, node, node_wm, page, up, stamp)
@@ -4998,11 +5164,15 @@ data:
             out["live_ring_newest_cursor"] = page.get("newest_cursor")
             if not page["has_more"]:
                 break
+            if next_pos <= start_pos:
+                # A salvage that recovered no whole row cannot move the cursor, and asking again with
+                # the same one would loop forever: the rest of the snapshot is the next run's work.
+                out["live_ring_reason"] = ("a /detections page was cut before its first whole row, so "
+                                           "the walk stopped at %s" % page["next_cursor"])
+                break
             cursor = page["next_cursor"]
             try:
-                page_body = fetch_detections(ip, timeout, cursor=cursor, until=snapshot,
-                                             limit=LIVE_RING_HTTP_MAX)
-                page = parse_live_ring(page_body)
+                raw_path, page_body, page = fetch_page(cursor, snapshot)
             except Exception as e:
                 out["errors"].append("detections: %r" % (e,))
                 out["live_ring_reason"] = "the cursor /detections walk ended before the snapshot did"
@@ -5038,22 +5208,30 @@ data:
         out["live_ring_pending"] = None
         out["live_ring_mode"] = None
         out["live_ring_pages"] = None
+        raw_path = None
         try:
             wm = read_watermarks(pl.root)
             node_wm = dict(wm.get(node) or {})
             prev = node_wm.get("live_ring") or {}
             cursor = prev.get("next_cursor") if isinstance(prev.get("next_cursor"), str) else None
             body = fetch_detections(ip, timeout, cursor=cursor, limit=LIVE_RING_HTTP_MAX)
+            # ⚠️THE BYTES GO TO THE DISK BEFORE ANYTHING JUDGES THEM. A body that will not parse is
+            # the one worth keeping: archiving after a successful parse throws away exactly the
+            # evidence a malformed or half-sent answer leaves behind.
+            raw_path = archive(pl.root, node, "detections-0001.raw", body, stamp)
             page = parse_live_ring(body)
         except Exception as e:
             out["errors"].append("detections: %r" % (e,))
-            out["live_ring_reason"] = "/detections could not be fetched, so nothing was measured"
+            out["live_ring_reason"] = (
+                "/detections could not be parsed; its raw body is archived at %s" % raw_path
+                if raw_path is not None else
+                "/detections could not be fetched, so nothing was measured")
             return out
         if page["contract"] == "legacy":
             return _drain_live_ring_legacy(pl, node, st, out, stamp, body, page["rows"],
-                                           page["truncated"], wm, node_wm, prev)
+                                           page["truncated"], wm, node_wm, prev, raw_path)
         return _drain_live_ring_cursor(pl, node, ip, st, out, timeout, stamp, body, page,
-                                       wm, node_wm, prev, cursor)
+                                       wm, node_wm, prev, cursor, raw_path)
     
     
     def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOUT_S,
