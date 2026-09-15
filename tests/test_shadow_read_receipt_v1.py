@@ -723,12 +723,21 @@ class TestBoundaries:
         assert SR.RECEIPT_CONTRACT_ID not in harvestable
 
     def test_nothing_in_the_runtime_tree_imports_the_comparator(self):
-        """A design module reachable from a running reader is not a design module."""
+        """A design module reachable from a running reader is not a design module.
+
+        The other **design** modules are exempt and named individually: `hear/verify/
+        list_read.py` imports this module's authority constant, redaction list and time
+        bounds on purpose, because two copies of "who is authoritative" drift and only one of
+        them gets tested on the day it matters. Exempting the design lane by name, rather
+        than by a directory glob, keeps the check failing the moment a *runtime* reader picks
+        either module up.
+        """
+        design_lane = ("shadow_read.py", "list_read.py", "gen_shadow_read_contracts.py",
+                       "gen_list_read_contracts.py", "__init__.py")
         importers = []
         for path in sorted((ROOT / "hear").rglob("*.py")) + sorted(
                 (ROOT / "tools").rglob("*.py")):
-            if path.name in ("shadow_read.py", "gen_shadow_read_contracts.py",
-                             "__init__.py"):
+            if path.name in design_lane:
                 continue
             if "shadow_read" in path.read_text():
                 importers.append(path.relative_to(ROOT).as_posix())

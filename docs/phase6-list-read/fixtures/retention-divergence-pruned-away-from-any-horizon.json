@@ -1,0 +1,162 @@
+{
+  "case": "retention-divergence-pruned-away-from-any-horizon",
+  "description": "One surface has pruned rows the other still lists, nowhere near either declared horizon.",
+  "expected_classification": "retention_divergence",
+  "expected_gate_impact": "none",
+  "expected_repair_action": "manual_review",
+  "expected_severity": "warn",
+  "receipt": {
+    "aggregate": null,
+    "comparator": {
+      "name": "hear-read-compare",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "coverage": {
+      "accounted": true,
+      "compared": 940,
+      "eligible": 960,
+      "excluded_retention_edge": 10,
+      "excluded_sampling": 20,
+      "excluded_unbounded": 0,
+      "excluded_unpinned": 0,
+      "excluded_unsettled": 30,
+      "legacy_rows_offered": 1000,
+      "ratio": 0.9791666666666666
+    },
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "gate_impact": "none",
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "manual_review",
+      "repairable": false
+    },
+    "drift": {
+      "kind": "none",
+      "rows_deleted": null,
+      "rows_inserted": null,
+      "rows_updated": null
+    },
+    "emitted_at": "2026-09-15T02:00:45Z",
+    "evidence": {
+      "canonical_result_ref": "readcompare/canonical/retention-divergence-pruned-away-from-any-horizon.json",
+      "legacy_result_ref": "readcompare/legacy/retention-divergence-pruned-away-from-any-horizon.json",
+      "redaction_profile": "hear.readcompare.redact.v1"
+    },
+    "export": null,
+    "grain": "page",
+    "page": {
+      "boundary_first_row_key": "r:b103d5ddd7812681afa4bd5d107dc3cd82fd1456f5bfaf235eb9a8ed634a36d2",
+      "boundary_last_row_key": "r:427d8796d81c21c9fe073eff23a17f05c3a5ba919cf2ebc3a3f348627ebda4ba",
+      "count": 1,
+      "fingerprint": "p:3429a81bdd5e692a30f103af52913d6febf3d2861d1de575aa7a2a3751c4deec",
+      "first": true,
+      "index": 0,
+      "last": false,
+      "size": 50
+    },
+    "query": {
+      "bound_kind": "half_open",
+      "device_ids": [
+        "gold"
+      ],
+      "expected_difference_list": "legacy-defects-2026-09-15",
+      "filters": {
+        "kind": "gunshot",
+        "state": {
+          "redacted": "sha256:2c0a83f10ab5ec53"
+        }
+      },
+      "fingerprint": "q:044a074d38b1157d9443ee976caa9bc2f31ae46b77f62b15ef970e9eab8e307c",
+      "page_size": 50,
+      "projection_version": 1,
+      "site_id": "site-alpha",
+      "sort": {
+        "direction": "asc",
+        "field": "captured_at",
+        "tie_break": "row_uid"
+      },
+      "surface": "detection_list",
+      "threshold_fingerprint": "t:eadae5dd16f85e8e9ad0dd9d67d8c7b26e9f179c461850bf6f5aa71ae7ae6803",
+      "time_from": "2026-09-14T00:00:00Z",
+      "time_to": "2026-09-15T01:45:00Z"
+    },
+    "read_authority": "legacy",
+    "read_mode": "shadow",
+    "receipt_id": "a5ea275f-5868-56bf-851e-0efbc780051e",
+    "run_id": "readcompare-2026-09-15T02",
+    "sampling": {
+      "forced_reason": "mismatches are never sampled",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.readcompare.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "cursor_stable": true,
+        "membership_digest": "m:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "order_digest": "o:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "outcome": "answered",
+        "page_count": 1,
+        "pin_age_s": 30.0,
+        "pin_id": "pin:cursor_pin:detection_list",
+        "pin_kind": "cursor_pin",
+        "projection_fields_digest": "j:d9880f7e5533127c957a390d3df86d180c4916fab343d39945b858b3ed086629",
+        "projection_version": 1,
+        "read_contract_major": 1,
+        "reader": "canonical list reader (cursor paginated)",
+        "reader_version": "0.1.6",
+        "reasons": [],
+        "result_hash": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "retention_class": "R0-derived",
+        "retention_horizon_s": 7776000,
+        "row_count": 0,
+        "row_state": "retention_expired",
+        "snapshot_at": "2026-09-15T02:00:00Z",
+        "truncated": false
+      },
+      "legacy": {
+        "cursor_stable": true,
+        "membership_digest": "m:2b58ed3276ed438c38eca0f509bbbeac97a156bc5ed93e7f520d3162418cce45",
+        "order_digest": "o:14275d2b0e903fcf3feb92ea15399d2854ab10c726146fd2b76c899a5856fc29",
+        "outcome": "answered",
+        "page_count": 1,
+        "pin_age_s": 30.0,
+        "pin_id": "pin:range_pin:detection_list",
+        "pin_kind": "range_pin",
+        "projection_fields_digest": "j:d9880f7e5533127c957a390d3df86d180c4916fab343d39945b858b3ed086629",
+        "projection_version": 1,
+        "read_contract_major": 1,
+        "reader": "tools/hear_annotate server.py /api/queue + /pool products",
+        "reader_version": "0.1.6",
+        "reasons": [],
+        "result_hash": "sha256:217bf671a6908e0f4c355e540837658f8c37ecb7a873d335311d3fd37e0b1aa7",
+        "retention_class": "R0-derived",
+        "retention_horizon_s": 7776000,
+        "row_count": 3,
+        "row_state": "present",
+        "snapshot_at": "2026-09-15T02:00:00Z",
+        "truncated": false
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "retention_divergence",
+      "gate_impact": "none",
+      "notes": [
+        "one surface has pruned rows the other still lists, and the window is not near either declared horizon"
+      ],
+      "repair_action": "manual_review",
+      "severity": "warn"
+    },
+    "window": {
+      "as_of": "2026-09-15T02:00:00Z",
+      "end": "2026-09-15T02:00:00Z",
+      "settle_s": 900.0,
+      "start": "2026-09-15T01:00:00Z"
+    }
+  }
+}
