@@ -28,6 +28,8 @@
 #include <Update.h>
 #include "esp_ota_ops.h"
 #include "esp_task_wdt.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_cpu.h"     // cycle counter for /dsp
 #include <hear_boot.h>
 #include "mel_impulse.h"
@@ -1785,6 +1787,13 @@ static void boot_wdt_service() {
   if (boot_wdt_live) esp_task_wdt_reset();
   yield();
 }
+
+// The call path that actually blocks in loop() must stay under the watchdog after the boot probes
+// finish. A rearm here keeps the main loop and the network pump from silently freezing a node into
+// an unreachable state that never advances the failback counter.
+static void loop_wdt_arm(uint32_t ms) {
+  boot_wdt_arm(ms);
+}
 static void boot_wait_ms(uint32_t ms) {
   uint32_t t0 = millis();
   while (millis() - t0 < ms) { boot_wdt_service(); delay(1); }
@@ -2569,6 +2578,7 @@ static char clip_rand[CLIP_RAND_HEX + 1] = "000000";
 #define HEAR_PUSH_READ_TIMEOUT_MS   2000u
 #define HEAR_PUSH_FAIL_LOG_MS       60000UL
 #define HEAR_PUSH_HEARTBEAT_MS      10000UL
+#define HEAR_PUSH_RETRY_BASE_MS     1000UL
 #define HEAR_PUSH_HEARTBEAT_MAX_MS  60000UL
 #define HEAR_PUSH_EVENT_NONE        0u
 #define HEAR_PUSH_EVENT_CLIP        1u
@@ -2589,13 +2599,12 @@ static uint32_t push_failures = 0;
 static uint32_t push_last_fail_log_ms = 0;
 
 static uint32_t push_backoff_ms() {
-  if (!push_failures) return HEAR_PUSH_HEARTBEAT_MS;
-  uint32_t ms = HEAR_PUSH_HEARTBEAT_MS;
-  for (uint32_t k = 0; k < push_failures && ms < HEAR_PUSH_HEARTBEAT_MAX_MS; k++) {
-    if (ms > HEAR_PUSH_HEARTBEAT_MAX_MS / 2) return HEAR_PUSH_HEARTBEAT_MAX_MS;
-    ms *= 2;
+  uint32_t cap = HEAR_PUSH_RETRY_BASE_MS;
+  for (uint32_t k = 1; k < push_failures && cap < HEAR_PUSH_HEARTBEAT_MAX_MS; k++) {
+    cap = cap > HEAR_PUSH_HEARTBEAT_MAX_MS / 2 ? HEAR_PUSH_HEARTBEAT_MAX_MS : cap * 2;
   }
-  return ms > HEAR_PUSH_HEARTBEAT_MAX_MS ? HEAR_PUSH_HEARTBEAT_MAX_MS : ms;
+  uint32_t delay_ms = (uint32_t)random((long)cap + 1L);
+  return delay_ms ? delay_ms : 1;
 }
 
 static void push_schedule_heartbeat(uint32_t delay_ms) {
@@ -2674,6 +2683,7 @@ static void push_fill_event(const struct HearPushEvent *src, hear_push_event_t *
 }
 
 static bool push_post_json(const char *path, const char *body, size_t body_len, int *code_out) {
+  boot_wdt_service();
   if (!sta_ok || WiFi.status() != WL_CONNECTED) {
     if (code_out) *code_out = -2;
     return false;
@@ -2711,6 +2721,7 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
   WiFiClient client;
 #endif
   client.setNoDelay(true);
+  boot_wdt_service();
   if (!client.connect(HEAR_PUSH_HOST, HEAR_PUSH_PORT, HEAR_PUSH_CONNECT_TIMEOUT_MS)) {
     if (code_out) *code_out = -4;
     return false;
@@ -2768,6 +2779,7 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
   // never told anyone. One bounded read of the "HTTP/1.1 NNN ..." line is enough to know which
   // one happened; the body (if any) is discarded because nothing here consumes it.
   client.setTimeout(HEAR_PUSH_READ_TIMEOUT_MS);
+  boot_wdt_service();
   String status_line = client.readStringUntil('\n');
   client.stop();
   int code = -6;  // no status line arrived within the read timeout
@@ -3175,7 +3187,7 @@ static String status_json() {
       "\"gps\":\"%s\",\"pps\":\"%s\",\"wifi\":\"%s\"},"
     "\"net\":{\"connected\":%s,\"rssi\":%s,\"rssi_join\":%d,\"ch\":%d,\"bssid\":\"%s\",\"joined\":%d,"
       "\"seen\":%d,\"join_ms\":%lu,\"disc\":%lu,\"reconn\":%lu,\"reason\":%d,\"disc_age_s\":%s},"
-    "\"sys\":{\"reset\":\"%s\",\"heap_min\":%lu,\"psram_min\":%lu,\"loop_max_ms\":%lu,"
+    "\"sys\":{\"reset\":\"%s\",\"heap_min\":%lu,\"heap_max_alloc\":%lu,\"stack_high_watermark_words\":%lu,\"psram_min\":%lu,\"loop_max_ms\":%lu,"
       "\"loop_max_boot_ms\":%lu,\"loop_max_boot_at_s\":%lu,\"chip_c\":%.1f,\"stream_stalls\":%lu,\"stream_gone\":%lu},"
     "\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
@@ -3257,7 +3269,8 @@ static String status_json() {
     bssid_str(), net_join.joined, net_join.seen, (unsigned long)net_join.join_ms,
     (unsigned long)hear_net_disconnects(), (unsigned long)hear_net_reconnects(),
     hear_net_last_reason(), disc_age_json(),
-    reset_reason_name(), (unsigned long)ESP.getMinFreeHeap(), (unsigned long)ESP.getMinFreePsram(),
+    reset_reason_name(), (unsigned long)ESP.getMinFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(),
+    (unsigned long)uxTaskGetStackHighWaterMark(NULL), (unsigned long)ESP.getMinFreePsram(),
     (unsigned long)(loop_max_us / 1000), (unsigned long)(loop_max_boot_us / 1000),
     (unsigned long)loop_max_boot_at_s, temperatureRead(),
     (unsigned long)stream_stall_n, (unsigned long)stream_gone_n,
@@ -3875,7 +3888,6 @@ void setup() {
   // longer than that. Must precede begin(), which keeps a queue that already exists.
   Serial.setRxBufferSize(HEAR_PROV_LINE_MAX + 64);
   Serial.begin(115200);
-  Serial.setTxTimeoutMs(50);
   delay(1500);
   boot_ms = millis();
   det_boot_id = ((uint64_t)esp_random() << 32) ^ (uint64_t)esp_random();
@@ -3886,6 +3898,20 @@ void setup() {
   logf("\n=== dama-hear node %s (%s) fw %s, credentials %s%s ===\n", node_id, node_class, FW_BUILD,
        prov_src, prov_nvs ? ", in NVS" : "");
   logf("boot  reset reason %s\n", reset_reason_name());
+  RTC_NOINIT_ATTR static uint32_t last_reset_reason = 0;
+  RTC_NOINIT_ATTR static uint32_t last_panic_code = 0;
+  RTC_NOINIT_ATTR static uint32_t last_boot_try = 0;
+  uint32_t reset_reason = (uint32_t)esp_reset_reason();
+  last_reset_reason = reset_reason;
+  last_boot_try = (uint32_t)hear_boot_try();
+  switch (reset_reason) {
+    case ESP_RST_PANIC: last_panic_code = 0x0001u; break;
+    case ESP_RST_INT_WDT: case ESP_RST_WDT: last_panic_code = 0x0002u; break;
+    case ESP_RST_TASK_WDT: last_panic_code = 0x0003u; break;
+    default: last_panic_code = 0; break;
+  }
+  logf("boot  rtc postmortem reset=%s boot_try=%lu panic_code=0x%08lx\n",
+       reset_reason_name(), (unsigned long)last_boot_try, (unsigned long)last_panic_code);
 
   // Strongest configured network first, and the strongest access point within it. An outdoor node
   // may reach several, and the first to answer is not the one it hears best.
@@ -4807,6 +4833,9 @@ void setup() {
   }
   log_selftest();
   boot_wdt_disarm();
+  // The boot probes are done. Re-arm for the live loop and the network send path so a hang becomes a
+  // reset instead of a silent dead node that never reaches healthy or marks the partition bad.
+  loop_wdt_arm(5000);
   push_init();
 }
 
@@ -5246,6 +5275,7 @@ void loop() {
       if (d > loop_max_boot_us) { loop_max_boot_us = d; loop_max_boot_at_s = (millis() - boot_ms) / 1000; }
     }
     last_us = now; }
+  boot_wdt_service();
   http.handleClient();
   audio_pump();
   prov_serial_poll();
@@ -5471,9 +5501,21 @@ void loop() {
     }
   }
 
+  static uint32_t wifi_retry_at = 0;
+  static uint32_t wifi_failures = 0;
   if (sta_ok && WiFi.status() != WL_CONNECTED) {     // AP blipped; a node reconnects
-    static uint32_t retry = 0;
-    if (millis() - retry > 15000) { retry = millis(); WiFi.reconnect(); }
+    if ((int32_t)(millis() - wifi_retry_at) >= 0) {
+      WiFi.reconnect();
+      uint32_t cap = 1000UL;
+      for (uint32_t k = 1; k < wifi_failures && cap < 60000UL; k++)
+        cap = cap > 30000UL ? 60000UL : cap * 2;
+      uint32_t delay_ms = (uint32_t)random((long)cap + 1L);
+      wifi_retry_at = millis() + (delay_ms ? delay_ms : 1);
+      wifi_failures++;
+    }
+  } else if (sta_ok) {
+    wifi_retry_at = 0;
+    wifi_failures = 0;
   }
 
   if (prov.n > 0) hear_boot_tick(sta_ok);          // reachability is the sketch's to answer, not the library's

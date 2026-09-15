@@ -29,11 +29,14 @@
 #include <esp_ota_ops.h>
 #include <esp_mac.h>
 #include "soc/gpio_struct.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <Wire.h>
 #include "driver/gpio.h"
 #include <ESP_I2S.h>
 #include <WiFiUdp.h>
 #include <time.h>
+#include <esp_task_wdt.h>
 #include <hear_boot.h>   // ⚠️unconditional: nesting it in the secrets guard
                           // builds a sketch with no failback and no error
 
@@ -85,6 +88,28 @@ struct NtpResult {
 static char node_id[24];
 static WebServer http(80);
 static bool sta_ok = false;
+static uint32_t wifi_retry_at = 0;
+static uint32_t wifi_failures = 0;
+static bool task_wdt_live = false;
+static void task_wdt_arm(uint32_t ms) {
+  esp_task_wdt_config_t c = { .timeout_ms = ms, .idle_core_mask = 0, .trigger_panic = true };
+  if (esp_task_wdt_reconfigure(&c) != ESP_OK) esp_task_wdt_init(&c);
+  esp_task_wdt_add(NULL);
+  esp_task_wdt_reset();
+  task_wdt_live = true;
+}
+static void task_wdt_service() {
+  if (task_wdt_live) esp_task_wdt_reset();
+  yield();
+}
+
+static uint32_t wifi_backoff_ms() {
+  uint32_t cap = 1000UL;
+  for (uint32_t k = 1; k < wifi_failures && cap < 60000UL; k++)
+    cap = cap > 30000UL ? 60000UL : cap * 2;
+  uint32_t delay_ms = (uint32_t)random((long)cap + 1L);
+  return delay_ms ? delay_ms : 1;
+}
 
 // ---------------------------------------------------------------- admin auth
 #ifndef HEAR_REQUIRE_ADMIN_AUTH
@@ -158,6 +183,23 @@ static void node_identity() {
   uint8_t m[6]; esp_efuse_mac_get_default(m);
   snprintf(node_id, sizeof node_id, "puc-%02x%02x%02x", m[3], m[4], m[5]);
 #endif
+}
+
+static void rtc_postmortem_boot_log() {
+  RTC_NOINIT_ATTR static uint32_t last_reset_reason = 0;
+  RTC_NOINIT_ATTR static uint32_t last_panic_code = 0;
+  RTC_NOINIT_ATTR static uint32_t last_boot_try = 0;
+  uint32_t reason = (uint32_t)esp_reset_reason();
+  last_reset_reason = reason;
+  last_boot_try = (uint32_t)hear_boot_try();
+  switch (reason) {
+    case ESP_RST_PANIC: last_panic_code = 0x0001u; break;
+    case ESP_RST_INT_WDT: case ESP_RST_WDT: last_panic_code = 0x0002u; break;
+    case ESP_RST_TASK_WDT: last_panic_code = 0x0003u; break;
+    default: last_panic_code = 0; break;
+  }
+  Serial.printf("boot  rtc reset=%s boot_try=%lu panic_code=0x%08lx\n",
+                reset_name(), (unsigned long)last_boot_try, (unsigned long)last_panic_code);
 }
 
 // ---------------------------------------------------------------- GPS (PMTK, not UBX)
@@ -718,22 +760,24 @@ static void routes() {
     char b[700];
     snprintf(b, sizeof b,
       "<pre>dama-hear PUC node %s (%s)\n\n"
-      "uptime  %lus\nheap    %lu   psram %lu\n"
+      "uptime  %lus\nheap    %lu min %lu max_alloc %lu stack_low_words %lu psram %lu\n"
       "gps     fix %d, %d sats, %s   sentences %lu (%lu valid)\n"
       "pps     %lu edges on GPIO%d\n\n"
       "/status /pins /i2c /i2creg /rtc /time /timesync /sqw /pdmscan /mic /scan /scanpd /scanpu /gps /pmtk?cmd= /pps /ota /update /reboot\n</pre>",
       node_id, NODE_CLASS, (unsigned long)(millis() / 1000),
-      (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getFreePsram(),
+      (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(),
+      (unsigned long)ESP.getMaxAllocHeap(), (unsigned long)uxTaskGetStackHighWaterMark(NULL),
+      (unsigned long)ESP.getFreePsram(),
       gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences, (unsigned long)gps_valid,
       (unsigned long)pps_count, PPS_PIN);
     http.send(200, "text/html", b);
   });
 
   http.on("/status", []() {
-    char b[900];
+    char b[1100];
     snprintf(b, sizeof b,
       "{\"node\":\"%s\",\"class\":\"%s\",\"uptime_s\":%lu,"
-      "\"reset\":\"%s\",\"power_cycled\":%s,\"heap\":%lu,\"psram\":%lu,"
+      "\"reset\":\"%s\",\"power_cycled\":%s,\"heap\":%lu,\"heap_min\":%lu,\"heap_max_alloc\":%lu,\"stack_high_watermark_words\":%lu,\"psram\":%lu,"
       "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid\":%lu,"
       "\"baud\":%d,\"rx_pin\":%d,\"tx_pin\":%d,\"last\":\"%s\"},"
       "\"pps\":{\"pin\":%d,\"edges\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,"
@@ -742,7 +786,9 @@ static void routes() {
       "\"wifi\":{\"configured\":%s,\"sta\":%s,\"rssi\":%d,\"ip\":\"%s\"}}",
       node_id, NODE_CLASS, (unsigned long)(millis() / 1000),
       reset_name(), esp_reset_reason() == ESP_RST_POWERON ? "true" : "false",
-      (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getFreePsram(),
+      (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(),
+      (unsigned long)ESP.getMaxAllocHeap(), (unsigned long)uxTaskGetStackHighWaterMark(NULL),
+      (unsigned long)ESP.getFreePsram(),
       gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences, (unsigned long)gps_valid,
       GPS_BAUD, GPS_RX_PIN, GPS_TX_PIN, gps_last,
       PPS_PIN, (unsigned long)pps_count,
@@ -1211,10 +1257,23 @@ void setup() {
   http.collectHeaders(auth_headers, 1);
   http.begin();
   Serial.println("http  up -- this board never needs the cable again\n");
+  rtc_postmortem_boot_log();
+  task_wdt_arm(5000);
 }
 
 void loop() {
+  task_wdt_service();
   http.handleClient();
+  if (sta_ok && WiFi.status() != WL_CONNECTED) {
+    if ((int32_t)(millis() - wifi_retry_at) >= 0) {
+      WiFi.reconnect();
+      wifi_retry_at = millis() + wifi_backoff_ms();
+      wifi_failures++;
+    }
+  } else if (sta_ok) {
+    wifi_retry_at = 0;
+    wifi_failures = 0;
+  }
   gps_pump();
   hear_boot_tick(sta_ok);   // ⚠️the argument this node used to ignore
   static uint32_t last = 0;
