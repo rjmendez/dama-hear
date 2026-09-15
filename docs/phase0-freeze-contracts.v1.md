@@ -14,11 +14,11 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | 0cf2c987caf891a2a769a8e9153844f31998bc54996597a85814cbea549c371d |
+| baseline | 17fef1382b1d97d838b71c7cf97e0c072aaf0bdd0706884a8119aa67e54362b1 |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
 | firmware_build_metadata | af9ba585abe4af010b45e0a7aeb3a1061dac602cd8123b15b85588922fd37b34 |
-| schemas | 427c86937d28bd12b6de71c3b4604eae609d2b24edfd4f1a761256bc74a6b580 |
-| published_contracts | 4a58f893566092f45a9608b98489332c06c7ea265d5f5abf46299aba2a3f65c6 |
+| schemas | 248d557d9051b2f32b5e89018296b180cf2772b602b7ed3ad3761989cc412519 |
+| published_contracts | a87c434d400f4f31ec4cc252761fff18ee14355a8170cf80133ef72315c082f3 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |
 | redis_keys | d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03 |
 | kubernetes_and_pvc_layout | bc5c119800506749b5a4b7225771e8c0b871fc47b11568343a7e8e563680a79c |
@@ -106,6 +106,8 @@ Source hashes:
 | hear.calibrated_node_biases.v1 | tools/calibrate_claps.py |
 | hear.clip_tag.v2 | tools/hear_tag.py |
 | hear.experimental_clap_geometry_selfcal.v1 | tools/estimate_geometry_from_claps.py |
+| hear.ingest.batch.receipt.v1 | hear/ingest/batch.py |
+| hear.ingest.batch.v1 | hear/ingest/batch.py |
 | hear.ingest.v1 | hear/ingest/envelope.py |
 | hear.node_positions.v1 | tools/hear_drain.py |
 | hear.sketch.golden.v4 | testdata/sketch_golden.json<br>tools/gen_golden.py |
@@ -121,12 +123,28 @@ Generated artifacts are written by their tools/gen_*.py generator and ruled on b
 
 | contract | schema sha256 | manifest sha256 | fixtures | contract hash |
 | --- | --- | --- | --- | --- |
+| hear.ingest.batch.receipt.v1 | bdd922f393b7a2f988b37f196cf24bc24b40897ae9b3407060aa218d88f0245e | (none) | 0 | 91506c3ca6951a12372f0cddda7732a3987ea6aa548bd85fc6b488975e6cf3f2 |
+| hear.ingest.batch.v1 | 8e1fb2df5e6c0f5a0f386bcdbadcfd0047dc4d8db783e9d698d63c45d5c3032a | 4eb98291717282d709bec5ad92df926d7a2afabef6b37746fa3400a73c1b061d | 20 | 3d8ffd668a6ee4f07c5c5185e2533e83eec97bd5fd3ab0db85f6d95326c5ec59 |
 | hear.ingest.v1 | 604bb162690d127973f15738a5e7a33332b75b345c9d40e4f67646289afd1d70 | 911548909a45dae8c27d41bbcb7fc018b78d3160eeedd529df4606966a5ddbc1 | 10 | 149a18a91bc3652d378f85cbaa5ecd4d65a9afb802144a66886fbbf85be18e51 |
 
 ### Declared fixture outcomes
 
 | contract | fixture | expect_status | dispatchable | reasons | sha256 |
 | --- | --- | --- | --- | --- | --- |
+| hear.ingest.batch.v1 | valid-node-batch | accepted | no | (none) | fa27398775d256af9711c76b6807745c20f909f02785a44e576fa2b70667a958 |
+| hear.ingest.batch.v1 | mixed-version-legacy-messages | accepted | no | (none) | 37cc0d8c2a7ed99381628bdfbcceca921cb0da94b9b69424e95963f46347ed10 |
+| hear.ingest.batch.v1 | poison-item-keeps-batch | accepted | no | (none) | 6b3b360fe0fe5bb2bb7694f3b5910e02e1079e108e69612fe7d504113150211a |
+| hear.ingest.batch.v1 | item-future-major-refused-alone | accepted | no | (none) | 66fc0ab9d3e13a3ba9184715eaba709d5a64797e1d261d53b4e43423c07f90f2 |
+| hear.ingest.batch.v1 | item-identity-mismatch | accepted | no | (none) | 5e6dde945d318cc1f24afdb4e3f68fed9e5cc8932558cacc4f0b5cf281fdb764 |
+| hear.ingest.batch.v1 | gateway-site-scoped-batch | accepted | no | (none) | 81bf21c6b82b66fdd36e936d929c470709a744710f7e84e75c78f21f7a9a1b65 |
+| hear.ingest.batch.v1 | forward-additive-frame-fields | accepted | no | (none) | 9e525a79fb2ec7e4f57845f9d5c58a3dc8bda42040fded07824c0bb44f8a20a1 |
+| hear.ingest.batch.v1 | unrecognized-items-refused | accepted | no | (none) | 21e9f1dce918979758547ce25560ff7807c8002fbfe01a8a6fd62ecb94a5eed6 |
+| hear.ingest.batch.v1 | unsupported-future-batch-major | refused | no | batch_schema_version_unsupported | 918927511f0d9bd34cfe0c011301c737175a2290de2d757a5d4831fef3dbd131 |
+| hear.ingest.batch.v1 | empty-batch | refused | no | batch_empty | fdabe6d57bbf285edb6cea7b8c4da6e3ec191fb6555079575851deb5b3660090 |
+| hear.ingest.batch.v1 | batch-too-many-items | refused | no | batch_too_many_items | 2b41040a60afbf6ccc5604c5aae1c87b5ddba411ae7b7a920fe0f55a7ec57663 |
+| hear.ingest.batch.v1 | device-identity-mismatch | refused | no | device_identity_mismatch | 60fbc0c403e04ddeca1d59b9539fc6ad52f5fb51da9697fbc9faeb21009a0804 |
+| hear.ingest.batch.v1 | missing-credential | refused | no | credential_missing | fa27398775d256af9711c76b6807745c20f909f02785a44e576fa2b70667a958 |
+| hear.ingest.batch.v1 | malformed-frame-field-types | refused | no | timestamp_not_rfc3339_utc, type_invalid | a7d4e65fae2b3828565de1fc39e4ad54c62468796129986c6a7402e2f3abfa37 |
 | hear.ingest.v1 | valid-node-detection | accepted | yes | (none) | 3a43b833cd2ac44caebde0a151858527302b6b56308b6f710ba77681ae24dde2 |
 | hear.ingest.v1 | degraded-no-clock-anchor | accepted | yes | (none) | 18034d456e4e359341501d1994edb791f39c383b0d43f81bbf13ab8f76e7bbc4 |
 | hear.ingest.v1 | minimal-legacy-producer | accepted | yes | (none) | 4661e871a7ee4179a377bc60112ae0b1db8c53cf397a13a9d287772ecb922e1e |
@@ -142,7 +160,28 @@ Generated artifacts are written by their tools/gen_*.py generator and ruled on b
 
 | path | size_bytes | sha256 |
 | --- | --- | --- |
-| contracts/README.md | 2081 | 1775a7dc72a27613405e6edfeb2c5eae7f0277237199d5830179d8bbac4ff8fe |
+| contracts/README.md | 2630 | 8f247b09d00305f59620e533e9a3f27dae1427c91256b372bb451a0a0e0ea8e5 |
+| contracts/fixtures/hear.ingest.batch.v1/batch-too-many-items.json | 850 | 2b41040a60afbf6ccc5604c5aae1c87b5ddba411ae7b7a920fe0f55a7ec57663 |
+| contracts/fixtures/hear.ingest.batch.v1/device-identity-mismatch.json | 1326 | 60fbc0c403e04ddeca1d59b9539fc6ad52f5fb51da9697fbc9faeb21009a0804 |
+| contracts/fixtures/hear.ingest.batch.v1/empty-batch.json | 325 | fdabe6d57bbf285edb6cea7b8c4da6e3ec191fb6555079575851deb5b3660090 |
+| contracts/fixtures/hear.ingest.batch.v1/forward-additive-frame-fields.json | 3376 | 9e525a79fb2ec7e4f57845f9d5c58a3dc8bda42040fded07824c0bb44f8a20a1 |
+| contracts/fixtures/hear.ingest.batch.v1/gateway-site-scoped-batch.json | 2413 | 81bf21c6b82b66fdd36e936d929c470709a744710f7e84e75c78f21f7a9a1b65 |
+| contracts/fixtures/hear.ingest.batch.v1/gateway-site-scoped-batch.receipt.json | 861 | 8f8f32c8dcccec0de69886798304ac93deefd2d72190f739c8496e2228bbb1eb |
+| contracts/fixtures/hear.ingest.batch.v1/item-future-major-refused-alone.json | 2326 | 66fc0ab9d3e13a3ba9184715eaba709d5a64797e1d261d53b4e43423c07f90f2 |
+| contracts/fixtures/hear.ingest.batch.v1/item-future-major-refused-alone.receipt.json | 870 | bfd941f1f9e2faa48235fad3a9d1d31d530b4eb24ad990a97b4070de3cdc9d35 |
+| contracts/fixtures/hear.ingest.batch.v1/item-identity-mismatch.json | 2325 | 5e6dde945d318cc1f24afdb4e3f68fed9e5cc8932558cacc4f0b5cf281fdb764 |
+| contracts/fixtures/hear.ingest.batch.v1/item-identity-mismatch.receipt.json | 866 | 38d2ab915f68581f22d51db5b53fb1562a356be6e0ac260b8d13381a8dcc0cbc |
+| contracts/fixtures/hear.ingest.batch.v1/malformed-frame-field-types.json | 1333 | a7d4e65fae2b3828565de1fc39e4ad54c62468796129986c6a7402e2f3abfa37 |
+| contracts/fixtures/hear.ingest.batch.v1/manifest.json | 15336 | 4eb98291717282d709bec5ad92df926d7a2afabef6b37746fa3400a73c1b061d |
+| contracts/fixtures/hear.ingest.batch.v1/missing-credential.json | 3321 | fa27398775d256af9711c76b6807745c20f909f02785a44e576fa2b70667a958 |
+| contracts/fixtures/hear.ingest.batch.v1/mixed-version-legacy-messages.json | 1799 | 37cc0d8c2a7ed99381628bdfbcceca921cb0da94b9b69424e95963f46347ed10 |
+| contracts/fixtures/hear.ingest.batch.v1/poison-item-keeps-batch.json | 3222 | 6b3b360fe0fe5bb2bb7694f3b5910e02e1079e108e69612fe7d504113150211a |
+| contracts/fixtures/hear.ingest.batch.v1/poison-item-keeps-batch.receipt.json | 1082 | 45d22a01d8e8d9769aff965ee4c8053ef156373365bc023962ea817550c1e54c |
+| contracts/fixtures/hear.ingest.batch.v1/unrecognized-items-refused.json | 1382 | 21e9f1dce918979758547ce25560ff7807c8002fbfe01a8a6fd62ecb94a5eed6 |
+| contracts/fixtures/hear.ingest.batch.v1/unrecognized-items-refused.receipt.json | 1071 | bbe4d9b11dfa9cfdcf7e75f8c55fb6cf2215cd8fb97753da81fd5bef7dacd63b |
+| contracts/fixtures/hear.ingest.batch.v1/unsupported-future-batch-major.json | 3321 | 918927511f0d9bd34cfe0c011301c737175a2290de2d757a5d4831fef3dbd131 |
+| contracts/fixtures/hear.ingest.batch.v1/valid-node-batch.json | 3321 | fa27398775d256af9711c76b6807745c20f909f02785a44e576fa2b70667a958 |
+| contracts/fixtures/hear.ingest.batch.v1/valid-node-batch.receipt.json | 1081 | 1511808fa47bef11ac25942f2f9863bae8ad4bf68c18f1b712235b373a9a612f |
 | contracts/fixtures/hear.ingest.v1/degraded-no-clock-anchor.json | 790 | 18034d456e4e359341501d1994edb791f39c383b0d43f81bbf13ab8f76e7bbc4 |
 | contracts/fixtures/hear.ingest.v1/forward-additive-stripped.json | 860 | 33fba79f29783a82372a055fd2dff9f855b55be440bbabbc6d705ae2e60a7a21 |
 | contracts/fixtures/hear.ingest.v1/forward-additive-unknown-fields.json | 954 | bf48c1df998bd7d8cf148fbe43c634f7b9c6691b70c3530dba91edc04c33f04d |
@@ -154,6 +193,8 @@ Generated artifacts are written by their tools/gen_*.py generator and ruled on b
 | contracts/fixtures/hear.ingest.v1/minimal-legacy-producer.json | 625 | 4661e871a7ee4179a377bc60112ae0b1db8c53cf397a13a9d287772ecb922e1e |
 | contracts/fixtures/hear.ingest.v1/unsupported-future-major.json | 862 | 5ea74e18ec0396e5516c7f4b30ee98ef028c29cf3e69e74b5fdf08c3a6bd4afd |
 | contracts/fixtures/hear.ingest.v1/valid-node-detection.json | 862 | 3a43b833cd2ac44caebde0a151858527302b6b56308b6f710ba77681ae24dde2 |
+| contracts/schemas/hear.ingest.batch.receipt.v1.schema.json | 5839 | bdd922f393b7a2f988b37f196cf24bc24b40897ae9b3407060aa218d88f0245e |
+| contracts/schemas/hear.ingest.batch.v1.schema.json | 4145 | 8e1fb2df5e6c0f5a0f386bcdbadcfd0047dc4d8db783e9d698d63c45d5c3032a |
 | contracts/schemas/hear.ingest.v1.schema.json | 5543 | 604bb162690d127973f15738a5e7a33332b75b345c9d40e4f67646289afd1d70 |
 
 ## MQTT topics
