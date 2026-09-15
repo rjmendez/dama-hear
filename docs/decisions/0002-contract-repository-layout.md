@@ -117,12 +117,18 @@ those rules are *checkable from outside this repository*:
 - `tools/freeze_contracts.py --check` now runs in CI. The Phase 0 baseline was reproducible
   but ungated, so a contract-affecting change could land without the frozen inventory
   noticing. This closes that.
-- **Known gap, deliberately not closed here.** `freeze_contracts.py` scans `hear`, `modules`,
-  `tools`, `testdata`, `tests/fixtures` and `docs/data` — not `contracts/`. A published
-  artifact is therefore covered by its generator's drift gate but is not hashed into the
-  frozen baseline. Extending the scan roots regenerates the baseline files, which the
-  envelope lane is concurrently editing, so it is sequenced as a follow-up after that lane
-  merges rather than raced with it.
+- **Known gap, closed after the envelope lane merged.** `freeze_contracts.py` originally
+  scanned `hear`, `modules`, `tools`, `testdata`, `tests/fixtures` and `docs/data` — not
+  `contracts/`. A published artifact was covered by its generator's drift gate but was not
+  hashed into the frozen baseline, so a generated schema, fixture or manifest could be
+  edited while `--check` still passed. The freeze now carries a `published_contracts`
+  section that records each published contract's schema, fixture and manifest bytes plus
+  the manifest's declared outcomes. It stays an inventory: the generator still owns what
+  the artifacts say, `check_contract_layout.py` still owns where they may live, and the
+  freeze only guarantees that editing one moves the baseline hash.
+- The published artifacts are inventoried, never treated as a source of truth. Rule 1 reads
+  `schemas.schema_identifiers`, which continues to scan owning modules only, so a generated
+  `contracts/` path can never satisfy a contract's source-of-truth requirement.
 
 ## Ownership
 
@@ -161,4 +167,6 @@ checker land independently of the lane that creates the first contract.
 - The `dama-platform/` extraction becomes a directory rename rather than a content rewrite.
 - Adding a contract is mechanically constrained: source module, generator, CI wiring,
   decision record, fixtures with declared outcomes — or it does not merge.
-- The freeze-scope gap above remains open and is the one follow-up this record creates.
+- The freeze-scope gap this record created is closed: published artifacts are hashed into
+  `docs/data/phase0-freeze-contracts.v1.json`, so a contract edit that skips its generator
+  fails `tools/freeze_contracts.py --check` as well as the generator's own drift gate.
