@@ -24,6 +24,28 @@ reviewed implementation (AES-GCM / ChaCha20-Poly1305) behind a KMS, injected thr
 `HmacCtrCipher.production_ready` is `False` and `ObjectCrypto` refuses to be built from a
 not-production-ready cipher unless it is explicitly told this is a test (`allow_test_cipher=True`).
 
+⚠️THE DEFAULT CIPHER ENCRYPTS NOTHING. `RefusingCipher` is what `ObjectCrypto()` and `Importer()`
+get when nobody chose, and it raises on `seal`. The earlier default -- "construct the test cipher
+and pass `allow_test_cipher=True` on the caller's behalf" -- made the guard decorative, because the
+one wiring that was supposed to be a deliberate act was the one the constructor performed for you.
+Only test code may name `HmacCtrCipher`, and it must still say `allow_test_cipher=True` to use it.
+
+⚠️ONE DEK, TWO INDEPENDENT (KEY, NONCE) PAIRS, DERIVED WITH HKDF. The body and the sealed metadata
+sub-document are separate streams under the same data key, so they must never share a keystream: a
+CTR-mode stream reused across two messages gives up `P1 XOR P2`, and the metadata plaintext is a
+known JSON shape, which makes that an unmasking of the body. `hkdf_expand` (RFC 5869, HMAC-SHA256)
+derives `body/key`, `body/nonce`, `metadata/key` and `metadata/nonce` under distinct info strings
+bound to the tenant, class, key id and cipher name. A real AEAD drops into the same seam and gets
+the same four values.
+
+⚠️A NONCE IS DERIVED FROM THE SECRET DEK AND IS NEVER PUBLISHED. It used to be
+`sha256("nonce/" + plaintext_digest + wrapped_key)`, with both inputs public -- which is a
+confirmation oracle with no key at all: guess the plaintext, recompute, compare to the published
+nonce. Now every nonce comes out of the HKDF over the DEK, so reproducing one requires the KEK, and
+nothing digest-derived appears in any published field. `wrapped_key_hex` stays public because
+unwrapping it needs the KEK; it is convergent on the plaintext digest, which is the same
+intra-tenant equality leak the HMAC blob id already carries, and it is not verifiable from a guess.
+
 NOT PRODUCTION: no backend is selected, no KMS exists, and no gate (G0-G6) is satisfied.
 """
 from __future__ import annotations
@@ -40,6 +62,48 @@ from . import streaming as S
 #: The AEAD tag is appended to the ciphertext stream as its final chunk.
 TAG_BYTES = 32
 NONCE_BYTES = 16
+KEY_BYTES = 32
+#: Everything derived under this label is bound to this package and this schema version.
+KDF_LABEL = b"hear/objectstore/v1"
+#: What the metadata records about the derivation, so a reader never has to guess it.
+KDF_NAME = "hkdf-sha256"
+
+
+def hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
+    """RFC 5869 extract. The DEK is already uniform, but extract costs nothing and keeps it RFC."""
+    return hmac.new(salt or b"\x00" * 32, ikm, hashlib.sha256).digest()
+
+
+def hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
+    """RFC 5869 expand over HMAC-SHA256, stdlib only, no third-party dependency in this package."""
+    if length > 255 * 32:
+        raise ValueError("hkdf-sha256 cannot expand that far")
+    out = b""
+    block = b""
+    counter = 1
+    while len(out) < length:
+        block = hmac.new(prk, block + info + bytes([counter]), hashlib.sha256).digest()
+        out += block
+        counter += 1
+    return out[:length]
+
+
+def derive_stream_material(dek: bytes, purpose: str, context: bytes) -> tuple:
+    """`(key, nonce)` for one purpose. ⚠️TWO PURPOSES NEVER SHARE EITHER HALF.
+
+    `purpose` is `body` or `metadata`. Both are sealed under the same DEK -- that is what makes a
+    single wrapped key enough to read an object -- so the *only* thing keeping the body's keystream
+    away from the metadata's is this derivation. `context` binds the pair to the tenant, the data
+    class, the key id and the cipher name, so the same DEK reached through a different key ref or a
+    swapped cipher does not reproduce the same keystream either.
+    """
+    if purpose not in ("body", "metadata"):
+        raise ValueError("unknown key purpose: %r" % (purpose,))
+    prk = hkdf_extract(KDF_LABEL + b"/salt", dek)
+    info = KDF_LABEL + b"/" + purpose.encode() + b"/" + context
+    block = hkdf_expand(prk, info + b"/key", KEY_BYTES)
+    nonce = hkdf_expand(prk, info + b"/nonce", NONCE_BYTES)
+    return block, nonce
 
 
 class KeyUnavailable(Exception):
@@ -137,21 +201,29 @@ class InMemoryTestKeyProvider:
     def tenant_index_key(self, tenant_id: str) -> bytes:
         return hashlib.sha256(b"index/" + tenant_id.encode() + b"/" + self._seed).digest()
 
+    def _wrap_mask(self, tenant_id: str, data_class: str) -> bytes:
+        return hkdf_expand(hkdf_extract(KDF_LABEL + b"/wrap", self._kek(tenant_id, data_class)),
+                           KDF_LABEL + b"/wrap/mask", KEY_BYTES)
+
     def data_key(self, tenant_id: str, data_class: str, context: str) -> SealedKey:
         # Convergent on the plaintext digest, so re-sealing the same bytes is byte-identical and
         # dedupe survives. A real provider does the same derivation inside the KMS.
+        #
+        # ⚠️`wrapped` IS CONVERGENT TOO, AND THAT IS NOT AN ORACLE: reproducing it from a guessed
+        # plaintext needs the KEK, which never leaves this object. What it does leak is the same
+        # intra-tenant equality the HMAC blob id already leaks. It has to be deterministic --
+        # metadata is digest-addressed and immutable, so a wrapping that changed per run would make
+        # every replay write a new metadata object and turn an idempotent re-run into a conflict.
         self._issued += 1
         dek = hashlib.sha256(b"dek/" + context.encode() + b"/"
                              + self._kek(tenant_id, data_class)).digest()
-        kek = self._kek(tenant_id, data_class)
-        wrapped = bytes(a ^ b for a, b in zip(dek, hashlib.sha256(b"wrap/" + kek).digest()))
+        wrapped = bytes(a ^ b for a, b in zip(dek, self._wrap_mask(tenant_id, data_class)))
         ref = KeyRef(provider=self.name, tenant_id=tenant_id, data_class=data_class,
                      key_id="kek-v%d" % self._kek_version)
         return SealedKey(key=dek, wrapped=wrapped, ref=ref)
 
     def open_key(self, ref: KeyRef, wrapped: bytes) -> bytes:
-        kek = self._kek(ref.tenant_id, ref.data_class)
-        return bytes(a ^ b for a, b in zip(wrapped, hashlib.sha256(b"wrap/" + kek).digest()))
+        return bytes(a ^ b for a, b in zip(wrapped, self._wrap_mask(ref.tenant_id, ref.data_class)))
 
 
 class Cipher(Protocol):
@@ -163,6 +235,28 @@ class Cipher(Protocol):
     def seal(self, key: bytes, nonce: bytes, chunks: Iterable[bytes]) -> Iterator[bytes]: ...
 
     def open(self, key: bytes, nonce: bytes, chunks: Iterable[bytes]) -> Iterator[bytes]: ...
+
+
+class RefusingCipher:
+    """The default. It has no algorithm, and that is the point -- see the module docstring.
+
+    It is not "not production ready" in the way a test double is; it cannot encrypt at all, so
+    `ObjectCrypto` admits it without `allow_test_cipher` and an importer nobody configured still
+    cannot put a restricted class anywhere. `is_refusing` is what the constructor checks, so a
+    future real cipher -- which will not carry that flag -- can never slide into this slot.
+    """
+
+    name = "refusing"
+    production_ready = False
+    is_refusing = True
+
+    def seal(self, key: bytes, nonce: bytes, chunks: Iterable[bytes]) -> Iterator[bytes]:
+        raise KeyUnavailable("no cipher is configured; nothing may be sealed")
+        yield b""  # pragma: no cover - unreachable, keeps this a generator function
+
+    def open(self, key: bytes, nonce: bytes, chunks: Iterable[bytes]) -> Iterator[bytes]:
+        raise KeyUnavailable("no cipher is configured; nothing may be opened")
+        yield b""  # pragma: no cover - unreachable, keeps this a generator function
 
 
 class HmacCtrCipher:
@@ -271,12 +365,20 @@ class ObjectCrypto:
     def __init__(self, provider: Optional[KeyProvider] = None, *, cipher: Optional[Cipher] = None,
                  tenant_id: str = "dama", allow_test_cipher: bool = False) -> None:
         self.provider = provider or NoKeyProvider()
-        self.cipher = cipher or HmacCtrCipher()
+        self.cipher = cipher or RefusingCipher()
         self.tenant_id = tenant_id
+        if getattr(self.cipher, "is_refusing", False):
+            return
         if not getattr(self.cipher, "production_ready", False) and not allow_test_cipher:
             raise KeyUnavailable(
                 "%r is not a production cipher; pass allow_test_cipher=True to use it in a test"
                 % (getattr(self.cipher, "name", self.cipher),))
+
+    @property
+    def can_seal(self) -> bool:
+        """False for the default wiring. Nothing here seals until someone chose both halves."""
+        return not getattr(self.cipher, "is_refusing", False) \
+            and not isinstance(self.provider, NoKeyProvider)
 
     # ------------------------------------------------------------------ ids
 
@@ -311,14 +413,13 @@ class ObjectCrypto:
         """
         sealed_key = self.provider.data_key(self.tenant_id, data_class or object_class,
                                             plaintext_digest)
-        nonce = hashlib.sha256(
-            b"nonce/" + plaintext_digest.encode() + b"/" + sealed_key.wrapped
-        ).digest()[:NONCE_BYTES]
+        context = self._context(sealed_key.ref)
+        body_key, body_nonce = derive_stream_material(sealed_key.key, "body", context)
         state: Dict[str, Any] = {"plain": None, "cipher": None}
 
         def _chunks() -> Iterator[bytes]:
             plain = S.DigestingChunks(source())
-            out = S.DigestingChunks(self.cipher.seal(sealed_key.key, nonce, plain))
+            out = S.DigestingChunks(self.cipher.seal(body_key, body_nonce, plain))
             for chunk in out:
                 yield chunk
             state["plain"] = plain.stat()
@@ -337,7 +438,7 @@ class ObjectCrypto:
                 plaintext_digest=plain.digest, plaintext_bytes=plain.bytes,
                 ciphertext_bytes=ct.bytes, cipher_name=self.cipher.name,
                 ciphertext_digest=ct.digest, key_ref=sealed_key.ref,
-                sealed_metadata=self._seal_metadata(sealed_key, nonce, {
+                sealed_metadata=self._seal_metadata(sealed_key, {
                     "plaintext": {"algo": "sha256", "digest": plain.digest, "bytes": plain.bytes},
                 }))
 
@@ -346,8 +447,8 @@ class ObjectCrypto:
     def open_stream(self, sealed: SealedObject, source: S.ChunkSource) -> S.ChunkSource:
         """Reader-side round trip, used by tests to prove the ciphertext is the plaintext sealed."""
         wrapped = bytes.fromhex(sealed.sealed_metadata["wrapped_key_hex"])
-        key = self.provider.open_key(sealed.key_ref, wrapped)
-        nonce = bytes.fromhex(sealed.sealed_metadata["nonce_hex"])
+        dek = self.provider.open_key(sealed.key_ref, wrapped)
+        key, nonce = derive_stream_material(dek, "body", self._context(sealed.key_ref))
 
         def _open() -> Iterator[bytes]:
             yield from self.cipher.open(key, nonce, source())
@@ -356,27 +457,40 @@ class ObjectCrypto:
 
     # ------------------------------------------------------------- metadata
 
-    def _seal_metadata(self, sealed_key: SealedKey, nonce: bytes,
-                       sensitive: Dict[str, Any]) -> Dict[str, Any]:
-        """The sensitive sub-document, encrypted under the same DEK, plus what a reader needs.
+    def _context(self, ref: KeyRef) -> bytes:
+        """What every derivation is bound to. Public, and useless without the DEK it expands."""
+        return b"|".join([ref.provider.encode(), ref.tenant_id.encode(),
+                          ref.data_class.encode(), ref.key_id.encode(),
+                          self.cipher.name.encode()])
 
-        The wrapped key and the nonce are not secrets -- the KEK is -- so they are carried here;
-        the plaintext digest and any coordinate are inside `ciphertext_hex` and nowhere else.
+    def _seal_metadata(self, sealed_key: SealedKey, sensitive: Dict[str, Any]) -> Dict[str, Any]:
+        """The sensitive sub-document, under its *own* derived key and nonce, plus what a reader needs.
+
+        ⚠️THIS IS NOT THE BODY'S KEYSTREAM. It used to be sealed with the body's `(key, nonce)`,
+        which in CTR mode hands out `body XOR metadata` to anyone holding both ciphertexts -- and
+        the metadata plaintext is a JSON shape you can guess, so that is the body in the clear.
+        `derive_stream_material(..., "metadata", ...)` gives an independent pair from the same DEK.
+
+        The wrapped key is carried here because unwrapping it needs the KEK. The nonce is *not*
+        carried: it is derived from the DEK, so publishing it would be publishing key-derived
+        material for no reader benefit, and the old public nonce was a confirmation oracle.
         """
+        key, nonce = derive_stream_material(sealed_key.key, "metadata",
+                                            self._context(sealed_key.ref))
         body = K.canonical_json(sensitive)
-        blob = b"".join(self.cipher.seal(sealed_key.key, nonce, [body]))
+        blob = b"".join(self.cipher.seal(key, nonce, [body]))
         return {
             "cipher": self.cipher.name,
+            "kdf": KDF_NAME,
             "key_ref": sealed_key.ref.as_metadata(),
             "wrapped_key_hex": sealed_key.wrapped.hex(),
-            "nonce_hex": nonce.hex(),
             "ciphertext_hex": blob.hex(),
         }
 
     def open_metadata(self, sealed: SealedObject) -> Dict[str, Any]:
         doc = sealed.sealed_metadata
-        key = self.provider.open_key(sealed.key_ref, bytes.fromhex(doc["wrapped_key_hex"]))
-        nonce = bytes.fromhex(doc["nonce_hex"])
+        dek = self.provider.open_key(sealed.key_ref, bytes.fromhex(doc["wrapped_key_hex"]))
+        key, nonce = derive_stream_material(dek, "metadata", self._context(sealed.key_ref))
         raw = b"".join(self.cipher.open(key, nonce, [bytes.fromhex(doc["ciphertext_hex"])]))
         import json
 

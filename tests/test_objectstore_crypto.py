@@ -12,6 +12,8 @@ the same digest sat in the object key, which is exactly where it used to be.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 
@@ -272,3 +274,166 @@ def test_two_tenants_do_not_share_a_blob_id_for_identical_bytes(pool, store, tmp
     assert len(blobs) == 2
     assert len({b.rsplit("/", 1)[-1] for b in blobs}) == 2  # different ids, not just prefixes
     assert one.blob_id("clip", pool["clip_digest"])[0] != two.blob_id("clip", pool["clip_digest"])[0]
+
+
+# ------------------------------------- domain separation and the nonce oracle
+
+
+def test_hkdf_matches_the_rfc_5869_test_vector():
+    """The derivation is the published one, not something shaped like it."""
+    ikm = bytes.fromhex("0b" * 22)
+    salt = bytes.fromhex("000102030405060708090a0b0c")
+    info = bytes.fromhex("f0f1f2f3f4f5f6f7f8f9")
+    prk = C.hkdf_extract(salt, ikm)
+    assert prk.hex() == "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
+    assert C.hkdf_expand(prk, info, 42).hex() == (
+        "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+
+
+def test_the_body_and_the_metadata_never_share_a_key_or_a_nonce():
+    dek = bytes(range(32))
+    context = b"in-memory-test|dama|clip|kek-v1|hmac-ctr-etm-sha256"
+    body_key, body_nonce = C.derive_stream_material(dek, "body", context)
+    meta_key, meta_nonce = C.derive_stream_material(dek, "metadata", context)
+
+    assert body_key != meta_key
+    assert body_nonce != meta_nonce
+    assert len({body_key, meta_key, body_nonce, meta_nonce}) == 4
+    assert dek not in (body_key, meta_key)           # the DEK itself is never a stream key
+    # A different key ref or cipher is a different context, so it is a different keystream too.
+    other, _ = C.derive_stream_material(dek, "body", context.replace(b"kek-v1", b"kek-v2"))
+    assert other != body_key
+
+
+def test_xoring_the_body_against_the_sealed_metadata_recovers_nothing(pool, store, tmp_path):
+    """⚠️THE CTR KEYSTREAM REUSE REGRESSION.
+
+    The sealed metadata used to be sealed with the body's `(key, nonce)`. In a CTR construction
+    that publishes `body XOR metadata` to anyone holding both ciphertexts -- and the metadata
+    plaintext is a JSON shape an attacker can write out from the schema, so subtracting it yields
+    the body in the clear. This test performs that attack and requires it to fail.
+    """
+    crypto = C.synthetic_crypto()
+    _importer(store, tmp_path, crypto=crypto).run([_clip_task(pool)])
+    body_ct = store.get_range(store.keys_under("hear/v1/blob/")[0])[:-C.TAG_BYTES]
+    meta = json.loads(store.get_range(store.keys_under("hear/v1/meta/")[0]))
+    meta_ct = bytes.fromhex(meta["sealed"]["ciphertext_hex"])[:-C.TAG_BYTES]
+    plaintext = open(pool["clip_paths"][0], "rb").read()
+
+    # The attacker knows the metadata plaintext exactly: it is a schema-shaped document whose one
+    # unknown, the digest, they are trying to confirm. Give them the real thing -- the strongest
+    # version of the attack -- and the body must still not fall out.
+    known = K.canonical_json({"plaintext": {"algo": "sha256", "digest": pool["clip_digest"],
+                                            "bytes": pool["clip_bytes"]}})
+    n = min(len(body_ct), len(meta_ct), len(known))
+    assert n > 32
+    recovered = bytes(a ^ b ^ c for a, b, c in zip(body_ct[:n], meta_ct[:n], known[:n]))
+    assert recovered != plaintext[:n]
+    assert plaintext[:16] not in recovered
+
+
+def test_no_published_field_confirms_a_guessed_plaintext(pool, store, tmp_path):
+    """⚠️THE CONFIRMATION ORACLE REGRESSION, run as a search rather than a single assertion.
+
+    The nonce used to be `sha256("nonce/" + plaintext_digest + wrapped_key)[:16]`, and both inputs
+    were published -- so anyone who could guess the bytes could recompute it and compare, with no
+    key at all. Here the attacker *has* the plaintext (the strongest guess there is) and every
+    published byte, and must still not be able to reproduce a single published field.
+    """
+    crypto = C.synthetic_crypto()
+    _importer(store, tmp_path, crypto=crypto).run([_clip_task(pool)])
+    keys = store.keys_under("hear/")
+    published = "\n".join(keys) + "\n" + _all_stored_bytes(store).decode("latin-1")
+
+    guess = open(pool["clip_paths"][0], "rb").read()
+    digest = K.sha256_hex(guess)
+    assert digest == pool["clip_digest"]
+    meta = json.loads(store.get_range(store.keys_under("hear/v1/meta/")[0]))
+    wrapped = bytes.fromhex(meta["sealed"]["wrapped_key_hex"])
+
+    # Everything an attacker can compute from the guess plus the public metadata.
+    candidates = {
+        "plaintext_digest": digest,
+        "old_public_nonce": hashlib.sha256(b"nonce/" + digest.encode() + b"/"
+                                           + wrapped).digest()[:C.NONCE_BYTES].hex(),
+        "digest_of_guess_bytes": hashlib.sha256(guess).hexdigest(),
+        "dek_shaped": hashlib.sha256(b"dek/" + digest.encode()).hexdigest(),
+        "hmac_of_digest_under_itself": hmac.new(digest.encode(), guess,
+                                                hashlib.sha256).hexdigest(),
+    }
+    for purpose in ("body", "metadata"):
+        key, nonce = C.derive_stream_material(hashlib.sha256(digest.encode()).digest(), purpose,
+                                              b"in-memory-test|dama|clip|kek-v1|"
+                                              + crypto.cipher.name.encode())
+        candidates["keyless_%s_key" % purpose] = key.hex()
+        candidates["keyless_%s_nonce" % purpose] = nonce.hex()
+
+    for name, value in candidates.items():
+        assert value not in published, "a keyless derivation (%s) appears in published data" % name
+    assert "nonce_hex" not in meta["sealed"]  # the nonce is not published at all any more
+
+    # The positive control: confirmation is possible *with* the key, which is what makes the
+    # negative results above mean something rather than being a property of an unrelated blob.
+    sealed_key = crypto.provider.data_key("dama", "clip", digest)
+    body_key, body_nonce = C.derive_stream_material(sealed_key.key, "body",
+                                                    crypto._context(sealed_key.ref))
+    resealed = b"".join(crypto.cipher.seal(body_key, body_nonce, [guess]))
+    assert resealed == store.get_range(store.keys_under("hear/v1/blob/")[0])
+    assert crypto.blob_id("clip", digest)[0] in "\n".join(keys)
+
+
+def test_the_wrapped_key_cannot_be_reproduced_without_the_kek(pool):
+    """It is convergent on the digest, so it must not be *computable* from the digest."""
+    provider = C.InMemoryTestKeyProvider()
+    digest = pool["clip_digest"]
+    wrapped = provider.data_key("dama", "clip", digest).wrapped
+    assert wrapped != bytes.fromhex(digest[:64])
+    assert wrapped != hashlib.sha256(digest.encode()).digest()
+    # A provider with a different seed -- an attacker guessing the KEK -- gets different material.
+    assert C.InMemoryTestKeyProvider(b"another-seed").data_key("dama", "clip",
+                                                              digest).wrapped != wrapped
+
+
+# ------------------------------------------- the default cipher seals nothing
+
+
+def test_the_default_object_crypto_names_no_cipher_and_can_seal_nothing():
+    crypto = C.ObjectCrypto()
+    assert isinstance(crypto.cipher, C.RefusingCipher)
+    assert crypto.cipher.production_ready is False
+    assert crypto.can_seal is False
+    with pytest.raises(C.KeyUnavailable):
+        b"".join(crypto.cipher.seal(b"k" * 32, b"n" * 16, [b"x"]))
+    with pytest.raises(C.KeyUnavailable):
+        b"".join(crypto.cipher.open(b"k" * 32, b"n" * 16, [b"x"]))
+
+
+def test_a_key_provider_alone_does_not_make_an_importer_able_to_encrypt(pool, store, tmp_path):
+    """⚠️THE DEFAULT-CIPHER REGRESSION: key material must not be enough to start sealing.
+
+    The default used to construct `HmacCtrCipher` and pass `allow_test_cipher=True` on the
+    caller's behalf, so the one guard that keeps a test cipher out of a real run was defeated by
+    the constructor that was supposed to enforce it. Now the default cipher refuses, so an operator
+    who wires up a KMS and forgets to choose a cipher publishes nothing rather than test-grade
+    ciphertext.
+    """
+    crypto = C.ObjectCrypto(C.InMemoryTestKeyProvider(), tenant_id="dama")
+    assert crypto.can_seal is False
+    report = _importer(store, tmp_path, crypto=crypto).run([_clip_task(pool)])
+    assert [q["error_class"] for q in report.quarantined] == ["key_provider_unavailable"]
+    assert store.keys_under("hear/v1/obj/") == []
+    assert store.keys_under("hear/v1/blob/") == []
+
+
+def test_the_importers_own_default_is_the_refusing_pair(store, tmp_path):
+    crypto = _importer(store, tmp_path).crypto
+    assert isinstance(crypto.cipher, C.RefusingCipher)
+    assert isinstance(crypto.provider, C.NoKeyProvider)
+    assert crypto.can_seal is False
+
+
+def test_the_test_cipher_still_has_to_be_asked_for_by_name():
+    with pytest.raises(C.KeyUnavailable):
+        C.ObjectCrypto(C.InMemoryTestKeyProvider(), cipher=C.HmacCtrCipher())
+    assert C.synthetic_crypto().can_seal is True
+    assert C.synthetic_crypto().cipher.production_ready is False

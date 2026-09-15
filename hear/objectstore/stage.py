@@ -149,10 +149,12 @@ class Importer:
         self.lease = lease
         self.git_commit = git_commit
         self.chunk_bytes = chunk_bytes
-        #: The default refuses every key question, so a restricted class cannot be published by an
-        #: importer nobody deliberately gave key material to.
-        self.crypto = crypto or C.ObjectCrypto(C.NoKeyProvider(), cipher=C.HmacCtrCipher(),
-                                               tenant_id=tenant_id, allow_test_cipher=True)
+        #: ⚠️THE DEFAULT SEALS NOTHING AND NAMES NO CIPHER. `ObjectCrypto()` is a refusing key
+        #: provider *and* a refusing cipher, so a restricted class is quarantined
+        #: `key_provider_unavailable` rather than published. The previous default built
+        #: `HmacCtrCipher` and passed `allow_test_cipher=True` itself, which made the guard against
+        #: shipping a test cipher into a real run something the constructor routinely defeated.
+        self.crypto = crypto or C.ObjectCrypto(tenant_id=tenant_id)
         self.ledger = RunLedger(ledger_path, run_id)
         self.resume: ResumeState = replay(ledger_path)
         #: (class, partition) already republished this run -- the §10.1 "never more than one" rule.
@@ -182,7 +184,7 @@ class Importer:
             if self.resume.is_done(task.task_id):
                 report.counters["skipped_done"] += 1
                 continue
-            outcome = self._one(task, report)
+            outcome = self._one_guarded(task, report)
             if outcome == "fenced":
                 report.outcome = "aborted"
                 break
@@ -193,6 +195,58 @@ class Importer:
         return report
 
     # -------------------------------------------------------------- one task
+
+    #: How a failure that belongs to one object is named when it escapes any step of the pipeline.
+    #: ⚠️THE MAP IS THE HANDLER. The re-stage after a bad readback is a second full read of the
+    #: source, so it can fail in every way the first read could -- an unreadable file, a key
+    #: provider that went away, a source that moved. When only the first read was wrapped, those
+    #: failures escaped `_one`, escaped `run`, and took the whole import down without a ledger
+    #: close, a report, or a quarantine record for the object that caused it. One object's failure
+    #: aborts one object, so every read goes through the same table.
+    OBJECT_FAILURES = (
+        (C.KeyUnavailable, "key_provider_unavailable", "message"),
+        (C.SourceChanged, "source_changed_during_import", "none"),
+        (C.TamperDetected, "stored_blob_corrupt", "none"),
+        (OSError, "source_unreadable", "type"),
+    )
+
+    def _failure_reason(self, exc: BaseException) -> Optional[Tuple[str, Optional[str]]]:
+        for kind, reason, detail in self.OBJECT_FAILURES:
+            if isinstance(exc, kind):
+                if detail == "message":
+                    return reason, str(exc)
+                if detail == "type":
+                    return reason, type(exc).__name__
+                return reason, None
+        return None
+
+    def _one_guarded(self, task: ImportTask, report: RunReport) -> str:
+        """Run one object and let no per-object failure out. The run still closes and reports."""
+        try:
+            return self._one(task, report)
+        except BaseException as exc:  # noqa: BLE001 - narrowed immediately by the table
+            named = self._failure_reason(exc)
+            if named is None:
+                raise
+            reason, detail = named
+            if detail is None:
+                self._quarantine(task, report, reason)
+            else:
+                self._quarantine(task, report, reason, detail=detail)
+            return "quarantined"
+
+    def _stage_guarded(self, task: ImportTask, report: RunReport,
+                       restricted: bool) -> Tuple["StagedFacts", Optional[B.StagedRef]]:
+        """`_stage`, with the source deleted from staging if it failed halfway through.
+
+        Raises the same exceptions `_stage` does; `_one_guarded` is what turns them into a
+        quarantine record, so the first read and the re-stage get identical treatment.
+        """
+        try:
+            return self._stage(task, report, restricted)
+        except Exception:
+            self.store.delete_staged(self.run_id, task.task_id)
+            raise
 
     def _one(self, task: ImportTask, report: RunReport) -> str:
         tid = task.task_id
@@ -207,17 +261,7 @@ class Importer:
             self._republished.add(slot)
 
         # ---------------------------------------------------- stage (streaming)
-        try:
-            sealed, staged = self._stage(task, report, restricted)
-        except C.KeyUnavailable as exc:
-            self._quarantine(task, report, "key_provider_unavailable", detail=str(exc))
-            return "quarantined"
-        except C.SourceChanged:
-            self._quarantine(task, report, "source_changed_during_import")
-            return "quarantined"
-        except OSError as exc:
-            self._quarantine(task, report, "source_unreadable", detail=type(exc).__name__)
-            return "quarantined"
+        sealed, staged = self._stage_guarded(task, report, restricted)
         if staged is None:
             self._quarantine(task, report, "backend_transient", detail="retries_exhausted")
             return "quarantined"
@@ -251,7 +295,7 @@ class Importer:
         readback = S.digest_source(self.store.range_source(staged.key, chunk_bytes=self.chunk_bytes))
         if readback.digest != stored_digest or readback.bytes != sealed.stored_bytes:
             self.store.delete_staged(self.run_id, staged.staging_id)
-            retry_sealed, staged = self._stage(task, report, restricted)  # one re-stage, then stop
+            retry_sealed, staged = self._stage_guarded(task, report, restricted)  # one re-stage
             if staged is None:
                 self._quarantine(task, report, "readback_mismatch",
                                  expected=self._public(task, expected, stored_digest))

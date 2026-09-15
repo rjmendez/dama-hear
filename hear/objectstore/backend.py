@@ -23,6 +23,13 @@ document -- and that is a design change, not a config change, so both are modell
 are check-then-write, which *does* lose an update under a race, and the only thing that makes it
 safe is that a commit without a live fencing lease is refused.
 
+⚠️A GENERATION CLAIM AND ITS POINTER WRITE ARE TWO OPERATIONS, so a writer can die between them.
+The claim is the CAS and is made first; if a later attempt finds generation N already claimed by a
+document naming the same object, blob and predecessor, it *finishes that commit* rather than
+reporting a conflict. Treating the orphan claim as somebody else's would wedge the object forever:
+generation N can never be re-claimed, and generation N+1 can never be reached because the pointer
+never advanced. A claim that names a different blob is still a real conflict.
+
 ⚠️A LEASE IS WON ATOMICALLY OR IT IS NOT WON. Acquisition is `O_CREAT|O_EXCL` on a file named for
 the *epoch* being claimed, so two acquirers racing for the same epoch have exactly one winner and
 the loser is told `None` rather than handed a lease it does not own. Read-then-write acquisition
@@ -42,7 +49,7 @@ import json
 import os
 import shutil
 import time
-from typing import Any, Callable, Dict, Iterator, List, Optional, Protocol
+from typing import Any, Callable, Dict, Iterator, List, Optional, Protocol, Tuple
 
 from . import streaming as S
 
@@ -185,6 +192,9 @@ class LocalDirBackend:
         self.race_hook = race_hook
         #: Fault injection for the retry/quarantine tests. Each entry is consumed once.
         self.fail_next_put: List[Exception] = []
+        #: Fault injection between a generation claim and the pointer write it belongs to: the
+        #: window whose recovery is the whole point of `_claim_generation`'s `identical`.
+        self.fail_after_claim: List[Exception] = []
         self.reads = 0
         self.writes = 0
         self.bytes_written = 0
@@ -231,8 +241,15 @@ class LocalDirBackend:
             raise
         try:
             written = self._write_stream(fd, source)
-        finally:
+        except BaseException:
+            # ⚠️AN INTERRUPTED WRITE IS REMOVED, and this is not the `delete_object` the importer
+            # is denied: the key was created by this call, was never committed and was never
+            # observable. Leaving it behind would publish a truncated blob that every later run
+            # finds present, re-reads, and quarantines as corrupt forever.
             os.close(fd)
+            _unlink_quietly(path)
+            raise
+        os.close(fd)
         self.writes += 1
         self.bytes_written += written
         return written
@@ -258,8 +275,11 @@ class LocalDirBackend:
         fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o644)
         try:
             written = self._write_stream(fd, source)
-        finally:
+        except BaseException:
             os.close(fd)
+            _unlink_quietly(tmp)  # a source that died mid-write leaves no scratch file behind
+            raise
+        os.close(fd)
         os.replace(tmp, path)
         self.writes += 1
         self.bytes_written += written
@@ -370,9 +390,19 @@ class LocalDirBackend:
 
         if expect_generation is None:
             if existing is None:
-                body = _doc_bytes(doc)
-                if self._write_exclusive(path, S.bytes_chunks(body)) is not None:
-                    self._record_generation(key, doc)
+                claim, claimed = self._claim_generation(key, doc)
+                if claim == "taken":
+                    # Generation 1 is already owned by a different document. The pointer is missing,
+                    # so this is not a replay -- it is two importers disagreeing about the object.
+                    other = json.loads(claimed)
+                    return CommitResult(key=key, outcome="conflict", generation=generation,
+                                        existing_blob=other.get("blob_key"))
+                self._after_claim_hook(key)
+                # ⚠️THE CLAIM IS WHAT GETS PUBLISHED, not the caller's copy of it. The generation
+                # record is immutable and was written first, so finishing an interrupted commit
+                # means publishing exactly what was claimed; anything else leaves the pointer and
+                # its own generation record disagreeing about the same generation.
+                if self._write_exclusive(path, S.bytes_chunks(claimed)) is not None:
                     return CommitResult(key=key, outcome="committed", generation=generation)
                 existing = self._read_pointer(key)
             assert existing is not None
@@ -395,12 +425,24 @@ class LocalDirBackend:
         if current != expect_generation or generation != current + 1:
             return CommitResult(key=key, outcome="generation_conflict", generation=current,
                                 existing_blob=existing.get("blob_key") if existing else None)
-        if self._record_generation(key, doc) is None:
-            # Someone else already claimed this generation. The loser re-reads and retries.
+        claim, claimed = self._claim_generation(key, doc)
+        if claim == "taken":
+            # Someone else already claimed this generation with a *different* document. The loser
+            # re-reads and retries.
             return CommitResult(key=key, outcome="generation_conflict", generation=current,
                                 existing_blob=existing.get("blob_key") if existing else None)
-        self._replace_write(path, S.bytes_chunks(_doc_bytes(doc)))
+        # `claim == "identical"` is the crash-in-the-middle case: a previous attempt claimed this
+        # generation and died before the pointer write. Rolling forward is the only outcome that
+        # does not wedge the object forever, and it is safe precisely because the claim we found
+        # points at the same blob, in the same generation, superseding the same one.
+        self._after_claim_hook(key)
+        self._replace_write(path, S.bytes_chunks(claimed))
         return CommitResult(key=key, outcome="committed", generation=generation)
+
+    def _after_claim_hook(self, key: str) -> None:
+        """Where a test stands between the generation claim and the pointer write."""
+        if self.fail_after_claim:
+            raise self.fail_after_claim.pop(0)
 
     def _read_pointer(self, key: str) -> Optional[Dict[str, Any]]:
         path = self._path(key)
@@ -409,22 +451,48 @@ class LocalDirBackend:
         with open(path, "rb") as fh:
             return json.loads(fh.read().decode("utf-8"))
 
-    def _record_generation(self, key: str, doc: Dict[str, Any]) -> Optional[int]:
-        """Claim generation N exclusively. `None` means another writer already holds it."""
-        gkey = generation_key(key, int(doc.get("generation", 1)))
-        gpath = self._path(gkey)
+    def _read_generation(self, key: str, generation: int) -> Optional[Dict[str, Any]]:
+        gpath = self._path(generation_key(key, generation))
+        if not os.path.isfile(gpath):
+            return None
+        with open(gpath, "rb") as fh:
+            return json.loads(fh.read().decode("utf-8"))
+
+    def _claim_generation(self, key: str, doc: Dict[str, Any]) -> Tuple[str, bytes]:
+        """Claim generation N exclusively. `(claimed|identical|taken, the bytes now on disk)`.
+
+        ⚠️`identical` IS A ROLL-FORWARD, NOT A CONFLICT. The claim and the pointer write are two
+        operations, and a process that dies between them leaves generation N claimed with no
+        pointer to show for it. Reading that back as "someone else owns N" wedges the object for
+        every future run: the retry can never claim N, and can never move to N+1 either, because
+        the pointer never advanced. So the claim is compared against the document we were about to
+        write, and a match means we are finishing somebody's interrupted work -- possibly our own.
+
+        ⚠️THE COMPARISON IS ON IDENTITY, NOT ON EVERY BYTE. A generation record also carries
+        provenance that legitimately differs between runs (the metadata object is digest-addressed
+        and its document names the run that produced it), so a byte comparison would call the
+        second run's honest retry a conflict and wedge exactly the case this exists for. What must
+        match is what the pointer *means*: the object, the blob it points at, the generation and
+        what it supersedes.
+        """
+        generation = int(doc.get("generation", 1))
+        gpath = self._path(generation_key(key, generation))
+        body = _doc_bytes(doc)
         os.makedirs(os.path.dirname(gpath), exist_ok=True)
         try:
             fd = os.open(gpath, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError:
-            return None
+            with open(gpath, "rb") as fh:
+                found = fh.read()
+            same = _generation_identity(json.loads(found)) == _generation_identity(doc)
+            return ("identical" if same else "taken"), found
         try:
-            written = self._write_stream(fd, S.bytes_chunks(_doc_bytes(doc)))
+            written = self._write_stream(fd, S.bytes_chunks(body))
         finally:
             os.close(fd)
         self.writes += 1
         self.bytes_written += written
-        return written
+        return "claimed", body
 
     def pointer_generations(self, key: str) -> List[Dict[str, Any]]:
         """Every generation of one pointer, oldest first, with `superseded_by` derived.
@@ -522,5 +590,21 @@ class LocalDirBackend:
         return sorted(h.key for h in self.list_prefix(prefix))
 
 
+def _unlink_quietly(path: str) -> None:
+    """Remove a file this call created and never committed. Nothing else is ever unlinked here."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:  # pragma: no cover - the write never got that far
+        pass
+
+
 def _doc_bytes(doc: Dict[str, Any]) -> bytes:
     return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+#: What two writers must agree on before one may finish the other's interrupted commit.
+GENERATION_IDENTITY_FIELDS = ("object_key", "blob_key", "generation", "supersedes", "state")
+
+
+def _generation_identity(doc: Dict[str, Any]) -> tuple:
+    return tuple(doc.get(f) for f in GENERATION_IDENTITY_FIELDS)
