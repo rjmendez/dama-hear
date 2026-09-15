@@ -180,6 +180,16 @@ Invariants, in priority order:
    had already published. The secondary's pending set is a *comparison signal* (§8), not work.
 5. **Ordering within a stage never changes.** The cut-over is a primary swap, which swaps step 2
    with step 3 atomically at process start — not a code path that can interleave.
+6. **The Redis dedupe marker is scoped exactly like the durable identity.** The event stream's
+   dedupe ZSET member is a single token, and today it is the bare `record_uid`. The moment
+   Postgres stops merging two devices that share a uid, the *records* are distinct but that
+   marker is not: the first device's event would suppress the second device's `XADD` and D1
+   would reappear one layer out, invisible to every database-level test. The token the store
+   passes to `RedisHeartbeatCache.write()` is therefore
+   `tools/hear_durable_pg.py:redis_dedupe_token()` — `tenant|device|uid` — and both halves of
+   that (the collision with the bare uid, the separation with the scoped token) are asserted in
+   `tests/test_hear_durable_pg_store_parity.py`. This is a store-side change, not a schema one:
+   the SQLite path keeps its current token until it is retired.
 
 ---
 
@@ -488,6 +498,28 @@ they are chosen rather than inherited.
 ## 14. Test plan
 
 All of it runs in CI except where marked. No test touches the live cluster.
+
+**What exists now (M2's half of this plan, shipped ahead of the store).** The ephemeral-Postgres
+harness and the schema/store parity suite are in the tree and green in CI:
+
+* `tools/hear_durable_pg_testdb.py` creates a `hear_test_<random>` database per test on the
+  server named by `HEAR_PG_TEST_DSN`, applies `0001`–`0005`, and drops it afterwards. It refuses
+  to manage a database it did not create, and needs no driver — everything goes through `psql`;
+* `tests/fixtures/durable_pg_store_parity.sql` (`PAR01`–`PAR10`) asserts byte-identical payload
+  preservation, device-scoped identity, claim ordering, atomic claim → publish, lease expiry,
+  backoff/dead-letter shape, O(1) health, backfill-never-republishes, and the partition and
+  retention safeguards;
+* `tests/test_hear_durable_pg_store_parity.py` runs that fixture, asserts the same invariants
+  against the shipping SQLite store wherever the two must agree, proves `SKIP LOCKED` from two
+  simultaneous sessions, proves the migration set re-applies as a no-op and rolls back
+  completely, and holds the Redis-boundary requirements (heartbeat TTL re-arming, a device-scoped
+  event dedupe token, replay in claim order);
+* CI job `durable outbox on an ephemeral postgres` runs it against a `postgres:16` service
+  container with `HEAR_PG_REQUIRE_LIVE=1`, so the suite cannot pass by skipping — gate G7.
+
+What it deliberately does not contain: anything that needs the Postgres `DurableRecordStore`
+itself (seam conformance parametrised over three backends, dual-write, reconciliation, reverse
+backfill, the performance smoke). Those land with the store, and the list below is their spec.
 
 **Unit / file-level (no server)** — extends `tests/test_hear_durable_pg_schema.py`:
 

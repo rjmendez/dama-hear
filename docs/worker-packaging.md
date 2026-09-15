@@ -184,7 +184,7 @@ Ordering is by blast radius and by what a failure costs, not by convenience.
 | 0 | *base images* | `hear-runtime`, `hear-numeric`, `hear-ml-cpu`, `hear-ml-gpu` | Substrate. No workload changes. |
 | 1 | **`hear-heartbeat`** (pilot) | service image on `hear-runtime` | One file, one dependency, its own PVC, an HTTP health probe, and a single consumer manifest. |
 | 2 | `hear-mqtt-bridge` | same image family | Shares the receiver source with the pilot, so the pilot's build is most of it. Gated on the soak (below) and on PR #189. |
-| 3 | `hear-annotate` | service image on `hear-runtime` | Single Deployment, but it owns `annotations.sqlite3` — irreplaceable human ground truth. Requires the hand-embedded ConfigMap to be brought under the generator *first*. |
+| 3 | `hear-annotate` | service image on `hear-runtime` | Single Deployment, but it owns `annotations.sqlite3` — irreplaceable human ground truth. Its ConfigMap is now generated and guarded (gate 3 below), so the rollback artifact is a generated bundle. |
 | 4 | `hear-score` (+ `-check`) | `hear-numeric` | First CronJob and first shared-`/pool/pylib` consumer; models move into the image with it. |
 | 5 | `hear-drain` (+ `-check`) | `hear-numeric` | Writes the corpus and talks to every node; the largest operational surface among the numeric lanes. |
 | 6 | `hear-tdoa` (+ `-check`) | `hear-numeric` | Largest bundle, server-side apply only, import closure not verifiable by the current check. |
@@ -215,12 +215,27 @@ correctness fixes, or not during the counted window at all.** The R1–R3 fixes 
 reset; folding the packaging change into that same cutover costs one reset instead of two. The
 pilot is unaffected: `hear-heartbeat` writes its own database and is not the soak artifact.
 
-**Gate 3 — `hear-annotate` precondition.** Its `server.py` is hand-embedded inside
+**Gate 3 — `hear-annotate` precondition.** ~~Its `server.py` is hand-embedded inside
 `deploy/k8s/hear-annotate.yaml` with no `BUNDLES` entry and no sync test. It is in sync today,
-and nothing enforces that. Bring it under the generator and the guard test *before* migrating it,
-so the rollback artifact is a generated bundle rather than a hand-maintained copy. Its
-`annotations.sqlite3` is irreplaceable and unbacked (the same `local-path`/`Delete` exposure as
-R6/R7): back it up with the SQLite backup API — never a raw copy of a live WAL — before cutover.
+and nothing enforces that.~~ **Done, and the "in sync today" half of that sentence was already
+false when it was written.** The embedded copy drifted from `tools/hear_annotate/server.py` at
+commit `fa5a589` (#151): the checkout gained path-traversal, proxy-trust, submission-idempotency
+and WAV-frame-count hardening and the ConfigMap did not, so the live pod has been running the
+pre-hardening server. That is the failure mode this gate exists to close, and it had already
+happened — an unguarded copy is not "in sync", it is "unmeasured".
+
+`hear-annotate-code` is now generated from the checkout through `gen_configmap.EMBEDDED_BUNDLES`
+(`python3 deploy/k8s/gen_configmap.py hear-annotate-code`, which rewrites that one document in
+place and leaves the Deployment and Service bytes alone) and guarded by
+`tests/test_configmap_sync.py::TestTheEmbeddedConfigMaps`, which requires the sources to
+reproduce the committed manifest byte for byte and reports live drift read-only when a cluster is
+reachable. The rollback artifact for the migration is therefore a generated bundle, as this gate
+required. Its `annotations.sqlite3` is irreplaceable and unbacked (the same `local-path`/`Delete`
+exposure as R6/R7): back it up with the SQLite backup API — never a raw copy of a live WAL —
+before cutover. ⚠️And before the *first* apply of the regenerated ConfigMap, which is itself a
+code change to the running pod: the hardened server adds the `submission_id` column by additive
+`ALTER TABLE` and attributes annotations to `client:<ip>` until
+`HEAR_ANNOTATE_TRUSTED_PROXIES` names the tailnet proxy.
 
 **Gate 4 — every CronJob lane.** One full schedule cycle on the image with output equivalent to
 the pre-cutover run: same row/file counts for the same input window, same refusal accounting,

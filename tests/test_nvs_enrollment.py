@@ -77,7 +77,7 @@ def test_status_says_where_the_credentials_came_from():
     assert re.search(r'\\"prov\\":\{\\"src\\":\\"%s\\",\\"nets\\":%d,\\"nvs\\":%s,'
                      r'\\"loaded\\":%s\}', _code())
     assert '\\"auth\\":{\\"push\\":{\\"configured\\":%s,\\"src\\":\\"%s\\",\\"last_code\\":%d,' in _code()
-    assert '\\"admin\\":{\\"configured\\":%s,\\"src\\":\\"%s\\"}}' in _code()
+    assert '\\"admin\\":{\\"configured\\":%s,\\"src\\":\\"%s\\",\\"ota_recovery_open\\":%s}}' in _code()
 
 
 def test_status_and_prov_report_the_boot_selftest():

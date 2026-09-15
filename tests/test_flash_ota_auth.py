@@ -1,12 +1,11 @@
 """flash.py must survive the endpoint-auth change it never knew about.
 
-The firmware endpoint-auth work made /update require `X-Hear-Auth: <HEAR_ADMIN_TOKEN>` and made
-hear_auth_ok() fail CLOSED when the compiled-in token is empty. Nothing on the client side moved:
-flash.py is the only OTA client in the tree and it posted the image with no header at all, so the
-first node to run an auth-aware image would have answered every future `flash.py <node> <ip>` with
-401 and "unauthorized". Worse, HEAR_ADMIN_TOKEN is compile-time -- NVS carries the node id and its
-Wi-Fi, not this -- so an image built on a machine with no ~/.hear_push entry locks its own board
-out of /update, /reboot, /format and /gate forever, and over the air there is no way back in.
+The firmware endpoint-auth work made protected /update uploads require
+`X-Hear-Auth: <HEAR_ADMIN_TOKEN>`. Nothing on the client side moved: flash.py is the only OTA
+client in the tree and it posted the image with no header at all, so the first node to run an
+auth-aware image would have answered every future `flash.py <node> <ip>` with 401 and
+"unauthorized". Runtime credentials now live in NVS, and release flashes are refused until /status
+proves NVS has both push and admin auth before any bytes are written.
 
 These tests pin both halves: the token is sent, and a tokenless image is refused before it can be
 put somewhere only a USB cable can reach.
@@ -156,10 +155,15 @@ class TestTheSketchStillWantsTheHeaderThisSends:
     def test_the_firmware_reads_the_header_flash_py_writes(self):
         ino = (ROOT / "firmware" / "hear_node" / "hear_node.ino").read_text(errors="replace")
         assert 'http.hasHeader("X-Hear-Auth")' in ino
-        assert "ota_authorized = hear_auth_ok();" in ino
+        assert "ota_authorized = hear_ota_auth_ok();" in ino
 
-    def test_an_empty_compiled_in_token_really_does_refuse_everything(self):
+    def test_an_empty_compiled_in_token_refuses_non_ota_admin_routes(self):
         """The premise of the lockout refusal, asserted against the source it is about."""
         ino = (ROOT / "firmware" / "hear_node" / "hear_node.ino").read_text(errors="replace")
         assert "#define HEAR_ADMIN_TOKEN \"\"" in ino
         assert "if (!wn) return false;" in ino
+
+    def test_update_has_the_last_resort_recovery_valve(self):
+        ino = (ROOT / "firmware" / "hear_node" / "hear_node.ino").read_text(errors="replace")
+        assert "static bool hear_ota_auth_ok()" in ino
+        assert "if (!admin_token_runtime()[0]) return true;" in ino
