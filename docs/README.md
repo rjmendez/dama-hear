@@ -19,6 +19,7 @@ current code disagree, the design states the intended end state.
 | [fleet-management.md](fleet-management.md) | The standalone fleet control plane: device identity, desired vs reported state, signed firmware compatibility, staged rollouts, and lifecycle audit. |
 | [ml-lifecycle.md](ml-lifecycle.md) | The minimal self-hosted acoustic ML lifecycle: corpus and retention, labelling, reproducible training, promotion, edge deployment, and rollback. |
 | [phase0-freeze-contracts.v1.md](phase0-freeze-contracts.v1.md) | The Phase 0 contract freeze: the hashed, reproducible inventory of wire profiles, schemas, and firmware build metadata that later phases must not silently break. |
+| [durable-postgres-schema.md](durable-postgres-schema.md) | The Phase 2 canonical Postgres schema for the durable heartbeat/event outbox: device-scoped identity, claim leases, partitions and retention, O(1) health, access control, backfill and rollback. Design and DDL only; not deployed. |
 | [REDESIGN-LESSONS.md](REDESIGN-LESSONS.md) | Postmortem of the existing fleet: observed failure modes and the systems-design lessons that constrain the redesign. Evidence-tagged. |
 | [loci-memory-validation.md](loci-memory-validation.md) | Validation of the Loci spatial/memory behaviour used by the localization lane. |
 
