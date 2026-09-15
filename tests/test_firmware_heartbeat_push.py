@@ -269,6 +269,7 @@ def test_push_post_json_uses_tls_and_wraps_the_batch_envelope_for_the_ingest_api
     assert "client.setInsecure();" in body
     assert '"{\\"device_id\\":\\"%s\\",\\"messages\\":[%.*s]}"' in body
     assert "node_id," in body
+    assert "char wrapped[1024];" in body
     assert "Authorization: Bearer %s" in body
 
 

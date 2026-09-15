@@ -543,12 +543,60 @@ static const char *clock_state_name(uint8_t st) {
   }
 }
 
-static uint8_t clock_state_at(uint64_t local_us) {
-  (void)local_us;
+static uint8_t clock_raw_state() {
   if (!time_valid || !edge_unix_us || !pps_count) return CLOCK_STATE_FAULT;
   if (ubx_silent_run > 0) return CLOCK_STATE_HOLDOVER;
   if (!gps_has_fix() || pps_count < clock_settle_until_edge) return CLOCK_STATE_DEGRADED;
   return CLOCK_STATE_LOCKED;
+}
+
+static uint32_t clock_raw_discontinuity_flags() {
+  uint32_t flags = 0;
+  if (!time_valid || !edge_unix_us || !pps_count) flags |= CLOCK_DISC_BOOT;
+  if (ubx_silent_run > 0) flags |= CLOCK_DISC_GPS_SILENT;
+  if (!gps_has_fix() && (ubx_pvt > 0 || gps_link_ok)) flags |= CLOCK_DISC_NO_FIX;
+  if (pps_count < clock_settle_until_edge) flags |= clock_recent_flags;
+  return flags;
+}
+
+static bool clock_observation_ready = false;
+static uint8_t clock_observed_state = CLOCK_STATE_FAULT;
+static uint8_t clock_previous_state = CLOCK_STATE_FAULT;
+static uint32_t clock_observed_flags = CLOCK_DISC_BOOT;
+static uint32_t clock_previous_flags = CLOCK_DISC_BOOT;
+static uint64_t clock_transition_local_us = 0;
+
+static void clock_snapshot_at(uint64_t local_us, uint8_t *state_out, uint32_t *flags_out) {
+  uint64_t observed_us = (uint64_t)esp_timer_get_time();
+  uint8_t state = clock_raw_state();
+  uint32_t flags = clock_raw_discontinuity_flags();
+  if (!clock_observation_ready) {
+    clock_observed_state = clock_previous_state = state;
+    clock_observed_flags = clock_previous_flags = flags;
+    clock_transition_local_us = observed_us;
+    clock_observation_ready = true;
+  } else if (state != clock_observed_state || flags != clock_observed_flags) {
+    clock_previous_state = clock_observed_state;
+    clock_previous_flags = clock_observed_flags;
+    clock_observed_state = state;
+    clock_observed_flags = flags;
+    clock_transition_local_us = observed_us;
+  }
+  if (local_us < clock_transition_local_us) {
+    // A state change can be noticed after the audio block containing it was captured. Use the
+    // more conservative state and union of flags rather than assigning later LOCKED metadata.
+    state = clock_previous_state < clock_observed_state
+              ? clock_previous_state : clock_observed_state;
+    flags = clock_previous_flags | clock_observed_flags;
+  }
+  if (state_out) *state_out = state;
+  if (flags_out) *flags_out = flags;
+}
+
+static uint8_t clock_state_at(uint64_t local_us) {
+  uint8_t state = CLOCK_STATE_FAULT;
+  clock_snapshot_at(local_us, &state, NULL);
+  return state;
 }
 
 static uint64_t clock_anchor_age_us(uint64_t local_us) {
@@ -563,12 +611,8 @@ static int64_t clock_boot_epoch_us() {
 }
 
 static uint32_t clock_discontinuity_flags_at(uint64_t local_us) {
-  (void)local_us;
   uint32_t flags = 0;
-  if (!time_valid || !edge_unix_us || !pps_count) flags |= CLOCK_DISC_BOOT;
-  if (ubx_silent_run > 0) flags |= CLOCK_DISC_GPS_SILENT;
-  if (!gps_has_fix() && (ubx_pvt > 0 || gps_link_ok)) flags |= CLOCK_DISC_NO_FIX;
-  if (pps_count < clock_settle_until_edge) flags |= clock_recent_flags;
+  clock_snapshot_at(local_us, NULL, &flags);
   return flags;
 }
 
@@ -1587,7 +1631,7 @@ struct Det { uint32_t sample; uint32_t pps_n; int32_t us_since_pps; int64_t utc_
               // What utc_us is worth, 1-sigma, nanoseconds -- see stamp_sigma_ns(). 0 = no
               // stamp, and dets.csv then carries an EMPTY column rather than a zero.
               uint64_t sync_sigma_ns;
-              uint32_t anchor_age_us;
+              uint64_t anchor_age_us;
               int64_t boot_epoch_us;
               uint32_t clock_discontinuity_flags;
               uint8_t clock_state;
@@ -2540,7 +2584,7 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
 #if HEAR_PUSH_WRAP_BATCH
   // The ingest Lambda expects one batch envelope per POST; hear_push_payload.h's encoders build
   // hear_node's own bare object, so wrap it here rather than teach them about this one backend.
-  char wrapped[512];
+  char wrapped[1024];
   int wn = snprintf(wrapped, sizeof wrapped, "{\"device_id\":\"%s\",\"messages\":[%.*s]}",
                      node_id, (int)body_len, body);
   if (wn <= 0 || wn >= (int)sizeof wrapped) {
@@ -3265,13 +3309,14 @@ static void det_send_row(uint32_t k, const char *prefix) {
   snprintf(b, sizeof b, "%s{\"i\":%lu,\"utc_us\":%lld,\"uptime_s\":%lu,\"sample\":%lu,\"pps_n\":%lu,"
                         "\"us_since_pps\":%ld,\"trigger\":%d,\"flags\":%u,\"fs_hz\":%.3f,"
                         "\"sync_sigma_ns\":%s,"
-                        "\"clock_state\":\"%s\",\"anchor_age_us\":%lu,\"boot_epoch_us\":%s,"
+                        "\"clock_state\":\"%s\",\"anchor_age_us\":%llu,\"boot_epoch_us\":%s,"
                         "\"boot_id\":\"%s\",\"clock_discontinuity_flags\":%u,"
                         "\"frame_len\":%d,\"frame\":\"",
            prefix, (unsigned long)k, (long long)d.utc_us,
            (unsigned long)d.uptime_s, (unsigned long)d.sample,
            (unsigned long)d.pps_n, (long)d.us_since_pps, d.trigger, (unsigned)d.flags, d.fs_at,
-           sync_json, clock_state_name(d.clock_state), (unsigned long)d.anchor_age_us, boot_epoch_json,
+           sync_json, clock_state_name(d.clock_state),
+           (unsigned long long)d.anchor_age_us, boot_epoch_json,
            boot_id, (unsigned)d.clock_discontinuity_flags,
            MELIMP_FRAME_BYTES);
   http.sendContent(b);
@@ -4730,7 +4775,7 @@ static void det_flush() {
     if (d.sync_sigma_ns) snprintf(sg, sizeof sg, "%llu", (unsigned long long)d.sync_sigma_ns);
     char age[24] = "";
     if (d.anchor_age_us || d.clock_state != CLOCK_STATE_FAULT)
-      snprintf(age, sizeof age, "%lu", (unsigned long)d.anchor_age_us);
+      snprintf(age, sizeof age, "%llu", (unsigned long long)d.anchor_age_us);
     char boot_epoch[24] = "";
     if (d.boot_epoch_us) snprintf(boot_epoch, sizeof boot_epoch, "%lld", (long long)d.boot_epoch_us);
     char disc[16] = "";
@@ -4912,7 +4957,7 @@ static void audio_pump() {
           // clip and sketch, and the anchor can be refreshed in that window -- a sigma read then
           // would describe a different instant than the stamp beside it.
           dets[idx].sync_sigma_ns = tok ? stamp_sigma_ns(cap_us) : 0;
-          dets[idx].anchor_age_us = tok ? (uint32_t)clock_anchor_age_us(cap_us) : 0;
+          dets[idx].anchor_age_us = tok ? clock_anchor_age_us(cap_us) : 0;
           dets[idx].boot_epoch_us = tok ? (t - (int64_t)cap_us) : 0;
           dets[idx].clock_discontinuity_flags = clock_discontinuity_flags_at(cap_us);
           dets[idx].clock_state = clock_state_at(cap_us);
