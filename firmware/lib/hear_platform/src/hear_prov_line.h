@@ -21,6 +21,12 @@ typedef struct {
   int  n;
   char ssid[HEAR_PROV_MAX_NETS][33];
   char psk[HEAR_PROV_MAX_NETS][65];
+  // The node's OWN fallback-AP password (Alert 5: every node used to share one compiled-in
+  // "damahear" string). Empty means "not provisioned" -- the firmware then derives one from its
+  // own MAC rather than falling back to a fleet-wide shared secret. Same length limits as psk:
+  // WPA2 requires 8-63 chars, and 65 holds 64 plus the NUL this parser and hear_prov.cpp both
+  // expect.
+  char ap_pass[65];
 } hear_prov_t;
 
 // The node-id grammar gen_secrets.py enforces: [a-z0-9][a-z0-9-]{0,22}.
@@ -115,6 +121,12 @@ static inline const char *hear_prov_parse_(const char *line, hear_prov_t *p) {
       if (sl < 1 || sl > 32) return "bad ssid";
       if (pl < 8 || pl > 64) return "bad psk";
       p->n++;
+    } else if (kn == 2 && !strncmp(s, "ap", 2)) {
+      // The node's own fallback-AP password (Alert 5), hex like a psk so it can hold any byte.
+      // Optional: an enroll.py run that omits it leaves ap_pass empty and the firmware derives
+      // one from its own MAC instead of reusing a fleet-wide default.
+      int al = hear_prov_unhex(v, vn, p->ap_pass, sizeof p->ap_pass);
+      if (al < 8 || al > 64) return "bad ap password";
     } else {
       return "unknown key";
     }
@@ -136,6 +148,7 @@ static inline const char *hear_prov_parse(const char *line, hear_prov_t *p) {
 
 static inline int hear_prov_same(const hear_prov_t *a, const hear_prov_t *b) {
   if (a->n != b->n || strcmp(a->node, b->node) || strcmp(a->cls, b->cls)) return 0;
+  if (strcmp(a->ap_pass, b->ap_pass)) return 0;
   for (int k = 0; k < a->n; k++)
     if (strcmp(a->ssid[k], b->ssid[k]) || strcmp(a->psk[k], b->psk[k])) return 0;
   return 1;

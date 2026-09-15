@@ -55,8 +55,13 @@ def sign(line):
     return "%s crc=%08x" % (line, zlib.crc32(line.encode()) & 0xFFFFFFFF)
 
 
-def prov_line(node, cls, pairs):
-    """The signed PROV line hear_prov_line.h parses. Raises ValueError for anything it would refuse."""
+def prov_line(node, cls, pairs, ap_pass=None):
+    """The signed PROV line hear_prov_line.h parses. Raises ValueError for anything it would refuse.
+
+    ap_pass is the node's OWN fallback-AP password (Alert 5 -- see hear_prov_line.h's "ap" token).
+    Optional: a caller that omits it gets a record with no ap_pass, and the firmware then derives
+    one from its own MAC rather than falling back to a fleet-wide shared string.
+    """
     if not ID_RE.fullmatch(node):
         raise ValueError("node id must be lowercase letters, digits and dashes: %r" % node)
     if cls and not ID_RE.fullmatch(cls):
@@ -71,10 +76,21 @@ def prov_line(node, cls, pairs):
         if not 1 <= len(s) <= 32 or not 8 <= len(p) <= 64 or b"\0" in s + p:
             raise ValueError("network %d is not a valid WPA2 SSID/passphrase pair" % i)
         toks.append("net=%s:%s" % (s.hex(), p.hex()))
+    if ap_pass:
+        a = ap_pass.encode()
+        if not 8 <= len(a) <= 64 or b"\0" in a:
+            raise ValueError("ap_pass must be 8-64 bytes with no embedded NUL")
+        toks.append("ap=" + a.hex())
     line = sign(" ".join(toks))
     if len(line) >= LINE_MAX:
         raise ValueError("the PROV line is %d bytes; the node reads at most %d" % (len(line), LINE_MAX - 1))
     return line
+
+
+def random_ap_pass(nbytes=12):
+    """A per-device fallback-AP password with no operator input required -- see --ap-pass."""
+    import secrets as _secrets
+    return _secrets.token_hex(nbytes)  # 2*nbytes hex chars, well within the 8-64 char WPA2 range
 
 
 def fetch(url, timeout=60):
@@ -229,11 +245,24 @@ def main(argv=None):
                     help="accept selftest gps=no-fix after enrollment (for indoor bench work only)")
     ap.add_argument("--allow-pps-absent", action="store_true",
                     help="accept selftest pps=absent after enrollment")
+    ap.add_argument("--ap-pass",
+                    help="this node's own fallback-AP password (Alert 5: no shared default). "
+                         "Omit to have one generated and printed for you to record.")
+    ap.add_argument("--no-ap-pass", action="store_true",
+                    help="provision no AP password at all; the node derives one from its own MAC "
+                         "instead (unique per node, but not operator-chosen or secret-strength)")
     a = ap.parse_args(argv)
+
+    ap_pass = None
+    if not a.no_ap_pass:
+        ap_pass = a.ap_pass or random_ap_pass()
+        if not a.ap_pass:
+            print("enroll: generated fallback-AP password for %s: %s (record this -- it is not "
+                  "shown again)" % (a.node, ap_pass))
 
     try:
         pairs = wifi_store.read_pairs(a.wifi)
-        line = prov_line(a.node, a.cls, pairs)
+        line = prov_line(a.node, a.cls, pairs, ap_pass=ap_pass)
     except (OSError, ValueError) as e:
         die(str(e))
     print("enroll: %s (%s) with %d network(s): %s"

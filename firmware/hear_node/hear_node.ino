@@ -47,6 +47,8 @@
 #if __has_include("secrets.h")
 #include "secrets.h"
 #endif
+#include "hear_push_ca.h"   // HEAR_PUSH_CA_CERT / HEAR_PUSH_TLS_INSECURE (Alert 3); after
+                            // secrets.h so a build can override either there.
 
 // ---- shared platform -------------------------------------------------------------------------
 // firmware/lib/hear_platform. Built with: arduino-cli compile --libraries firmware/lib
@@ -171,6 +173,15 @@ static void node_identity() {
   snprintf(prov.node, sizeof prov.node, "%s", NODE_ID);
 #endif
   snprintf(prov.cls, sizeof prov.cls, "%s", NODE_CLASS);
+#ifdef AP_PASS_OVERRIDE
+  snprintf(prov.ap_pass, sizeof prov.ap_pass, "%s", AP_PASS_OVERRIDE);
+#endif
+#ifndef AP_PASS_OVERRIDE
+  // A compiled secrets.h says nothing about the fallback-AP password (it is enroll.py's job, not
+  // gen_secrets.py's), so carry over whatever NVS already holds -- otherwise every rebuild of a
+  // compiled-secrets image would silently erase a previously enrolled per-device AP password.
+  if (have_nv) snprintf(prov.ap_pass, sizeof prov.ap_pass, "%s", nv.ap_pass);
+#endif
   prov_src = "compiled";
   prov_loaded = have_nv && hear_prov_same(&nv, &prov);
   if (hear_prov_id_ok(prov.node))
@@ -187,8 +198,18 @@ static void node_identity() {
   }
   snprintf(node_class, sizeof node_class, "%s", prov.cls[0] ? prov.cls : NODE_CLASS);
 }
+// Fills out with this node's fallback-AP password: the enrolled one (prov.ap_pass, from
+// enroll.py --ap-pass or --no-ap-pass's random default) when there is one, otherwise a password
+// DERIVED FROM THIS NODE'S OWN MAC (Alert 5). The old firmware compiled one literal "damahear"
+// into every node's flash image, so one leak anywhere on the fleet exposed every node's fallback
+// AP; deriving from the MAC at least makes that string different per node even with nothing
+// provisioned. It is not operator-secret-strength -- enroll.py is how a node gets a real one.
+static void ap_password(char *out, size_t cap) {
+  if (prov.ap_pass[0]) { snprintf(out, cap, "%s", prov.ap_pass); return; }
+  uint8_t m[6]; esp_efuse_mac_get_default(m);
+  snprintf(out, cap, "hear-%02x%02x%02x%02x%02x%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
 #define AP_SSID   "dama-hear-node"
-#define AP_PASS   "damahear"          // >=8 chars or the AP silently refuses to start
 
 // Pins and part facts now live in one place per hardware build, so a third node is wired from a
 // document rather than from whichever #define someone finds first. See firmware/boards/README.md.
@@ -1677,6 +1698,53 @@ static WebServer http(80);
 static bool sd_ok = false, sta_ok = false;
 static int sd_cs = 0;
 
+// ---------------------------------------------------------------- admin auth (Alert 1)
+// Every privileged endpoint below -- OTA upload, reboot, SD format, gate-floor writes, and the
+// hardware-sweep probes that repurpose live GPIOs -- used to run for ANY request on the same
+// Wi-Fi the node's sensor data rides, no credential of any kind. hear_auth_ok() is the one place
+// that decides whether such a request may proceed; every handler that needs it calls
+// HEAR_REQUIRE_AUTH() first and does nothing else once that macro has returned.
+#ifndef HEAR_REQUIRE_ADMIN_AUTH
+// 0 is for bench work with the node on an isolated USB/AP link only. Shipping a build with this
+// off puts Alert 1 straight back: anything that can reach the node's HTTP port can reflash it,
+// reboot it, or wipe its card.
+#define HEAR_REQUIRE_ADMIN_AUTH 1
+#endif
+#ifndef HEAR_ADMIN_TOKEN
+// Per-device secret, from secrets.h (gen_secrets.py / enroll.py's provisioning), never the same
+// across the fleet. Empty means "nothing can authenticate" -- HEAR_REQUIRE_ADMIN_AUTH fails
+// CLOSED when a build forgot to set one, rather than quietly falling open.
+#define HEAR_ADMIN_TOKEN ""
+#endif
+static bool hear_auth_ok() {
+#if !HEAR_REQUIRE_ADMIN_AUTH
+  return true;
+#else
+  static const char *want = HEAR_ADMIN_TOKEN;
+  size_t wn = strlen(want);
+  if (!wn) return false;
+  String given = http.hasHeader("X-Hear-Auth") ? http.header("X-Hear-Auth")
+               : (http.hasArg("token") ? http.arg("token") : String());
+  size_t gn = given.length();
+  // Compared over the longer of the two lengths with every byte touched regardless of an early
+  // mismatch, so a wrong guess is not measurably cheaper to reject than a right one.
+  size_t n = wn > gn ? wn : gn;
+  uint32_t diff = (uint32_t)(wn ^ gn);
+  for (size_t i = 0; i < n; i++) {
+    char a = i < wn ? want[i] : '\0';
+    char b = i < gn ? given[i] : '\0';
+    diff |= (uint32_t)(uint8_t)(a ^ b);
+  }
+  return diff == 0;
+#endif
+}
+static void hear_auth_reject() {
+  http.sendHeader("WWW-Authenticate", "X-Hear-Auth realm=\"hear-node\"");
+  http.send(401, "text/plain", "unauthorized: set header X-Hear-Auth: <token> or ?token=<token>\n");
+}
+// One line at the top of a handler: does nothing else and returns if the request is unauthorized.
+#define HEAR_REQUIRE_AUTH() do { if (!hear_auth_ok()) { hear_auth_reject(); return; } } while (0)
+
 // ---------------------------------------------------------------- OTA + failback
 // Moved to hear_platform/hear_boot.{h,cpp}. It lived here AND in puc_node.ino, and the copies had
 // drifted: puc_node's mark_healthy_once() marked an image healthy after 30 s without checking
@@ -1686,6 +1754,7 @@ static int sd_cs = 0;
 #define BUILD_TAG "A"
 #endif
 static char ota_msg[96] = "idle";
+static bool ota_authorized = false;   // set once per upload attempt, at UPLOAD_FILE_START (Alert 1)
 
 // ---------------------------------------------------------------- log ring
 // Every diagnosis during bring-up -- the 230400/UBX baud scan, the driven-vs-floating pin probes, the I2C
@@ -2627,11 +2696,17 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
 #endif
 #if HEAR_PUSH_TLS
   WiFiClientSecure client;
-  // No root CA pinned: ACM certs rotate on a schedule this firmware has no way to track, and a
-  // stale pin would silently blackhole every push again, the same failure mode this whole fix is
-  // for. That trades away MITM-resistance on a low-value heartbeat/event payload; revisit if
-  // this path ever carries anything sensitive.
+#if HEAR_PUSH_TLS_INSECURE
+  // Explicit opt-in only (secrets.h HEAR_PUSH_TLS_INSECURE=1) -- see hear_push_ca.h. A build that
+  // reaches here made that trade-off on purpose; nothing defaults to it.
   client.setInsecure();
+#else
+  // The ROOT, not the leaf: ACM rotates leaf/intermediate certs on a schedule this firmware has
+  // no way to track, but Amazon Root CA 1 is self-signed and valid to 2038, so pinning it verifies
+  // the chain without the "a rotation silently blackholes every push" failure a leaf pin would
+  // have. HEAR_PUSH_CA_CERT is overridable in secrets.h for a HEAR_PUSH_HOST with a different CA.
+  client.setCACert(HEAR_PUSH_CA_CERT);
+#endif
 #else
   WiFiClient client;
 #endif
@@ -3768,6 +3843,31 @@ static void selftest_mic_probe() {
 // 4 kB of heap on a node with ~180 kB free and buys room for the next thing that lands here.
 SET_LOOP_TASK_STACK_SIZE(12 * 1024);
 
+// ---------------------------------------------------------------- /sd allowlist (Alert 2)
+// True for exactly the paths the firmware itself ever creates: the current and one "-prev"
+// rotation of health/dets/scene, gate.cfg, and this node's own clips. Everything else -- an
+// arbitrary card path, someone else's clip name, a symlink-shaped guess -- is refused by /sd
+// before SD.open() is reached. isDigit() is <ctype.h>'s; Arduino.h pulls it in already.
+static bool sd_path_allowed(const String &name) {
+  if (name == "/health.csv" || name == "/health-prev.csv" ||
+      name == "/dets.csv"   || name == "/dets-prev.csv"   ||
+      name == GATE_CFG) return true;
+  if (name.startsWith("/scene-") && name.endsWith(".csv")) {
+    String mid = name.substring(7, name.length() - 4);            // between "scene-" and ".csv"
+    if (mid.endsWith("-prev")) mid = mid.substring(0, mid.length() - 5);
+    if (mid.length() == 8) {
+      bool digits = true;
+      for (unsigned i = 0; i < mid.length(); i++) if (!isDigit(mid[i])) { digits = false; break; }
+      if (digits) return true;
+    }
+  }
+  if (name.startsWith(CLIP_DIR "/")) {
+    String rest = name.substring(sizeof(CLIP_DIR));   // sizeof() counts the '\0', i.e. skips the '/'
+    if (rest.length() > 0 && rest.indexOf('/') < 0 && rest.endsWith(".wav")) return true;
+  }
+  return false;
+}
+
 void setup() {
   hear_boot_guard();                    // first statement: a later fault still counts as a failed boot
   // The USB CDC default is 256 B, and a full queue drops the rest of a packet: a real PROV line is
@@ -3801,9 +3901,10 @@ void setup() {
   }
   else {
     char ap[40]; snprintf(ap, sizeof ap, "%s-%s", AP_SSID, node_id);
-    WiFi.mode(WIFI_AP); WiFi.softAP(ap, AP_PASS);
+    char ap_pw[65]; ap_password(ap_pw, sizeof ap_pw);
+    WiFi.mode(WIFI_AP); WiFi.softAP(ap, ap_pw);
     logf("wifi  AP   ssid \"%s\" pass \"%s\"  http://%s/\n",
-                  ap, AP_PASS, WiFi.softAPIP().toString().c_str());
+                  ap, ap_pw, WiFi.softAPIP().toString().c_str());
     logln(prov.n ? "      (no enrolled network answered -- see firmware/hear_node/README)"
                  : "      (not enrolled: run firmware/hear_node/enroll.py over USB)");
   }
@@ -3887,6 +3988,7 @@ void setup() {
   http.on("/", h_root); http.on("/status", h_status); http.on("/detections", h_dets);
   http.on("/update", HTTP_POST,
     []() {
+      if (!ota_authorized) { hear_auth_reject(); return; }
       bool bad = Update.hasError();
       http.send(bad ? 500 : 200, "text/plain", bad ? "FAILED\n" : "OK, rebooting into the new image\n");
       delay(400); ESP.restart();
@@ -3894,11 +3996,17 @@ void setup() {
     []() {
       HTTPUpload &u = http.upload();
       if (u.status == UPLOAD_FILE_START) {
+        // Checked once, before Update.begin() -- an unauthorized upload must not write a single
+        // byte of flash, not merely be refused after the fact by the completion handler above.
+        ota_authorized = hear_auth_ok();
+        if (!ota_authorized) { snprintf(ota_msg, sizeof ota_msg, "unauthorized"); return; }
         snprintf(ota_msg, sizeof ota_msg, "receiving %s", u.filename.c_str());
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
       } else if (u.status == UPLOAD_FILE_WRITE) {
+        if (!ota_authorized) return;
         if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
       } else if (u.status == UPLOAD_FILE_END) {
+        if (!ota_authorized) return;
         if (Update.end(true)) snprintf(ota_msg, sizeof ota_msg, "wrote %u B", (unsigned)u.totalSize);
         else { Update.printError(Serial); snprintf(ota_msg, sizeof ota_msg, "write failed"); }
       }
@@ -3921,14 +4029,27 @@ void setup() {
     http.send(200, "text/plain", o);
   });
   http.on("/reboot", HTTP_POST, []() {      // POST, so a link prefetcher cannot reboot the node
+    HEAR_REQUIRE_AUTH();
     http.send(200, "text/plain", "rebooting\n");
     delay(300); ESP.restart();
   });
+  // Alert 2 remediation: /sd used to open ANY absolute path on the card with no allowlist at
+  // all -- a caller that knew or guessed a filename could read anything the FAT filesystem held,
+  // GPS logs and clip audio included, over one unauthenticated HTTP GET. This restricts it to the
+  // small, fixed set of names the firmware itself ever writes: the rolling health/dets/scene CSVs
+  // (current file and one "-prev" rotation each), gate.cfg, and this node's own recorded clips.
+  // Anything else -- an arbitrary card path, a symlink-style traversal, someone else's clip name
+  // guessed off another node -- is refused before SD.open() is ever called.
   http.on("/sd", []() {
     // Any file on the card, over the same link the node reports on.
     String name = http.hasArg("file") ? http.arg("file") : String("/health.csv");
     if (!name.startsWith("/")) name = "/" + name;
     if (name.indexOf("..") >= 0) { http.send(400, "text/plain", "no\n"); return; }
+    if (!sd_path_allowed(name)) {
+      http.send(403, "text/plain",
+        "refused: " + name + " is not one of this node's own CSVs, gate.cfg, or a clip under " CLIP_DIR "\n");
+      return;
+    }
     if (!sd_ok) { http.send(503, "text/plain", "no card mounted\n"); return; }
     File f = SD.open(name.c_str(), FILE_READ);
     if (!f) { http.send(404, "text/plain", "not found: " + name + "\n"); return; }
@@ -3954,9 +4075,10 @@ void setup() {
   });
   http.on("/ls", []() {
     // dir defaults to root, so an old caller with no argument gets exactly the old listing.
-    // ⚠️/sd?file= already opens any absolute path with no authentication of any kind -- /reboot,
-    // /update and /log are unauthenticated too -- so restricting dir here would buy nothing real
-    // and would break its use as a whole-card census. Not an oversight; a decision.
+    // /ls itself stays a census (names and sizes only, no content) and is not restricted by the
+    // sd_path_allowed() allowlist that now gates /sd's actual reads: it names candidates for a
+    // drain to ask /sd for, and /sd is the one that decides whether that name is actually
+    // servable. Restricting dir here would break its use as a whole-card census for no real gain.
     if (!sd_ok) { http.send(503, "text/plain", "no card mounted\n"); return; }
     String dir = http.hasArg("dir") ? http.arg("dir") : String("/");
     if (!dir.startsWith("/")) dir = "/" + dir;
@@ -4141,6 +4263,7 @@ void setup() {
   // which is why /status could only ever say "(not read)". A duplicate route is a silent
   // shadow, not an error.
   http.on("/pinsweep", []() {
+    HEAR_REQUIRE_AUTH();
     // Answers "did you measure it right?" without relying on my two assumptions: that the wire
     // landed on D0, and that a ~45k internal pulldown cannot drag down a weakly-coupled tap.
     // Every free pin, all three pull modes. A 1 Hz / 100 ms pulse = ~2-3 edges and ~10% high.
@@ -4174,6 +4297,7 @@ void setup() {
     http.send(200, "text/plain", o);
   });
   http.on("/format", HTTP_POST, []() {
+    HEAR_REQUIRE_AUTH();
     // Both nodes shipped on Raspberry Pi boot cards, so the ESP32 only ever sees the small FAT
     // partition the Pi put there -- 40 MB on nyquist, about half of it kernel images that will
     // never be read again. scene.csv costs 0.8 MB/h, so a card's useful life is hours rather than
@@ -4246,6 +4370,7 @@ void setup() {
     http.send(r == FR_OK && sd_ok ? 200 : 500, "text/plain", b);
   });
   http.on("/ppsv", []() {
+    HEAR_REQUIRE_AUTH();
     // Sweep the pull modes as well as reading the voltage, because the obvious way for THIS
     // firmware to be the fault is for its own ~45k pulldown to be flattening a weak or
     // high-impedance source -- in which case the signal is real and I am destroying it before
@@ -4303,6 +4428,7 @@ void setup() {
     http.send(200, "text/plain", o);
   });
   http.on("/tplen", HTTP_POST, []() {
+    HEAR_REQUIRE_AUTH();
     // POST, not GET: this changes hardware state, and /reboot is POST for the same reason.
     if (!http.hasArg("ms")) {
       http.send(400, "text/plain",
@@ -4396,6 +4522,7 @@ void setup() {
   //   curl -X POST 'http://<node>/gpspins?swap=0'   # documented order
   //   curl -X POST 'http://<node>/gpspins?auto=1'   # hand it back to the probe
   http.on("/gpspins", HTTP_POST, []() {
+    HEAR_REQUIRE_AUTH();
     if (!http.hasArg("swap") && !http.hasArg("auto")) {
       http.send(400, "text/plain", "POST /gpspins?swap=0|1 | ?auto=1\n");
       return;
@@ -4428,6 +4555,7 @@ void setup() {
   });
 
   http.on("/gpsbaud", []() {
+    HEAR_REQUIRE_AUTH();
     // Detaching the UART for the measurement and putting it straight back: the pin is shared, and
     // a diagnostic that leaves the GPS silent afterwards would be worse than no diagnostic.
     Serial1.end();
@@ -4480,6 +4608,7 @@ void setup() {
   //   curl -X POST 'http://<ip>/gate?floor=300&persist=1'    # and across reboots
   //   curl -X POST 'http://<ip>/gate?reset=1'                # back to the compiled-in default
   http.on("/gate", HTTP_POST, []() {
+    HEAR_REQUIRE_AUTH();
     if (http.hasArg("reset")) {
       g_floor = FLOOR_DEFAULT; g_floor_src = "default";
       if (sd_ok) SD.remove(GATE_CFG);

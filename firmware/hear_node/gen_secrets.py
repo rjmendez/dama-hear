@@ -12,10 +12,11 @@ hostname, the fallback AP SSID, the `node` column of every CSV, and the prefix o
 only how many networks it found and a masked name, so a terminal log or a screenshot cannot leak
 them.
 
-~/.hear_push, if present, holds HEAR_PUSH_HOST=... and/or HEAR_PUSH_TOKEN=... to override the
-firmware's compiled-in heartbeat-push target and auth token; the token must match the
-hear-heartbeat-token k8s secret. Neither line is required -- a node built with no file here keeps
-the firmware's defaults.
+~/.hear_push, if present, holds HEAR_PUSH_HOST=..., HEAR_PUSH_TOKEN=... and/or HEAR_ADMIN_TOKEN=...
+to override the firmware's compiled-in heartbeat-push target/auth token and its admin-endpoint
+token (Alert 1: /update, /reboot, /format, /gate, hardware sweeps). None of the three lines is
+required -- a node built with no file here keeps the firmware's defaults, which for
+HEAR_ADMIN_TOKEN means "" and therefore every privileged endpoint refuses every request.
 """
 import os
 import re
@@ -26,16 +27,17 @@ def esc(s):
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-# HEAR_PUSH_HOST / HEAR_PUSH_TOKEN: read from ~/.hear_push (HEAR_PUSH_HOST=..., HEAR_PUSH_TOKEN=...,
-# one per line), same shape as ~/.wifi. Neither is required -- a node with no file here keeps the
-# firmware's compiled-in defaults -- but a node that pushes heartbeats needs a token that matches
-# the hear-heartbeat-token k8s secret, and that value must never be typed into a tracked file.
+# HEAR_PUSH_HOST / HEAR_PUSH_TOKEN / HEAR_ADMIN_TOKEN: read from ~/.hear_push (KEY=value, one per
+# line), same shape as ~/.wifi. None is required -- a node with no file here keeps the firmware's
+# compiled-in defaults -- but a node that pushes heartbeats needs a token matching the
+# hear-heartbeat-token k8s secret, and a node whose admin endpoints should answer at all needs its
+# own HEAR_ADMIN_TOKEN. Neither value may ever be typed into a tracked file.
 def read_push_config(path=None):
     path = path or os.path.expanduser("~/.hear_push")
     cfg = {}
     if not os.path.exists(path):
         return cfg
-    line_re = re.compile(r"\s*(HEAR_PUSH_HOST|HEAR_PUSH_TOKEN)\s*[:=]\s*(.*?)\s*$")
+    line_re = re.compile(r"\s*(HEAR_PUSH_HOST|HEAR_PUSH_TOKEN|HEAR_ADMIN_TOKEN)\s*[:=]\s*(.*?)\s*$")
     with open(path) as f:
         for line in f:
             m = line_re.match(line)
@@ -86,6 +88,8 @@ if __name__ == "__main__":
             f.write('#define HEAR_PUSH_HOST "%s"\n' % esc(push_cfg["HEAR_PUSH_HOST"]))
         if push_cfg.get("HEAR_PUSH_TOKEN"):
             f.write('#define HEAR_PUSH_TOKEN "%s"\n' % esc(push_cfg["HEAR_PUSH_TOKEN"]))
+        if push_cfg.get("HEAR_ADMIN_TOKEN"):
+            f.write('#define HEAR_ADMIN_TOKEN "%s"\n' % esc(push_cfg["HEAR_ADMIN_TOKEN"]))
         # FIRMWARE BUILD ID. Every node reported an identical /status shape while running binaries
         # built from different commits, and there was no field that could tell them apart -- so
         # "are all the nodes on the same version?" was not answerable from the fleet, only from
