@@ -357,10 +357,14 @@ health, TDoA and restore must all work with zero gotchi deployments.
 
 ## Relevant current work
 
-- Open PR #141 (`fix(spatial): use node GPS survey fallback`) and issue #105 affect the spatial
-  read projection, but do not change the canonical clock trust rules.
-- Open PR #151 adds broad tagger modules; keep it behind the canonical event/model contract.
+Current, dated status — including which of these are architecture blockers and which are
+operational debt — is tracked in [migration-risk-register.md](migration-risk-register.md). That
+register is the place to look before starting or gating a phase; the list below records only the
+long-lived issues that constrain the design itself.
+
 - Issue #107 is a known unrecoverable scene-tail gap after a long drain outage.
-- Issue #104 requires durable refusal rows for decode failures.
+- Issue #104 requires durable refusal rows for decode failures. The MQTT bridge still rejects
+  malformed messages *before* anything durable is written, which contradicts the raw-before-parse
+  rule above and makes row conservation unclosable.
 - Issues #101/#108 concern PMTK GPS semantics; #102 blocks one board class from TDoA; #99 and
   #103 show why freshness and boot health need durable, source-aware observability.
