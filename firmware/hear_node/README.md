@@ -90,7 +90,11 @@ LED swings: through an LED and series resistor only one side is a usable edge.
   caller stores `next_cursor` only after its rows land and can retry the same request idempotently.
   `until_cursor` freezes the first page's high-water mark so a later page does not chase rows that
   arrived after the walk began. `rows` is LAST in the object so a body cut mid-row can still be
-  salvaged to a whole-row prefix.
+  salvaged to a whole-row prefix -- but the header is streamed BEFORE the rows, so `returned`,
+  `has_more` and `next_cursor` on a cut body describe the page the node meant to send. A caller
+  must re-describe a salvaged page from the rows it actually parsed and advance its cursor only
+  that far; `until_cursor` and the oldest/newest pair stay usable, because they name the snapshot
+  rather than counting rows.
 
 **Roll forward:** deploy the cursor-aware `hear-drain` first, then flash nodes gradually; the
 drain asks for cursor paging and falls back to the legacy array automatically when a node ignores
