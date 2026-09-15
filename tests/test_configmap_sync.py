@@ -636,6 +636,17 @@ class TestTheEmbeddedConfigMaps:
             "regenerating %s rewrote a document it does not own" % bundle)
 
     @pytest.mark.parametrize("bundle", sorted(_gen()["EMBEDDED_BUNDLES"]))
+    def test_the_manifest_is_replaced_atomically(self, bundle):
+        """⚠️THE FILE IS NOT ONLY THE DOCUMENT THIS GENERATOR WRITES. A truncate-then-write
+        interrupted halfway leaves a manifest with no Deployment and no Service -- documents the
+        generator does not produce and cannot restore -- and the operator finds out at apply."""
+        src = GEN.read_text()
+        i = src.index("if embedded:", src.index("def main("))
+        body = src[i:src.index("text = render(", i)]
+        assert "os.replace(" in body, "the embedded manifest must be swapped into place, not truncated"
+        assert 'open(path, "w")' not in body, "a direct truncating write of the manifest is the defect"
+
+    @pytest.mark.parametrize("bundle", sorted(_gen()["EMBEDDED_BUNDLES"]))
     def test_the_provenance_identifies_the_embedded_content(self, bundle):
         gen = _gen()
         manifest, _app, code, data = gen["EMBEDDED_BUNDLES"][bundle]

@@ -624,8 +624,16 @@ def main(argv=None):
         # Deployment and a Service would truncate the two documents this does not generate.
         path = os.path.join(ROOT, manifest)
         text = render_embedded(name, stamp, open(path).read())
-        with open(path, "w") as fh:
+        # ⚠️ATOMIC, BECAUSE THE FILE IS NOT ONLY THE GENERATED DOCUMENT. An interrupted
+        # truncate-then-write leaves a manifest that has lost its Deployment and Service -- the
+        # two documents this generator does not produce and could not restore. Same directory,
+        # so the replace is a rename within one filesystem.
+        tmp = path + ".regen"
+        with open(tmp, "w") as fh:
             fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
         sys.stderr.write(
             "%s: regenerated in place inside %s from %s\n  kubectl apply -f %s\n"
             % (name, manifest, ", ".join(rel for _k, rel in code + data), manifest))
