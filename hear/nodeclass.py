@@ -897,48 +897,6 @@ register(NodeClass(
     notes="DESIGN TARGET, NOT BUILT. Mains-powered wildlife-camera profile with continuous audio and camera fusion.",
 ))
 
-register(NodeClass(
-    name="esp32s3-speaker",
-    time_source="gps_pps",
-    # Same bench-calibration-rig hardware as esp32s3-i2s-gps: PMTK GPS with 1PPS. The clock term
-    # is unmeasured on THIS board and inherits the family's unmeasured 100 us figure rather than
-    # a number taken from it directly -- see xiao-s3-i2s's note on why that transplant is only
-    # ever provisional.
-    t_sigma_s=100e-6,
-    # None: this class's capture path has never been measured against an external reference.
-    # tools/calibrate_claps.py drives a near-field clap rig that solves for exactly this number
-    # jointly with node geometry, and load_calibrated_biases() below is how its output --
-    # config/calibrated_node_biases.json -- reaches this field. Until that has run, this class
-    # is refused for arrivals the same as any other unmeasured board.
-    path_bias_s=None,
-    mic_count=1,
-    fs_hz=48000.0,
-    band_hz=(50.0, 15000.0),
-    env=(),
-    raw_retain_s=0.0,
-    power_profile="mains_continuous",
-    notes="Bench clap-calibration rig node co-located with a reference speaker. Refused for "
-          "arrivals ONLY because its capture path has never been measured; "
-          "tools/calibrate_claps.py + load_calibrated_biases() is how it gets measured.",
-))
-
-register(NodeClass(
-    name="esp32s3-box3",
-    time_source="gps_pps",
-    t_sigma_s=100e-6,
-    # None for the same reason as esp32s3-speaker above: a different enclosure is a different
-    # capture path, and nothing here has been measured against a co-located reference yet.
-    path_bias_s=None,
-    mic_count=1,
-    fs_hz=48000.0,
-    band_hz=(50.0, 15000.0),
-    env=(),
-    raw_retain_s=0.0,
-    power_profile="mains_continuous",
-    notes="Bench clap-calibration rig node, third enclosure variant. Refused for arrivals ONLY "
-          "because its capture path has never been measured; tools/calibrate_claps.py + "
-          "load_calibrated_biases() is how it gets measured.",
-))
 
 
 def strictest_arrival_class() -> NodeClass:
