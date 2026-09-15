@@ -32,9 +32,7 @@ MANIFEST = os.path.join(ROOT, "deploy", "k8s", "hear-drain.yaml")
 #: this same path on this same PVC. It is written here as a literal rather than read from that
 #: repo on purpose -- a test that reaches into a sibling checkout tests that checkout.
 PHONE_CORPUS_PATH = "/pool/sketch_corpus"
-CLIP_BYTES = 480_044
 BURST_CLIPS_PER_H = 370
-MEASURED_CLIP_BPS = 168_000
 
 
 def _containers(text):
@@ -75,7 +73,7 @@ def _script(block):
 
 
 def _arg_value(block, flag):
-    m = re.search(r"%s\s+([0-9.]+)" % re.escape(flag), block)
+    m = re.search(r"%s\s+(-?[0-9.]+)" % re.escape(flag), block)
     assert m, "%s present but with no value" % flag
     return float(m.group(1)) if "." in m.group(1) else int(m.group(1))
 
@@ -259,26 +257,18 @@ class TestTheClipLaneIsBounded:
             "the cap can bind every run while the check stays green")
 
 
-class TestTheBurstArithmeticIsEncoded:
-    """Measured production was 350-370 clips/hour/node. The manifest must fetch that many before
-    the firmware's rolling SD clip cache evicts them, or the old 80% loss mode returns silently."""
+class TestPrivacyModeIsTheDefault:
+    """The scheduled drain retains no human-audible audio unless an operator changes two caps."""
 
-    def test_the_per_run_cap_covers_a_370_clip_per_hour_burst(self, blocks):
-        schedule_s = 15 * 60
-        cap = _arg_value(blocks["drain"], "--clip-max-per-node")
-        burst_per_run = math.ceil(BURST_CLIPS_PER_H * schedule_s / 3600)
-        assert burst_per_run == 93
-        assert cap >= burst_per_run, (
-            "%d clips/run cannot drain a %d clips/hour burst on a 15-minute schedule (%d/run)"
-            % (cap, BURST_CLIPS_PER_H, burst_per_run))
+    def test_the_scheduled_drain_fetches_no_clips(self, blocks):
+        assert _arg_value(blocks["drain"], "--clip-max-per-node") == 0
 
-    def test_the_deadline_matches_the_measured_clip_transfer_rate(self, blocks):
-        deadline_s = _arg_value(blocks["drain"], "--clip-deadline-s")
-        burst_per_run = math.ceil(BURST_CLIPS_PER_H * 15 * 60 / 3600)
-        required_bps = burst_per_run * CLIP_BYTES / deadline_s
-        assert required_bps <= MEASURED_CLIP_BPS, (
-            "%.0f B/s is needed to drain %d burst clips in %.0f s; measured clip path is %.0f B/s"
-            % (required_bps, burst_per_run, deadline_s, MEASURED_CLIP_BPS))
+    def test_the_scheduled_drain_has_zero_audio_storage_budget(self, blocks):
+        assert _arg_value(blocks["drain"], "--clip-store-max-b") == 0
+
+    def test_clip_loss_gates_report_without_failing_while_collection_is_disabled(self, blocks):
+        assert _arg_value(blocks["check"], "--max-clips-deferred") == -1
+        assert _arg_value(blocks["check"], "--max-clips-lost") == -1
 
     def test_the_firmware_cache_lasts_longer_than_the_schedule(self):
         ino = os.path.join(ROOT, "firmware", "hear_node", "hear_node.ino")

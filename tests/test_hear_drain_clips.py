@@ -206,6 +206,17 @@ class TestAClipIsNotACsv:
         monkeypatch.setattr(HD, "_get", boom)
         assert HD.fetch_clip("10.0.0.1", CLIP_A) == (None, "transport")
 
+    def test_a_bounded_fetch_stops_after_the_cap(self, monkeypatch):
+        seen = []
+
+        def bounded(url, timeout, max_bytes):
+            seen.append(max_bytes)
+            return b"x" * (max_bytes + 1), True
+
+        monkeypatch.setattr(HD, "_get_bounded", bounded)
+        assert HD.fetch_clip("10.0.0.1", CLIP_A, max_bytes=123) == (None, "byte_cap")
+        assert seen == [123]
+
 
 # ---------------------------------------------------------------- S2: names out of dets.csv
 
@@ -492,6 +503,22 @@ class TestUnmeasuredIsNotClean:
             "a run that never reached the node reported a count: %r" % r)
         assert "/status" in r["clips_reason"]
 
+    def test_privacy_prune_runs_even_when_the_node_is_unreachable(self, tmp_path, monkeypatch):
+        pl = _pool(tmp_path)
+        path = CL.store_path(str(pl.root), "2026-09-15", "nyquist",
+                             _name(1).rsplit("/", 1)[1])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(_wav())
+
+        def boom(ip, timeout=None):
+            raise OSError("no route to host")
+
+        monkeypatch.setattr(HD, "fetch_status", boom)
+        HD.drain_node(
+            pl, "nyquist", "10.0.0.1", clip_max_per_node=0, clip_store_max_bytes=0)
+        assert not os.path.exists(path)
+
     def test_a_refused_identity_measures_no_clip(self, tmp_path, wired):
         wired(node="mach", dets_rows=[_dets_row(_name(1), sample=1)], clips={_name(1): _wav()})
         r = HD.drain_node(_pool(tmp_path), "nyquist", "10.0.0.1")
@@ -511,6 +538,22 @@ class TestUnmeasuredIsNotClean:
         r = HD.drain_node(_pool(tmp_path), "nyquist", "10.0.0.1", clip_max_per_node=0)
         assert r["clips_unknown"] is True and "disabled" in r["clips_reason"]
         assert _clip_paths(n) == []
+
+    def test_a_disabled_lane_prunes_existing_audio_to_its_zero_budget(self, tmp_path, wired):
+        n = wired(dets_rows=[_dets_row(_name(1), sample=1)], clips={})
+        pl = _pool(tmp_path)
+        path = CL.store_path(str(pl.root), "2026-09-15", "nyquist",
+                             _name(1).rsplit("/", 1)[1])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(_wav())
+
+        r = HD.drain_node(
+            pl, "nyquist", "10.0.0.1", clip_max_per_node=0, clip_store_max_bytes=0)
+
+        assert _clip_paths(n) == []
+        assert not os.path.exists(path)
+        assert r["prune"]["files_deleted"] == 1
 
     def test_a_node_with_no_clips_at_all_measures_zero_and_says_zero(self, tmp_path, wired):
         wired(dets_rows=[_dets_row("", sample=1)], clips={})

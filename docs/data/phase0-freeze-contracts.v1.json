@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "e4d7c1776f281cfcaf588df8ff34f2eb8d360e0e14e723963da0d38528b9c7b9",
+  "baseline_hash": "1d77cdbb8c878ba8724c2a0f0a64c4ff66d10f4618a2c1b51a6cd63d21b2a92f",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -463,8 +463,8 @@
       },
       {
         "path": "deploy/k8s/hear-drain.yaml",
-        "sha256": "38e02f09e8b124e5d321a7c51a97e93b898b03e27de6d19a0d38fb9b00cedf4e",
-        "size_bytes": 13594
+        "sha256": "f7509a485bbf352ca3d86346289dda912996fda95ee0f80f719b8cc46871a84d",
+        "size_bytes": 14020
       },
       {
         "path": "deploy/k8s/hear-embed.yaml",
@@ -503,8 +503,8 @@
       },
       {
         "path": "deploy/k8s/README.md",
-        "sha256": "8bcbcb12c00c025f2d36b2616db1df00b262ffb4c50c6a1bd948d101c24063a4",
-        "size_bytes": 24093
+        "sha256": "f65997456ec12cd77969e6541058eb6f1afd39b3b5f0883e958fb54ace236891",
+        "size_bytes": 25480
       }
     ],
     "objects": [
@@ -2379,7 +2379,7 @@
         "storage_request": "20Gi"
       }
     ],
-    "section_hash": "613744cc665480f871a325046b8bb13201782fef779b1172867ae8f32959fa74"
+    "section_hash": "cc477848f10c3ae883e1332934535e1180e9ca544a876c188e04ad32a32ca4ec"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",
@@ -3685,6 +3685,12 @@
         ]
       },
       {
+        "schema": "hear.debug_recording_audit.v1",
+        "source_paths": [
+          "tools/hear_debug_record.py"
+        ]
+      },
+      {
         "schema": "hear.experimental_clap_geometry_selfcal.v1",
         "source_paths": [
           "tools/estimate_geometry_from_claps.py"
@@ -3753,7 +3759,7 @@
         ]
       }
     ],
-    "section_hash": "248d557d9051b2f32b5e89018296b180cf2772b602b7ed3ad3761989cc412519",
+    "section_hash": "5123ef87ca6f5acd864c955667205e6c34835eddb58ba678b727355ed9840239",
     "telemetry_routes": [
       {
         "http_path": "/api/hear/heartbeat",
