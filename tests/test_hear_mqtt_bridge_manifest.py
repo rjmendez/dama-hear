@@ -46,6 +46,8 @@ def test_it_declares_the_expected_environment_and_durable_sqlite_outbox():
     assert env["HEAR_DURABLE_STORE"]["value"] == "sqlite"
     assert env["HEAR_DURABLE_DB"]["value"] == "/state/mqtt-bridge.sqlite3"
     assert env["HEAR_DURABLE_REPLAY_LIMIT"]["value"] == "256"
+    assert env["HEAR_DURABLE_REPLAY_MAX_BATCHES"]["value"] == "1024"
+    assert env["HEAR_DURABLE_REPLAY_INTERVAL_S"]["value"] == "60"
     assert env["REDIS_PASS"]["valueFrom"]["secretKeyRef"] == {
         "name": "dama-redis-secret",
         "key": "REDIS_PASS",

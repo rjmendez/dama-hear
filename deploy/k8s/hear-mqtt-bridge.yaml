@@ -61,6 +61,8 @@ spec:
             - { name: HEAR_DURABLE_STORE, value: "sqlite" }
             - { name: HEAR_DURABLE_DB, value: "/state/mqtt-bridge.sqlite3" }
             - { name: HEAR_DURABLE_REPLAY_LIMIT, value: "256" }
+            - { name: HEAR_DURABLE_REPLAY_MAX_BATCHES, value: "1024" }
+            - { name: HEAR_DURABLE_REPLAY_INTERVAL_S, value: "60" }
             - { name: REDIS_HOST, value: "audit-redis.infra.svc.cluster.local" }
             - { name: REDIS_PORT, value: "6379" }
             - name: REDIS_PASS

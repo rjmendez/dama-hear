@@ -210,6 +210,14 @@ heartbeat/event is committed to SQLite WAL storage before Redis is touched. Redi
 compatibility cache for current consumers, and startup replays any rows whose cache publish never
 recorded a success.
 
+Replay drains in bounded batches and then keeps going: `HEAR_DURABLE_REPLAY_LIMIT` caps one batch,
+`HEAR_DURABLE_REPLAY_MAX_BATCHES` caps a single drain, and `HEAR_DURABLE_REPLAY_INTERVAL_S`
+(0 disables) runs a recurring pass, so an outage that leaves more pending rows than one batch
+holds no longer strands the remainder until someone restarts the pod. The event stream append is
+guarded by a per-`record_uid` key (`dama:hear:published:*`, `HEAR_EVENT_PUBLISH_GUARD_TTL_S`), so a
+crash between the publish and the durable success marker replays without a second
+`dama:hear:events` entry.
+
 Rollback is explicit: set `HEAR_DURABLE_STORE=none` and remove the `/state` PVC mount to restore
 the previous Redis-only behavior. PostgreSQL is the next step once a shared dependency and DDL
 ownership are ready: keep the same `DurableRecordStore` seam, move `durable_records` and

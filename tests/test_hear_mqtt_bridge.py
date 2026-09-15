@@ -248,7 +248,28 @@ class TestMakeClient:
             "--durable-store", "sqlite",
             "--durable-db", "/state/mqtt-bridge.sqlite3",
             "--durable-replay-limit", "17",
+            "--durable-replay-max-batches", "9",
+            "--durable-replay-interval-s", "12.5",
         ])
         assert args.durable_store == "sqlite"
         assert args.durable_db == "/state/mqtt-bridge.sqlite3"
         assert args.durable_replay_limit == 17
+        assert args.durable_replay_max_batches == 9
+        assert args.durable_replay_interval_s == 12.5
+
+    def test_the_bridge_drains_a_backlog_bigger_than_one_replay_batch(self, tmp_path):
+        db = tmp_path / "mqtt-bridge.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        for i in range(300):
+            payload = _heartbeat()
+            payload["idempotency_key"] = f"backlog-{i:04d}"
+            payload["received_at"] = HR.utc_now()
+            payload["receiver_schema_version"] = HR.RECEIVER_SCHEMA_VERSION
+            durable.persist(f"backlog-{i:04d}", payload, HR.encode_json(payload))
+        st = HR.HeartbeatReceiverStore(
+            FakeRedis(), redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        summary = st.drain_pending(limit=256)
+        assert summary["synced"] == 300
+        assert summary["remaining_pending"] == 0

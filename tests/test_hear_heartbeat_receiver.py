@@ -5,6 +5,7 @@ import socket
 import sqlite3
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -16,6 +17,8 @@ from tools import hear_heartbeat_receiver as HR  # noqa: E402
 
 
 class FakeRedis:
+    """Minimal stand-in. ``eval`` emulates tools/hear_heartbeat_receiver's publish-once script."""
+
     def __init__(self, failures_before_success: int = 0):
         self.values = {}
         self.ttls = {}
@@ -23,7 +26,9 @@ class FakeRedis:
         self.streams = {}
         self.failures_before_success = failures_before_success
         self.execute_calls = 0
+        self.eval_calls = 0
         self._ops = []
+        self._lock = threading.Lock()
 
     def pipeline(self, transaction=False):
         assert transaction is False
@@ -38,13 +43,47 @@ class FakeRedis:
         self._ops.append(("sadd", key, members))
         return self
 
-    def set(self, key, value):
+    def set(self, key, value, nx=False, ex=None):
+        if nx:
+            with self._lock:
+                if key in self.values:
+                    return None
+                self.values[key] = value
+                if ex is not None:
+                    self.ttls[key] = ex
+                return True
         self._ops.append(("set", key, value))
         return self
+
+    def delete(self, key):
+        with self._lock:
+            self.values.pop(key, None)
+            self.ttls.pop(key, None)
+        return 1
+
+    def eval(self, script, numkeys, *args):
+        assert numkeys == 2
+        self.eval_calls += 1
+        guard_key, stream_key = args[0], args[1]
+        guard_value, guard_ttl, maxlen, device_id, payload = args[2:7]
+        with self._lock:
+            if guard_key in self.values:
+                return 0
+            self.values[guard_key] = guard_value
+            self.ttls[guard_key] = int(guard_ttl)
+            self._append_stream(stream_key, {"device_id": device_id, "payload": payload},
+                                int(maxlen))
+        return 1
 
     def xadd(self, key, fields, maxlen=None, approximate=True):
         self._ops.append(("xadd", key, dict(fields), maxlen, approximate))
         return str(len(self.streams.get(key, [])) + 1)
+
+    def _append_stream(self, key, fields, maxlen):
+        stream = self.streams.setdefault(key, [])
+        stream.append(fields)
+        if maxlen is not None and len(stream) > maxlen:
+            del stream[:-maxlen]
 
     def execute(self):
         self.execute_calls += 1
@@ -66,10 +105,7 @@ class FakeRedis:
                 self.values[key] = value
             elif kind == "xadd":
                 _, key, fields, maxlen, approximate = op
-                stream = self.streams.setdefault(key, [])
-                stream.append(fields)
-                if maxlen is not None and len(stream) > maxlen:
-                    del stream[:-maxlen]
+                self._append_stream(key, fields, maxlen)
                 assert approximate is True
         return []
 
@@ -409,6 +445,220 @@ class TestDurableSqlite(TestValidation):
         assert body["durable_store"]["backend"] == "sqlite"
         assert body["durable_store"]["path"].endswith("heartbeats.sqlite3")
         assert body["durable_store"]["pending_records"] == 0
+
+
+class TestPublishExactlyOnce(TestValidation):
+    """Regressions for the double-publish window between XADD and the durable success marker."""
+
+    @staticmethod
+    def _counts(db_path):
+        return TestDurableSqlite._counts(db_path)
+
+    def _store(self, db, fake):
+        return HR.HeartbeatReceiverStore(
+            fake,
+            heartbeat_ttl_s=30,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+
+    def test_crash_before_mark_success_does_not_republish_the_event_on_replay(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis()
+        store = self._store(db, fake)
+        # Simulate the crash window: the cache publish lands, the process dies before
+        # note_cache_success() is appended, so the record is still pending at the next start.
+        store.durable_store.note_cache_success = lambda *a, **k: None
+        store.write_event(self._event())
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+        assert store.health_snapshot()["durable_store"]["pending_records"] == 1
+
+        recovered = self._store(db, fake)
+        summary = recovered.replay_pending(limit=10)
+        assert summary["attempted"] == 1
+        assert summary["synced"] == 1
+        assert summary["failed"] == 0
+        assert summary["remaining_pending"] == 0
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+        assert self._counts(db)["successes"] == 1
+
+    def test_concurrent_duplicate_requests_publish_the_event_exactly_once(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis()
+        store = self._store(db, fake)
+        payload = self._event(idempotency_key="nyquist-clip-234")
+        start = threading.Barrier(8)
+        errors = []
+
+        def _post():
+            try:
+                start.wait(timeout=5)
+                store.write_event(dict(payload))
+            except Exception as exc:  # pragma: no cover - surfaced by the assert below.
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_post) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert errors == []
+        counts = self._counts(db)
+        assert counts["records"] == 1
+        assert counts["successes"] == 1
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+
+    def test_publish_guard_falls_back_when_the_client_cannot_run_scripts(self, tmp_path):
+        class NoScriptRedis(FakeRedis):
+            def eval(self, *a, **k):
+                raise HR.redis.exceptions.ResponseError("unknown command 'EVAL'")
+
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = NoScriptRedis()
+        store = self._store(db, fake)
+        store.durable_store.note_cache_success = lambda *a, **k: None
+        store.write_event(self._event())
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+
+        recovered = self._store(db, fake)
+        recovered.cache.client = fake
+        recovered.replay_pending(limit=10)
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+
+    def test_a_failed_publish_releases_the_guard_so_replay_can_retry(self, tmp_path):
+        class FlakyPublishRedis(FakeRedis):
+            def __init__(self):
+                super().__init__()
+                self.publish_failures = 1
+
+            def eval(self, *a, **k):
+                if self.publish_failures > 0:
+                    self.publish_failures -= 1
+                    raise RuntimeError("simulated redis outage")
+                return super().eval(*a, **k)
+
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FlakyPublishRedis()
+        store = self._store(db, fake)
+        with pytest.raises(RuntimeError, match="simulated redis outage"):
+            store.write_event(self._event())
+        assert fake.streams == {}
+        counts = self._counts(db)
+        assert counts["successes"] == 0
+        assert counts["failures"] == 1
+
+        summary = store.replay_pending(limit=10)
+        assert summary["synced"] == 1
+        assert summary["remaining_pending"] == 0
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+
+
+class TestReplayDrain(TestValidation):
+    """A backlog larger than one bounded replay batch must drain without a restart."""
+
+    @staticmethod
+    def _seed_pending(db_path, count):
+        durable = HR.make_durable_store("sqlite", str(db_path))
+        for i in range(count):
+            payload = TestValidation._heartbeat(idempotency_key=f"backlog-{i:04d}")
+            payload["received_at"] = HR.utc_now()
+            payload["receiver_schema_version"] = HR.RECEIVER_SCHEMA_VERSION
+            durable.persist(f"backlog-{i:04d}", payload, HR.encode_json(payload))
+        return durable
+
+    def test_backlog_larger_than_the_replay_limit_drains_in_batches(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        self._seed_pending(db, 300)
+        fake = FakeRedis()
+        store = HR.HeartbeatReceiverStore(
+            fake,
+            heartbeat_ttl_s=30,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        assert store.health_snapshot()["durable_store"]["pending_records"] == 300
+
+        # One bounded pass strands the remainder -- this is the defect.
+        single = store.replay_pending(limit=256)
+        assert single["synced"] == 256
+        assert single["remaining_pending"] == 44
+
+        # The draining loop finishes the job in the same process, no restart involved.
+        drained = store.drain_pending(limit=256)
+        assert drained["remaining_pending"] == 0
+        assert drained["drained"] is True
+        assert drained["batches"] >= 1
+        assert store.health_snapshot()["durable_store"]["pending_records"] == 0
+        assert self._counts(db)["successes"] == 300
+
+    def test_drain_from_scratch_clears_a_300_row_backlog_with_bounded_batches(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        self._seed_pending(db, 300)
+        store = HR.HeartbeatReceiverStore(
+            FakeRedis(),
+            heartbeat_ttl_s=30,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        summary = store.drain_pending(limit=64)
+        assert summary["attempted"] == 300
+        assert summary["synced"] == 300
+        assert summary["failed"] == 0
+        assert summary["batches"] == 5
+        assert summary["remaining_pending"] == 0
+
+    def test_drain_stops_instead_of_spinning_while_the_cache_is_down(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        self._seed_pending(db, 10)
+        fake = FakeRedis(failures_before_success=1000)
+        store = HR.HeartbeatReceiverStore(
+            fake,
+            heartbeat_ttl_s=30,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        summary = store.drain_pending(limit=4)
+        assert summary["batches"] == 1
+        assert summary["failed"] == 4
+        assert summary["synced"] == 0
+        assert summary["remaining_pending"] == 10
+        assert summary["drained"] is False
+
+    def test_the_background_worker_resumes_a_backlog_left_by_an_outage(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        self._seed_pending(db, 300)
+        store = HR.HeartbeatReceiverStore(
+            FakeRedis(),
+            heartbeat_ttl_s=30,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        worker = HR.start_replay_worker(store, interval_s=0.01, limit=128)
+        assert worker is not None
+        try:
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if store.health_snapshot()["durable_store"]["pending_records"] == 0:
+                    break
+                time.sleep(0.05)
+        finally:
+            worker.stop(timeout=5)
+        assert store.health_snapshot()["durable_store"]["pending_records"] == 0
+
+    def test_start_replay_worker_is_disabled_without_durability_or_interval(self, tmp_path):
+        store = HR.HeartbeatReceiverStore(FakeRedis(), redis_target="fake:6379")
+        assert HR.start_replay_worker(store, interval_s=5) is None
+        durable_store = HR.HeartbeatReceiverStore(
+            FakeRedis(),
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(tmp_path / "hb.sqlite3")),
+        )
+        assert HR.start_replay_worker(durable_store, interval_s=0) is None
+
+    @staticmethod
+    def _counts(db_path):
+        return TestDurableSqlite._counts(db_path)
 
 
 class TestStartupConfig:

@@ -32,6 +32,7 @@ from tools.hear_heartbeat_receiver import (  # noqa: E402
     add_durable_store_args,
     make_durable_store,
     make_redis_client,
+    start_replay_worker,
     validate_event_payload,
     validate_heartbeat_payload,
 )
@@ -158,13 +159,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         redis_target=redis_target,
         durable_store=make_durable_store(args.durable_store, args.durable_db),
     )
-    replay = store.replay_pending(limit=args.durable_replay_limit)
+    replay = store.drain_pending(limit=args.durable_replay_limit,
+                                 max_batches=args.durable_replay_max_batches)
     logger.info("Redis target -> %s", redis_target)
     logger.info("durable backend=%s path=%s", store.durable_store.backend, store.durable_store.path)
     if replay["attempted"] or replay["failed"]:
         logger.info("replay pending attempted=%d synced=%d failed=%d remaining=%d",
                     replay["attempted"], replay["synced"], replay["failed"],
                     replay["remaining_pending"])
+    start_replay_worker(
+        store,
+        interval_s=args.durable_replay_interval_s,
+        limit=args.durable_replay_limit,
+        max_batches=args.durable_replay_max_batches,
+        on_summary=lambda s: logger.info(
+            "replay pass attempted=%d synced=%d failed=%d remaining=%d",
+            s["attempted"], s["synced"], s["failed"], s["remaining_pending"]),
+    )
     logger.info("MQTT broker -> %s:%s topic=%s", args.mqtt_host, args.mqtt_port, args.mqtt_topic)
     client = make_client(store, topic=args.mqtt_topic, client_id=args.mqtt_client_id)
     client.connect(args.mqtt_host, args.mqtt_port, keepalive=args.mqtt_keepalive_s)
