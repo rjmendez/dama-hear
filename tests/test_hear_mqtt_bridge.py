@@ -1,6 +1,7 @@
 """The hear_node MQTT bridge: routes AWS-relayed telemetry into dama:hear:* Redis state."""
 import json
 import os
+import sqlite3
 import sys
 
 import pytest
@@ -60,10 +61,6 @@ def _event(**overrides):
 
 
 def _batch_ingest_wrapped(payload):
-    # What actually arrives over MQTT: batch_ingest's per-message normalization has added
-    # device_id (already present here), idempotency_key, batch_idempotency_key and
-    # ingest_trace_id, and replaced any "ts" with a numeric "ts_ms" it derived itself. The
-    # bridge must accept this shape, not just the receiver's own bare test fixtures.
     body = dict(payload)
     body["idempotency_key"] = "deadbeef" * 8
     body["batch_idempotency_key"] = "cafebabe" * 8
@@ -99,8 +96,6 @@ class TestDispatchMessage:
         assert fake.streams["dama:hear:events"][0]["device_id"] == "nyquist"
 
     def test_ignores_a_foreign_devices_telemetry_on_the_same_topic_pattern(self, store):
-        # The Oxalis consumer republishes ANY device's telemetry to dama/<id>/telemetry --
-        # a phone's payload has no telemetry_path field at all and must be skipped quietly.
         st, _fake = store
         stats = B.BridgeStats()
         raw = json.dumps({"device_id": "pixel_7_pro", "sensor": "gnss", "lat": 1.0}).encode()
@@ -132,8 +127,6 @@ class TestDispatchMessage:
         assert stats.rejected == 1
 
     def test_a_numeric_millisecond_ts_is_converted_to_rfc3339_and_accepted(self, store):
-        # What the forwarder actually sends: "ts" normalised to numeric milliseconds. The receiver
-        # contract wants an RFC3339 string, and without the conversion every message was rejected.
         st, fake = store
         stats = B.BridgeStats()
         raw = json.dumps(_batch_ingest_wrapped(_heartbeat(ts=1789256580000))).encode()
@@ -150,7 +143,7 @@ class TestDispatchMessage:
 
     @pytest.mark.parametrize("bad_ts", [1e30, -1e30])
     def test_an_unrepresentable_numeric_ts_is_rejected_without_raising(self, store, bad_ts):
-        st, fake = store
+        st, _fake = store
         stats = B.BridgeStats()
         raw = json.dumps(_batch_ingest_wrapped(_heartbeat(ts=bad_ts))).encode()
         assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats) is None
@@ -174,6 +167,26 @@ class TestDispatchMessage:
         assert record is not None
         assert stats.malformed == 1
         assert stats.accepted == 1
+
+    def test_duplicate_event_retry_is_idempotent_with_the_sqlite_outbox(self, tmp_path):
+        db = tmp_path / "mqtt-bridge.sqlite3"
+        fake = FakeRedis()
+        st = HR.HeartbeatReceiverStore(
+            fake,
+            heartbeat_ttl_s=30,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_event())).encode()
+        assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats) is not None
+        assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats) is not None
+        with sqlite3.connect(db) as con:
+            assert con.execute("SELECT COUNT(*) FROM durable_records").fetchone()[0] == 1
+            assert con.execute(
+                "SELECT COUNT(*) FROM cache_attempts WHERE outcome='succeeded'"
+            ).fetchone()[0] == 1
+        assert len(fake.streams["dama:hear:events"]) == 1
 
 
 class TestMakeClient:
@@ -229,3 +242,13 @@ class TestMakeClient:
         client.on_message(client, None, FakeMsg())
         assert "dama:hear:nyquist" in fake.values
         assert client.stats.accepted == 1
+
+    def test_parse_args_accepts_durable_store_flags(self):
+        args = B.parse_args([
+            "--durable-store", "sqlite",
+            "--durable-db", "/state/mqtt-bridge.sqlite3",
+            "--durable-replay-limit", "17",
+        ])
+        assert args.durable_store == "sqlite"
+        assert args.durable_db == "/state/mqtt-bridge.sqlite3"
+        assert args.durable_replay_limit == 17

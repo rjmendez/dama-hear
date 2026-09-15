@@ -1,4 +1,17 @@
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hear-mqtt-bridge-state
+  namespace: dama
+  labels:
+    app: hear-mqtt-bridge
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,10 +21,9 @@ metadata:
     app: hear-mqtt-bridge
   annotations:
     dama-hear/what: >-
-      Subscribes to the local mqtt-broker for hear_node telemetry relayed through
-      dama-gotchi's AWS ingest API (hear_node -> API Gateway -> batch_ingest Lambda -> SQS ->
-      forwarder Lambda -> Oxalis SQS -> dama-sqs-consumer.py) and writes it into the same
-      dama:hear:* Redis schema hear-heartbeat.yaml's LAN-only receiver writes.
+      Subscribes to the local mqtt-broker for hear_node telemetry relayed through dama-gotchi's
+      AWS ingest API, commits each accepted record to the phase-0 durable outbox, and reflects it
+      into the same dama:hear:* Redis schema hear-heartbeat.yaml's LAN receiver writes.
 spec:
   replicas: 1
   selector:
@@ -22,10 +34,6 @@ spec:
       labels:
         app: hear-mqtt-bridge
     spec:
-      # The local broker (fed directly by dama-sqs-consumer.py) is bound on this node's host
-      # network, not exposed through the `mqtt-broker` k8s Service (its selector currently
-      # matches zero pods -- that Service is stale). mqtt-bridge-botnet reaches the same broker
-      # the same way, at 127.0.0.1:31883, for the same reason.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:
@@ -50,6 +58,9 @@ spec:
             - { name: MQTT_PORT, value: "31883" }
             - { name: MQTT_TOPIC, value: "dama/+/telemetry" }
             - { name: MQTT_CLIENT_ID, value: "hear-mqtt-bridge" }
+            - { name: HEAR_DURABLE_STORE, value: "sqlite" }
+            - { name: HEAR_DURABLE_DB, value: "/state/mqtt-bridge.sqlite3" }
+            - { name: HEAR_DURABLE_REPLAY_LIMIT, value: "256" }
             - { name: REDIS_HOST, value: "audit-redis.infra.svc.cluster.local" }
             - { name: REDIS_PORT, value: "6379" }
             - name: REDIS_PASS
@@ -62,6 +73,7 @@ spec:
             - { name: code, mountPath: /app/tools/hear_heartbeat_receiver.py, subPath: tools_hear_heartbeat_receiver.py }
             - { name: code, mountPath: /app/tools/hear_mqtt_bridge.py, subPath: tools_hear_mqtt_bridge.py }
             - { name: deps, mountPath: /deps }
+            - { name: state, mountPath: /state }
           resources:
             requests: { cpu: 100m, memory: 128Mi }
             limits:   { cpu: "1",  memory: 256Mi }
@@ -71,3 +83,6 @@ spec:
             name: hear-mqtt-bridge-code
         - name: deps
           emptyDir: {}
+        - name: state
+          persistentVolumeClaim:
+            claimName: hear-mqtt-bridge-state

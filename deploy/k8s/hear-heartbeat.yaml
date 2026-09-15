@@ -1,4 +1,17 @@
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hear-heartbeat-state
+  namespace: dama
+  labels:
+    app: hear-heartbeat
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,8 +21,9 @@ metadata:
     app: hear-heartbeat
   annotations:
     dama-hear/what: >-
-      Receives hear_node heartbeat and event POSTs and writes short-TTL Redis liveness keys plus
-      advisory event state.
+      Receives hear_node heartbeat and event POSTs, commits each accepted record to the
+      phase-0 durable outbox, and then reflects it into the existing short-TTL dama:hear:*
+      Redis compatibility keys.
 spec:
   replicas: 1
   selector:
@@ -41,6 +55,9 @@ spec:
           env:
             - { name: HEAR_HEARTBEAT_TTL_S, value: "30" }
             - { name: HEAR_HEARTBEAT_SOCKET_TIMEOUT_S, value: "0.5" }
+            - { name: HEAR_DURABLE_STORE, value: "sqlite" }
+            - { name: HEAR_DURABLE_DB, value: "/state/heartbeat-receiver.sqlite3" }
+            - { name: HEAR_DURABLE_REPLAY_LIMIT, value: "256" }
             - { name: REDIS_HOST, value: "audit-redis.infra.svc.cluster.local" }
             - { name: REDIS_PORT, value: "6379" }
             - name: REDIS_PASS
@@ -57,6 +74,7 @@ spec:
           volumeMounts:
             - { name: code, mountPath: /app/tools/hear_heartbeat_receiver.py, subPath: tools_hear_heartbeat_receiver.py }
             - { name: deps, mountPath: /deps }
+            - { name: state, mountPath: /state }
           readinessProbe:
             httpGet: { path: /healthz, port: http }
             periodSeconds: 10
@@ -72,6 +90,9 @@ spec:
             name: hear-heartbeat-code
         - name: deps
           emptyDir: {}
+        - name: state
+          persistentVolumeClaim:
+            claimName: hear-heartbeat-state
 ---
 apiVersion: v1
 kind: Service

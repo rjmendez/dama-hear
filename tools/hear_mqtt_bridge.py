@@ -29,6 +29,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools.hear_heartbeat_receiver import (  # noqa: E402
     HeartbeatReceiverStore,
     RequestError,
+    add_durable_store_args,
+    make_durable_store,
     make_redis_client,
     validate_event_payload,
     validate_heartbeat_payload,
@@ -46,9 +48,6 @@ REDIS_HOST = os.environ.get("REDIS_HOST", "audit-redis.infra.svc.cluster.local")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 REDIS_PASS = os.environ.get("REDIS_PASS")
 
-# telemetry_path -> (validator, HeartbeatReceiverStore method name). Kept as a lookup table
-# (not if/elif) so adding a third hear_node message kind is one line here, not a new branch
-# in dispatch_message().
 _ROUTES: Dict[str, Tuple[Callable[[Any], Dict[str, Any]], str]] = {
     "hear/heartbeat": (validate_heartbeat_payload, "write_heartbeat"),
     "hear/event": (validate_event_payload, "write_event"),
@@ -66,14 +65,8 @@ class BridgeStats:
 
 
 def dispatch_message(store: HeartbeatReceiverStore, raw: bytes, topic: str,
-                      stats: Optional[BridgeStats] = None) -> Optional[Dict[str, Any]]:
-    """Decode and route one MQTT message payload; never raises.
-
-    A malformed payload, a message for a device that isn't a hear_node (this topic
-    pattern also carries dama-gotchi's own telemetry), or one that fails schema
-    validation must not crash the bridge or block the messages behind it -- so every
-    failure path here logs and returns None instead of propagating.
-    """
+                     stats: Optional[BridgeStats] = None) -> Optional[Dict[str, Any]]:
+    """Decode and route one MQTT message payload; never raises."""
     stats = stats if stats is not None else BridgeStats()
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -93,9 +86,6 @@ def dispatch_message(store: HeartbeatReceiverStore, raw: bytes, topic: str,
     validator, writer_name = route
 
     try:
-        # batch_ingest/forwarder normalize the transport timestamp to numeric
-        # milliseconds. The Redis contract uses an RFC3339 string.
-        # Seconds, like the receiver's own timestamps; sub-second precision stays in ts_ms.
         ts = payload.get("ts")
         if isinstance(ts, (int, float)) and not isinstance(ts, bool):
             payload = dict(payload)
@@ -107,8 +97,6 @@ def dispatch_message(store: HeartbeatReceiverStore, raw: bytes, topic: str,
         logger.warning("rejected %s message on %s: %s", payload.get("telemetry_path"), topic, exc)
         return None
     except (ValueError, OverflowError, OSError) as exc:
-        # A numeric ts outside what datetime can represent (inf, NaN, absurd magnitudes) is a bad
-        # message, not a reason to stop the bridge.
         stats.rejected += 1
         logger.warning("rejected %s message on %s: unusable numeric ts: %s",
                        payload.get("telemetry_path"), topic, exc)
@@ -157,6 +145,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--redis-host", default=REDIS_HOST)
     ap.add_argument("--redis-port", type=int, default=REDIS_PORT)
     ap.add_argument("--redis-pass", default=REDIS_PASS)
+    add_durable_store_args(ap)
     return ap.parse_args(argv)
 
 
@@ -167,10 +156,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     store = HeartbeatReceiverStore(
         make_redis_client(args.redis_host, args.redis_port, args.redis_pass),
         redis_target=redis_target,
+        durable_store=make_durable_store(args.durable_store, args.durable_db),
     )
-    client = make_client(store, topic=args.mqtt_topic, client_id=args.mqtt_client_id)
+    replay = store.replay_pending(limit=args.durable_replay_limit)
     logger.info("Redis target -> %s", redis_target)
+    logger.info("durable backend=%s path=%s", store.durable_store.backend, store.durable_store.path)
+    if replay["attempted"] or replay["failed"]:
+        logger.info("replay pending attempted=%d synced=%d failed=%d remaining=%d",
+                    replay["attempted"], replay["synced"], replay["failed"],
+                    replay["remaining_pending"])
     logger.info("MQTT broker -> %s:%s topic=%s", args.mqtt_host, args.mqtt_port, args.mqtt_topic)
+    client = make_client(store, topic=args.mqtt_topic, client_id=args.mqtt_client_id)
     client.connect(args.mqtt_host, args.mqtt_port, keepalive=args.mqtt_keepalive_s)
     client.loop_forever()
     return 0
