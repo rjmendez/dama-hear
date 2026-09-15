@@ -27,6 +27,7 @@ import paho.mqtt.client as mqtt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools.hear_heartbeat_receiver import (  # noqa: E402
+    DurableReplayWorker,
     HeartbeatReceiverStore,
     RequestError,
     add_durable_store_args,
@@ -165,10 +166,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         logger.info("replay pending attempted=%d synced=%d failed=%d remaining=%d",
                     replay["attempted"], replay["synced"], replay["failed"],
                     replay["remaining_pending"])
+    # Keeps replaying pending durable records for the life of the process, not only at this
+    # startup catch-up above, so a Redis outage that outlasts a few messages still self-heals
+    # once Redis recovers without requiring a bridge restart.
+    replay_worker = DurableReplayWorker(
+        store, args.durable_replay_interval_s, args.durable_replay_limit,
+        name="hear-mqtt-bridge-replay")
     logger.info("MQTT broker -> %s:%s topic=%s", args.mqtt_host, args.mqtt_port, args.mqtt_topic)
     client = make_client(store, topic=args.mqtt_topic, client_id=args.mqtt_client_id)
     client.connect(args.mqtt_host, args.mqtt_port, keepalive=args.mqtt_keepalive_s)
-    client.loop_forever()
+    try:
+        client.loop_forever()
+    finally:
+        replay_worker.stop()
     return 0
 
 
