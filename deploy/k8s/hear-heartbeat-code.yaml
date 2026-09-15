@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-heartbeat-code.yaml
-# apply-mode client: 60933 B serialised; 61197 B of annotations against a 262144 B cap.
+# apply-mode client: 61738 B serialised; 62002 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-heartbeat
   annotations:
-    dama-hear/commit: 'f87f326'
-    dama-hear/source-sha256: '31bcee329b4546e59e097d5484697a6f009a2227cb1f9305488b94319405c66d'
+    dama-hear/commit: 'f65b6da'
+    dama-hear/source-sha256: '3037bbf1ff4bc963fc7d64c4f87cdb0a133fbdab3b9cbdca56caf4de8c4aae6f'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '60933'
+    dama-hear/serialised-bytes: '61738'
 data:
   tools_hear_heartbeat_receiver.py: |
     #!/usr/bin/env python3
@@ -211,7 +211,11 @@ data:
                 try:
                     yield con
                 except BaseException:
-                    con.execute("ROLLBACK")
+                    try:
+                        con.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        # Never mask the real failure with a rollback-of-nothing error.
+                        logger.debug("rollback after a failed durable transaction was a no-op")
                     raise
                 con.execute("COMMIT")
             finally:
@@ -733,6 +737,13 @@ data:
             stream is append-only and already deduped Redis-side, so a duplicate must stay a no-op.
             """
             if stored.telemetry_path != "hear/heartbeat":
+                return
+            if self.durable_store.is_superseded(stored):
+                # An *older* heartbeat can be redelivered after a newer one was already cached (MQTT
+                # QoS-1 redelivery, a node draining its local outbox, an out-of-order retry). Writing
+                # its body back would roll dama:hear:<id> and dama:hear:latest backwards, which is the
+                # same hazard replay_pending refuses. The newer record already armed this device's TTL
+                # with current state, so the correct refresh here is none at all.
                 return
             try:
                 self.cache.write(stored.record, stored.body_json, stored.record_uid)
