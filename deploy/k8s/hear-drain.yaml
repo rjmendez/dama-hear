@@ -139,6 +139,12 @@ spec:
 # That is why the node map is repeated here: the heartbeat can say whether the drain moved data,
 # but the audio-loss signal lives on the node.
 #
+# ⚠️CLIP LOSS IS A PAGE, NOT A STAT. The default `--max-clips-lost -1` reports historical
+# `evicted_before_fetch` rows without failing because the first deployment had hundreds of
+# already-dead names to classify. The live fleet is past that bootstrap: if a check-window contains
+# any newly confirmed destroyed clip, the drain schedule/storage budget is losing audio and the
+# CronJob must be red until an operator changes the cadence, budget, or trigger rate.
+#
 # ⚠️THIS JOB RUNS ONE FIFTH AS OFTEN AS THE DRAIN ABOVE (`*/15 * * * *` vs `17 * * * *`), so four
 # drains land between two checks. A per-run heartbeat field would be overwritten three times
 # before the gate looked at it, so the heartbeat keeps a ring and `--unfetched-window-s` says how
@@ -190,7 +196,8 @@ spec:
                     --node ageev=172.16.100.83 \
                     --unfetched-window-s 7200 \
                     --max-ring-wall-span 1.02 \
-                    --max-clips-deferred 0
+                    --max-clips-deferred 0 \
+                    --max-clips-lost 0
                   rc=$?
                   # --stats runs EVEN WHEN THE CHECK FAILED: a failure is exactly when the pool
                   # summary is wanted. Its own status is discarded so it cannot mask rc.
