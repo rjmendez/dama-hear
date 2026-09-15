@@ -14,10 +14,11 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | 04c2e744bafc21a74e3d302b3bef06a9f392a15ad00dada18f39c389b9a03e57 |
+| baseline | f500298687a8452b78b5ff7391d232ca31a953926960ff97935f77f93ffa042b |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
 | firmware_build_metadata | 3fcf5bbb46bfba120bab6a1acab3a35521710b4fcc857000ff1abff8c193d875 |
 | schemas | 427c86937d28bd12b6de71c3b4604eae609d2b24edfd4f1a761256bc74a6b580 |
+| published_contracts | 4a58f893566092f45a9608b98489332c06c7ea265d5f5abf46299aba2a3f65c6 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |
 | redis_keys | d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03 |
 | kubernetes_and_pvc_layout | bc5c119800506749b5a4b7225771e8c0b871fc47b11568343a7e8e563680a79c |
@@ -113,6 +114,47 @@ Source hashes:
 | hear.tdoa_attempt.v1 | tools/hear_tdoa.py |
 | hear.tdoa_model_card.v1 | tools/hear_tdoa.py |
 | hear.window.golden.v2 | testdata/window_golden.json<br>tools/gen_golden.py |
+
+## Published contract artifacts
+
+Generated artifacts are written by their tools/gen_*.py generator and ruled on by tools/check_contract_layout.py. This section freezes their bytes so a published schema, fixture or manifest cannot change without moving the baseline hash.
+
+| contract | schema sha256 | manifest sha256 | fixtures | contract hash |
+| --- | --- | --- | --- | --- |
+| hear.ingest.v1 | 604bb162690d127973f15738a5e7a33332b75b345c9d40e4f67646289afd1d70 | 911548909a45dae8c27d41bbcb7fc018b78d3160eeedd529df4606966a5ddbc1 | 10 | 149a18a91bc3652d378f85cbaa5ecd4d65a9afb802144a66886fbbf85be18e51 |
+
+### Declared fixture outcomes
+
+| contract | fixture | expect_status | dispatchable | reasons | sha256 |
+| --- | --- | --- | --- | --- | --- |
+| hear.ingest.v1 | valid-node-detection | accepted | yes | (none) | 3a43b833cd2ac44caebde0a151858527302b6b56308b6f710ba77681ae24dde2 |
+| hear.ingest.v1 | degraded-no-clock-anchor | accepted | yes | (none) | 18034d456e4e359341501d1994edb791f39c383b0d43f81bbf13ab8f76e7bbc4 |
+| hear.ingest.v1 | minimal-legacy-producer | accepted | yes | (none) | 4661e871a7ee4179a377bc60112ae0b1db8c53cf397a13a9d287772ecb922e1e |
+| hear.ingest.v1 | gotchi-adapter-sketch | accepted | yes | (none) | 101052206fdc405dbf9a862b8a2a84c74b76487d67fe32325aed7cfc4e1b8541 |
+| hear.ingest.v1 | forward-additive-unknown-fields | accepted | no | (none) | bf48c1df998bd7d8cf148fbe43c634f7b9c6691b70c3530dba91edc04c33f04d |
+| hear.ingest.v1 | forward-additive-stripped | accepted | no | (none) | 33fba79f29783a82372a055fd2dff9f855b55be440bbabbc6d705ae2e60a7a21 |
+| hear.ingest.v1 | unsupported-future-major | refused | no | schema_version_unsupported | 5ea74e18ec0396e5516c7f4b30ee98ef028c29cf3e69e74b5fdf08c3a6bd4afd |
+| hear.ingest.v1 | malformed-missing-clock | refused | no | field_missing | a125694f01735174e471cb1c4c05240093ae63775cfcc1ca6bd88c955ef652a0 |
+| hear.ingest.v1 | malformed-field-types | refused | no | timestamp_not_rfc3339_utc, type_invalid, value_out_of_range | 70c8b806332d9c82aad123cd5eae53fd996d30e8e76da8dd02cd182234f42225 |
+| hear.ingest.v1 | malformed-clock-valid-without-time | refused | no | clock_valid_without_observed_at | 79923e2097b685727cd8fa17cd79629ee4ae27f46fcf3efea060ded97c5dfbb0 |
+
+### Artifact hashes
+
+| path | size_bytes | sha256 |
+| --- | --- | --- |
+| contracts/README.md | 2081 | 1775a7dc72a27613405e6edfeb2c5eae7f0277237199d5830179d8bbac4ff8fe |
+| contracts/fixtures/hear.ingest.v1/degraded-no-clock-anchor.json | 790 | 18034d456e4e359341501d1994edb791f39c383b0d43f81bbf13ab8f76e7bbc4 |
+| contracts/fixtures/hear.ingest.v1/forward-additive-stripped.json | 860 | 33fba79f29783a82372a055fd2dff9f855b55be440bbabbc6d705ae2e60a7a21 |
+| contracts/fixtures/hear.ingest.v1/forward-additive-unknown-fields.json | 954 | bf48c1df998bd7d8cf148fbe43c634f7b9c6691b70c3530dba91edc04c33f04d |
+| contracts/fixtures/hear.ingest.v1/gotchi-adapter-sketch.json | 780 | 101052206fdc405dbf9a862b8a2a84c74b76487d67fe32325aed7cfc4e1b8541 |
+| contracts/fixtures/hear.ingest.v1/malformed-clock-valid-without-time.json | 837 | 79923e2097b685727cd8fa17cd79629ee4ae27f46fcf3efea060ded97c5dfbb0 |
+| contracts/fixtures/hear.ingest.v1/malformed-field-types.json | 757 | 70c8b806332d9c82aad123cd5eae53fd996d30e8e76da8dd02cd182234f42225 |
+| contracts/fixtures/hear.ingest.v1/malformed-missing-clock.json | 779 | a125694f01735174e471cb1c4c05240093ae63775cfcc1ca6bd88c955ef652a0 |
+| contracts/fixtures/hear.ingest.v1/manifest.json | 3929 | 911548909a45dae8c27d41bbcb7fc018b78d3160eeedd529df4606966a5ddbc1 |
+| contracts/fixtures/hear.ingest.v1/minimal-legacy-producer.json | 625 | 4661e871a7ee4179a377bc60112ae0b1db8c53cf397a13a9d287772ecb922e1e |
+| contracts/fixtures/hear.ingest.v1/unsupported-future-major.json | 862 | 5ea74e18ec0396e5516c7f4b30ee98ef028c29cf3e69e74b5fdf08c3a6bd4afd |
+| contracts/fixtures/hear.ingest.v1/valid-node-detection.json | 862 | 3a43b833cd2ac44caebde0a151858527302b6b56308b6f710ba77681ae24dde2 |
+| contracts/schemas/hear.ingest.v1.schema.json | 5543 | 604bb162690d127973f15738a5e7a33332b75b345c9d40e4f67646289afd1d70 |
 
 ## MQTT topics
 

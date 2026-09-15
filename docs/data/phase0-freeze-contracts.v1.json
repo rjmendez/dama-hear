@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "04c2e744bafc21a74e3d302b3bef06a9f392a15ad00dada18f39c389b9a03e57",
+  "baseline_hash": "f500298687a8452b78b5ff7391d232ca31a953926960ff97935f77f93ffa042b",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -2158,6 +2158,213 @@
         "topic_pattern": "dama/hear/spatial_events"
       }
     ]
+  },
+  "published_contracts": {
+    "authority_note": "Generated artifacts are written by their tools/gen_*.py generator and ruled on by tools/check_contract_layout.py. This section freezes their bytes so a published schema, fixture or manifest cannot change without moving the baseline hash.",
+    "contracts": [
+      {
+        "contract_hash": "149a18a91bc3652d378f85cbaa5ecd4d65a9afb802144a66886fbbf85be18e51",
+        "contract_id": "hear.ingest.v1",
+        "fixture_files": [
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/degraded-no-clock-anchor.json",
+            "sha256": "18034d456e4e359341501d1994edb791f39c383b0d43f81bbf13ab8f76e7bbc4",
+            "size_bytes": 790
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/forward-additive-stripped.json",
+            "sha256": "33fba79f29783a82372a055fd2dff9f855b55be440bbabbc6d705ae2e60a7a21",
+            "size_bytes": 860
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/forward-additive-unknown-fields.json",
+            "sha256": "bf48c1df998bd7d8cf148fbe43c634f7b9c6691b70c3530dba91edc04c33f04d",
+            "size_bytes": 954
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/gotchi-adapter-sketch.json",
+            "sha256": "101052206fdc405dbf9a862b8a2a84c74b76487d67fe32325aed7cfc4e1b8541",
+            "size_bytes": 780
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/malformed-clock-valid-without-time.json",
+            "sha256": "79923e2097b685727cd8fa17cd79629ee4ae27f46fcf3efea060ded97c5dfbb0",
+            "size_bytes": 837
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/malformed-field-types.json",
+            "sha256": "70c8b806332d9c82aad123cd5eae53fd996d30e8e76da8dd02cd182234f42225",
+            "size_bytes": 757
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/malformed-missing-clock.json",
+            "sha256": "a125694f01735174e471cb1c4c05240093ae63775cfcc1ca6bd88c955ef652a0",
+            "size_bytes": 779
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/minimal-legacy-producer.json",
+            "sha256": "4661e871a7ee4179a377bc60112ae0b1db8c53cf397a13a9d287772ecb922e1e",
+            "size_bytes": 625
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/unsupported-future-major.json",
+            "sha256": "5ea74e18ec0396e5516c7f4b30ee98ef028c29cf3e69e74b5fdf08c3a6bd4afd",
+            "size_bytes": 862
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/valid-node-detection.json",
+            "sha256": "3a43b833cd2ac44caebde0a151858527302b6b56308b6f710ba77681ae24dde2",
+            "size_bytes": 862
+          }
+        ],
+        "manifest_declared": {
+          "codecs": {
+            "json": "application/vnd.dama.hear.ingest.v1+json"
+          },
+          "fixtures": [
+            {
+              "expect_dispatchable": true,
+              "expect_reasons": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "valid-node-detection.json",
+              "name": "valid-node-detection",
+              "sha256": "3a43b833cd2ac44caebde0a151858527302b6b56308b6f710ba77681ae24dde2"
+            },
+            {
+              "expect_dispatchable": true,
+              "expect_reasons": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "degraded-no-clock-anchor.json",
+              "name": "degraded-no-clock-anchor",
+              "sha256": "18034d456e4e359341501d1994edb791f39c383b0d43f81bbf13ab8f76e7bbc4"
+            },
+            {
+              "expect_dispatchable": true,
+              "expect_reasons": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "minimal-legacy-producer.json",
+              "name": "minimal-legacy-producer",
+              "sha256": "4661e871a7ee4179a377bc60112ae0b1db8c53cf397a13a9d287772ecb922e1e"
+            },
+            {
+              "expect_dispatchable": true,
+              "expect_reasons": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "gotchi-adapter-sketch.json",
+              "name": "gotchi-adapter-sketch",
+              "sha256": "101052206fdc405dbf9a862b8a2a84c74b76487d67fe32325aed7cfc4e1b8541"
+            },
+            {
+              "expect_dispatchable": false,
+              "expect_reasons": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [
+                "adapter.commit",
+                "clock.holdover_s",
+                "ingest_hints"
+              ],
+              "file": "forward-additive-unknown-fields.json",
+              "name": "forward-additive-unknown-fields",
+              "sha256": "bf48c1df998bd7d8cf148fbe43c634f7b9c6691b70c3530dba91edc04c33f04d"
+            },
+            {
+              "expect_dispatchable": false,
+              "expect_reasons": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "forward-additive-stripped.json",
+              "name": "forward-additive-stripped",
+              "sha256": "33fba79f29783a82372a055fd2dff9f855b55be440bbabbc6d705ae2e60a7a21"
+            },
+            {
+              "expect_dispatchable": false,
+              "expect_reasons": [
+                "schema_version_unsupported"
+              ],
+              "expect_status": "refused",
+              "expect_unknown_fields": [],
+              "file": "unsupported-future-major.json",
+              "name": "unsupported-future-major",
+              "sha256": "5ea74e18ec0396e5516c7f4b30ee98ef028c29cf3e69e74b5fdf08c3a6bd4afd"
+            },
+            {
+              "expect_dispatchable": false,
+              "expect_reasons": [
+                "field_missing"
+              ],
+              "expect_status": "refused",
+              "expect_unknown_fields": [],
+              "file": "malformed-missing-clock.json",
+              "name": "malformed-missing-clock",
+              "sha256": "a125694f01735174e471cb1c4c05240093ae63775cfcc1ca6bd88c955ef652a0"
+            },
+            {
+              "expect_dispatchable": false,
+              "expect_reasons": [
+                "timestamp_not_rfc3339_utc",
+                "type_invalid",
+                "value_out_of_range"
+              ],
+              "expect_status": "refused",
+              "expect_unknown_fields": [],
+              "file": "malformed-field-types.json",
+              "name": "malformed-field-types",
+              "sha256": "70c8b806332d9c82aad123cd5eae53fd996d30e8e76da8dd02cd182234f42225"
+            },
+            {
+              "expect_dispatchable": false,
+              "expect_reasons": [
+                "clock_valid_without_observed_at"
+              ],
+              "expect_status": "refused",
+              "expect_unknown_fields": [],
+              "file": "malformed-clock-valid-without-time.json",
+              "name": "malformed-clock-valid-without-time",
+              "sha256": "79923e2097b685727cd8fa17cd79629ee4ae27f46fcf3efea060ded97c5dfbb0"
+            }
+          ],
+          "generator": "tools/gen_ingest_contracts.py",
+          "identity_inputs": [
+            "source",
+            "device_id",
+            "kind",
+            "observed_at",
+            "producer.boot_id",
+            "producer.sequence",
+            "producer.cursor",
+            "payload"
+          ],
+          "schema_file": "schemas/hear.ingest.v1.schema.json",
+          "schema_id": "hear.ingest.v1",
+          "schema_major": 1
+        },
+        "manifest_file": {
+          "path": "contracts/fixtures/hear.ingest.v1/manifest.json",
+          "sha256": "911548909a45dae8c27d41bbcb7fc018b78d3160eeedd529df4606966a5ddbc1",
+          "size_bytes": 3929
+        },
+        "schema_file": {
+          "path": "contracts/schemas/hear.ingest.v1.schema.json",
+          "sha256": "604bb162690d127973f15738a5e7a33332b75b345c9d40e4f67646289afd1d70",
+          "size_bytes": 5543
+        }
+      }
+    ],
+    "generated_only": true,
+    "other_files": [
+      {
+        "path": "contracts/README.md",
+        "sha256": "1775a7dc72a27613405e6edfeb2c5eae7f0277237199d5830179d8bbac4ff8fe",
+        "size_bytes": 2081
+      }
+    ],
+    "present": true,
+    "published_root": "contracts",
+    "section_hash": "4a58f893566092f45a9608b98489332c06c7ea265d5f5abf46299aba2a3f65c6"
   },
   "redis_keys": {
     "keys": [

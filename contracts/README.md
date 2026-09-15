@@ -23,7 +23,13 @@ Regenerate and verify:
 ```sh
 python3 tools/gen_ingest_contracts.py           # rewrite artifacts
 python3 tools/gen_ingest_contracts.py --check   # CI gate: fail on drift
+python3 tools/freeze_contracts.py --check       # CI gate: artifacts match the frozen baseline
 ```
+
+The generator decides what the artifacts say. The frozen baseline
+(`docs/data/phase0-freeze-contracts.v1.json`) records their bytes, so a hand edit to a
+generated schema, fixture or manifest fails the freeze even if it is never regenerated.
+Regenerate both after any contract change.
 
 ## Rules
 
