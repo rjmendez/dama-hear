@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "48ccfe641a34a9f575ddaf3746f3ad50433a6dc4d329200ad288661bb00079ac",
+  "baseline_hash": "db14f144165b8e385c3fa61209b2f4b39cb24e2723facd35c1db2c39d00ba5b9",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -251,7 +251,7 @@
     ],
     "default_board_class": "xiao-s3-pps",
     "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
-    "section_hash": "3012270ff2868532ba3da610e42cbaeb792a55ad205516a22a864b36d58a43d2",
+    "section_hash": "acd247c3b7639c057dbc98affdd5dbe7fcfd28f30712604064c1443ab934bbfb",
     "source_files": [
       {
         "path": ".github/workflows/firmware.yml",
@@ -285,8 +285,8 @@
       },
       {
         "path": "firmware/hear_node/hear_node.ino",
-        "sha256": "2adf85221adf0d68d39a6efd6be8b207a1930c85e155ab9ada967969d0a4744a",
-        "size_bytes": 306655
+        "sha256": "ea883a0e3af75bc2e2173b199de4e6fed37994be398647a70de4611f4aa41c10",
+        "size_bytes": 308878
       },
       {
         "path": "firmware/hear_node/hear_push_payload.h",
