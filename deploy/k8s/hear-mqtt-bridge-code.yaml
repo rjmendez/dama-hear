@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-mqtt-bridge-code.yaml
-# apply-mode client: 61994 B serialised; 62258 B of annotations against a 262144 B cap.
+# apply-mode client: 63072 B serialised; 63336 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-mqtt-bridge
   annotations:
-    dama-hear/commit: 'eccd7e9'
-    dama-hear/source-sha256: '037388c8590815def6f8fb6251b315c4af3f28f45d70ad0cbe0460b0b1a56865'
+    dama-hear/commit: '308c993'
+    dama-hear/source-sha256: 'e3294e559e9182476eb456f1fc6ae94042fcca4ada36cc0a9f445acdb89dc2a6'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '61994'
+    dama-hear/serialised-bytes: '63072'
 data:
   tools_hear_heartbeat_receiver.py: |
     #!/usr/bin/env python3
@@ -1054,7 +1054,7 @@ data:
     import ssl
     import sys
     from datetime import datetime, timezone
-    from typing import Any, Callable, Dict, Optional, Tuple
+    from typing import Any, Callable, Dict, Mapping, Optional, Tuple
     
     import paho.mqtt.client as mqtt
     
@@ -1162,6 +1162,12 @@ data:
         return True
     
     
+    def _stated_time_is_invalid(payload: Mapping[str, Any]) -> bool:
+        """True only when the payload explicitly states ``time.valid`` is false."""
+        time_state = payload.get("time")
+        return isinstance(time_state, Mapping) and time_state.get("valid") is False
+    
+    
     def device_id_from_topic(topic: str) -> Optional[str]:
         """Extract the device_id segment from a ``dama/<device_id>/telemetry`` topic."""
         parts = topic.split("/")
@@ -1206,8 +1212,20 @@ data:
             ts = payload.get("ts")
             if isinstance(ts, (int, float)) and not isinstance(ts, bool):
                 payload = dict(payload)
-                payload["ts"] = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(
-                    timespec="seconds").replace("+00:00", "Z")
+                if _stated_time_is_invalid(payload):
+                    # A node without a GPS fix sends "ts":null and a monotonic
+                    # "ts_ms" (uptime-derived) purely to clear the upstream ingest
+                    # gate, which rejects a non-positive numeric timestamp. That
+                    # ingest then copies ts_ms back over the null ts, so what
+                    # arrives here claims a wall-clock time the node never had.
+                    # Restore the node's own contract -- no valid clock, no ts --
+                    # so the heartbeat lands as degraded-but-visible instead of
+                    # being rejected outright. received_at stays the trustworthy
+                    # time for these records.
+                    payload["ts"] = None
+                else:
+                    payload["ts"] = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(
+                        timespec="seconds").replace("+00:00", "Z")
             body = validator(payload)
         except RequestError as exc:
             stats.rejected += 1
