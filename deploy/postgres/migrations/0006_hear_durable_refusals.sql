@@ -388,6 +388,8 @@ GRANT SELECT, INSERT, UPDATE ON hear.refused_messages TO hear_durable_writer;
 GRANT SELECT, INSERT, UPDATE ON hear.refusal_counters, hear.refusal_events TO hear_durable_writer;
 GRANT SELECT ON hear.refusal_counters, hear.refusal_events
     TO hear_durable_reader, hear_durable_auditor, hear_durable_admin;
+GRANT SELECT ON hear.durable_records_unrouted
+    TO hear_durable_writer, hear_durable_reader, hear_durable_auditor, hear_durable_admin;
 GRANT EXECUTE ON FUNCTION hear.bump_refusal_counter(text, text, bigint) TO hear_durable_writer;
 GRANT SELECT, DELETE ON hear.refused_messages TO hear_durable_admin;
 GRANT SELECT ON hear.refused_messages_audit TO hear_durable_reader, hear_durable_auditor;
