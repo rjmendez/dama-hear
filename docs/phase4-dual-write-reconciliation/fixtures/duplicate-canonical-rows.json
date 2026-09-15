@@ -1,0 +1,97 @@
+{
+  "case": "duplicate-canonical-rows",
+  "description": "Identity-based dedup failed: two canonical rows mirror one legacy record. Judged before any value comparison, because 'which value differs' has no answer here.",
+  "expected_classification": "duplicate_canonical",
+  "expected_repair_action": "manual_review",
+  "expected_severity": "critical",
+  "receipt": {
+    "comparator": {
+      "name": "hear-reconcile",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "correlation": {
+      "binding": "bound",
+      "correlation_id": "legacy:ca17f8af36f302db838bf66bebeb4a24fd34b94558f6334e27e91dd79ee28f40",
+      "device_id": "nyquist",
+      "event_id": "22222222-2222-5222-8222-222222222222",
+      "legacy_uid": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "site_id": "site-alpha",
+      "source": "node-http",
+      "telemetry_path": "hear/heartbeat"
+    },
+    "credential": {
+      "canonical": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:nyquist",
+        "scope": "device"
+      },
+      "legacy": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:nyquist",
+        "scope": "device"
+      },
+      "matched": true
+    },
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "manual_review",
+      "repairable": false
+    },
+    "emitted_at": "2026-09-15T01:00:30Z",
+    "evidence": {
+      "canonical_raw_ref": null,
+      "legacy_raw_ref": null,
+      "redaction_profile": "hear.reconcile.redact.v1"
+    },
+    "receipt_id": "222d1d32-c3b1-55e1-bcb3-b175879d51c0",
+    "run_id": "recon-2026-09-15T00",
+    "sampling": {
+      "forced_reason": "mismatches are never sampled",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.reconcile.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 2,
+        "state_hash": "sha256:c145bd6fd2d51831ad872d260a9ef6bb44f23eaa260cf0df1057735469c0b468",
+        "writer": "hear.ingest.batch",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      },
+      "legacy": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:c145bd6fd2d51831ad872d260a9ef6bb44f23eaa260cf0df1057735469c0b468",
+        "writer": "tools/hear_heartbeat_receiver.py",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "duplicate_canonical",
+      "notes": [
+        "2 canonical rows for one legacy identity"
+      ],
+      "repair_action": "manual_review",
+      "severity": "critical"
+    },
+    "window": {
+      "end": "2026-09-15T01:00:00Z",
+      "start": "2026-09-15T00:00:00Z"
+    }
+  }
+}

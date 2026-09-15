@@ -1,0 +1,99 @@
+{
+  "case": "error-canonical-write-failed",
+  "description": "The canonical writer reported a failed write. Legacy stands and the site is unaffected, which is why this is warn rather than critical -- but it is repairable by replay and must not be left to the grace window to rediscover.",
+  "expected_classification": "error_canonical",
+  "expected_repair_action": "replay_inbox",
+  "expected_severity": "warn",
+  "receipt": {
+    "comparator": {
+      "name": "hear-reconcile",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "correlation": {
+      "binding": "legacy_orphan",
+      "correlation_id": "legacy:8a0f8ff4661e23a32b9fe3f29452b325c56cdeb27f9e41283d17548731146704",
+      "device_id": "nyquist",
+      "event_id": null,
+      "legacy_uid": "5555555555555555555555555555555555555555555555555555555555555555",
+      "site_id": "site-alpha",
+      "source": "node-http",
+      "telemetry_path": "hear/heartbeat"
+    },
+    "credential": {
+      "canonical": {
+        "key_id": null,
+        "principal_id": null,
+        "scope": "unknown"
+      },
+      "legacy": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:nyquist",
+        "scope": "device"
+      },
+      "matched": false
+    },
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "replay_inbox",
+      "repairable": true
+    },
+    "emitted_at": "2026-09-15T01:00:30Z",
+    "evidence": {
+      "canonical_raw_ref": null,
+      "legacy_raw_ref": null,
+      "redaction_profile": "hear.reconcile.redact.v1"
+    },
+    "receipt_id": "f8f84627-9c4d-550a-8121-46dd1e9645b2",
+    "run_id": "recon-2026-09-15T00",
+    "sampling": {
+      "forced_reason": "mismatches are never sampled",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.reconcile.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "clock_tier": null,
+        "observed_at": null,
+        "outcome": "errored",
+        "reasons": [
+          "durable_write_failed"
+        ],
+        "row_count": 0,
+        "state_hash": null,
+        "writer": "hear.ingest.batch",
+        "writer_version": null,
+        "written_at": null
+      },
+      "legacy": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:c145bd6fd2d51831ad872d260a9ef6bb44f23eaa260cf0df1057735469c0b468",
+        "writer": "tools/hear_heartbeat_receiver.py",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "error_canonical",
+      "notes": [
+        "legacy stands; the canonical writer reported failure"
+      ],
+      "repair_action": "replay_inbox",
+      "severity": "warn"
+    },
+    "window": {
+      "end": "2026-09-15T01:00:00Z",
+      "start": "2026-09-15T00:00:00Z"
+    }
+  }
+}

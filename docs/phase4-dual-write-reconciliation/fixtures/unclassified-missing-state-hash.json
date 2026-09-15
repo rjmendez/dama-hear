@@ -1,0 +1,97 @@
+{
+  "case": "unclassified-missing-state-hash",
+  "description": "One side published no projection digest, so no verdict is derivable. Classified `unclassified` at critical severity rather than quietly counted as a match.",
+  "expected_classification": "unclassified",
+  "expected_repair_action": "manual_review",
+  "expected_severity": "critical",
+  "receipt": {
+    "comparator": {
+      "name": "hear-reconcile",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "correlation": {
+      "binding": "bound",
+      "correlation_id": "legacy:df8fcab624eddc87ca1b440f499642e48f35ec736ab1b77bb198e22fb6a214aa",
+      "device_id": "rankine",
+      "event_id": "99999999-9999-5999-8999-999999999999",
+      "legacy_uid": "3333333333333333333333333333333333333333333333333333333333333333",
+      "site_id": "site-alpha",
+      "source": "node-http",
+      "telemetry_path": "hear/heartbeat"
+    },
+    "credential": {
+      "canonical": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:rankine",
+        "scope": "device"
+      },
+      "legacy": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:rankine",
+        "scope": "device"
+      },
+      "matched": true
+    },
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "manual_review",
+      "repairable": false
+    },
+    "emitted_at": "2026-09-15T01:00:30Z",
+    "evidence": {
+      "canonical_raw_ref": null,
+      "legacy_raw_ref": null,
+      "redaction_profile": "hear.reconcile.redact.v1"
+    },
+    "receipt_id": "8fd700bf-3322-5980-b168-bc764aabd466",
+    "run_id": "recon-2026-09-15T00",
+    "sampling": {
+      "forced_reason": "mismatches are never sampled",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.reconcile.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": null,
+        "writer": "hear.ingest.batch",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      },
+      "legacy": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:c2e5814de25380faf1a3e6d84c22a33ea468ae2a5e08dc6fb7066487f21e07fe",
+        "writer": "tools/hear_heartbeat_receiver.py",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "unclassified",
+      "notes": [
+        "a side did not publish a state hash"
+      ],
+      "repair_action": "manual_review",
+      "severity": "critical"
+    },
+    "window": {
+      "end": "2026-09-15T01:00:00Z",
+      "start": "2026-09-15T00:00:00Z"
+    }
+  }
+}

@@ -1,0 +1,106 @@
+{
+  "case": "value-divergence-on-a-counter",
+  "description": "A monotonic counter disagrees by one row. Counters are compared exactly, so this is critical: a counter that drifts is a write the canonical path did not make.",
+  "expected_classification": "value_divergence",
+  "expected_repair_action": "manual_review",
+  "expected_severity": "critical",
+  "receipt": {
+    "comparator": {
+      "name": "hear-reconcile",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "correlation": {
+      "binding": "bound",
+      "correlation_id": "legacy:18a05e2d6b3b8cdae3b776e8bdced736b83d28751d2ddfc3bba8936a2f6d2034",
+      "device_id": "mach",
+      "event_id": "33333333-3333-5333-8333-333333333333",
+      "legacy_uid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "site_id": "site-alpha",
+      "source": "node-http",
+      "telemetry_path": "hear/heartbeat"
+    },
+    "credential": {
+      "canonical": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:mach",
+        "scope": "device"
+      },
+      "legacy": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:mach",
+        "scope": "device"
+      },
+      "matched": true
+    },
+    "differences": [
+      {
+        "canonical": 4209,
+        "comparator": "count",
+        "legacy": 4210,
+        "path": "counters.dets_rows_written",
+        "quoted": true,
+        "tolerance": "equal"
+      }
+    ],
+    "differences_dropped": 0,
+    "disposition": {
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "manual_review",
+      "repairable": false
+    },
+    "emitted_at": "2026-09-15T01:00:30Z",
+    "evidence": {
+      "canonical_raw_ref": null,
+      "legacy_raw_ref": null,
+      "redaction_profile": "hear.reconcile.redact.v1"
+    },
+    "receipt_id": "5b65c75a-348e-5d2a-ba33-bfbf111a52a0",
+    "run_id": "recon-2026-09-15T00",
+    "sampling": {
+      "forced_reason": "mismatches are never sampled",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.reconcile.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:e5fbf4e7cff73bc3c44a2a7e08500b7a9fe57f5b7141c83d1ad5be9d0124416f",
+        "writer": "hear.ingest.batch",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      },
+      "legacy": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:4978670df2fae3cd7066047bc7a723cc0b5feb38a871c0abbc8af933c5ae2109",
+        "writer": "tools/hear_heartbeat_receiver.py",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "value_divergence",
+      "notes": [
+        "1 compared field(s) outside tolerance"
+      ],
+      "repair_action": "manual_review",
+      "severity": "critical"
+    },
+    "window": {
+      "end": "2026-09-15T01:00:00Z",
+      "start": "2026-09-15T00:00:00Z"
+    }
+  }
+}

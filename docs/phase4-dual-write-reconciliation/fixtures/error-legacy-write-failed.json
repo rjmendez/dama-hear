@@ -1,0 +1,99 @@
+{
+  "case": "error-legacy-write-failed",
+  "description": "The authoritative writer reported a failed write. Dual-write did not cause it and cannot mask it; the comparator surfaces it because it is the one failure that is already data loss.",
+  "expected_classification": "error_legacy",
+  "expected_repair_action": "manual_review",
+  "expected_severity": "critical",
+  "receipt": {
+    "comparator": {
+      "name": "hear-reconcile",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "correlation": {
+      "binding": "legacy_orphan",
+      "correlation_id": "legacy:f27a4c331fdb60b0c1c6b49ec4a2fdbb1606e7520e50bf719c56c9c256d9b11a",
+      "device_id": "gold",
+      "event_id": null,
+      "legacy_uid": "6666666666666666666666666666666666666666666666666666666666666666",
+      "site_id": "site-alpha",
+      "source": "node-http",
+      "telemetry_path": "hear/heartbeat"
+    },
+    "credential": {
+      "canonical": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:gold",
+        "scope": "device"
+      },
+      "legacy": {
+        "key_id": null,
+        "principal_id": null,
+        "scope": "unknown"
+      },
+      "matched": false
+    },
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "manual_review",
+      "repairable": false
+    },
+    "emitted_at": "2026-09-15T01:00:30Z",
+    "evidence": {
+      "canonical_raw_ref": null,
+      "legacy_raw_ref": null,
+      "redaction_profile": "hear.reconcile.redact.v1"
+    },
+    "receipt_id": "154d26b8-5cab-5036-9e62-190ee1b2378c",
+    "run_id": "recon-2026-09-15T00",
+    "sampling": {
+      "forced_reason": "mismatches are never sampled",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.reconcile.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:73bff649e59db87a6404e8c7a35d49a36d7d39aeeaa0a772c40f0d9ba78c9e39",
+        "writer": "hear.ingest.batch",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      },
+      "legacy": {
+        "clock_tier": null,
+        "observed_at": null,
+        "outcome": "errored",
+        "reasons": [
+          "durable_write_failed"
+        ],
+        "row_count": 0,
+        "state_hash": null,
+        "writer": "tools/hear_heartbeat_receiver.py",
+        "writer_version": null,
+        "written_at": null
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "error_legacy",
+      "notes": [
+        "the authoritative write reported failure"
+      ],
+      "repair_action": "manual_review",
+      "severity": "critical"
+    },
+    "window": {
+      "end": "2026-09-15T01:00:00Z",
+      "start": "2026-09-15T00:00:00Z"
+    }
+  }
+}

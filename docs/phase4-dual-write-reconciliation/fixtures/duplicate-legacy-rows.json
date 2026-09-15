@@ -1,0 +1,97 @@
+{
+  "case": "duplicate-legacy-rows",
+  "description": "Two authoritative rows map to one canonical identity -- the MQTT duplication the bridge already tolerates. Warn, not critical: legacy has always behaved this way and canonical collapsing them is the designed outcome, not a defect.",
+  "expected_classification": "duplicate_legacy",
+  "expected_repair_action": "manual_review",
+  "expected_severity": "warn",
+  "receipt": {
+    "comparator": {
+      "name": "hear-reconcile",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "correlation": {
+      "binding": "bound",
+      "correlation_id": "legacy:88f4fbe6295a435e993df52a14ac94d5fa8c08cd811cb8dcfc3cb2d5b936e80c",
+      "device_id": "kasami",
+      "event_id": "bbbbbbbb-bbbb-5bbb-8bbb-bbbbbbbbbbbb",
+      "legacy_uid": "7777777777777777777777777777777777777777777777777777777777777777",
+      "site_id": "site-alpha",
+      "source": "node-http",
+      "telemetry_path": "hear/heartbeat"
+    },
+    "credential": {
+      "canonical": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:kasami",
+        "scope": "device"
+      },
+      "legacy": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:kasami",
+        "scope": "device"
+      },
+      "matched": true
+    },
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "manual_review",
+      "repairable": false
+    },
+    "emitted_at": "2026-09-15T01:00:30Z",
+    "evidence": {
+      "canonical_raw_ref": null,
+      "legacy_raw_ref": null,
+      "redaction_profile": "hear.reconcile.redact.v1"
+    },
+    "receipt_id": "2c794b9c-e227-5460-a940-f19f68b98e61",
+    "run_id": "recon-2026-09-15T00",
+    "sampling": {
+      "forced_reason": "mismatches are never sampled",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.reconcile.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:e48758db15ec5a5d232cda3a3f3c2aee56d492a263d43273189ae8409e0e7765",
+        "writer": "hear.ingest.batch",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      },
+      "legacy": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 2,
+        "state_hash": "sha256:e48758db15ec5a5d232cda3a3f3c2aee56d492a263d43273189ae8409e0e7765",
+        "writer": "tools/hear_heartbeat_receiver.py",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "duplicate_legacy",
+      "notes": [
+        "2 legacy rows for one canonical identity"
+      ],
+      "repair_action": "manual_review",
+      "severity": "warn"
+    },
+    "window": {
+      "end": "2026-09-15T01:00:00Z",
+      "start": "2026-09-15T00:00:00Z"
+    }
+  }
+}
