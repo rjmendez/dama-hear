@@ -109,6 +109,7 @@ exceeds the round cadence; it rejects that detection and reports why.
 """
 from __future__ import annotations
 
+import bisect
 import itertools
 
 from typing import Dict, List, Optional, Sequence
@@ -123,6 +124,9 @@ from ..solve.consistency import physically_possible
 # JUDGEMENT, not measured. It must stay well under the tightest measured round spacing -- 85 ms at
 # 700 rpm (docs/validation-full-captures.md:35) -- or consecutive rounds merge. 30 ms leaves 55 ms.
 MARGIN_S: float = 0.030
+WHOLE_SECOND_TOL_S: float = 0.005
+WHOLE_SECOND_ALT_EVENT_S: float = 0.150
+WHOLE_SECOND_MAX_SHIFT_S: int = 3
 
 REASONS: frozenset = frozenset({
     "unknown_node", "duplicate_seq", "duplicate_node_in_group",
@@ -273,6 +277,72 @@ def _point_source_excess_s(group, p_of, c: float) -> float:
         if not physically_possible(dt, d_m, c, tol_s=0.0):
             worst = max(worst, dt - d_m / c)
     return worst
+
+
+def _whole_second_suspects(pool: Sequence[Dict], events: Sequence[Dict], p_of, c: float,
+                           margin_s: float) -> List[Dict]:
+    """Unused detections that become a good event member after an integer-second shift.
+
+    This does NOT rewrite timestamps. It reports the case the 2026-09-14 clap test exposed:
+    two nodes agree on an event, a third reports a burst with the same sub-second phase but
+    exactly N whole UTC seconds away, and nothing in the original timestamp says that burst
+    belongs to any event near where it was stamped.
+    """
+    used = {(int(m["node_id"]), int(m["seq"]), float(m["t_utc_s"]))
+            for ev in events for m in ev["detections"]}
+    by_node = {}
+    for d in pool:
+        by_node.setdefault(int(d["node_id"]), []).append(float(d["t_utc_s"]))
+
+    def _has_near(node_id: int, t_utc_s: float) -> bool:
+        xs = by_node.get(int(node_id), [])
+        j = bisect.bisect_left(xs, t_utc_s)
+        return any(0 <= k < len(xs) and abs(xs[k] - t_utc_s) <= WHOLE_SECOND_ALT_EVENT_S
+                   for k in (j - 1, j))
+
+    out: List[Dict] = []
+    for d in pool:
+        key = (int(d["node_id"]), int(d["seq"]), float(d["t_utc_s"]))
+        if key in used:
+            continue
+        nid = int(d["node_id"])
+        t = float(d["t_utc_s"])
+        best = None
+        for ev in events:
+            if nid in ev["node_ids"]:
+                continue
+            arrivals = [float(x) for x in ev["arrivals"]]
+            if any(_has_near(int(mid), t) for mid in ev["node_ids"]):
+                continue
+            tref = float(sum(arrivals) / len(arrivals))
+            for k in range(1, WHOLE_SECOND_MAX_SHIFT_S + 1):
+                for sign in (-1, 1):
+                    shifted = t + sign * float(k)
+                    err_s = shifted - tref
+                    if abs(err_s) > WHOLE_SECOND_TOL_S:
+                        continue
+                    if not all(abs(shifted - a)
+                               <= float(np.linalg.norm(_xyz(p_of(nid)) - _xyz(p_of(int(mid))))) / c
+                               + float(margin_s)
+                               for mid, a in zip(ev["node_ids"], arrivals)):
+                        continue
+                    cand = {
+                        "node_id": nid,
+                        "seq": int(d["seq"]),
+                        "t_utc_s": t,
+                        "event_id": int(ev["event_id"]),
+                        "event_t0_utc_s": float(ev["t0_utc_s"]),
+                        "event_node_ids": [int(x) for x in ev["node_ids"]],
+                        "shift_s": int(sign * k),
+                        "corrected_t_utc_s": shifted,
+                        "shift_error_ms": err_s * 1e3,
+                    }
+                    if best is None or abs(cand["shift_error_ms"]) < abs(best["shift_error_ms"]):
+                        best = cand
+        if best is not None:
+            out.append(best)
+    out.sort(key=lambda r: (r["t_utc_s"], r["node_id"], r["seq"]))
+    return out
 
 
 def associate(detections: Sequence[Dict], survey, temp_c: float = 20.0,
@@ -457,6 +527,7 @@ def associate(detections: Sequence[Dict], survey, temp_c: float = 20.0,
         "events": events,
         "rejected": rejected,
         "duplicates": duplicates,
+        "whole_second_suspects": _whole_second_suspects(pool, events, _p, c, margin_s),
         "window_s": window_s,
         "margin_s": float(margin_s),
         "sound_speed_mps": c,

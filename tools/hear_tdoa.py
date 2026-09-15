@@ -2249,6 +2249,8 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
         "associate": {
             "n_events": len(grouped["events"]), "n_rejected": len(grouped["rejected"]),
             "n_duplicates": len(grouped["duplicates"]),
+            "n_whole_second_suspects": len(grouped.get("whole_second_suspects") or []),
+            "whole_second_suspects": list(grouped.get("whole_second_suspects") or []),
             # ⚠️HOW MANY OF n_events COULD BE A POINT SOURCE AT ALL. associate() admits on
             # d/c + MARGIN_S; this counts against d/c with NO margin. Measured on the live pool
             # 2026-09-11: 1 of 4, the other three 2.81 m, 7.51 m and 9.01 m past any bound the

@@ -684,3 +684,29 @@ class TestAnEventSaysWhetherAPointSourceCouldHaveMadeIt:
         """⚠️A SECOND COPY OF |tau| <= d/c WOULD DRIFT FROM THE FIRST. consistency.py owns it."""
         import hear.backend.associate as mod
         assert mod.physically_possible is CONS.physically_possible
+
+
+class TestWholeSecondSuspects:
+    """A one-second UTC mislabel is not random spread and should be named as such."""
+
+    def test_flags_an_unused_detection_that_matches_after_a_whole_second_shift(self):
+        dets = [_det(1, 100.000, 0), _det(2, 100.002, 0), _det(3, 99.001, 0)]
+        got = AS.associate(dets, TIGHT, min_nodes=2)
+        _conserved(got, len(dets))
+        assert [e["node_ids"] for e in got["events"]] == [[1, 2]]
+        assert len(got["whole_second_suspects"]) == 1
+        s = got["whole_second_suspects"][0]
+        assert (s["node_id"], s["seq"], s["event_id"], s["shift_s"]) == (3, 0, 0, 1)
+        assert s["corrected_t_utc_s"] == pytest.approx(100.001, abs=1e-9)
+        assert abs(s["shift_error_ms"]) < 5.0
+
+    def test_does_not_flag_a_detection_when_the_shifted_time_has_another_real_event(self):
+        dets = [
+            _det(1, 100.000, 0), _det(2, 100.002, 0),
+            _det(1, 101.060, 1), _det(2, 101.062, 1),
+            _det(3, 101.001, 0),
+        ]
+        got = AS.associate(dets, TIGHT, min_nodes=2)
+        _conserved(got, len(dets))
+        assert len(got["events"]) == 2
+        assert got["whole_second_suspects"] == []
