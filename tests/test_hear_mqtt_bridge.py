@@ -13,6 +13,18 @@ from tools import hear_mqtt_bridge as B  # noqa: E402
 from tests.test_hear_heartbeat_receiver import FakeRedis  # noqa: E402
 
 
+# What the firmware's hear_push_time_json() emits with no GPS fix.
+_NO_FIX_TIME = {
+    "valid": False,
+    "state": "FAULT",
+    "sync_sigma_ns": None,
+    "anchor_age_us": None,
+    "boot_epoch_us": None,
+    "boot_id": "e76fcbcfc5e3c474",
+    "discontinuity_flags": 16,
+}
+
+
 def _heartbeat(**overrides):
     payload = {
         "telemetry_path": "hear/heartbeat",
@@ -156,6 +168,62 @@ class TestDispatchMessage:
         st, _fake = store
         stats = B.BridgeStats()
         raw = json.dumps(_batch_ingest_wrapped(_heartbeat(ts=True))).encode()
+        assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats) is None
+        assert stats.rejected == 1
+
+    def test_ingest_restamped_ts_is_dropped_when_the_node_says_its_clock_is_invalid(self, store):
+        st, fake = store
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_heartbeat(
+            ts=12346001,  # uptime_s * 1000 + 1, copied over the node's null by AWS ingest
+            gps={"fix": 0},
+            time=_NO_FIX_TIME,
+        ))).encode()
+        record = B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats)
+        assert record is not None and stats.accepted == 1 and stats.rejected == 0
+        stored = json.loads(fake.values["dama:hear:nyquist"])
+        assert stored["ts"] is None
+        assert stored["time"]["valid"] is False
+        assert stored.get("received_at")
+
+    def test_ingest_restamped_event_ts_is_dropped_when_the_clock_is_invalid(self, store):
+        st, fake = store
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_event(
+            ts=12350001,
+            gps={"fix": 0},
+            time=_NO_FIX_TIME,
+        ))).encode()
+        record = B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats)
+        assert record is not None and stats.accepted == 1 and stats.rejected == 0
+
+    def test_a_null_ts_with_an_invalid_clock_is_still_accepted_untouched(self, store):
+        st, fake = store
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_heartbeat(
+            ts=None, gps={"fix": 0}, time=_NO_FIX_TIME,
+        ))).encode()
+        assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats) is not None
+        assert json.loads(fake.values["dama:hear:nyquist"])["ts"] is None
+
+    def test_a_numeric_ts_is_still_converted_when_the_clock_is_valid(self, store):
+        st, fake = store
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_heartbeat(
+            ts=1789256580000,
+            time={"valid": True, "state": "LOCKED", "sync_sigma_ns": 35083,
+                  "anchor_age_us": 504134, "boot_epoch_us": 1789256000000000,
+                  "boot_id": "a76912aa81236b2f", "discontinuity_flags": 0},
+        ))).encode()
+        assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats) is not None
+        assert json.loads(fake.values["dama:hear:nyquist"])["ts"] == "2026-09-12T23:43:00Z"
+
+    def test_a_string_ts_with_an_invalid_clock_is_still_rejected(self, store):
+        st, _fake = store
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_heartbeat(
+            ts="2026-09-12T23:43:00Z", gps={"fix": 0}, time=_NO_FIX_TIME,
+        ))).encode()
         assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats) is None
         assert stats.rejected == 1
 
