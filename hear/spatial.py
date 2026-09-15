@@ -23,6 +23,7 @@ import numpy as np
 from scipy.signal import correlate
 
 from . import geodesy as GEO
+from . import nodeclass as NC
 from .backend import associate as AS
 from .backend import survey as SV
 from .detsfile import read_file, read_text
@@ -49,6 +50,7 @@ def calculate_gdop_bounds(
     sigma_t_s: float = 0.001,
     temp_c: float = 20.0,
     confidence_level: float = 0.95,
+    position_sigma_m: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     """Calculate GDOP (HDOP, VDOP, PDOP) and confidence ellipse / error radius for a 2D/3D solve.
 
@@ -58,6 +60,8 @@ def calculate_gdop_bounds(
         sigma_t_s: Arrival time uncertainty in seconds (1-sigma).
         temp_c: Air temperature in Celsius for sound speed.
         confidence_level: Confidence level for error ellipse (default 0.95 -> scale ~ 2.447).
+        position_sigma_m: Per-node horizontal position uncertainty (1-sigma), folded into
+            the range uncertainty. Omit for the legacy timing-only bound.
 
     Returns:
         Dict with hdop, vdop, pdop, error_radius_m, and confidence_ellipse details.
@@ -67,6 +71,15 @@ def calculate_gdop_bounds(
     s = np.array([s_arr[0], s_arr[1], s_arr[2] if len(s_arr) > 2 else 0.0])
     c = SW.sound_speed(temp_c)
     sigma_r = c * sigma_t_s
+    if position_sigma_m is None:
+        range_sigma_m = None
+    else:
+        position_sigma_m = np.asarray(position_sigma_m, float).ravel()
+        if len(position_sigma_m) != len(P):
+            raise ValueError("position_sigma_m must contain one value per node")
+        if not np.all(np.isfinite(position_sigma_m)) or np.any(position_sigma_m < 0.0):
+            raise ValueError("position_sigma_m values must be finite and non-negative")
+        range_sigma_m = np.hypot(sigma_r, position_sigma_m)
 
     d3 = PL.dop3(P, s)
     hdop = d3.get("hdop", float("inf"))
@@ -80,7 +93,8 @@ def calculate_gdop_bounds(
             hdop = d2["dop"]
 
     # Error radius (1-sigma horizontal position error bound)
-    error_radius_m = hdop * sigma_r if math.isfinite(hdop) else 0.0
+    bound_sigma_m = sigma_r if range_sigma_m is None else float(np.max(range_sigma_m))
+    error_radius_m = hdop * bound_sigma_m if math.isfinite(hdop) else 0.0
 
     # Calculate 2D covariance matrix in ENU for confidence ellipse
     n = len(P)
@@ -93,12 +107,20 @@ def calculate_gdop_bounds(
     }
 
     if G is not None and n >= 3:
-        M = np.eye(n) - np.ones((n, n)) / float(n)
-        F = G.T @ M @ G
+        if range_sigma_m is None:
+            M = np.eye(n) - np.ones((n, n)) / float(n)
+            F = G.T @ M @ G
+            covariance_scale = sigma_r ** 2
+        else:
+            inv_r = np.diag(1.0 / (range_sigma_m ** 2))
+            one = np.ones((n, 1))
+            M = inv_r - (inv_r @ one @ one.T @ inv_r) / (one.T @ inv_r @ one).item()
+            F = G.T @ M @ G
+            covariance_scale = 1.0
         try:
             if abs(float(np.linalg.det(F))) > 1e-12:
                 Q = np.linalg.inv(F)
-                C = Q * (sigma_r ** 2)
+                C = Q * covariance_scale
                 evals, evecs = np.linalg.eigh(C)
                 idx = np.argsort(evals)[::-1]
                 evals = np.maximum(evals[idx], 1e-12)
@@ -318,6 +340,44 @@ def estimate_trajectory_from_clips(
     }
 
 
+def _event_arrival_sigmas(
+    event: Dict[str, Any],
+    survey: SV.Survey,
+    temp_c: float,
+) -> Optional[List[float]]:
+    """Per-receiver sigma vector for one solve, or None when not every receiver states one.
+
+    `associate()` carries `t_sigma_s` through when the caller already resolved it, but
+    tools/hear_spatial.py reads raw dets.csv rows that often only carry `sync_sigma_ns`. When
+    every receiver in the event states that clock sigma, resolve it here through nodeclass and
+    fold any GPS-positioned receiver's own position sigma into the same range budget
+    hear-tdoa uses. A partial vector stays unweighted: the solvers refuse mixed stated/unstated
+    sigmas rather than inventing the missing ones.
+    """
+    node_ids = event["node_ids"]
+    detections = event.get("detections", [])
+    sigmas = list(event.get("arrival_sigma_s") or [None] * len(node_ids))
+    if len(sigmas) != len(node_ids):
+        raise ValueError("arrival_sigma_s must align with node_ids")
+    if len(detections) != len(node_ids):
+        raise ValueError("detections must align with node_ids")
+    if any(s is None for s in sigmas):
+        for i, (node_id, det) in enumerate(zip(node_ids, detections)):
+            if sigmas[i] is None and det.get("sync_sigma_ns") is not None:
+                sigmas[i] = NC.stamp_t_sigma_s(
+                    det["sync_sigma_ns"], survey.classes.get(int(node_id))
+                )
+    if any(s is None for s in sigmas):
+        return None
+    c_mps = SW.sound_speed(temp_c)
+    return [
+        math.hypot(float(sigmas[i]), float(survey.sigma_m[int(node_id)]) / c_mps)
+        if survey.position_sources.get(int(node_id), "survey") == SV.POSITION_SOURCE_GPS
+        else float(sigmas[i])
+        for i, node_id in enumerate(node_ids)
+    ]
+
+
 @dataclass
 class SpatialEvent:
     """Dataclass representing a localized spatial event."""
@@ -525,12 +585,9 @@ class SpatialEventPipeline:
         for ev in events:
             node_ids = ev["node_ids"]
             arrivals = ev["arrivals"]
-            sigmas = ev.get("arrival_sigma_s")
+            sigmas = _event_arrival_sigmas(ev, self.survey, self.temp_c)
 
             positions = self.survey.positions(node_ids)
-
-            if sigmas and all(s is None for s in sigmas):
-                sigmas = None
 
             try:
                 sol = PT.solve(
@@ -560,7 +617,13 @@ class SpatialEventPipeline:
             sigma_t_s = max(rms_ms / 1000.0 if rms_ms is not None else 0.001, 0.0001)
 
             gdop_bounds = calculate_gdop_bounds(
-                positions, enu, sigma_t_s=sigma_t_s, temp_c=self.temp_c
+                positions, enu, sigma_t_s=sigma_t_s, temp_c=self.temp_c,
+                position_sigma_m=[
+                    self.survey.sigma_m[node_id]
+                    if self.survey.position_sources.get(node_id, "survey") == SV.POSITION_SOURCE_GPS
+                    else 0.0
+                    for node_id in node_ids
+                ],
             )
 
             # Confidence score heuristic
@@ -585,6 +648,11 @@ class SpatialEventPipeline:
                 confidence_ellipse=gdop_bounds.get("confidence_ellipse"),
                 metadata={
                     "contributing_node_ids": node_ids,
+                    "position_sources": {
+                        self.survey.names[node_id] or str(node_id):
+                        self.survey.position_sources.get(node_id, "survey")
+                        for node_id in node_ids
+                    },
                     "n_nodes": ev["n_nodes"],
                     "point_source_possible": ev.get("point_source_possible", True),
                 },
