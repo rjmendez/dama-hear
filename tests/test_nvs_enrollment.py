@@ -131,24 +131,74 @@ def test_the_argument_check_would_catch_a_leak():
     assert re.search(r"\b(?:psk|ssid)\b", args)
 
 
+def _file_record(path, data):
+    return {"path": path, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
 def _release_manifest_text(tag, board_class, assets, dirty=False):
+    """A schema-valid manifest; verification refuses anything less."""
+    stub = b"stub\n"
     return json.dumps({
         "schema_version": release_manifest.SCHEMA_VERSION,
         "manifest_type": release_manifest.MANIFEST_TYPE,
         "tag": tag,
+        "firmware_version": tag,
         "source": {
+            "repository": "rjmendez/dama-hear",
             "commit": "abc123",
+            "commit_short": "abc123",
             "describe": tag,
             "dirty": dirty,
+            "dirty_paths": ["firmware/hear_node/hear_node.ino"] if dirty else [],
             "verifiable": not dirty,
             "refusals": ["dirty tree"] if dirty else [],
         },
+        "build": {
+            "sketch": "firmware/hear_node",
+            "fqbn": board_profiles.FQBN,
+            "libraries": ["firmware/lib"],
+            "arduino_cli_version": "1.5.1",
+            "esp32_core_version": "3.3.11",
+            "credentials_policy": "none compiled in",
+        },
+        "inputs": [_file_record("firmware/hear_node/hear_node.ino", stub)],
+        "generated_files": [_file_record("firmware/hear_node/decim.h", stub)],
+        "schema_guards": [_file_record("tests/test_firmware_csv_schema.py", stub)],
         "variants": [{
             "board_class": board_class,
+            "release_stem": board_profiles.release_stem(board_class),
+            "build_flags": ["-DHEAR_ALLOW_NO_WIFI"],
+            "board_header": _file_record(board_profiles.board_header(board_class), stub),
+            "capture_profile": {
+                "board_name": board_class,
+                "board_header": board_profiles.board_header(board_class),
+                "gps_protocol": "ubx",
+                "mic_kind": "i2s",
+                "mic_count": 1,
+                "fs_nominal_hz": 16000,
+                "decimation": 3,
+                "fs_acquisition_hz": 48000,
+                "mic_band_lo_hz": 50,
+                "mic_band_hi_hz": 7000,
+            },
+            "partition_table": {
+                "artifact": board_profiles.release_asset_name(tag, board_class, "partitions"),
+                "sha256": hashlib.sha256(stub).hexdigest(),
+                "bytes": len(stub),
+                "source_path": None,
+                "source_sha256": None,
+                "source_status": "binary-only",
+            },
             "artifacts": [{
                 "name": name,
+                "bytes": len(data),
                 "sha256": hashlib.sha256(data).hexdigest(),
             } for name, data in assets.items()],
+        }],
+        "release_artifacts": [{
+            "name": "build-info.json",
+            "bytes": len(stub),
+            "sha256": hashlib.sha256(stub).hexdigest(),
         }],
     })
 

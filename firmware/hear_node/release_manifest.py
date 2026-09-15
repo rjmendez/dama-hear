@@ -343,6 +343,97 @@ def _load_manifest(source):
     raise TypeError("cannot load manifest from %r" % type(source))
 
 
+_JSON_TYPES = {
+    "object": dict,
+    "array": list,
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "null": type(None),
+}
+
+
+def _type_matches(value, want: str) -> bool:
+    expected = _JSON_TYPES[want]
+    if want in ("integer", "number") and isinstance(value, bool):
+        return False
+    if want == "boolean":
+        return isinstance(value, bool)
+    return isinstance(value, expected)
+
+
+def _schema_errors(value, schema, where: str):
+    """Validate against the subset of JSON Schema that schema_document() uses."""
+    problems = []
+    if "const" in schema and value != schema["const"]:
+        problems.append("%s must be %r, got %r" % (where, schema["const"], value))
+        return problems
+    types = schema.get("type")
+    if types is not None:
+        wanted = types if isinstance(types, list) else [types]
+        if not any(_type_matches(value, t) for t in wanted):
+            problems.append("%s must be of type %s" % (where, " or ".join(wanted)))
+            return problems
+    if isinstance(value, dict):
+        for key in schema.get("required", []):
+            if key not in value:
+                problems.append("%s is missing required field %r" % (where, key))
+        for key, sub in schema.get("properties", {}).items():
+            if key in value:
+                problems.extend(_schema_errors(value[key], sub, "%s.%s" % (where, key)))
+    elif isinstance(value, list) and "items" in schema:
+        for i, item in enumerate(value):
+            problems.extend(_schema_errors(item, schema["items"], "%s[%d]" % (where, i)))
+    elif isinstance(value, str):
+        pattern = schema.get("pattern")
+        if pattern and not re.search(pattern, value):
+            problems.append("%s %r does not match %s" % (where, value, pattern))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        minimum = schema.get("minimum")
+        if minimum is not None and value < minimum:
+            problems.append("%s must be >= %s" % (where, minimum))
+    return problems
+
+
+def manifest_schema_problems(manifest):
+    """Problems that make a manifest document unusable, as plain strings."""
+    if not isinstance(manifest, dict):
+        return ["release manifest must be a JSON object, got %s" % type(manifest).__name__]
+    return _schema_errors(manifest, schema_document(), "manifest")
+
+
+def validate_manifest_document(manifest):
+    """Refuse any manifest that does not satisfy the published schema."""
+    problems = manifest_schema_problems(manifest)
+    if problems:
+        shown, extra = problems[:6], len(problems) - 6
+        detail = "; ".join(shown) + (" (+%d more)" % extra if extra > 0 else "")
+        raise ValueError("release manifest does not match %s: %s" % (SCHEMA_NAME, detail))
+    return manifest
+
+
+def _artifact_index(variant, board_class: str):
+    """Artifacts keyed by name; refuse structurally incomplete entries."""
+    index = {}
+    for i, item in enumerate(variant.get("artifacts", [])):
+        where = "variant %s artifact[%d]" % (board_class, i)
+        if not isinstance(item, dict):
+            raise ValueError("%s is not an object" % where)
+        for field in ("name", "sha256", "bytes"):
+            if field not in item:
+                raise ValueError("%s is missing required field %r" % (where, field))
+        name, digest, size = item["name"], item["sha256"], item["bytes"]
+        if not isinstance(name, str) or not name:
+            raise ValueError("%s has a non-string name %r" % (where, name))
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("%s (%s) has a malformed sha256 %r" % (where, name, digest))
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise ValueError("%s (%s) has a malformed byte count %r" % (where, name, size))
+        index[name] = item
+    return index
+
+
 def _variant_lookup(manifest, board_class: str):
     for variant in manifest.get("variants", []):
         if variant.get("board_class") == board_class:
@@ -357,7 +448,11 @@ def _check_hash(name: str, data: bytes, want: str):
 
 
 def verify_downloaded_release_assets(manifest_source, tag: str, board_class: str, assets: dict[str, bytes]):
-    manifest = _load_manifest(manifest_source)
+    try:
+        manifest = _load_manifest(manifest_source)
+    except json.JSONDecodeError as e:
+        raise ValueError("release manifest is not valid JSON: %s" % e) from e
+    validate_manifest_document(manifest)
     if manifest.get("manifest_type") != MANIFEST_TYPE:
         raise ValueError("unexpected manifest_type %r" % manifest.get("manifest_type"))
     if manifest.get("schema_version") != SCHEMA_VERSION:
@@ -371,7 +466,7 @@ def verify_downloaded_release_assets(manifest_source, tag: str, board_class: str
         raise ValueError("manifest is marked unverifiable: %s"
                          % "; ".join(source.get("refusals") or ["no reason given"]))
     variant = _variant_lookup(manifest, board_class)
-    expected = {item["name"]: item for item in variant.get("artifacts", [])}
+    expected = _artifact_index(variant, board_class)
     missing = sorted(set(assets) - set(expected))
     if missing:
         raise ValueError("manifest does not declare %s for board_class %s"
@@ -388,7 +483,11 @@ def verify_downloaded_release_assets(manifest_source, tag: str, board_class: str
 
 def verify_release_directory(manifest_path: pathlib.Path, dist_dir: pathlib.Path,
                              expected_tag=None, expected_board_class=None, source_root=None):
-    manifest = _load_manifest(manifest_path)
+    try:
+        manifest = _load_manifest(manifest_path)
+    except json.JSONDecodeError as e:
+        raise ValueError("release manifest is not valid JSON: %s" % e) from e
+    validate_manifest_document(manifest)
     problems = []
     if manifest.get("manifest_type") != MANIFEST_TYPE:
         problems.append("unexpected manifest_type %r" % manifest.get("manifest_type"))
@@ -485,6 +584,14 @@ def schema_document():
         },
         "additionalProperties": True,
     }
+    named_file_record = {
+        **file_record,
+        "required": ["name", "bytes", "sha256"],
+    }
+    path_file_record = {
+        **file_record,
+        "required": ["path", "bytes", "sha256"],
+    }
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "dama-hear hear_node release manifest",
@@ -532,9 +639,9 @@ def schema_document():
                 },
                 "additionalProperties": True,
             },
-            "inputs": {"type": "array", "items": file_record},
-            "generated_files": {"type": "array", "items": file_record},
-            "schema_guards": {"type": "array", "items": file_record},
+            "inputs": {"type": "array", "items": path_file_record},
+            "generated_files": {"type": "array", "items": path_file_record},
+            "schema_guards": {"type": "array", "items": path_file_record},
             "variants": {
                 "type": "array",
                 "items": {
@@ -547,7 +654,7 @@ def schema_document():
                         "board_class": {"type": "string"},
                         "release_stem": {"type": "string"},
                         "build_flags": {"type": "array", "items": {"type": "string"}},
-                        "board_header": file_record,
+                        "board_header": path_file_record,
                         "capture_profile": {
                             "type": "object",
                             "required": [
@@ -585,12 +692,12 @@ def schema_document():
                             },
                             "additionalProperties": True,
                         },
-                        "artifacts": {"type": "array", "items": file_record},
+                        "artifacts": {"type": "array", "items": named_file_record},
                     },
                     "additionalProperties": True,
                 },
             },
-            "release_artifacts": {"type": "array", "items": file_record},
+            "release_artifacts": {"type": "array", "items": named_file_record},
         },
         "additionalProperties": True,
     }
