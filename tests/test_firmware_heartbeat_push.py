@@ -299,7 +299,7 @@ def test_push_post_json_uses_tls_and_wraps_the_batch_envelope_for_the_ingest_api
     assert "client.setInsecure();" in body
     assert '"{\\"device_id\\":\\"%s\\",\\"messages\\":[%.*s]}"' in body
     assert "node_id," in body
-    assert "char wrapped[HEAR_PUSH_WRAPPED_MAX];" in body
+    assert "static char wrapped[HEAR_PUSH_WRAPPED_MAX];" in body
     assert "Authorization: Bearer %s" in body
 
 
@@ -326,9 +326,9 @@ def test_the_push_buffers_are_derived_from_what_they_hold_not_from_magic_numbers
             "(HEAR_PUSH_WRAPPED_MAX + HEAR_PUSH_REQ_HEADER_MAX)") in CODE
     # The body buffers the encoders fill, the envelope that carries them and the request that
     # carries that are ONE number, spelled once. A literal here is the defect this stops.
-    assert CODE.count("char body[HEAR_PUSH_BODY_MAX];") == 2
+    assert CODE.count("static char body[HEAR_PUSH_BODY_MAX];") == 2
     assert not re.search(r"char (body|wrapped|req)\[\d+\];", CODE)
-    assert "char req[HEAR_PUSH_REQ_MAX];" in _fn("push_post_json")
+    assert "static char req[HEAR_PUSH_REQ_MAX];" in _fn("push_post_json")
 
 
 def test_the_firmware_static_asserts_the_envelope_can_hold_a_full_size_body():
@@ -371,6 +371,76 @@ def test_truncation_still_fails_the_push_instead_of_sending_half_a_message():
     assert "*code_out = -8;" in body
     assert "if (n <= 0 || n >= (int)sizeof req) {" in body
     assert "*code_out = -3;" in body
+
+# ------------------------------------------------- push buffers off the stack (nyquist, panic)
+# Sizing the envelope chain correctly put body(768) + wrapped(823) + req(1103) live at the same
+# time in the push call chain -- ~2.7 kB -- in the same frame where push_post_json() stands up a
+# WiFiClientSecure whose mbedtls handshake wants several kB of the 8 kB Arduino loop task stack.
+# nyquist panicked ~20-25 s after boot on real hardware, twice; the boot guard saw reset=panic
+# before HEAR_BOOT_HEALTHY_MS and reverted the slot both times. `static` keeps the sizes above and
+# takes the bytes out of the frame. A stack-depth test is not possible on the host, so what is
+# checkable is the storage class itself, plus the single-threadedness that makes it safe.
+
+PUSH_BUFFERS = (
+    ("push_post_json", "wrapped", "HEAR_PUSH_WRAPPED_MAX"),
+    ("push_post_json", "req", "HEAR_PUSH_REQ_MAX"),
+    ("push_send_heartbeat", "body", "HEAR_PUSH_BODY_MAX"),
+    ("push_send_event", "body", "HEAR_PUSH_BODY_MAX"),
+)
+
+
+@pytest.mark.parametrize("fn,buf,size", PUSH_BUFFERS)
+def test_the_push_buffers_have_static_storage_not_a_stack_frame(fn, buf, size):
+    body = _fn(fn)
+    assert re.search(r"\bstatic\s+char\s+%s\[%s\]\s*;" % (buf, size), body), (
+        "%s() must declare %s[] static: on the loop task stack it is what panicked nyquist" % (fn, buf))
+    assert not re.search(r"(?<!static )\bchar\s+%s\[" % buf, body), (
+        "%s[] must not also exist as a stack local in %s()" % (buf, fn))
+
+
+def test_the_push_frame_no_longer_carries_the_overflowing_buffer_total():
+    # The math the panic came from: the three buffers are live simultaneously, because
+    # push_send_heartbeat()/push_send_event() hold body while push_post_json() builds wrapped
+    # and req from it. None of those bytes may be frame bytes any more.
+    body_max, _node_id, wrapped_max = _push_sizes()
+    # body -> wrapped -> req, so the request buffer is strictly the largest of the three and the
+    # live total is well past the point where it matters on an 8 kB loop task that also runs a
+    # TLS handshake in the same frame.
+    live_total = body_max + wrapped_max + (wrapped_max + 160)
+    assert live_total > 2048, "the simultaneous total is what overflowed the frame"
+    for fn, buf, size in PUSH_BUFFERS:
+        assert "static char %s[%s];" % (buf, size) in _fn(fn)
+
+
+def test_the_push_path_is_single_threaded_so_static_buffers_cannot_be_reentered():
+    # `static` is only safe because nothing else can be inside this call chain at the same time.
+    # push_pump() is called from loop() and nowhere else; no xTaskCreate anywhere in the sketch
+    # puts a second task on it; and the one ISR in the sketch (pps_isr) touches no push state.
+    assert CODE.count("push_pump();") == 1
+    assert "xTaskCreate" not in CODE
+    for caller in ("pps_isr",):
+        isr = _fn(caller)
+        assert "push_" not in isr
+    # push_pump() dispatches at most one of the three senders per call, so body[] is never held
+    # by two frames at once either.
+    pump = _fn("push_pump")
+    assert pump.count("return;") >= 2
+    assert "push_send_heartbeat();" in pump
+
+
+def test_the_loop_task_gets_headroom_on_top_of_the_static_buffers_not_instead_of_them():
+    # A bigger stack alone would only move the cliff: the buffers must be off the frame FIRST,
+    # and this is the margin for whatever grows next (mbedtls, another header, a longer body).
+    m = re.search(r"SET_LOOP_TASK_STACK_SIZE\((\d+)\s*\*\s*1024\)", CODE)
+    assert m, "the loop task stack size is left at the core's 8 kB default"
+    assert int(m.group(1)) >= 12
+    for fn, buf, size in PUSH_BUFFERS:
+        assert "static char %s[%s];" % (buf, size) in _fn(fn)
+
+
+def test_the_sketch_records_why_the_push_buffers_are_static():
+    assert "static`, NOT A STACK LOCAL" in INO.read_text()
+
 
 def test_the_connect_timeout_is_long_enough_to_complete_a_real_tcp_handshake():
     # HEAR_PUSH_CONNECT_TIMEOUT_MS was 15 -- 15 milliseconds, not 1.5 seconds -- which meant

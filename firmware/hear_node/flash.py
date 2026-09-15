@@ -17,8 +17,12 @@ So the two steps are one step. The identity cannot be stale relative to the targ
 target is not chosen separately from it.
 
 AFTER FLASHING it reads /status back and REFUSES to report success if the node that answers is not
-the node that was asked for. A flash that silently lands the wrong identity is the failure being
-fixed; catching it needs the check to be part of the same command too.
+the node that was asked for, or -- in a build-mode flash -- is not running the version that was
+just built. A flash that silently lands the wrong identity is the failure being
+fixed; catching it needs the check to be part of the same command too. Identity alone is not
+enough: a node whose new image panics before HEAR_BOOT_HEALTHY_MS is reverted to its previous
+slot by the boot guard and keeps answering with the same name, so only the reported fw string
+separates "flashed" from "flashed, panicked and rolled back".
 
 RELEASE MODE installs a published image instead of building one. Release images carry no
 credentials and no name; the node's NVS supplies both. So the node must already be enrolled, either
@@ -42,6 +46,31 @@ import release_manifest  # noqa: E402
 SKETCH = os.path.relpath(HERE, REPO)
 FQBN = board_profiles.FQBN
 REPO_SLUG = "rjmendez/dama-hear"
+
+
+def built_fw_version(path=None):
+    """The FW_BUILD gen_secrets.py just compiled in, or None if it is not assertable.
+
+    A build-mode flash used to be called OK on identity alone, and identity survives a revert:
+    when the new image panics before HEAR_BOOT_HEALTHY_MS the boot guard rolls back to the
+    previous slot, which answers /status with the SAME node id -- so the flash that put a
+    panicking image on the fleet reported `flash: OK`. The version the node reports is what
+    tells those two apart. Returns None (check skipped, not failed) when the value cannot mean
+    anything: no secrets.h, or a placeholder git could not resolve.
+    """
+    path = path or os.path.join(HERE, "secrets.h")
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return None
+    m = re.search(r'^\s*#define\s+FW_BUILD\s+"([^"]*)"', text, re.M)
+    if not m:
+        return None
+    build = m.group(1).strip()
+    if build in ("", "unknown", "unset"):
+        return None
+    return build
 
 
 def die(msg, code=1):
@@ -151,6 +180,7 @@ def main(argv):
 
     is_serial = target.startswith("/dev/")
     was = None
+    expect_fw = None
 
     if release:
         if is_serial:
@@ -177,6 +207,9 @@ def main(argv):
 
         subprocess.run([sys.executable, os.path.join(HERE, "gen_secrets.py"), node, board_class],
                        cwd=REPO, check=True)
+        # What this build will report as fw, read from the secrets.h just written. Checked at
+        # step 5 so a boot-guard revert cannot pass as a successful flash.
+        expect_fw = built_fw_version()
 
         # 2. if the target is already reachable, refuse a target that is a DIFFERENT node.
         #    Flashing a node with someone else's identity is recoverable; doing it without
@@ -224,6 +257,7 @@ def main(argv):
     if host is None:
         print("flash: serial upload done; verify with  curl http://%s.local/status" % node)
         return 0
+    stale_fw = None
     for _ in range(40):
         time.sleep(3)
         try:
@@ -239,9 +273,21 @@ def main(argv):
                 die("%s came back as %r but reports fw=%r prov=%r, not %s on its NVS record"
                     % (host, got, now.get("fw"), prov, release))
             continue          # still the old image, answering before the reboot
+        if not release and expect_fw and now.get("fw") != expect_fw:
+            # Identity matches and the version does not: either the reboot has not landed yet,
+            # or the node ran the new image, panicked and the boot guard put the old one back.
+            # Both look identical for the first seconds, so keep polling and only call it a
+            # failure once the window closes.
+            stale_fw = now.get("fw")
+            continue
         print("flash: OK -- %s reports node=%r class=%r fw=%r prov=%r uptime=%ss"
               % (host, got, now.get("class"), now.get("fw"), prov, now.get("uptime_s")))
         return 0
+    if stale_fw is not None:
+        die("%s answers as %r but still reports fw=%r, not the %r just flashed -- the image did "
+            "not stay up (a panic before HEAR_BOOT_HEALTHY_MS makes the boot guard revert to the "
+            "previous slot, which keeps the same identity). Read its /log before reflashing."
+            % (host, node, stale_fw, expect_fw))
     die("node did not come back within 120 s -- check it before flashing anything else")
 
 

@@ -246,6 +246,79 @@ class TestReleaseRefusal:
             flash.main(["flash.py", "nyquist", "/dev/ttyACM0", "--release", "v0.1.0"])
 
 
+class TestPostFlashVersionCheck:
+    """`flash: OK` used to mean only "a node with the right name answered".
+
+    It does not follow that the image stayed up. A build that panics before
+    HEAR_BOOT_HEALTHY_MS is reverted by hear_boot_guard() to the previous slot, which answers
+    /status with the SAME node id and the OLD fw -- exactly what happened to nyquist twice on
+    the v0.1.4-122-g794e3f5 heartbeat-push build. The version has to be part of the verdict.
+    """
+
+    def _flash(self, monkeypatch, states, built="v0.1.4-123-gabc1234"):
+        monkeypatch.setattr(flash, "status", lambda host: next(states))
+        monkeypatch.setattr(flash.os.path, "exists", lambda path: path.endswith("hear_node.ino.bin"))
+        monkeypatch.setattr(flash.time, "sleep", lambda _: None)
+        monkeypatch.setattr(flash, "built_fw_version", lambda path=None: built)
+        monkeypatch.setattr(flash.subprocess, "run", lambda cmd, **kw: type(
+            "R", (), {"stdout": "OK", "stderr": "", "returncode": 0})())
+        return flash.main(["flash.py", "gold", "172.16.100.50"])
+
+    def _live(self, fw, uptime=4):
+        return {"node": "gold", "class": "xiao-s3-pps", "fw": fw, "uptime_s": uptime,
+                "prov": {"src": "compiled", "nets": 1, "nvs": True}}
+
+    def test_a_node_that_reverted_to_the_old_firmware_is_not_reported_as_ok(self, monkeypatch, capsys):
+        # The boot guard put the previous slot back: right name, old version, forever.
+        states = iter([self._live("v0.1.4-122-g794e3f5")] * 200)
+        with pytest.raises(SystemExit) as e:
+            self._flash(monkeypatch, states)
+        assert e.value.code != 0
+        out, err = capsys.readouterr()
+        assert "v0.1.4-122-g794e3f5" in err and "v0.1.4-123-gabc1234" in err
+        assert "boot guard" in err
+        assert "flash: OK --" not in out
+
+    def test_the_just_built_version_coming_back_is_ok(self, monkeypatch, capsys):
+        states = iter([self._live("v0.1.4-123-gabc1234")] * 200)
+        assert self._flash(monkeypatch, states) == 0
+        assert "flash: OK --" in capsys.readouterr().out
+
+    def test_the_old_version_during_the_reboot_window_is_waited_out_not_failed(self, monkeypatch):
+        # First polls catch the pre-reboot image; the check must not fire on those.
+        states = iter([self._live("v0.1.4-122-g794e3f5"),
+                       self._live("v0.1.4-122-g794e3f5")]
+                      + [self._live("v0.1.4-123-gabc1234", uptime=6)] * 40)
+        assert self._flash(monkeypatch, states) == 0
+
+    def test_no_assertable_build_version_skips_the_check_rather_than_failing(self, monkeypatch):
+        # A tree with no git (FW_BUILD "unknown"/"unset") or no secrets.h has nothing to compare.
+        states = iter([self._live("whatever-it-reports")] * 200)
+        assert self._flash(monkeypatch, states, built=None) == 0
+
+    def test_built_fw_version_reads_secrets_h_and_rejects_placeholders(self, tmp_path):
+        p = tmp_path / "secrets.h"
+        p.write_text('#define NODE_ID "gold"\n#define FW_BUILD "v0.1.4-123-gabc1234"\n')
+        assert flash.built_fw_version(str(p)) == "v0.1.4-123-gabc1234"
+        p.write_text('#define FW_BUILD "unknown"\n')
+        assert flash.built_fw_version(str(p)) is None
+        p.write_text('#define NODE_ID "gold"\n')
+        assert flash.built_fw_version(str(p)) is None
+        assert flash.built_fw_version(str(tmp_path / "nope.h")) is None
+
+    def test_the_release_path_still_verifies_against_the_release_tag(self, monkeypatch):
+        # Untouched: a release image's version is the tag, and its prov must come from NVS.
+        good = {"node": "gold", "class": "xiao-s3-pps", "prov": {"src": "nvs", "nets": 1, "nvs": True}}
+        states = iter([good] + [dict(good, fw="v0.1.4-122-g794e3f5", uptime_s=90)] * 200)
+        monkeypatch.setattr(flash, "status", lambda host: next(states))
+        monkeypatch.setattr(flash.time, "sleep", lambda _: None)
+        monkeypatch.setattr(flash, "release_image", lambda tag, board_class: "/x/app.bin")
+        monkeypatch.setattr(flash.subprocess, "run", lambda cmd, **kw: type(
+            "R", (), {"stdout": "OK", "stderr": "", "returncode": 0})())
+        with pytest.raises(SystemExit):
+            flash.main(["flash.py", "gold", "172.16.100.50", "--release", "v0.1.5"])
+
+
 class TestBoardClassSelection:
     def test_default_xiao_release_asset_name_is_unchanged_for_existing_nodes(self):
         assert board_profiles.release_asset_name("v0.1.3", "xiao-s3-pps", "app") \
@@ -275,6 +348,9 @@ class TestBoardClassSelection:
         monkeypatch.setattr(flash, "status", lambda host: next(states))
         monkeypatch.setattr(flash.os.path, "exists", lambda path: path.endswith("hear_node.ino.bin"))
         monkeypatch.setattr(flash.time, "sleep", lambda _: None)
+        # gen_secrets.py is stubbed out below, so no secrets.h is written for this build and the
+        # version assertion has nothing to assert against; that is the skip case, not a failure.
+        monkeypatch.setattr(flash, "built_fw_version", lambda path=None: None)
 
         def fake_run(cmd, **kwargs):
             cmds.append(cmd)
