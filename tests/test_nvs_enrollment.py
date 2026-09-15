@@ -342,7 +342,7 @@ class TestPostFlashVersionCheck:
         states = iter([good] + [dict(good, fw="v0.1.4-122-g794e3f5", uptime_s=90)] * 200)
         monkeypatch.setattr(flash, "status", lambda host: next(states))
         monkeypatch.setattr(flash.time, "sleep", lambda _: None)
-        monkeypatch.setattr(flash, "release_image", lambda tag, board_class, psram_mode=None: "/x/app.bin")
+        monkeypatch.setattr(flash, "release_image", lambda tag, board_class, psram_mode=None, **kw: "/x/app.bin")
         monkeypatch.setattr(flash, "ota_post", lambda host, bin_path, token: ("OK", "200", ""))
         monkeypatch.setattr(flash, "admin_token", lambda path=None: "admin-token")
         monkeypatch.setattr(flash.subprocess, "run", lambda cmd, **kw: type(
@@ -361,7 +361,7 @@ class TestPostFlashVersionCheck:
         states = iter([before, after])
         monkeypatch.setattr(flash, "status", lambda host: next(states))
         monkeypatch.setattr(flash.time, "sleep", lambda _: None)
-        monkeypatch.setattr(flash, "release_image", lambda tag, board_class, psram_mode=None: "/x/app.bin")
+        monkeypatch.setattr(flash, "release_image", lambda tag, board_class, psram_mode=None, **kw: "/x/app.bin")
         monkeypatch.setattr(flash, "ota_post", lambda host, bin_path, token: ("OK", "200", ""))
         monkeypatch.setattr(flash, "admin_token", lambda path=None: "admin-token")
         with pytest.raises(SystemExit):
@@ -404,7 +404,7 @@ class TestBoardClassSelection:
         monkeypatch.setattr(flash, "ota_post", lambda host, bin_path, token: ("OK", "200", ""))
         monkeypatch.setattr(flash, "admin_token", lambda path=None: "admin-token")
 
-        def fake_release_image(tag, board_class, psram_mode=None):
+        def fake_release_image(tag, board_class, psram_mode=None, **kw):
             called.append((tag, board_class, psram_mode))
             return "/x/app.bin"
 

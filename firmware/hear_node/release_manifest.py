@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 from typing import Iterable
@@ -29,8 +32,26 @@ PROVISIONING_REQUIRED = ("node_id", "wifi", "admin_token", "push_token")
 # discovering it after the assets are public and the tokens have to be rotated across the fleet.
 SECRETS_HEADER = "firmware/hear_node/secrets.h"
 SCHEMA_NAME = "release-manifest.schema.json"
+# ⚠️STAYS AT 1 WHILE FIELDS ARE ADDED. `verify` refuses any other schema_version, and the fleet
+# installs from manifests that are already published, so a bump would strand every node on a
+# release that predates it. `sbom` and `attestation` below are therefore OPTIONAL additions: a
+# v0.1.5 manifest that has neither still verifies, and a manifest that has them is checked for
+# them. The version moves only when an existing field changes meaning.
 SCHEMA_VERSION = 1
 MANIFEST_TYPE = "dama-hear-hear_node-release"
+SBOM_NAME = "release-sbom.cdx.json"
+SBOM_KIND = "sbom"
+# The signed attestation is a SEPARATE asset, and deliberately NOT hashed by this manifest: its
+# in-toto subjects include the manifest, so a manifest that hashed the bundle could never be
+# generated. SHA256SUMS covers the bundle; the bundle covers the manifest; the manifest covers
+# every image. Each link is checkable on its own.
+ATTESTATION_BUNDLE_NAME = "release-provenance.intoto.jsonl"
+ATTESTATION_PREDICATE_TYPE = "https://slsa.dev/provenance/v1"
+IN_TOTO_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
+ATTESTATION_ISSUER = "https://token.actions.githubusercontent.com"
+ATTESTATION_WORKFLOW = ".github/workflows/release.yml"
+REVOCATIONS_NAME = "release_revocations.json"
+REVOCATIONS_TYPE = "dama-hear-hear_node-release-revocations"
 UPLOAD_KINDS = ("app", "bootloader", "partitions", "merged", "elf")
 COMMON_INPUTS = (
     (".github/workflows/firmware.yml", "ci-build-workflow"),
@@ -337,6 +358,24 @@ def build_manifest(repo_root: pathlib.Path, dist_dir: pathlib.Path, build_info_p
         _record_bytes("build-info.json", build_info_bytes, kind="build-info"),
         _record_bytes(SCHEMA_NAME, schema_text.encode("utf-8"), kind="manifest-schema"),
     ]
+    # The SBOM is written BEFORE the manifest (release.yml runs release_sbom.py first) precisely
+    # so the manifest can hash it: an SBOM nobody's checksum covers is a document an attacker can
+    # rewrite. A release cut without one still produces a manifest, and an installer that meets a
+    # manifest with no sbom block does not demand one -- that is what keeps v0.1.5 installable.
+    sbom_block = None
+    sbom_path = dist_dir / SBOM_NAME
+    if sbom_path.exists():
+        sbom_bytes = sbom_path.read_bytes()
+        release_artifacts.append(_record_bytes(SBOM_NAME, sbom_bytes, kind=SBOM_KIND))
+        sbom_block = {
+            "name": SBOM_NAME,
+            "format": "CycloneDX",
+            "spec_version": "1.6",
+            "bytes": len(sbom_bytes),
+            "sha256": _sha256_bytes(sbom_bytes),
+            "generator": "firmware/hear_node/release_sbom.py",
+            "generator_sha256": _sha256_path(HERE / "release_sbom.py"),
+        }
 
     manifest = {
         "schema_version": SCHEMA_VERSION,
@@ -366,8 +405,267 @@ def build_manifest(repo_root: pathlib.Path, dist_dir: pathlib.Path, build_info_p
         "schema_guards": schema_guards,
         "variants": variants,
         "release_artifacts": release_artifacts,
+        "attestation": attestation_policy(state["repository"]),
     }
+    if sbom_block:
+        manifest["sbom"] = sbom_block
     return manifest, schema_text
+
+
+def attestation_policy(repository: str = "rjmendez/dama-hear"):
+    """What signs a release, where the signature is published, and how to check it.
+
+    ⚠️NO KEY, NO SECRET, NO TOKEN. Signing is Sigstore keyless through the workflow's GitHub OIDC
+    identity: the job asks for an `id-token` and gets a short-lived certificate bound to the
+    repository, the workflow file and the commit. There is nothing to store in `secrets`, nothing
+    to rotate, and nothing an operator can leak, which is the only signing scheme this repository
+    can adopt without inventing a key-custody procedure it would then have to run.
+
+    ⚠️THE BUNDLE IS PUBLISHED AS A RELEASE ASSET. Verification therefore needs no GitHub
+    credential and no API call for the attestation itself -- `gh attestation verify --bundle` can
+    check a downloaded release from a laptop that has never authenticated to GitHub.
+    """
+    return {
+        "bundle": ATTESTATION_BUNDLE_NAME,
+        "predicate_type": ATTESTATION_PREDICATE_TYPE,
+        "statement_type": IN_TOTO_STATEMENT_TYPE,
+        "signing": {
+            "method": "sigstore-keyless-github-oidc",
+            "issuer": ATTESTATION_ISSUER,
+            "repository": repository,
+            "workflow": ATTESTATION_WORKFLOW,
+            "identity": "https://github.com/%s/%s@refs/tags/<tag>" % (repository, ATTESTATION_WORKFLOW),
+            "secrets_required": False,
+        },
+        "covers": "every file published with this release, by sha256, including %s" % MANIFEST_NAME,
+        "not_covered_by_manifest": (
+            "the bundle's own sha256 is in SHA256SUMS, not in this manifest: the bundle attests "
+            "to the manifest, so the manifest cannot attest to the bundle"),
+        "verify": (
+            "gh attestation verify <asset> --repo %s "
+            "--signer-workflow %s/%s --bundle %s"
+            % (repository, repository, ATTESTATION_WORKFLOW, ATTESTATION_BUNDLE_NAME)),
+        "offline_note": (
+            "release_manifest.py verify --attestation checks the bundle's STRUCTURE and subject "
+            "digests offline; it does not check the signature. Cryptographic verification needs "
+            "gh (or cosign) and a Sigstore trusted root."),
+    }
+
+
+def _decode_statements(bundle_source):
+    """in-toto statements out of a Sigstore bundle (.jsonl of one bundle per line).
+
+    Parsing only. This reads the payload WITHOUT verifying the DSSE signature, so nothing here
+    may be described to an operator as "verified" -- it answers "does this bundle even claim to
+    cover these files", which is the question that catches a mismatched or truncated asset before
+    anyone spends a Sigstore round trip on it.
+    """
+    if isinstance(bundle_source, pathlib.Path):
+        bundle_source = bundle_source.read_bytes()
+    if isinstance(bundle_source, bytes):
+        bundle_source = bundle_source.decode("utf-8", "replace")
+    statements = []
+    for lineno, line in enumerate(bundle_source.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            bundle = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise ValueError("attestation bundle line %d is not valid JSON: %s" % (lineno, e))
+        envelope = bundle.get("dsseEnvelope") or bundle.get("dsse_envelope") or bundle
+        payload = envelope.get("payload")
+        if payload is None:
+            raise ValueError("attestation bundle line %d has no DSSE payload" % lineno)
+        try:
+            raw = base64.b64decode(payload, validate=True)
+        except (ValueError, binascii.Error) as e:
+            raise ValueError("attestation bundle line %d payload is not base64: %s" % (lineno, e))
+        try:
+            statements.append(json.loads(raw))
+        except json.JSONDecodeError as e:
+            raise ValueError("attestation bundle line %d payload is not a JSON statement: %s"
+                             % (lineno, e))
+    if not statements:
+        raise ValueError("attestation bundle contains no statements")
+    return statements
+
+
+def attestation_subjects(bundle_source):
+    """{subject name: sha256} across every statement in a bundle."""
+    out = {}
+    for statement in _decode_statements(bundle_source):
+        for subject in statement.get("subject") or []:
+            digest = (subject.get("digest") or {}).get("sha256")
+            name = subject.get("name")
+            if name and digest:
+                out[str(name).rsplit("/", 1)[-1]] = digest
+    return out
+
+
+def attestation_structure_problems(bundle_source, manifest=None, expected=None,
+                                   repository="rjmendez/dama-hear"):
+    """Structural problems with an attestation bundle. Offline; signature NOT checked."""
+    problems = []
+    try:
+        statements = _decode_statements(bundle_source)
+    except ValueError as e:
+        return [str(e)]
+    for i, statement in enumerate(statements):
+        where = "attestation statement[%d]" % i
+        if statement.get("_type") != IN_TOTO_STATEMENT_TYPE:
+            problems.append("%s _type is %r, expected %r"
+                            % (where, statement.get("_type"), IN_TOTO_STATEMENT_TYPE))
+        if statement.get("predicateType") != ATTESTATION_PREDICATE_TYPE:
+            problems.append("%s predicateType is %r, expected %r"
+                            % (where, statement.get("predicateType"), ATTESTATION_PREDICATE_TYPE))
+        external = (((statement.get("predicate") or {}).get("buildDefinition") or {})
+                    .get("externalParameters") or {})
+        workflow = external.get("workflow") or {}
+        repo_url = workflow.get("repository") or ""
+        if repo_url and not repo_url.endswith("/" + repository):
+            problems.append("%s was built from %r, not %s" % (where, repo_url, repository))
+        path = workflow.get("path") or ""
+        if path and path != ATTESTATION_WORKFLOW:
+            problems.append("%s names workflow %r, expected %r"
+                            % (where, path, ATTESTATION_WORKFLOW))
+    subjects = attestation_subjects(bundle_source)
+    wanted = dict(expected or {})
+    if manifest is not None:
+        for variant in manifest.get("variants", []):
+            for item in variant.get("artifacts", []):
+                wanted.setdefault(item["name"], item["sha256"])
+        for item in manifest.get("release_artifacts", []):
+            wanted.setdefault(item["name"], item["sha256"])
+    for name, digest in sorted(wanted.items()):
+        got = subjects.get(name)
+        if got is None:
+            problems.append("the attestation does not cover %s" % name)
+        elif got != digest:
+            problems.append("the attestation covers a different %s (subject sha256 %s, want %s)"
+                            % (name, got, digest))
+    return problems
+
+
+def check_attestation_structure(bundle_source, manifest=None, expected=None,
+                                repository="rjmendez/dama-hear"):
+    problems = attestation_structure_problems(bundle_source, manifest=manifest, expected=expected,
+                                              repository=repository)
+    if problems:
+        shown, extra = problems[:8], len(problems) - 8
+        raise ValueError("attestation bundle does not cover this release: "
+                         + "; ".join(shown) + (" (+%d more)" % extra if extra > 0 else ""))
+    return sorted(attestation_subjects(bundle_source))
+
+
+def verify_attestation_signature(bundle_path, asset_path, repository="rjmendez/dama-hear"):
+    """Cryptographic verification, delegated to `gh attestation verify`.
+
+    Needs the `gh` CLI and a Sigstore trusted root (network), and NO GitHub credential: the
+    bundle is a local file. Returns the command's stdout; raises ValueError with the tool's own
+    message on failure, and a RuntimeError if gh is not installed, because "the check could not
+    run" must never read as "the check passed".
+    """
+    gh = shutil.which("gh")
+    if not gh:
+        raise RuntimeError(
+            "gh is not installed, so the release signature was NOT verified. Install GitHub CLI "
+            "2.49+ or verify elsewhere with: %s" % attestation_policy(repository)["verify"])
+    cmd = [gh, "attestation", "verify", str(asset_path), "--repo", repository,
+           "--signer-workflow", "%s/%s" % (repository, ATTESTATION_WORKFLOW),
+           "--bundle", str(bundle_path)]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode:
+        raise ValueError("gh attestation verify failed: %s"
+                         % (proc.stderr.strip() or proc.stdout.strip() or "no output"))
+    return (proc.stdout or proc.stderr).strip()
+
+
+def load_revocations(path=None):
+    """The local revocation list: releases that must not be installed, and why."""
+    path = pathlib.Path(path) if path else (HERE / REVOCATIONS_NAME)
+    if not path.exists():
+        return {"schema_version": 1, "type": REVOCATIONS_TYPE, "revoked": []}
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError("%s is not valid JSON: %s" % (path, e)) from e
+    if doc.get("type") != REVOCATIONS_TYPE:
+        raise ValueError("%s is not a %s document" % (path, REVOCATIONS_TYPE))
+    if not isinstance(doc.get("revoked"), list):
+        raise ValueError("%s has no revoked list" % path)
+    return doc
+
+
+def revocation_refusal(tag: str, path=None):
+    """Why this tag must not be installed, or None.
+
+    ⚠️A GITHUB RELEASE CANNOT BE UNPUBLISHED RETROACTIVELY -- a mirror, a cached asset or an
+    operator's `.otabuild` copy outlives any deletion, and deleting the release also deletes the
+    manifest that would have explained why. So revocation is a fact in the REPOSITORY, which is
+    what the installers run from: an entry here refuses the tag before anything is downloaded.
+    An operator who has not pulled gets the old answer, which is why §revocation in
+    docs/release-provenance.md requires a pull before a rollout and an entry in the release
+    notes of the successor tag.
+    """
+    for item in load_revocations(path).get("revoked", []):
+        if item.get("tag") == tag:
+            reason = item.get("reason") or "no reason recorded"
+            replacement = item.get("superseded_by")
+            return ("release %s is revoked: %s%s"
+                    % (tag, reason, "; use %s instead" % replacement if replacement else ""))
+    return None
+
+
+def fetch_provenance_assets(fetch, base: str, manifest, allow_unattested=False):
+    """Fetch the SBOM and the attestation bundle a manifest declares.
+
+    `fetch` is the caller's downloader (enroll.fetch), so this adds no new network stack and no
+    credential: these are public release assets on the same base URL as the images.
+
+    A declared-but-missing SBOM or bundle is a REFUSAL, not a shrug. The manifest that named them
+    is the same document that names the image hashes; if one of the three is absent the release
+    is not the release the manifest describes, and "verified" would be a lie. A manifest that
+    declares neither -- v0.1.5 and earlier -- passes straight through.
+    """
+    sbom = None
+    block = manifest.get("sbom")
+    if block:
+        name = block.get("name", SBOM_NAME)
+        try:
+            sbom = fetch(base + name)
+        except OSError as e:
+            raise ValueError("manifest declares %s but it could not be fetched (%s); refusing a "
+                             "release whose SBOM is missing" % (name, e)) from e
+    bundle = None
+    policy = manifest.get("attestation")
+    if policy:
+        name = policy.get("bundle", ATTESTATION_BUNDLE_NAME)
+        try:
+            bundle = fetch(base + name)
+        except OSError as e:
+            if not allow_unattested:
+                raise ValueError(
+                    "manifest declares a signed attestation (%s) but it could not be fetched "
+                    "(%s). An incomplete release is not an installable one; re-cut it, or pass "
+                    "--allow-unattested to install without the provenance check." % (name, e)
+                ) from e
+    return sbom, bundle
+
+
+def describe_verification(manifest, bundle_present: bool, signature_verified: bool) -> str:
+    """One honest line about how far verification actually got. Never overstates it."""
+    parts = [MANIFEST_NAME]
+    if manifest.get("sbom"):
+        parts.append(manifest["sbom"].get("name", SBOM_NAME))
+    if signature_verified:
+        parts.append("signed attestation (signature VERIFIED)")
+    elif bundle_present:
+        parts.append("attestation subjects (structure only -- signature NOT checked; run `%s`)"
+                     % attestation_policy().get("verify"))
+    elif manifest.get("attestation"):
+        parts.append("attestation NOT checked")
+    return ", ".join(parts)
 
 
 def write_manifest(repo_root: pathlib.Path, dist_dir: pathlib.Path, build_info_path: pathlib.Path,
@@ -518,8 +816,39 @@ def image_provisioning_refusal(manifest):
     return None
 
 
+def verify_declared_sbom(manifest, sbom_source, dist_dir=None):
+    """Check a release's SBOM against what its manifest says the SBOM is.
+
+    Two directions, both required. The manifest pins the SBOM's bytes (so the document cannot be
+    swapped), and the SBOM has to describe the same artifacts, the same source closure and the
+    same toolchain the manifest records (so a genuine document for a different build is caught
+    too). A manifest with no `sbom` block is a pre-SBOM release and is left alone.
+    """
+    block = manifest.get("sbom")
+    if block is None and sbom_source is None:
+        return None
+    if block is None:
+        raise ValueError("a %s was supplied for a release whose manifest does not declare one"
+                         % SBOM_NAME)
+    if sbom_source is None:
+        raise ValueError("manifest declares %s but it was not fetched; refusing to install a "
+                         "release whose SBOM cannot be checked" % block.get("name", SBOM_NAME))
+    data = sbom_source.read_bytes() if isinstance(sbom_source, pathlib.Path) else sbom_source
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    _check_hash(block.get("name", SBOM_NAME), data, block["sha256"])
+    if block.get("bytes") is not None and len(data) != block["bytes"]:
+        raise ValueError("%s is %d B, manifest says %d"
+                         % (block.get("name", SBOM_NAME), len(data), block["bytes"]))
+    import release_sbom                                        # noqa: E402  (avoids a cycle)
+    doc = release_sbom.load_sbom(data)
+    return release_sbom.verify_sbom(doc, manifest=manifest, dist_dir=dist_dir)
+
+
 def verify_downloaded_release_assets(manifest_source, tag: str, board_class: str,
-                                     assets: dict[str, bytes], psram_mode: str | None = None):
+                                     assets: dict[str, bytes], psram_mode: str | None = None,
+                                     sbom_source=None, attestation_bundle=None,
+                                     revocations_path=None):
     try:
         manifest = _load_manifest(manifest_source)
     except json.JSONDecodeError as e:
@@ -531,6 +860,9 @@ def verify_downloaded_release_assets(manifest_source, tag: str, board_class: str
         raise ValueError("unsupported schema_version %r" % manifest.get("schema_version"))
     if manifest.get("tag") != tag:
         raise ValueError("manifest tag %r does not match requested %r" % (manifest.get("tag"), tag))
+    revoked = revocation_refusal(tag, revocations_path)
+    if revoked:
+        raise ValueError(revoked)
     source = manifest.get("source") or {}
     if source.get("dirty"):
         raise ValueError("manifest refuses dirty source commit %s" % source.get("describe", source.get("commit")))
@@ -548,18 +880,35 @@ def verify_downloaded_release_assets(manifest_source, tag: str, board_class: str
                          % (", ".join(missing), board_class))
     for name, data in assets.items():
         _check_hash(name, data, expected[name]["sha256"])
+    verify_declared_sbom(manifest, sbom_source)
+    attested = None
+    if attestation_bundle is not None:
+        expected = {n: expected[n]["sha256"] for n in assets}
+        # When the caller still has the manifest's exact bytes -- an installer that just
+        # downloaded it does -- require the attestation to cover the manifest too, not only the
+        # image it describes.
+        raw = manifest_source if isinstance(manifest_source, (str, bytes)) else None
+        if raw is not None:
+            expected[MANIFEST_NAME] = _sha256_bytes(raw.encode("utf-8")
+                                                    if isinstance(raw, str) else raw)
+        attested = check_attestation_structure(
+            attestation_bundle, expected=expected,
+            repository=source.get("repository") or "rjmendez/dama-hear")
     return {
         "tag": manifest["tag"],
         "commit": source.get("commit"),
         "board_class": board_class,
         "psram_mode": variant.get("psram_mode"),
         "verified_assets": sorted(assets),
+        "sbom": (manifest.get("sbom") or {}).get("name"),
+        "attested_subjects": attested,
     }
 
 
 def verify_release_directory(manifest_path: pathlib.Path, dist_dir: pathlib.Path,
                              expected_tag=None, expected_board_class=None, expected_psram_mode=None,
-                             source_root=None):
+                             source_root=None, check_sbom=True, attestation=False,
+                             attestation_bundle=None, verify_signature=False):
     try:
         manifest = _load_manifest(manifest_path)
     except json.JSONDecodeError as e:
@@ -642,6 +991,55 @@ def verify_release_directory(manifest_path: pathlib.Path, dist_dir: pathlib.Path
                     continue
                 if _sha256_path(path) != item["sha256"]:
                     problems.append("%s sha256 does not match manifest" % item["path"])
+    sbom_checked = False
+    if check_sbom:
+        sbom_block = manifest.get("sbom")
+        if sbom_block:
+            sbom_path = dist_dir / sbom_block.get("name", SBOM_NAME)
+            if not sbom_path.exists():
+                problems.append("manifest declares %s but it is not in the release directory"
+                                % sbom_path.name)
+            else:
+                try:
+                    verify_declared_sbom(manifest, sbom_path.read_bytes(), dist_dir=dist_dir)
+                    sbom_checked = True
+                except ValueError as e:
+                    problems.append(str(e))
+
+    attested = None
+    signature_verified = False
+    if attestation or attestation_bundle:
+        policy = manifest.get("attestation")
+        if not policy:
+            problems.append("this release predates signed attestations: its manifest declares "
+                            "none, so there is nothing to verify")
+        else:
+            bundle_path = pathlib.Path(attestation_bundle) if attestation_bundle \
+                else dist_dir / policy.get("bundle", ATTESTATION_BUNDLE_NAME)
+            if not bundle_path.exists():
+                problems.append("attestation bundle %s is not in the release directory"
+                                % bundle_path.name)
+            else:
+                repository = (manifest.get("source") or {}).get("repository") or "rjmendez/dama-hear"
+                # The manifest is the document every other hash is read out of, so the bundle has
+                # to cover it too -- an attestation over the binaries alone leaves the one file
+                # that describes them swappable.
+                expected = {manifest_path.name: _sha256_path(manifest_path)}
+                try:
+                    attested = check_attestation_structure(bundle_path.read_bytes(),
+                                                           manifest=manifest,
+                                                           expected=expected,
+                                                           repository=repository)
+                except ValueError as e:
+                    problems.append(str(e))
+                if attested and verify_signature:
+                    subject = dist_dir / manifest["release_artifacts"][0]["name"]
+                    try:
+                        verify_attestation_signature(bundle_path, subject, repository=repository)
+                        signature_verified = True
+                    except (ValueError, RuntimeError) as e:
+                        problems.append(str(e))
+
     if problems:
         raise ValueError("\n".join(problems))
     return {
@@ -651,6 +1049,9 @@ def verify_release_directory(manifest_path: pathlib.Path, dist_dir: pathlib.Path
                                  for cls, mode in variant_checks)
                              + len(manifest.get("release_artifacts", [])),
         "source_checked": bool(source_root),
+        "sbom_checked": sbom_checked,
+        "attestation_subjects": attested,
+        "signature_verified": signature_verified,
     }
 
 
@@ -789,6 +1190,47 @@ def schema_document():
                 },
             },
             "release_artifacts": {"type": "array", "items": named_file_record},
+            # Optional, and optional on purpose: a manifest published before these existed is
+            # still a valid manifest, and an installer that meets one does not demand them.
+            "sbom": {
+                "type": "object",
+                "required": ["name", "format", "spec_version", "bytes", "sha256"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "format": {"type": "string"},
+                    "spec_version": {"type": "string"},
+                    "bytes": {"type": "integer", "minimum": 0},
+                    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "generator": {"type": "string"},
+                    "generator_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                },
+                "additionalProperties": True,
+            },
+            "attestation": {
+                "type": "object",
+                "required": ["bundle", "predicate_type", "signing", "verify"],
+                "properties": {
+                    "bundle": {"type": "string"},
+                    "predicate_type": {"type": "string"},
+                    "statement_type": {"type": "string"},
+                    "signing": {
+                        "type": "object",
+                        "required": ["method", "issuer", "repository", "workflow"],
+                        "properties": {
+                            "method": {"type": "string"},
+                            "issuer": {"type": "string"},
+                            "repository": {"type": "string"},
+                            "workflow": {"type": "string"},
+                            "identity": {"type": "string"},
+                            "secrets_required": {"type": "boolean"},
+                        },
+                        "additionalProperties": True,
+                    },
+                    "covers": {"type": "string"},
+                    "verify": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
         },
         "additionalProperties": True,
     }
@@ -818,10 +1260,19 @@ def _cmd_verify(args):
         expected_board_class=args.board_class,
         expected_psram_mode=args.psram_mode,
         source_root=pathlib.Path(args.source_root).resolve() if args.source_root else None,
+        check_sbom=not args.no_sbom,
+        attestation=args.attestation or args.verify_signature,
+        attestation_bundle=args.attestation_bundle,
+        verify_signature=args.verify_signature,
     )
-    print("release-manifest: verified %s (%d artefacts%s)"
+    print("release-manifest: verified %s (%d artefacts%s%s%s)"
           % (summary["tag"], summary["artifacts_checked"],
-             ", source checked" if summary["source_checked"] else ""))
+             ", source checked" if summary["source_checked"] else "",
+             ", SBOM cross-checked" if summary["sbom_checked"] else "",
+             (", signature verified" if summary["signature_verified"]
+              else ", attestation covers %d subjects (SIGNATURE NOT CHECKED -- run `gh "
+                   "attestation verify`)" % len(summary["attestation_subjects"])
+              if summary["attestation_subjects"] else "")))
     return 0
 
 
@@ -845,6 +1296,16 @@ def main(argv=None):
     verify.add_argument("--board-class")
     verify.add_argument("--psram-mode", choices=board_profiles.known_psram_modes())
     verify.add_argument("--source-root")
+    verify.add_argument("--no-sbom", action="store_true",
+                        help="skip the SBOM cross-check even if the manifest declares one")
+    verify.add_argument("--attestation", action="store_true",
+                        help="also check, offline, that the published attestation bundle covers "
+                             "every asset by sha256 (structure only: the SIGNATURE is not checked)")
+    verify.add_argument("--attestation-bundle",
+                        help="path to the Sigstore bundle, if it is not in --dist")
+    verify.add_argument("--verify-signature", action="store_true",
+                        help="cryptographically verify the bundle with `gh attestation verify` "
+                             "(needs gh and a Sigstore trusted root; needs no GitHub credential)")
     verify.set_defaults(func=_cmd_verify)
 
     args = ap.parse_args(argv)

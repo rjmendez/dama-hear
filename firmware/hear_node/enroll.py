@@ -135,9 +135,20 @@ def check_sums(sums_text, name, data):
         raise ValueError("%s sha256 %s, SHA256SUMS says %s" % (name, got, want))
 
 
-def release_files(tag, dest, board_class, psram_mode=None, repo=REPO_SLUG):
+def release_files(tag, dest, board_class, psram_mode=None, repo=REPO_SLUG,
+                  allow_unattested=False, verify_signature=False):
+    """Download one variant's USB install set and refuse it unless the release vouches for it.
+
+    Same three gates as flash.py --release, because a USB install of a public asset is the same
+    trust decision made over a different cable: the tag must not be revoked, the manifest must
+    match every downloaded byte, and the SBOM and attestation the manifest declares must exist
+    and cover these assets.
+    """
     board_profiles.require_board_class(board_class)
     psram_mode = board_profiles.require_psram_mode(psram_mode or board_profiles.psram_mode(board_class))
+    revoked = release_manifest.revocation_refusal(tag)
+    if revoked:
+        die("%s. Nothing was downloaded." % revoked)
     base = "https://github.com/%s/releases/download/%s/" % (repo, tag)
     manifest_text = None
     try:
@@ -155,10 +166,26 @@ def release_files(tag, dest, board_class, psram_mode=None, repo=REPO_SLUG):
         with open(os.path.join(dest, board_profiles.upload_filename(kind)), "wb") as f:
             f.write(data)
     if manifest_text is not None:
+        manifest = json.loads(manifest_text)
+        sbom, bundle = release_manifest.fetch_provenance_assets(
+            fetch, base, manifest, allow_unattested=allow_unattested)
         release_manifest.verify_downloaded_release_assets(
-            manifest_text, tag, board_class, fetched, psram_mode=psram_mode)
+            manifest_text, tag, board_class, fetched, psram_mode=psram_mode,
+            sbom_source=sbom, attestation_bundle=bundle)
+        signature_verified = False
+        if bundle is not None and verify_signature:
+            bundle_path = os.path.join(dest, release_manifest.ATTESTATION_BUNDLE_NAME)
+            with open(bundle_path, "wb") as f:
+                f.write(bundle)
+            release_manifest.verify_attestation_signature(
+                bundle_path,
+                os.path.join(dest, board_profiles.upload_filename("app")),
+                repository=repo)
+            signature_verified = True
         print("enroll: %s %s assets verified against %s"
-              % (tag, board_class, release_manifest.MANIFEST_NAME))
+              % (tag, board_class,
+                 release_manifest.describe_verification(manifest, bundle is not None,
+                                                        signature_verified)))
     else:
         print("enroll: %s %s assets verified against SHA256SUMS (legacy release)"
               % (tag, board_class))
@@ -276,6 +303,12 @@ def main(argv=None):
     ap.add_argument("--ap-pass",
                     help="this node's own fallback-AP password (Alert 5: no shared default). "
                          "Omit to have one generated and printed for you to record.")
+    ap.add_argument("--verify-signature", action="store_true",
+                    help="cryptographically verify the release's Sigstore attestation with `gh "
+                         "attestation verify` (needs gh; needs no GitHub credential)")
+    ap.add_argument("--allow-unattested", action="store_true",
+                    help="install a release whose declared attestation bundle is missing, and "
+                         "say so, instead of refusing it")
     ap.add_argument("--no-ap-pass", action="store_true",
                     help="provision no AP password at all; the node derives one from its own MAC "
                          "instead (unique per node, but not operator-chosen or secret-strength)")
@@ -326,7 +359,9 @@ def main(argv=None):
         d = os.path.join(REPO, ".otabuild", "release-%s-%s-usb" % (a.release, variant))
         os.makedirs(d, exist_ok=True)
         try:
-            release_files(a.release, d, a.cls, mode)
+            release_files(a.release, d, a.cls, mode,
+                          allow_unattested=a.allow_unattested,
+                          verify_signature=a.verify_signature)
         except (OSError, ValueError) as e:
             die("release %s (%s): %s" % (a.release, a.cls, e))
         upload(a.port, d, node_fqbn())

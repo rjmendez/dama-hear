@@ -29,6 +29,13 @@ credentials and no name; the node's NVS supplies both. So the node must already 
 by enroll.py or by any build of this tree flashed in the default mode, which copies its compiled-in
 credentials into NVS at boot. A node that does not report an NVS record is refused.
 
+RELEASE PROVENANCE. A release-mode flash refuses a tag listed in release_revocations.json before
+it downloads anything, and refuses a release whose manifest declares an SBOM or a signed
+attestation that is not there. `--verify-signature` additionally runs `gh attestation verify`
+against the published Sigstore bundle (no GitHub credential needed); without it the printed line
+says the signature was NOT checked rather than implying it was. `--allow-unattested` installs a
+release whose attestation bundle is missing, and says so.
+
 /update IS A PRIVILEGED ENDPOINT. The firmware endpoint-auth change made /update, /reboot, /format
 and /gate require `X-Hear-Auth: <HEAR_ADMIN_TOKEN>`. This script is the only OTA client there is,
 so it sends the token (from ~/.hear_push, never a tracked file). A release-mode flash is refused
@@ -234,12 +241,28 @@ def resolve_board_class(requested, live_status=None, require_live=False):
         raise
 
 
-def release_image(tag, board_class, psram_mode=None, repo=REPO_SLUG):
-    """Download the board-class/PSRAM app image, refuse it unless release metadata vouches for it."""
+def release_image(tag, board_class, psram_mode=None, repo=REPO_SLUG, allow_unattested=False,
+                  verify_signature=False):
+    """Download the board-class/PSRAM app image, refuse it unless release metadata vouches for it.
+
+    Three checks, in this order, and any one of them refuses before a byte is written to the node:
+
+      1. The tag is not revoked (release_revocations.json in THIS checkout -- an installer that
+         has not pulled gets the stale answer, which is why a rollout starts with a pull).
+      2. The manifest's hash for this exact asset matches what was downloaded, and the release
+         does not claim to carry compiled-in credentials.
+      3. The SBOM and the signed attestation the manifest declares exist and cover this asset.
+         The signature itself is checked only with --verify-signature, which needs `gh`; without
+         it the printed line says so rather than implying a signature was checked.
+    """
     import enroll
     base = "https://github.com/%s/releases/download/%s/" % (repo, tag)
     psram_mode = board_profiles.require_psram_mode(psram_mode or board_profiles.psram_mode(board_class))
     name = board_profiles.release_asset_name(tag, board_class, "app", psram_mode)
+    revoked = release_manifest.revocation_refusal(tag)
+    if revoked:
+        die("%s. Nothing was downloaded." % revoked)
+    bundle = None
     try:
         manifest_text = None
         try:
@@ -248,12 +271,18 @@ def release_image(tag, board_class, psram_mode=None, repo=REPO_SLUG):
             pass
         data = enroll.fetch(base + name)
         if manifest_text is not None:
+            manifest = json.loads(manifest_text)
+            sbom, bundle = release_manifest.fetch_provenance_assets(
+                enroll.fetch, base, manifest, allow_unattested=allow_unattested)
+            # The TEXT, not the parsed dict: the attestation's subject digest for
+            # release-manifest.json is over the bytes that were downloaded.
             release_manifest.verify_downloaded_release_assets(
-                manifest_text, tag, board_class, {name: data}, psram_mode=psram_mode)
+                manifest_text, tag, board_class, {name: data}, psram_mode=psram_mode,
+                sbom_source=sbom, attestation_bundle=bundle)
         else:
             sums = enroll.fetch(base + "SHA256SUMS").decode()
             enroll.check_sums(sums, name, data)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, json.JSONDecodeError) as e:
         die("release %s: %s" % (tag, e))
     variant = board_profiles.build_variant(board_class) if psram_mode == board_profiles.psram_mode(board_class) \
         else board_class + board_profiles.PSRAM_MODES[psram_mode]["variant_suffix"]
@@ -262,9 +291,21 @@ def release_image(tag, board_class, psram_mode=None, repo=REPO_SLUG):
     path = os.path.join(d, name)
     with open(path, "wb") as f:
         f.write(data)
-    stamp = release_manifest.MANIFEST_NAME if manifest_text is not None else "SHA256SUMS"
+    signature_verified = False
+    if bundle is not None and verify_signature:
+        bundle_path = os.path.join(d, release_manifest.ATTESTATION_BUNDLE_NAME)
+        with open(bundle_path, "wb") as f:
+            f.write(bundle)
+        try:
+            release_manifest.verify_attestation_signature(bundle_path, path, repository=repo)
+            signature_verified = True
+        except (ValueError, RuntimeError) as e:
+            die("release %s: %s" % (tag, e))
     if manifest_text is None:
-        stamp += " (legacy release)"
+        stamp = "SHA256SUMS (legacy release)"
+    else:
+        stamp = release_manifest.describe_verification(
+            json.loads(manifest_text), bundle is not None, signature_verified)
     print("flash: %s verified against %s (%d B)" % (name, stamp, len(data)))
     return path
 
@@ -284,6 +325,9 @@ def main(argv):
             die("--class needs a board class")
         board_class = argv[i + 1].strip()
         argv = argv[:i] + argv[i + 2:]
+    # Provenance switches. Flags, not values, so nothing here can land in shell history or `ps`.
+    allow_unattested = "--allow-unattested" in argv
+    verify_signature = "--verify-signature" in argv
     pos = [a for a in argv[1:] if not a.startswith("--")]
     if len(pos) < 2:
         print(__doc__.strip())
@@ -312,7 +356,9 @@ def main(argv):
         why = board_profiles.release_variant_refusal(board_class, node, mode)
         if why:
             die("refusing to install %s on %s: %s" % (release, target, why))
-        bin_path = release_image(release, board_class, mode)
+        bin_path = release_image(release, board_class, mode,
+                                 allow_unattested=allow_unattested,
+                                 verify_signature=verify_signature)
     else:
         # 1. identity, for THIS node, immediately before the build that carries it
         if not is_serial:
