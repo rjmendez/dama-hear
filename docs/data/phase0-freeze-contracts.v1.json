@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "4512afabcda387850c15407bf969442f3b6c432d52f1422ca8fbd1874f498cfa",
+  "baseline_hash": "84d88e9886b4b20dc29d5b001b97fe4a046ce157dfe995214ee9909c5a53c95b",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -251,7 +251,7 @@
     ],
     "default_board_class": "xiao-s3-pps",
     "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
-    "section_hash": "b0673c032f2405f723e9f0ed56b4eb65daedae48df7d86b925f693a1b82fd525",
+    "section_hash": "b72b7caf411ab1fd4ce6b3d7dbf4d2739ab557d8b070f7be82732cd573191714",
     "source_files": [
       {
         "path": ".github/workflows/firmware.yml",
@@ -280,13 +280,13 @@
       },
       {
         "path": "firmware/hear_node/gen_secrets.py",
-        "sha256": "c8e439cfdddffc2da7032710f9feb30f5fba55b48d2dc6bb8ff20fabfaaa5c12",
-        "size_bytes": 5502
+        "sha256": "5f0e84ce51d9c192e68991ecae591d21bd465ac3a94d57cf03ea451f9f23afb3",
+        "size_bytes": 5882
       },
       {
         "path": "firmware/hear_node/hear_node.ino",
-        "sha256": "03300ab8df946fd576178308cb1f26f71623b3ef538e34846673f2e529f0a037",
-        "size_bytes": 310347
+        "sha256": "7f4a0b57eeaa50eebd39d33c91e110a69352303ed4236b55add58fa2fd723cc3",
+        "size_bytes": 317560
       },
       {
         "path": "firmware/hear_node/hear_push_payload.h",
@@ -442,8 +442,8 @@
       },
       {
         "path": "deploy/k8s/hear-mqtt-bridge.yaml",
-        "sha256": "5370f68c3933e90a9d8f2422667f1e4711356a859bb28c81445a077c5376391a",
-        "size_bytes": 3235
+        "sha256": "3134036c192d570bdae35260ccc051f4116a2e843d8b9b0ada129c8921431c3b",
+        "size_bytes": 4352
       },
       {
         "path": "deploy/k8s/hear-score.yaml",
@@ -1216,6 +1216,26 @@
                 "optional": true,
                 "secret_key": "REDIS_PASS",
                 "secret_name": "dama-redis-secret"
+              },
+              {
+                "binding": "literal",
+                "name": "MQTT_CA_CERTS"
+              },
+              {
+                "binding": "literal",
+                "name": "MQTT_CERTFILE"
+              },
+              {
+                "binding": "literal",
+                "name": "MQTT_KEYFILE"
+              },
+              {
+                "binding": "literal",
+                "name": "MQTT_TLS_INSECURE"
+              },
+              {
+                "binding": "literal",
+                "name": "MQTT_TLS_VERSION"
               }
             ],
             "image": "python:3.13-slim",
@@ -1243,6 +1263,12 @@
                 "mount_path": "/state",
                 "sub_path": null,
                 "volume_name": "state"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/tls",
+                "sub_path": null,
+                "volume_name": "tls"
               }
             ],
             "name": "bridge"
@@ -2082,7 +2108,7 @@
         "storage_request": "5Gi"
       }
     ],
-    "section_hash": "24a0c203649aa2c0885434f458ed909b6531487afe9b7c60a97244033b356725"
+    "section_hash": "bfd85fdf63dd8419d1d4c306688a3edbf2b47a5535222f6b0516e2aa1a3d5736"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",
