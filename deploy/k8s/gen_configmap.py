@@ -220,10 +220,11 @@ EMBEDDED_BUNDLES = {
 #: kind of bundle where a stale ConfigMap is a live incident and not just a next-deploy problem.
 #:
 #: ⚠️subPath CONFIGMAP MOUNTS DO NOT LIVE-UPDATE, AND THIS CONFIGMAP IS SUBPATH-MOUNTED. Every
-#: hear-mqtt-bridge.yaml volumeMount below uses `subPath:`, which kubelet's ConfigMap sync
-#: deliberately does not touch after the pod starts (that is upstream's documented behaviour,
-#: not a bug here) -- so re-running this generator and `kubectl apply`-ing only the ConfigMap
-#: changes what the NEXT pod runs and leaves the CURRENT one on the old code indefinitely.
+#: hear-mqtt-bridge.yaml, hear-heartbeat.yaml and hear-annotate.yaml volumeMount below uses
+#: `subPath:`, which kubelet's ConfigMap sync deliberately does not touch after the pod starts
+#: (that is upstream's documented behaviour, not a bug here) -- so re-running this generator and
+#: `kubectl apply`-ing only the ConfigMap changes what the NEXT pod runs and leaves the CURRENT
+#: one on the old code indefinitely.
 #: Measured: mach's hear/event rows kept failing "time must be an object" for two hours after
 #: #203 (ffd2054) was merged and its ConfigMap applied, because the running bridge pod predated
 #: both and nothing forced it to restart; the fix had shipped and was invisible from the cluster.
@@ -232,6 +233,8 @@ EMBEDDED_BUNDLES = {
 #: operator must still run -- this script does not touch the cluster) always rolls the pod, the
 #: same way EMBEDDED_BUNDLES keeps a ConfigMap from drifting from the checkout that ships it.
 DEPLOYMENT_CHECKSUM_TARGETS = {
+    "hear-annotate-code": "deploy/k8s/hear-annotate.yaml",
+    "hear-heartbeat-code": "deploy/k8s/hear-heartbeat.yaml",
     "hear-mqtt-bridge-code": "deploy/k8s/hear-mqtt-bridge.yaml",
 }
 
@@ -686,6 +689,17 @@ def main(argv=None):
     generated |= set(DEPLOYMENT_CHECKSUM_TARGETS.values())
     dirty = [ln for ln in porcelain if ln[3:].strip().strip('"') not in generated]
     stamp = sha + ("-dirty" if dirty else "")
+    if name in DEPLOYMENT_CHECKSUM_TARGETS:
+        # ⚠️THE DIGEST, NOT THE STAMP. `stamp` carries the commit (and "-dirty"), which is
+        # provenance about *this generation*; the Deployment must instead change exactly when
+        # the bundle's SOURCE changes, the same signal source_digest() already gives the
+        # ConfigMap's own dama-hear/source-sha256 annotation, so a clean re-run of this
+        # generator against unchanged sources never dirties the Deployment file either.
+        changed = sync_deployment_checksum(name, source_digest(code, data))
+        if changed:
+            sys.stderr.write(
+                "%s: checksum synced into %s (forces a pod restart on next apply)\n"
+                % (name, DEPLOYMENT_CHECKSUM_TARGETS[name]))
     if embedded:
         # ⚠️WRITTEN IN PLACE, NEVER PRINTED. The documented command for a standalone bundle
         # redirects stdout into the file it generates; doing that with a manifest that carries a
@@ -706,17 +720,6 @@ def main(argv=None):
             "%s: regenerated in place inside %s from %s\n  kubectl apply -f %s\n"
             % (name, manifest, ", ".join(rel for _k, rel in code + data), manifest))
         return
-    if name in DEPLOYMENT_CHECKSUM_TARGETS:
-        # ⚠️THE DIGEST, NOT THE STAMP. `stamp` carries the commit (and "-dirty"), which is
-        # provenance about *this generation*; the Deployment must instead change exactly when
-        # the bundle's SOURCE changes, the same signal source_digest() already gives the
-        # ConfigMap's own dama-hear/source-sha256 annotation, so a clean re-run of this
-        # generator against unchanged sources never dirties the Deployment file either.
-        changed = sync_deployment_checksum(name, source_digest(code, data))
-        if changed:
-            sys.stderr.write(
-                "%s: checksum synced into %s (forces a pod restart on next apply)\n"
-                % (name, DEPLOYMENT_CHECKSUM_TARGETS[name]))
     text = render(name, app, code, data, stamp)
     mode, n_bytes, n_ann = apply_mode(code, data, name=name, sha=stamp, app=app)
     # stderr, because stdout is redirected into the .yaml by the documented command and an

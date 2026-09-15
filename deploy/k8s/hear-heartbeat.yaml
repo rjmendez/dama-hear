@@ -38,6 +38,11 @@ spec:
     metadata:
       labels:
         app: hear-heartbeat
+      annotations:
+        # Forces a new ReplicaSet (Recreate: a full pod restart) whenever
+        # hear-heartbeat-code.yaml's content changes. The code file below is mounted
+        # with subPath, which kubelet's ConfigMap sync does not live-update.
+        checksum/hear-heartbeat-code: '2a7e1811cdeb995d28a888b48af9eba5739535766b28c4a3b9f0c05f91a0d03e'
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet

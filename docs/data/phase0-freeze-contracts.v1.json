@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "2ac4a59129e6b5641bcc45dd362f97fd8d6dac5809459578fcf4620a75bd5f16",
+  "baseline_hash": "fa52919a5aa7f94d8fb484c0539f24a9d4bbd42b6d5e24e76eaec0e670b64438",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -453,8 +453,8 @@
     "manifest_files": [
       {
         "path": "deploy/k8s/hear-annotate.yaml",
-        "sha256": "7df467571e4e8b8da1942b41875ea7e30bc4859d24a5d975183576af2fa86314",
-        "size_bytes": 40634
+        "sha256": "43537c445a510b443e4d28e1c0bb592347c58da5713f38bba1c8b4a4c74e118e",
+        "size_bytes": 40926
       },
       {
         "path": "deploy/k8s/hear-birdnet.yaml",
@@ -473,8 +473,8 @@
       },
       {
         "path": "deploy/k8s/hear-heartbeat.yaml",
-        "sha256": "2fe073497c87d1b0de637a5adba377f84cf1b18cf6a3cb2d0c47bec4016dd3e8",
-        "size_bytes": 3663
+        "sha256": "c4cb18d1a5a9a72637b88611ddd2909f93c635b4de54194c7f02fafd378f2d9e",
+        "size_bytes": 4023
       },
       {
         "path": "deploy/k8s/hear-mqtt-bridge.yaml",
@@ -2379,7 +2379,7 @@
         "storage_request": "20Gi"
       }
     ],
-    "section_hash": "613744cc665480f871a325046b8bb13201782fef779b1172867ae8f32959fa74"
+    "section_hash": "b8eede03c445ea4ebce1e027b16012ef5208ca5135faaf54ad5054b02c38cee4"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",
