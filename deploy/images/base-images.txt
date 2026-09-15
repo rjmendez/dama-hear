@@ -1,0 +1,22 @@
+# Upstream base images, pinned by digest.
+#
+# ⚠️A TAG IS NOT A PIN. `python:3.13-slim` is republished, so two builds a week apart are two
+# different images and nothing in the repo records which one a pod ran. Every FROM in
+# deploy/images/Dockerfile.* resolves through this file, and tests/test_image_pins.py fails if a
+# Dockerfile names an image that is not listed here, or lists a digest that disagrees.
+#
+# ⚠️IT ALSO COVERS deploy/k8s. Every `image:` in a deploy/k8s manifest must appear here, so the
+# tag the cluster still runs and the tag the images are built from cannot drift apart while the
+# ConfigMap workloads are being migrated. The manifests keep naming tags (they resolve at pull
+# time, per node); this file is what says which digest that tag meant when it was last checked.
+#
+# Refresh one line (no docker pull, registry HEAD only):
+#
+#     python3 deploy/images/gen_pip_lock.py --print-digest python 3.13-slim
+#
+# and re-run the locks for every variant whose base moved: a base bump is a dependency
+# resolution, not a cosmetic edit.
+#
+# name                    tag             digest
+python                    3.13-slim       sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285
+tensorflow/tensorflow     2.20.0-gpu      sha256:ef97f51a830268acdffe8829a348c6d283702df7f30b117d3ed2e72129c28946

@@ -1,0 +1,182 @@
+name: images
+
+# The base images the workers will run on: deploy/images/. This builds them, proves the lock
+# files still describe them, scans them, and publishes them with an SBOM and provenance.
+#
+# ⚠️A PULL REQUEST BUILDS AND DOES NOT PUSH. Nothing reaches a registry from a branch, so a fork
+# cannot publish an image; the scan still runs against the image that was just built, which is
+# what a review needs. Publishing happens on main, where the digest a manifest will reference is
+# what gets recorded.
+#
+# ⚠️ONE JOB, THREE BUILDS, IN ORDER. ml-cpu is built FROM numeric, which is built FROM runtime,
+# and each child is handed the exact parent the previous step produced -- a matrix would put the
+# three on three runners and the chain would have to go through a registry to exist at all.
+#
+# ⚠️ml-gpu IS NOT BUILT HERE. Its base is a multi-gigabyte CUDA image and the hosted runner has
+# neither the disk budget nor a GPU to verify it on. Its lock is still checked below, which is
+# the part that drifts silently; building and publishing it is a site job. See
+# deploy/images/README.md.
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  REGISTRY: ghcr.io
+  NAMESPACE: ${{ github.repository_owner }}/dama-hear
+
+jobs:
+  locks-are-current:
+    name: lock files still describe their bases
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # The half that needs neither docker nor the network. It runs in the pytest job too; it is
+      # repeated here so a failure of the regeneration below reads as "the resolution moved"
+      # rather than "somebody edited a pin and did not regenerate".
+      - name: headers match their inputs
+        run: python3 deploy/images/gen_pip_lock.py --check
+
+      - name: regenerate every CPU lock inside its pinned base
+        run: |
+          for v in numeric ml-cpu; do
+            python3 deploy/images/gen_pip_lock.py "$v" > "requirements/lock/$v.txt"
+          done
+
+      - name: nothing changed
+        run: |
+          if ! git diff --quiet; then
+            git diff -- requirements/lock
+            echo "::error::a lock file differs from what its base image resolves today; rerun deploy/images/gen_pip_lock.py and commit"
+            exit 1
+          fi
+
+  build:
+    name: build the CPU base chain
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4.4.0
+
+      - uses: docker/login-action@v4.6.0
+        if: inputs.publish
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: docker/build-push-action@v7.4.0
+        id: runtime
+        with:
+          context: .
+          file: deploy/images/Dockerfile.runtime
+          # The tag is the commit. There is no `latest`: a manifest references a digest.
+          tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/base-runtime:${{ github.sha }}
+          load: ${{ !inputs.publish }}
+          push: ${{ inputs.publish }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=base-runtime
+          cache-to: type=gha,mode=max,scope=base-runtime
+
+      # A published child records the digest of the parent it was actually built on; a local
+      # build has no digest to record yet, so it names the tag that is loaded in the daemon.
+      - name: runtime parent ref
+        id: runtime_ref
+        run: |
+          base="$REGISTRY/$NAMESPACE"
+          if [ "${{ inputs.publish }}" = "true" ]; then
+            echo "ref=$base/base-runtime@${{ steps.runtime.outputs.digest }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=$base/base-runtime:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/build-push-action@v7.4.0
+        id: numeric
+        with:
+          context: .
+          file: deploy/images/Dockerfile.numeric
+          build-args: RUNTIME_IMAGE=${{ steps.runtime_ref.outputs.ref }}
+          tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/base-numeric:${{ github.sha }}
+          load: ${{ !inputs.publish }}
+          push: ${{ inputs.publish }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=base-numeric
+          cache-to: type=gha,mode=max,scope=base-numeric
+
+      - name: numeric parent ref
+        id: numeric_ref
+        run: |
+          base="$REGISTRY/$NAMESPACE"
+          if [ "${{ inputs.publish }}" = "true" ]; then
+            echo "ref=$base/base-numeric@${{ steps.numeric.outputs.digest }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=$base/base-numeric:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/build-push-action@v7.4.0
+        id: ml_cpu
+        with:
+          context: .
+          file: deploy/images/Dockerfile.ml-cpu
+          build-args: NUMERIC_IMAGE=${{ steps.numeric_ref.outputs.ref }}
+          tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/base-ml-cpu:${{ github.sha }}
+          load: ${{ !inputs.publish }}
+          push: ${{ inputs.publish }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=base-ml-cpu
+          cache-to: type=gha,mode=max,scope=base-ml-cpu
+
+      # The interpreter and the pinned versions, read out of the image that was just built
+      # rather than out of the file that asked for them. Only on the non-publishing path,
+      # where the image is loaded into the local daemon.
+      - name: what the image actually contains
+        if: ${{ !inputs.publish }}
+        run: |
+          docker run --rm "$REGISTRY/$NAMESPACE/base-ml-cpu:${{ github.sha }}" python -c '
+          import sys, numpy, scipy, onnxruntime, ai_edge_litert
+          print("python", sys.version.split()[0])
+          print("numpy", numpy.__version__, "scipy", scipy.__version__,
+                "onnxruntime", onnxruntime.__version__)'
+
+      - name: digests
+        run: |
+          {
+            echo "| image | digest |"
+            echo "|---|---|"
+            echo "| base-runtime | \`${{ steps.runtime.outputs.digest }}\` |"
+            echo "| base-numeric | \`${{ steps.numeric.outputs.digest }}\` |"
+            echo "| base-ml-cpu  | \`${{ steps.ml_cpu.outputs.digest }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ⚠️A SCAN THAT NEVER FAILS IS A BADGE. This exits non-zero on a fixable HIGH/CRITICAL;
+      # unfixable findings are reported by Trivy and not gated on, because a base image cannot be
+      # patched for a CVE upstream has not fixed.
+      - name: scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/base-ml-cpu:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table

@@ -1,0 +1,44 @@
+# hear-ml-gpu -- the hear-embed / perch_v2 lane: vendored TensorFlow, plus the matched CUDA set.
+#
+# ⚠️ITS BASE IS NOT hear-runtime. TensorFlow's GPU image carries a CUDA userspace that
+# python:3.13-slim does not, and rebuilding that stack here would be maintaining a CUDA
+# distribution as a side effect of an acoustics repo. The cost is that this variant does NOT get
+# the runtime layer's non-root uid or its thread caps, so it restates both.
+#
+# ⚠️ITS PYTHON IS NOT 3.13. tensorflow/tensorflow:2.20.0-gpu ships its own interpreter; that is
+# why requirements/lock/ml-gpu.txt is resolved inside this image and is not interchangeable with
+# the other locks.
+FROM tensorflow/tensorflow@sha256:ef97f51a830268acdffe8829a348c6d283702df7f30b117d3ed2e72129c28946
+LABEL org.opencontainers.image.base.name="docker.io/tensorflow/tensorflow:2.20.0-gpu"
+LABEL org.opencontainers.image.base.digest="sha256:ef97f51a830268acdffe8829a348c6d283702df7f30b117d3ed2e72129c28946"
+LABEL org.opencontainers.image.source="https://github.com/rjmendez/dama-hear"
+LABEL org.opencontainers.image.title="hear-ml-gpu"
+LABEL org.opencontainers.image.description="TensorFlow 2.20.0 GPU + the pinned CUDA 12.9 / cuDNN 9.26 wheels, from requirements/lock/ml-gpu.txt."
+LABEL org.opencontainers.image.licenses="MIT"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ONLY_BINARY=:all: \
+    PYTHONPATH=/app \
+    TF_FORCE_GPU_ALLOW_GROWTH=true \
+    TF_CPP_MIN_LOG_LEVEL=1
+
+COPY requirements/lock/ml-gpu.txt /etc/hear/lock/ml-gpu.txt
+# --no-deps is what the live manifest already does, and here it is enforced by the lock rather
+# than by a flag someone can drop: these twelve wheels are a matched set.
+RUN set -eux; \
+    pip install --no-cache-dir --require-hashes --no-deps -r /etc/hear/lock/ml-gpu.txt; \
+    groupadd --gid 65532 hear; \
+    useradd --uid 65532 --gid 65532 --home-dir /app --no-create-home --shell /usr/sbin/nologin hear; \
+    mkdir -p /app; \
+    chown 65532:65532 /app
+
+# The lane's LD_LIBRARY_PATH is assembled in the manifest today from directories that may not
+# exist. In the image the wheels are installed at build time, so the path is known and fixed --
+# and if a CUDA directory is missing the build fails, not the 03:00 CronJob.
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cublas/lib:/usr/local/lib/python3.12/dist-packages/nvidia/cuda_cupti/lib:/usr/local/lib/python3.12/dist-packages/nvidia/cuda_nvcc/lib:/usr/local/lib/python3.12/dist-packages/nvidia/cuda_nvrtc/lib:/usr/local/lib/python3.12/dist-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/lib:/usr/local/lib/python3.12/dist-packages/nvidia/cufft/lib:/usr/local/lib/python3.12/dist-packages/nvidia/curand/lib:/usr/local/lib/python3.12/dist-packages/nvidia/cusolver/lib:/usr/local/lib/python3.12/dist-packages/nvidia/cusparse/lib:/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/lib/python3.12/dist-packages/nvidia/nvjitlink/lib
+
+WORKDIR /app
+USER 65532:65532
