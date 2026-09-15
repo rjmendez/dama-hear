@@ -133,7 +133,7 @@ the constraint.
 |---|---|
 | `200` | Frame admitted. **Per-item outcomes are in the receipt, including refusals.** A refused item is not an HTTP error: it is a durable, attributable result. |
 | `400` | Undecodable body, `not_an_object`, malformed frame fields. |
-| `401` | Missing/invalid/expired credential. |
+| `401` | Missing/invalid/expired credential, or no credential identity resolved (`credential_missing`). The route is never served open. |
 | `403` | Valid credential lacking `ingest:write`, or authorized for a different site. |
 | `409` | `Idempotency-Key` reused with a different body fingerprint. |
 | `413` | Body over `max_batch_bytes`, rejected before decoding. |
@@ -152,22 +152,32 @@ response, not an accounting entry.
    shared fleet token. Today's receiver treats `HEAR_AUTH_TOKEN` as optional and disables
    auth when unset; on `/v1/ingest/batches` auth is **mandatory**, and a build that cannot
    load a credential store refuses to serve the route rather than serving it open.
-2. **Identity comes from the credential.** `site_id` is derived from the credential and
-   never read from the body (ADR 0001 field note, `api-boundaries.md` rule). `device_id` in
-   the frame is cross-checked against the credential; a mismatch is `422`
+2. **Identity comes from the credential, at both layers.** `site_id` is derived from the
+   credential and never read from the body (ADR 0001 field note, `api-boundaries.md` rule).
+   `device_id` in the **frame** is cross-checked against the credential; a mismatch is `422`
    `device_identity_mismatch` — refused, not silently corrected — mirroring the MQTT bridge's
-   topic/body cross-check.
-3. **Scope.** Device credentials carry `ingest:write` only. They are not usable on query,
+   topic/body cross-check. Each **item** is checked too, and that check is the one that
+   matters: `device_id` is an input to the closed identity tuple, so an authenticated node
+   smuggling an item attributed to a neighbour would mint a durable, dispatchable event for a
+   node that never sent it — and, because dedup is by `event_id`, could collide with that
+   node's real events. A device-scoped credential pins every item's `device_id`
+   (`item_identity_mismatch`); a site-scoped gateway credential pins `site_id`
+   (`item_site_mismatch`) and may submit for many devices.
+3. **No credential means refusal, never a free pass.** A missing credential identity is
+   `credential_missing`, not "skip the check". The reader takes the credential as a required
+   argument so an auth layer that failed open cannot be mistaken for one that authorized the
+   caller.
+4. **Scope.** Device credentials carry `ingest:write` only. They are not usable on query,
    export or configuration routes.
-4. **Gateway submissions.** When a drain/import adapter submits on a node's behalf it
+5. **Gateway submissions.** When a drain/import adapter submits on a node's behalf it
    presents its own service credential, sets `adapter` in the frame, and is authorized for
    the site rather than for a single device. Its submissions are attributable to the adapter,
    not laundered into looking like device-originated traffic.
-5. **Rotation without reflash.** Credentials are overlapping-window: a new credential is
+6. **Rotation without reflash.** Credentials are overlapping-window: a new credential is
    valid before the old one is revoked, so rotation never requires a firmware reflash. This
    is a hard requirement from `standalone-migration.md` ("never require a firmware reflash to
    rotate server credentials or migrate storage").
-6. **No credential material in logs, receipts, events or metrics labels.**
+7. **No credential material in logs, receipts, events or metrics labels.**
 
 ## 5. Batch sizing, framing and limits
 
@@ -191,6 +201,15 @@ Framing rules:
 - The frame reader classifies each item shallowly — `canonical`, `translation_required`,
   `unrecognized` — and never interprets a legacy body itself. Translation is the adapter's
   attributable act (`adapter.name`/`adapter.version` on the resulting envelope).
+- A `translation_required` item has **no receipt-ready outcome**. The adapter translates it
+  and resolves it to a real status; a receipt may not be issued while any item is still
+  untranslated (`build_receipt` raises). Reporting an untranslated item as `deferred` would
+  tell the producer to resend a body that will be classified identically every time — an
+  infinite loop over a legacy node's entire backlog. A translation that cannot succeed
+  resolves to `refused` with a reason, which is durable and therefore acknowledged.
+- A body that cannot be decoded safely — invalid UTF-8, `NaN`/`Infinity` literals the
+  canonical form cannot represent, or nesting deep enough to exhaust the JSON decoder — is a
+  `400` refusal with a durable record, never an unhandled crash with no accounting entry.
 
 ## 6. Acknowledgement, idempotency, replay and ordering
 
@@ -333,7 +352,8 @@ that.
    (`batch.batch_refusal_record`, `envelope.refusal_record`).
 3. Refusal reasons are stable machine codes, never prose: `batch_schema_version_unsupported`,
    `batch_empty`, `batch_too_many_items`, `batch_id_invalid`, `device_identity_mismatch`,
-   `item_unrecognized`, `item_too_large`, `item_not_canonicalizable`, plus the item-level
+   `credential_missing`, `item_unrecognized`, `item_too_large`, `item_not_canonicalizable`,
+   `item_identity_mismatch`, `item_site_mismatch`, plus the item-level
    codes from ADR 0001 (`schema_version_unsupported`, `field_missing`, `type_invalid`,
    `value_out_of_range`, `timestamp_not_rfc3339_utc`, `clock_valid_without_observed_at`).
 4. Refusals are visible three ways: in the receipt (immediately, to the producer), as a

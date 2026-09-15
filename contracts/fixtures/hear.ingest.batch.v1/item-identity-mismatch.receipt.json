@@ -1,33 +1,35 @@
 {
   "batch_schema_version": 1,
-  "batch_id": "018f2c1a-batch-legacy-1",
+  "batch_id": "018f2c1a-batch-forged-1",
   "received_at": "2026-09-14T18:03:12.100000Z",
-  "ack_through_index": -1,
+  "ack_through_index": 1,
   "counts": {
     "submitted": 2,
-    "accepted": 0,
+    "accepted": 1,
     "duplicate": 0,
-    "refused": 0,
-    "deferred": 2
+    "refused": 1,
+    "deferred": 0
   },
   "results": [
     {
       "index": 0,
-      "status": "deferred",
-      "event_id": null,
-      "dispatchable": false,
+      "status": "accepted",
+      "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+      "dispatchable": true,
       "reasons": [],
       "raw_ref": null,
-      "classification": "translation_required"
+      "classification": "canonical"
     },
     {
       "index": 1,
-      "status": "deferred",
+      "status": "refused",
       "event_id": null,
       "dispatchable": false,
-      "reasons": [],
+      "reasons": [
+        "item_identity_mismatch"
+      ],
       "raw_ref": null,
-      "classification": "translation_required"
+      "classification": "canonical"
     }
   ],
   "retry_after_s": null,

@@ -74,7 +74,20 @@ tell a producer which items are safe to forget.
    handed to the edge adapter, not refused. Every node in the fleet emits that shape today;
    a frame reader that refused it would make the batch path useless until a full reflash,
    which inverts the required ordering ("a new server release must read old nodes before any
-   firmware rollout").
+   firmware rollout"). Because `translation_required` is a classification and not an outcome,
+   **no receipt may be issued while an item is still untranslated**: an untranslated item
+   reported as `deferred` would be reclassified identically on every retry, which is the
+   infinite loop rule 4 exists to prevent. A translation that cannot succeed resolves to
+   `refused` with a reason — durable, and therefore acknowledged.
+
+6a. **Item identity is bound to the credential, not just the frame's.** `device_id` is an
+   identity input, so an authenticated node smuggling an item attributed to a neighbour would
+   mint a durable, dispatchable event for a node that never sent it, and could collide with
+   that node's real events. A device-scoped credential pins every item's `device_id`; a
+   site-scoped gateway credential pins `site_id` instead, because a drain/import adapter
+   legitimately submits for many devices. A missing credential is a refusal, never a skipped
+   check: a reader that treated "no credential" as "no constraint" would trust the body's own
+   claim about who sent it.
 
 7. **The first client is the server-side edge adapter, not the firmware.** Batching pays off
    where a durable spool already exists — `hear_drain.py` replaying an SD backlog and the

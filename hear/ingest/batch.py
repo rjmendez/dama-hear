@@ -55,7 +55,7 @@ RECEIPT_MEDIA_TYPE = "application/vnd.dama.hear.ingest.batch-receipt.v1+json"
 # are deliberately small enough that a full batch fits in one TLS record stream without the
 # node fragmenting its spool, and they are server-enforced so a client bug cannot widen them.
 MAX_ITEMS_PER_BATCH = 64
-MAX_BATCH_BYTES = 262_144      # 256 KiB, decoded
+MAX_BATCH_BYTES = 262_144      # 256 KiB, enforced against raw wire bytes before decoding
 MAX_ITEM_BYTES = 65_536        # 64 KiB, canonical form of one item
 MAX_CLOCK_SKEW_S = 900         # frame `sent_at` sanity bound, not an item time source
 
@@ -64,9 +64,14 @@ ITEM_STATUSES: Tuple[str, ...] = ("accepted", "duplicate", "refused", "deferred"
 status that does not carry a durable server-side record."""
 
 TRANSLATION_REQUIRED = "translation_required"
-"""Classification, not a status: a recognizable legacy telemetry body that this contract
-deliberately does not judge. The edge adapter translates it into `hear.ingest.v1` and the
-translated envelope is what receives an item status."""
+"""Classification, not an outcome: a recognizable legacy telemetry body that this contract
+deliberately does not judge. The edge adapter translates it into `hear.ingest.v1` and calls
+`resolve_translation()` to give it a real status. `build_receipt()` refuses to issue a
+receipt while any item still carries this classification, because a receipt that reported an
+untranslated item as `deferred` would tell a producer to resend a body forever."""
+
+TRANSLATED = "translated"
+"""Classification of an item that arrived legacy and was translated by the adapter."""
 
 _BATCH_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 _RFC3339_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$")
@@ -254,11 +259,18 @@ def classify_item(item: Any) -> str:
     return "unrecognized"
 
 
-def _item_bytes(item: Any) -> int:
+def _item_bytes(item: Any) -> Optional[int]:
+    """Canonical size of one item, or None when it has no canonical form at all.
+
+    The two are different failures and must not share a reason code: an operator who sees
+    `item_too_large` tunes a limit, while `item_not_canonicalizable` means a payload carries
+    something the canonical form cannot represent (a non-finite number), which no limit will
+    fix. Conflating them would send the operator to the wrong defect.
+    """
     try:
         return len(EV.canonical_bytes(item))
     except EV.EnvelopeError:
-        return MAX_ITEM_BYTES + 1
+        return None
 
 
 # --- frame validation --------------------------------------------------------------------
@@ -311,14 +323,21 @@ def _check_fields(spec: Iterable[Field], obj: Mapping[str, Any], prefix: str,
             warnings.append({"reason": "unknown_field", "path": prefix + name})
 
 
-def validate_batch(frame: Any, *, credential_device_id: Optional[str] = None,
+def validate_batch(frame: Any, *, credential_device_id: Optional[str],
+                   credential_site_id: Optional[str] = None,
+                   site_scoped: bool = False,
                    validate_items: bool = True) -> BatchValidationResult:
-    """Validate one decoded batch frame and classify its items.
+    """Validate one decoded batch frame and classify its items against a credential.
 
     Frame refusal and item refusal are separate on purpose. A frame error (unsupported
     frame major, oversized body, device/credential mismatch) refuses the whole request and
     the producer retries it unchanged. An item error refuses exactly one item, which is
     durably recorded and never resent, so a single poisoned row cannot wedge a backlog.
+
+    The credential is a REQUIRED argument, not an optional one. Auth on this route is
+    mandatory, so a caller whose auth layer returned nothing must get a refusal rather than
+    an accepted frame carrying a body-supplied identity. Pass `site_scoped=True` with a
+    `credential_site_id` for a gateway/import adapter submitting for many devices.
 
     `validate_items=False` is for a reader that only needs to admit the frame before
     streaming items to a translator; it never widens what is accepted.
@@ -352,6 +371,14 @@ def validate_batch(frame: Any, *, credential_device_id: Optional[str] = None,
         errors.append({"reason": "timestamp_not_rfc3339_utc", "path": "sent_at",
                        "got": sent_at})
 
+    if site_scoped:
+        if not credential_site_id:
+            errors.append({"reason": "credential_missing", "path": "site_id"})
+    elif credential_device_id is None:
+        # No identity to bind to. Accepting the frame would mean trusting the body's own
+        # claim about who sent it, which is the one thing this check exists to prevent.
+        errors.append({"reason": "credential_missing", "path": "device_id"})
+
     device_id = frame.get("device_id")
     if credential_device_id is not None and isinstance(device_id, str) \
             and device_id != credential_device_id:
@@ -370,18 +397,30 @@ def validate_batch(frame: Any, *, credential_device_id: Optional[str] = None,
             errors.append({"reason": "batch_too_many_items", "path": "messages",
                            "limit": MAX_ITEMS_PER_BATCH, "got": len(messages)})
         if validate_items and not errors:
-            items = classify_and_validate_items(messages)
+            items = classify_and_validate_items(
+                messages, credential_device_id=credential_device_id,
+                credential_site_id=credential_site_id, site_scoped=site_scoped)
 
     return BatchValidationResult(frame, errors, warnings, items)
 
 
-def classify_and_validate_items(messages: Sequence[Any]) -> List[ItemResult]:
+def classify_and_validate_items(messages: Sequence[Any], *,
+                                credential_device_id: Optional[str] = None,
+                                credential_site_id: Optional[str] = None,
+                                site_scoped: bool = False) -> List[ItemResult]:
     """Per-item outcomes for an admitted frame.
 
     Duplicate detection is not decidable here: it needs the durable store. This returns
     `accepted` for an item that is valid in isolation, and the persisting reader downgrades
     it to `duplicate` when `event_id` is already durable. That downgrade is the whole
     replay story, and it is identity-based, so it survives reordering and re-batching.
+
+    Item identity is bound to the credential, not only the frame. `device_id` is an input to
+    the closed identity tuple, so an item claiming another node would produce a durable,
+    dispatchable event attributed to a node that never sent it -- and, because dedup is by
+    `event_id`, could collide with that node's real events. A device-scoped credential
+    therefore pins every item's `device_id`; a site-scoped gateway credential pins `site_id`
+    and lets the adapter submit for many devices.
     """
     results: List[ItemResult] = []
     for index, item in enumerate(messages):
@@ -391,6 +430,10 @@ def classify_and_validate_items(messages: Sequence[Any]) -> List[ItemResult]:
                                       classification=None))
             continue
         size = _item_bytes(item)
+        if size is None:
+            results.append(ItemResult(index, "refused", reasons=["item_not_canonicalizable"],
+                                      classification=classification))
+            continue
         if size > MAX_ITEM_BYTES:
             results.append(ItemResult(index, "refused", reasons=["item_too_large"],
                                       classification=classification))
@@ -398,24 +441,60 @@ def classify_and_validate_items(messages: Sequence[Any]) -> List[ItemResult]:
         if classification == TRANSLATION_REQUIRED:
             # Recognized, retained, and handed to the translating adapter. Not judged here,
             # and specifically not refused: refusing it would delete a legacy node's data
-            # during the window where legacy is the only shape it can emit.
+            # during the window where legacy is the only shape it can emit. It is not a
+            # receipt-ready outcome either -- see resolve_translation().
             results.append(ItemResult(index, "deferred", classification=TRANSLATION_REQUIRED))
             continue
+        reasons = sorted(set(EV.validate(item).reasons))
+        reasons += _identity_reasons(item, credential_device_id=credential_device_id,
+                                     credential_site_id=credential_site_id,
+                                     site_scoped=site_scoped)
+        if reasons:
+            results.append(ItemResult(index, "refused", reasons=sorted(set(reasons)),
+                                      classification="canonical"))
+            continue
         result = EV.validate(item)
-        if not result.ok:
-            results.append(ItemResult(index, "refused", reasons=sorted(set(result.reasons)),
-                                      classification="canonical"))
-            continue
-        try:
-            event_id = EV.derive_event_id(item)
-        except EV.EnvelopeError:
-            results.append(ItemResult(index, "refused", reasons=["item_not_canonicalizable"],
-                                      classification="canonical"))
-            continue
-        results.append(ItemResult(index, "accepted", event_id=event_id,
+        results.append(ItemResult(index, "accepted", event_id=EV.derive_event_id(item),
                                   dispatchable=result.dispatchable,
                                   classification="canonical"))
     return results
+
+
+def _identity_reasons(item: Mapping[str, Any], *, credential_device_id: Optional[str],
+                      credential_site_id: Optional[str],
+                      site_scoped: bool) -> List[str]:
+    """Reasons an otherwise valid item's claimed identity contradicts the credential."""
+    reasons: List[str] = []
+    if site_scoped:
+        if credential_site_id is not None and item.get("site_id") != credential_site_id:
+            reasons.append("item_site_mismatch")
+    elif credential_device_id is not None and item.get("device_id") != credential_device_id:
+        reasons.append("item_identity_mismatch")
+    return reasons
+
+
+def resolve_translation(result: ItemResult, *, status: str,
+                        event_id: Optional[str] = None, dispatchable: bool = False,
+                        reasons: Sequence[str] = (),
+                        raw_ref: Optional[str] = None) -> ItemResult:
+    """Replace a `translation_required` placeholder with the translated item's real outcome.
+
+    This exists so the obligation is named in the contract rather than left as prose. A
+    receipt may not be issued while an item is still untranslated (`build_receipt` raises),
+    because reporting it as `deferred` would tell the producer to resend a body that will be
+    classified identically on every attempt -- an infinite loop over a node's whole backlog.
+    A translation that cannot succeed must resolve to `refused` with a reason, which is
+    durable and therefore acknowledged, not to `deferred`.
+    """
+    if result.classification != TRANSLATION_REQUIRED:
+        raise BatchError("item %d is not awaiting translation" % (result.index,))
+    if status == "deferred" and not reasons:
+        # `deferred` after translation means a durability failure, which the caller must be
+        # able to explain. Silent deferral is how an item disappears from accounting.
+        raise BatchError("a translated item deferred without a reason is not accountable")
+    return ItemResult(result.index, status, event_id=event_id, dispatchable=dispatchable,
+                      reasons=reasons, raw_ref=raw_ref or result.raw_ref,
+                      classification=TRANSLATED)
 
 
 def body_too_large(raw: bytes) -> bool:
@@ -431,9 +510,19 @@ def ack_through_index(results: Sequence[ItemResult]) -> int:
     Contiguity is the point. A producer releases spool space by index, so acknowledging a
     later durable item while an earlier one is only `deferred` would let the producer free
     a record the server never stored.
+
+    Index order is verified rather than assumed. A reader that appends results as writes
+    land -- which is what the durable-then-receipt ordering encourages -- produces an
+    unordered list, and walking it naively would acknowledge straight past a deferred gap.
     """
+    ordered = sorted(results, key=lambda r: r.index)
+    seen = {r.index for r in ordered}
+    if len(seen) != len(ordered):
+        raise BatchError("duplicate item index in batch results")
     ack = -1
-    for result in results:
+    for expected, result in enumerate(ordered):
+        if result.index != expected:
+            raise BatchError("item index %d is missing from batch results" % (expected,))
         if result.status == "deferred":
             break
         ack = result.index
@@ -467,6 +556,12 @@ def build_receipt(frame: Mapping[str, Any], results: Sequence[ItemResult], *,
     """
     if not isinstance(frame, Mapping):
         raise BatchError("receipt needs the submitted frame")
+    untranslated = [r.index for r in results if r.classification == TRANSLATION_REQUIRED]
+    if untranslated:
+        raise BatchError(
+            "items %s are still awaiting translation; resolve_translation() must give each "
+            "one a real outcome before a receipt is issued, or the producer will resend "
+            "them forever" % (untranslated,))
     return {
         "batch_schema_version": BATCH_SCHEMA_MAJOR,
         "batch_id": frame.get("batch_id"),

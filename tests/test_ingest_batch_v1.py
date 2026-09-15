@@ -34,6 +34,11 @@ def _entry(name: str) -> dict:
     return next(e for e in ENTRIES if e["name"] == name)
 
 
+DEV = {"credential_device_id": GEN.DEVICE_ID}
+SITE = {"credential_device_id": None, "credential_site_id": "site-quarry-north",
+        "site_scoped": True}
+
+
 # --- generated artifacts stay in step with the field tables --------------------------------
 
 def test_checked_in_batch_contracts_match_generator():
@@ -74,7 +79,7 @@ def test_fixture_digests_pin_contents():
 @pytest.mark.parametrize("entry", ENTRIES, ids=[e["name"] for e in ENTRIES])
 def test_fixture_matches_declared_outcome(entry):
     frame = _load(entry["file"])
-    result = BA.validate_batch(frame, credential_device_id=entry["credential_device_id"])
+    result = BA.validate_batch(frame, **entry["credential"])
     assert result.status == entry["expect_status"]
     assert sorted(set(result.reasons)) == entry["expect_reasons"]
     assert sorted(result.unknown_fields) == entry["expect_unknown_fields"]
@@ -108,7 +113,7 @@ def test_one_bad_item_does_not_refuse_the_batch():
     # The whole reason a batch is not a transaction: a node with one unreadable row would
     # otherwise retry the same batch forever and never drain anything behind it.
     result = BA.validate_batch(_frame("poison-item-keeps-batch"),
-                               credential_device_id=GEN.DEVICE_ID)
+                               **DEV)
     assert result.ok
     assert [r.status for r in result.items] == ["accepted", "refused", "accepted"]
     assert result.items[1].reasons == ["field_missing"]
@@ -117,7 +122,7 @@ def test_one_bad_item_does_not_refuse_the_batch():
 
 def test_item_major_is_not_frame_major():
     result = BA.validate_batch(_frame("item-future-major-refused-alone"),
-                               credential_device_id=GEN.DEVICE_ID)
+                               **DEV)
     assert result.ok, "a newer item does not make the frame unreadable"
     assert result.items[0].status == "accepted"
     assert result.items[1].status == "refused"
@@ -126,7 +131,7 @@ def test_item_major_is_not_frame_major():
 
 def test_unsupported_frame_major_is_refused_before_any_item_is_read():
     result = BA.validate_batch(_frame("unsupported-future-batch-major"),
-                               credential_device_id=GEN.DEVICE_ID)
+                               **DEV)
     assert result.reasons == ["batch_schema_version_unsupported"]
     assert result.items == [], "no item may be interpreted under an unknown framing"
     assert result.errors[0]["supported"] == BA.BATCH_SCHEMA_MAJOR
@@ -134,7 +139,7 @@ def test_unsupported_frame_major_is_refused_before_any_item_is_read():
 
 def test_forward_additive_frame_fields_are_preserved_not_refused():
     frame = _frame("forward-additive-frame-fields")
-    result = BA.validate_batch(frame, credential_device_id=GEN.DEVICE_ID)
+    result = BA.validate_batch(frame, **DEV)
     assert result.ok
     assert set(result.unknown_fields) == {"compression", "producer.link"}
     assert json.loads(EV.encode(frame).decode("utf-8")) == frame
@@ -142,7 +147,7 @@ def test_forward_additive_frame_fields_are_preserved_not_refused():
 
 def test_unrecognized_items_are_refused_individually_with_a_reason():
     result = BA.validate_batch(_frame("unrecognized-items-refused"),
-                               credential_device_id=GEN.DEVICE_ID)
+                               **DEV)
     assert result.ok
     assert [r.status for r in result.items] == ["accepted", "refused", "refused"]
     assert result.items[1].reasons == ["item_unrecognized"]
@@ -154,15 +159,15 @@ def test_unrecognized_items_are_refused_individually_with_a_reason():
 def test_body_device_id_may_not_override_the_credential():
     frame = _frame("device-identity-mismatch")
     assert BA.validate_batch(frame, credential_device_id="mach").ok
-    result = BA.validate_batch(frame, credential_device_id=GEN.DEVICE_ID)
+    result = BA.validate_batch(frame, **DEV)
     assert "device_identity_mismatch" in result.reasons
 
 
 def test_limits_are_server_enforced():
     assert not BA.validate_batch(_frame("empty-batch"),
-                                 credential_device_id=GEN.DEVICE_ID).ok
+                                 **DEV).ok
     over = BA.validate_batch(_frame("batch-too-many-items"),
-                             credential_device_id=GEN.DEVICE_ID)
+                             **DEV)
     assert over.reasons == ["batch_too_many_items"]
     assert over.errors[0]["limit"] == BA.MAX_ITEMS_PER_BATCH
     assert BA.body_too_large(b"x" * (BA.MAX_BATCH_BYTES + 1))
@@ -175,7 +180,7 @@ def test_oversized_item_is_refused_without_refusing_the_batch():
     fat = json.loads(json.dumps(frame["messages"][1]))
     fat["payload"] = dict(fat["payload"], blob="A" * (BA.MAX_ITEM_BYTES + 1))
     frame = dict(frame, messages=[frame["messages"][0], fat])
-    result = BA.validate_batch(frame, credential_device_id=GEN.DEVICE_ID)
+    result = BA.validate_batch(frame, **DEV)
     assert result.ok
     assert result.items[1].reasons == ["item_too_large"]
 
@@ -201,8 +206,8 @@ def test_producer_retries_only_what_was_not_acknowledged():
     # The refused item is inside the acknowledged prefix and is durable as a refusal, so it
     # is never resent. Resending it would be an infinite loop on a body the server refuses.
     assert BA.unacknowledged_indices(receipt) == []
-    receipt = _load(_entry("mixed-version-legacy-messages")["receipt_file"])
-    assert BA.unacknowledged_indices(receipt) == [0, 1]
+    partial = dict(receipt, ack_through_index=0)
+    assert BA.unacknowledged_indices(partial) == [1, 2]
 
 
 def test_counts_must_close():
@@ -220,13 +225,13 @@ def test_reordering_and_rebatching_do_not_change_identity():
     # Delivery order is transport detail; identity is content. A node that reboots mid-spool
     # and re-splits its backlog differently must not create a second durable event.
     frame = _frame("valid-node-batch")
-    ids = [BA.validate_batch(frame, credential_device_id=GEN.DEVICE_ID).items[i].event_id
+    ids = [BA.validate_batch(frame, **DEV).items[i].event_id
            for i in range(3)]
     reversed_frame = dict(frame, messages=list(reversed(frame["messages"])))
-    rev = BA.validate_batch(reversed_frame, credential_device_id=GEN.DEVICE_ID)
+    rev = BA.validate_batch(reversed_frame, **DEV)
     assert [r.event_id for r in rev.items] == list(reversed(ids))
     split = dict(frame, messages=frame["messages"][:1], batch_id="018f2c1a-batch-0008")
-    again = BA.validate_batch(split, credential_device_id=GEN.DEVICE_ID)
+    again = BA.validate_batch(split, **DEV)
     assert again.items[0].event_id == ids[0]
     assert len(set(ids)) == 3, "distinct observations stay distinct"
 
@@ -234,25 +239,60 @@ def test_reordering_and_rebatching_do_not_change_identity():
 def test_batch_id_is_not_a_deduplication_key():
     frame = _frame("valid-node-batch")
     renamed = dict(frame, batch_id="018f2c1a-batch-9999")
-    a = BA.validate_batch(frame, credential_device_id=GEN.DEVICE_ID)
-    b = BA.validate_batch(renamed, credential_device_id=GEN.DEVICE_ID)
+    a = BA.validate_batch(frame, **DEV)
+    b = BA.validate_batch(renamed, **DEV)
     assert [r.event_id for r in a.items] == [r.event_id for r in b.items]
 
 
 def test_malformed_batch_id_is_refused():
     for bad in ("", "short", "has space", "x" * 200):
         result = BA.validate_batch(dict(_frame("valid-node-batch"), batch_id=bad),
-                                   credential_device_id=GEN.DEVICE_ID)
+                                   **DEV)
         assert "batch_id_invalid" in result.reasons or "type_invalid" in result.reasons
 
 
 # --- mixed-version window -----------------------------------------------------------------------
 
+def test_a_receipt_may_not_be_issued_while_an_item_is_untranslated():
+    # This is the loop the contract has to make impossible: every item of a legacy-only
+    # batch is untranslated, so a naive receipt would ack nothing and the producer would
+    # resend identical bytes forever. Issuing that receipt is refused outright.
+    result = BA.validate_batch(_frame("mixed-version-legacy-messages"), **DEV)
+    with pytest.raises(BA.BatchError):
+        BA.build_receipt(_frame("mixed-version-legacy-messages"), result.items,
+                         received_at="2026-09-14T18:03:12Z", adapter="ingest-batch",
+                         adapter_version="0.1.0")
+
+
+def test_translated_items_become_acknowledgeable():
+    result = BA.validate_batch(_frame("mixed-version-legacy-messages"), **DEV)
+    resolved = [BA.resolve_translation(r, status="accepted", event_id="e%d" % r.index,
+                                       dispatchable=True) for r in result.items]
+    receipt = BA.build_receipt(_frame("mixed-version-legacy-messages"), resolved,
+                               received_at="2026-09-14T18:03:12Z", adapter="ingest-batch",
+                               adapter_version="0.1.0")
+    assert receipt["ack_through_index"] == 1
+    assert BA.unacknowledged_indices(receipt) == []
+    assert all(r["classification"] == BA.TRANSLATED for r in receipt["results"])
+
+
+def test_a_failed_translation_must_refuse_rather_than_defer_silently():
+    result = BA.validate_batch(_frame("mixed-version-legacy-messages"), **DEV)
+    refused = BA.resolve_translation(result.items[0], status="refused",
+                                     reasons=["translation_failed"])
+    assert refused.status == "refused" and refused.reasons == ["translation_failed"]
+    with pytest.raises(BA.BatchError):
+        # A deferral nobody can explain is how an item leaves the accounting.
+        BA.resolve_translation(result.items[1], status="deferred")
+    with pytest.raises(BA.BatchError):
+        BA.resolve_translation(refused, status="accepted")
+
+
 def test_legacy_telemetry_bodies_are_recognized_not_refused():
     # This is the compatibility hinge. Today every node emits `telemetry_path` bodies; if the
     # frame reader refused them, enabling batch ingest would delete a whole fleet's uplink.
     result = BA.validate_batch(_frame("mixed-version-legacy-messages"),
-                               credential_device_id=GEN.DEVICE_ID)
+                               **DEV)
     assert result.ok
     assert all(r.classification == BA.TRANSLATION_REQUIRED for r in result.items)
     assert all(r.status == "deferred" for r in result.items)
@@ -271,7 +311,7 @@ def test_classification_is_shallow_and_total():
 def test_a_batch_may_mix_canonical_and_legacy_items():
     frame = _frame("valid-node-batch")
     mixed = dict(frame, messages=[frame["messages"][0], GEN.LEGACY_HEARTBEAT])
-    result = BA.validate_batch(mixed, credential_device_id=GEN.DEVICE_ID)
+    result = BA.validate_batch(mixed, **DEV)
     assert result.ok
     assert result.items[0].status == "accepted"
     assert result.items[1].classification == BA.TRANSLATION_REQUIRED
@@ -317,7 +357,7 @@ def test_undecodable_and_non_object_bodies_raise_before_interpretation():
         BA.decode_batch(b"\x00\x01not json")
     with pytest.raises(BA.BatchError):
         BA.decode_batch(b"[1,2,3]")
-    assert BA.validate_batch([1, 2, 3]).reasons == ["not_an_object"]
+    assert BA.validate_batch([1, 2, 3], **DEV).reasons == ["not_an_object"]
 
 
 def test_batch_media_type_negotiation():
@@ -333,7 +373,81 @@ def test_batch_media_type_negotiation():
 def test_frame_timestamps_are_rfc3339_utc_or_absent():
     frame = _frame("valid-node-batch")
     assert BA.validate_batch(dict(frame, sent_at=None),
-                             credential_device_id=GEN.DEVICE_ID).ok
+                             **DEV).ok
     bad = BA.validate_batch(dict(frame, sent_at="2026-09-14T18:03:11+00:00"),
-                            credential_device_id=GEN.DEVICE_ID)
+                            **DEV)
     assert "timestamp_not_rfc3339_utc" in bad.reasons
+
+
+# --- defects the first review caught ------------------------------------------------------
+
+def test_ack_never_walks_past_a_gap_in_unordered_results():
+    # A reader that appends results as durable writes land produces an unordered list.
+    # Walking it naively acknowledged index 2 while index 1 was never stored.
+    out_of_order = [BA.ItemResult(0, "accepted"), BA.ItemResult(2, "accepted"),
+                    BA.ItemResult(1, "deferred")]
+    assert BA.ack_through_index(out_of_order) == 0
+
+
+def test_ack_refuses_duplicate_or_missing_indices():
+    with pytest.raises(BA.BatchError):
+        BA.ack_through_index([BA.ItemResult(0, "accepted"), BA.ItemResult(0, "accepted")])
+    with pytest.raises(BA.BatchError):
+        BA.ack_through_index([BA.ItemResult(0, "accepted"), BA.ItemResult(2, "accepted")])
+
+
+def test_an_item_may_not_claim_a_device_the_credential_does_not_authorize():
+    # device_id is an identity input, so this would mint a durable, dispatchable event for
+    # a node that never sent it, and could collide with that node's real events.
+    result = BA.validate_batch(_frame("item-identity-mismatch"), **DEV)
+    assert result.ok, "the frame itself is well formed"
+    assert result.items[0].status == "accepted"
+    assert result.items[1].status == "refused"
+    assert result.items[1].reasons == ["item_identity_mismatch"]
+    assert result.items[1].event_id is None
+
+
+def test_a_site_scoped_gateway_may_submit_for_several_devices():
+    frame = _frame("gateway-site-scoped-batch")
+    result = BA.validate_batch(frame, **SITE)
+    assert result.ok
+    assert [r.status for r in result.items] == ["accepted", "accepted"]
+    assert {m["device_id"] for m in frame["messages"]} == {"nyquist", "mach"}
+    # but it is still pinned to its own site
+    off_site = dict(SITE, credential_site_id="site-somewhere-else")
+    other = BA.validate_batch(frame, **off_site)
+    assert all(r.reasons == ["item_site_mismatch"] for r in other.items)
+
+
+def test_a_missing_credential_is_a_refusal_not_a_free_pass():
+    # Auth is mandatory on this route, so "no credential" must not mean "trust the body".
+    result = BA.validate_batch(_frame("missing-credential"), credential_device_id=None)
+    assert result.reasons == ["credential_missing"]
+    assert BA.validate_batch(_frame("valid-node-batch"), credential_device_id=None,
+                             site_scoped=True).reasons == ["credential_missing"]
+
+
+def test_non_finite_literals_are_refused_at_decode_not_crashed_on():
+    with pytest.raises(BA.BatchError):
+        BA.decode_batch(b'{"batch_schema_version":1,"messages":[{"x":NaN}]}')
+    with pytest.raises(EV.EnvelopeError):
+        EV.decode(b'{"x":Infinity}')
+
+
+def test_non_canonicalizable_item_is_not_mislabelled_as_oversized():
+    # Reason codes drive alerting. Reporting a NaN payload as `item_too_large` sends an
+    # operator to tune a limit that has nothing to do with the defect.
+    frame = _frame("valid-node-batch")
+    bad = json.loads(json.dumps(frame["messages"][1]))
+    bad["payload"] = {"peak_db": float("nan")}
+    result = BA.validate_batch(dict(frame, messages=[frame["messages"][0], bad]), **DEV)
+    assert result.items[1].reasons == ["item_not_canonicalizable"]
+
+
+def test_deeply_nested_body_is_a_refusal_not_an_unhandled_crash():
+    # Well under max_batch_bytes, so the size bound does not catch it. json.loads raises
+    # RecursionError, which is not a ValueError and used to escape both decoders.
+    hostile = b'{"batch_schema_version":1,"messages":' + b"[" * 60000
+    assert not BA.body_too_large(hostile)
+    with pytest.raises(BA.BatchError):
+        BA.decode_batch(hostile)

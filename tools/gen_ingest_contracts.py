@@ -323,6 +323,32 @@ def _batch_identity_mismatch() -> Dict[str, Any]:
                   batch_id="018f2c1a-batch-mismatch-1")
 
 
+def _batch_item_identity_mismatch() -> Dict[str, Any]:
+    """A correctly-addressed frame smuggling an item attributed to another node.
+
+    `device_id` is an identity input, so accepting this would mint a durable, dispatchable
+    event for a node that never sent it. The frame is fine; the item is refused.
+    """
+    forged = _copy(BASE)
+    forged["device_id"] = "gold"
+    forged["site_id"] = "site-somewhere-else"
+    forged["producer"] = dict(forged["producer"], sequence=4472, cursor="dets:4472")
+    forged = _signed(forged)
+    return _frame([_item(4471), forged], batch_id="018f2c1a-batch-forged-1")
+
+
+def _batch_gateway_site_scoped() -> Dict[str, Any]:
+    """A drain/import adapter submitting for several nodes under a site credential."""
+    mach = _copy(BASE)
+    mach["device_id"] = "mach"
+    mach["source"] = "import"
+    mach["adapter"] = {"name": "hear-drain-shadow", "version": "0.1.0"}
+    mach["producer"] = dict(mach["producer"], sequence=881, cursor="dets:881")
+    return _frame([_item(4471), _signed(mach)], device_id="hear-drain-shadow",
+                  batch_id="018f2c1a-batch-gateway-1",
+                  adapter={"name": "hear-drain-shadow", "version": "0.1.0"})
+
+
 def _batch_malformed_frame() -> Dict[str, Any]:
     frame = _batch_valid()
     frame["batch_id"] = "018f2c1a-batch-malformed-1"
@@ -336,24 +362,38 @@ def _batch_unrecognized_item() -> Dict[str, Any]:
                   batch_id="018f2c1a-batch-junk-1")
 
 
-# name, factory, credential_device_id, frame status, frame reasons, emit receipt
+# A credential is mandatory on this route, so every fixture declares the credential it is
+# asserted against. `site` fixtures use a site-scoped gateway credential instead.
+DEVICE_CRED = {"credential_device_id": DEVICE_ID}
+SITE_CRED = {"credential_device_id": None, "credential_site_id": BASE["site_id"],
+             "site_scoped": True}
+
+# name, factory, credential, frame status, frame reasons, emit receipt
 BATCH_FIXTURES = (
-    ("valid-node-batch", _batch_valid, DEVICE_ID, "accepted", [], True),
-    ("mixed-version-legacy-messages", _batch_legacy_messages, DEVICE_ID, "accepted", [], True),
-    ("poison-item-keeps-batch", _batch_poison_item, DEVICE_ID, "accepted", [], True),
-    ("item-future-major-refused-alone", _batch_item_future_major, DEVICE_ID, "accepted", [],
-     True),
-    ("forward-additive-frame-fields", _batch_forward_additive, DEVICE_ID, "accepted", [],
+    ("valid-node-batch", _batch_valid, DEVICE_CRED, "accepted", [], True),
+    # No receipt: every item is still awaiting translation, and a receipt may not be issued
+    # in that state. The post-translation receipt is the adapter's, not the frame reader's.
+    ("mixed-version-legacy-messages", _batch_legacy_messages, DEVICE_CRED, "accepted", [],
      False),
-    ("unrecognized-items-refused", _batch_unrecognized_item, DEVICE_ID, "accepted", [], True),
-    ("unsupported-future-batch-major", _batch_future_major, DEVICE_ID, "refused",
+    ("poison-item-keeps-batch", _batch_poison_item, DEVICE_CRED, "accepted", [], True),
+    ("item-future-major-refused-alone", _batch_item_future_major, DEVICE_CRED, "accepted", [],
+     True),
+    ("item-identity-mismatch", _batch_item_identity_mismatch, DEVICE_CRED, "accepted", [],
+     True),
+    ("gateway-site-scoped-batch", _batch_gateway_site_scoped, SITE_CRED, "accepted", [], True),
+    ("forward-additive-frame-fields", _batch_forward_additive, DEVICE_CRED, "accepted", [],
+     False),
+    ("unrecognized-items-refused", _batch_unrecognized_item, DEVICE_CRED, "accepted", [], True),
+    ("unsupported-future-batch-major", _batch_future_major, DEVICE_CRED, "refused",
      ["batch_schema_version_unsupported"], False),
-    ("empty-batch", _batch_empty, DEVICE_ID, "refused", ["batch_empty"], False),
-    ("batch-too-many-items", _batch_too_many_items, DEVICE_ID, "refused",
+    ("empty-batch", _batch_empty, DEVICE_CRED, "refused", ["batch_empty"], False),
+    ("batch-too-many-items", _batch_too_many_items, DEVICE_CRED, "refused",
      ["batch_too_many_items"], False),
-    ("device-identity-mismatch", _batch_identity_mismatch, DEVICE_ID, "refused",
+    ("device-identity-mismatch", _batch_identity_mismatch, DEVICE_CRED, "refused",
      ["device_identity_mismatch"], False),
-    ("malformed-frame-field-types", _batch_malformed_frame, DEVICE_ID, "refused",
+    ("missing-credential", _batch_valid, {"credential_device_id": None}, "refused",
+     ["credential_missing"], False),
+    ("malformed-frame-field-types", _batch_malformed_frame, DEVICE_CRED, "refused",
      ["type_invalid", "timestamp_not_rfc3339_utc"], False),
 )
 
@@ -369,7 +409,7 @@ def build_batch(out: Dict[Path, str]) -> None:
         path = BATCH_FIXTURE_DIR / ("%s.json" % name)
         out[path] = body
 
-        result = BA.validate_batch(frame, credential_device_id=credential)
+        result = BA.validate_batch(frame, **credential)
         if result.status != status:
             raise SystemExit("batch fixture %s expected %s, validator says %s (%s)"
                              % (name, status, result.status, result.reasons))
@@ -380,7 +420,7 @@ def build_batch(out: Dict[Path, str]) -> None:
         entry: Dict[str, Any] = {
             "name": name,
             "file": path.name,
-            "credential_device_id": credential,
+            "credential": dict(credential),
             "expect_status": status,
             "expect_reasons": sorted(set(reasons)),
             "expect_unknown_fields": sorted(result.unknown_fields),
@@ -420,11 +460,13 @@ def build_batch(out: Dict[Path, str]) -> None:
         "item_results_note": (
             "expect_items is what the frame reader alone can conclude. It does not consult "
             "the durable store, so an item it calls `accepted` becomes `duplicate` when its "
-            "event_id is already durable, and a `translation_required` item is `deferred` "
-            "only until the edge adapter translates it into an item envelope, which then "
-            "receives a real status in the same request. A cross-language adapter asserts "
-            "against these values for frame admission and item classification, not for the "
-            "final persisted outcome."),
+            "event_id is already durable. An item classified `translation_required` carries "
+            "no receipt-ready outcome at all: the adapter must translate it and call "
+            "resolve_translation() to give it a real status, and build_receipt() refuses to "
+            "issue a receipt while any item is still untranslated -- reporting one as "
+            "`deferred` would tell the producer to resend it forever. A cross-language "
+            "adapter asserts against these values for frame admission and item "
+            "classification, not for the final persisted outcome."),
         "limits": {
             "max_items_per_batch": BA.MAX_ITEMS_PER_BATCH,
             "max_batch_bytes": BA.MAX_BATCH_BYTES,
