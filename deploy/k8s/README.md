@@ -221,6 +221,10 @@ and the solvers read the pool with no adapter.
   numpy directory exists means whichever workload reaches an empty PVC first decides the version
   and the other silently uses what it finds — both pins then read as discipline while enforcing
   nothing. `hear-score` asserts the version and prints the resolved one.
+  ⚠️This, and the runtime `pip install` that produces it, is what
+  [`deploy/images`](../images/README.md) exists to remove: digest-pinned base images whose
+  dependencies are resolved once, at build time, from a hash-locked closure. Nothing in this
+  directory has been migrated yet — the images are the substrate, not a cut-over.
 - ⚠️**`deploy/k8s/hear-drain.yaml` on this branch is behind the cluster.** The live `hear-drain`
   carries `--phone-corpus /pool/sketch_corpus` (a cross-repo contract with `dama-sketch-corpus`'s
   `SKETCH_CORPUS_OUT_DIR`) and the live `hear-drain-check` captures `rc=$?`; the checked-in file

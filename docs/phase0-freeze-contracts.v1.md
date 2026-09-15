@@ -14,14 +14,14 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | c2141bc42b4011c027d3fa6e742089fbd273f4f058c6a548597d164af0ddaf15 |
+| baseline | 4fa0fec28823ba937bb61712df10e52d51e51f53c8075b1fcc3a2986cf9fc10d |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
 | firmware_build_metadata | 05d4e0c5b5b784ffecfa19a6695b56b67e45a6ccb2e8a5b59b1b8aeb78833826 |
 | schemas | 427c86937d28bd12b6de71c3b4604eae609d2b24edfd4f1a761256bc74a6b580 |
 | published_contracts | 4a58f893566092f45a9608b98489332c06c7ea265d5f5abf46299aba2a3f65c6 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |
 | redis_keys | d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03 |
-| kubernetes_and_pvc_layout | 179d27e4ed2cbe06a441df046dee19f659810c30ac18843fc400f8e9ed62030b |
+| kubernetes_and_pvc_layout | c95e3ae220c4ece6acd80de76c0ba0ece704b33f4a63e6276e0e10ac9d40090d |
 | corpus_fixture_metadata | 5a27ffc150822a94847095b765d20e4f0299ec4d9e58f2ea1af05d6ecf470d77 |
 
 ## Compatibility
@@ -189,7 +189,7 @@ Manifest hashes:
 | deploy/k8s/hear-score.yaml | 11126 | 03c0713d22b23d3f06177c79ca6d612925768c98d566f012fc01d209de5dcf0d |
 | deploy/k8s/hear-tag.yaml | 15625 | 367ed67528bb15a5dd652bf924db0af409a8f65c1b00128c0a3b14e990be1890 |
 | deploy/k8s/hear-tdoa.yaml | 17920 | 8ff0135e4b56f76d7b0d69ccdc4f9129efd3050047698cc9161b002cfaae2cc8 |
-| deploy/k8s/README.md | 20417 | 60372898eb46ec89a1f69675d0cce496839a5ff03fd5c992eb1302f614c396b0 |
+| deploy/k8s/README.md | 20755 | 0c8bc43156a57555f1c00931d0548795bc9c2bc93b349cfeed16664bf3d2c630 |
 
 ### PVCs
 

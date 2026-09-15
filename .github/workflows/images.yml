@@ -1,0 +1,190 @@
+name: images
+
+# The base images the workers will run on: deploy/images/. This builds them, proves the lock
+# files still describe them, scans them, and publishes them with an SBOM and provenance.
+#
+# ⚠️A PULL REQUEST PUBLISHES NOTHING. It builds the same chain, with the same SBOM and
+# provenance, into a registry service that exists only for the duration of the job, so a fork
+# cannot push an image anywhere that outlives it. Publishing to ghcr.io happens on main, where
+# the digest a manifest will reference is what gets recorded.
+#
+# ⚠️ONE JOB, THREE BUILDS, IN ORDER. ml-cpu is built FROM numeric, which is built FROM runtime,
+# and each child is handed the exact parent the previous step produced -- a matrix would put the
+# three on three runners and the chain would have to go through a registry to exist at all.
+#
+# ⚠️ml-gpu IS NOT BUILT HERE. Its base is a multi-gigabyte CUDA image and the hosted runner has
+# neither the disk budget nor a GPU to verify it on. Its lock is still checked below, which is
+# the part that drifts silently; building and publishing it is a site job. See
+# deploy/images/README.md.
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  REGISTRY: ghcr.io
+  NAMESPACE: ${{ github.repository_owner }}/dama-hear
+
+jobs:
+  locks-are-current:
+    name: lock files still describe their bases
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # The half that needs neither docker nor the network. It runs in the pytest job too; it is
+      # repeated here so a failure of the regeneration below reads as "the resolution moved"
+      # rather than "somebody edited a pin and did not regenerate".
+      - name: headers match their inputs
+        run: python3 deploy/images/gen_pip_lock.py --check
+
+      - name: regenerate every CPU lock inside its pinned base
+        run: |
+          for v in numeric ml-cpu; do
+            python3 deploy/images/gen_pip_lock.py "$v" > "requirements/lock/$v.txt"
+          done
+
+      - name: nothing changed
+        run: |
+          if ! git diff --quiet; then
+            git diff -- requirements/lock
+            echo "::error::a lock file differs from what its base image resolves today; rerun deploy/images/gen_pip_lock.py and commit"
+            exit 1
+          fi
+
+  build:
+    name: build the CPU base chain
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    # ⚠️A PULL REQUEST STILL PUSHES -- to a registry that lives and dies with the job. buildx
+    # runs in a container and cannot see an image `load`ed into the runner's daemon, so a chain
+    # of three images has to resolve its parents through *a* registry; and an attestation makes
+    # the build emit a manifest list, which the docker exporter cannot export at all. A
+    # throwaway localhost registry gives the PR the same build the publish path performs --
+    # digest-linked parents, SBOM and provenance included -- while nothing leaves the runner.
+    services:
+      registry:
+        image: registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          # so the builder container can reach the job's registry service on localhost
+          driver-opts: network=host
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: inputs.publish
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: where these images go
+        id: where
+        run: |
+          if [ "${{ inputs.publish }}" = "true" ]; then
+            echo "prefix=$REGISTRY/$NAMESPACE" >> "$GITHUB_OUTPUT"
+          else
+            echo "prefix=localhost:5000/dama-hear" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: runtime
+        with:
+          context: .
+          file: deploy/images/Dockerfile.runtime
+          # The tag is the commit. There is no `latest`: a manifest references a digest.
+          tags: ${{ steps.where.outputs.prefix }}/base-runtime:${{ github.sha }}
+          push: true
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=base-runtime
+          cache-to: type=gha,mode=max,scope=base-runtime
+
+      # ⚠️THE CHILD NAMES ITS PARENT BY DIGEST, not by the tag it was just pushed under. A tag
+      # can be republished between two steps of the same job; the digest is what the built
+      # image's provenance will say it was built on.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: numeric
+        with:
+          context: .
+          file: deploy/images/Dockerfile.numeric
+          build-args: RUNTIME_IMAGE=${{ steps.where.outputs.prefix }}/base-runtime@${{ steps.runtime.outputs.digest }}
+          tags: ${{ steps.where.outputs.prefix }}/base-numeric:${{ github.sha }}
+          push: true
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=base-numeric
+          cache-to: type=gha,mode=max,scope=base-numeric
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: ml_cpu
+        with:
+          context: .
+          file: deploy/images/Dockerfile.ml-cpu
+          build-args: NUMERIC_IMAGE=${{ steps.where.outputs.prefix }}/base-numeric@${{ steps.numeric.outputs.digest }}
+          tags: ${{ steps.where.outputs.prefix }}/base-ml-cpu:${{ github.sha }}
+          push: true
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=base-ml-cpu
+          cache-to: type=gha,mode=max,scope=base-ml-cpu
+
+      # The interpreter and the pinned versions, read out of the image that was just built
+      # rather than out of the file that asked for them. Also what puts the image into the
+      # runner's daemon, which is where the scanner then finds it.
+      - name: what the image actually contains
+        id: contents
+        run: |
+          ref="${{ steps.where.outputs.prefix }}/base-ml-cpu@${{ steps.ml_cpu.outputs.digest }}"
+          docker pull -q "$ref"
+          docker tag "$ref" hear-base-ml-cpu:scan
+          docker run --rm hear-base-ml-cpu:scan python -c '
+          import sys, numpy, scipy, onnxruntime, ai_edge_litert
+          print("python", sys.version.split()[0])
+          print("numpy", numpy.__version__, "scipy", scipy.__version__,
+                "onnxruntime", onnxruntime.__version__)'
+          docker run --rm hear-base-ml-cpu:scan id
+
+      - name: digests
+        run: |
+          {
+            echo "| image | digest |"
+            echo "|---|---|"
+            echo "| base-runtime | \`${{ steps.runtime.outputs.digest }}\` |"
+            echo "| base-numeric | \`${{ steps.numeric.outputs.digest }}\` |"
+            echo "| base-ml-cpu  | \`${{ steps.ml_cpu.outputs.digest }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ⚠️A SCAN THAT NEVER FAILS IS A BADGE. This exits non-zero on a fixable HIGH/CRITICAL;
+      # unfixable findings are reported and not gated on, because a base image cannot be patched
+      # for a CVE upstream has not fixed. ml-cpu is the whole chain: it contains runtime and
+      # numeric.
+      - name: scan
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: hear-base-ml-cpu:scan
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+          # dated, reviewed exceptions -- each one expires
+          trivyignores: deploy/images/trivyignore.yaml
