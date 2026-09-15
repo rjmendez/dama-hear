@@ -395,3 +395,37 @@ def test_a_published_object_is_never_overwritten_in_place(pool, store, tmp_path)
     assert store.get_range(blob) != b"replacement bytes"
     with pytest.raises(ValueError):
         store.put_immutable(blob, b"replacement bytes", if_absent=False)
+
+
+def test_a_restage_that_reads_different_bytes_is_refused_rather_than_published(store, tmp_path):
+    """The re-stage after a bad readback is a NEW read, and it gets the same interrogation.
+
+    Carrying the first attempt's digest forward would publish the second attempt's bytes under the
+    first attempt's name -- a source that moved, laundered into a fact.
+    """
+    reads = {"n": 0}
+
+    def shifting():
+        reads["n"] += 1
+        return iter([b"first read\n" if reads["n"] == 1 else b"second read\n"])
+
+    real_iter = store.iter_range
+    lied = {"n": 0}
+
+    def liar(key, offset=0, length=None, **kw):
+        if lied["n"] == 0 and "/staging/" in key:
+            lied["n"] = 1
+            return iter([b"not what was written"])
+        return real_iter(key, offset, length, **kw)
+
+    store.iter_range = liar
+    task = ST.ImportTask(object_class="record-seg", logical_id="0",
+                         partition=("2026-09-12", "mach"), chunks=shifting,
+                         digest_source="stream-digest")
+    report = _importer(store, tmp_path).run([task])
+    store.iter_range = real_iter
+
+    assert [q["error_class"] for q in report.quarantined] == ["source_changed_during_import"]
+    assert store.keys_under("hear/v1/obj/") == []
+    assert store.keys_under("hear/v1/blob/") == []
+    assert store.keys_under("hear/v1/staging/") == []

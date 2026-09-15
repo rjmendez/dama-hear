@@ -252,15 +252,26 @@ class Importer:
         if readback.digest != stored_digest or readback.bytes != sealed.stored_bytes:
             self.store.delete_staged(self.run_id, staged.staging_id)
             retry_sealed, staged = self._stage(task, report, restricted)  # one re-stage, then stop
-            ok = False
-            if staged is not None:
-                again = S.digest_source(
-                    self.store.range_source(staged.key, chunk_bytes=self.chunk_bytes))
-                ok = (again.digest == retry_sealed.stored_digest
-                      and again.bytes == retry_sealed.stored_bytes)
-                sealed = retry_sealed
-                stored_digest = retry_sealed.stored_digest
-            if not ok:
+            if staged is None:
+                self._quarantine(task, report, "readback_mismatch",
+                                 expected=self._public(task, expected, stored_digest))
+                return "quarantined"
+            report.counters["bytes_read"] += retry_sealed.plaintext_bytes
+            # ⚠️THE RE-STAGE IS A NEW READ OF THE SOURCE, so it gets the same interrogation the
+            # first one got. Carrying the first attempt's plaintext digest forward would let a
+            # source that moved between the two reads be published under the digest of bytes the
+            # store no longer holds -- a laundered change, which is the failure this whole file
+            # exists to refuse.
+            if retry_sealed.plaintext_digest != plaintext_digest \
+                    or retry_sealed.plaintext_bytes != sealed.plaintext_bytes:
+                self.store.delete_staged(self.run_id, staged.staging_id)
+                self._quarantine(task, report, "source_changed_during_import")
+                return "quarantined"
+            sealed = retry_sealed
+            stored_digest = retry_sealed.stored_digest
+            again = S.digest_source(
+                self.store.range_source(staged.key, chunk_bytes=self.chunk_bytes))
+            if again.digest != stored_digest or again.bytes != sealed.stored_bytes:
                 self._quarantine(task, report, "readback_mismatch",
                                  expected=self._public(task, expected, stored_digest))
                 return "quarantined"

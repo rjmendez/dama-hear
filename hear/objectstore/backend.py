@@ -120,6 +120,10 @@ class Backend(Protocol):
     def iter_range(self, key: str, offset: int = 0, length: Optional[int] = None, *,
                    chunk_bytes: int = S.DEFAULT_CHUNK_BYTES) -> Iterator[bytes]: ...
 
+    def range_source(self, key: str, offset: int = 0, length: Optional[int] = None, *,
+                     chunk_bytes: int = S.DEFAULT_CHUNK_BYTES) -> S.ChunkSource:
+        """A re-openable source over a stored object. The publish path re-reads, so it needs one."""
+
     def get_range(self, key: str, offset: int = 0, length: Optional[int] = None) -> bytes: ...
 
     def head(self, key: str) -> Optional[ObjectHead]: ...
