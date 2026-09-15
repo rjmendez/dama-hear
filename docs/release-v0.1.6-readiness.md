@@ -150,6 +150,11 @@ token is an operator decision and the only remaining decision that gates the rol
 on the operator machine currently carries `HEAR_PUSH_TOKEN` only, so `HEAR_ADMIN_TOKEN` must be
 **chosen** and provisioned — there is nothing to recover.
 
+The policy, threat model, key lifecycle, lost-token behaviour and the exact tooling changes each
+option implies are worked out in `docs/decisions/0006-admin-token-provisioning-policy.md`, which
+recommends **per-node** tokens and likewise generates nothing. This section states the decision;
+that ADR states what follows from it.
+
 Required decision before §7 begins:
 
 * Is the admin token **fleet-wide or per-node**? Per-node limits blast radius; fleet-wide is one
