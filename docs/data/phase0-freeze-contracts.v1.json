@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "8341753350e68fb2d7896ff4b856d76065394f00cb749e360377e227030782f2",
+  "baseline_hash": "bbe0ad63e1fc1c2a8c08db77581f2babdee518c0fb3c619847f68e050423f0b1",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -478,8 +478,8 @@
       },
       {
         "path": "deploy/k8s/hear-mqtt-bridge.yaml",
-        "sha256": "191e575074cd1960d4ecd0fd502a4ef999377061242b62bc3ea7ba006b1d8caf",
-        "size_bytes": 4781
+        "sha256": "43f53a0ec58056e08a5104dd8fdb5ed51f6ea4f700363777a94468e050ca8538",
+        "size_bytes": 5560
       },
       {
         "path": "deploy/k8s/hear-score.yaml",
@@ -2144,7 +2144,7 @@
         "storage_request": "5Gi"
       }
     ],
-    "section_hash": "1c2938a918c84c354987f3105b6cfc93930953b342cd09468f97fb10315a9ef8"
+    "section_hash": "8e3dfe9ef4d6bee7218b72162ee08b446b807241b39f25b5f43e64d1b7250d0f"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",
