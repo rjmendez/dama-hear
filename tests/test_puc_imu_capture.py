@@ -59,6 +59,18 @@ def test_fifo_bounded_burst_raw_ring_and_monotonic_clock_are_exposed():
     assert "sample-clock-reconstructed-from-burst-end-monotonic-us" in src
 
 
+def test_burst_timestamps_are_assigned_after_successful_drain_only_to_read_samples():
+    code = _code()
+    assert "uint64_t drain_done_us = (uint64_t)esp_timer_get_time()" in code
+    assert code.index("uint64_t drain_done_us") > code.index("lis3dh_read_sample(&xs[got]")
+    assert "uint8_t got = 0" in code
+    assert "for (uint8_t i = 0; i < got; i++)" in code
+    assert "drain_done_us - (uint64_t)(got - 1 - i) * IMU_DT_US" in code
+    src = _json_literals()
+    assert '"last_read_latency_us"' in src
+    assert '"timestamp_basis":"last_sample_estimate_post_drain_us"' in src
+
+
 def test_lis3dh_full_fifo_fss_value_is_drained_as_32_samples():
     code = _code()
     assert "fss == 0x1F ? IMU_FIFO_CAPACITY : fss" in code, (
@@ -69,8 +81,23 @@ def test_lis3dh_full_fifo_fss_value_is_drained_as_32_samples():
 
 def test_status_reports_health_rate_drops_and_fifo_overruns():
     src = _json_literals()
-    for token in ('"imu":', '"odr_hz"', '"drops"', '"fifo_overruns"', '"fifo_lost_min"', '"i2c_errors"', '"short_reads"'):
+    for token in (
+        '"imu":', '"state"', '"odr_hz"', '"drops"', '"fifo_overruns"', '"fifo_lost_min"',
+        '"i2c_errors"', '"consecutive_i2c_errors"', '"short_reads"', '"last_age_s"'
+    ):
         assert token in src
+
+
+def test_runtime_i2c_failures_make_health_unhealthy_without_one_transient_flap():
+    code = _code()
+    src = _json_literals()
+    assert _define_int("IMU_MAX_CONSEC_I2C_ERRORS") == 3
+    assert _define_int("IMU_STALE_US") == 1000000
+    assert "imu_consecutive_i2c_errors < IMU_MAX_CONSEC_I2C_ERRORS" in code
+    assert "return \"i2c_fault\"" in code
+    assert "return \"stale\"" in code
+    assert "imu_consecutive_i2c_errors = 0" in code
+    assert '"ok":%s,"state":"%s"' in src
 
 
 def test_feature_contract_marks_imu_seismic_not_microphone():
@@ -102,7 +129,16 @@ def test_phone_feature_names_are_computed_from_calibrated_accel_mag_mps2():
         "phone-compatible crest_factor/dc_offset must not be computed over raw LIS3DH counts")
 
 
+def test_vibration_onset_peak_field_names_units_not_raw_counts():
+    src = _json_literals()
+    assert '"peak_mag_mps2"' in src
+    assert "peak_abs_raw" not in src
+
+
 def test_operator_doc_names_required_on_device_validation():
     doc = DOC.read_text()
-    for token in ("WHO_AM_I 0x33", "SDA GPIO47", "SCL GPIO48", "400 Hz", "/imu", "fifo_overruns"):
+    for token in (
+        "WHO_AM_I 0x33", "SDA GPIO47", "SCL GPIO48", "400 Hz", "/imu", "fifo_overruns",
+        "peak_mag_mps2", "last_sample_estimate_post_drain_us", "consecutive_i2c_errors"
+    ):
         assert token in doc

@@ -643,6 +643,8 @@ static String mic_capture(int clk, int din, int fs, bool stereo) {
 #define IMU_FIFO_CAPACITY        32
 #define IMU_FIFO_WATERMARK       24
 #define IMU_BURST_MAX            32
+#define IMU_MAX_CONSEC_I2C_ERRORS 3
+#define IMU_STALE_US             1000000ULL
 #define LIS3DH_MPS2_PER_LSB      (9.80665f * 0.001f / 16.0f)
 
 struct ImuSample {
@@ -656,7 +658,8 @@ struct ImuSample {
 static ImuSample imu_ring[IMU_RING_N];
 static uint32_t imu_seq = 0, imu_seen = 0, imu_bursts = 0, imu_fifo_overruns = 0;
 static uint32_t imu_fifo_lost_min = 0, imu_ring_drops = 0, imu_i2c_errors = 0, imu_short_reads = 0;
-static uint64_t imu_last_us = 0;
+static uint32_t imu_consecutive_i2c_errors = 0, imu_last_read_latency_us = 0;
+static uint64_t imu_last_us = 0, imu_init_us = 0;
 static uint8_t imu_who = 0, imu_fifo_level = 0, imu_ctrl1 = 0, imu_ctrl4 = 0, imu_ctrl5 = 0, imu_fifo_ctrl = 0;
 static bool imu_ok = false;
 static const char *imu_fault = "not initialised";
@@ -711,9 +714,31 @@ static void imu_note_sample(uint64_t mono_us, int16_t x, int16_t y, int16_t z) {
   imu_last_us = mono_us;
 }
 
+static void imu_note_i2c_error() {
+  imu_i2c_errors++;
+  if (imu_consecutive_i2c_errors < 0xFFFFFFFF) imu_consecutive_i2c_errors++;
+}
+
+static bool imu_fresh(uint64_t now_us) {
+  if (!imu_last_us) return imu_init_us && (now_us - imu_init_us) <= IMU_STALE_US;
+  return (now_us - imu_last_us) <= IMU_STALE_US;
+}
+
+static bool imu_runtime_ok(uint64_t now_us) {
+  return imu_ok && imu_consecutive_i2c_errors < IMU_MAX_CONSEC_I2C_ERRORS && imu_fresh(now_us);
+}
+
+static const char *imu_state(uint64_t now_us) {
+  if (!imu_ok) return "disabled";
+  if (imu_consecutive_i2c_errors >= IMU_MAX_CONSEC_I2C_ERRORS) return "i2c_fault";
+  if (!imu_fresh(now_us)) return "stale";
+  return "ok";
+}
+
 static bool imu_init() {
   imu_ok = false;
   imu_fault = "bus begin failed";
+  imu_init_us = (uint64_t)esp_timer_get_time();
   if (!imu_bus_begin()) return false;
   if (!lis3dh_read_reg(LIS3DH_WHO_AM_I, &imu_who)) { imu_fault = "WHO_AM_I read failed"; return false; }
   if (imu_who != LIS3DH_WHO_AM_I_EXPECTED) { imu_fault = "WHO_AM_I mismatch"; return false; }
@@ -734,7 +759,7 @@ static bool imu_init() {
 static void imu_poll() {
   if (!imu_ok) return;
   uint8_t src = 0;
-  if (!lis3dh_read_reg(LIS3DH_FIFO_SRC_REG, &src)) { imu_i2c_errors++; return; }
+  if (!lis3dh_read_reg(LIS3DH_FIFO_SRC_REG, &src)) { imu_note_i2c_error(); return; }
   uint8_t fss = src & 0x1F;
   bool empty = src & 0x20;
   bool overrun = src & 0x40;
@@ -743,13 +768,22 @@ static void imu_poll() {
   if (overrun) { imu_fifo_overruns++; imu_fifo_lost_min++; }
   if (n > IMU_BURST_MAX) n = IMU_BURST_MAX;
   if (!n) return;
-  uint64_t end_us = (uint64_t)esp_timer_get_time();
+  int16_t xs[IMU_BURST_MAX], ys[IMU_BURST_MAX], zs[IMU_BURST_MAX];
+  uint8_t got = 0;
+  uint64_t read_start_us = (uint64_t)esp_timer_get_time();
   for (uint8_t i = 0; i < n; i++) {
-    int16_t x, y, z;
-    if (!lis3dh_read_sample(&x, &y, &z)) { imu_i2c_errors++; break; }
-    uint64_t sample_us = end_us - (uint64_t)(n - 1 - i) * IMU_DT_US;
-    imu_note_sample(sample_us, x, y, z);
+    if (!lis3dh_read_sample(&xs[got], &ys[got], &zs[got])) { imu_note_i2c_error(); break; }
+    got++;
   }
+  if (!got) return;
+  uint64_t drain_done_us = (uint64_t)esp_timer_get_time();
+  uint64_t read_latency_us = drain_done_us - read_start_us;
+  imu_last_read_latency_us = read_latency_us > 0xFFFFFFFFULL ? 0xFFFFFFFF : (uint32_t)read_latency_us;
+  for (uint8_t i = 0; i < got; i++) {
+    uint64_t sample_us = drain_done_us - (uint64_t)(got - 1 - i) * IMU_DT_US;
+    imu_note_sample(sample_us, xs[i], ys[i], zs[i]);
+  }
+  imu_consecutive_i2c_errors = 0;
   imu_bursts++;
 }
 
@@ -758,21 +792,27 @@ static uint32_t imu_available() {
 }
 
 static String imu_health_json() {
-  double age_s = imu_last_us ? ((uint64_t)esp_timer_get_time() - imu_last_us) / 1e6 : -1.0;
-  char b[560];
+  uint64_t now_us = (uint64_t)esp_timer_get_time();
+  double age_s = imu_last_us ? (now_us - imu_last_us) / 1e6 : -1.0;
+  char b[720];
   snprintf(b, sizeof b,
-    "{\"ok\":%s,\"fault\":\"%s\",\"sensor\":\"lis3dh\",\"addr\":\"0x18\",\"who_am_i\":\"0x%02X\","
+    "{\"ok\":%s,\"state\":\"%s\",\"fault\":\"%s\",\"sensor\":\"lis3dh\",\"addr\":\"0x18\","
+    "\"who_am_i\":\"0x%02X\","
     "\"bus\":{\"sda\":%d,\"scl\":%d,\"hz\":%d},\"odr_hz\":%d,\"dt_us\":%d,"
     "\"mode\":\"high_resolution_fifo_stream_poll\",\"fifo_watermark\":%d,\"fifo_level\":%u,"
     "\"samples\":%lu,\"ring_samples\":%lu,\"burst_reads\":%lu,\"drops\":%lu,"
-    "\"fifo_overruns\":%lu,\"fifo_lost_min\":%lu,\"i2c_errors\":%lu,\"short_reads\":%lu,\"last_age_s\":%.3f,"
+    "\"fifo_overruns\":%lu,\"fifo_lost_min\":%lu,\"i2c_errors\":%lu,"
+    "\"consecutive_i2c_errors\":%lu,\"max_consecutive_i2c_errors\":%d,"
+    "\"short_reads\":%lu,\"last_age_s\":%.3f,\"stale_after_s\":%.3f,"
+    "\"last_read_latency_us\":%lu,\"timestamp_basis\":\"last_sample_estimate_post_drain_us\","
     "\"ctrl\":{\"reg1\":\"0x%02X\",\"reg4\":\"0x%02X\",\"reg5\":\"0x%02X\",\"fifo\":\"0x%02X\"}}",
-    imu_ok ? "true" : "false", imu_fault, imu_who, IMU_I2C_SDA, IMU_I2C_SCL, IMU_I2C_HZ,
-    IMU_ODR_HZ, IMU_DT_US, IMU_FIFO_WATERMARK, imu_fifo_level,
+    imu_runtime_ok(now_us) ? "true" : "false", imu_state(now_us), imu_fault, imu_who,
+    IMU_I2C_SDA, IMU_I2C_SCL, IMU_I2C_HZ, IMU_ODR_HZ, IMU_DT_US, IMU_FIFO_WATERMARK, imu_fifo_level,
     (unsigned long)imu_seen, (unsigned long)imu_available(), (unsigned long)imu_bursts,
     (unsigned long)imu_ring_drops, (unsigned long)imu_fifo_overruns, (unsigned long)imu_fifo_lost_min,
-    (unsigned long)imu_i2c_errors, (unsigned long)imu_short_reads, age_s, imu_ctrl1, imu_ctrl4, imu_ctrl5,
-    imu_fifo_ctrl);
+    (unsigned long)imu_i2c_errors, (unsigned long)imu_consecutive_i2c_errors, IMU_MAX_CONSEC_I2C_ERRORS,
+    (unsigned long)imu_short_reads, age_s, IMU_STALE_US / 1000000.0,
+    (unsigned long)imu_last_read_latency_us, imu_ctrl1, imu_ctrl4, imu_ctrl5, imu_fifo_ctrl);
   return String(b);
 }
 
@@ -815,7 +855,7 @@ static String imu_features_json() {
   bool onset = n >= 40 && crest >= 5.0 && peak_abs >= rms * 5.0;
   char onset_buf[120];
   if (onset)
-    snprintf(onset_buf, sizeof onset_buf, "{\"mono_us\":%llu,\"seq\":%lu,\"peak_abs_raw\":%.1f}",
+    snprintf(onset_buf, sizeof onset_buf, "{\"mono_us\":%llu,\"seq\":%lu,\"peak_mag_mps2\":%.3f}",
              (unsigned long long)pk.mono_us, (unsigned long)pk.seq, peak_abs);
   else
     snprintf(onset_buf, sizeof onset_buf, "null");
