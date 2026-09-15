@@ -207,6 +207,25 @@ EMBEDDED_BUNDLES = {
     "hear-annotate-code": ("deploy/k8s/hear-annotate.yaml", "hear-annotate", ANNOTATE_CODE, []),
 }
 
+#: bundle name -> manifest that carries the long-running Deployment reading it, for the one
+#: kind of bundle where a stale ConfigMap is a live incident and not just a next-deploy problem.
+#:
+#: ⚠️subPath CONFIGMAP MOUNTS DO NOT LIVE-UPDATE, AND THIS CONFIGMAP IS SUBPATH-MOUNTED. Every
+#: hear-mqtt-bridge.yaml volumeMount below uses `subPath:`, which kubelet's ConfigMap sync
+#: deliberately does not touch after the pod starts (that is upstream's documented behaviour,
+#: not a bug here) -- so re-running this generator and `kubectl apply`-ing only the ConfigMap
+#: changes what the NEXT pod runs and leaves the CURRENT one on the old code indefinitely.
+#: Measured: mach's hear/event rows kept failing "time must be an object" for two hours after
+#: #203 (ffd2054) was merged and its ConfigMap applied, because the running bridge pod predated
+#: both and nothing forced it to restart; the fix had shipped and was invisible from the cluster.
+#: Stamping the bundle's own source digest into the Deployment's pod-template annotations makes
+#: every regeneration change the template, so `kubectl apply -f hear-mqtt-bridge.yaml` (which an
+#: operator must still run -- this script does not touch the cluster) always rolls the pod, the
+#: same way EMBEDDED_BUNDLES keeps a ConfigMap from drifting from the checkout that ships it.
+DEPLOYMENT_CHECKSUM_TARGETS = {
+    "hear-mqtt-bridge-code": "deploy/k8s/hear-mqtt-bridge.yaml",
+}
+
 
 def _imported_paths(tree):
     """Every repo-local module path a parsed file imports, as repo-relative .py paths.
@@ -590,6 +609,42 @@ def render_embedded(name, sha, text):
     return "\n".join(out + after)
 
 
+def sync_deployment_checksum(name, digest):
+    """Rewrites `checksum/<name>` in DEPLOYMENT_CHECKSUM_TARGETS[name]'s pod-template
+    annotations to `digest`, touching nothing else in the file.
+
+    ⚠️ONE LINE, FOUND BY EXACT KEY, NOT A YAML ROUND-TRIP. Loading this manifest with
+    `yaml.safe_load`/`yaml.dump` and writing it back out would reformat every comment,
+    quoting style and key order in a hand-maintained file that also carries a PVC and a
+    Deployment -- the same reason render_embedded() edits ConfigMap text directly instead
+    of parsing it. This is a targeted line replace: the key already exists (this script
+    does not invent the annotations block), and the only thing that may change is the
+    value after the colon.
+    """
+    rel = DEPLOYMENT_CHECKSUM_TARGETS[name]
+    path = os.path.join(ROOT, rel)
+    text = open(path).read()
+    key = "checksum/%s:" % name
+    lines = text.split("\n")
+    hits = [i for i, l in enumerate(lines) if l.strip().startswith(key)]
+    if len(hits) != 1:
+        sys.exit("%s: expected exactly one %r annotation in %s, found %d"
+                 % (name, key, rel, len(hits)))
+    i = hits[0]
+    indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+    lines[i] = "%s%s %r" % (indent, key, digest)
+    new_text = "\n".join(lines)
+    if new_text == text:
+        return False
+    tmp = path + ".regen"
+    with open(tmp, "w") as fh:
+        fh.write(new_text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    return True
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     name = argv[0] if argv else DEFAULT_BUNDLE
@@ -616,6 +671,10 @@ def main(argv=None):
     # write dirties the tree it stamps. Only its OTHER documents are hand-maintained, and an
     # edit to those is not evidence about the source this ConfigMap ships.
     generated |= {m for m, _a, _c, _d in EMBEDDED_BUNDLES.values()}
+    # ⚠️AND THE DEPLOYMENT A CHECKSUM IS SYNCED INTO, same reasoning: syncing the checksum
+    # dirties that manifest's tracked file, and that write is evidence about the regen, not
+    # about the source tree it stamps.
+    generated |= set(DEPLOYMENT_CHECKSUM_TARGETS.values())
     dirty = [ln for ln in porcelain if ln[3:].strip().strip('"') not in generated]
     stamp = sha + ("-dirty" if dirty else "")
     if embedded:
@@ -638,6 +697,17 @@ def main(argv=None):
             "%s: regenerated in place inside %s from %s\n  kubectl apply -f %s\n"
             % (name, manifest, ", ".join(rel for _k, rel in code + data), manifest))
         return
+    if name in DEPLOYMENT_CHECKSUM_TARGETS:
+        # ⚠️THE DIGEST, NOT THE STAMP. `stamp` carries the commit (and "-dirty"), which is
+        # provenance about *this generation*; the Deployment must instead change exactly when
+        # the bundle's SOURCE changes, the same signal source_digest() already gives the
+        # ConfigMap's own dama-hear/source-sha256 annotation, so a clean re-run of this
+        # generator against unchanged sources never dirties the Deployment file either.
+        changed = sync_deployment_checksum(name, source_digest(code, data))
+        if changed:
+            sys.stderr.write(
+                "%s: checksum synced into %s (forces a pod restart on next apply)\n"
+                % (name, DEPLOYMENT_CHECKSUM_TARGETS[name]))
     text = render(name, app, code, data, stamp)
     mode, n_bytes, n_ann = apply_mode(code, data, name=name, sha=stamp, app=app)
     # stderr, because stdout is redirected into the .yaml by the documented command and an
