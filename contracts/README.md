@@ -17,13 +17,26 @@ contracts/
 | Contract | Source of truth | Generator | Decision |
 |---|---|---|---|
 | `hear.ingest.v1` | `hear/ingest/envelope.py` | `tools/gen_ingest_contracts.py` | `docs/decisions/0001-hear-ingest-v1-envelope-and-codec.md` |
+| `hear.ingest.batch.v1` | `hear/ingest/batch.py` | `tools/gen_ingest_contracts.py` | `docs/decisions/0004-phase4-https-batch-ingest-adapter.md` |
+
+`hear.ingest.batch.v1` is the HTTPS batch request frame and its receipt. It carries
+`hear.ingest.v1` items but versions only the framing: an unsupported *frame* major is refused
+whole, an unsupported *item* major refuses that item alone. Its fixture manifest also
+publishes the server-enforced limits and the item status vocabulary, so a cross-language
+adapter reads them instead of hard-coding them.
 
 Regenerate and verify:
 
 ```sh
 python3 tools/gen_ingest_contracts.py           # rewrite artifacts
 python3 tools/gen_ingest_contracts.py --check   # CI gate: fail on drift
+python3 tools/freeze_contracts.py --check       # CI gate: artifacts match the frozen baseline
 ```
+
+The generator decides what the artifacts say. The frozen baseline
+(`docs/data/phase0-freeze-contracts.v1.json`) records their bytes, so a hand edit to a
+generated schema, fixture or manifest fails the freeze even if it is never regenerated.
+Regenerate both after any contract change.
 
 ## Rules
 

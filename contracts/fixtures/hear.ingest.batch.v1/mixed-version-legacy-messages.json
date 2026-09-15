@@ -1,0 +1,70 @@
+{
+  "batch_schema_version": 1,
+  "batch_id": "018f2c1a-batch-legacy-1",
+  "device_id": "nyquist",
+  "sent_at": "2026-09-14T18:03:11.990000Z",
+  "messages": [
+    {
+      "telemetry_path": "hear/heartbeat",
+      "telemetry_schema_version": 1,
+      "device_id": "nyquist",
+      "ts": "2026-09-14T18:03:10Z",
+      "ts_ms": 1789495390000,
+      "class": "esp32s3-i2s-gps",
+      "fw_version": "hear-node-2026.09.1",
+      "uptime_s": 86412,
+      "gps": {
+        "fix": 1
+      },
+      "time": {
+        "valid": true,
+        "state": "LOCKED",
+        "sync_sigma_ns": 420000,
+        "anchor_age_us": 812000,
+        "boot_epoch_us": 1789495200000000,
+        "boot_id": "018f2b905f3c7c21",
+        "discontinuity_flags": 0
+      },
+      "wifi": {
+        "rssi_dbm": -61
+      },
+      "counters": {
+        "scene_rows_written": 91204,
+        "dets_rows_written": 4471,
+        "clips_written": 38,
+        "clips_evicted": 4
+      }
+    },
+    {
+      "telemetry_path": "hear/event",
+      "telemetry_schema_version": 1,
+      "device_id": "nyquist",
+      "ts": "2026-09-14T18:03:11Z",
+      "ts_ms": 1789495391000,
+      "class": "esp32s3-i2s-gps",
+      "fw_version": "hear-node-2026.09.1",
+      "uptime_s": 86413,
+      "time": {
+        "valid": true,
+        "state": "LOCKED",
+        "sync_sigma_ns": 420000,
+        "anchor_age_us": 813000,
+        "boot_epoch_us": 1789495200000000,
+        "boot_id": "018f2b905f3c7c21",
+        "discontinuity_flags": 0
+      },
+      "event_type": "dets",
+      "event_seq": 512,
+      "event": {
+        "dets_rows_written": 4471,
+        "batch_rows": 12
+      }
+    }
+  ],
+  "producer": {
+    "boot_id": "018f2b90-5f3c-7c21-9a7e-1d2c3b4a5e6f",
+    "boot_epoch_us": 1789495200000000,
+    "batch_sequence": 7,
+    "spool_backlog": 118
+  }
+}

@@ -1,7 +1,7 @@
 -- Semantic fixture for the Postgres durable outbox.
 --
 -- Runs the audited defect cases and the retention/claim rules against a real, empty database
--- that has migrations 0001-0005 applied, and raises on the first violated invariant. It is the
+-- that has migrations 0001-0006 applied, and raises on the first violated invariant. It is the
 -- executable half of docs/durable-postgres-schema.md: every assertion here corresponds to a row
 -- of the audit's test matrix that can be decided by the schema alone (the rest need the Python
 -- store, which does not exist yet).
@@ -384,6 +384,90 @@ BEGIN
         RAISE EXCEPTION 'grants: the writer role must not be able to delete records';
     EXCEPTION WHEN insufficient_privilege THEN
         NULL;
+    END;
+END;
+$$;
+
+-- ------------------------------------------------------------------------------------------
+-- R4Q: the refusal quarantine stores rejected input, bounds it, and cannot reach the outbox
+-- ------------------------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_id       bigint;
+    v_rows     bigint;
+    v_outbox   bigint;
+    v_outbox2  bigint;
+    v_evicted  bigint;
+    v_health   jsonb;
+BEGIN
+    PERFORM set_config('hear.tenant_id', 'default', false);
+    SELECT count(*) INTO v_outbox FROM hear.durable_records;
+
+    -- A refused message is recorded, and a repeat of the identical refusal bumps the counter
+    -- instead of adding a row.
+    v_id := hear.record_refusal('default', 'uid-refusal-1', 'hear/event', 'mach', 'mqtt_bridge',
+                                'time must be an object', '{"telemetry_path":"hear/event"}');
+    IF v_id IS NULL THEN
+        RAISE EXCEPTION 'R4Q: a refusal within the bounds must be stored';
+    END IF;
+    PERFORM hear.record_refusal('default', 'uid-refusal-1', 'hear/event', 'mach', 'mqtt_bridge',
+                                'time must be an object', '{"telemetry_path":"hear/event"}');
+    SELECT count(*) INTO v_rows FROM hear.refused_messages;
+    IF v_rows <> 1 THEN
+        RAISE EXCEPTION 'R4Q: a repeated refusal must bump occurrences, got % rows', v_rows;
+    END IF;
+    IF (SELECT occurrences FROM hear.refused_messages WHERE refusal_uid = 'uid-refusal-1') <> 2 THEN
+        RAISE EXCEPTION 'R4Q: the repeat was not counted';
+    END IF;
+
+    -- A flood of distinct bodies is bounded by row count, not by age, and the eviction takes
+    -- from the loudest publisher.
+    FOR i IN 1..40 LOOP
+        PERFORM hear.record_refusal('default', 'flood-' || i, 'hear/event', 'flooder',
+                                    'mqtt_bridge', 'malformed JSON', '{"n":' || i || '}',
+                                    false, 10, 16777216);
+    END LOOP;
+    SELECT count(*) INTO v_rows FROM hear.refused_messages;
+    IF v_rows > 10 THEN
+        RAISE EXCEPTION 'R4Q: the row cap must bound the quarantine, got % rows', v_rows;
+    END IF;
+
+    -- The outbox is untouched by any of it.
+    SELECT count(*) INTO v_outbox2 FROM hear.durable_records;
+    IF v_outbox2 <> v_outbox THEN
+        RAISE EXCEPTION 'R4Q: refusal handling must never touch accepted records (% -> %)',
+            v_outbox, v_outbox2;
+    END IF;
+
+    -- The writer bounds the ring through the definer function, but still cannot delete by hand.
+    BEGIN
+        DELETE FROM hear.refused_messages WHERE refusal_uid = 'uid-refusal-1';
+        RAISE EXCEPTION 'R4Q: the writer role must not be able to delete refusals directly';
+    EXCEPTION WHEN insufficient_privilege THEN
+        NULL;
+    END;
+
+    -- Health reports the quarantine without widening the durable health contract.
+    v_health := hear.refusal_health_snapshot();
+    IF (v_health->>'refused_messages')::bigint <> v_rows THEN
+        RAISE EXCEPTION 'R4Q: refusal health must report the stored rows';
+    END IF;
+    IF v_health ? 'pending_records' THEN
+        RAISE EXCEPTION 'R4Q: the refusal surface must not restate the durable health contract';
+    END IF;
+
+    -- Retention is dry-run by default and refuses to exceed the governance ceiling.
+    PERFORM hear.enforce_refusal_retention(30);
+    IF (SELECT count(*) FROM hear.refused_messages) <> v_rows THEN
+        RAISE EXCEPTION 'R4Q: a dry-run retention must not delete anything';
+    END IF;
+    BEGIN
+        PERFORM hear.enforce_refusal_retention(365, false);
+        RAISE EXCEPTION 'R4Q: retention beyond 90 days must be refused';
+    EXCEPTION WHEN raise_exception THEN
+        IF SQLERRM LIKE 'R4Q:%' THEN
+            RAISE;
+        END IF;
     END;
 END;
 $$;

@@ -1,0 +1,25 @@
+# hear-numeric -- hear-runtime plus the numerical stack, installed from a hash-pinned lock.
+#
+# This is what replaces `pip install --target /pool/pylib numpy==2.2.6 scipy==1.15.3` in
+# hear-drain, hear-score and hear-tdoa. ⚠️Those three share ONE directory on the PVC today, so
+# whichever pod reaches an empty PVC first decides the versions for the other two and every pin
+# below it reads as discipline while enforcing nothing. In an image there is no first writer.
+#
+# ⚠️THE PARENT IS AN ARGUMENT SO CI CAN PASS A DIGEST. A local build uses the dev tag; the images
+# workflow builds hear-runtime, reads the digest it produced, and passes it here, so a published
+# hear-numeric records exactly which hear-runtime it was built on.
+ARG RUNTIME_IMAGE=hear-runtime:dev
+FROM ${RUNTIME_IMAGE}
+
+LABEL org.opencontainers.image.title="hear-numeric"
+LABEL org.opencontainers.image.description="hear-runtime + numpy/scipy, from requirements/lock/numeric.txt."
+
+USER root
+COPY requirements/lock/numeric.txt /etc/hear/lock/numeric.txt
+# --require-hashes: every artifact is verified against the lock, so a compromised or re-uploaded
+# index cannot substitute one. --no-deps: the resolver already ran (gen_pip_lock.py); the build
+# replays a closure instead of computing a new one.
+RUN set -eux; \
+    pip install --no-cache-dir --require-hashes --no-deps -r /etc/hear/lock/numeric.txt; \
+    python -c "import numpy, scipy; print(numpy.__version__, scipy.__version__)"
+USER 65532:65532

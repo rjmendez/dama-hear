@@ -725,6 +725,11 @@ static const char *selftest_wifi_now() {
 static void log_selftest() {
   logf("selftest mic=%s gps=%s pps=%s wifi=%s\n",
        selftest_mic, selftest_gps, selftest_pps, selftest_wifi);
+  // The verdict alone cannot be read: `silent` after one read and `silent` after the whole settle
+  // window are different claims about the hardware. Say which one this boot made.
+  logf("selftest mic_state=%s reason=%s attempts=%lu settle_ms=%lu\n",
+       selftest_mic_diag.state_name, selftest_mic_diag.reason,
+       (unsigned long)selftest_mic_diag.attempts, (unsigned long)selftest_mic_diag.settle_ms);
 }
 // Node POSITION. NAV-PVT has carried lat/lon all along and this firmware parsed the same message
 // for time and threw the position away -- which left the array unable to do the one thing it is
@@ -2428,6 +2433,20 @@ static void gps_wait_ms(uint32_t ms) {
 }
 
 // Pumps until the socket can take STREAM_CHUNK_B without blocking. false: gone or stalled.
+//
+// ⚠️ALSO SERVICES THE RUNTIME WATCHDOG, and it is the only place in a transfer that does.
+// loop_wdt_arm(5000) (PR #175) put the loop task under a 5 s task_wdt, but http.handleClient()
+// runs the handlers from inside loop(), so every byte of a response is sent between two of
+// loop()'s boot_wdt_service() calls. A whole-file /sd fetch of a rolled CSV -- rankine's card
+// held an 11.6 MB scene-20260915.csv -- spends tens of seconds in the transfer loop below, so
+// v0.1.5 panicked with reset=task_wdt a few minutes into every */15 hear-drain window and the
+// drain saw TimeoutError for exactly those files.
+//
+// Servicing here and nowhere else is deliberate: every long handler (/sd, /ls, /audio, /perf)
+// gates each chunk on this function, so one call covers all of them, and nothing ELSE in those
+// loops is covered. A card read, a socket write or any other call that actually blocks never
+// reaches this line, so a real hang still panics on schedule. The no-progress case is bounded by
+// STREAM_STALL_MS below, which returns false and ends the response rather than spinning forever.
 static bool stream_ready(WiFiClient &c, uint64_t *due) {
   uint32_t t0 = millis();
   for (;;) {
@@ -3354,7 +3373,7 @@ static String status_json() {
     "\"selftest\":{\"mic\":\"%s\",\"mic_state\":\"%s\",\"mic_reason\":\"%s\","
       "\"mic_stats\":{\"samples\":%lu,\"lo\":%d,\"hi\":%d,\"span\":%lu,\"mean\":%ld,"
         "\"mean_abs\":%lu,\"zero_cross_pct\":%lu,\"same_adj_pct\":%lu,\"unique\":%lu,"
-        "\"sat_pct\":%lu,\"rail_hits\":%lu},"
+        "\"sat_pct\":%lu,\"rail_hits\":%lu,\"attempts\":%lu,\"settle_ms\":%lu},"
       "\"gps\":\"%s\",\"pps\":\"%s\",\"wifi\":\"%s\"},"
     "\"net\":{\"connected\":%s,\"rssi\":%s,\"rssi_join\":%d,\"ch\":%d,\"bssid\":\"%s\",\"joined\":%d,"
       "\"seen\":%d,\"join_ms\":%lu,\"disc\":%lu,\"reconn\":%lu,\"reason\":%d,\"disc_age_s\":%s},"
@@ -3447,6 +3466,7 @@ static String status_json() {
     (unsigned long)selftest_mic_diag.mean_abs, (unsigned long)selftest_mic_diag.zero_cross_pct,
     (unsigned long)selftest_mic_diag.same_adj_pct, (unsigned long)selftest_mic_diag.unique,
     (unsigned long)selftest_mic_diag.sat_pct, (unsigned long)selftest_mic_diag.rail_hits,
+    (unsigned long)selftest_mic_diag.attempts, (unsigned long)selftest_mic_diag.settle_ms,
     selftest_gps_now(), selftest_pps_now(), selftest_wifi_now(),
     WiFi.isConnected() ? "true" : "false", rssi_json(), net_join.rssi_join, net_join.channel,
     bssid_str(), net_join.joined, net_join.seen, (unsigned long)net_join.join_ms,
@@ -4029,15 +4049,39 @@ static void selftest_gps_settle() {
   selftest_gps = gps_has_fix() ? "ok" : (gps_link_ok ? "no-fix" : "silent");
 }
 
+// The three hardware edges of the mic probe, kept behind callbacks so the settle policy itself
+// lives in mic_diagnostics.h and is exercised by tests without an ESP32 attached.
+static int mic_probe_read_i2s(void *ctx, int16_t *dst, size_t max_samples) {
+  (void)ctx;
+  size_t got = i2s.readBytes((char *)dst, max_samples * sizeof(int16_t));
+  return (int)(got / sizeof(int16_t));
+}
+static uint32_t mic_probe_now_ms(void *ctx) { (void)ctx; return millis(); }
+static void mic_probe_wait_ms(void *ctx, uint32_t ms) { (void)ctx; boot_wait_ms(ms); }
+static int mic_probe_cold_boot() {
+  esp_reset_reason_t r = esp_reset_reason();
+  // Only a reset that cut the microphone's supply is a cold one. ESP_RST_SW covers the OTA
+  // restart path, where the part kept running and answers the first read.
+  return r == ESP_RST_POWERON || r == ESP_RST_BROWNOUT || r == ESP_RST_DEEPSLEEP ||
+         r == ESP_RST_EXT || r == ESP_RST_UNKNOWN;
+}
+
 static void selftest_mic_probe() {
   int16_t probe[ABLOCK];
-  size_t got = i2s.readBytes((char *)probe, sizeof probe);
-  int n = got / 2;
-  if (n <= 0) {
-    selftest_mic_set_diag(mic_diag_missing("no_samples"));
-    return;
-  }
-  selftest_mic_set_diag(mic_diag_classify(probe, (size_t)n));
+  mic_probe_cfg_t cfg;
+  cfg.read = mic_probe_read_i2s;
+  cfg.now_ms = mic_probe_now_ms;
+  cfg.wait_ms = mic_probe_wait_ms;
+  cfg.ctx = NULL;
+  cfg.buf = probe;
+  cfg.buf_samples = ABLOCK;
+  // A cold part comes up from unpowered; a software/OTA restart leaves the mic supplied and it
+  // answers on the first read, so that path pays the shorter window only when something IS wrong.
+  cfg.settle_budget_ms = mic_probe_budget_ms(mic_probe_cold_boot());
+  cfg.retry_gap_ms = MIC_PROBE_RETRY_GAP_MS;
+  cfg.max_attempts = MIC_PROBE_MAX_ATTEMPTS;
+  selftest_mic_set_diag(mic_probe_settle(&cfg));
+  boot_wdt_service();
 }
 
 // DEFENCE IN DEPTH, NOT THE FIX. The push buffers are `static` (see HEAR_PUSH_BODY_MAX) so this

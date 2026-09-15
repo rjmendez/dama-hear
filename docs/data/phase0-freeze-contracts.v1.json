@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "7f2b41fd0bd62642f8d365ad43933bd06225d552b6b5ee2929f325e09736e80f",
+  "baseline_hash": "68bb14208259d80df1503ac9d08f2abc971bbde2128b759c1f2bc874e7a284db",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -251,7 +251,7 @@
     ],
     "default_board_class": "xiao-s3-pps",
     "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
-    "section_hash": "3fcf5bbb46bfba120bab6a1acab3a35521710b4fcc857000ff1abff8c193d875",
+    "section_hash": "af9ba585abe4af010b45e0a7aeb3a1061dac602cd8123b15b85588922fd37b34",
     "source_files": [
       {
         "path": ".github/workflows/firmware.yml",
@@ -270,8 +270,8 @@
       },
       {
         "path": "firmware/hear_node/README.md",
-        "sha256": "808840256488bf4e46abc230c7cf41c761faf907b216d653086bb952469798c2",
-        "size_bytes": 53621
+        "sha256": "ad202e43705846ffe29facaae533a456d154af53f066d86069bd389b941bbe7b",
+        "size_bytes": 54651
       },
       {
         "path": "firmware/hear_node/board_profiles.py",
@@ -285,8 +285,8 @@
       },
       {
         "path": "firmware/hear_node/hear_node.ino",
-        "sha256": "bd471b96e680a2cf26080039bf350f98937f7d29311a5a2b9a388fbe5ff5284a",
-        "size_bytes": 330047
+        "sha256": "ca2dcaef159645999a2a0a11a414dc8608e45b977dd814da9ed70ebf3f254aae",
+        "size_bytes": 333005
       },
       {
         "path": "firmware/hear_node/hear_push_payload.h",
@@ -477,8 +477,8 @@
       },
       {
         "path": "deploy/k8s/README.md",
-        "sha256": "157e2eed4140bfe331e0d8c39b45a1ca934b20f536c95a5a5dcf0f10f86b9ea7",
-        "size_bytes": 16983
+        "sha256": "0c8bc43156a57555f1c00931d0548795bc9c2bc93b349cfeed16664bf3d2c630",
+        "size_bytes": 20755
       }
     ],
     "objects": [
@@ -2123,7 +2123,7 @@
         "storage_request": "5Gi"
       }
     ],
-    "section_hash": "9ec4c936083033a3238a047532214784492b665fb2c5d8de9898cda19300b525"
+    "section_hash": "c95e3ae220c4ece6acd80de76c0ba0ece704b33f4a63e6276e0e10ac9d40090d"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",
@@ -2158,6 +2158,843 @@
         "topic_pattern": "dama/hear/spatial_events"
       }
     ]
+  },
+  "published_contracts": {
+    "authority_note": "Generated artifacts are written by their tools/gen_*.py generator and ruled on by tools/check_contract_layout.py. This section freezes their bytes so a published schema, fixture or manifest cannot change without moving the baseline hash.",
+    "contracts": [
+      {
+        "contract_hash": "91506c3ca6951a12372f0cddda7732a3987ea6aa548bd85fc6b488975e6cf3f2",
+        "contract_id": "hear.ingest.batch.receipt.v1",
+        "fixture_files": [],
+        "manifest_declared": null,
+        "manifest_file": null,
+        "schema_file": {
+          "path": "contracts/schemas/hear.ingest.batch.receipt.v1.schema.json",
+          "sha256": "bdd922f393b7a2f988b37f196cf24bc24b40897ae9b3407060aa218d88f0245e",
+          "size_bytes": 5839
+        }
+      },
+      {
+        "contract_hash": "3d8ffd668a6ee4f07c5c5185e2533e83eec97bd5fd3ab0db85f6d95326c5ec59",
+        "contract_id": "hear.ingest.batch.v1",
+        "fixture_files": [
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/batch-too-many-items.json",
+            "sha256": "2b41040a60afbf6ccc5604c5aae1c87b5ddba411ae7b7a920fe0f55a7ec57663",
+            "size_bytes": 850
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/device-identity-mismatch.json",
+            "sha256": "60fbc0c403e04ddeca1d59b9539fc6ad52f5fb51da9697fbc9faeb21009a0804",
+            "size_bytes": 1326
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/empty-batch.json",
+            "sha256": "fdabe6d57bbf285edb6cea7b8c4da6e3ec191fb6555079575851deb5b3660090",
+            "size_bytes": 325
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/forward-additive-frame-fields.json",
+            "sha256": "9e525a79fb2ec7e4f57845f9d5c58a3dc8bda42040fded07824c0bb44f8a20a1",
+            "size_bytes": 3376
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/gateway-site-scoped-batch.json",
+            "sha256": "81bf21c6b82b66fdd36e936d929c470709a744710f7e84e75c78f21f7a9a1b65",
+            "size_bytes": 2413
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/gateway-site-scoped-batch.receipt.json",
+            "sha256": "8f8f32c8dcccec0de69886798304ac93deefd2d72190f739c8496e2228bbb1eb",
+            "size_bytes": 861
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/item-future-major-refused-alone.json",
+            "sha256": "66fc0ab9d3e13a3ba9184715eaba709d5a64797e1d261d53b4e43423c07f90f2",
+            "size_bytes": 2326
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/item-future-major-refused-alone.receipt.json",
+            "sha256": "bfd941f1f9e2faa48235fad3a9d1d31d530b4eb24ad990a97b4070de3cdc9d35",
+            "size_bytes": 870
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/item-identity-mismatch.json",
+            "sha256": "5e6dde945d318cc1f24afdb4e3f68fed9e5cc8932558cacc4f0b5cf281fdb764",
+            "size_bytes": 2325
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/item-identity-mismatch.receipt.json",
+            "sha256": "38d2ab915f68581f22d51db5b53fb1562a356be6e0ac260b8d13381a8dcc0cbc",
+            "size_bytes": 866
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/malformed-frame-field-types.json",
+            "sha256": "a7d4e65fae2b3828565de1fc39e4ad54c62468796129986c6a7402e2f3abfa37",
+            "size_bytes": 1333
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/missing-credential.json",
+            "sha256": "fa27398775d256af9711c76b6807745c20f909f02785a44e576fa2b70667a958",
+            "size_bytes": 3321
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/mixed-version-legacy-messages.json",
+            "sha256": "37cc0d8c2a7ed99381628bdfbcceca921cb0da94b9b69424e95963f46347ed10",
+            "size_bytes": 1799
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/poison-item-keeps-batch.json",
+            "sha256": "6b3b360fe0fe5bb2bb7694f3b5910e02e1079e108e69612fe7d504113150211a",
+            "size_bytes": 3222
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/poison-item-keeps-batch.receipt.json",
+            "sha256": "45d22a01d8e8d9769aff965ee4c8053ef156373365bc023962ea817550c1e54c",
+            "size_bytes": 1082
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/unrecognized-items-refused.json",
+            "sha256": "21e9f1dce918979758547ce25560ff7807c8002fbfe01a8a6fd62ecb94a5eed6",
+            "size_bytes": 1382
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/unrecognized-items-refused.receipt.json",
+            "sha256": "bbe4d9b11dfa9cfdcf7e75f8c55fb6cf2215cd8fb97753da81fd5bef7dacd63b",
+            "size_bytes": 1071
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/unsupported-future-batch-major.json",
+            "sha256": "918927511f0d9bd34cfe0c011301c737175a2290de2d757a5d4831fef3dbd131",
+            "size_bytes": 3321
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/valid-node-batch.json",
+            "sha256": "fa27398775d256af9711c76b6807745c20f909f02785a44e576fa2b70667a958",
+            "size_bytes": 3321
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.batch.v1/valid-node-batch.receipt.json",
+            "sha256": "1511808fa47bef11ac25942f2f9863bae8ad4bf68c18f1b712235b373a9a612f",
+            "size_bytes": 1081
+          }
+        ],
+        "manifest_declared": {
+          "codecs": {
+            "json": "application/vnd.dama.hear.ingest.batch.v1+json"
+          },
+          "decision": "docs/decisions/0004-phase4-https-batch-ingest-adapter.md",
+          "fixtures": [
+            {
+              "credential": {
+                "credential_device_id": "nyquist"
+              },
+              "expect_ack_through_index": 2,
+              "expect_counts": {
+                "accepted": 3,
+                "deferred": 0,
+                "duplicate": 0,
+                "refused": 0,
+                "submitted": 3
+              },
+              "expect_items": [
+                {
+                  "classification": "canonical",
+                  "dispatchable": true,
+                  "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+                  "index": 0,
+                  "raw_ref": null,
+                  "reasons": [],
+                  "status": "accepted"
+                },
+                {
+                  "classification": "canonical",
+                  "dispatchable": true,
+                  "event_id": "e083f81e-7ee3-85a4-87e6-1790aa1185a1",
+                  "index": 1,
+                  "raw_ref": null,
+                  "reasons": [],
+                  "status": "accepted"
+                },
+                {
+                  "classification": "canonical",
+                  "dispatchable": true,
+                  "event_id": "25c4998a-4f9f-8e79-a040-344a8204196a",
+                  "index": 2,
+                  "raw_ref": null,
+                  "reasons": [],
+                  "status": "accepted"
+                }
+              ],
+              "expect_reasons": [],
+              "expect_retry_indices": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "valid-node-batch.json",
+              "name": "valid-node-batch",
+              "receipt_file": "valid-node-batch.receipt.json",
+              "receipt_sha256": "1511808fa47bef11ac25942f2f9863bae8ad4bf68c18f1b712235b373a9a612f",
+              "sha256": "fa27398775d256af9711c76b6807745c20f909f02785a44e576fa2b70667a958"
+            },
+            {
+              "credential": {
+                "credential_device_id": "nyquist"
+              },
+              "expect_ack_through_index": -1,
+              "expect_counts": {
+                "accepted": 0,
+                "deferred": 2,
+                "duplicate": 0,
+                "refused": 0,
+                "submitted": 2
+              },
+              "expect_items": [
+                {
+                  "classification": "translation_required",
+                  "dispatchable": false,
+                  "event_id": null,
+                  "index": 0,
+                  "raw_ref": null,
+                  "reasons": [],
+                  "status": "deferred"
+                },
+                {
+                  "classification": "translation_required",
+                  "dispatchable": false,
+                  "event_id": null,
+                  "index": 1,
+                  "raw_ref": null,
+                  "reasons": [],
+                  "status": "deferred"
+                }
+              ],
+              "expect_reasons": [],
+              "expect_retry_indices": [
+                0,
+                1
+              ],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "mixed-version-legacy-messages.json",
+              "name": "mixed-version-legacy-messages",
+              "sha256": "37cc0d8c2a7ed99381628bdfbcceca921cb0da94b9b69424e95963f46347ed10"
+            },
+            {
+              "credential": {
+                "credential_device_id": "nyquist"
+              },
+              "expect_ack_through_index": 2,
+              "expect_counts": {
+                "accepted": 2,
+                "deferred": 0,
+                "duplicate": 0,
+                "refused": 1,
+                "submitted": 3
+              },
+              "expect_items": [
+                {
+                  "classification": "canonical",
+                  "dispatchable": true,
+                  "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+                  "index": 0,
+                  "raw_ref": null,
+                  "reasons": [],
+                  "status": "accepted"
+                },
+                {
+                  "classification": "canonical",
+                  "dispatchable": false,
+                  "event_id": null,
+                  "index": 1,
+                  "raw_ref": null,
+                  "reasons": [
+                    "field_missing"
+                  ],
+                  "status": "refused"
+                },
+                {
+                  "classification": "canonical",
+                  "dispatchable": true,
+                  "event_id": "25c4998a-4f9f-8e79-a040-344a8204196a",
+                  "index": 2,
+                  "raw_ref": null,
+                  "reasons": [],
+                  "status": "accepted"
+                }
+              ],
+              "expect_reasons": [],
+              "expect_retry_indices": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "poison-item-keeps-batch.json",
+              "name": "poison-item-keeps-batch",
+              "receipt_file": "poison-item-keeps-batch.receipt.json",
+              "receipt_sha256": "45d22a01d8e8d9769aff965ee4c8053ef156373365bc023962ea817550c1e54c",
+              "sha256": "6b3b360fe0fe5bb2bb7694f3b5910e02e1079e108e69612fe7d504113150211a"
+            },
+            {
+              "credential": {
+                "credential_device_id": "nyquist"
+              },
+              "expect_ack_through_index": 1,
+              "expect_counts": {
+                "accepted": 1,
+                "deferred": 0,
+                "duplicate": 0,
+                "refused": 1,
+                "submitted": 2
+              },
+              "expect_items": [
+                {
+                  "classification": "canonical",
+                  "dispatchable": true,
+                  "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+                  "index": 0,
+                  "raw_ref": null,
+                  "reasons": [],
+                  "status": "accepted"
+                },
+                {
+                  "classification": "canonical",
+                  "dispatchable": false,
+                  "event_id": null,
+                  "index": 1,
+                  "raw_ref": null,
+                  "reasons": [
+                    "schema_version_unsupported"
+                  ],
+                  "status": "refused"
+                }
+              ],
+              "expect_reasons": [],
+              "expect_retry_indices": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "item-future-major-refused-alone.json",
+              "name": "item-future-major-refused-alone",
+              "receipt_file": "item-future-major-refused-alone.receipt.json",
+              "receipt_sha256": "bfd941f1f9e2faa48235fad3a9d1d31d530b4eb24ad990a97b4070de3cdc9d35",
+              "sha256": "66fc0ab9d3e13a3ba9184715eaba709d5a64797e1d261d53b4e43423c07f90f2"
+            },
+            {
+              "credential": {
+                "credential_device_id": "nyquist"
+              },
+              "expect_ack_through_index": 1,
+              "expect_counts": {
+                "accepted": 1,
+                "deferred": 0,
+                "duplicate": 0,
+                "refused": 1,
+                "submitted": 2
+              },
+              "expect_items": [
+                {
+                  "classification": "canonical",
+                  "dispatchable": true,
+                  "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+                  "index": 0,
+                  "raw_ref": null,
+                  "reasons": [],
+                  "status": "accepted"
+                },
+                {
+                  "classification": "canonical",
+                  "dispatchable": false,
+                  "event_id": null,
+                  "index": 1,
+                  "raw_ref": null,
+                  "reasons": [
+                    "item_identity_mismatch"
+                  ],
+                  "status": "refused"
+                }
+              ],
+              "expect_reasons": [],
+              "expect_retry_indices": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "item-identity-mismatch.json",
+              "name": "item-identity-mismatch",
+              "receipt_file": "item-identity-mismatch.receipt.json",
+              "receipt_sha256": "38d2ab915f68581f22d51db5b53fb1562a356be6e0ac260b8d13381a8dcc0cbc",
+              "sha256": "5e6dde945d318cc1f24afdb4e3f68fed9e5cc8932558cacc4f0b5cf281fdb764"
+            },
+            {
+              "credential": {
+                "credential_device_id": null,
+                "credential_site_id": "site-quarry-north",
+                "site_scoped": true
+              },
+              "expect_ack_through_index": 1,
+              "expect_counts": {
+                "accepted": 2,
+                "deferred": 0,
+                "duplicate": 0,
+                "refused": 0,
+                "submitted": 2
+              },
+              "expect_items": [
+                {
+                  "classification": "canonical",
+                  "dispatchable": true,
+                  "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+                  "index": 0,
+                  "raw_ref": null,
+                  "reasons": [],
+                  "status": "accepted"
+                },
+                {
+                  "classification": "canonical",
+                  "dispatchable": true,
+                  "event_id": "eebef916-0ed5-8705-8ec7-492040516aaa",
+                  "index": 1,
+                  "raw_ref": null,
+                  "reasons": [],
+                  "status": "accepted"
+                }
+              ],
+              "expect_reasons": [],
+              "expect_retry_indices": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "gateway-site-scoped-batch.json",
+              "name": "gateway-site-scoped-batch",
+              "receipt_file": "gateway-site-scoped-batch.receipt.json",
+              "receipt_sha256": "8f8f32c8dcccec0de69886798304ac93deefd2d72190f739c8496e2228bbb1eb",
+              "sha256": "81bf21c6b82b66fdd36e936d929c470709a744710f7e84e75c78f21f7a9a1b65"
+            },
+            {
+              "credential": {
+                "credential_device_id": "nyquist"
+              },
+              "expect_ack_through_index": 2,
+              "expect_counts": {
+                "accepted": 3,
+                "deferred": 0,
+                "duplicate": 0,
+                "refused": 0,
+                "submitted": 3
+              },
+              "expect_items": [
+                {
+                  "classification": "canonical",
+                  "dispatchable": true,
+                  "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+                  "index": 0,
+                  "raw_ref": null,
+                  "reasons": [],
+                  "status": "accepted"
+                },
+                {
+                  "classification": "canonical",
+                  "dispatchable": true,
+                  "event_id": "e083f81e-7ee3-85a4-87e6-1790aa1185a1",
+                  "index": 1,
+                  "raw_ref": null,
+                  "reasons": [],
+                  "status": "accepted"
+                },
+                {
+                  "classification": "canonical",
+                  "dispatchable": true,
+                  "event_id": "25c4998a-4f9f-8e79-a040-344a8204196a",
+                  "index": 2,
+                  "raw_ref": null,
+                  "reasons": [],
+                  "status": "accepted"
+                }
+              ],
+              "expect_reasons": [],
+              "expect_retry_indices": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [
+                "compression",
+                "producer.link"
+              ],
+              "file": "forward-additive-frame-fields.json",
+              "name": "forward-additive-frame-fields",
+              "sha256": "9e525a79fb2ec7e4f57845f9d5c58a3dc8bda42040fded07824c0bb44f8a20a1"
+            },
+            {
+              "credential": {
+                "credential_device_id": "nyquist"
+              },
+              "expect_ack_through_index": 2,
+              "expect_counts": {
+                "accepted": 1,
+                "deferred": 0,
+                "duplicate": 0,
+                "refused": 2,
+                "submitted": 3
+              },
+              "expect_items": [
+                {
+                  "classification": "canonical",
+                  "dispatchable": true,
+                  "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+                  "index": 0,
+                  "raw_ref": null,
+                  "reasons": [],
+                  "status": "accepted"
+                },
+                {
+                  "classification": null,
+                  "dispatchable": false,
+                  "event_id": null,
+                  "index": 1,
+                  "raw_ref": null,
+                  "reasons": [
+                    "item_unrecognized"
+                  ],
+                  "status": "refused"
+                },
+                {
+                  "classification": null,
+                  "dispatchable": false,
+                  "event_id": null,
+                  "index": 2,
+                  "raw_ref": null,
+                  "reasons": [
+                    "item_unrecognized"
+                  ],
+                  "status": "refused"
+                }
+              ],
+              "expect_reasons": [],
+              "expect_retry_indices": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "unrecognized-items-refused.json",
+              "name": "unrecognized-items-refused",
+              "receipt_file": "unrecognized-items-refused.receipt.json",
+              "receipt_sha256": "bbe4d9b11dfa9cfdcf7e75f8c55fb6cf2215cd8fb97753da81fd5bef7dacd63b",
+              "sha256": "21e9f1dce918979758547ce25560ff7807c8002fbfe01a8a6fd62ecb94a5eed6"
+            },
+            {
+              "credential": {
+                "credential_device_id": "nyquist"
+              },
+              "expect_items": [],
+              "expect_reasons": [
+                "batch_schema_version_unsupported"
+              ],
+              "expect_status": "refused",
+              "expect_unknown_fields": [],
+              "file": "unsupported-future-batch-major.json",
+              "name": "unsupported-future-batch-major",
+              "sha256": "918927511f0d9bd34cfe0c011301c737175a2290de2d757a5d4831fef3dbd131"
+            },
+            {
+              "credential": {
+                "credential_device_id": "nyquist"
+              },
+              "expect_items": [],
+              "expect_reasons": [
+                "batch_empty"
+              ],
+              "expect_status": "refused",
+              "expect_unknown_fields": [],
+              "file": "empty-batch.json",
+              "name": "empty-batch",
+              "sha256": "fdabe6d57bbf285edb6cea7b8c4da6e3ec191fb6555079575851deb5b3660090"
+            },
+            {
+              "credential": {
+                "credential_device_id": "nyquist"
+              },
+              "expect_items": [],
+              "expect_reasons": [
+                "batch_too_many_items"
+              ],
+              "expect_status": "refused",
+              "expect_unknown_fields": [],
+              "file": "batch-too-many-items.json",
+              "name": "batch-too-many-items",
+              "sha256": "2b41040a60afbf6ccc5604c5aae1c87b5ddba411ae7b7a920fe0f55a7ec57663"
+            },
+            {
+              "credential": {
+                "credential_device_id": "nyquist"
+              },
+              "expect_items": [],
+              "expect_reasons": [
+                "device_identity_mismatch"
+              ],
+              "expect_status": "refused",
+              "expect_unknown_fields": [],
+              "file": "device-identity-mismatch.json",
+              "name": "device-identity-mismatch",
+              "sha256": "60fbc0c403e04ddeca1d59b9539fc6ad52f5fb51da9697fbc9faeb21009a0804"
+            },
+            {
+              "credential": {
+                "credential_device_id": null
+              },
+              "expect_items": [],
+              "expect_reasons": [
+                "credential_missing"
+              ],
+              "expect_status": "refused",
+              "expect_unknown_fields": [],
+              "file": "missing-credential.json",
+              "name": "missing-credential",
+              "sha256": "fa27398775d256af9711c76b6807745c20f909f02785a44e576fa2b70667a958"
+            },
+            {
+              "credential": {
+                "credential_device_id": "nyquist"
+              },
+              "expect_items": [],
+              "expect_reasons": [
+                "timestamp_not_rfc3339_utc",
+                "type_invalid"
+              ],
+              "expect_status": "refused",
+              "expect_unknown_fields": [],
+              "file": "malformed-frame-field-types.json",
+              "name": "malformed-frame-field-types",
+              "sha256": "a7d4e65fae2b3828565de1fc39e4ad54c62468796129986c6a7402e2f3abfa37"
+            }
+          ],
+          "generator": "tools/gen_ingest_contracts.py",
+          "item_results_note": "expect_items is what the frame reader alone can conclude. It does not consult the durable store, so an item it calls `accepted` becomes `duplicate` when its event_id is already durable. An item classified `translation_required` carries no receipt-ready outcome at all: the adapter must translate it and call resolve_translation() to give it a real status, and build_receipt() refuses to issue a receipt while any item is still untranslated -- reporting one as `deferred` would tell the producer to resend it forever. A cross-language adapter asserts against these values for frame admission and item classification, not for the final persisted outcome.",
+          "item_results_stage": "frame-reader, pre-translation and pre-dedup",
+          "item_schema_file": "schemas/hear.ingest.v1.schema.json",
+          "item_schema_id": "hear.ingest.v1",
+          "item_statuses": [
+            "accepted",
+            "duplicate",
+            "refused",
+            "deferred"
+          ],
+          "limits": {
+            "max_batch_bytes": 262144,
+            "max_clock_skew_s": 900,
+            "max_item_bytes": 65536,
+            "max_items_per_batch": 64
+          },
+          "receipt_media_type": "application/vnd.dama.hear.ingest.batch-receipt.v1+json",
+          "receipt_schema_file": "schemas/hear.ingest.batch.receipt.v1.schema.json",
+          "receipt_schema_id": "hear.ingest.batch.receipt.v1",
+          "schema_file": "schemas/hear.ingest.batch.v1.schema.json",
+          "schema_id": "hear.ingest.batch.v1",
+          "schema_major": 1
+        },
+        "manifest_file": {
+          "path": "contracts/fixtures/hear.ingest.batch.v1/manifest.json",
+          "sha256": "4eb98291717282d709bec5ad92df926d7a2afabef6b37746fa3400a73c1b061d",
+          "size_bytes": 15336
+        },
+        "schema_file": {
+          "path": "contracts/schemas/hear.ingest.batch.v1.schema.json",
+          "sha256": "8e1fb2df5e6c0f5a0f386bcdbadcfd0047dc4d8db783e9d698d63c45d5c3032a",
+          "size_bytes": 4145
+        }
+      },
+      {
+        "contract_hash": "149a18a91bc3652d378f85cbaa5ecd4d65a9afb802144a66886fbbf85be18e51",
+        "contract_id": "hear.ingest.v1",
+        "fixture_files": [
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/degraded-no-clock-anchor.json",
+            "sha256": "18034d456e4e359341501d1994edb791f39c383b0d43f81bbf13ab8f76e7bbc4",
+            "size_bytes": 790
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/forward-additive-stripped.json",
+            "sha256": "33fba79f29783a82372a055fd2dff9f855b55be440bbabbc6d705ae2e60a7a21",
+            "size_bytes": 860
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/forward-additive-unknown-fields.json",
+            "sha256": "bf48c1df998bd7d8cf148fbe43c634f7b9c6691b70c3530dba91edc04c33f04d",
+            "size_bytes": 954
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/gotchi-adapter-sketch.json",
+            "sha256": "101052206fdc405dbf9a862b8a2a84c74b76487d67fe32325aed7cfc4e1b8541",
+            "size_bytes": 780
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/malformed-clock-valid-without-time.json",
+            "sha256": "79923e2097b685727cd8fa17cd79629ee4ae27f46fcf3efea060ded97c5dfbb0",
+            "size_bytes": 837
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/malformed-field-types.json",
+            "sha256": "70c8b806332d9c82aad123cd5eae53fd996d30e8e76da8dd02cd182234f42225",
+            "size_bytes": 757
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/malformed-missing-clock.json",
+            "sha256": "a125694f01735174e471cb1c4c05240093ae63775cfcc1ca6bd88c955ef652a0",
+            "size_bytes": 779
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/minimal-legacy-producer.json",
+            "sha256": "4661e871a7ee4179a377bc60112ae0b1db8c53cf397a13a9d287772ecb922e1e",
+            "size_bytes": 625
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/unsupported-future-major.json",
+            "sha256": "5ea74e18ec0396e5516c7f4b30ee98ef028c29cf3e69e74b5fdf08c3a6bd4afd",
+            "size_bytes": 862
+          },
+          {
+            "path": "contracts/fixtures/hear.ingest.v1/valid-node-detection.json",
+            "sha256": "3a43b833cd2ac44caebde0a151858527302b6b56308b6f710ba77681ae24dde2",
+            "size_bytes": 862
+          }
+        ],
+        "manifest_declared": {
+          "codecs": {
+            "json": "application/vnd.dama.hear.ingest.v1+json"
+          },
+          "fixtures": [
+            {
+              "expect_dispatchable": true,
+              "expect_reasons": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "valid-node-detection.json",
+              "name": "valid-node-detection",
+              "sha256": "3a43b833cd2ac44caebde0a151858527302b6b56308b6f710ba77681ae24dde2"
+            },
+            {
+              "expect_dispatchable": true,
+              "expect_reasons": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "degraded-no-clock-anchor.json",
+              "name": "degraded-no-clock-anchor",
+              "sha256": "18034d456e4e359341501d1994edb791f39c383b0d43f81bbf13ab8f76e7bbc4"
+            },
+            {
+              "expect_dispatchable": true,
+              "expect_reasons": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "minimal-legacy-producer.json",
+              "name": "minimal-legacy-producer",
+              "sha256": "4661e871a7ee4179a377bc60112ae0b1db8c53cf397a13a9d287772ecb922e1e"
+            },
+            {
+              "expect_dispatchable": true,
+              "expect_reasons": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "gotchi-adapter-sketch.json",
+              "name": "gotchi-adapter-sketch",
+              "sha256": "101052206fdc405dbf9a862b8a2a84c74b76487d67fe32325aed7cfc4e1b8541"
+            },
+            {
+              "expect_dispatchable": false,
+              "expect_reasons": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [
+                "adapter.commit",
+                "clock.holdover_s",
+                "ingest_hints"
+              ],
+              "file": "forward-additive-unknown-fields.json",
+              "name": "forward-additive-unknown-fields",
+              "sha256": "bf48c1df998bd7d8cf148fbe43c634f7b9c6691b70c3530dba91edc04c33f04d"
+            },
+            {
+              "expect_dispatchable": false,
+              "expect_reasons": [],
+              "expect_status": "accepted",
+              "expect_unknown_fields": [],
+              "file": "forward-additive-stripped.json",
+              "name": "forward-additive-stripped",
+              "sha256": "33fba79f29783a82372a055fd2dff9f855b55be440bbabbc6d705ae2e60a7a21"
+            },
+            {
+              "expect_dispatchable": false,
+              "expect_reasons": [
+                "schema_version_unsupported"
+              ],
+              "expect_status": "refused",
+              "expect_unknown_fields": [],
+              "file": "unsupported-future-major.json",
+              "name": "unsupported-future-major",
+              "sha256": "5ea74e18ec0396e5516c7f4b30ee98ef028c29cf3e69e74b5fdf08c3a6bd4afd"
+            },
+            {
+              "expect_dispatchable": false,
+              "expect_reasons": [
+                "field_missing"
+              ],
+              "expect_status": "refused",
+              "expect_unknown_fields": [],
+              "file": "malformed-missing-clock.json",
+              "name": "malformed-missing-clock",
+              "sha256": "a125694f01735174e471cb1c4c05240093ae63775cfcc1ca6bd88c955ef652a0"
+            },
+            {
+              "expect_dispatchable": false,
+              "expect_reasons": [
+                "timestamp_not_rfc3339_utc",
+                "type_invalid",
+                "value_out_of_range"
+              ],
+              "expect_status": "refused",
+              "expect_unknown_fields": [],
+              "file": "malformed-field-types.json",
+              "name": "malformed-field-types",
+              "sha256": "70c8b806332d9c82aad123cd5eae53fd996d30e8e76da8dd02cd182234f42225"
+            },
+            {
+              "expect_dispatchable": false,
+              "expect_reasons": [
+                "clock_valid_without_observed_at"
+              ],
+              "expect_status": "refused",
+              "expect_unknown_fields": [],
+              "file": "malformed-clock-valid-without-time.json",
+              "name": "malformed-clock-valid-without-time",
+              "sha256": "79923e2097b685727cd8fa17cd79629ee4ae27f46fcf3efea060ded97c5dfbb0"
+            }
+          ],
+          "generator": "tools/gen_ingest_contracts.py",
+          "identity_inputs": [
+            "source",
+            "device_id",
+            "kind",
+            "observed_at",
+            "producer.boot_id",
+            "producer.sequence",
+            "producer.cursor",
+            "payload"
+          ],
+          "schema_file": "schemas/hear.ingest.v1.schema.json",
+          "schema_id": "hear.ingest.v1",
+          "schema_major": 1
+        },
+        "manifest_file": {
+          "path": "contracts/fixtures/hear.ingest.v1/manifest.json",
+          "sha256": "911548909a45dae8c27d41bbcb7fc018b78d3160eeedd529df4606966a5ddbc1",
+          "size_bytes": 3929
+        },
+        "schema_file": {
+          "path": "contracts/schemas/hear.ingest.v1.schema.json",
+          "sha256": "604bb162690d127973f15738a5e7a33332b75b345c9d40e4f67646289afd1d70",
+          "size_bytes": 5543
+        }
+      }
+    ],
+    "generated_only": true,
+    "other_files": [
+      {
+        "path": "contracts/README.md",
+        "sha256": "8f247b09d00305f59620e533e9a3f27dae1427c91256b372bb451a0a0e0ea8e5",
+        "size_bytes": 2630
+      }
+    ],
+    "present": true,
+    "published_root": "contracts",
+    "section_hash": "a87c434d400f4f31ec4cc252761fff18ee14355a8170cf80133ef72315c082f3"
   },
   "redis_keys": {
     "keys": [
@@ -2598,6 +3435,18 @@
         ]
       },
       {
+        "schema": "hear.ingest.batch.receipt.v1",
+        "source_paths": [
+          "hear/ingest/batch.py"
+        ]
+      },
+      {
+        "schema": "hear.ingest.batch.v1",
+        "source_paths": [
+          "hear/ingest/batch.py"
+        ]
+      },
+      {
         "schema": "hear.ingest.v1",
         "source_paths": [
           "hear/ingest/envelope.py"
@@ -2648,7 +3497,7 @@
         ]
       }
     ],
-    "section_hash": "427c86937d28bd12b6de71c3b4604eae609d2b24edfd4f1a761256bc74a6b580",
+    "section_hash": "248d557d9051b2f32b5e89018296b180cf2772b602b7ed3ad3761989cc412519",
     "telemetry_routes": [
       {
         "http_path": "/api/hear/heartbeat",

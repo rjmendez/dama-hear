@@ -1,0 +1,9 @@
+# hear-numeric: the shared numerical stack, for the hear-drain / hear-score / hear-tdoa lanes.
+#
+# ⚠️These versions are the ones the pods install today (deploy/k8s/hear-*.yaml) and the ones
+# requirements/ci-pods.txt tests against. tests/test_image_pins.py fails if the three disagree,
+# because an image that is numerically different from CI is an image CI did not test.
+#
+# Resolved to requirements/lock/numeric.txt; that file, not this one, is what the build installs.
+numpy==2.2.6
+scipy==1.15.3

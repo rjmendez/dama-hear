@@ -130,10 +130,32 @@ def configure_tls(client: mqtt.Client, *, ca_certs: Optional[str] = None,
     return True
 
 
+def _uptime_fallback_ts_ms(payload: Mapping[str, Any]) -> bool:
+    """True when ``ts_ms`` is the node's own uptime-derived placeholder, not a wall clock.
+
+    hear_push_ts_ms() returns ``uptime_s * 1000 + 1`` while the clock is invalid, purely to clear
+    the upstream ingest gate that rejects a non-positive numeric timestamp. Matching that exact
+    arithmetic is how a body carrying no time block at all (pre-#156 event firmware) is still
+    recognised as having had no clock: the only wall clock that could collide is a 1970 one.
+    """
+    ts_ms = payload.get("ts_ms")
+    uptime_s = payload.get("uptime_s")
+    if isinstance(ts_ms, bool) or isinstance(uptime_s, bool):
+        return False
+    if not isinstance(ts_ms, (int, float)) or not isinstance(uptime_s, int):
+        return False
+    return int(ts_ms) == uptime_s * 1000 + 1
+
+
 def _stated_time_is_invalid(payload: Mapping[str, Any]) -> bool:
-    """True only when the payload explicitly states ``time.valid`` is false."""
+    """True when the payload states -- or, for a legacy body, demonstrates -- an invalid clock."""
     time_state = payload.get("time")
-    return isinstance(time_state, Mapping) and time_state.get("valid") is False
+    if isinstance(time_state, Mapping):
+        return time_state.get("valid") is False
+    # A pre-#156 firmware sends no time block on hear/event at all. Its uptime-derived ts_ms
+    # placeholder is the same "I have no clock" statement the time block would have carried, so
+    # the #185 fix has to cover it too or the upstream-rewritten ts is taken at face value.
+    return "time" not in payload and _uptime_fallback_ts_ms(payload)
 
 
 def device_id_from_topic(topic: str) -> Optional[str]:
@@ -153,6 +175,8 @@ class BridgeStats:
         self.rejected = 0
         self.malformed = 0
         self.impersonation = 0
+        # Refused messages that were durably quarantined rather than only logged (R4).
+        self.quarantined = 0
 
 
 def dispatch_message(store: HeartbeatReceiverStore, raw: bytes, topic: str,
@@ -175,6 +199,23 @@ def dispatch_message(store: HeartbeatReceiverStore, raw: bytes, topic: str,
         stats.ignored += 1
         return None
     validator, writer_name = route
+    telemetry_path = str(payload.get("telemetry_path"))
+    # The bytes as received, captured before any ts rewrite below: the quarantine is evidence of
+    # what the publisher sent, so it must not hold this bridge's repaired copy.
+    raw_payload = raw
+
+    def quarantine(reason: str) -> None:
+        # The topic segment first: it is the only identity the broker ties to the publishing
+        # connection, so grouping and rate-limiting on it cannot be evaded by rotating the
+        # device_id in the body.
+        device_id = device_id_from_topic(topic)
+        if not device_id:
+            claimed = payload.get("device_id")
+            device_id = claimed.strip() if isinstance(claimed, str) and claimed.strip() else "unknown"
+        entry = store.record_refusal(telemetry_path, device_id, "mqtt_bridge",
+                                     reason, raw_payload)
+        if entry is not None:
+            stats.quarantined += 1
 
     try:
         ts = payload.get("ts")
@@ -198,11 +239,13 @@ def dispatch_message(store: HeartbeatReceiverStore, raw: bytes, topic: str,
     except RequestError as exc:
         stats.rejected += 1
         logger.warning("rejected %s message on %s: %s", payload.get("telemetry_path"), topic, exc)
+        quarantine(str(exc))
         return None
     except (ValueError, OverflowError, OSError) as exc:
         stats.rejected += 1
         logger.warning("rejected %s message on %s: unusable numeric ts: %s",
                        payload.get("telemetry_path"), topic, exc)
+        quarantine(f"unusable numeric ts: {exc}")
         return None
 
     # The broker's topic is the only thing this bridge can trust to belong to the
@@ -218,6 +261,9 @@ def dispatch_message(store: HeartbeatReceiverStore, raw: bytes, topic: str,
             "(possible impersonation) on %s",
             payload.get("telemetry_path"), topic_device_id, payload_device_id, topic,
         )
+        quarantine(
+            f"topic device_id {topic_device_id!r} does not match payload device_id "
+            f"{payload_device_id!r}")
         return None
 
     writer: Callable[[Dict[str, Any]], Dict[str, Any]] = getattr(store, writer_name)
