@@ -37,6 +37,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import board_profiles  # noqa: E402
+import release_manifest  # noqa: E402
 
 SKETCH = os.path.relpath(HERE, REPO)
 FQBN = board_profiles.FQBN
@@ -99,9 +100,18 @@ def release_image(tag, board_class, repo=REPO_SLUG):
     base = "https://github.com/%s/releases/download/%s/" % (repo, tag)
     name = board_profiles.release_asset_name(tag, board_class, "app")
     try:
-        sums = enroll.fetch(base + "SHA256SUMS").decode()
+        manifest_text = None
+        try:
+            manifest_text = enroll.fetch(base + release_manifest.MANIFEST_NAME).decode()
+        except OSError:
+            pass
         data = enroll.fetch(base + name)
-        enroll.check_sums(sums, name, data)
+        if manifest_text is not None:
+            release_manifest.verify_downloaded_release_assets(
+                manifest_text, tag, board_class, {name: data})
+        else:
+            sums = enroll.fetch(base + "SHA256SUMS").decode()
+            enroll.check_sums(sums, name, data)
     except (OSError, ValueError) as e:
         die("release %s: %s" % (tag, e))
     d = os.path.join(REPO, ".otabuild", "release-%s-%s" % (tag, board_class))
@@ -109,7 +119,10 @@ def release_image(tag, board_class, repo=REPO_SLUG):
     path = os.path.join(d, name)
     with open(path, "wb") as f:
         f.write(data)
-    print("flash: %s verified against SHA256SUMS (%d B)" % (name, len(data)))
+    stamp = release_manifest.MANIFEST_NAME if manifest_text is not None else "SHA256SUMS"
+    if manifest_text is None:
+        stamp += " (legacy release)"
+    print("flash: %s verified against %s (%d B)" % (name, stamp, len(data)))
     return path
 
 

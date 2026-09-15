@@ -9,10 +9,12 @@ BOARD_PROFILES = {
     "xiao-s3-pps": {
         "cpp_flags": [],
         "release_stem": "hear_node-xiao-s3-pps",
+        "board_header": "firmware/boards/xiao_s3_sense.h",
     },
     "esp32s3-i2s-gps": {
         "cpp_flags": ["-DHEAR_BOARD_ESP32S3_I2S_GPS"],
         "release_stem": "hear_node-esp32s3-i2s-gps",
+        "board_header": "firmware/boards/esp32s3_i2s_gps.h",
     },
 }
 
@@ -46,6 +48,11 @@ def build_extra_flags(board_class, *extra_flags):
 def release_stem(board_class):
     require_board_class(board_class)
     return BOARD_PROFILES[board_class]["release_stem"]
+
+
+def board_header(board_class):
+    require_board_class(board_class)
+    return BOARD_PROFILES[board_class]["board_header"]
 
 
 def release_asset_name(tag, board_class, kind="app"):

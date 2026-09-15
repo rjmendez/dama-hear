@@ -34,6 +34,7 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import deploy_gate  # noqa: E402
 import board_profiles  # noqa: E402
+import release_manifest  # noqa: E402
 import wifi_store  # noqa: E402
 
 REPO_SLUG = "rjmendez/dama-hear"
@@ -98,14 +99,28 @@ def check_sums(sums_text, name, data):
 def release_files(tag, dest, board_class, repo=REPO_SLUG):
     board_profiles.require_board_class(board_class)
     base = "https://github.com/%s/releases/download/%s/" % (repo, tag)
-    sums = fetch(base + "SHA256SUMS").decode()
+    manifest_text = None
+    try:
+        manifest_text = fetch(base + release_manifest.MANIFEST_NAME).decode()
+    except OSError:
+        pass
+    sums = None if manifest_text is not None else fetch(base + "SHA256SUMS").decode()
+    fetched = {}
     for kind in ("app", "bootloader", "partitions"):
         name = board_profiles.release_asset_name(tag, board_class, kind)
         data = fetch(base + name)
-        check_sums(sums, name, data)
+        if manifest_text is None:
+            check_sums(sums, name, data)
+        fetched[name] = data
         with open(os.path.join(dest, board_profiles.upload_filename(kind)), "wb") as f:
             f.write(data)
-    print("enroll: %s %s assets verified against SHA256SUMS" % (tag, board_class))
+    if manifest_text is not None:
+        release_manifest.verify_downloaded_release_assets(manifest_text, tag, board_class, fetched)
+        print("enroll: %s %s assets verified against %s"
+              % (tag, board_class, release_manifest.MANIFEST_NAME))
+    else:
+        print("enroll: %s %s assets verified against SHA256SUMS (legacy release)"
+              % (tag, board_class))
 
 
 def upload(port, input_dir):
