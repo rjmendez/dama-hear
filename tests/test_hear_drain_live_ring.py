@@ -151,6 +151,53 @@ class CursorNode(CardlessNode):
         return body
 
 
+class TruncatingCursorNode(CursorNode):
+    """A cursor page whose body stops mid-row: the header it already sent still claims the lot.
+
+    `keep_rows` whole rows arrive, then the connection dies inside the next one -- the shape gold
+    served on 2026-09-13 once its heap ran out, now with a header in front of the rows.
+    """
+
+    def __init__(self, keep_rows=None, fail_after=None, **kw):
+        super().__init__(**kw)
+        self.keep_rows = keep_rows
+        self.fail_after = fail_after
+
+    def detections(self, ip, timeout=None, cursor=None, limit=None, until=None):
+        if self.fail_after is not None and self.detection_calls >= self.fail_after:
+            self.detection_calls += 1
+            raise OSError("the node closed the connection")
+        body = super().detections(ip, timeout, cursor=cursor, limit=limit, until=until)
+        if self.keep_rows is None or (cursor is None and limit is None and until is None):
+            return body
+        text = body.decode()
+        starts, k = [], text.index('"rows": [')
+        while True:
+            k = text.find('{"i": ', k)
+            if k < 0:
+                break
+            starts.append(k)
+            k += 1
+        if len(starts) <= self.keep_rows:
+            return body
+        return text[:starts[self.keep_rows] + 30].encode()
+
+
+class HolePageNode(CursorNode):
+    """A cut page whose FIRST row lost its `i`: nothing contiguous survives the salvage."""
+
+    def detections(self, ip, timeout=None, cursor=None, limit=None, until=None):
+        body = super().detections(ip, timeout, cursor=cursor, limit=limit, until=until)
+        if cursor is None and limit is None and until is None:
+            return body
+        obj = json.loads(body)
+        if len(obj["rows"]) < 3:
+            return body
+        obj["rows"][0].pop("i", None)
+        text = json.dumps(obj)
+        return text[:text.rfind('{"') + 30].encode()
+
+
 class BrokenCursorNode(CardlessNode):
     def detections(self, ip, timeout=None, cursor=None, limit=None, until=None):
         self.detection_calls += 1
@@ -387,6 +434,131 @@ class TestCursorDrain:
         assert "detections:" in r["errors"][0]
 
 
+class TestLegacyWatermarkInterop:
+    """A node drained before the cursor existed carries `last_i`, not `next_cursor`.
+
+    ⚠️A CURSORLESS PAGE REQUEST MAKES THE FIRMWARE SERVE FROM ITS OLDEST ROW AND REPORT NO GAP,
+    so the rows between the stored index and that oldest row would read as a measured zero.
+    """
+
+    def _legacy_mark(self, root, node, last_i, uptime_s, at):
+        HD.write_watermarks(root, {node: {"live_ring": {"last_i": last_i, "uptime_s": uptime_s,
+                                                        "at": at, "mode": "legacy"}}})
+
+    def test_a_legacy_last_i_below_the_ring_is_reported_as_the_loss_it_is(self, tmp_path,
+                                                                          cardless):
+        root = str(tmp_path / "pool")
+        pl = P.Pool(root)
+        n = cardless(cls=CursorNode, ring_cap=16).fire(40)      # the node holds rows 24..39
+        self._legacy_mark(root, "gold", 5, n.uptime, T)
+        r = _run(pl, n.tick(900), T + 900)
+        assert r["ok"] and r["added"] == 16
+        assert r["live_ring_lost"] == 24 - 6                     # rows 6..23 aged out unread
+        assert r["live_ring_gap"]["kind"] == "overrun"
+        assert r["live_ring_gap"]["source"] == "legacy_watermark"
+        assert r["live_ring_gap"]["requested_cursor"] == HD.live_ring_cursor(n.boot_id, 6)
+        assert "last_i=5" in r["live_ring_reason"]
+        assert HD.read_watermarks(root)["gold"]["live_ring"]["next_cursor"] == \
+            HD.live_ring_cursor(n.boot_id, 40)
+
+    def test_a_legacy_last_i_still_in_the_ring_resumes_there_and_loses_nothing(self, tmp_path,
+                                                                               cardless):
+        root = str(tmp_path / "pool")
+        pl = P.Pool(root)
+        n = cardless(cls=CursorNode, ring_cap=16).fire(40)
+        self._legacy_mark(root, "gold", 29, n.uptime, T)
+        r = _run(pl, n.tick(900), T + 900)
+        assert r["ok"] and r["added"] == 10                      # rows 30..39, not the whole ring
+        assert r["live_ring_lost"] == 0 and r["live_ring_gap"] is None
+        assert r["live_ring_rows"] == 10
+        assert HD.read_watermarks(root)["gold"]["live_ring"]["next_cursor"] == \
+            HD.live_ring_cursor(n.boot_id, 40)
+
+    def test_a_legacy_last_i_from_another_boot_is_a_reboot_not_a_measured_zero(self, tmp_path,
+                                                                               cardless):
+        root = str(tmp_path / "pool")
+        pl = P.Pool(root)
+        n = cardless(cls=CursorNode, ring_cap=16).fire(20)
+        self._legacy_mark(root, "gold", 5, 99999, T - 99999)     # a boot that ended long ago
+        r = _run(pl, n, T)
+        assert r["ok"]
+        assert r["live_ring_gap"]["kind"] == "reboot"
+        assert r["live_ring_gap"]["source"] == "legacy_watermark"
+        assert r["live_ring_lost"] == 4                           # rows 0..3 of THIS boot aged out
+        assert "previous boot are unmeasured" in r["live_ring_reason"]
+
+    def test_the_second_run_after_the_interop_run_is_a_plain_cursor_run(self, tmp_path, cardless):
+        root = str(tmp_path / "pool")
+        pl = P.Pool(root)
+        n = cardless(cls=CursorNode, ring_cap=64).fire(20)
+        self._legacy_mark(root, "gold", 9, n.uptime, T)
+        r1 = _run(pl, n.tick(900), T + 900)
+        r2 = _run(pl, n.tick(900).fire(5), T + 1800)
+        assert (r1["added"], r1["live_ring_lost"]) == (10, 0)
+        assert (r2["added"], r2["live_ring_lost"], r2["live_ring_gap"]) == (5, 0, None)
+
+
+class TestCursorPageSalvage:
+    def test_the_raw_body_is_archived_before_anything_tries_to_parse_it(self, tmp_path, cardless):
+        root = str(tmp_path / "pool")
+        pl = P.Pool(root)
+        r = _run(pl, cardless(cls=BrokenCursorNode).fire(1), T)
+        assert not r["ok"]
+        raw = tmp_path / "pool" / "raw" / "gold" / ("%d-detections-0001.raw" % T)
+        assert raw.read_bytes() == b'{"contract":"cursor-v1","rows":"not-a-list"}'
+        assert str(raw) in r["live_ring_reason"]
+
+    def test_a_cut_page_advances_the_watermark_only_over_the_rows_that_parsed(self, tmp_path,
+                                                                              cardless):
+        root = str(tmp_path / "pool")
+        pl = P.Pool(root)
+        n = cardless(cls=TruncatingCursorNode, keep_rows=4)
+        _run(pl, n, T)                                   # seed the cursor on an empty ring
+        n.fire(10)
+        n.fail_after = n.detection_calls + 1              # only the first cut page gets through
+        r = _run(pl, n.tick(900), T + 900)
+        assert r["added"] == 4                            # the header claimed all 10
+        assert r["live_ring_truncated_pages"] == 1 and r["live_ring_truncated_bytes"] > 0
+        assert r["live_ring_cursor"] == HD.live_ring_cursor(n.boot_id, 4)
+        wm = HD.read_watermarks(root)["gold"]["live_ring"]
+        assert (wm["next_cursor"], wm["last_i"]) == (HD.live_ring_cursor(n.boot_id, 4), 3)
+        saved = json.loads((tmp_path / "pool" / "raw" / "gold"
+                            / ("%d-detections-0001-salvaged.json" % (T + 900))).read_text())
+        assert (saved["returned"], len(saved["rows"]), saved["has_more"]) == (4, 4, True)
+        assert saved["next_cursor"] == HD.live_ring_cursor(n.boot_id, 4)
+        raw = (tmp_path / "pool" / "raw" / "gold"
+               / ("%d-detections-0001.raw" % (T + 900))).read_bytes()
+        assert len(raw) == r["live_ring_truncated_bytes"]
+        with pytest.raises(ValueError):
+            json.loads(raw.decode())                      # the archive really is the cut body
+        n.fail_after = None                               # the next run picks up where it stopped
+        r2 = _run(pl, n.tick(900), T + 1800)
+        assert r2["added"] == 6 and r2["live_ring_lost"] == 0
+        assert len(list(pl.raw())) == 10
+
+    def test_a_walk_of_cut_pages_still_reaches_the_snapshot_in_one_run(self, tmp_path, cardless):
+        pl = P.Pool(str(tmp_path / "pool"))
+        n = cardless(cls=TruncatingCursorNode, keep_rows=4)
+        _run(pl, n, T)
+        r = _run(pl, n.tick(900).fire(10), T + 900)
+        assert r["ok"] and r["added"] == 10 and r["live_ring_lost"] == 0
+        assert r["live_ring_pages"] == 3 and r["live_ring_truncated_pages"] == 2
+        assert r["live_ring_pending"] == 0
+
+    def test_a_page_cut_before_its_first_whole_row_stops_the_walk_instead_of_looping(
+            self, tmp_path, cardless):
+        root = str(tmp_path / "pool")
+        pl = P.Pool(root)
+        n = cardless(cls=HolePageNode)
+        _run(pl, n, T)
+        r = _run(pl, n.tick(900).fire(10), T + 900)
+        assert r["added"] == 0 and r["live_ring_pages"] == 1
+        assert r["live_ring_pending"] == 10
+        assert "cut before its first whole row" in r["live_ring_reason"]
+        assert HD.read_watermarks(root)["gold"]["live_ring"]["next_cursor"] == \
+            HD.live_ring_cursor(n.boot_id, 0)
+
+
 class TestCursorParsing:
     def test_parse_live_ring_salvages_a_truncated_cursor_page(self):
         n = CardlessNode().fire(2)
@@ -411,6 +583,32 @@ class TestCursorParsing:
         got = HD.parse_live_ring(text[:cut].encode())
         assert got["truncated"] == cut
         assert got["returned"] == 2
+
+    def test_a_salvage_is_described_by_its_rows_not_by_the_header_it_came_with(self):
+        n = CardlessNode().fire(6)
+        boot = "00000000000000a1"
+        body = {
+            "contract": HD.LIVE_RING_CURSOR_CONTRACT, "node": "gold", "boot_id": boot,
+            "boot_epoch_us": 1788900000000000,
+            "cursor": HD.live_ring_cursor(boot, 0),
+            "oldest_cursor": HD.live_ring_cursor(boot, 0),
+            "newest_cursor": HD.live_ring_cursor(boot, 5),
+            "next_cursor": HD.live_ring_cursor(boot, 6),
+            "until_cursor": HD.live_ring_cursor(boot, 6),
+            "limit": 128, "returned": 6, "has_more": False, "gap": None,
+            "rows": [dict(r) for r in n.ring],
+        }
+        text = json.dumps(body)
+        cut = text.index('{"i": 3') + 20                   # the node dies inside row 3
+        got = HD.parse_live_ring(text[:cut].encode())
+        assert got["truncated"] == cut
+        assert (got["returned"], len(got["rows"])) == (3, 3)
+        assert got["next_cursor"] == HD.live_ring_cursor(boot, 3)
+        assert got["has_more"] is True                     # the header said the page was complete
+        assert got["salvaged"] is True
+        assert got["claimed"] == {"next_cursor": HD.live_ring_cursor(boot, 6), "returned": 6,
+                                  "has_more": False}
+        assert got["until_cursor"] == HD.live_ring_cursor(boot, 6)
 
     def test_parse_live_ring_rejects_a_malformed_cursor_object(self):
         bad = b'{"contract":"cursor-v1","boot_id":"00000000000000a1","rows":"nope"}'

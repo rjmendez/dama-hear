@@ -560,6 +560,19 @@ the nodes run today). S0.2 makes it
 
 **Roll forward:** deploy the cursor-aware drainer first, then roll firmware. **Roll back:** revert
 either side independently; the drainer accepts both shapes and the bare endpoint did not change.
+
+Two things the mixed-version window gets wrong if they are left implicit, so they are explicit:
+
+* a watermark written before this migration is a row index (`last_i`) with no cursor. A page
+  request carrying no cursor is served from the node's OLDEST held row with `gap: null`, so the
+  drainer derives the resume cursor from `last_i + 1` itself and reports anything between that
+  and `oldest_cursor` as an `overrun` gap (`gap.source = legacy_watermark`) rather than a
+  measured zero;
+* a page the node cuts mid-row still carries the header it already sent, so `returned`,
+  `has_more` and `next_cursor` describe the page it MEANT to send. The raw body is archived
+  before anything parses it, the salvage is re-described from the rows that actually parsed, and
+  the watermark advances only to that recomputed cursor -- never to the header's claim.
+
 Then the cadence cut in S0.2 is free rather than self-defeating. State the end-to-end latency as
 a number against the addressable window. Unanchored sketches (26.2 %) route to a lane that is
 explicitly not pullable.
