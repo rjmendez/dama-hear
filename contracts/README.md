@@ -17,7 +17,7 @@ contracts/
 | Contract | Source of truth | Generator | Decision |
 |---|---|---|---|
 | `hear.ingest.v1` | `hear/ingest/envelope.py` | `tools/gen_ingest_contracts.py` | `docs/decisions/0001-hear-ingest-v1-envelope-and-codec.md` |
-| `hear.ingest.batch.v1` | `hear/ingest/batch.py` | `tools/gen_ingest_contracts.py` | `docs/decisions/0002-phase4-https-batch-ingest-adapter.md` |
+| `hear.ingest.batch.v1` | `hear/ingest/batch.py` | `tools/gen_ingest_contracts.py` | `docs/decisions/0004-phase4-https-batch-ingest-adapter.md` |
 
 `hear.ingest.batch.v1` is the HTTPS batch request frame and its receipt. It carries
 `hear.ingest.v1` items but versions only the framing: an unsupported *frame* major is refused

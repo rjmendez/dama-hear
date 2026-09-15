@@ -4,7 +4,7 @@ This is the *transport frame* that carries `hear.ingest.v1` envelopes (and, duri
 mixed-version window, untranslated legacy telemetry bodies) over one
 `POST /v1/ingest/batches` request. It is a contract, not an adapter: nothing here opens a
 socket, names a host, touches Redis/SQLite/PostgreSQL, or translates a legacy body. The
-design record is `docs/decisions/0002-phase4-https-batch-ingest-adapter.md` and the
+design record is `docs/decisions/0004-phase4-https-batch-ingest-adapter.md` and the
 operational specification is `docs/phase4-https-batch-ingest.md`.
 
 `contracts/schemas/hear.ingest.batch.v1.schema.json` and

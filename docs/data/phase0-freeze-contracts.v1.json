@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "396bc18f8bc7c93eade5e1d0d4e5ec9fd34fbc8a0431f7bfad0a7f20b5173185",
+  "baseline_hash": "b986b6d7f0026b8970d9f44a3f311ee97e3e1f6729e92870626ef55b12de5c07",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -251,7 +251,7 @@
     ],
     "default_board_class": "xiao-s3-pps",
     "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
-    "section_hash": "b39faa85108f494d66c2f81ab768d94261fa4ffeed08b1a0bda765c236c9805d",
+    "section_hash": "fd6917fb9e119d34570a6d393be9c3b11fbd0f7bd409c2fd69fd65e49e39d526",
     "source_files": [
       {
         "path": ".github/workflows/firmware.yml",
@@ -285,8 +285,8 @@
       },
       {
         "path": "firmware/hear_node/hear_node.ino",
-        "sha256": "562719fde36eb8dae052eee21516457328828849c20194ded703a8e4291bcb73",
-        "size_bytes": 325407
+        "sha256": "23d303252fd421267ac4851be1bffb48131475c0dea982bb80d499d0941e3b4c",
+        "size_bytes": 327754
       },
       {
         "path": "firmware/hear_node/hear_push_payload.h",
@@ -457,8 +457,8 @@
       },
       {
         "path": "deploy/k8s/hear-mqtt-bridge.yaml",
-        "sha256": "3134036c192d570bdae35260ccc051f4116a2e843d8b9b0ada129c8921431c3b",
-        "size_bytes": 4352
+        "sha256": "191e575074cd1960d4ecd0fd502a4ef999377061242b62bc3ea7ba006b1d8caf",
+        "size_bytes": 4781
       },
       {
         "path": "deploy/k8s/hear-score.yaml",
@@ -2123,7 +2123,7 @@
         "storage_request": "5Gi"
       }
     ],
-    "section_hash": "bad6a937b5aa2dc1b51c48b9979ec4360ff2d6157b6df400d27dbffd1df92ee9"
+    "section_hash": "849be220cbf001054dd939e25a023e245a0f01638b1f97a3c05659238bdd8edc"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",

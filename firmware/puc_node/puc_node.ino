@@ -1105,6 +1105,7 @@ static void routes() {
     char b[1800];
     snprintf(b, sizeof b,
       "{\"node\":\"%s\",\"class\":\"%s\",\"uptime_s\":%lu,"
+      "\"auth\":{\"admin\":{\"configured\":%s,\"src\":\"%s\"}},"
       "\"reset\":\"%s\",\"power_cycled\":%s,\"heap\":%lu,\"heap_min\":%lu,\"heap_max_alloc\":%lu,\"stack_high_watermark_words\":%lu,\"psram\":%lu,"
       "\"imu\":%s,"
       "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid\":%lu,"
@@ -1117,6 +1118,7 @@ static void routes() {
       // configured is a BUILD fact (were there credentials at all); sta is the link state.
       "\"wifi\":{\"configured\":%s,\"sta\":%s,\"rssi\":%d,\"ip\":\"%s\"}}",
       node_id, NODE_CLASS, (unsigned long)(millis() / 1000),
+      HEAR_ADMIN_TOKEN[0] ? "true" : "false", HEAR_ADMIN_TOKEN[0] ? "compiled" : "missing",
       reset_name(), esp_reset_reason() == ESP_RST_POWERON ? "true" : "false",
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(),
       (unsigned long)ESP.getMaxAllocHeap(), (unsigned long)uxTaskGetStackHighWaterMark(NULL),

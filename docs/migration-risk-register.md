@@ -98,7 +98,7 @@ and land PR #189 (R8) — then start the counted window.
 | Gate | Blocked by | Not blocked by |
 |---|---|---|
 | Phase 1 — envelope and conformance suite | R4 (refusal rows must exist in the contract) | R5, R12, R14 |
-| Phase 1.5 — OCI images | — | R9 is the lane's own motivation, not a blocker |
+| Phase 1.5 — OCI images | — | R9 is the lane's own motivation, not a blocker. Scope, boundaries, sequence and gates: [worker-packaging.md](worker-packaging.md) |
 | Phase 2 — Postgres implementation | R1, R2, R3 (fix and re-soak), R16 | R5, R11, R12 |
 | Phase 3 — object store import | R6 (no backed-up source, no rollback) | R1–R3 |
 | Localization eligibility for `esp32s3-i2s-gps` | R5 | every other row |

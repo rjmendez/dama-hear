@@ -1,0 +1,375 @@
+"""The import publishes atomically, resumes for free, and never touches the source.
+
+Read these as the claims a Phase 3 shadow import would have to make before anyone let it near
+`/pool`, each one written as the failure it prevents. NOTHING HERE TALKS TO A REAL BACKEND: the
+store is a throwaway directory, the pool is synthetic, and no gate (G0 backup, G1 backend choice)
+is satisfied, so this is a proof about the rules and not a licence to run them on evidence.
+"""
+from __future__ import annotations
+
+import json
+import os
+
+import pytest
+
+from hear.objectstore import backend as B
+from hear.objectstore import keys as K
+from hear.objectstore import ledger as L
+from hear.objectstore import stage as ST
+from tests import objectstore_mini_pool as MINI
+
+RUN = "2026-09-16T0000Z-a1b2c3"
+
+
+class CountingBackend(B.LocalDirBackend):
+    """Counts the listings, because "resume without listing the bucket" is a testable claim."""
+
+    def __init__(self, root, **kw):
+        super().__init__(root, **kw)
+        self.list_calls = 0
+
+    def list_prefix(self, prefix):
+        self.list_calls += 1
+        return super().list_prefix(prefix)
+
+
+@pytest.fixture()
+def pool(tmp_path):
+    return MINI.build(str(tmp_path / "pool"))
+
+
+@pytest.fixture()
+def store(tmp_path):
+    return CountingBackend(str(tmp_path / "store"))
+
+
+def _ledger_path(tmp_path, run=RUN):
+    return str(tmp_path / "work" / "runs" / run / "ledger.jsonl")
+
+
+def _raw_task(path, digest, nbytes, logical=None):
+    return ST.ImportTask(
+        object_class="raw", logical_id=logical or os.path.basename(path),
+        partition=("mach",), source_path=path,
+        expected_digest=digest, expected_bytes=nbytes, digest_source="ledger.jsonl")
+
+
+def _clip_task(path, digest, nbytes, clip_key, day):
+    return ST.ImportTask(
+        object_class="clip", logical_id=clip_key, partition=(day, "mach"), source_path=path,
+        expected_digest=digest, expected_bytes=nbytes, digest_source="index.jsonl")
+
+
+def _tasks(pool):
+    a, b = pool["raw_duplicate_paths"]
+    ca, cb = pool["clip_paths"]
+    return [
+        _raw_task(a, pool["raw_digest"], pool["raw_bytes"]),
+        _raw_task(b, pool["raw_digest"], pool["raw_bytes"]),
+        _clip_task(ca, pool["clip_digest"], pool["clip_bytes"], "9f2c" + "0" * 28, "2026-09-12"),
+        _clip_task(cb, pool["clip_digest"], pool["clip_bytes"], "7e1d" + "0" * 28, "unanchored"),
+    ]
+
+
+def _importer(store, tmp_path, run=RUN, lease=None):
+    return ST.Importer(store, _ledger_path(tmp_path, run), run, lease=lease,
+                       git_commit="0000000")
+
+
+# --------------------------------------------------------------------- gates
+
+
+def test_an_unmet_gate_reads_nothing_and_publishes_nothing(pool, store, tmp_path):
+    imp = _importer(store, tmp_path)
+    with pytest.raises(ST.GateFailed):
+        imp.run(_tasks(pool), gates={"G0_pool_backup": False, "G1_backend_selected": True})
+    assert store.keys_under("hear/v1/obj/") == []
+    assert store.bytes_written == 0
+
+
+# ------------------------------------------------------- identity and resume
+
+
+def test_a_rerun_publishes_no_second_copy(pool, store, tmp_path):
+    first = _importer(store, tmp_path).run(_tasks(pool))
+    assert first.counters["published"] == 4
+    wrote = store.bytes_written
+    assert wrote > 0
+
+    second = _importer(store, tmp_path).run(_tasks(pool))
+    assert second.counters["published"] == 0
+    assert second.counters["skipped_done"] == 4
+    assert second.exit_code == 0
+    assert store.bytes_written == wrote  # zero bytes, not "few bytes"
+    assert len(store.keys_under("hear/v1/obj/")) == 4
+
+
+def test_a_resume_reads_the_ledger_and_not_the_bucket(pool, store, tmp_path):
+    _importer(store, tmp_path).run(_tasks(pool))
+    before = store.list_calls
+    resumed = _importer(store, tmp_path)
+    assert resumed.resume.published
+    resumed.run(_tasks(pool))
+    assert store.list_calls == before
+
+
+def test_a_resume_after_a_crash_publishes_exactly_what_is_missing(pool, store, tmp_path, monkeypatch):
+    tasks = _tasks(pool)
+    imp = _importer(store, tmp_path)
+    real_commit = store.commit_pointer
+    seen = {"n": 0}
+
+    def crash(key, doc, **kw):
+        seen["n"] += 1
+        if seen["n"] == 3:
+            raise KeyboardInterrupt("power cut mid-run")
+        return real_commit(key, doc, **kw)
+
+    monkeypatch.setattr(store, "commit_pointer", crash)
+    with pytest.raises(KeyboardInterrupt):
+        imp.run(tasks)
+    published_before = set(store.keys_under("hear/v1/obj/"))
+    assert len(published_before) == 2
+
+    monkeypatch.setattr(store, "commit_pointer", real_commit)
+    report = _importer(store, tmp_path).run(tasks)
+    assert report.counters["published"] == 2
+    assert report.counters["skipped_done"] == 2
+    assert len(store.keys_under("hear/v1/obj/")) == 4
+
+
+def test_a_crashed_import_publishes_nothing_it_did_not_finish(pool, store, tmp_path, monkeypatch):
+    """A crash between stage and commit leaves staging garbage and no visible object."""
+    task = _tasks(pool)[0]
+
+    def boom(key, doc, **kw):
+        raise KeyboardInterrupt("crash before the only observable step")
+
+    monkeypatch.setattr(store, "commit_pointer", boom)
+    with pytest.raises(KeyboardInterrupt):
+        _importer(store, tmp_path).run([task])
+    assert store.keys_under("hear/v1/obj/") == []
+    assert store.keys_under("hear/v1/staging/") != []
+
+    state = L.replay(_ledger_path(tmp_path))
+    assert state.published == set()
+    assert task.task_id in state.claimed
+
+
+def test_the_ledger_never_leads_the_store(pool, store, tmp_path):
+    """Every `published` row in the ledger has a pointer behind it -- set equality, both ways."""
+    _importer(store, tmp_path).run(_tasks(pool))
+    rows = [r for r in L.read_rows(_ledger_path(tmp_path)) if r["type"] == "published"]
+    from_ledger = {r["object_key"] for r in rows}
+    from_store = set(store.keys_under("hear/v1/obj/"))
+    assert from_ledger == from_store
+
+
+# ------------------------------------------------------------ verification
+
+
+def test_a_readback_is_compared_to_the_recorded_digest_not_to_the_bytes_just_written(
+        pool, store, tmp_path, monkeypatch):
+    """The store echoing back whatever it was handed must not count as verification."""
+    task = _tasks(pool)[0]
+    monkeypatch.setattr(store, "get_range", lambda key, offset=0, length=None: b"different bytes")
+    report = _importer(store, tmp_path).run([task])
+    assert report.counters["published"] == 0
+    assert [q["error_class"] for q in report.quarantined] == ["readback_mismatch"]
+    assert report.exit_code == 1
+
+
+def test_a_corrupted_source_is_quarantined_and_the_run_continues(pool, store, tmp_path):
+    rotten = ST.ImportTask(
+        object_class="raw", logical_id="nyquist-rotten", partition=("nyquist",),
+        source_path=pool["rotten_path"], expected_digest=pool["rotten_recorded_digest"],
+        expected_bytes=pool["raw_bytes"], digest_source="ledger.jsonl")
+    tasks = [rotten] + _tasks(pool)
+    report = _importer(store, tmp_path).run(tasks)
+    assert report.counters["quarantined"] == 1
+    assert report.quarantined[0]["error_class"] == "source_digest_mismatch"
+    assert report.counters["published"] == 4  # the run kept going
+    assert report.outcome == "partial" and report.exit_code == 1
+    # The corrupt source was not repaired, re-hashed in place, or published under a new digest.
+    assert not any("nyquist-rotten" in k for k in store.keys_under("hear/v1/obj/"))
+
+
+def test_a_corrupted_object_in_the_store_is_caught_before_a_pointer_is_added_to_it(
+        pool, store, tmp_path):
+    """Dedupe must re-verify the blob it is about to point at; silent rot is caught nowhere else."""
+    tasks = _tasks(pool)
+    _importer(store, tmp_path).run([tasks[0]])
+    blob = K.blob_key(pool["raw_digest"])
+    store.corrupt(blob, b"rotted in place")
+
+    report = _importer(store, tmp_path, run="second-run").run([tasks[1]])
+    assert report.counters["published"] == 0
+    assert [q["error_class"] for q in report.quarantined] == ["stored_blob_corrupt"]
+
+
+def test_a_digest_match_with_a_length_mismatch_is_refused(pool, store, tmp_path):
+    task = _raw_task(pool["raw_duplicate_paths"][0], pool["raw_digest"], pool["raw_bytes"] + 1)
+    report = _importer(store, tmp_path).run([task])
+    assert [q["error_class"] for q in report.quarantined] == ["length_mismatch_on_digest_match"]
+    assert store.keys_under("hear/v1/obj/") == []
+
+
+def test_a_quarantine_record_for_a_restricted_class_withholds_the_plaintext_digest(
+        pool, store, tmp_path, monkeypatch):
+    clip = _clip_task(pool["clip_paths"][0], pool["clip_digest"], pool["clip_bytes"],
+                      "9f2c" + "0" * 28, "2026-09-12")
+    monkeypatch.setattr(store, "get_range", lambda key, offset=0, length=None: b"nope")
+    report = _importer(store, tmp_path).run([clip])
+    doc = report.quarantined[0]
+    assert doc["digests_withheld"] == "restricted_class"
+    assert pool["clip_digest"] not in json.dumps(doc)
+
+
+# --------------------------------------------------------- the pointer commit
+
+
+def test_a_commit_that_already_exists_with_the_same_blob_is_a_replay_not_an_error(
+        pool, store, tmp_path):
+    task = _tasks(pool)[0]
+    _importer(store, tmp_path).run([task])
+    # A different run id, so nothing is skipped by the ledger: the commit itself must be idempotent.
+    report = _importer(store, tmp_path, run="second-run").run([task])
+    assert report.counters["replayed"] == 1
+    assert report.counters["published"] == 0
+    assert report.exit_code == 0
+    assert len(store.keys_under("hear/v1/obj/")) == 1
+
+
+def test_a_commit_that_exists_with_a_different_blob_halts_the_class(pool, store, tmp_path):
+    a, b = pool["raw_duplicate_paths"]
+    first = _raw_task(a, pool["raw_digest"], pool["raw_bytes"], logical="collide")
+    _importer(store, tmp_path).run([first])
+
+    other_body = b"a different archive under the same logical id\n"
+    other = tmp_path / "other-dets.csv"
+    other.write_bytes(other_body)
+    conflicting = ST.ImportTask(
+        object_class="raw", logical_id="collide", partition=("mach",), source_path=str(other),
+        expected_digest=K.sha256_hex(other_body), expected_bytes=len(other_body),
+        digest_source="ledger.jsonl")
+    follower = _raw_task(b, pool["raw_digest"], pool["raw_bytes"], logical="follower")
+
+    report = _importer(store, tmp_path, run="second-run").run([conflicting, follower])
+    assert [q["error_class"] for q in report.quarantined] == ["pointer_conflict"]
+    assert "raw" in report.halted_classes
+    assert report.counters["deferred"] == 1  # the follower was not attempted after the halt
+    doc = json.loads(store.get_range(K.object_key("raw", ("mach",), "collide")))
+    assert doc["blob_key"] == K.blob_key(pool["raw_digest"])  # the existing pointer is untouched
+
+
+# ------------------------------------------------------------ retry, fencing
+
+
+def test_a_transient_backend_error_is_retried_and_publishes_once(pool, store, tmp_path):
+    task = _tasks(pool)[0]
+    store.fail_next_put = [B.BackendTransient("503"), B.BackendTransient("timeout")]
+    report = _importer(store, tmp_path).run([task])
+    assert report.counters["retries"] == 2
+    assert report.counters["published"] == 1
+    assert len(store.keys_under("hear/v1/obj/")) == 1
+
+
+def test_a_backend_that_never_recovers_quarantines_the_object_and_not_the_run(pool, store, tmp_path):
+    tasks = _tasks(pool)
+    store.fail_next_put = [B.BackendTransient("503")] * ST.MAX_TRANSIENT_RETRIES
+    report = _importer(store, tmp_path).run(tasks)
+    assert [q["error_class"] for q in report.quarantined] == ["backend_transient"]
+    assert report.counters["published"] == 3
+
+
+def test_a_zombie_importer_with_a_stale_lease_is_fenced_at_the_commit(pool, tmp_path):
+    """The zombie is still alive, still holds bytes, and still believes it owns the run."""
+    clock = {"t": 1000.0}
+    store = CountingBackend(str(tmp_path / "store"), now=lambda: clock["t"])
+    stale = store.acquire_lease("import/run", ttl_s=60, holder="zombie")
+    clock["t"] += 61  # the zombie stalled past its TTL; a takeover happened without it noticing
+    fresh = store.acquire_lease("import/run", ttl_s=60, holder="takeover")
+    assert fresh.epoch == stale.epoch + 1
+
+    report = _importer(store, tmp_path, lease=stale).run(_tasks(pool))
+    assert report.outcome == "aborted"
+    assert store.keys_under("hear/v1/obj/") == []
+
+    ok = _importer(store, tmp_path, run="second-run", lease=fresh).run(_tasks(pool))
+    assert ok.counters["published"] == 4
+
+
+def test_an_expired_lease_cannot_be_renewed_into_a_fresh_one(tmp_path):
+    clock = {"t": 1000.0}
+    store = B.LocalDirBackend(str(tmp_path / "store"), now=lambda: clock["t"])
+    lease = store.acquire_lease("import/run", ttl_s=60, holder="a")
+    clock["t"] += 61
+    assert store.renew_lease(lease, ttl_s=60) is None
+    taken = store.acquire_lease("import/run", ttl_s=60, holder="b")
+    assert taken is not None and taken.epoch == lease.epoch + 1
+    assert store.renew_lease(lease, ttl_s=60) is None
+
+
+# ------------------------------------------------------------------- dedupe
+
+
+def test_a_duplicate_archive_writes_a_pointer_and_no_bytes(pool, store, tmp_path):
+    a, b = pool["raw_duplicate_paths"]
+    report = _importer(store, tmp_path).run([
+        _raw_task(a, pool["raw_digest"], pool["raw_bytes"]),
+        _raw_task(b, pool["raw_digest"], pool["raw_bytes"]),
+    ])
+    assert report.counters["published"] == 2
+    assert report.counters["deduped"] == 1
+    blobs = store.keys_under("hear/v1/blob/")
+    assert len(blobs) == 1
+    published = [json.loads(store.get_range(k)) for k in store.keys_under("hear/v1/obj/")]
+    assert {p["blob_key"] for p in published} == {K.blob_key(pool["raw_digest"])}
+
+
+def test_two_identical_clips_get_two_objects_and_one_blob(pool, store, tmp_path):
+    ca, cb = pool["clip_paths"]
+    report = _importer(store, tmp_path).run([
+        _clip_task(ca, pool["clip_digest"], pool["clip_bytes"], "9f2c" + "0" * 28, "2026-09-12"),
+        _clip_task(cb, pool["clip_digest"], pool["clip_bytes"], "7e1d" + "0" * 28, "unanchored"),
+    ])
+    assert report.counters["published"] == 2
+    assert len([k for k in store.keys_under("hear/v1/blob/")]) == 1
+    keys = store.keys_under("hear/v1/obj/")
+    assert any("/unanchored/" in k for k in keys)
+
+
+# ------------------------------------------------------------- non-mutation
+
+
+def test_the_importer_never_writes_to_the_pool(pool, store, tmp_path):
+    before = ST.census(pool["root"])
+    report = _importer(store, tmp_path).run(_tasks(pool))
+    assert report.counters["published"] == 4
+    assert ST.census(pool["root"]) == before
+
+
+def test_no_source_file_is_modified_by_a_dedupe_or_by_a_quarantine(pool, store, tmp_path):
+    rotten = ST.ImportTask(
+        object_class="raw", logical_id="nyquist-rotten", partition=("nyquist",),
+        source_path=pool["rotten_path"], expected_digest=pool["rotten_recorded_digest"],
+        expected_bytes=pool["raw_bytes"], digest_source="ledger.jsonl")
+    before = ST.census(pool["root"])
+    _importer(store, tmp_path).run(_tasks(pool) + [rotten])
+    assert ST.census(pool["root"]) == before
+
+
+def test_the_importer_has_no_way_to_delete_a_published_object(store):
+    assert not hasattr(store, "delete_object")
+    assert [m for m in dir(store) if m.startswith("delete")] == ["delete_staged"]
+
+
+def test_a_published_object_is_never_overwritten_in_place(pool, store, tmp_path):
+    task = _tasks(pool)[0]
+    _importer(store, tmp_path).run([task])
+    blob = K.blob_key(pool["raw_digest"])
+    result = store.put_immutable(blob, b"replacement bytes")
+    assert result.created is False
+    assert store.get_range(blob) != b"replacement bytes"
+    with pytest.raises(ValueError):
+        store.put_immutable(blob, b"replacement bytes", if_absent=False)

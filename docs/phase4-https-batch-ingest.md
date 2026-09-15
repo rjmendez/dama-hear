@@ -1,7 +1,7 @@
 # Phase 4: HTTPS batch ingest adapter
 
 Design specification for an **additive** HTTPS batch ingest path. Decision record:
-[`decisions/0002-phase4-https-batch-ingest-adapter.md`](decisions/0002-phase4-https-batch-ingest-adapter.md).
+[`decisions/0004-phase4-https-batch-ingest-adapter.md`](decisions/0004-phase4-https-batch-ingest-adapter.md).
 Item contract: [`decisions/0001-hear-ingest-v1-envelope-and-codec.md`](decisions/0001-hear-ingest-v1-envelope-and-codec.md).
 Frame contract: `hear/ingest/batch.py`, generated into
 `contracts/schemas/hear.ingest.batch.v1.schema.json`,

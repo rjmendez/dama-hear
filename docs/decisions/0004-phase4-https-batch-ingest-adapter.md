@@ -1,4 +1,4 @@
-# 0002 - Phase 4 HTTPS batch ingest adapter
+# 0004 - Phase 4 HTTPS batch ingest adapter
 
 - Status: accepted (design only)
 - Date: 2026-09-15
@@ -146,7 +146,7 @@ tell a producer which items are safe to forget.
 
 ## Consequences
 
-- One new contract (`hear.ingest.batch.v1` plus its receipt), generated into
+- One new contract (`hear.ingest.batch.v1` plus its receipt, `hear.ingest.batch.receipt.v1`), generated into
   `contracts/schemas/` and `contracts/fixtures/hear.ingest.batch.v1/` from the same field
   table, with eleven fixtures carrying declared outcomes for cross-language adapters.
 - No existing writer or reader changes in this phase. The legacy routes remain authoritative.

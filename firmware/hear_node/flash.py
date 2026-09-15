@@ -48,6 +48,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import board_profiles  # noqa: E402
+import deploy_gate  # noqa: E402
 import gen_secrets  # noqa: E402
 import release_manifest  # noqa: E402
 
@@ -184,6 +185,11 @@ def release_refusal(st, node, board_class=None):
                 "(flash.py %s <ip>); that copies its credentials into NVS" % node)
     if not prov.get("nvs") or int(prov.get("nets") or 0) < 1:
         return "NVS holds no enrolled Wi-Fi for it, so a release image would come up as its own AP"
+    if not prov.get("loaded"):
+        return "NVS enrollment has not been read back yet; reboot once before installing a release"
+    auth = deploy_gate.auth_reasons(st, require_nvs_credentials=True)
+    if auth:
+        return "; ".join(auth)
     return None
 
 
@@ -405,6 +411,13 @@ def main(argv):
                 die("%s came back as %r but reports fw=%r prov=%r, not %s on its NVS record"
                     % (host, got, now.get("fw"), prov, release))
             continue          # still the old image, answering before the reboot
+        if release:
+            auth = deploy_gate.auth_reasons(now, require_nvs_credentials=True, require_push_success=True)
+            if auth:
+                if any("401" in reason for reason in auth) or now.get("uptime_s", 0) > 90:
+                    die("%s is running %s but failed the authentication gate: %s"
+                        % (host, release, "; ".join(auth)))
+                continue
         if not release and expect_fw and now.get("fw") != expect_fw:
             # Identity matches and the version does not: either the reboot has not landed yet,
             # or the node ran the new image, panicked and the boot guard put the old one back.

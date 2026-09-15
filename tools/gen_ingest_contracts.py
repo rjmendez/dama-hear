@@ -8,7 +8,7 @@ Two contracts are generated here:
 
 * `hear.ingest.v1` from `hear/ingest/envelope.py` -- the canonical item envelope.
 * `hear.ingest.batch.v1` from `hear/ingest/batch.py` -- the HTTPS batch request frame and
-  its receipt (`docs/decisions/0002-phase4-https-batch-ingest-adapter.md`).
+  its receipt (`docs/decisions/0004-phase4-https-batch-ingest-adapter.md`).
 
 Fixtures are generated, not hand-maintained, so a field-table edit cannot leave the golden
 payloads describing an envelope that no longer exists. The fixture manifest carries each
@@ -474,7 +474,7 @@ def build_batch(out: Dict[Path, str]) -> None:
             "max_clock_skew_s": BA.MAX_CLOCK_SKEW_S,
         },
         "generator": "tools/gen_ingest_contracts.py",
-        "decision": "docs/decisions/0002-phase4-https-batch-ingest-adapter.md",
+        "decision": "docs/decisions/0004-phase4-https-batch-ingest-adapter.md",
         "fixtures": entries,
     }
     out[BATCH_MANIFEST_PATH] = json.dumps(manifest, indent=2) + "\n"

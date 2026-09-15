@@ -25,7 +25,7 @@
     "max_clock_skew_s": 900
   },
   "generator": "tools/gen_ingest_contracts.py",
-  "decision": "docs/decisions/0002-phase4-https-batch-ingest-adapter.md",
+  "decision": "docs/decisions/0004-phase4-https-batch-ingest-adapter.md",
   "fixtures": [
     {
       "name": "valid-node-batch",
