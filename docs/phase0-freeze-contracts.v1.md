@@ -14,14 +14,14 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | 01d473eefbd0c132b32c0095e08831503b0715202a9cd9a80215d5a9a099cfc3 |
+| baseline | 0dfe3b1663d3a9c4222cdeeb124b1606d4b0b46dd18c9b6f2192a9bbb5c7df77 |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
 | firmware_build_metadata | af9ba585abe4af010b45e0a7aeb3a1061dac602cd8123b15b85588922fd37b34 |
 | schemas | 248d557d9051b2f32b5e89018296b180cf2772b602b7ed3ad3761989cc412519 |
 | published_contracts | a87c434d400f4f31ec4cc252761fff18ee14355a8170cf80133ef72315c082f3 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |
 | redis_keys | d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03 |
-| kubernetes_and_pvc_layout | 7b050db86fd4b86d3ffba4cd660f49126a6df9ec0cfcd311bd0e569417fc956f |
+| kubernetes_and_pvc_layout | a67300c7ba9035522fac026f32997d1d6d71fda676d7706e3e2eb104fc96da90 |
 | corpus_fixture_metadata | 466b3b2d681cbeee4ed0d49edf24fff01ad829e5c00c60bf20e2b64c51b1b4cb |
 
 ## Compatibility
@@ -221,7 +221,7 @@ Manifest hashes:
 
 | path | size_bytes | sha256 |
 | --- | --- | --- |
-| deploy/k8s/hear-annotate.yaml | 32871 | 3160298b27e45596ad5a46527502a5566185f777045bfa197a67bc2e6e139661 |
+| deploy/k8s/hear-annotate.yaml | 40634 | 8233fe7a57781bcdbb5a1969e165fbcb4738c99c2c0ff3ebb6dd4c66659216c6 |
 | deploy/k8s/hear-birdnet.yaml | 7474 | 9a4265e78c5c03e10a563b1a178582492e3f0aeef0c47f630f56fe23c06c6aa5 |
 | deploy/k8s/hear-drain.yaml | 13594 | 38e02f09e8b124e5d321a7c51a97e93b898b03e27de6d19a0d38fb9b00cedf4e |
 | deploy/k8s/hear-embed.yaml | 9190 | 1f3e86e8d5d1f57f4bc5d8d4ca6adb958671f5a65c7db7b21e47225916d465ad |
@@ -230,7 +230,7 @@ Manifest hashes:
 | deploy/k8s/hear-score.yaml | 11126 | 03c0713d22b23d3f06177c79ca6d612925768c98d566f012fc01d209de5dcf0d |
 | deploy/k8s/hear-tag.yaml | 15625 | 367ed67528bb15a5dd652bf924db0af409a8f65c1b00128c0a3b14e990be1890 |
 | deploy/k8s/hear-tdoa.yaml | 17920 | 8ff0135e4b56f76d7b0d69ccdc4f9129efd3050047698cc9161b002cfaae2cc8 |
-| deploy/k8s/README.md | 23121 | 1d94babbd294e02cd2b235ac55ff0bd96a99623942a68fd3a64531b160cd3c99 |
+| deploy/k8s/README.md | 24093 | 8bcbcb12c00c025f2d36b2616db1df00b262ffb4c50c6a1bd948d101c24063a4 |
 
 ### PVCs
 
