@@ -8,7 +8,7 @@ metadata:
   labels:
     app: hear-mqtt-bridge
   annotations:
-    dama-hear/commit: 'e63d980'
+    dama-hear/commit: '9a64578'
     dama-hear/source-sha256: '87813f5d8789eeb2f706354898e26b2798ae3b6d868b1620589d8c769c410ba0'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client

@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 347190 B serialised; 347455 B of annotations against a 262144 B cap.
+# apply-mode server: 347767 B serialised; 348032 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'e63d980'
-    dama-hear/source-sha256: 'f10303425ba3a2f87164af2c0045b6d95e53479b2d547b03b8fcb2a4e1e4c1f4'
+    dama-hear/commit: '9a64578'
+    dama-hear/source-sha256: 'd61dd08d2cc06441dceea422a13bd59e081319f0aff1a0e5968f27c0d264d27a'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '347190'
+    dama-hear/serialised-bytes: '347767'
 data:
   hear__init__.py: |
     
@@ -1847,6 +1847,7 @@ data:
     
     import base64
     import binascii
+    from decimal import Decimal, InvalidOperation
     import gzip
     import hashlib
     import json
@@ -2067,10 +2068,19 @@ data:
             fh = fh[:-1]
         frame = binascii.unhexlify(fh)
         d = WR.decode(frame)
-        try:
-            utc_us = int(float(row.get("utc_us") or 0))
-        except (TypeError, ValueError):
+        raw_utc_us = row.get("utc_us")
+        if raw_utc_us in (None, ""):
             utc_us = 0
+        else:
+            try:
+                utc_decimal = Decimal(str(raw_utc_us).strip())
+                if utc_decimal != utc_decimal.to_integral_value():
+                    raise ValueError("utc_us is not an integer: %r" % (raw_utc_us,))
+                utc_us = int(utc_decimal)
+            except (InvalidOperation, TypeError, ValueError) as e:
+                raise ValueError("utc_us is not an integer: %r" % (raw_utc_us,)) from e
+            if not 0 <= utc_us <= 253402300799999999:
+                raise ValueError("utc_us outside the supported UTC range: %d" % utc_us)
         node = row["node"]
         # fs: the FRAME is authoritative when it states a rate; the CSV column is only the node's
         # running estimate.
@@ -3646,7 +3656,7 @@ data:
     
     
     def fetch_status(ip: str, timeout: float = DEFAULT_TIMEOUT_S) -> Dict[str, Any]:
-        return json.loads(_get("http://%s/status" % ip, timeout).decode("utf-8", "replace"))
+        return json.loads(_get("http://%s/status" % ip, timeout).decode("utf-8"))
     
     
     def fetch_audio_status(ip: str, timeout: float = DEFAULT_TIMEOUT_S) -> Dict[str, Any]:
