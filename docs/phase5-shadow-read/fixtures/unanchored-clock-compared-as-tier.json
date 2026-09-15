@@ -1,0 +1,128 @@
+{
+  "case": "unanchored-clock-compared-as-tier",
+  "description": "Neither surface has a GPS-anchored instant for these rows. Time is compared as its clock tier and the value is ignored, so two honest readers with no fix agree. Without this rule the comparator manufactures a permanent red signal out of correct behaviour.",
+  "expected_classification": "match",
+  "expected_gate_impact": "none",
+  "expected_repair_action": "none",
+  "expected_severity": "info",
+  "receipt": {
+    "comparator": {
+      "name": "hear-shadow-read",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "coverage": {
+      "accounted": true,
+      "compared": 3,
+      "eligible": 3,
+      "excluded_retention_edge": 0,
+      "excluded_sampling": 0,
+      "excluded_unsettled": 0,
+      "legacy_rows_offered": 3,
+      "ratio": 1.0
+    },
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "gate_impact": "none",
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "none",
+      "repairable": false
+    },
+    "emitted_at": "2026-09-15T02:00:45Z",
+    "evidence": {
+      "canonical_result_ref": "hear/v1/blob/sha256/bb/canonical-answer",
+      "legacy_result_ref": "hear/v1/blob/sha256/aa/legacy-answer",
+      "redaction_profile": "hear.shadowread.redact.v1"
+    },
+    "grain": "result_set",
+    "query": {
+      "device_ids": [
+        "rankine"
+      ],
+      "evidence_class": "detection",
+      "filters": {
+        "bound": "half_open",
+        "kind": "gunshot"
+      },
+      "fingerprint": "q:9d64809e890cab3f5b9c7ddd3a2124150308c28c0df1a06ebaf63b1b669f49d9",
+      "page_size": 50,
+      "projection_version": 1,
+      "site_id": "site-alpha",
+      "sort": {
+        "direction": "asc",
+        "field": "captured_at"
+      },
+      "time_from": "2026-09-14T00:00:00Z",
+      "time_to": "2026-09-15T01:45:00Z"
+    },
+    "read_authority": "legacy",
+    "read_mode": "shadow",
+    "receipt_id": "ed17309d-037e-5acc-8f6a-fd893297c229",
+    "row": {
+      "logical_id_present": false,
+      "row_key": null
+    },
+    "run_id": "shadow-2026-09-15T02",
+    "sampling": {
+      "forced_reason": "board-class first day",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.shadowread.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "cursor_stable": true,
+        "outcome": "answered",
+        "page_count": 1,
+        "projection_version": 1,
+        "read_contract_major": 1,
+        "reader": "hear.objectstore + durable postgres reader",
+        "reader_version": "0.1.6",
+        "reasons": [],
+        "result_hash": "sha256:3db982a6bd0b07f92e44d676f2a6bec0a476f85b1460ed6056b0734f466b0801",
+        "retention_class": "R0-derived",
+        "retention_horizon_s": 7776000,
+        "row_count": 3,
+        "row_state": "present",
+        "snapshot_at": "2026-09-15T02:00:00Z",
+        "state_hash": "sha256:a0691896ff72d73287c6f500d05cf2b06d744b71251324dfb6edd00c3286ef69",
+        "truncated": false
+      },
+      "legacy": {
+        "cursor_stable": true,
+        "outcome": "answered",
+        "page_count": 1,
+        "projection_version": 1,
+        "read_contract_major": 1,
+        "reader": "hear/pool.py + tools/hear_heartbeat_receiver.py views",
+        "reader_version": "0.1.6",
+        "reasons": [],
+        "result_hash": "sha256:3db982a6bd0b07f92e44d676f2a6bec0a476f85b1460ed6056b0734f466b0801",
+        "retention_class": "R0-derived",
+        "retention_horizon_s": 7776000,
+        "row_count": 3,
+        "row_state": "present",
+        "snapshot_at": "2026-09-15T02:00:00Z",
+        "state_hash": "sha256:a0691896ff72d73287c6f500d05cf2b06d744b71251324dfb6edd00c3286ef69",
+        "truncated": false
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "match",
+      "gate_impact": "none",
+      "notes": [],
+      "repair_action": "none",
+      "severity": "info"
+    },
+    "window": {
+      "as_of": "2026-09-15T02:00:00Z",
+      "end": "2026-09-15T02:00:00Z",
+      "settle_s": 900.0,
+      "start": "2026-09-15T01:00:00Z"
+    }
+  }
+}

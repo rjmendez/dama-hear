@@ -1,0 +1,130 @@
+{
+  "case": "count-divergence-on-a-settled-window",
+  "description": "Both surfaces answered the same settled question and returned different row counts. Compared exhaustively per device and day rather than sampled, because sampling an aggregate deletes the only number anybody checks.",
+  "expected_classification": "count_divergence",
+  "expected_gate_impact": "blocks_cutover",
+  "expected_repair_action": "manual_review",
+  "expected_severity": "critical",
+  "receipt": {
+    "comparator": {
+      "name": "hear-shadow-read",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "coverage": {
+      "accounted": true,
+      "compared": 3,
+      "eligible": 3,
+      "excluded_retention_edge": 0,
+      "excluded_sampling": 0,
+      "excluded_unsettled": 0,
+      "legacy_rows_offered": 3,
+      "ratio": 1.0
+    },
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "gate_impact": "blocks_cutover",
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "manual_review",
+      "repairable": false
+    },
+    "emitted_at": "2026-09-15T02:00:45Z",
+    "evidence": {
+      "canonical_result_ref": "hear/v1/blob/sha256/bb/canonical-answer",
+      "legacy_result_ref": "hear/v1/blob/sha256/aa/legacy-answer",
+      "redaction_profile": "hear.shadowread.redact.v1"
+    },
+    "grain": "result_set",
+    "query": {
+      "device_ids": [
+        "gold"
+      ],
+      "evidence_class": "ledger_stat",
+      "filters": {
+        "bound": "half_open",
+        "kind": "gunshot"
+      },
+      "fingerprint": "q:c8bd23f75fc6c6b073d63630523603d6ca62ee9fd641e0ae7eff3094c5536e20",
+      "page_size": 50,
+      "projection_version": 1,
+      "site_id": "site-alpha",
+      "sort": {
+        "direction": "asc",
+        "field": "captured_at"
+      },
+      "time_from": "2026-09-14T00:00:00Z",
+      "time_to": "2026-09-15T01:45:00Z"
+    },
+    "read_authority": "legacy",
+    "read_mode": "compare",
+    "receipt_id": "29898ede-2ce7-54de-9842-2d0771a3a6ea",
+    "row": {
+      "logical_id_present": false,
+      "row_key": null
+    },
+    "run_id": "shadow-2026-09-15T02",
+    "sampling": {
+      "forced_reason": "mismatches are never sampled",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.shadowread.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "cursor_stable": true,
+        "outcome": "answered",
+        "page_count": 1,
+        "projection_version": 1,
+        "read_contract_major": 1,
+        "reader": "hear.objectstore + durable postgres reader",
+        "reader_version": "0.1.6",
+        "reasons": [],
+        "result_hash": "sha256:bb5f79cb5804b75fd8e759e065ba39e1f1879fe84c3e909be2ede9c3b00b9010",
+        "retention_class": "R0-derived",
+        "retention_horizon_s": 7776000,
+        "row_count": 2,
+        "row_state": "present",
+        "snapshot_at": "2026-09-15T02:00:00Z",
+        "state_hash": "sha256:42410202118d5279bc97dd2715ae132a0905a6b446cf77d608ce7ca5e04143c0",
+        "truncated": false
+      },
+      "legacy": {
+        "cursor_stable": true,
+        "outcome": "answered",
+        "page_count": 1,
+        "projection_version": 1,
+        "read_contract_major": 1,
+        "reader": "hear/pool.py + tools/hear_heartbeat_receiver.py views",
+        "reader_version": "0.1.6",
+        "reasons": [],
+        "result_hash": "sha256:823ef1eece0c14755c638c495583446f503535b4d85d9c5b2f320eaeb1c9dcb7",
+        "retention_class": "R0-derived",
+        "retention_horizon_s": 7776000,
+        "row_count": 3,
+        "row_state": "present",
+        "snapshot_at": "2026-09-15T02:00:00Z",
+        "state_hash": "sha256:42410202118d5279bc97dd2715ae132a0905a6b446cf77d608ce7ca5e04143c0",
+        "truncated": false
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "count_divergence",
+      "gate_impact": "blocks_cutover",
+      "notes": [
+        "legacy returned 3 settled rows, canonical 2"
+      ],
+      "repair_action": "manual_review",
+      "severity": "critical"
+    },
+    "window": {
+      "as_of": "2026-09-15T02:00:00Z",
+      "end": "2026-09-15T02:00:00Z",
+      "settle_s": 900.0,
+      "start": "2026-09-15T01:00:00Z"
+    }
+  }
+}

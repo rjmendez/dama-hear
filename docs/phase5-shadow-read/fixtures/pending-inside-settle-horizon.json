@@ -1,0 +1,9 @@
+{
+  "case": "pending-inside-settle-horizon",
+  "description": "The legacy surface already returns a row whose write is minutes old. Two stores do not commit at the same instant, so anything newer than the settle horizon is excluded from comparison rather than reported. No receipt is emitted.",
+  "expected_classification": "pending",
+  "expected_gate_impact": "none",
+  "expected_repair_action": "none",
+  "expected_severity": "info",
+  "receipt": null
+}
