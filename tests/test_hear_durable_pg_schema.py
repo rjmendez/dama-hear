@@ -202,9 +202,71 @@ class TestSchemaShape:
         assert "r.body_json" not in audit_view
 
     def test_views_are_security_invoker_so_row_level_security_still_applies(self, migrations):
-        for version in (4, 5):
+        for version in (4, 5, 6):
             sql = _sql(migrations, version)
             assert sql.count("WITH (security_invoker = true)") == sql.count("CREATE OR REPLACE VIEW")
+
+    def test_the_refusal_quarantine_is_implemented_key_for_key(self, migrations):
+        """The SQLite refusal seam must survive the cut-over instead of being dropped with it."""
+        refusals = _sql(migrations, 6)
+        assert "hear.refused_messages" in refusals
+        assert "hear.refusal_health_snapshot" in refusals
+        for key in HR.DurableRecordStore().refusal_health():
+            if key in ("backend", "enabled", "max_rows", "max_bytes"):
+                # backend/enabled are literals in the snapshot; the caps are parameters of
+                # enforce_refusal_bounds, asserted below rather than as health keys.
+                continue
+            assert f"'{key}'" in refusals, key
+
+    def test_the_durable_health_contract_is_not_widened_by_the_quarantine(self, migrations):
+        """Refusal keys must stay off health(), or a store that cannot keep refusals breaks it."""
+        base = HR.DurableRecordStore().health()
+        assert "refused_messages" not in base and "last_refusal_at" not in base
+        assert "refused_messages" not in _sql(migrations, 2)
+        # ... and the refusal surface still reports them.
+        assert {"refused_messages", "last_refusal_at"} <= set(
+            HR.DurableRecordStore().refusal_health())
+
+    def test_refusals_are_bounded_by_size_not_only_by_age(self, migrations):
+        """Any topic publisher can mint unique rejected bodies; age alone is not a capacity bound."""
+        refusals = _sql(migrations, 6)
+        assert "hear.enforce_refusal_bounds" in refusals
+        assert "p_max_rows  integer DEFAULT 5000" in refusals
+        assert f"p_max_bytes bigint  DEFAULT {16 * 1024 * 1024}" in refusals
+        assert "PERFORM hear.enforce_refusal_bounds" in refusals
+        # Eviction is scoped to the quarantine; the outbox is not reachable from that path.
+        bounds = refusals.split("CREATE OR REPLACE FUNCTION hear.enforce_refusal_bounds")[1]
+        bounds = bounds.split("COMMENT ON FUNCTION hear.enforce_refusal_bounds")[0]
+        assert "durable_records" not in bounds and "cache_attempts" not in bounds
+        assert "GROUP BY g.source, g.device_id" in bounds
+
+    def test_refusal_retention_matches_the_outbox_posture(self, migrations):
+        refusals = _sql(migrations, 6)
+        assert f"p_days    integer DEFAULT {HR.DURABLE_RETENTION_DAYS}" in refusals
+        assert "IF p_days > 90 THEN" in refusals
+        assert "p_dry_run boolean DEFAULT true" in refusals
+
+    def test_refusals_are_tenant_isolated_and_readable_without_the_body(self, migrations):
+        refusals = _sql(migrations, 6)
+        assert "ALTER TABLE hear.refused_messages ENABLE ROW LEVEL SECURITY" in refusals
+        assert "CREATE POLICY tenant_isolation ON hear.%I" in refusals
+        assert "'refused_messages', 'refusal_counters', 'refusal_events'" in refusals
+        audit_view = refusals.split("CREATE OR REPLACE VIEW hear.refused_messages_audit")[1]
+        assert "security_invoker = true" in audit_view
+        # A refused body is unvalidated device input: it stays off the reader/auditor surface.
+        assert "r.body_text" not in audit_view
+        assert "GRANT SELECT ON hear.refused_messages_audit TO hear_durable_reader" in refusals
+        # The writer quarantines and bounds; only the admin deletes.
+        assert "GRANT SELECT, INSERT, UPDATE ON hear.refused_messages TO hear_durable_writer" in refusals
+        assert "GRANT SELECT, DELETE ON hear.refused_messages TO hear_durable_admin" in refusals
+
+    def test_the_refusal_rollback_reverses_only_what_the_migration_created(self, migrations):
+        rollback = next(m.rollback_sql for m in migrations if m.version == 6)
+        assert "DROP TABLE IF EXISTS hear.refused_messages" in rollback
+        assert "DROP FUNCTION IF EXISTS hear.refusal_health_snapshot(text)" in rollback
+        for kept in ("hear.durable_records", "hear.cache_attempts", "hear.health_snapshot"):
+            assert f"DROP TABLE IF EXISTS {kept}" not in rollback
+            assert f"DROP FUNCTION IF EXISTS {kept}" not in rollback
 
     def test_backfill_never_publishes_and_keeps_the_legacy_uid(self, migrations):
         backfill = _sql(migrations, 5)

@@ -196,6 +196,22 @@ the readiness probe at `periodSeconds: 10`. In Postgres:
   answered from partial indexes over the working set, not the table;
 * `last_cache_failure_at` / `last_publish_at` come from `hear.durable_events`.
 
+### 7.1 The refusal quarantine is a separate surface
+
+A message that fails validation is not outbox material — it has no `record_uid`, is never
+claimed, never published and never replayed — so it lives in `hear.refused_messages` and is
+reported by `hear.refusal_health_snapshot()`, mirroring `DurableRecordStore.refusal_health()`
+key for key. It is deliberately *not* folded into `health_snapshot()`: that key set is the
+cross-store contract every backend must satisfy, and widening it would make a store that cannot
+keep refusals non-compliant rather than merely quieter.
+
+The quarantine is bounded by row count and byte total (`hear.enforce_refusal_bounds`), not only
+by age. It accepts input that failed validation, so any publisher reachable on the topic can mint
+unbounded distinct bodies; without a hard cap that becomes a full volume shared with accepted
+telemetry, i.e. rejected input causing an availability failure. Eviction always takes the oldest
+row of whichever `(source, device_id)` holds the most, so a flooding publisher erases its own
+history first, and nothing in that path can reach `hear.durable_records`.
+
 `hear.health_snapshot()` returns every key the SQLite `health()` returns except `path`, which
 only the Python store knows and must return redacted — the DSN carries a password and must come
 from a `Secret`, never a ConfigMap, and must never appear in `/healthz` or a log line.
@@ -318,11 +334,12 @@ Named, not silently defaulted. Each is a parameter or a one-line change, not a r
 | `deploy/postgres/migrations/0003_hear_durable_partitions_and_retention.sql` | partition maintenance and retention |
 | `deploy/postgres/migrations/0004_hear_durable_access_control.sql` | roles, RLS, redacted views, grants |
 | `deploy/postgres/migrations/0005_hear_durable_backfill_compat.sql` | SQLite import surface, watermarks, collision views |
+| `deploy/postgres/migrations/0006_hear_durable_refusals.sql` | refusal quarantine: bounded ring, counters, retention, RLS, body-free audit view |
 | `deploy/postgres/rollback/*_down.sql` | one reversal per migration |
 | `tools/hear_durable_pg.py` | reads/checks/plans the migrations; never connects |
 | `tests/fixtures/durable_pg_semantics.sql` | executable assertions for the audited defects |
 | `tests/test_hear_durable_pg_schema.py` | file-level guards (no server) + an opt-in real-server run |
 
-Validated against PostgreSQL 16: all five migrations apply to an empty database, apply a second
+Validated against PostgreSQL 16: all six migrations apply to an empty database, apply a second
 time as no-ops, pass every assertion in the semantics fixture, and roll back to nothing.
 Minimum supported version is 15 (`security_invoker` views).

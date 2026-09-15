@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-heartbeat-code.yaml
-# apply-mode client: 63229 B serialised; 63493 B of annotations against a 262144 B cap.
+# apply-mode client: 83217 B serialised; 83481 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-heartbeat
   annotations:
-    dama-hear/commit: '60cbdc1'
-    dama-hear/source-sha256: '8f04a87d2c40e7c4d1d0d0fea01c2004e9b9dd4815bfa51d5fccbae7bb53d96b'
+    dama-hear/commit: '8586f95'
+    dama-hear/source-sha256: '2a7e1811cdeb995d28a888b48af9eba5739535766b28c4a3b9f0c05f91a0d03e'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '63229'
+    dama-hear/serialised-bytes: '83217'
 data:
   tools_hear_heartbeat_receiver.py: |
     #!/usr/bin/env python3
@@ -33,6 +33,7 @@ data:
     import socket
     import sqlite3
     import threading
+    import time
     from contextlib import contextmanager
     from dataclasses import dataclass
     from datetime import datetime, timedelta, timezone
@@ -61,6 +62,26 @@ data:
     # keeps the phase-0 outbox's previous "grows forever" behavior for anyone not yet opted in.
     DURABLE_RETENTION_DAYS = int(os.environ.get("HEAR_DURABLE_RETENTION_DAYS", "30"))
     DURABLE_PRUNE_INTERVAL_S = float(os.environ.get("HEAR_DURABLE_PRUNE_INTERVAL_S", "3600"))
+    # Refusal quarantine (R4). A message that fails validation used to leave nothing behind but a log
+    # line, so a node whose firmware sends a shape this build rejects simply disappeared. Refusals are
+    # recorded in their *own* table -- never in durable_records, never replayed, never published.
+    #
+    # Three independent bounds, because the refusal ledger accepts input that by definition failed
+    # validation and therefore cannot be trusted to be small, unique or infrequent:
+    #   * per-row body cap: one refusal can never store more than this many characters;
+    #   * hard row/byte caps: the table is a ring, enforced inside the insert transaction, so a flood
+    #     of distinct bodies evicts older *refusals* and can never grow the shared PVC without bound
+    #     nor touch an accepted outbox row;
+    #   * a per-source arrival rate limit (see HeartbeatReceiverStore.record_refusal) so a flood is
+    #     dropped in memory instead of becoming one fsync per hostile message.
+    REFUSAL_MAX_BODY_CHARS = int(os.environ.get("HEAR_REFUSAL_MAX_BODY_CHARS", "8192"))
+    REFUSAL_MAX_ROWS = int(os.environ.get("HEAR_REFUSAL_MAX_ROWS", "5000"))
+    REFUSAL_MAX_BYTES = int(os.environ.get("HEAR_REFUSAL_MAX_BYTES", str(16 * 1024 * 1024)))
+    # Refusals accepted per source (device id, or the topic when no device could be identified) per
+    # window. Beyond it refusals are counted and dropped, never written. <= 0 disables the limiter;
+    # the hard caps above still apply.
+    REFUSAL_RATE_LIMIT = int(os.environ.get("HEAR_REFUSAL_RATE_LIMIT", "30"))
+    REFUSAL_RATE_WINDOW_S = float(os.environ.get("HEAR_REFUSAL_RATE_WINDOW_S", "60"))
     # Seconds a writer may hold the exclusive right to publish one durable record to Redis before
     # another writer (usually the background replay worker) may take it over. Bounded so a process
     # that dies mid-publish cannot strand a record forever; long enough that a slow-but-alive Redis
@@ -111,6 +132,10 @@ data:
     _BOOT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,31}$")
     _EVENT_TYPES = {"clip_written", "detection_batch_ready"}
     _CLOCK_STATES = frozenset({"LOCKED", "HOLDOVER", "DEGRADED", "FAULT"})
+    # Marks a time block this receiver reconstructed for a pre-clock-state firmware rather than one
+    # the device sent. Stored on the record, so a reader can tell an inferred clock state from a
+    # reported one.
+    LEGACY_TIME_SOURCE = "legacy_pre_clock_state_firmware"
     
     
     class RequestError(ValueError):
@@ -137,6 +162,47 @@ data:
         # durable_records.id of the stored row (0 when durability is disabled). Used to order replay
         # and to detect that a newer record for the same device already reached the cache.
         row_id: int = 0
+    
+    
+    @dataclass(frozen=True)
+    class RefusalEntry:
+        """One message that failed validation, kept as evidence rather than replay material.
+    
+        Deliberately *not* a DurableEntry: a refusal has no record_uid in the outbox namespace, is
+        never claimed, never published to Redis and never replayed. ``body_text`` is the received
+        bytes as decoded, truncated to REFUSAL_MAX_BODY_CHARS, so what is quarantined is what the
+        publisher actually sent -- not a normalised or repaired copy of it.
+        """
+        refusal_uid: str
+        telemetry_path: str
+        device_id: str
+        source: str
+        reason: str
+        body_text: str
+        truncated: bool
+        received_at: str
+    
+    
+    def _refusal_body_text(raw: Any) -> tuple[str, bool]:
+        """The received body as text, capped. Returns (text, truncated)."""
+        if isinstance(raw, bytes):
+            text = raw.decode("utf-8", errors="replace")
+        elif isinstance(raw, str):
+            text = raw
+        else:
+            text = encode_json(raw)
+        if len(text) > REFUSAL_MAX_BODY_CHARS:
+            return text[:REFUSAL_MAX_BODY_CHARS], True
+        return text, False
+    
+    
+    def _refusal_uid(telemetry_path: str, device_id: str, source: str,
+                     reason: str, body_text: str) -> str:
+        digest = hashlib.sha256()
+        for part in (telemetry_path, device_id, source, reason, body_text):
+            digest.update(part.encode("utf-8"))
+            digest.update(b"\x1f")
+        return digest.hexdigest()
     
     
     class DurableRecordStore:
@@ -168,6 +234,35 @@ data:
         def prune_acknowledged(self, retention_days: int) -> int:
             return 0
     
+        # -- refusal quarantine seam -------------------------------------------------------------
+        #
+        # Deliberately *not* part of health(): that key set is the cross-store durable contract the
+        # Postgres generation must implement key for key (tests/test_hear_durable_pg_schema.py), and
+        # widening it here would silently make every store that cannot store refusals non-compliant.
+        # Refusal observability lives on its own surface instead, reported beside the durable store
+        # in health_snapshot() and implemented per backend.
+    
+        def record_refusal(self, telemetry_path: str, device_id: str, source: str,
+                           reason: str, raw_body: Any) -> Optional[RefusalEntry]:
+            return None
+    
+        def refusals(self, limit: int = 50, telemetry_path: Optional[str] = None) -> list[RefusalEntry]:
+            return []
+    
+        def prune_refusals(self, retention_days: int) -> int:
+            return 0
+    
+        def refusal_health(self) -> Dict[str, Any]:
+            return {
+                "backend": self.backend,
+                "enabled": False,
+                "refused_messages": 0,
+                "last_refusal_at": None,
+                "max_rows": 0,
+                "max_bytes": 0,
+                "evicted_refusals": 0,
+            }
+    
         def health(self) -> Dict[str, Any]:
             return {
                 "backend": self.backend,
@@ -184,11 +279,16 @@ data:
         backend = "sqlite"
         enabled = True
     
-        def __init__(self, path: str, claim_lease_s: int = DURABLE_CLAIM_LEASE_S):
+        def __init__(self, path: str, claim_lease_s: int = DURABLE_CLAIM_LEASE_S,
+                     refusal_max_rows: int = REFUSAL_MAX_ROWS,
+                     refusal_max_bytes: int = REFUSAL_MAX_BYTES):
             if not path or not path.strip():
                 raise ValueError("HEAR_DURABLE_DB / --durable-db must be set for sqlite durability")
             self.path = os.path.abspath(path)
             self.claim_lease_s = max(1, int(claim_lease_s))
+            self.refusal_max_rows = max(0, int(refusal_max_rows))
+            self.refusal_max_bytes = max(0, int(refusal_max_bytes))
+            self._evicted_refusals = 0
             self._lock = threading.Lock()
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             self._init_db()
@@ -303,6 +403,36 @@ data:
                         value TEXT NOT NULL
                     )
                     """
+                )
+                # Refused messages (R4). Separate table, no foreign key into durable_records and no
+                # reference from it: an older receiver binary rolled back onto this same file neither
+                # reads nor writes this table, and nothing it writes references it. body_bytes is
+                # stored rather than computed so the byte cap is enforceable with an indexed SUM
+                # instead of a scan over the bodies themselves.
+                con.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS refused_messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        refusal_uid TEXT NOT NULL UNIQUE,
+                        telemetry_path TEXT NOT NULL,
+                        device_id TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        body_text TEXT NOT NULL,
+                        body_bytes INTEGER NOT NULL,
+                        truncated INTEGER NOT NULL,
+                        received_at TEXT NOT NULL,
+                        occurrences INTEGER NOT NULL DEFAULT 1
+                    )
+                    """
+                )
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS refused_messages_received "
+                    "ON refused_messages(received_at, id)"
+                )
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS refused_messages_source "
+                    "ON refused_messages(source, device_id, id)"
                 )
             self._migrate_record_uids()
     
@@ -498,6 +628,133 @@ data:
                 con.execute(
                     f"DELETE FROM durable_records WHERE record_uid IN ({placeholders})", uids)
             return len(uids)
+    
+        def record_refusal(self, telemetry_path: str, device_id: str, source: str,
+                           reason: str, raw_body: Any) -> Optional[RefusalEntry]:
+            """Durably records one refused message, then enforces the hard caps in the same write.
+    
+            Insert, read-back confirmation and cap enforcement share a single BEGIN IMMEDIATE
+            transaction: either a caller is told a refusal is stored *and it is*, or nothing changed.
+            Repeats of an identical refusal bump a counter instead of adding a row, so a stuck node
+            resending the same rejected body cannot consume the ledger.
+    
+            The caps make this a ring over refusals only. Eviction always takes the oldest row of
+            whichever (source, device) contributes the most rows, so one flooding publisher evicts
+            its own history before anyone else's, and no statement here can touch durable_records,
+            cache_attempts or cache_claims -- accepted outbox data is unreachable from this path.
+            """
+            body_text, truncated = _refusal_body_text(raw_body)
+            refusal_uid = _refusal_uid(telemetry_path, device_id, source, reason, body_text)
+            received_at = utc_now()
+            body_bytes = len(body_text.encode("utf-8"))
+            with self._lock, self._transaction() as con:
+                con.execute(
+                    """
+                    INSERT INTO refused_messages
+                        (refusal_uid, telemetry_path, device_id, source, reason, body_text,
+                         body_bytes, truncated, received_at, occurrences)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    ON CONFLICT(refusal_uid) DO UPDATE SET
+                        occurrences = occurrences + 1,
+                        received_at = excluded.received_at
+                    """,
+                    (refusal_uid, telemetry_path, device_id, source, reason, body_text,
+                     body_bytes, 1 if truncated else 0, received_at),
+                )
+                self._enforce_refusal_caps(con)
+                row = con.execute(
+                    "SELECT refusal_uid, telemetry_path, device_id, source, reason, body_text, "
+                    "truncated, received_at FROM refused_messages WHERE refusal_uid = ?",
+                    (refusal_uid,),
+                ).fetchone()
+            if row is None:
+                # Only reachable when this very refusal was the one the caps evicted (a cap of zero,
+                # or a body larger than the byte cap). The message is still refused; there is simply
+                # no evidence row to hand back, and saying so is better than implying one exists.
+                return None
+            return RefusalEntry(str(row["refusal_uid"]), str(row["telemetry_path"]),
+                                str(row["device_id"]), str(row["source"]), str(row["reason"]),
+                                str(row["body_text"]), bool(row["truncated"]),
+                                str(row["received_at"]))
+    
+        def _enforce_refusal_caps(self, con: sqlite3.Connection) -> int:
+            """Evicts refusals until both the row and byte caps hold. Caller supplies the transaction."""
+            evicted = 0
+            # Bounded by construction: every pass deletes at least one row, and the loop stops as soon
+            # as both caps hold, so a single insert can never do unbounded work.
+            while True:
+                rows, total_bytes = con.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(body_bytes), 0) FROM refused_messages"
+                ).fetchone()
+                if rows == 0:
+                    break
+                if rows <= self.refusal_max_rows and total_bytes <= self.refusal_max_bytes:
+                    break
+                victim = con.execute(
+                    """
+                    SELECT id FROM refused_messages
+                    WHERE source || char(31) || device_id = (
+                        SELECT source || char(31) || device_id FROM refused_messages
+                        GROUP BY source, device_id
+                        ORDER BY COUNT(*) DESC, MAX(id) DESC LIMIT 1
+                    )
+                    ORDER BY id LIMIT 1
+                    """
+                ).fetchone()
+                if victim is None:
+                    break
+                con.execute("DELETE FROM refused_messages WHERE id = ?", (int(victim[0]),))
+                evicted += 1
+            if evicted:
+                self._evicted_refusals += evicted
+            return evicted
+    
+        def refusals(self, limit: int = 50, telemetry_path: Optional[str] = None) -> list[RefusalEntry]:
+            if limit <= 0:
+                return []
+            query = ("SELECT refusal_uid, telemetry_path, device_id, source, reason, body_text, "
+                     "truncated, received_at FROM refused_messages")
+            params: list[Any] = []
+            if telemetry_path is not None:
+                query += " WHERE telemetry_path = ?"
+                params.append(telemetry_path)
+            query += " ORDER BY id DESC LIMIT ?"
+            params.append(int(limit))
+            with self._lock, self._reading() as con:
+                rows = con.execute(query, params).fetchall()
+            return [RefusalEntry(str(r["refusal_uid"]), str(r["telemetry_path"]), str(r["device_id"]),
+                                 str(r["source"]), str(r["reason"]), str(r["body_text"]),
+                                 bool(r["truncated"]), str(r["received_at"])) for r in rows]
+    
+        def prune_refusals(self, retention_days: int) -> int:
+            """Age-based sweep. The hard caps above are what actually bounds the volume; this only
+            keeps the quarantine from holding evidence longer than the telemetry it came from."""
+            if retention_days <= 0:
+                return 0
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat(
+                timespec="seconds").replace("+00:00", "Z")
+            with self._lock, self._transaction() as con:
+                cursor = con.execute("DELETE FROM refused_messages WHERE received_at < ?", (cutoff,))
+                return int(cursor.rowcount or 0)
+    
+        def refusal_health(self) -> Dict[str, Any]:
+            with self._lock, self._reading() as con:
+                refused, body_bytes = con.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(body_bytes), 0) FROM refused_messages"
+                ).fetchone()
+                last = con.execute(
+                    "SELECT received_at FROM refused_messages ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            return {
+                "backend": self.backend,
+                "enabled": True,
+                "refused_messages": int(refused),
+                "last_refusal_at": None if last is None else str(last[0]),
+                "refused_bytes": int(body_bytes),
+                "max_rows": self.refusal_max_rows,
+                "max_bytes": self.refusal_max_bytes,
+                "evicted_refusals": self._evicted_refusals,
+            }
     
         def _append_attempt(self, record_uid: str, cache_target: str,
                             outcome: str, error_text: Optional[str]) -> None:
@@ -704,7 +961,9 @@ data:
                      event_stream_key: str = EVENT_STREAM_KEY,
                      event_stream_maxlen: int = EVENT_STREAM_MAXLEN,
                      redis_target: Optional[str] = None,
-                     durable_store: Optional[DurableRecordStore] = None):
+                     durable_store: Optional[DurableRecordStore] = None,
+                     refusal_rate_limit: int = REFUSAL_RATE_LIMIT,
+                     refusal_rate_window_s: float = REFUSAL_RATE_WINDOW_S):
             self.client = client
             self.heartbeat_ttl_s = heartbeat_ttl_s
             self.event_stream_key = event_stream_key
@@ -717,6 +976,47 @@ data:
                 event_stream_key=event_stream_key,
                 event_stream_maxlen=event_stream_maxlen,
             )
+            self.refusal_rate_limit = max(0, int(refusal_rate_limit))
+            self.refusal_rate_window_s = float(refusal_rate_window_s)
+            self._refusal_lock = threading.Lock()
+            self._refusal_windows: Dict[str, tuple[float, int]] = {}
+            self.suppressed_refusals = 0
+    
+        def record_refusal(self, telemetry_path: str, device_id: str, source: str,
+                           reason: str, raw_body: Any) -> Optional[RefusalEntry]:
+            """Quarantines a refused message, rate-limited per source.
+    
+            The limiter is in memory and costs no I/O, which is the point: without it every message a
+            hostile or broken publisher sends becomes one synchronous fsync on the shared telemetry
+            volume. Over the limit the refusal is counted (suppressed_refusals) and dropped; the
+            message stays refused either way, so nothing here can turn bad input into an ingest
+            failure. Storage failures are logged, never raised, for the same reason.
+            """
+            if not self._refusal_allowed(device_id or source):
+                self.suppressed_refusals += 1
+                return None
+            try:
+                return self.durable_store.record_refusal(
+                    telemetry_path, device_id, source, reason, raw_body)
+            except Exception as exc:  # pragma: no cover - defensive; a refusal must never 500.
+                logger.warning("could not quarantine refused %s message: %s", telemetry_path, exc)
+                return None
+    
+        def _refusal_allowed(self, key: str) -> bool:
+            if self.refusal_rate_limit <= 0 or self.refusal_rate_window_s <= 0:
+                # <= 0 disables the limiter, matching the other "0 turns this off" knobs here. The
+                # hard row/byte caps still bound what the flood can actually consume.
+                return True
+            now = time.monotonic()
+            with self._refusal_lock:
+                started, count = self._refusal_windows.get(key, (now, 0))
+                if now - started >= self.refusal_rate_window_s:
+                    started, count = now, 0
+                if count >= self.refusal_rate_limit:
+                    self._refusal_windows[key] = (started, count)
+                    return False
+                self._refusal_windows[key] = (started, count + 1)
+                return True
     
         def write_heartbeat(self, payload: Dict[str, Any]) -> Dict[str, Any]:
             return self._write(payload)
@@ -808,9 +1108,14 @@ data:
             return summary
     
         def health_snapshot(self) -> Dict[str, Any]:
+            refusals = dict(self.durable_store.refusal_health())
+            refusals["suppressed_refusals"] = self.suppressed_refusals
             return {
                 "redis_target": self.redis_target,
                 "durable_store": self.durable_store.health(),
+                # Separate surface, not extra durable_store keys: see the refusal seam on
+                # DurableRecordStore for why the cross-store health contract stays as it is.
+                "refusals": refusals,
             }
     
     
@@ -883,6 +1188,10 @@ data:
                     if pruned:
                         logger.info("pruned %d acknowledged durable record(s) older than %dd",
                                     pruned, self.retention_days)
+                    refused = self.store.durable_store.prune_refusals(self.retention_days)
+                    if refused:
+                        logger.info("pruned %d quarantined refusal(s) older than %dd",
+                                    refused, self.retention_days)
                 except Exception:
                     logger.exception("background durable prune attempt failed")
     
@@ -1069,8 +1378,41 @@ data:
         return time_state
     
     
-    def _validate_common(payload: Any, telemetry_path: str, *, require_gps: bool = True) -> Dict[str, Any]:
+    def _legacy_event_time_block(body: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """The time block a pre-#156 firmware would have sent on an event, inferred from ``ts``.
+    
+        That firmware emitted ``"time": {"valid": <bool>}`` on heartbeats but no time key at all on
+        events (firmware/hear_node/hear_push_payload.h at f3b2ec9), so a node still running it has
+        every heartbeat accepted and every event refused. The clock state it *did* express on an
+        event is the ts field itself: hear_push_ts_field() writes the ISO timestamp when the clock is
+        valid and a literal null when it is not. That is a total mapping, so the block can be
+        reconstructed exactly -- no guessing, and nothing else about the body is treated as valid.
+    
+        Returns None for any other shape (a numeric ts, an empty string, a missing key), which keeps
+        the refusal for genuinely malformed input.
+        """
+        if "time" in body:
+            return None
+        if "ts" not in body:
+            return None
+        ts = body["ts"]
+        if ts is None:
+            return {"valid": False, "source": LEGACY_TIME_SOURCE}
+        if isinstance(ts, str) and ts.strip():
+            return {"valid": True, "source": LEGACY_TIME_SOURCE}
+        return None
+    
+    
+    def _validate_common(payload: Any, telemetry_path: str, *, require_gps: bool = True,
+                         allow_legacy_time: bool = False) -> Dict[str, Any]:
         body = _require_object(payload, "payload")
+        if allow_legacy_time:
+            legacy_time = _legacy_event_time_block(body)
+            if legacy_time is not None:
+                # _require_object hands back the caller's own dict, so canonicalise onto a copy: the
+                # quarantine and the bridge must still see the bytes the device actually sent.
+                body = dict(body)
+                body["time"] = legacy_time
         if body.get("telemetry_path") != telemetry_path:
             raise RequestError(f"telemetry_path must be {telemetry_path!r}")
         if body.get("telemetry_schema_version") != 1:
@@ -1109,7 +1451,7 @@ data:
     
     
     def validate_event_payload(payload: Any) -> Dict[str, Any]:
-        body = _validate_common(payload, "hear/event", require_gps=False)
+        body = _validate_common(payload, "hear/event", require_gps=False, allow_legacy_time=True)
         event_type = _require_string(body, "event_type")
         if event_type not in _EVENT_TYPES:
             raise RequestError("event_type must be one of %s" % ", ".join(sorted(_EVENT_TYPES)))
@@ -1123,6 +1465,27 @@ data:
             _require_int(event, "dets_rows_written")
             _require_int(event, "batch_rows")
         return body
+    
+    
+    def _refused_device_id(raw_body: Any) -> str:
+        """Best-effort device id for a refused body; "unknown" when it cannot be read.
+    
+        Never trusted as identity -- it only groups refusals and feeds the per-source rate limit.
+        """
+        try:
+            if isinstance(raw_body, bytes):
+                parsed = json.loads(raw_body.decode("utf-8"))
+            elif isinstance(raw_body, str):
+                parsed = json.loads(raw_body)
+            else:
+                parsed = raw_body
+        except (ValueError, UnicodeDecodeError):
+            return "unknown"
+        if isinstance(parsed, dict):
+            device_id = parsed.get("device_id")
+            if isinstance(device_id, str) and _DEVICE_ID_RE.fullmatch(device_id.strip()):
+                return device_id.strip()
+        return "unknown"
     
     
     def make_handler(store: HeartbeatReceiverStore,
@@ -1146,6 +1509,7 @@ data:
                     "service": "hear-heartbeat-receiver",
                     "redis_target": snapshot["redis_target"],
                     "durable_store": snapshot["durable_store"],
+                    "refusals": snapshot["refusals"],
                 })
     
             def do_POST(self) -> None:
@@ -1159,10 +1523,19 @@ data:
                     self.send_error(404)
                     return
                 validator, writer = route
+                telemetry_path = path.replace("/api/", "", 1)
+                self.raw_body = None
                 try:
                     self.require_auth(auth_token)
                     writer(validator(self.read_json_body(max_body_bytes)))
                 except RequestError as exc:
+                    # An authenticated caller whose body this build rejects gets a durable refusal
+                    # row (R4): the message is refused, but it stops disappearing. 401s are excluded
+                    # deliberately -- an unauthenticated stranger must not be able to write to the
+                    # telemetry volume at all.
+                    if exc.status != 401 and self.raw_body is not None:
+                        store.record_refusal(telemetry_path, _refused_device_id(self.raw_body),
+                                             "lan_http", str(exc), self.raw_body)
                     self.send_json({"error": str(exc)}, exc.status)
                     return
                 except Exception as exc:  # pragma: no cover - exercised with a fake failing store.
@@ -1196,6 +1569,9 @@ data:
                     raw = self.rfile.read(length)
                 except (TimeoutError, socket.timeout) as exc:
                     raise RequestError("request body read timed out", status=408) from exc
+                # Kept before parsing: a body that fails to decode or parse is exactly the one worth
+                # quarantining, and what is quarantined is the received bytes, not a repaired copy.
+                self.raw_body = raw
                 if len(raw) != length:
                     raise RequestError("truncated request body")
                 try:

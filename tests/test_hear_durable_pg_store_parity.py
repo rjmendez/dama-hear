@@ -470,6 +470,61 @@ class TestAgainstAnEphemeralDatabase:
                         "WHERE record_uid = 'parity-1'") == \
             hashlib.sha256(body.encode("utf-8")).hexdigest()
 
+    def test_the_two_backends_quarantine_and_bound_refusals_the_same_way(self, db, tmp_path):
+        """R4 must survive the cut-over: refused input stays evidence, and stays bounded."""
+        sqlite_store = HR.SqliteDurableRecordStore(str(tmp_path / "state" / "refusals.sqlite3"),
+                                                   refusal_max_rows=10)
+        body = '{"telemetry_path":"hear/event","device_id":"mach"}'
+        entry = sqlite_store.record_refusal("hear/event", "mach", "mqtt_bridge",
+                                            "time must be an object", body)
+        assert entry is not None
+        assert db.value(
+            "SELECT hear.record_refusal('default', " + lit(entry.refusal_uid)
+            + ", 'hear/event', 'mach', 'mqtt_bridge', 'time must be an object', "
+            + lit(body) + ")") != ""
+
+        # The identical refusal repeated is one row on both backends, not two.
+        sqlite_store.record_refusal("hear/event", "mach", "mqtt_bridge",
+                                    "time must be an object", body)
+        db.sql("SELECT hear.record_refusal('default', " + lit(entry.refusal_uid)
+               + ", 'hear/event', 'mach', 'mqtt_bridge', 'time must be an object', "
+               + lit(body) + ")")
+        assert db.value("SELECT count(*) FROM hear.refused_messages") == "1"
+        assert len(sqlite_store.refusals()) == 1
+        assert db.value("SELECT occurrences FROM hear.refused_messages") == "2"
+
+        # A flood of distinct bodies is bounded by row count on both, and the node that sent one
+        # refusal keeps its evidence on both.
+        for i in range(100):
+            flood = '{"n":%d}' % i
+            sqlite_store.record_refusal("hear/event", "flooder", "mqtt_bridge",
+                                        "malformed JSON", flood)
+            db.sql("SELECT hear.record_refusal('default', 'flood-%d', 'hear/event', 'flooder', "
+                   "'mqtt_bridge', 'malformed JSON', %s, false, 10, 16777216)"
+                   % (i, lit(flood)))
+        assert sqlite_store.refusal_health()["refused_messages"] == 10
+        assert db.value("SELECT count(*) FROM hear.refused_messages") == "10"
+        assert db.value("SELECT count(*) FROM hear.refused_messages WHERE device_id = 'mach'") == "1"
+        assert any(r.device_id == "mach" for r in sqlite_store.refusals(limit=50))
+
+        # ... and neither backend let the quarantine touch the outbox.
+        assert sqlite_store.health()["pending_records"] == 0
+        assert db.value("SELECT count(*) FROM hear.durable_records") == "0"
+
+    def test_the_refusal_surface_reports_the_same_keys_on_both_backends(self, db, tmp_path):
+        sqlite_store = HR.SqliteDurableRecordStore(str(tmp_path / "state" / "rh.sqlite3"))
+        sqlite_store.record_refusal("hear/event", "mach", "mqtt_bridge", "nope", "{}")
+        snapshot = json.loads(db.value("SELECT hear.refusal_health_snapshot()"))
+        shared = {"backend", "enabled", "refused_messages", "refused_bytes",
+                  "last_refusal_at", "evicted_refusals"}
+        assert shared <= set(snapshot)
+        assert shared <= set(sqlite_store.refusal_health())
+        assert snapshot["refused_messages"] == 0      # this database saw none of it
+        assert sqlite_store.refusal_health()["refused_messages"] == 1
+        # The durable health contract itself is unchanged by any of this.
+        assert "refused_messages" not in sqlite_store.health()
+        assert "refused_messages" not in json.loads(db.value("SELECT hear.health_snapshot()"))
+
     def test_the_two_backends_report_the_same_health_for_the_same_traffic(self, db, tmp_path):
         sqlite_store = HR.SqliteDurableRecordStore(str(tmp_path / "state" / "health.sqlite3"))
         for uid in ("h-1", "h-2", "h-3"):
