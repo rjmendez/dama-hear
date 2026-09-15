@@ -1,0 +1,2774 @@
+{
+  "baseline_hash": "4609e8fb228c7c29b5f1da7b461d56f75381d70c215a4789a402acc46009c32b",
+  "baseline_version": 1,
+  "compatibility": {
+    "forward_path": [
+      "Regenerate the JSON and markdown baselines before any contract change and diff them in review.",
+      "Allocate new wire profile ids or schema generations instead of editing deployed meanings in place.",
+      "Document transport, Redis, or manifest layout changes beside the code that changes them."
+    ],
+    "guarantee": "This freeze adds read-only tooling and versioned baseline artifacts only; it does not change wire formats, firmware behavior, MQTT topics, Redis keys, or manifests.",
+    "rollback_path": [
+      "Revert the contract-changing commit or restore the earlier versioned baseline files.",
+      "Redeploy the prior firmware tag or manifest set if an operational change shipped with the contract change.",
+      "Run `python3 tools/freeze_contracts.py --check` to confirm the checkout matches the frozen baseline again."
+    ]
+  },
+  "corpus_fixture_metadata": {
+    "files": [
+      {
+        "path": "docs/data/clap-calibration-2026-09-14/clean_clap_arrivals.json",
+        "sha256": "4fe8c28df91c876b3020c131b135a7885b6c9f5876bb76da84cacef799ebad0e",
+        "size_bytes": 3469,
+        "summary": {
+          "top_level_keys": [
+            "observations"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "path": "docs/data/clap-calibration-2026-09-14/colocated_survey.json",
+        "sha256": "e5d047bb0cc3a76de4ab7353b195512b2b928e44c635b3c07fe56a1c9ce4e99d",
+        "size_bytes": 369,
+        "summary": {
+          "nodes_count": 6,
+          "top_level_keys": [
+            "nodes"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "path": "testdata/hugbot_latency_trials.json",
+        "sha256": "72f50300ca13d7d4bbf01ff0959dc4512d1d4f96b1a81eb3872e84992ff2b254",
+        "size_bytes": 143346,
+        "summary": {
+          "length": 450,
+          "type": "array"
+        }
+      },
+      {
+        "path": "testdata/sketch_golden.json",
+        "sha256": "6c3cfbce52d54f01f9b6e21523d5f2dc426fa0b0562fbe193251a771d67516bd",
+        "size_bytes": 109646,
+        "summary": {
+          "cases_count": 9,
+          "schema": "hear.sketch.golden.v4",
+          "top_level_keys": [
+            "cases",
+            "f_hi",
+            "f_lo",
+            "frames",
+            "fs_codes",
+            "fs_mask",
+            "fs_shift",
+            "hop_s",
+            "layout_bit",
+            "layout_equivalent_above_hz",
+            "mel_bands",
+            "nfft",
+            "note",
+            "schema",
+            "wire_size"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "path": "testdata/window_golden.json",
+        "sha256": "cadf188a841010ea11c969a053b1f57970832f9cb0a8164d3da9e65d32ea4d41",
+        "size_bytes": 52751,
+        "summary": {
+          "cases_count": 4,
+          "schema": "hear.window.golden.v2",
+          "top_level_keys": [
+            "cases",
+            "env_ms",
+            "guard_s",
+            "note",
+            "onset_frac",
+            "retrigger_s",
+            "schema"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "path": "tests/fixtures/status_mach.json",
+        "sha256": "2d822b7f2f640ce6e8f2f987727dbda0458a7959c681862ecce15c61f1b1e881",
+        "size_bytes": 2111,
+        "summary": {
+          "top_level_keys": [
+            "acq",
+            "audio",
+            "class",
+            "clips",
+            "env",
+            "esp_clock",
+            "gate",
+            "gps",
+            "heap",
+            "i2c",
+            "i2s",
+            "node",
+            "pos",
+            "pps",
+            "psram",
+            "raw",
+            "scene",
+            "sd",
+            "sd_free_mb",
+            "sd_total_mb",
+            "time",
+            "uptime_s",
+            "write_fail"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "path": "tests/fixtures/status_nyquist.json",
+        "sha256": "fc6caf8751a1438c474a205e816f6b5772fb294e42a17c0c976d8b5e15d3dc57",
+        "size_bytes": 2113,
+        "summary": {
+          "top_level_keys": [
+            "acq",
+            "audio",
+            "class",
+            "clips",
+            "env",
+            "esp_clock",
+            "gate",
+            "gps",
+            "heap",
+            "i2c",
+            "i2s",
+            "node",
+            "pos",
+            "pps",
+            "psram",
+            "raw",
+            "scene",
+            "sd",
+            "sd_free_mb",
+            "sd_total_mb",
+            "time",
+            "uptime_s",
+            "write_fail"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "path": "tests/fixtures/tdoa-solved-events-2026-09-11.json",
+        "sha256": "027f8fd72650a8371238fee45cee91aac08f8d16985284bb207b7c20d7432a86",
+        "size_bytes": 8191,
+        "summary": {
+          "events_count": 2,
+          "top_level_keys": [
+            "events",
+            "how_to_read",
+            "provenance",
+            "what"
+          ],
+          "type": "object"
+        }
+      }
+    ],
+    "metadata_only": true,
+    "privacy_note": "Representative fixture inventory only: repo paths, top-level schema ids, counts, sizes, and sha256 digests. No live corpus pulls and no payload bodies are copied.",
+    "section_hash": "5a27ffc150822a94847095b765d20e4f0299ec4d9e58f2ea1af05d6ecf470d77"
+  },
+  "firmware_build_metadata": {
+    "board_profiles": [
+      {
+        "board_class": "esp32s3-i2s-gps",
+        "cpp_flags": [
+          "-DHEAR_BOARD_ESP32S3_I2S_GPS"
+        ],
+        "release_stem": "hear_node-esp32s3-i2s-gps",
+        "upload_kinds": [
+          {
+            "artifact_suffix": ".bin",
+            "kind": "app",
+            "upload_filename": "hear_node.ino.bin"
+          },
+          {
+            "artifact_suffix": "-bootloader.bin",
+            "kind": "bootloader",
+            "upload_filename": "hear_node.ino.bootloader.bin"
+          },
+          {
+            "artifact_suffix": ".elf",
+            "kind": "elf",
+            "upload_filename": "hear_node.ino.elf"
+          },
+          {
+            "artifact_suffix": "-merged.bin",
+            "kind": "merged",
+            "upload_filename": "hear_node.ino.merged.bin"
+          },
+          {
+            "artifact_suffix": "-partitions.bin",
+            "kind": "partitions",
+            "upload_filename": "hear_node.ino.partitions.bin"
+          }
+        ]
+      },
+      {
+        "board_class": "xiao-s3-pps",
+        "cpp_flags": [],
+        "release_stem": "hear_node-xiao-s3-pps",
+        "upload_kinds": [
+          {
+            "artifact_suffix": ".bin",
+            "kind": "app",
+            "upload_filename": "hear_node.ino.bin"
+          },
+          {
+            "artifact_suffix": "-bootloader.bin",
+            "kind": "bootloader",
+            "upload_filename": "hear_node.ino.bootloader.bin"
+          },
+          {
+            "artifact_suffix": ".elf",
+            "kind": "elf",
+            "upload_filename": "hear_node.ino.elf"
+          },
+          {
+            "artifact_suffix": "-merged.bin",
+            "kind": "merged",
+            "upload_filename": "hear_node.ino.merged.bin"
+          },
+          {
+            "artifact_suffix": "-partitions.bin",
+            "kind": "partitions",
+            "upload_filename": "hear_node.ino.partitions.bin"
+          }
+        ]
+      }
+    ],
+    "default_board_class": "xiao-s3-pps",
+    "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
+    "section_hash": "e3824a7e325f0ff284872d91f9845a28c77d354052b6074210efaf6215d525de",
+    "source_files": [
+      {
+        "path": ".github/workflows/firmware.yml",
+        "sha256": "cc883e24286073e7535935ae2bda67ce3df57f5abb09fb4b51f4c413eb3446de",
+        "size_bytes": 5125
+      },
+      {
+        "path": ".github/workflows/release.yml",
+        "sha256": "2f28bd279d85565f83992b52c099f1111111df8daf2fa467e7b243381f84dd82",
+        "size_bytes": 5017
+      },
+      {
+        "path": "firmware/README.md",
+        "sha256": "e40f924b6fb95f0a3b4ba9953a3f5a74e4f532aa2631f5deffbabc74a27b8322",
+        "size_bytes": 7348
+      },
+      {
+        "path": "firmware/hear_node/README.md",
+        "sha256": "b8b88201f266acf0d179705423cdcaf6ec3d709be0e6dde28be9112f653f86a7",
+        "size_bytes": 50138
+      },
+      {
+        "path": "firmware/hear_node/board_profiles.py",
+        "sha256": "c542aa4980fe021f5c75f36f7b24a19707dca6f0c39473bc49e9cb9b3142310b",
+        "size_bytes": 2146
+      },
+      {
+        "path": "firmware/hear_node/gen_secrets.py",
+        "sha256": "c8e439cfdddffc2da7032710f9feb30f5fba55b48d2dc6bb8ff20fabfaaa5c12",
+        "size_bytes": 5502
+      },
+      {
+        "path": "firmware/hear_node/hear_node.ino",
+        "sha256": "fbc75bd0190544965c6a9cbc9080d0b85e2faeea95dd08629275083ca3dc7d25",
+        "size_bytes": 304834
+      },
+      {
+        "path": "firmware/hear_node/hear_push_payload.h",
+        "sha256": "afc76e125418a3e24fca56b1796be88989279feba79d4026c11137d5ec297259",
+        "size_bytes": 7623
+      },
+      {
+        "path": "firmware/hear_node/mel_impulse.h",
+        "sha256": "d56d54b4dbf83b95963bacff98d3b8d6306ba56fe068360a9024ddba8e79ea77",
+        "size_bytes": 9147
+      },
+      {
+        "path": "firmware/hear_node/mel_scene.h",
+        "sha256": "87a72dc1c4846831aefaa26affc928e23f15c1b72f3ae9d9699bf891b7cf9e39",
+        "size_bytes": 5958
+      },
+      {
+        "path": "firmware/puc_node/partitions.csv",
+        "sha256": "bdcfb8b4096725540e6fa061f5ac18c90f76eec2d0da43b505dc719f371ae477",
+        "size_bytes": 928
+      },
+      {
+        "path": "requirements/ci-dev.txt",
+        "sha256": "bfdea89437a0a557116a7e752bec0140b72aac84b73ab464228c75bdcae0e464",
+        "size_bytes": 249
+      },
+      {
+        "path": "requirements/ci-pods.txt",
+        "sha256": "07d5393d8e459a6273940d30a0fb3a17518626c02d8928fefa766f5b85b4a730",
+        "size_bytes": 325
+      }
+    ],
+    "toolchain": {
+      "arduino_cli_version": "1.5.1",
+      "esp32_core": "3.3.11",
+      "esp32_index": "https://espressif.github.io/arduino-esp32/package_esp32_index.json"
+    },
+    "workflow_builds": [
+      {
+        "artifact": "fw-hear_node-xiao-s3-pps",
+        "board_class": "xiao-s3-pps",
+        "build_flags": [
+          "-DHEAR_ALLOW_NO_WIFI"
+        ],
+        "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
+        "guard_flags": [],
+        "guarded": true,
+        "release_stem": "hear_node-xiao-s3-pps",
+        "sketch": "hear_node"
+      },
+      {
+        "artifact": "fw-hear_node-esp32s3-i2s-gps",
+        "board_class": "esp32s3-i2s-gps",
+        "build_flags": [
+          "-DHEAR_ALLOW_NO_WIFI",
+          "-DHEAR_BOARD_ESP32S3_I2S_GPS"
+        ],
+        "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
+        "guard_flags": [
+          "-DHEAR_BOARD_ESP32S3_I2S_GPS"
+        ],
+        "guarded": true,
+        "release_stem": "hear_node-esp32s3-i2s-gps",
+        "sketch": "hear_node"
+      },
+      {
+        "artifact": "fw-puc_node",
+        "board_class": null,
+        "build_flags": [
+          "-DHEAR_ALLOW_NO_WIFI"
+        ],
+        "fqbn": "esp32:esp32:esp32s3:PSRAM=opi",
+        "guard_flags": [],
+        "guarded": true,
+        "release_stem": null,
+        "sketch": "puc_node"
+      },
+      {
+        "artifact": "fw-hear_poc",
+        "board_class": null,
+        "build_flags": [
+          "-DHEAR_ALLOW_NO_WIFI"
+        ],
+        "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
+        "guard_flags": [],
+        "guarded": false,
+        "release_stem": null,
+        "sketch": "hear_poc"
+      },
+      {
+        "artifact": "fw-path_test",
+        "board_class": null,
+        "build_flags": [
+          "-DHEAR_ALLOW_NO_WIFI"
+        ],
+        "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
+        "guard_flags": [],
+        "guarded": false,
+        "release_stem": null,
+        "sketch": "path_test"
+      },
+      {
+        "artifact": "fw-sense_bringup",
+        "board_class": null,
+        "build_flags": [
+          "-DHEAR_ALLOW_NO_WIFI"
+        ],
+        "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
+        "guard_flags": [],
+        "guarded": false,
+        "release_stem": null,
+        "sketch": "sense_bringup"
+      }
+    ]
+  },
+  "inventory_scope": {
+    "excludes": [
+      "live secrets",
+      "cluster state",
+      "Redis contents",
+      "private or bulk corpus payloads",
+      "fixture sample values"
+    ],
+    "mode": "repository-visible contracts only",
+    "runtime_behavior_changed": false
+  },
+  "kubernetes_and_pvc_layout": {
+    "manifest_files": [
+      {
+        "path": "deploy/k8s/hear-annotate.yaml",
+        "sha256": "626e06637419460bc35de39328e1a75e072946d0c192a12ce9f1c8ea079a4061",
+        "size_bytes": 27683
+      },
+      {
+        "path": "deploy/k8s/hear-birdnet.yaml",
+        "sha256": "9a4265e78c5c03e10a563b1a178582492e3f0aeef0c47f630f56fe23c06c6aa5",
+        "size_bytes": 7474
+      },
+      {
+        "path": "deploy/k8s/hear-drain.yaml",
+        "sha256": "9564038fd29653b578e91ef1a4134473e306466eb4f229cd4ec1c66b984ff07c",
+        "size_bytes": 13077
+      },
+      {
+        "path": "deploy/k8s/hear-embed.yaml",
+        "sha256": "1f3e86e8d5d1f57f4bc5d8d4ca6adb958671f5a65c7db7b21e47225916d465ad",
+        "size_bytes": 9190
+      },
+      {
+        "path": "deploy/k8s/hear-heartbeat.yaml",
+        "sha256": "9926d4a4b0a8b8adabaf17980a962d71bd29b9f7b30ad12d662fd1253b262669",
+        "size_bytes": 3386
+      },
+      {
+        "path": "deploy/k8s/hear-mqtt-bridge.yaml",
+        "sha256": "5370f68c3933e90a9d8f2422667f1e4711356a859bb28c81445a077c5376391a",
+        "size_bytes": 3235
+      },
+      {
+        "path": "deploy/k8s/hear-score.yaml",
+        "sha256": "03c0713d22b23d3f06177c79ca6d612925768c98d566f012fc01d209de5dcf0d",
+        "size_bytes": 11126
+      },
+      {
+        "path": "deploy/k8s/hear-tag.yaml",
+        "sha256": "367ed67528bb15a5dd652bf924db0af409a8f65c1b00128c0a3b14e990be1890",
+        "size_bytes": 15625
+      },
+      {
+        "path": "deploy/k8s/hear-tdoa.yaml",
+        "sha256": "632210e13b07f81dcbf675769a296f4051904b4dfd00d7c870d1e3978e4725f5",
+        "size_bytes": 17242
+      },
+      {
+        "path": "deploy/k8s/README.md",
+        "sha256": "5c4aa09a4232e6b872ccb70a6d255db7b03775816524f57adc32dc1b65776166",
+        "size_bytes": 14978
+      }
+    ],
+    "objects": [
+      {
+        "kind": "ConfigMap",
+        "manifest": "deploy/k8s/hear-annotate.yaml",
+        "name": "hear-annotate-code",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/corpus/annotations.sqlite3",
+          "/pool/corpus/clips"
+        ]
+      },
+      {
+        "containers": [
+          {
+            "env_bindings": [
+              {
+                "binding": "literal",
+                "name": "HEAR_ANNOTATE_DB"
+              }
+            ],
+            "image": "python:3.13-slim",
+            "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/server.py",
+                "sub_path": "server.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": "hear-pool",
+                "mount_path": "/pool",
+                "sub_path": null,
+                "volume_name": "pool"
+              }
+            ],
+            "name": "web"
+          }
+        ],
+        "host_network": false,
+        "kind": "Deployment",
+        "manifest": "deploy/k8s/hear-annotate.yaml",
+        "name": "hear-annotate",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/corpus/annotations.sqlite3",
+          "/pool/corpus/clips"
+        ]
+      },
+      {
+        "kind": "Service",
+        "manifest": "deploy/k8s/hear-annotate.yaml",
+        "name": "hear-annotate",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/corpus/annotations.sqlite3",
+          "/pool/corpus/clips"
+        ],
+        "ports": [
+          {
+            "name": "http",
+            "port": 8080,
+            "targetPort": "http"
+          }
+        ]
+      },
+      {
+        "containers": [
+          {
+            "env_bindings": [
+              {
+                "binding": "secretKeyRef",
+                "name": "HEAR_SITE_LATLON",
+                "optional": false,
+                "secret_key": "latlon",
+                "secret_name": "hear-site"
+              }
+            ],
+            "image": "python:3.13-slim",
+            "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/__init__.py",
+                "sub_path": "hear__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/sketch.py",
+                "sub_path": "hear_sketch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/clips.py",
+                "sub_path": "hear_clips.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/tags.py",
+                "sub_path": "hear_tags.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/resample.py",
+                "sub_path": "hear_resample.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/infrasound.py",
+                "sub_path": "hear_infrasound.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_tag.py",
+                "sub_path": "tools_hear_tag.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": "hear-pool",
+                "mount_path": "/pool",
+                "sub_path": null,
+                "volume_name": "pool"
+              }
+            ],
+            "name": "birdnet"
+          }
+        ],
+        "host_network": false,
+        "kind": "CronJob",
+        "manifest": "deploy/k8s/hear-birdnet.yaml",
+        "name": "hear-birdnet",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/models/birdnet_v24",
+          "/pool/pylib-birdnet",
+          "/pool/pylib-tag"
+        ],
+        "schedule": "19,49 * * * *"
+      },
+      {
+        "containers": [
+          {
+            "env_bindings": [],
+            "image": "python:3.13-slim",
+            "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/__init__.py",
+                "sub_path": "hear__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/sketch.py",
+                "sub_path": "hear_sketch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/clips.py",
+                "sub_path": "hear_clips.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/tags.py",
+                "sub_path": "hear_tags.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/resample.py",
+                "sub_path": "hear_resample.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/infrasound.py",
+                "sub_path": "hear_infrasound.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_tag.py",
+                "sub_path": "tools_hear_tag.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": "hear-pool",
+                "mount_path": "/pool",
+                "sub_path": null,
+                "volume_name": "pool"
+              }
+            ],
+            "name": "check"
+          }
+        ],
+        "host_network": false,
+        "kind": "CronJob",
+        "manifest": "deploy/k8s/hear-birdnet.yaml",
+        "name": "hear-birdnet-check",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/models/birdnet_v24",
+          "/pool/pylib-birdnet",
+          "/pool/pylib-tag"
+        ],
+        "schedule": "58 * * * *"
+      },
+      {
+        "access_modes": [
+          "ReadWriteOnce"
+        ],
+        "kind": "PersistentVolumeClaim",
+        "manifest": "deploy/k8s/hear-drain.yaml",
+        "name": "hear-pool",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/pylib",
+          "/pool/sketch_corpus"
+        ],
+        "storage_request": "5Gi"
+      },
+      {
+        "containers": [
+          {
+            "env_bindings": [],
+            "image": "python:3.13-slim",
+            "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/__init__.py",
+                "sub_path": "hear__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/wire.py",
+                "sub_path": "hear_wire.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/sketch.py",
+                "sub_path": "hear_sketch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/corpus.py",
+                "sub_path": "hear_corpus.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/detsfile.py",
+                "sub_path": "hear_detsfile.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/scenefile.py",
+                "sub_path": "hear_scenefile.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/identity.py",
+                "sub_path": "hear_identity.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/pool.py",
+                "sub_path": "hear_pool.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/clips.py",
+                "sub_path": "hear_clips.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_drain.py",
+                "sub_path": "tools_hear_drain.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/fleet.py",
+                "sub_path": "tools_fleet.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": "hear-pool",
+                "mount_path": "/pool",
+                "sub_path": null,
+                "volume_name": "pool"
+              }
+            ],
+            "name": "drain"
+          }
+        ],
+        "host_network": false,
+        "kind": "CronJob",
+        "manifest": "deploy/k8s/hear-drain.yaml",
+        "name": "hear-drain",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/pylib",
+          "/pool/sketch_corpus"
+        ],
+        "schedule": "*/15 * * * *"
+      },
+      {
+        "containers": [
+          {
+            "env_bindings": [],
+            "image": "python:3.13-slim",
+            "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/__init__.py",
+                "sub_path": "hear__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/wire.py",
+                "sub_path": "hear_wire.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/sketch.py",
+                "sub_path": "hear_sketch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/corpus.py",
+                "sub_path": "hear_corpus.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/detsfile.py",
+                "sub_path": "hear_detsfile.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/scenefile.py",
+                "sub_path": "hear_scenefile.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/identity.py",
+                "sub_path": "hear_identity.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/pool.py",
+                "sub_path": "hear_pool.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/clips.py",
+                "sub_path": "hear_clips.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_drain.py",
+                "sub_path": "tools_hear_drain.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/fleet.py",
+                "sub_path": "tools_fleet.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": "hear-pool",
+                "mount_path": "/pool",
+                "sub_path": null,
+                "volume_name": "pool"
+              }
+            ],
+            "name": "check"
+          }
+        ],
+        "host_network": false,
+        "kind": "CronJob",
+        "manifest": "deploy/k8s/hear-drain.yaml",
+        "name": "hear-drain-check",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/pylib",
+          "/pool/sketch_corpus"
+        ],
+        "schedule": "17 * * * *"
+      },
+      {
+        "containers": [
+          {
+            "env_bindings": [
+              {
+                "binding": "literal",
+                "name": "CUDA_VISIBLE_DEVICES"
+              },
+              {
+                "binding": "literal",
+                "name": "CUDA_DEVICE_ORDER"
+              },
+              {
+                "binding": "literal",
+                "name": "TF_FORCE_GPU_ALLOW_GROWTH"
+              },
+              {
+                "binding": "literal",
+                "name": "TF_CPP_MIN_LOG_LEVEL"
+              }
+            ],
+            "image": "tensorflow/tensorflow:2.20.0-gpu",
+            "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/__init__.py",
+                "sub_path": "hear__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/sketch.py",
+                "sub_path": "hear_sketch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/clips.py",
+                "sub_path": "hear_clips.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/tags.py",
+                "sub_path": "hear_tags.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/resample.py",
+                "sub_path": "hear_resample.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/infrasound.py",
+                "sub_path": "hear_infrasound.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_tag.py",
+                "sub_path": "tools_hear_tag.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": "hear-pool",
+                "mount_path": "/pool",
+                "sub_path": null,
+                "volume_name": "pool"
+              }
+            ],
+            "name": "embed"
+          }
+        ],
+        "host_network": false,
+        "kind": "CronJob",
+        "manifest": "deploy/k8s/hear-embed.yaml",
+        "name": "hear-embed",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/models/perch_v2",
+          "/pool/pylib-perch",
+          "/pool/pylib-tag"
+        ],
+        "schedule": "4,34 * * * *"
+      },
+      {
+        "containers": [
+          {
+            "env_bindings": [],
+            "image": "python:3.13-slim",
+            "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/__init__.py",
+                "sub_path": "hear__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/sketch.py",
+                "sub_path": "hear_sketch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/clips.py",
+                "sub_path": "hear_clips.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/tags.py",
+                "sub_path": "hear_tags.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/resample.py",
+                "sub_path": "hear_resample.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/infrasound.py",
+                "sub_path": "hear_infrasound.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_tag.py",
+                "sub_path": "tools_hear_tag.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": "hear-pool",
+                "mount_path": "/pool",
+                "sub_path": null,
+                "volume_name": "pool"
+              }
+            ],
+            "name": "check"
+          }
+        ],
+        "host_network": false,
+        "kind": "CronJob",
+        "manifest": "deploy/k8s/hear-embed.yaml",
+        "name": "hear-embed-check",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/models/perch_v2",
+          "/pool/pylib-perch",
+          "/pool/pylib-tag"
+        ],
+        "schedule": "38 * * * *"
+      },
+      {
+        "access_modes": [
+          "ReadWriteOnce"
+        ],
+        "kind": "PersistentVolumeClaim",
+        "manifest": "deploy/k8s/hear-heartbeat.yaml",
+        "name": "hear-heartbeat-state",
+        "namespace": "dama",
+        "path_references": [],
+        "storage_request": "5Gi"
+      },
+      {
+        "containers": [
+          {
+            "env_bindings": [
+              {
+                "binding": "literal",
+                "name": "HEAR_HEARTBEAT_TTL_S"
+              },
+              {
+                "binding": "literal",
+                "name": "HEAR_HEARTBEAT_SOCKET_TIMEOUT_S"
+              },
+              {
+                "binding": "literal",
+                "name": "HEAR_DURABLE_STORE"
+              },
+              {
+                "binding": "literal",
+                "name": "HEAR_DURABLE_DB"
+              },
+              {
+                "binding": "literal",
+                "name": "HEAR_DURABLE_REPLAY_LIMIT"
+              },
+              {
+                "binding": "literal",
+                "name": "REDIS_HOST"
+              },
+              {
+                "binding": "literal",
+                "name": "REDIS_PORT"
+              },
+              {
+                "binding": "secretKeyRef",
+                "name": "REDIS_PASS",
+                "optional": true,
+                "secret_key": "REDIS_PASS",
+                "secret_name": "dama-redis-secret"
+              },
+              {
+                "binding": "secretKeyRef",
+                "name": "HEAR_HEARTBEAT_TOKEN",
+                "optional": false,
+                "secret_key": "token",
+                "secret_name": "hear-heartbeat-token"
+              }
+            ],
+            "image": "python:3.13-slim",
+            "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_heartbeat_receiver.py",
+                "sub_path": "tools_hear_heartbeat_receiver.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/deps",
+                "sub_path": null,
+                "volume_name": "deps"
+              },
+              {
+                "claim_name": "hear-heartbeat-state",
+                "mount_path": "/state",
+                "sub_path": null,
+                "volume_name": "state"
+              }
+            ],
+            "name": "receiver"
+          }
+        ],
+        "host_network": true,
+        "kind": "Deployment",
+        "manifest": "deploy/k8s/hear-heartbeat.yaml",
+        "name": "hear-heartbeat",
+        "namespace": "dama",
+        "path_references": []
+      },
+      {
+        "kind": "Service",
+        "manifest": "deploy/k8s/hear-heartbeat.yaml",
+        "name": "hear-heartbeat",
+        "namespace": "dama",
+        "path_references": [],
+        "ports": [
+          {
+            "name": "http",
+            "port": 5051,
+            "targetPort": "http"
+          }
+        ]
+      },
+      {
+        "access_modes": [
+          "ReadWriteOnce"
+        ],
+        "kind": "PersistentVolumeClaim",
+        "manifest": "deploy/k8s/hear-mqtt-bridge.yaml",
+        "name": "hear-mqtt-bridge-state",
+        "namespace": "dama",
+        "path_references": [],
+        "storage_request": "5Gi"
+      },
+      {
+        "containers": [
+          {
+            "env_bindings": [
+              {
+                "binding": "literal",
+                "name": "MQTT_HOST"
+              },
+              {
+                "binding": "literal",
+                "name": "MQTT_PORT"
+              },
+              {
+                "binding": "literal",
+                "name": "MQTT_TOPIC"
+              },
+              {
+                "binding": "literal",
+                "name": "MQTT_CLIENT_ID"
+              },
+              {
+                "binding": "literal",
+                "name": "HEAR_DURABLE_STORE"
+              },
+              {
+                "binding": "literal",
+                "name": "HEAR_DURABLE_DB"
+              },
+              {
+                "binding": "literal",
+                "name": "HEAR_DURABLE_REPLAY_LIMIT"
+              },
+              {
+                "binding": "literal",
+                "name": "REDIS_HOST"
+              },
+              {
+                "binding": "literal",
+                "name": "REDIS_PORT"
+              },
+              {
+                "binding": "secretKeyRef",
+                "name": "REDIS_PASS",
+                "optional": true,
+                "secret_key": "REDIS_PASS",
+                "secret_name": "dama-redis-secret"
+              }
+            ],
+            "image": "python:3.13-slim",
+            "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_heartbeat_receiver.py",
+                "sub_path": "tools_hear_heartbeat_receiver.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_mqtt_bridge.py",
+                "sub_path": "tools_hear_mqtt_bridge.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/deps",
+                "sub_path": null,
+                "volume_name": "deps"
+              },
+              {
+                "claim_name": "hear-mqtt-bridge-state",
+                "mount_path": "/state",
+                "sub_path": null,
+                "volume_name": "state"
+              }
+            ],
+            "name": "bridge"
+          }
+        ],
+        "host_network": true,
+        "kind": "Deployment",
+        "manifest": "deploy/k8s/hear-mqtt-bridge.yaml",
+        "name": "hear-mqtt-bridge",
+        "namespace": "dama",
+        "path_references": []
+      },
+      {
+        "containers": [
+          {
+            "env_bindings": [],
+            "image": "python:3.13-slim",
+            "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/__init__.py",
+                "sub_path": "hear__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/sketch.py",
+                "sub_path": "hear_sketch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/modules/supersonic/classify.py",
+                "sub_path": "modules_supersonic_classify.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/modules/supersonic/model.json",
+                "sub_path": "modules_supersonic_model.json",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/modules/supersonic/model_sketch.json",
+                "sub_path": "modules_supersonic_model_sketch.json",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/modules/supersonic/model_sketch_15.json",
+                "sub_path": "modules_supersonic_model_sketch_15.json",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_score.py",
+                "sub_path": "tools_hear_score.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": "hear-pool",
+                "mount_path": "/pool",
+                "sub_path": null,
+                "volume_name": "pool"
+              }
+            ],
+            "name": "score"
+          }
+        ],
+        "host_network": false,
+        "kind": "CronJob",
+        "manifest": "deploy/k8s/hear-score.yaml",
+        "name": "hear-score",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/corpus/scores",
+          "/pool/pylib"
+        ],
+        "schedule": "7,22,37,52 * * * *"
+      },
+      {
+        "containers": [
+          {
+            "env_bindings": [],
+            "image": "python:3.13-slim",
+            "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/__init__.py",
+                "sub_path": "hear__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/sketch.py",
+                "sub_path": "hear_sketch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/modules/supersonic/classify.py",
+                "sub_path": "modules_supersonic_classify.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/modules/supersonic/model.json",
+                "sub_path": "modules_supersonic_model.json",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/modules/supersonic/model_sketch.json",
+                "sub_path": "modules_supersonic_model_sketch.json",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/modules/supersonic/model_sketch_15.json",
+                "sub_path": "modules_supersonic_model_sketch_15.json",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_score.py",
+                "sub_path": "tools_hear_score.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": "hear-pool",
+                "mount_path": "/pool",
+                "sub_path": null,
+                "volume_name": "pool"
+              }
+            ],
+            "name": "check"
+          }
+        ],
+        "host_network": false,
+        "kind": "CronJob",
+        "manifest": "deploy/k8s/hear-score.yaml",
+        "name": "hear-score-check",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/corpus/scores",
+          "/pool/pylib"
+        ],
+        "schedule": "27 * * * *"
+      },
+      {
+        "containers": [
+          {
+            "env_bindings": [],
+            "image": "python:3.13-slim",
+            "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/__init__.py",
+                "sub_path": "hear__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/sketch.py",
+                "sub_path": "hear_sketch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/clips.py",
+                "sub_path": "hear_clips.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/tags.py",
+                "sub_path": "hear_tags.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/resample.py",
+                "sub_path": "hear_resample.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/infrasound.py",
+                "sub_path": "hear_infrasound.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_tag.py",
+                "sub_path": "tools_hear_tag.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": "hear-pool",
+                "mount_path": "/pool",
+                "sub_path": null,
+                "volume_name": "pool"
+              }
+            ],
+            "name": "tag"
+          }
+        ],
+        "host_network": false,
+        "kind": "CronJob",
+        "manifest": "deploy/k8s/hear-tag.yaml",
+        "name": "hear-tag",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/corpus/clips/tags.jsonl",
+          "/pool/models/mn10_as",
+          "/pool/pylib",
+          "/pool/pylib-tag"
+        ],
+        "schedule": "12,42 * * * *"
+      },
+      {
+        "containers": [
+          {
+            "env_bindings": [],
+            "image": "python:3.13-slim",
+            "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/__init__.py",
+                "sub_path": "hear__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/sketch.py",
+                "sub_path": "hear_sketch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/clips.py",
+                "sub_path": "hear_clips.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/tags.py",
+                "sub_path": "hear_tags.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/resample.py",
+                "sub_path": "hear_resample.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/infrasound.py",
+                "sub_path": "hear_infrasound.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_tag.py",
+                "sub_path": "tools_hear_tag.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": "hear-pool",
+                "mount_path": "/pool",
+                "sub_path": null,
+                "volume_name": "pool"
+              }
+            ],
+            "name": "check"
+          }
+        ],
+        "host_network": false,
+        "kind": "CronJob",
+        "manifest": "deploy/k8s/hear-tag.yaml",
+        "name": "hear-tag-check",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/corpus/clips/tags.jsonl",
+          "/pool/models/mn10_as",
+          "/pool/pylib",
+          "/pool/pylib-tag"
+        ],
+        "schedule": "52 * * * *"
+      },
+      {
+        "containers": [
+          {
+            "env_bindings": [
+              {
+                "binding": "secretKeyRef",
+                "name": "HEAR_SITE_ORIGIN",
+                "optional": false,
+                "secret_key": "origin",
+                "secret_name": "hear-site"
+              }
+            ],
+            "image": "python:3.13-slim",
+            "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/__init__.py",
+                "sub_path": "hear__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/sketch.py",
+                "sub_path": "hear_sketch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/corpus.py",
+                "sub_path": "hear_corpus.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/detsfile.py",
+                "sub_path": "hear_detsfile.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/scenefile.py",
+                "sub_path": "hear_scenefile.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/identity.py",
+                "sub_path": "hear_identity.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/pool.py",
+                "sub_path": "hear_pool.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/geodesy.py",
+                "sub_path": "hear_geodesy.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/nodeclass.py",
+                "sub_path": "hear_nodeclass.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/wire.py",
+                "sub_path": "hear_wire.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/node/__init__.py",
+                "sub_path": "hear_node__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/node/detect.py",
+                "sub_path": "hear_node_detect.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/node/pipeline.py",
+                "sub_path": "hear_node_pipeline.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/node/telemetry.py",
+                "sub_path": "hear_node_telemetry.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/backend/__init__.py",
+                "sub_path": "hear_backend__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/backend/survey.py",
+                "sub_path": "hear_backend_survey.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/backend/associate.py",
+                "sub_path": "hear_backend_associate.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/backend/pipeline.py",
+                "sub_path": "hear_backend_pipeline.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/solve/__init__.py",
+                "sub_path": "hear_solve__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/solve/placement.py",
+                "sub_path": "hear_solve_placement.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/solve/shockwave.py",
+                "sub_path": "hear_solve_shockwave.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/solve/point.py",
+                "sub_path": "hear_solve_point.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/solve/consistency.py",
+                "sub_path": "hear_solve_consistency.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/solve/soundspeed.py",
+                "sub_path": "hear_solve_soundspeed.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/solve/calibrate.py",
+                "sub_path": "hear_solve_calibrate.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_tdoa.py",
+                "sub_path": "tools_hear_tdoa.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/survey.json",
+                "sub_path": "survey.json",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": "hear-pool",
+                "mount_path": "/pool",
+                "sub_path": null,
+                "volume_name": "pool"
+              }
+            ],
+            "name": "tdoa"
+          }
+        ],
+        "host_network": false,
+        "kind": "CronJob",
+        "manifest": "deploy/k8s/hear-tdoa.yaml",
+        "name": "hear-tdoa",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/corpus/tdoa",
+          "/pool/corpus/tdoa/arrivals",
+          "/pool/corpus/tdoa/model_card.json",
+          "/pool/corpus/tdoa/runs",
+          "/pool/pylib"
+        ],
+        "schedule": "11,26,41,56 * * * *"
+      },
+      {
+        "containers": [
+          {
+            "env_bindings": [
+              {
+                "binding": "secretKeyRef",
+                "name": "HEAR_SITE_ORIGIN",
+                "optional": false,
+                "secret_key": "origin",
+                "secret_name": "hear-site"
+              }
+            ],
+            "image": "python:3.13-slim",
+            "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/__init__.py",
+                "sub_path": "hear__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/sketch.py",
+                "sub_path": "hear_sketch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/corpus.py",
+                "sub_path": "hear_corpus.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/detsfile.py",
+                "sub_path": "hear_detsfile.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/scenefile.py",
+                "sub_path": "hear_scenefile.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/identity.py",
+                "sub_path": "hear_identity.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/pool.py",
+                "sub_path": "hear_pool.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/geodesy.py",
+                "sub_path": "hear_geodesy.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/nodeclass.py",
+                "sub_path": "hear_nodeclass.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/wire.py",
+                "sub_path": "hear_wire.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/node/__init__.py",
+                "sub_path": "hear_node__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/node/detect.py",
+                "sub_path": "hear_node_detect.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/node/pipeline.py",
+                "sub_path": "hear_node_pipeline.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/node/telemetry.py",
+                "sub_path": "hear_node_telemetry.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/backend/__init__.py",
+                "sub_path": "hear_backend__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/backend/survey.py",
+                "sub_path": "hear_backend_survey.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/backend/associate.py",
+                "sub_path": "hear_backend_associate.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/backend/pipeline.py",
+                "sub_path": "hear_backend_pipeline.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/solve/__init__.py",
+                "sub_path": "hear_solve__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/solve/placement.py",
+                "sub_path": "hear_solve_placement.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/solve/shockwave.py",
+                "sub_path": "hear_solve_shockwave.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/solve/point.py",
+                "sub_path": "hear_solve_point.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/solve/consistency.py",
+                "sub_path": "hear_solve_consistency.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/solve/soundspeed.py",
+                "sub_path": "hear_solve_soundspeed.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/solve/calibrate.py",
+                "sub_path": "hear_solve_calibrate.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_tdoa.py",
+                "sub_path": "tools_hear_tdoa.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/survey.json",
+                "sub_path": "survey.json",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": "hear-pool",
+                "mount_path": "/pool",
+                "sub_path": null,
+                "volume_name": "pool"
+              }
+            ],
+            "name": "check"
+          }
+        ],
+        "host_network": false,
+        "kind": "CronJob",
+        "manifest": "deploy/k8s/hear-tdoa.yaml",
+        "name": "hear-tdoa-check",
+        "namespace": "dama",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/corpus/tdoa",
+          "/pool/corpus/tdoa/arrivals",
+          "/pool/corpus/tdoa/model_card.json",
+          "/pool/corpus/tdoa/runs",
+          "/pool/pylib"
+        ],
+        "schedule": "47 * * * *"
+      }
+    ],
+    "pvcs": [
+      {
+        "access_modes": [
+          "ReadWriteOnce"
+        ],
+        "claim_name": "hear-heartbeat-state",
+        "consumers": [
+          {
+            "container": "receiver",
+            "kind": "Deployment",
+            "manifest": "deploy/k8s/hear-heartbeat.yaml",
+            "mount_path": "/state",
+            "object_name": "hear-heartbeat"
+          }
+        ],
+        "declared_in": "deploy/k8s/hear-heartbeat.yaml",
+        "path_references": [],
+        "storage_request": "5Gi"
+      },
+      {
+        "access_modes": [
+          "ReadWriteOnce"
+        ],
+        "claim_name": "hear-mqtt-bridge-state",
+        "consumers": [
+          {
+            "container": "bridge",
+            "kind": "Deployment",
+            "manifest": "deploy/k8s/hear-mqtt-bridge.yaml",
+            "mount_path": "/state",
+            "object_name": "hear-mqtt-bridge"
+          }
+        ],
+        "declared_in": "deploy/k8s/hear-mqtt-bridge.yaml",
+        "path_references": [],
+        "storage_request": "5Gi"
+      },
+      {
+        "access_modes": [
+          "ReadWriteOnce"
+        ],
+        "claim_name": "hear-pool",
+        "consumers": [
+          {
+            "container": "drain",
+            "kind": "CronJob",
+            "manifest": "deploy/k8s/hear-drain.yaml",
+            "mount_path": "/pool",
+            "object_name": "hear-drain"
+          },
+          {
+            "container": "check",
+            "kind": "CronJob",
+            "manifest": "deploy/k8s/hear-drain.yaml",
+            "mount_path": "/pool",
+            "object_name": "hear-drain-check"
+          },
+          {
+            "container": "embed",
+            "kind": "CronJob",
+            "manifest": "deploy/k8s/hear-embed.yaml",
+            "mount_path": "/pool",
+            "object_name": "hear-embed"
+          },
+          {
+            "container": "check",
+            "kind": "CronJob",
+            "manifest": "deploy/k8s/hear-embed.yaml",
+            "mount_path": "/pool",
+            "object_name": "hear-embed-check"
+          },
+          {
+            "container": "score",
+            "kind": "CronJob",
+            "manifest": "deploy/k8s/hear-score.yaml",
+            "mount_path": "/pool",
+            "object_name": "hear-score"
+          },
+          {
+            "container": "check",
+            "kind": "CronJob",
+            "manifest": "deploy/k8s/hear-score.yaml",
+            "mount_path": "/pool",
+            "object_name": "hear-score-check"
+          },
+          {
+            "container": "tag",
+            "kind": "CronJob",
+            "manifest": "deploy/k8s/hear-tag.yaml",
+            "mount_path": "/pool",
+            "object_name": "hear-tag"
+          },
+          {
+            "container": "check",
+            "kind": "CronJob",
+            "manifest": "deploy/k8s/hear-tag.yaml",
+            "mount_path": "/pool",
+            "object_name": "hear-tag-check"
+          },
+          {
+            "container": "tdoa",
+            "kind": "CronJob",
+            "manifest": "deploy/k8s/hear-tdoa.yaml",
+            "mount_path": "/pool",
+            "object_name": "hear-tdoa"
+          },
+          {
+            "container": "check",
+            "kind": "CronJob",
+            "manifest": "deploy/k8s/hear-tdoa.yaml",
+            "mount_path": "/pool",
+            "object_name": "hear-tdoa-check"
+          }
+        ],
+        "declared_in": "deploy/k8s/hear-drain.yaml",
+        "path_references": [
+          "/pool",
+          "/pool/corpus",
+          "/pool/corpus/clips/tags.jsonl",
+          "/pool/corpus/scores",
+          "/pool/corpus/tdoa",
+          "/pool/corpus/tdoa/arrivals",
+          "/pool/corpus/tdoa/model_card.json",
+          "/pool/corpus/tdoa/runs",
+          "/pool/models/mn10_as",
+          "/pool/models/perch_v2",
+          "/pool/pylib",
+          "/pool/pylib-perch",
+          "/pool/pylib-tag",
+          "/pool/sketch_corpus"
+        ],
+        "storage_request": "5Gi"
+      }
+    ],
+    "section_hash": "214cca2a3146a0da2bf84aab555fc173e5be0a01085a07353c0375cbd62034c0"
+  },
+  "mqtt_topics": {
+    "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",
+    "topics": [
+      {
+        "role": "captured sketch ingest and replay lane",
+        "source_paths": [
+          "hear/corpus.py",
+          "hear/pool.py",
+          "tools/hear_score.py"
+        ],
+        "topic_hash": "f26a478389dd2df7d81f5ba40024c0d313b17ddac100007a7643e7c560fedab8",
+        "topic_pattern": "dama/+/acoustic_sketch"
+      },
+      {
+        "resolved_shape": "dama/<device_id>/telemetry",
+        "role": "bridge subscription for hear_node telemetry relayed through MQTT",
+        "source_paths": [
+          "tools/hear_mqtt_bridge.py",
+          "deploy/k8s/hear-mqtt-bridge.yaml"
+        ],
+        "topic_hash": "e34d40daea6072d9681c7fd4fd23b0972861365aa548e396b42dbbcaa15e65e0",
+        "topic_pattern": "dama/+/telemetry"
+      },
+      {
+        "role": "optional GeoJSON publish from the spatial pipeline",
+        "source_paths": [
+          "hear/spatial.py",
+          "tools/hear_spatial.py"
+        ],
+        "topic_hash": "e3dcf2f1b18a6fed7ff832462773b4bb324a09f8d59719d03db2594369e316a4",
+        "topic_pattern": "dama/hear/spatial_events"
+      }
+    ]
+  },
+  "redis_keys": {
+    "keys": [
+      {
+        "key_hash": "68d3602c089f318c183302985aece92cbd32c773fcab5768a35d0ead366718e9",
+        "kind": "string-with-ttl",
+        "pattern": "dama:hear:{device_id}",
+        "source_paths": [
+          "tools/hear_heartbeat_receiver.py"
+        ],
+        "ttl_seconds": 30,
+        "writer": "HeartbeatReceiverStore.write_heartbeat"
+      },
+      {
+        "key_hash": "862d8f57414b90c0fc09572a4f393124dfba2261f9f3af761cfa5ce39d548ab1",
+        "kind": "set",
+        "pattern": "dama:hear:devices",
+        "source_paths": [
+          "tools/hear_heartbeat_receiver.py"
+        ],
+        "writer": "HeartbeatReceiverStore.write_heartbeat/write_event"
+      },
+      {
+        "key_hash": "0f16cc75de96da9726d951f35fb4b3ea3331ab2c261bd6dba88ba118e9eb8c7f",
+        "kind": "string",
+        "pattern": "dama:hear:latest",
+        "source_paths": [
+          "tools/hear_heartbeat_receiver.py"
+        ],
+        "writer": "HeartbeatReceiverStore.write_heartbeat"
+      },
+      {
+        "key_hash": "3385a6a1584289ca19adb8c0085700845436f5287b1cea63a53d61ec60aa702f",
+        "kind": "string",
+        "pattern": "dama:hear:event:{device_id}",
+        "source_paths": [
+          "tools/hear_heartbeat_receiver.py"
+        ],
+        "writer": "HeartbeatReceiverStore.write_event"
+      },
+      {
+        "configurable_env": "HEAR_EVENT_STREAM_KEY",
+        "key_hash": "3c42fc1042df96c52f5a7a78756961b134b7b879a72678ddb8a63b497d833a45",
+        "kind": "stream",
+        "maxlen": 1024,
+        "pattern": "dama:hear:events",
+        "source_paths": [
+          "tools/hear_heartbeat_receiver.py"
+        ],
+        "writer": "HeartbeatReceiverStore.write_event"
+      }
+    ],
+    "section_hash": "d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03"
+  },
+  "schemas": {
+    "bridge_telemetry_paths": [
+      "hear/event",
+      "hear/heartbeat"
+    ],
+    "dets_csv": {
+      "frame_hex_lengths": [
+        344,
+        346
+      ],
+      "generations": [
+        {
+          "broken_header": false,
+          "declared_header": [
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "pps_n",
+            "us_since_pps",
+            "trigger",
+            "flags",
+            "fs_hz",
+            "frame_hex"
+          ],
+          "generation": "G1",
+          "header_hash": "baf99ad0128515ff728a0461d2d3f9e5c744b9bd6a0a1f33c056d637f9cc7213",
+          "written_header": [
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "pps_n",
+            "us_since_pps",
+            "trigger",
+            "flags",
+            "fs_hz",
+            "frame_hex"
+          ]
+        },
+        {
+          "broken_header": false,
+          "declared_header": [
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "pps_n",
+            "us_since_pps",
+            "trigger",
+            "flags",
+            "fs_hz",
+            "frame_hex",
+            "clip",
+            "clip_why"
+          ],
+          "generation": "G2",
+          "header_hash": "89af2a0fb30565d620e0551d022c3e83410f8283cfb99c817b2da729c2f1cc6b",
+          "written_header": [
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "pps_n",
+            "us_since_pps",
+            "trigger",
+            "flags",
+            "fs_hz",
+            "frame_hex",
+            "clip",
+            "clip_why"
+          ]
+        },
+        {
+          "broken_header": true,
+          "declared_header": [
+            "node",
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "pps_n",
+            "us_since_pps",
+            "trigger",
+            "flags",
+            "fs_hz",
+            "frame_hex",
+            "clip",
+            "clip_why"
+          ],
+          "generation": "G3",
+          "header_hash": "6f9b855ce6306b13a78333ab998c7babca0c68db0f2b84121e951633122297e5",
+          "written_header": [
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "pps_n",
+            "us_since_pps",
+            "trigger",
+            "flags",
+            "fs_hz",
+            "frame_hex",
+            "clip",
+            "clip_why"
+          ]
+        },
+        {
+          "broken_header": false,
+          "declared_header": [
+            "node_id",
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "pps_n",
+            "us_since_pps",
+            "trigger",
+            "flags",
+            "fs_hz",
+            "frame_hex",
+            "clip",
+            "clip_why"
+          ],
+          "generation": "G4",
+          "header_hash": "5f9f9804f130fe68f4ac50045a7331483f1cdd58398861621bfe6bce550b68c6",
+          "written_header": [
+            "node_id",
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "pps_n",
+            "us_since_pps",
+            "trigger",
+            "flags",
+            "fs_hz",
+            "frame_hex",
+            "clip",
+            "clip_why"
+          ]
+        },
+        {
+          "broken_header": false,
+          "declared_header": [
+            "node_id",
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "pps_n",
+            "us_since_pps",
+            "trigger",
+            "flags",
+            "fs_hz",
+            "sketch_back",
+            "frame_hex",
+            "clip",
+            "clip_why"
+          ],
+          "generation": "G5",
+          "header_hash": "749ab70f5a5be2f0d3d01aa396bddadd9f60bd0838054dd434eaa57ea3cd8339",
+          "written_header": [
+            "node_id",
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "pps_n",
+            "us_since_pps",
+            "trigger",
+            "flags",
+            "fs_hz",
+            "sketch_back",
+            "frame_hex",
+            "clip",
+            "clip_why"
+          ]
+        },
+        {
+          "broken_header": false,
+          "declared_header": [
+            "node_id",
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "pps_n",
+            "us_since_pps",
+            "trigger",
+            "flags",
+            "fs_hz",
+            "sketch_back",
+            "frame_hex",
+            "clip",
+            "clip_why",
+            "sync_sigma_ns"
+          ],
+          "generation": "G6",
+          "header_hash": "125b1d22f6968deb596790cd9b58a845b95c2f14fa34acabeed4d43a32e0fe2d",
+          "written_header": [
+            "node_id",
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "pps_n",
+            "us_since_pps",
+            "trigger",
+            "flags",
+            "fs_hz",
+            "sketch_back",
+            "frame_hex",
+            "clip",
+            "clip_why",
+            "sync_sigma_ns"
+          ]
+        },
+        {
+          "broken_header": false,
+          "declared_header": [
+            "node_id",
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "pps_n",
+            "us_since_pps",
+            "trigger",
+            "flags",
+            "fs_hz",
+            "sketch_back",
+            "frame_hex",
+            "clip",
+            "clip_why",
+            "sync_sigma_ns",
+            "clock_state",
+            "anchor_age_us",
+            "boot_epoch_us",
+            "boot_id",
+            "clock_discontinuity_flags"
+          ],
+          "generation": "G7",
+          "header_hash": "b97b30226d09c41e6b7597cee117a61ddec4ff03ae914b5de727fa7a26984043",
+          "written_header": [
+            "node_id",
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "pps_n",
+            "us_since_pps",
+            "trigger",
+            "flags",
+            "fs_hz",
+            "sketch_back",
+            "frame_hex",
+            "clip",
+            "clip_why",
+            "sync_sigma_ns",
+            "clock_state",
+            "anchor_age_us",
+            "boot_epoch_us",
+            "boot_id",
+            "clock_discontinuity_flags"
+          ]
+        }
+      ],
+      "latest_generation": "G7"
+    },
+    "pool_schema_version": 1,
+    "receiver_schema_version": 1,
+    "scene_csv": {
+      "generations": [
+        {
+          "broken_header": false,
+          "declared_header": [
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "bands",
+            "slices",
+            "span_ms",
+            "ref_db4",
+            "frames",
+            "fft_us",
+            "mel_hex"
+          ],
+          "generation": "S0",
+          "header_hash": "8077e4ed101a57637e7791c316fa575dc66d814e1452577bf948a108c4f9f783",
+          "written_header": [
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "bands",
+            "slices",
+            "span_ms",
+            "ref_db4",
+            "frames",
+            "fft_us",
+            "mel_hex"
+          ]
+        },
+        {
+          "broken_header": false,
+          "declared_header": [
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "bands",
+            "slices",
+            "span_ms",
+            "ref_db4",
+            "frames",
+            "fft_us",
+            "mel_hex",
+            "f_lo_hz",
+            "f_hi_hz"
+          ],
+          "generation": "S1",
+          "header_hash": "0578f62d61e4834c5f21a4ded1ce8bc260d1a1c99b366d6ef14af9cc1cdde478",
+          "written_header": [
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "bands",
+            "slices",
+            "span_ms",
+            "ref_db4",
+            "frames",
+            "fft_us",
+            "mel_hex",
+            "f_lo_hz",
+            "f_hi_hz"
+          ]
+        },
+        {
+          "broken_header": false,
+          "declared_header": [
+            "node",
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "bands",
+            "slices",
+            "span_ms",
+            "ref_db4",
+            "frames",
+            "fft_us",
+            "mel_hex",
+            "f_lo_hz",
+            "f_hi_hz"
+          ],
+          "generation": "S2",
+          "header_hash": "0f1f05d060df821146818fc1cd15b5fa3ade746e594103515023a4281ee99c07",
+          "written_header": [
+            "node",
+            "utc_us",
+            "uptime_s",
+            "sample",
+            "bands",
+            "slices",
+            "span_ms",
+            "ref_db4",
+            "frames",
+            "fft_us",
+            "mel_hex",
+            "f_lo_hz",
+            "f_hi_hz"
+          ]
+        }
+      ],
+      "latest_generation": "S2"
+    },
+    "schema_identifiers": [
+      {
+        "schema": "acoustic_latency_calibration.v1",
+        "source_paths": [
+          "tools/hear_latency_cal.py"
+        ]
+      },
+      {
+        "schema": "hear.calibrated_node_biases.v1",
+        "source_paths": [
+          "tools/calibrate_claps.py"
+        ]
+      },
+      {
+        "schema": "hear.clip_tag.v2",
+        "source_paths": [
+          "tools/hear_tag.py"
+        ]
+      },
+      {
+        "schema": "hear.experimental_clap_geometry_selfcal.v1",
+        "source_paths": [
+          "tools/estimate_geometry_from_claps.py"
+        ]
+      },
+      {
+        "schema": "hear.node_positions.v1",
+        "source_paths": [
+          "tools/hear_drain.py"
+        ]
+      },
+      {
+        "schema": "hear.sketch.golden.v4",
+        "source_paths": [
+          "testdata/sketch_golden.json",
+          "tools/gen_golden.py"
+        ]
+      },
+      {
+        "schema": "hear.sketch_score.v1",
+        "source_paths": [
+          "tools/hear_score.py"
+        ]
+      },
+      {
+        "schema": "hear.tdoa_arrival.v1",
+        "source_paths": [
+          "tools/hear_tdoa.py"
+        ]
+      },
+      {
+        "schema": "hear.tdoa_attempt.v1",
+        "source_paths": [
+          "tools/hear_tdoa.py"
+        ]
+      },
+      {
+        "schema": "hear.tdoa_model_card.v1",
+        "source_paths": [
+          "tools/hear_tdoa.py"
+        ]
+      },
+      {
+        "schema": "hear.window.golden.v2",
+        "source_paths": [
+          "testdata/window_golden.json",
+          "tools/gen_golden.py"
+        ]
+      }
+    ],
+    "section_hash": "d154fa286b1f1cb8506ab5c36f0d6291dfeaab5f096512b7635d9582f833b5e1",
+    "telemetry_routes": [
+      {
+        "http_path": "/api/hear/heartbeat",
+        "required_fields": [
+          "telemetry_path",
+          "telemetry_schema_version",
+          "device_id",
+          "ts",
+          "ts_ms",
+          "class",
+          "fw_version",
+          "uptime_s",
+          "gps.fix",
+          "time.valid",
+          "wifi.rssi_dbm",
+          "counters.scene_rows_written",
+          "counters.dets_rows_written",
+          "counters.clips_written",
+          "counters.clips_evicted"
+        ],
+        "route_hash": "2d79cc68fbc256079267fbc9cba1a859826417ba4691a6c106c848e9570159ff",
+        "telemetry_path": "hear/heartbeat"
+      },
+      {
+        "event_types": [
+          "clip_written",
+          "detection_batch_ready"
+        ],
+        "http_path": "/api/hear/event",
+        "required_fields": [
+          "telemetry_path",
+          "telemetry_schema_version",
+          "device_id",
+          "ts",
+          "ts_ms",
+          "class",
+          "fw_version",
+          "uptime_s",
+          "time.valid",
+          "event_type",
+          "event_seq",
+          "event.clip_basename",
+          "event.clips_written",
+          "event.clips_evicted",
+          "event.dets_rows_written",
+          "event.batch_rows"
+        ],
+        "route_hash": "9baf63637473382626f04e29f01f6741e90657ed2e2ad1c84394dd7131b2e094",
+        "telemetry_path": "hear/event"
+      }
+    ],
+    "telemetry_schema_version": 1
+  },
+  "title": "Phase 0 contract freeze",
+  "wire_profiles": {
+    "default_profile_id": 1,
+    "meshtastic_usable_bytes": 200,
+    "new_profile_ids": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "profiles": [
+      {
+        "bands": 20,
+        "f_hi_hz": 20000.0,
+        "f_lo_hz": 300.0,
+        "fits_meshtastic_v2": true,
+        "frames": 8,
+        "fs_hz": null,
+        "hop_s": 0.004,
+        "layout": "nyquist",
+        "legacy_read_only": true,
+        "nfft": 256,
+        "profile_hash": "8a7ba0284ffc4a541f284c1579627782b04d557758c0f7fce5580bf63e193c51",
+        "profile_id": 0,
+        "wire_size_bytes": 173
+      },
+      {
+        "bands": 20,
+        "f_hi_hz": 20000.0,
+        "f_lo_hz": 300.0,
+        "fits_meshtastic_v2": true,
+        "frames": 8,
+        "fs_hz": 48000.0,
+        "hop_s": 0.004,
+        "layout": "fixed",
+        "legacy_read_only": false,
+        "nfft": 256,
+        "profile_hash": "61b0a0210c6b536c5a5b2bb467fc7a022cb46d3c09953e80717e3a230ea1ea07",
+        "profile_id": 1,
+        "wire_size_bytes": 173
+      },
+      {
+        "bands": 20,
+        "f_hi_hz": 20000.0,
+        "f_lo_hz": 300.0,
+        "fits_meshtastic_v2": true,
+        "frames": 8,
+        "fs_hz": 16000.0,
+        "hop_s": 0.004,
+        "layout": "fixed",
+        "legacy_read_only": false,
+        "nfft": 256,
+        "profile_hash": "542cb37884b6303cdbb5dd290445b4a3a27714f6874cb410651d45b076d0b53a",
+        "profile_id": 2,
+        "wire_size_bytes": 173
+      },
+      {
+        "bands": 20,
+        "f_hi_hz": 20000.0,
+        "f_lo_hz": 300.0,
+        "fits_meshtastic_v2": true,
+        "frames": 8,
+        "fs_hz": 32000.0,
+        "hop_s": 0.004,
+        "layout": "fixed",
+        "legacy_read_only": false,
+        "nfft": 256,
+        "profile_hash": "bcfa39189546c524585ae43e64125baf2e8324f8c472f086c7d82daefba9120f",
+        "profile_id": 3,
+        "wire_size_bytes": 173
+      },
+      {
+        "bands": 20,
+        "f_hi_hz": 20000.0,
+        "f_lo_hz": 300.0,
+        "fits_meshtastic_v2": true,
+        "frames": 8,
+        "fs_hz": 24000.0,
+        "hop_s": 0.004,
+        "layout": "fixed",
+        "legacy_read_only": false,
+        "nfft": 256,
+        "profile_hash": "af8d6082d6380add519d82d9e45fb88cf39658cd655403f962b3b81a18bd72d8",
+        "profile_id": 4,
+        "wire_size_bytes": 173
+      }
+    ],
+    "section_hash": "4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba",
+    "source_files": [
+      {
+        "path": "firmware/hear_node/mel_impulse.h",
+        "sha256": "d56d54b4dbf83b95963bacff98d3b8d6306ba56fe068360a9024ddba8e79ea77",
+        "size_bytes": 9147
+      },
+      {
+        "path": "firmware/hear_node/sketch_domain.h",
+        "sha256": "fc594c69bc46022f48c39a4c75ad1c3103fe055a65bf78af4b7cbc59a430066d",
+        "size_bytes": 3264
+      },
+      {
+        "path": "hear/sketch.py",
+        "sha256": "3b35a11f2dd115cb6620925a06ebf77fffd6096db2cea15ead61c47f850128d0",
+        "size_bytes": 12254
+      },
+      {
+        "path": "hear/wire.py",
+        "sha256": "afc80491583dc79985308ef77085f380ef0ba81e9b42a7bf39719a3d06710432",
+        "size_bytes": 17680
+      },
+      {
+        "path": "testdata/sketch_golden.json",
+        "sha256": "6c3cfbce52d54f01f9b6e21523d5f2dc426fa0b0562fbe193251a771d67516bd",
+        "size_bytes": 109646
+      }
+    ]
+  }
+}
