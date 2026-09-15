@@ -1,0 +1,121 @@
+{
+  "case": "retention-edge-excluded-not-reported",
+  "description": "A raw row has aged past the legacy surface's 7-day horizon while the canonical copy still holds it. Excluded from comparison rather than reported: a TTL that fires between two reads is correct behaviour on both sides, and reporting it is the most reliable way to turn two healthy stores into a permanently red board.",
+  "expected_classification": "match",
+  "expected_gate_impact": "none",
+  "expected_repair_action": "none",
+  "expected_severity": "info",
+  "receipt": {
+    "comparator": {
+      "name": "hear-shadow-read",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "coverage": {},
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "gate_impact": "none",
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "none",
+      "repairable": false
+    },
+    "emitted_at": "2026-09-15T02:00:45Z",
+    "evidence": {
+      "canonical_result_ref": "hear/v1/blob/sha256/bb/canonical-answer",
+      "legacy_result_ref": "hear/v1/blob/sha256/aa/legacy-answer",
+      "redaction_profile": "hear.shadowread.redact.v1"
+    },
+    "grain": "row",
+    "query": {
+      "device_ids": [
+        "rankine"
+      ],
+      "evidence_class": "scene",
+      "filters": {
+        "bound": "half_open",
+        "kind": "gunshot"
+      },
+      "fingerprint": "q:6e4f3bc87edf71043f2f41b341edc0e2f601feb0a3711c1ae675fd799de977c2",
+      "page_size": 50,
+      "projection_version": 1,
+      "site_id": "site-alpha",
+      "sort": {
+        "direction": "asc",
+        "field": "captured_at"
+      },
+      "time_from": "2026-09-14T00:00:00Z",
+      "time_to": "2026-09-15T01:45:00Z"
+    },
+    "read_authority": "legacy",
+    "read_mode": "compare",
+    "receipt_id": "f20c1764-1a70-5d48-9ece-1f7aeeb44904",
+    "row": {
+      "logical_id_present": true,
+      "row_key": "r:cea1b17b3c3edc5454bfb4eeae141e4861bf34c98433fc140e1164cab89f5cc0"
+    },
+    "run_id": "shadow-2026-09-15T02",
+    "sampling": {
+      "forced_reason": null,
+      "rate_denominator": 1000,
+      "sampled": false
+    },
+    "schema": "hear.shadowread.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "cursor_stable": true,
+        "outcome": "answered",
+        "page_count": 1,
+        "projection_version": 1,
+        "read_contract_major": 1,
+        "reader": "hear.objectstore + durable postgres reader",
+        "reader_version": "0.1.6",
+        "reasons": [],
+        "result_hash": "sha256:1d1981e55c6d1054f8f0244f41f6a18df8701a4d8b0035853f9e1b9130e57118",
+        "retention_class": "R2-raw",
+        "retention_horizon_s": 604800,
+        "row_count": 1,
+        "row_state": "present",
+        "snapshot_at": "2026-09-15T02:00:00Z",
+        "state_hash": "sha256:a0691896ff72d73287c6f500d05cf2b06d744b71251324dfb6edd00c3286ef69",
+        "truncated": false
+      },
+      "legacy": {
+        "cursor_stable": true,
+        "outcome": "answered",
+        "page_count": 1,
+        "projection_version": 1,
+        "read_contract_major": 1,
+        "reader": "hear/pool.py + tools/hear_heartbeat_receiver.py views",
+        "reader_version": "0.1.6",
+        "reasons": [],
+        "result_hash": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "retention_class": "R2-raw",
+        "retention_horizon_s": 604800,
+        "row_count": 0,
+        "row_state": "retention_expired",
+        "snapshot_at": "2026-09-15T02:00:00Z",
+        "state_hash": "sha256:a0691896ff72d73287c6f500d05cf2b06d744b71251324dfb6edd00c3286ef69",
+        "truncated": false
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "match",
+      "gate_impact": "none",
+      "notes": [
+        "outside the intersection of both retention horizons; excluded from comparison rather than reported as loss"
+      ],
+      "repair_action": "none",
+      "severity": "info"
+    },
+    "window": {
+      "as_of": "2026-09-15T02:00:00Z",
+      "end": "2026-09-15T02:00:00Z",
+      "settle_s": 900.0,
+      "start": "2026-09-15T01:00:00Z"
+    }
+  }
+}
