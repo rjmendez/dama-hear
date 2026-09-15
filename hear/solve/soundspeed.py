@@ -56,7 +56,7 @@ import itertools
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -64,6 +64,13 @@ from .shockwave import sound_speed  # noqa: F401  (re-exported: one definition o
 
 DC_DT = 0.606          # m/s per degC
 C0 = 331.3             # m/s at 0 C
+
+ENV_TEMP_RANGE_C = (-40.0, 70.0)
+ENV_SOUND_SPEED_RANGE_MPS = (300.0, 380.0)
+DEFAULT_ENV_MAX_AGE_S = 7200.0
+DEFAULT_ENV_MAX_SPREAD_MPS = 5.0
+DEFAULT_ENV_TEMP_C_MISMATCH = 2.0
+ENV_REQUIRED_CLASS = "xiao-s3-pps"
 
 
 def temperature_c(c: float) -> float:
@@ -74,6 +81,133 @@ def temperature_c(c: float) -> float:
 def temperature_sigma_c(c: float, sigma_c: float) -> float:
     """degC uncertainty from a m/s uncertainty. Linear: sigma_T = sigma_c / 0.606."""
     return abs(float(sigma_c)) / DC_DT
+
+
+def sound_speed_provenance_from_statuses(
+        reports: Sequence[Dict[str, Any]], assumed_temp_c: float = 20.0,
+        now: Optional[float] = None, max_age_s: float = DEFAULT_ENV_MAX_AGE_S,
+        max_spread_mps: float = DEFAULT_ENV_MAX_SPREAD_MPS,
+        required_class: str = ENV_REQUIRED_CLASS) -> Dict[str, Any]:
+    """Choose the speed of sound from live node environment reports, or loudly assume it.
+
+    `reports` are `/status` documents, optionally wrapped as
+    `{"status": doc, "node": expected_name, "source": "...", "at": fetched_utc_s}`. Only
+    clock-disciplined `xiao-s3-pps` nodes are candidates. `env.c_mps` is used when stated; else
+    `env.temp_c` is converted through the repo's single dry-air relation.
+    """
+    assumed_c = sound_speed(assumed_temp_c)
+    refusals: List[Dict[str, Any]] = []
+    candidates: List[Dict[str, Any]] = []
+
+    def assumed(reason: str) -> Dict[str, Any]:
+        return {
+            "provenance": "ASSUMED",
+            "source": "assumed_temp_c",
+            "reason": reason,
+            "sound_speed_mps": assumed_c,
+            "temp_c": float(assumed_temp_c),
+            "assumed_temp_c": float(assumed_temp_c),
+            "candidates": candidates,
+            "refusals": refusals,
+            "max_age_s": float(max_age_s),
+            "max_spread_mps": float(max_spread_mps),
+        }
+
+    for r in reports or ():
+        st = r.get("status") if isinstance(r.get("status"), dict) else r
+        want = r.get("node") or r.get("name")
+        name = str(st.get("node") or want or "")
+        src = str(r.get("source") or name or "status")
+
+        def refuse(reason: str, **extra: Any) -> None:
+            refusals.append({"node": name or want, "source": src, "reason": reason, **extra})
+
+        if r.get("error"):
+            refuse("status_unreadable", error=r.get("error"))
+            continue
+        if required_class and st.get("class") != required_class:
+            refuse("not_required_class", got=st.get("class"), required=required_class)
+            continue
+        if want and name and str(want) != name:
+            refuse("identity_mismatch", expected=want, got=name)
+            continue
+        if r.get("at") is not None and now is not None:
+            age = float(now) - float(r["at"])
+            if age < 0.0 or age > float(max_age_s):
+                refuse("stale_fetch", age_s=age)
+                continue
+        tblock = st.get("time") or {}
+        if tblock.get("valid") is not True:
+            refuse("clock_not_disciplined", time_valid=tblock.get("valid"))
+            continue
+        if now is not None and tblock.get("utc_us") is not None:
+            age = abs(float(now) - float(tblock["utc_us"]) / 1e6)
+            if age > float(max_age_s):
+                refuse("stale_node_clock", age_s=age)
+                continue
+        if int((st.get("pps") or {}).get("edges") or 0) <= 0:
+            refuse("pps_not_observed")
+            continue
+        env = st.get("env") or {}
+        temp = env.get("temp_c")
+        c = env.get("c_mps", env.get("sound_speed_mps"))
+        if temp is None and c is None:
+            refuse("no_env_temperature")
+            continue
+        try:
+            temp_f = None if temp is None else float(temp)
+            c_f = sound_speed(temp_f) if c is None else float(c)
+        except (TypeError, ValueError):
+            refuse("env_not_numeric", temp_c=temp, c_mps=c)
+            continue
+        if not math.isfinite(c_f) or not (ENV_SOUND_SPEED_RANGE_MPS[0] <= c_f <=
+                                          ENV_SOUND_SPEED_RANGE_MPS[1]):
+            refuse("bad_sound_speed", c_mps=c_f)
+            continue
+        implied_temp = temperature_c(c_f)
+        if temp_f is None:
+            temp_f = implied_temp
+        if not math.isfinite(temp_f) or not (ENV_TEMP_RANGE_C[0] <= temp_f <=
+                                             ENV_TEMP_RANGE_C[1]):
+            refuse("bad_temperature", temp_c=temp_f)
+            continue
+        if abs(implied_temp - temp_f) > DEFAULT_ENV_TEMP_C_MISMATCH:
+            refuse("temp_c_mismatch", temp_c=temp_f, implied_temp_c=implied_temp, c_mps=c_f)
+            continue
+        candidates.append({
+            "node": name,
+            "source": src,
+            "temp_c": temp_f,
+            "sound_speed_mps": c_f,
+            "from": "env.c_mps" if c is not None else "env.temp_c",
+            "status_utc_s": (None if tblock.get("utc_us") is None
+                             else float(tblock["utc_us"]) / 1e6),
+            "fetched_at_s": r.get("at"),
+        })
+
+    if not candidates:
+        return assumed("no_valid_measured_temperature")
+    speeds = sorted(float(c["sound_speed_mps"]) for c in candidates)
+    spread = speeds[-1] - speeds[0]
+    if spread > float(max_spread_mps):
+        return assumed("measured_nodes_disagree")
+    mid = len(speeds) // 2
+    c_med = speeds[mid] if len(speeds) % 2 else 0.5 * (speeds[mid - 1] + speeds[mid])
+    return {
+        "provenance": "MEASURED",
+        "source": "node_env_median",
+        "reason": None,
+        "sound_speed_mps": c_med,
+        "temp_c": temperature_c(c_med),
+        "assumed_temp_c": float(assumed_temp_c),
+        "candidates": candidates,
+        "refusals": refusals,
+        "n_measured": len(candidates),
+        "nodes": [c["node"] for c in candidates],
+        "spread_mps": spread,
+        "max_age_s": float(max_age_s),
+        "max_spread_mps": float(max_spread_mps),
+    }
 
 
 def fractional_speed_error(delta_t_c: float) -> float:
