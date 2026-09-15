@@ -185,6 +185,25 @@ def test_a_dockerfile_copies_only_its_own_lock(df):
             "service image (deploy/images/README.md)" % (df.name, src))
 
 
+def test_the_variants_are_the_ones_phase_1_5_sequences():
+    """⚠️docs/worker-packaging.md schedules workloads ONTO these names; a rename is a plan edit.
+
+    That document is the migration's decision record and this directory is step 0 of its
+    sequence. If a variant is renamed, added or dropped here without the plan moving with it,
+    the sequence that tells an operator which base each workload lands on is silently wrong.
+    """
+    plan = (ROOT / "docs" / "worker-packaging.md").read_text()
+    for variant in sorted(gen_pip_lock.VARIANTS):
+        assert "hear-%s" % variant in plan, (
+            "docs/worker-packaging.md does not mention hear-%s; the packaging plan and the "
+            "images have drifted" % variant)
+    assert "deploy/images/README.md" in plan, (
+        "docs/worker-packaging.md must name its companion document")
+    readme = (IMAGES / "README.md").read_text()
+    assert "docs/worker-packaging.md" in readme, (
+        "deploy/images/README.md must name the migration plan it is step 0 of")
+
+
 def test_ci_runs_the_images_workflow_and_publishes_only_from_main():
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
     assert "uses: ./.github/workflows/images.yml" in ci, (

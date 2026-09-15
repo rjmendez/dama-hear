@@ -5,6 +5,14 @@ that is the first pilot's job (`deploy/images/service/`, not added yet). What is
 every worker migration would otherwise have to invent separately — the pinned base, the lock
 mechanism, the naming and the provenance.
 
+**Companion document: [`docs/worker-packaging.md`](../../docs/worker-packaging.md)** (Phase 1.5,
+accepted 2026-09-15). That document owns the *migration* — boundaries, ordering, gates, rollback,
+and the per-workload cutover procedure. This one owns the *mechanism*, which is step 0 of its
+sequence: the base images, the lock generator and the build provenance. Neither repeats the
+other. Where Phase 1.5 states a requirement of this lane ("digest-pinned base", "hash-locked
+closure", "SBOM and provenance per published image", "the guard test is offline and mandatory"),
+`tests/test_image_pins.py` is where that requirement is enforced.
+
 ## The problem this replaces
 
 Every workload in `deploy/k8s` starts the same way:
@@ -106,7 +114,9 @@ Baking them in would couple a model promotion to an image rebuild, multiply imag
 model zoo, and put an artifact with a separate approval trail inside one whose identity is
 supposed to be the code. The small JSON models in `modules/supersonic/` are the deliberate
 exception: they are already in git, already in the code bundle, kilobytes, and `__file__`-relative
-— they ship with the code because they *are* the code's data files.
+— they ship with the code because they *are* the code's data files. `survey.json` is the other
+side of that line and stays **out**: it is site geometry, mounted as configuration, and Phase 1.5
+decides both cases explicitly.
 
 ## Naming and versioning
 
@@ -118,9 +128,13 @@ exception: they are already in git, already in the code bundle, kilobytes, and `
 <registry>/dama-hear/<worker>:<short-sha>          # service images, from the first pilot on
 ```
 
-- `<registry>` is the in-cluster registry the site already runs (`dama-bridge`,
-  `embedding-worker` and the runners are published there), with `ghcr.io/rjmendez` as the
-  mirror for anything that has to be pulled from outside the site.
+- ⚠️**`<registry>` is not decided here, and nothing in this lane depends on the answer.** CI
+  publishes to `ghcr.io/<owner>/dama-hear` from `main`. Whether the *cluster* pulls from GHCR or
+  from the in-cluster registry the site already runs (`dama-bridge`, `embedding-worker` and the
+  runners are published there) is open question 1 of
+  [`docs/worker-packaging.md`](../../docs/worker-packaging.md) — it decides whether a node
+  restart during a registry outage is survivable, and it must be answered before the *second*
+  workload moves, not before the images exist.
 - ⚠️**A tag is an alias; a manifest references a digest.** Tags are `<short-sha>` of the commit
   that built the image — never `latest`, never a mutable channel name. The `image:` line in a
   workload manifest carries `name@sha256:…`, so what a pod ran is answerable from git alone.
@@ -156,7 +170,9 @@ manifest lists`). That is why the PR path pushes to `localhost:5000` rather than
 
 ## Rollout and rollback compatibility
 
-The ConfigMap path and the image path are designed to coexist, one workload at a time:
+The per-workload cutover procedure, the ordering and the gates belong to
+[`docs/worker-packaging.md`](../../docs/worker-packaging.md). What this lane owes that procedure
+is that the two packaging paths can coexist, one workload at a time:
 
 1. A migrated workload stops mounting its `code` and `deps` volumes and names an image digest.
    **Its ConfigMap stays applied and unreferenced.**
@@ -168,11 +184,19 @@ The ConfigMap path and the image path are designed to coexist, one workload at a
    `tests (py3.13, pods)` CI job installs — so an image is numerically what CI tested, before and
    after a migration.
 
-⚠️**A rollout of an image-based Deployment is not free where the current manifests are.**
-`hear-heartbeat` and `hear-mqtt-bridge` are `hostNetwork` with a `hostPort`, one replica and no
-`strategy` block: the default RollingUpdate cannot schedule the new pod beside the old one. Any
-workload in that shape needs `strategy: { type: Recreate }` in the same change that gives it an
-image, or its first image rollout deadlocks.
+⚠️**A `hostPort` or an RWO PVC makes a rolling image bump deadlock.** The surge pod cannot bind
+the port or attach the volume, so it stays `Pending` — and if it did start, two writers would
+share one SQLite ledger. Both Deployments in that shape now carry `strategy: type: Recreate`
+(`hear-mqtt-bridge` via #189), so this is a standing requirement on any *new* workload rather
+than an outstanding defect.
+
+⚠️**A nonroot base image does not make a workload nonroot.** `hear-runtime` ends as uid 65532 and
+the guard test enforces that, but `/pool` and the `/state` SQLite databases are root-owned and
+`local-path` volumes get no `fsGroup` management. A workload that writes to a PVC keeps running
+as root until a separate ownership-reconciliation change re-owns that path and proves the write —
+the identity boundary in [`docs/worker-packaging.md`](../../docs/worker-packaging.md). Changing
+the uid in the same commit as the image is how that becomes a runtime error on a PVC after
+cutover.
 
 ## Recipes
 
