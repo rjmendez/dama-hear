@@ -28,12 +28,13 @@ metadata:
       2 receivers is rank-1 and singular for ANY geometry. 3 receivers with the height DECLARED
       is exactly determined, so its residual is ~0 BY CONSTRUCTION -- including for a badly wrong
       --fixed-up-m -- and is NOT evidence the fit is right. `up` is declared, not solved. `c` is
-      ASSUMED from --temp-c and determines_speed says it can never be recovered from 3 ground
-      receivers and an unknown source at ANY number of events. Position error is ~20x the timing
-      error here, so the next accuracy gain is a re-survey, not a clock. And a run with ZERO
-      events is NOT evidence of no gunshots -- the referent is the co-activity number in
-      coactivity.json. /pool/corpus/tdoa/model_card.json carries the reasoning and every figure
-      in it is computed at runtime from the survey that was actually loaded.
+      MEASURED from healthy xiao-s3-pps node env telemetry when available and otherwise ASSUMED
+      from --temp-c; determines_speed says it can never be recovered from 3 ground receivers and
+      an unknown source at ANY number of events. Position error is still the dominant term, so
+      measured c improves systematic correctness but is not a substitute for a re-survey. And a
+      run with ZERO events is NOT evidence of no gunshots -- the referent is the co-activity
+      number in coactivity.json. /pool/corpus/tdoa/model_card.json carries the reasoning and
+      every figure in it is computed at runtime from the survey that was actually loaded.
     dama-hear/source-class-is-an-operator-assertion: >-
       --source-class below is asserted by the operator and is never inferred. Nothing in this
       repo classifies cone-vs-point, and asserting the wrong one is a measured 67.4 degree error
@@ -108,6 +109,9 @@ spec:
                     --out /pool/corpus/tdoa \
                     --source-class blast \
                     --fixed-up-m 0.0 \
+                    --sound-speed-node nyquist=172.16.100.105 \
+                    --sound-speed-node mach=172.16.100.116 \
+                    --sound-speed-node rankine=172.16.100.50 \
                     --lookback-h 168 \
                     --null-trials 200
               env:
@@ -217,12 +221,18 @@ spec:
                   export PYTHONPATH=/pool/pylib:/app
                   python /app/tools/hear_tdoa.py --pool /pool/corpus \
                     --survey /app/survey.json --out /pool/corpus/tdoa --check \
-                    --window-s 7200 --max-stale-s 7200
+                    --window-s 7200 --max-stale-s 7200 \
+                    --sound-speed-node nyquist=172.16.100.105 \
+                    --sound-speed-node mach=172.16.100.116 \
+                    --sound-speed-node rankine=172.16.100.50
                   rc=$?
                   echo "--- census (stages 1-2, writes nothing) ---"
                   python /app/tools/hear_tdoa.py --pool /pool/corpus \
                     --survey /app/survey.json --out /pool/corpus/tdoa --census \
-                    --source-class blast || true
+                    --source-class blast \
+                    --sound-speed-node nyquist=172.16.100.105 \
+                    --sound-speed-node mach=172.16.100.116 \
+                    --sound-speed-node rankine=172.16.100.50 || true
                   exit "$rc"
               env:
                 - name: HEAR_SITE_ORIGIN
