@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.dama.example/hear/ingest/v1/batch-receipt.schema.json",
+  "title": "hear.ingest.batch.receipt.v1",
+  "description": "Receipt for one hear.ingest.batch.v1 submission (application/vnd.dama.hear.ingest.batch-receipt.v1+json). counts.submitted equals accepted + duplicate + refused + deferred. A producer may release spooled items only through ack_through_index; items after it are not durable.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "batch_schema_version",
+    "batch_id",
+    "received_at",
+    "ack_through_index",
+    "counts",
+    "results",
+    "retry_after_s",
+    "server"
+  ],
+  "properties": {
+    "batch_schema_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Frame major version this receipt answers.",
+      "const": 1
+    },
+    "batch_id": {
+      "type": "string",
+      "description": "Echoed submitted batch_id, so a receipt is attributable without the body."
+    },
+    "received_at": {
+      "type": "string",
+      "description": "RFC3339 UTC instant the server accepted the bytes. Never a producer claim."
+    },
+    "ack_through_index": {
+      "type": "integer",
+      "minimum": -1,
+      "description": "Last item index made durable with no gap before it; -1 acknowledges nothing. A producer may release spool space only up to this index."
+    },
+    "counts": {
+      "type": "object",
+      "properties": {
+        "submitted": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Items in the submitted frame."
+        },
+        "accepted": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Newly durable events."
+        },
+        "duplicate": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Already durable under the same event_id. Success, not an error."
+        },
+        "refused": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Durably refused with a machine reason and retained raw bytes."
+        },
+        "deferred": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Not made durable. The producer must retry these."
+        }
+      },
+      "required": [
+        "submitted",
+        "accepted",
+        "duplicate",
+        "refused",
+        "deferred"
+      ],
+      "additionalProperties": true,
+      "description": "Conservation accounting. The four counts sum to the submitted item count."
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "title": "hear.ingest.batch.v1 item result",
+        "additionalProperties": true,
+        "required": [
+          "index",
+          "status",
+          "event_id",
+          "dispatchable",
+          "reasons",
+          "raw_ref",
+          "classification"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Zero-based index in the submitted `messages` array."
+          },
+          "status": {
+            "type": "string",
+            "x-known-values": [
+              "accepted",
+              "duplicate",
+              "refused",
+              "deferred"
+            ],
+            "description": "Outcome for this item. Unknown members are preserved, never guessed."
+          },
+          "event_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Derived event identity when one could be derived, else null."
+          },
+          "dispatchable": {
+            "type": "boolean",
+            "description": "False for a stored record carrying an enum member this build does not know."
+          },
+          "reasons": {
+            "type": "array",
+            "description": "Machine reason codes. Empty for accepted and duplicate.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "raw_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Object key of the retained original item bytes, or null when inlined."
+          },
+          "classification": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Item shape recognized by the frame reader: canonical envelope, or translation_required for a legacy telemetry body, or null."
+          }
+        }
+      },
+      "description": "Per-item outcome in submitted order, one entry per submitted item."
+    },
+    "retry_after_s": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "Server-directed minimum delay before the next batch. Null means no direction; it is advice about load, never a substitute for client backoff."
+    },
+    "server": {
+      "type": "object",
+      "properties": {
+        "adapter": {
+          "type": "string",
+          "description": "Ingest adapter name."
+        },
+        "version": {
+          "type": "string",
+          "description": "Ingest adapter build."
+        },
+        "envelope_major": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Item envelope major this server supports."
+        }
+      },
+      "required": [
+        "adapter",
+        "version",
+        "envelope_major"
+      ],
+      "additionalProperties": true,
+      "description": "Answering build, so a bad translation or a bad rollout is attributable."
+    }
+  },
+  "x-schema-id": "hear.ingest.batch.receipt.v1",
+  "x-schema-major": 1,
+  "x-media-type": "application/vnd.dama.hear.ingest.batch-receipt.v1+json",
+  "x-item-statuses": [
+    "accepted",
+    "duplicate",
+    "refused",
+    "deferred"
+  ]
+}

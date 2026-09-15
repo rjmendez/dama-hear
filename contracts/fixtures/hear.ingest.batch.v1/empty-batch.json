@@ -1,0 +1,13 @@
+{
+  "batch_schema_version": 1,
+  "batch_id": "018f2c1a-batch-empty-1",
+  "device_id": "nyquist",
+  "sent_at": "2026-09-14T18:03:11.990000Z",
+  "messages": [],
+  "producer": {
+    "boot_id": "018f2b90-5f3c-7c21-9a7e-1d2c3b4a5e6f",
+    "boot_epoch_us": 1789495200000000,
+    "batch_sequence": 7,
+    "spool_backlog": 118
+  }
+}

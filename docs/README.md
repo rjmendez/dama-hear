@@ -22,6 +22,17 @@ current code disagree, the design states the intended end state.
 | [REDESIGN-LESSONS.md](REDESIGN-LESSONS.md) | Postmortem of the existing fleet: observed failure modes and the systems-design lessons that constrain the redesign. Evidence-tagged. |
 | [loci-memory-validation.md](loci-memory-validation.md) | Validation of the Loci spatial/memory behaviour used by the localization lane. |
 
+## Decision records
+
+Numbered, dated records of decisions that constrain later phases. A decision record states
+what was chosen, the in-tree evidence it rests on, and what was deliberately left open.
+
+| Record | What it decides |
+|---|---|
+| [0001 - `hear.ingest.v1` envelope and codec](decisions/0001-hear-ingest-v1-envelope-and-codec.md) | The canonical ingest envelope as a codec-agnostic logical schema, UTF-8 JSON as the only normative v1 wire codec, and a closed identity tuple for `event_id`. |
+| [0002 - Phase 4 HTTPS batch ingest adapter](decisions/0002-phase4-https-batch-ingest-adapter.md) | An additive HTTPS batch ingest path: frame versioned separately from items, receipt-based contiguous acknowledgement, identity-based replay safety, and no broker or queue at this scale. |
+| [phase4-https-batch-ingest.md](phase4-https-batch-ingest.md) | The operational specification behind 0002: API and auth, sizing and limits, retry/offline durability, timestamp and version semantics, refusal visibility, TLS/key lifecycle, observability, dual-write comparison and rollback. |
+
 ## System and subsystem references
 
 | Document | What it covers |

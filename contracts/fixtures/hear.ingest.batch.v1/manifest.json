@@ -1,0 +1,380 @@
+{
+  "schema_id": "hear.ingest.batch.v1",
+  "schema_major": 1,
+  "schema_file": "schemas/hear.ingest.batch.v1.schema.json",
+  "receipt_schema_id": "hear.ingest.batch.receipt.v1",
+  "receipt_schema_file": "schemas/hear.ingest.batch.receipt.v1.schema.json",
+  "item_schema_id": "hear.ingest.v1",
+  "item_schema_file": "schemas/hear.ingest.v1.schema.json",
+  "codecs": {
+    "json": "application/vnd.dama.hear.ingest.batch.v1+json"
+  },
+  "receipt_media_type": "application/vnd.dama.hear.ingest.batch-receipt.v1+json",
+  "item_statuses": [
+    "accepted",
+    "duplicate",
+    "refused",
+    "deferred"
+  ],
+  "item_results_stage": "frame-reader, pre-translation and pre-dedup",
+  "item_results_note": "expect_items is what the frame reader alone can conclude. It does not consult the durable store, so an item it calls `accepted` becomes `duplicate` when its event_id is already durable, and a `translation_required` item is `deferred` only until the edge adapter translates it into an item envelope, which then receives a real status in the same request. A cross-language adapter asserts against these values for frame admission and item classification, not for the final persisted outcome.",
+  "limits": {
+    "max_items_per_batch": 64,
+    "max_batch_bytes": 262144,
+    "max_item_bytes": 65536,
+    "max_clock_skew_s": 900
+  },
+  "generator": "tools/gen_ingest_contracts.py",
+  "decision": "docs/decisions/0002-phase4-https-batch-ingest-adapter.md",
+  "fixtures": [
+    {
+      "name": "valid-node-batch",
+      "file": "valid-node-batch.json",
+      "credential_device_id": "nyquist",
+      "expect_status": "accepted",
+      "expect_reasons": [],
+      "expect_unknown_fields": [],
+      "expect_items": [
+        {
+          "index": 0,
+          "status": "accepted",
+          "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+          "dispatchable": true,
+          "reasons": [],
+          "raw_ref": null,
+          "classification": "canonical"
+        },
+        {
+          "index": 1,
+          "status": "accepted",
+          "event_id": "e083f81e-7ee3-85a4-87e6-1790aa1185a1",
+          "dispatchable": true,
+          "reasons": [],
+          "raw_ref": null,
+          "classification": "canonical"
+        },
+        {
+          "index": 2,
+          "status": "accepted",
+          "event_id": "25c4998a-4f9f-8e79-a040-344a8204196a",
+          "dispatchable": true,
+          "reasons": [],
+          "raw_ref": null,
+          "classification": "canonical"
+        }
+      ],
+      "sha256": "fa27398775d256af9711c76b6807745c20f909f02785a44e576fa2b70667a958",
+      "expect_counts": {
+        "submitted": 3,
+        "accepted": 3,
+        "duplicate": 0,
+        "refused": 0,
+        "deferred": 0
+      },
+      "expect_ack_through_index": 2,
+      "expect_retry_indices": [],
+      "receipt_file": "valid-node-batch.receipt.json",
+      "receipt_sha256": "1511808fa47bef11ac25942f2f9863bae8ad4bf68c18f1b712235b373a9a612f"
+    },
+    {
+      "name": "mixed-version-legacy-messages",
+      "file": "mixed-version-legacy-messages.json",
+      "credential_device_id": "nyquist",
+      "expect_status": "accepted",
+      "expect_reasons": [],
+      "expect_unknown_fields": [],
+      "expect_items": [
+        {
+          "index": 0,
+          "status": "deferred",
+          "event_id": null,
+          "dispatchable": false,
+          "reasons": [],
+          "raw_ref": null,
+          "classification": "translation_required"
+        },
+        {
+          "index": 1,
+          "status": "deferred",
+          "event_id": null,
+          "dispatchable": false,
+          "reasons": [],
+          "raw_ref": null,
+          "classification": "translation_required"
+        }
+      ],
+      "sha256": "37cc0d8c2a7ed99381628bdfbcceca921cb0da94b9b69424e95963f46347ed10",
+      "expect_counts": {
+        "submitted": 2,
+        "accepted": 0,
+        "duplicate": 0,
+        "refused": 0,
+        "deferred": 2
+      },
+      "expect_ack_through_index": -1,
+      "expect_retry_indices": [
+        0,
+        1
+      ],
+      "receipt_file": "mixed-version-legacy-messages.receipt.json",
+      "receipt_sha256": "ff5cae501b3767180ee52c84db0b741eba40afc4ac0cc451a9b918934b0614ef"
+    },
+    {
+      "name": "poison-item-keeps-batch",
+      "file": "poison-item-keeps-batch.json",
+      "credential_device_id": "nyquist",
+      "expect_status": "accepted",
+      "expect_reasons": [],
+      "expect_unknown_fields": [],
+      "expect_items": [
+        {
+          "index": 0,
+          "status": "accepted",
+          "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+          "dispatchable": true,
+          "reasons": [],
+          "raw_ref": null,
+          "classification": "canonical"
+        },
+        {
+          "index": 1,
+          "status": "refused",
+          "event_id": null,
+          "dispatchable": false,
+          "reasons": [
+            "field_missing"
+          ],
+          "raw_ref": null,
+          "classification": "canonical"
+        },
+        {
+          "index": 2,
+          "status": "accepted",
+          "event_id": "25c4998a-4f9f-8e79-a040-344a8204196a",
+          "dispatchable": true,
+          "reasons": [],
+          "raw_ref": null,
+          "classification": "canonical"
+        }
+      ],
+      "sha256": "6b3b360fe0fe5bb2bb7694f3b5910e02e1079e108e69612fe7d504113150211a",
+      "expect_counts": {
+        "submitted": 3,
+        "accepted": 2,
+        "duplicate": 0,
+        "refused": 1,
+        "deferred": 0
+      },
+      "expect_ack_through_index": 2,
+      "expect_retry_indices": [],
+      "receipt_file": "poison-item-keeps-batch.receipt.json",
+      "receipt_sha256": "45d22a01d8e8d9769aff965ee4c8053ef156373365bc023962ea817550c1e54c"
+    },
+    {
+      "name": "item-future-major-refused-alone",
+      "file": "item-future-major-refused-alone.json",
+      "credential_device_id": "nyquist",
+      "expect_status": "accepted",
+      "expect_reasons": [],
+      "expect_unknown_fields": [],
+      "expect_items": [
+        {
+          "index": 0,
+          "status": "accepted",
+          "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+          "dispatchable": true,
+          "reasons": [],
+          "raw_ref": null,
+          "classification": "canonical"
+        },
+        {
+          "index": 1,
+          "status": "refused",
+          "event_id": null,
+          "dispatchable": false,
+          "reasons": [
+            "schema_version_unsupported"
+          ],
+          "raw_ref": null,
+          "classification": "canonical"
+        }
+      ],
+      "sha256": "66fc0ab9d3e13a3ba9184715eaba709d5a64797e1d261d53b4e43423c07f90f2",
+      "expect_counts": {
+        "submitted": 2,
+        "accepted": 1,
+        "duplicate": 0,
+        "refused": 1,
+        "deferred": 0
+      },
+      "expect_ack_through_index": 1,
+      "expect_retry_indices": [],
+      "receipt_file": "item-future-major-refused-alone.receipt.json",
+      "receipt_sha256": "bfd941f1f9e2faa48235fad3a9d1d31d530b4eb24ad990a97b4070de3cdc9d35"
+    },
+    {
+      "name": "forward-additive-frame-fields",
+      "file": "forward-additive-frame-fields.json",
+      "credential_device_id": "nyquist",
+      "expect_status": "accepted",
+      "expect_reasons": [],
+      "expect_unknown_fields": [
+        "compression",
+        "producer.link"
+      ],
+      "expect_items": [
+        {
+          "index": 0,
+          "status": "accepted",
+          "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+          "dispatchable": true,
+          "reasons": [],
+          "raw_ref": null,
+          "classification": "canonical"
+        },
+        {
+          "index": 1,
+          "status": "accepted",
+          "event_id": "e083f81e-7ee3-85a4-87e6-1790aa1185a1",
+          "dispatchable": true,
+          "reasons": [],
+          "raw_ref": null,
+          "classification": "canonical"
+        },
+        {
+          "index": 2,
+          "status": "accepted",
+          "event_id": "25c4998a-4f9f-8e79-a040-344a8204196a",
+          "dispatchable": true,
+          "reasons": [],
+          "raw_ref": null,
+          "classification": "canonical"
+        }
+      ],
+      "sha256": "9e525a79fb2ec7e4f57845f9d5c58a3dc8bda42040fded07824c0bb44f8a20a1",
+      "expect_counts": {
+        "submitted": 3,
+        "accepted": 3,
+        "duplicate": 0,
+        "refused": 0,
+        "deferred": 0
+      },
+      "expect_ack_through_index": 2,
+      "expect_retry_indices": []
+    },
+    {
+      "name": "unrecognized-items-refused",
+      "file": "unrecognized-items-refused.json",
+      "credential_device_id": "nyquist",
+      "expect_status": "accepted",
+      "expect_reasons": [],
+      "expect_unknown_fields": [],
+      "expect_items": [
+        {
+          "index": 0,
+          "status": "accepted",
+          "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+          "dispatchable": true,
+          "reasons": [],
+          "raw_ref": null,
+          "classification": "canonical"
+        },
+        {
+          "index": 1,
+          "status": "refused",
+          "event_id": null,
+          "dispatchable": false,
+          "reasons": [
+            "item_unrecognized"
+          ],
+          "raw_ref": null,
+          "classification": null
+        },
+        {
+          "index": 2,
+          "status": "refused",
+          "event_id": null,
+          "dispatchable": false,
+          "reasons": [
+            "item_unrecognized"
+          ],
+          "raw_ref": null,
+          "classification": null
+        }
+      ],
+      "sha256": "21e9f1dce918979758547ce25560ff7807c8002fbfe01a8a6fd62ecb94a5eed6",
+      "expect_counts": {
+        "submitted": 3,
+        "accepted": 1,
+        "duplicate": 0,
+        "refused": 2,
+        "deferred": 0
+      },
+      "expect_ack_through_index": 2,
+      "expect_retry_indices": [],
+      "receipt_file": "unrecognized-items-refused.receipt.json",
+      "receipt_sha256": "bbe4d9b11dfa9cfdcf7e75f8c55fb6cf2215cd8fb97753da81fd5bef7dacd63b"
+    },
+    {
+      "name": "unsupported-future-batch-major",
+      "file": "unsupported-future-batch-major.json",
+      "credential_device_id": "nyquist",
+      "expect_status": "refused",
+      "expect_reasons": [
+        "batch_schema_version_unsupported"
+      ],
+      "expect_unknown_fields": [],
+      "expect_items": [],
+      "sha256": "918927511f0d9bd34cfe0c011301c737175a2290de2d757a5d4831fef3dbd131"
+    },
+    {
+      "name": "empty-batch",
+      "file": "empty-batch.json",
+      "credential_device_id": "nyquist",
+      "expect_status": "refused",
+      "expect_reasons": [
+        "batch_empty"
+      ],
+      "expect_unknown_fields": [],
+      "expect_items": [],
+      "sha256": "fdabe6d57bbf285edb6cea7b8c4da6e3ec191fb6555079575851deb5b3660090"
+    },
+    {
+      "name": "batch-too-many-items",
+      "file": "batch-too-many-items.json",
+      "credential_device_id": "nyquist",
+      "expect_status": "refused",
+      "expect_reasons": [
+        "batch_too_many_items"
+      ],
+      "expect_unknown_fields": [],
+      "expect_items": [],
+      "sha256": "2b41040a60afbf6ccc5604c5aae1c87b5ddba411ae7b7a920fe0f55a7ec57663"
+    },
+    {
+      "name": "device-identity-mismatch",
+      "file": "device-identity-mismatch.json",
+      "credential_device_id": "nyquist",
+      "expect_status": "refused",
+      "expect_reasons": [
+        "device_identity_mismatch"
+      ],
+      "expect_unknown_fields": [],
+      "expect_items": [],
+      "sha256": "60fbc0c403e04ddeca1d59b9539fc6ad52f5fb51da9697fbc9faeb21009a0804"
+    },
+    {
+      "name": "malformed-frame-field-types",
+      "file": "malformed-frame-field-types.json",
+      "credential_device_id": "nyquist",
+      "expect_status": "refused",
+      "expect_reasons": [
+        "timestamp_not_rfc3339_utc",
+        "type_invalid"
+      ],
+      "expect_unknown_fields": [],
+      "expect_items": [],
+      "sha256": "a7d4e65fae2b3828565de1fc39e4ad54c62468796129986c6a7402e2f3abfa37"
+    }
+  ]
+}

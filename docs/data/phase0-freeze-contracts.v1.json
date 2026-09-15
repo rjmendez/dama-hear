@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "caa03479a17dd1eac412e9ed946f0bde1bd98ed478d899e5e0e44ac4339fc21c",
+  "baseline_hash": "396bc18f8bc7c93eade5e1d0d4e5ec9fd34fbc8a0431f7bfad0a7f20b5173185",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -2598,6 +2598,18 @@
         ]
       },
       {
+        "schema": "hear.ingest.batch.receipt.v1",
+        "source_paths": [
+          "hear/ingest/batch.py"
+        ]
+      },
+      {
+        "schema": "hear.ingest.batch.v1",
+        "source_paths": [
+          "hear/ingest/batch.py"
+        ]
+      },
+      {
         "schema": "hear.ingest.v1",
         "source_paths": [
           "hear/ingest/envelope.py"
@@ -2648,7 +2660,7 @@
         ]
       }
     ],
-    "section_hash": "427c86937d28bd12b6de71c3b4604eae609d2b24edfd4f1a761256bc74a6b580",
+    "section_hash": "248d557d9051b2f32b5e89018296b180cf2772b602b7ed3ad3761989cc412519",
     "telemetry_routes": [
       {
         "http_path": "/api/hear/heartbeat",

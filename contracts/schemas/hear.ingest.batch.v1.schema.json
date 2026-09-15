@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.dama.example/hear/ingest/v1/batch.schema.json",
+  "title": "hear.ingest.batch.v1",
+  "description": "DAMA Hear HTTPS batch ingest request frame, major version 1. Normative wire codec is UTF-8 JSON (application/vnd.dama.hear.ingest.batch.v1+json). The frame major versions the framing only; each item carries its own schema_version. Readers MUST accept unknown properties within this major, MUST refuse an unsupported batch_schema_version before reading any item, and MUST refuse a single malformed item without refusing the batch.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "batch_schema_version",
+    "batch_id",
+    "device_id",
+    "sent_at",
+    "messages"
+  ],
+  "properties": {
+    "batch_schema_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Frame major version. Unsupported majors are refused before any item is read.",
+      "const": 1
+    },
+    "batch_id": {
+      "type": "string",
+      "description": "Producer-chosen batch identity, stable across retries of the same batch. Used for receipt correlation and log joins, never for deduplication."
+    },
+    "device_id": {
+      "type": "string",
+      "description": "Submitting producer. Cross-checked against the credential; a mismatch is refused, never overwritten from the body."
+    },
+    "sent_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "RFC3339 UTC instant the producer handed the batch to the transport, or null when it has no usable clock. Never used as an observation time."
+    },
+    "messages": {
+      "type": "array",
+      "items": {
+        "description": "One hear.ingest.v1 envelope, or a legacy telemetry body during the mixed-version window. Items are not constrained by this schema: the item contract is https://schemas.dama.example/hear/ingest/v1/envelope.schema.json and a legacy body is translated by the edge adapter, not by the frame reader.",
+        "type": "object"
+      },
+      "description": "Items in producer order: hear.ingest.v1 envelopes, or legacy telemetry bodies during the mixed-version window. Order is preserved; it is not identity.",
+      "maxItems": 64,
+      "minItems": 1
+    },
+    "producer": {
+      "type": "object",
+      "properties": {
+        "boot_id": {
+          "type": "string",
+          "description": "Producer boot identity; a change means batch sequences are not comparable."
+        },
+        "boot_epoch_us": {
+          "type": "integer",
+          "description": "Producer boot epoch in microseconds UTC."
+        },
+        "batch_sequence": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonic per-boot batch counter. Gap detection evidence only."
+        },
+        "spool_backlog": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Items still spooled at the producer after this batch. Backpressure input."
+        }
+      },
+      "additionalProperties": true,
+      "description": "Optional continuity evidence for the batch itself. Absent means the producer exposes no boot/sequence, not that continuity is fine."
+    },
+    "adapter": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Adapter name."
+        },
+        "version": {
+          "type": "string",
+          "description": "Adapter build."
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "additionalProperties": true,
+      "description": "Submitting adapter identity when a gateway, drain or import tool submits on a producer's behalf. Absent for a device submitting directly."
+    }
+  },
+  "x-schema-id": "hear.ingest.batch.v1",
+  "x-schema-major": 1,
+  "x-item-schema": "https://schemas.dama.example/hear/ingest/v1/envelope.schema.json",
+  "x-codecs": {
+    "json": "application/vnd.dama.hear.ingest.batch.v1+json"
+  },
+  "x-limits": {
+    "max_items_per_batch": 64,
+    "max_batch_bytes": 262144,
+    "max_item_bytes": 65536,
+    "max_clock_skew_s": 900
+  }
+}
