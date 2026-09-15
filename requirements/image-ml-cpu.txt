@@ -1,0 +1,11 @@
+# hear-ml-cpu: CPU inference runtimes, for the hear-tag (onnxruntime) and hear-birdnet
+# (ai-edge-litert) lanes. Layered on hear-numeric, so numpy is restated at the same pin rather
+# than being allowed to float in behind a runtime's dependency range.
+#
+# ⚠️NO MODEL WEIGHTS. mn10_as.onnx, birdnet_v24 and perch_v2 are data with their own sha256 pins
+# in tools/hear_tag.py, staged on the PVC out of band. See deploy/images/README.md.
+#
+# Resolved to requirements/lock/ml-cpu.txt.
+numpy==2.2.6
+onnxruntime==1.27.0
+ai-edge-litert==2.2.0
