@@ -134,6 +134,21 @@ class TestThePhoneLegIsDeclared:
             % PHONE_CORPUS_PATH)
 
 
+class TestTheDrainAnnotationDoesNotOverclaimConcurrencySafety:
+    """The pool deduplicates refetches, but the node side is still single-client."""
+
+    def test_the_annotation_warns_that_the_nodes_do_not_support_parallel_readers(self):
+        with open(MANIFEST) as fh:
+            text = fh.read()
+        assert "Pool ingest is content-addressed and re-fetched files dedupe" in text
+        assert "serve one client at a time" in text, (
+            "the manifest must warn operators that a second drain or other card-reading workload "
+            "against the same nodes will contend with hear-drain on the node side")
+        assert "overlapping runs and re-fetched files cost nothing" not in text, (
+            "that claim is only true of pool-side dedupe. The nodes themselves refuse a second "
+            "client rather than queueing it, so overlapping node-targeted drains are not free")
+
+
 # ---------------------------------------------------------------- seam S9: bundle <-> mounts
 
 def _gen():
