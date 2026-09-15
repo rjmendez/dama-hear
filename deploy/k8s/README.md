@@ -239,3 +239,54 @@ Rollback is explicit: set `HEAR_DURABLE_STORE=none` and remove the `/state` PVC 
 the previous Redis-only behavior. PostgreSQL is the next step once a shared dependency and DDL
 ownership are ready: keep the same `DurableRecordStore` seam, move `durable_records` and
 `cache_attempts` there, and leave the Redis contract unchanged during the cut-over.
+
+### Refused messages are quarantined, not dropped
+
+Validation used to happen entirely *before* persistence, so a message the receiver did not
+understand left nothing behind but a log line and an in-memory counter (migration risk register
+R4). Anything that identifies itself as hear telemetry and is then refused now gets a row in
+`refused_messages` (body as received, telemetry path, source, reason, receipt time) in the same
+SQLite file, kept apart from `durable_records` and never published to Redis — a quarantined
+message must never be mistaken for an accepted one. `/healthz` reports the quarantine under its
+own `refusals` key rather than inside `durable_store`, because `durable_store` is the contract
+every durable backend has to implement key for key.
+
+The quarantine is a **bounded ring**, not an append-only ledger: it accepts input that by
+definition failed validation, so any publisher reachable on the topic can mint unbounded distinct
+rejected bodies, and age alone is not a capacity bound on a 5Gi volume shared with accepted
+telemetry.
+
+| Knob | Default | What it bounds |
+|---|---|---|
+| `HEAR_REFUSAL_MAX_BODY_CHARS` | `8192` | characters stored per refusal |
+| `HEAR_REFUSAL_MAX_ROWS` | `5000` | rows in the quarantine |
+| `HEAR_REFUSAL_MAX_BYTES` | `16777216` | total quarantined body bytes |
+| `HEAR_REFUSAL_RATE_LIMIT` | `30` | refusals stored per source per window (`0` disables) |
+| `HEAR_REFUSAL_RATE_WINDOW_S` | `60` | length of that window |
+| `HEAR_DURABLE_RETENTION_DAYS` | `30` | age sweep, shared with acknowledged records |
+
+The caps are enforced inside the same transaction as the insert, and eviction always takes the
+oldest row of whichever `(source, device)` holds the most — so a flooding publisher erases its
+own history first and cannot evict another node's evidence. Nothing on that path can reach
+`durable_records` or `cache_attempts`: a refusal flood can cost older *refusals*, never accepted
+telemetry, and never an ingest failure. The rate limiter is in memory, ahead of the disk, so a
+flood does not become one synchronous fsync per hostile message.
+
+Two things are deliberately *not* quarantined: unauthenticated requests, and foreign or
+undecodable traffic on the shared `dama/+/telemetry` topic. Neither is recoverable hear data, and
+storing either would let an unrelated (or hostile) publisher write to the telemetry volume.
+
+The Postgres generation keeps all of this (`deploy/postgres/migrations/0006_hear_durable_refusals.sql`):
+same bounded ring, counters in `hear.durable_counters`, `hear.refusal_health_snapshot()`, tenant
+RLS, and an audit view that omits the quarantined body.
+
+### Legacy `hear/event` bodies
+
+Firmware older than the clock-state rollout emits `hear/event` with **no `time` block at all**
+while its heartbeats carry `"time":{"valid":<bool>}`. Those events are now canonicalized instead
+of refused: the block is reconstructed from the `ts` the same firmware derived from the same
+`time_valid` flag, and marked `"source":"legacy_pre_clock_state_firmware"` so an inferred block
+is distinguishable from one a node actually sent. A node that has no wall clock is detected by
+its `uptime_s * 1000 + 1` fallback timestamp, so the upstream ingest's restamp of a null `ts`
+cannot be laundered into a valid wall-clock time. A `time` block that is present but malformed,
+or a legacy event whose `ts` is neither a string nor null, is still refused (and quarantined).

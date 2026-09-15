@@ -616,3 +616,159 @@ class TestTopicPayloadDeviceIdValidation:
         assert stats.impersonation == 1
         assert stats.accepted == 1
         assert "dama:hear:nyquist" in fake.values
+
+
+def _legacy_event(**overrides):
+    """A pre-#156 firmware event: no time block at all, and ts_ms is uptime-derived.
+
+    mach still runs v0.1.4-5-g2355270, whose hear_push_event_json() writes no "time" key. AWS
+    batch ingest then copies ts_ms over a null ts, so what arrives here claims a wall clock the
+    node never had -- the same rewrite the #185 heartbeat fix undoes.
+    """
+    payload = _event(**overrides)
+    payload.pop("time", None)
+    return payload
+
+
+class TestLegacyEventCompatibility:
+    def test_a_legacy_event_is_accepted_instead_of_refused(self, store):
+        st, fake = store
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_legacy_event())).encode()
+        record = B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats)
+        assert record is not None
+        assert stats.rejected == 0 and stats.accepted == 1
+        assert record["time"] == {"valid": True, "source": HR.LEGACY_TIME_SOURCE}
+        assert json.loads(fake.values["dama:hear:event:nyquist"])["event_seq"] == 234
+
+    def test_a_legacy_event_from_a_node_with_no_clock_lands_as_degraded_not_rejected(self, store):
+        st, _fake = store
+        stats = B.BridgeStats()
+        payload = _legacy_event(ts=None, uptime_s=12349, ts_ms=12349 * 1000 + 1)
+        # What AWS ingest does to it before this bridge ever sees it.
+        payload["ts"] = payload["ts_ms"]
+        raw = json.dumps(_batch_ingest_wrapped(payload)).encode()
+        record = B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats)
+        assert record is not None
+        assert record["ts"] is None
+        assert record["time"] == {"valid": False, "source": HR.LEGACY_TIME_SOURCE}
+        assert stats.rejected == 0
+
+    def test_a_current_firmware_event_is_unchanged(self, store):
+        st, _fake = store
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_event())).encode()
+        record = B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats)
+        assert record is not None
+        assert record["time"] == {"valid": True}
+        assert stats.accepted == 1
+
+    def test_an_event_that_is_malformed_for_other_reasons_is_still_refused(self, store):
+        st, _fake = store
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_legacy_event(event_seq="nope"))).encode()
+        assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats) is None
+        assert stats.rejected == 1
+
+
+class TestUptimeFallbackDetection:
+    def test_the_firmware_placeholder_is_recognised(self):
+        assert B._uptime_fallback_ts_ms({"uptime_s": 12349, "ts_ms": 12349 * 1000 + 1}) is True
+
+    def test_a_real_wall_clock_is_not(self):
+        assert B._uptime_fallback_ts_ms({"uptime_s": 12349, "ts_ms": 1789256584000}) is False
+
+    @pytest.mark.parametrize("payload", [
+        {}, {"uptime_s": 12349}, {"ts_ms": 12350001},
+        {"uptime_s": True, "ts_ms": 1001}, {"uptime_s": 1, "ts_ms": True},
+        {"uptime_s": "12349", "ts_ms": 12349001},
+    ])
+    def test_anything_else_is_not_treated_as_a_placeholder(self, payload):
+        assert B._uptime_fallback_ts_ms(payload) is False
+
+    def test_a_stated_time_block_still_wins(self):
+        # A body that says valid:true keeps its numeric ts converted, placeholder-looking or not.
+        assert B._stated_time_is_invalid({"time": {"valid": True}, "uptime_s": 1,
+                                          "ts_ms": 1001}) is False
+
+
+class TestDurableRefusalRows:
+    """R4: a message refused on the MQTT path leaves durable evidence, within hard bounds."""
+
+    @staticmethod
+    def _store(tmp_path, **kwargs):
+        durable = HR.SqliteDurableRecordStore(str(tmp_path / "bridge.sqlite3"))
+        fake = FakeRedis()
+        return HR.HeartbeatReceiverStore(fake, redis_target="fake:6379",
+                                         durable_store=durable, **kwargs), durable
+
+    def test_a_rejected_event_is_quarantined_with_the_bytes_as_received(self, tmp_path):
+        st, durable = self._store(tmp_path)
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_event(time="nope"))).encode()
+        assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats) is None
+        assert stats.rejected == 1 and stats.quarantined == 1
+        stored = durable.refusals()
+        assert len(stored) == 1
+        assert stored[0].reason == "time must be an object"
+        assert stored[0].source == "mqtt_bridge"
+        assert stored[0].device_id == "nyquist"
+        assert json.loads(stored[0].body_text)["time"] == "nope"
+
+    def test_the_quarantined_body_is_not_this_bridges_repaired_copy(self, tmp_path):
+        st, durable = self._store(tmp_path)
+        payload = _heartbeat(ts=1789256580000, time=_NO_FIX_TIME, counters={"scene_rows_written": 1})
+        raw = json.dumps(_batch_ingest_wrapped(payload)).encode()
+        assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", B.BridgeStats()) is None
+        body = json.loads(durable.refusals()[0].body_text)
+        assert body["ts"] == 1789256580000
+
+    def test_an_impersonation_attempt_is_recorded_against_the_topic_device(self, tmp_path):
+        st, durable = self._store(tmp_path)
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_event(device_id="impostor"))).encode()
+        assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats) is None
+        assert stats.impersonation == 1
+        stored = durable.refusals()
+        assert stored[0].device_id == "nyquist"
+        assert "impostor" in stored[0].reason
+
+    def test_foreign_traffic_on_the_shared_topic_is_not_written_to_the_volume(self, tmp_path):
+        """dama/+/telemetry carries other projects' messages; they are not hear data to keep."""
+        st, durable = self._store(tmp_path)
+        stats = B.BridgeStats()
+        for raw in (b"not json at all", b"[1,2,3]",
+                    json.dumps({"telemetry_path": "other/thing"}).encode()):
+            assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats) is None
+        assert durable.refusals() == []
+        assert stats.quarantined == 0
+
+    def test_a_refusal_row_is_never_replayed_to_redis(self, tmp_path):
+        st, durable = self._store(tmp_path)
+        raw = json.dumps(_batch_ingest_wrapped(_event(time="nope"))).encode()
+        B.dispatch_message(st, raw, "dama/nyquist/telemetry", B.BridgeStats())
+        assert durable.pending_records(10) == []
+        assert durable.health()["pending_records"] == 0
+
+    def test_a_unique_message_flood_cannot_grow_the_volume_without_bound(self, tmp_path):
+        durable = HR.SqliteDurableRecordStore(str(tmp_path / "bridge.sqlite3"),
+                                              refusal_max_rows=8)
+        st = HR.HeartbeatReceiverStore(FakeRedis(), redis_target="fake:6379",
+                                       durable_store=durable, refusal_rate_limit=0)
+        stats = B.BridgeStats()
+        for i in range(300):
+            raw = json.dumps(_batch_ingest_wrapped(_event(time="nope", event_seq=i))).encode()
+            B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats)
+        assert stats.rejected == 300
+        assert durable.refusal_health()["refused_messages"] == 8
+
+    def test_the_bridge_keeps_working_when_the_quarantine_cannot_be_written(self, tmp_path):
+        st, durable = self._store(tmp_path)
+        durable.record_refusal = lambda *a, **k: (_ for _ in ()).throw(
+            sqlite3.OperationalError("disk I/O error"))
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_event(time="nope"))).encode()
+        assert B.dispatch_message(st, raw, "dama/nyquist/telemetry", stats) is None
+        assert stats.rejected == 1 and stats.quarantined == 0
+        raw_ok = json.dumps(_batch_ingest_wrapped(_event())).encode()
+        assert B.dispatch_message(st, raw_ok, "dama/nyquist/telemetry", stats) is not None

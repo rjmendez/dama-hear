@@ -1306,3 +1306,352 @@ class TestDurableOutboxCorrectness(TestValidation):
         finally:
             con.close()
         assert any("cache_attempts_outcome_id" in plan for plan in plans), plans
+
+
+class TestLegacyEventTimeBlock(TestValidation):
+    """R4: a pre-#156 firmware sends no time block on hear/event at all.
+
+    mach is still on v0.1.4-5-g2355270, whose hear_push_event_json() omits the key that
+    hear_push_heartbeat_json() writes, so every one of its heartbeats is accepted and every one
+    of its events is refused with "time must be an object" before anything durable is written.
+    """
+
+    @staticmethod
+    def _legacy_event(**overrides):
+        payload = TestValidation._event(**overrides)
+        payload.pop("time", None)
+        return payload
+
+    def test_a_legacy_event_with_a_timestamp_is_accepted_as_clock_valid(self):
+        got = HR.validate_event_payload(self._legacy_event())
+        assert got["time"] == {"valid": True, "source": HR.LEGACY_TIME_SOURCE}
+        assert got["ts"] == "2026-09-12T23:43:04Z"
+
+    def test_a_legacy_event_without_a_timestamp_is_accepted_as_clock_invalid(self):
+        got = HR.validate_event_payload(self._legacy_event(ts=None))
+        assert got["time"] == {"valid": False, "source": HR.LEGACY_TIME_SOURCE}
+
+    def test_the_inferred_block_is_marked_so_a_reader_can_tell_it_apart(self):
+        reported = HR.validate_event_payload(TestValidation._event())
+        assert "source" not in reported["time"]
+
+    def test_the_canonicalisation_does_not_mutate_the_callers_body(self):
+        payload = self._legacy_event()
+        HR.validate_event_payload(payload)
+        assert "time" not in payload
+
+    def test_a_heartbeat_without_a_time_block_is_still_refused(self):
+        """Only events lost the block; a heartbeat missing it is a genuinely broken body."""
+        payload = TestValidation._heartbeat()
+        payload.pop("time")
+        with pytest.raises(HR.RequestError, match="time must be an object"):
+            HR.validate_heartbeat_payload(payload)
+
+    @pytest.mark.parametrize("ts", [1757721784000, "", "   ", True, [], {}])
+    def test_a_malformed_ts_is_still_refused_rather_than_guessed(self, ts):
+        with pytest.raises(HR.RequestError):
+            HR.validate_event_payload(self._legacy_event(ts=ts))
+
+    def test_an_explicit_time_block_is_never_overridden(self):
+        with pytest.raises(HR.RequestError, match="ts must be null"):
+            HR.validate_event_payload(TestValidation._event(time={"valid": False}))
+
+    def test_a_current_firmware_event_is_unaffected(self):
+        got = HR.validate_event_payload(TestValidation._event(
+            time={"valid": True, "state": "LOCKED", "boot_id": "a1b2c3d4",
+                  "sync_sigma_ns": 900, "anchor_age_us": 12, "boot_epoch_us": 17},
+        ))
+        assert got["time"]["state"] == "LOCKED"
+        assert "source" not in got["time"]
+
+
+class TestDurableRefusals(TestValidation):
+    """R4: a refused message leaves a durable row instead of only a log line."""
+
+    @staticmethod
+    def _store(db, fake=None, **kwargs):
+        durable = HR.SqliteDurableRecordStore(str(db), **kwargs)
+        return HR.HeartbeatReceiverStore(fake or FakeRedis(), redis_target="fake:6379",
+                                         durable_store=durable)
+
+    def test_a_refusal_is_recorded_with_the_body_as_received(self, tmp_path):
+        store = self._store(tmp_path / "hb.sqlite3")
+        entry = store.record_refusal("hear/event", "mach", "mqtt_bridge",
+                                     "time must be an object", b'{"telemetry_path":"hear/event"}')
+        assert entry is not None
+        assert entry.reason == "time must be an object"
+        assert entry.body_text == '{"telemetry_path":"hear/event"}'
+        stored = store.durable_store.refusals()
+        assert [r.refusal_uid for r in stored] == [entry.refusal_uid]
+
+    def test_a_refusal_never_becomes_replay_material(self, tmp_path):
+        store = self._store(tmp_path / "hb.sqlite3")
+        store.record_refusal("hear/event", "mach", "mqtt_bridge", "nope", b"{}")
+        assert store.durable_store.pending_records(10) == []
+        assert store.durable_store.health()["pending_records"] == 0
+
+    def test_a_repeat_of_the_same_refusal_does_not_add_a_row(self, tmp_path):
+        store = self._store(tmp_path / "hb.sqlite3")
+        for _ in range(5):
+            store.record_refusal("hear/event", "mach", "mqtt_bridge", "nope", b"{}")
+        assert len(store.durable_store.refusals()) == 1
+        assert store.durable_store.refusal_health()["refused_messages"] == 1
+
+    def test_an_oversized_body_is_truncated_rather_than_stored_whole(self, tmp_path):
+        store = self._store(tmp_path / "hb.sqlite3")
+        entry = store.record_refusal("hear/event", "mach", "mqtt_bridge", "nope",
+                                     b"x" * (HR.REFUSAL_MAX_BODY_CHARS * 3))
+        assert entry.truncated is True
+        assert len(entry.body_text) == HR.REFUSAL_MAX_BODY_CHARS
+
+    def test_refusals_are_not_in_the_cross_store_health_contract(self, tmp_path):
+        """The PG generation must implement health() key for key; refusals are their own surface."""
+        store = self._store(tmp_path / "hb.sqlite3")
+        store.record_refusal("hear/event", "mach", "mqtt_bridge", "nope", b"{}")
+        assert set(store.durable_store.health()) == set(HR.DurableRecordStore().health())
+        snapshot = store.health_snapshot()
+        assert "refused_messages" not in snapshot["durable_store"]
+        assert snapshot["refusals"]["refused_messages"] == 1
+        assert snapshot["refusals"]["last_refusal_at"].endswith("Z")
+
+    def test_the_disabled_store_accepts_the_seam_without_storing_anything(self):
+        store = HR.HeartbeatReceiverStore(FakeRedis(), redis_target="fake:6379")
+        assert store.record_refusal("hear/event", "mach", "mqtt_bridge", "nope", b"{}") is None
+        assert store.durable_store.refusals() == []
+        assert store.durable_store.refusal_health()["enabled"] is False
+
+    def test_a_storage_failure_never_propagates_to_the_caller(self, tmp_path):
+        store = self._store(tmp_path / "hb.sqlite3")
+
+        def boom(*args, **kwargs):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        store.durable_store.record_refusal = boom
+        assert store.record_refusal("hear/event", "mach", "mqtt_bridge", "nope", b"{}") is None
+
+    # -- transactions and connections ---------------------------------------------------------
+
+    def test_every_refusal_path_closes_its_connection(self, tmp_path):
+        """A leaked connection holds a WAL read snapshot open and keeps the file from checkpointing."""
+        store = self._store(tmp_path / "hb.sqlite3")
+        opened = []
+        real_connect = sqlite3.connect
+
+        def tracking_connect(*args, **kwargs):
+            con = real_connect(*args, **kwargs)
+            opened.append(con)
+            return con
+
+        sqlite3.connect = tracking_connect
+        try:
+            store.record_refusal("hear/event", "mach", "mqtt_bridge", "nope", b"{}")
+            store.durable_store.refusals()
+            store.durable_store.prune_refusals(1)
+            store.durable_store.refusal_health()
+        finally:
+            sqlite3.connect = real_connect
+        assert opened
+        for con in opened:
+            with pytest.raises(sqlite3.ProgrammingError):
+                con.execute("SELECT 1")
+
+    def test_the_insert_and_its_confirmation_are_one_transaction(self, tmp_path):
+        """A caller handed a RefusalEntry must be holding a committed row, not a hopeful one."""
+        db = tmp_path / "hb.sqlite3"
+        store = self._store(db)
+        entry = store.record_refusal("hear/event", "mach", "mqtt_bridge", "nope", b"{}")
+        con = sqlite3.connect(db)
+        try:
+            rows = con.execute("SELECT refusal_uid FROM refused_messages").fetchall()
+        finally:
+            con.close()
+        assert [r[0] for r in rows] == [entry.refusal_uid]
+
+    def test_a_failed_refusal_write_leaves_no_partial_row(self, tmp_path):
+        db = tmp_path / "hb.sqlite3"
+        durable = HR.SqliteDurableRecordStore(str(db))
+        real_enforce = durable._enforce_refusal_caps
+
+        def failing(con):
+            real_enforce(con)
+            raise sqlite3.OperationalError("database is locked")
+
+        durable._enforce_refusal_caps = failing
+        with pytest.raises(sqlite3.OperationalError):
+            durable.record_refusal("hear/event", "mach", "mqtt_bridge", "nope", b"{}")
+        assert durable.refusals() == []
+
+    # -- bounded capacity ---------------------------------------------------------------------
+
+    def test_a_flood_of_distinct_bodies_is_bounded_by_row_count_not_age(self, tmp_path):
+        """Any publisher on the shared topic can mint unique rejected bodies; age alone is not a bound."""
+        durable = HR.SqliteDurableRecordStore(str(tmp_path / "hb.sqlite3"), refusal_max_rows=10)
+        for i in range(200):
+            durable.record_refusal("hear/event", "flooder", "mqtt_bridge", "malformed JSON",
+                                   ('{"n":%d}' % i).encode())
+        health = durable.refusal_health()
+        assert health["refused_messages"] == 10
+        assert health["evicted_refusals"] == 190
+
+    def test_the_byte_cap_bounds_the_volume_independently_of_the_row_cap(self, tmp_path):
+        durable = HR.SqliteDurableRecordStore(str(tmp_path / "hb.sqlite3"),
+                                              refusal_max_rows=10_000, refusal_max_bytes=4096)
+        for i in range(50):
+            durable.record_refusal("hear/event", "flooder", "mqtt_bridge", "malformed JSON",
+                                   (('%04d' % i) + "x" * 1000).encode())
+        assert durable.refusal_health()["refused_bytes"] <= 4096
+
+    def test_a_flood_evicts_its_own_history_before_another_devices(self, tmp_path):
+        durable = HR.SqliteDurableRecordStore(str(tmp_path / "hb.sqlite3"), refusal_max_rows=5)
+        durable.record_refusal("hear/event", "mach", "mqtt_bridge", "time must be an object",
+                               b'{"device_id":"mach"}')
+        for i in range(100):
+            durable.record_refusal("hear/event", "flooder", "mqtt_bridge", "malformed JSON",
+                                   ('{"n":%d}' % i).encode())
+        devices = {r.device_id for r in durable.refusals(limit=50)}
+        assert "mach" in devices, "a flooding publisher must not evict another node's evidence"
+
+    def test_bounding_a_refusal_flood_never_touches_accepted_records(self, tmp_path):
+        db = tmp_path / "hb.sqlite3"
+        durable = HR.SqliteDurableRecordStore(str(db), refusal_max_rows=2)
+        store = HR.HeartbeatReceiverStore(FakeRedis(), redis_target="fake:6379",
+                                          durable_store=durable, refusal_rate_limit=0)
+        store.write_event(self._event(idempotency_key="keep-me"))
+        for i in range(50):
+            durable.record_refusal("hear/event", "flooder", "mqtt_bridge", "malformed JSON",
+                                   ('{"n":%d}' % i).encode())
+        con = sqlite3.connect(db)
+        try:
+            assert con.execute("SELECT COUNT(*) FROM durable_records").fetchone()[0] == 1
+            assert con.execute("SELECT COUNT(*) FROM cache_attempts").fetchone()[0] == 1
+            assert con.execute("SELECT COUNT(*) FROM refused_messages").fetchone()[0] == 2
+        finally:
+            con.close()
+
+    def test_a_flood_is_rate_limited_in_memory_before_it_reaches_the_disk(self, tmp_path):
+        """Without this, every hostile message costs one synchronous fsync on the shared volume."""
+        store = self._store(tmp_path / "hb.sqlite3")
+        store.refusal_rate_limit = 5
+        for i in range(100):
+            store.record_refusal("hear/event", "flooder", "mqtt_bridge", "malformed JSON",
+                                 ('{"n":%d}' % i).encode())
+        assert store.durable_store.refusal_health()["refused_messages"] == 5
+        assert store.suppressed_refusals == 95
+
+    def test_one_loud_source_does_not_consume_another_sources_rate_budget(self, tmp_path):
+        store = self._store(tmp_path / "hb.sqlite3")
+        store.refusal_rate_limit = 2
+        for i in range(20):
+            store.record_refusal("hear/event", "flooder", "mqtt_bridge", "malformed JSON",
+                                 ('{"n":%d}' % i).encode())
+        assert store.record_refusal("hear/event", "mach", "mqtt_bridge",
+                                    "time must be an object", b'{"device_id":"mach"}') is not None
+
+    def test_the_rate_window_reopens(self, tmp_path):
+        store = self._store(tmp_path / "hb.sqlite3")
+        store.refusal_rate_limit = 1
+        store.refusal_rate_window_s = 0.05
+        assert store.record_refusal("hear/event", "mach", "mqtt_bridge", "a", b"{}") is not None
+        assert store.record_refusal("hear/event", "mach", "mqtt_bridge", "b", b"{}") is None
+        time.sleep(0.06)
+        assert store.record_refusal("hear/event", "mach", "mqtt_bridge", "c", b"{}") is not None
+
+    # -- retention ----------------------------------------------------------------------------
+
+    def test_pruning_drops_refusals_older_than_the_retention_window(self, tmp_path):
+        db = tmp_path / "hb.sqlite3"
+        durable = HR.SqliteDurableRecordStore(str(db))
+        durable.record_refusal("hear/event", "mach", "mqtt_bridge", "old", b'{"a":1}')
+        durable.record_refusal("hear/event", "mach", "mqtt_bridge", "new", b'{"a":2}')
+        con = sqlite3.connect(db)
+        try:
+            con.execute("UPDATE refused_messages SET received_at='2000-01-01T00:00:00Z' "
+                        "WHERE reason='old'")
+            con.commit()
+        finally:
+            con.close()
+        assert durable.prune_refusals(30) == 1
+        assert [r.reason for r in durable.refusals()] == ["new"]
+
+    def test_pruning_is_disabled_by_a_non_positive_retention(self, tmp_path):
+        durable = HR.SqliteDurableRecordStore(str(tmp_path / "hb.sqlite3"))
+        durable.record_refusal("hear/event", "mach", "mqtt_bridge", "old", b"{}")
+        assert durable.prune_refusals(0) == 0
+        assert len(durable.refusals()) == 1
+
+    def test_the_background_prune_worker_sweeps_refusals_too(self, tmp_path):
+        db = tmp_path / "hb.sqlite3"
+        durable = HR.SqliteDurableRecordStore(str(db))
+        durable.record_refusal("hear/event", "mach", "mqtt_bridge", "old", b"{}")
+        con = sqlite3.connect(db)
+        try:
+            con.execute("UPDATE refused_messages SET received_at='2000-01-01T00:00:00Z'")
+            con.commit()
+        finally:
+            con.close()
+        store = HR.HeartbeatReceiverStore(FakeRedis(), redis_target="fake:6379",
+                                          durable_store=durable)
+        worker = HR.DurablePruneWorker(store, interval_s=0.05, retention_days=30)
+        try:
+            for _ in range(100):
+                time.sleep(0.05)
+                if not durable.refusals():
+                    break
+        finally:
+            worker.stop()
+        assert durable.refusals() == []
+
+    # -- HTTP ---------------------------------------------------------------------------------
+
+    def test_a_refused_post_leaves_a_durable_row(self, tmp_path):
+        durable = HR.SqliteDurableRecordStore(str(tmp_path / "hb.sqlite3"))
+        with running_server(durable_store=durable) as (base_url, _fake, _addr, _server):
+            with pytest.raises(urllib.error.HTTPError) as ei:
+                TestHttpIntegration._post(base_url + "/api/hear/event",
+                                          self._event(event_seq="not-an-int"))
+            assert ei.value.code == 400
+        stored = durable.refusals()
+        assert len(stored) == 1
+        assert stored[0].telemetry_path == "hear/event"
+        assert stored[0].device_id == "nyquist"
+        assert stored[0].source == "lan_http"
+
+    def test_an_unauthenticated_post_is_not_allowed_to_write_to_the_volume(self, tmp_path):
+        durable = HR.SqliteDurableRecordStore(str(tmp_path / "hb.sqlite3"))
+        with running_server(auth_token="secret", durable_store=durable) as (base_url, *_):
+            with pytest.raises(urllib.error.HTTPError) as ei:
+                TestHttpIntegration._post(base_url + "/api/hear/event", self._event())
+            assert ei.value.code == 401
+        assert durable.refusals() == []
+
+    def test_an_unparseable_body_is_quarantined_as_received(self, tmp_path):
+        durable = HR.SqliteDurableRecordStore(str(tmp_path / "hb.sqlite3"))
+        with running_server(durable_store=durable) as (base_url, _fake, _addr, _server):
+            req = urllib.request.Request(base_url + "/api/hear/event", data=b"{not json",
+                                         headers={"Content-Type": "application/json"},
+                                         method="POST")
+            with pytest.raises(urllib.error.HTTPError):
+                urllib.request.urlopen(req, timeout=2)
+        stored = durable.refusals()
+        assert [r.body_text for r in stored] == ["{not json"]
+        assert stored[0].device_id == "unknown"
+
+    def test_healthz_reports_the_quarantine(self, tmp_path):
+        durable = HR.SqliteDurableRecordStore(str(tmp_path / "hb.sqlite3"))
+        with running_server(durable_store=durable) as (base_url, _fake, _addr, _server):
+            with pytest.raises(urllib.error.HTTPError):
+                TestHttpIntegration._post(base_url + "/api/hear/event",
+                                          self._event(event_seq="not-an-int"))
+            with urllib.request.urlopen(base_url + "/healthz", timeout=2) as resp:
+                body = json.loads(resp.read())
+        assert body["refusals"]["refused_messages"] == 1
+        assert "refused_messages" not in body["durable_store"]
+
+    def test_a_legacy_event_posted_over_http_is_accepted_and_not_quarantined(self, tmp_path):
+        durable = HR.SqliteDurableRecordStore(str(tmp_path / "hb.sqlite3"))
+        legacy = TestLegacyEventTimeBlock._legacy_event()
+        with running_server(durable_store=durable) as (base_url, fake, _addr, _server):
+            with TestHttpIntegration._post(base_url + "/api/hear/event", legacy) as resp:
+                assert resp.status == 204
+        assert durable.refusals() == []
+        assert json.loads(fake.values["dama:hear:event:nyquist"])["event_type"] == "clip_written"
