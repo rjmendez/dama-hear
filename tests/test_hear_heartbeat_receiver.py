@@ -2,6 +2,7 @@
 import json
 import os
 import socket
+import sqlite3
 import sys
 import threading
 import urllib.error
@@ -15,38 +16,61 @@ from tools import hear_heartbeat_receiver as HR  # noqa: E402
 
 
 class FakeRedis:
-    def __init__(self):
+    def __init__(self, failures_before_success: int = 0):
         self.values = {}
         self.ttls = {}
         self.sets = {}
         self.streams = {}
+        self.failures_before_success = failures_before_success
+        self.execute_calls = 0
+        self._ops = []
 
     def pipeline(self, transaction=False):
         assert transaction is False
+        self._ops = []
         return self
 
     def setex(self, key, ttl, value):
-        self.values[key] = value
-        self.ttls[key] = ttl
+        self._ops.append(("setex", key, ttl, value))
         return self
 
     def sadd(self, key, *members):
-        self.sets.setdefault(key, set()).update(members)
+        self._ops.append(("sadd", key, members))
         return self
 
     def set(self, key, value):
-        self.values[key] = value
+        self._ops.append(("set", key, value))
         return self
 
     def xadd(self, key, fields, maxlen=None, approximate=True):
-        stream = self.streams.setdefault(key, [])
-        stream.append(dict(fields))
-        if maxlen is not None and len(stream) > maxlen:
-            del stream[:-maxlen]
-        assert approximate is True
-        return str(len(stream))
+        self._ops.append(("xadd", key, dict(fields), maxlen, approximate))
+        return str(len(self.streams.get(key, [])) + 1)
 
     def execute(self):
+        self.execute_calls += 1
+        ops, self._ops = self._ops, []
+        if self.failures_before_success > 0:
+            self.failures_before_success -= 1
+            raise RuntimeError("simulated redis outage")
+        for op in ops:
+            kind = op[0]
+            if kind == "setex":
+                _, key, ttl, value = op
+                self.values[key] = value
+                self.ttls[key] = ttl
+            elif kind == "sadd":
+                _, key, members = op
+                self.sets.setdefault(key, set()).update(members)
+            elif kind == "set":
+                _, key, value = op
+                self.values[key] = value
+            elif kind == "xadd":
+                _, key, fields, maxlen, approximate = op
+                stream = self.streams.setdefault(key, [])
+                stream.append(fields)
+                if maxlen is not None and len(stream) > maxlen:
+                    del stream[:-maxlen]
+                assert approximate is True
         return []
 
 
@@ -137,9 +161,14 @@ class TestValidation:
 
 
 @contextmanager
-def running_server(auth_token=None, socket_timeout_s=0.2):
+def running_server(auth_token=None, socket_timeout_s=0.2, durable_store=None):
     fake = FakeRedis()
-    store = HR.HeartbeatReceiverStore(fake, heartbeat_ttl_s=30, redis_target="fake:6379")
+    store = HR.HeartbeatReceiverStore(
+        fake,
+        heartbeat_ttl_s=30,
+        redis_target="fake:6379",
+        durable_store=durable_store,
+    )
     server = HR.create_server(
         "127.0.0.1", 0, store, max_body_bytes=2048,
         auth_token=auth_token, socket_timeout_s=socket_timeout_s,
@@ -215,6 +244,7 @@ class TestHttpIntegration(TestValidation):
                 body = json.loads(resp.read().decode("utf-8"))
         assert body["service"] == "hear-heartbeat-receiver"
         assert body["redis_target"] == "fake:6379"
+        assert body["durable_store"]["backend"] == "none"
 
     def test_slow_client_times_out_instead_of_holding_a_thread_forever(self):
         with running_server(socket_timeout_s=0.2) as (_base_url, _fake, addr, server):
@@ -250,6 +280,137 @@ class TestHttpIntegration(TestValidation):
         assert _parse_port("invalid", 5051) == 5051
 
 
+class TestDurableSqlite(TestValidation):
+    @staticmethod
+    def _counts(db_path):
+        with sqlite3.connect(db_path) as con:
+            records = con.execute("SELECT COUNT(*) FROM durable_records").fetchone()[0]
+            return {
+                "records": records,
+                "successes": con.execute(
+                    "SELECT COUNT(*) FROM cache_attempts WHERE outcome='succeeded'"
+                ).fetchone()[0],
+                "failures": con.execute(
+                    "SELECT COUNT(*) FROM cache_attempts WHERE outcome='failed'"
+                ).fetchone()[0],
+                "payload": con.execute(
+                    "SELECT payload_json FROM durable_records ORDER BY id LIMIT 1"
+                ).fetchone()[0] if records else None,
+            }
+
+    def test_sqlite_durable_store_commits_before_cache_and_tracks_success(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        store = HR.HeartbeatReceiverStore(
+            FakeRedis(),
+            heartbeat_ttl_s=30,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        record = store.write_heartbeat(self._heartbeat())
+        counts = self._counts(db)
+        assert record["device_id"] == "nyquist"
+        assert counts["records"] == 1
+        assert counts["successes"] == 1
+        assert json.loads(counts["payload"])["received_at"] == record["received_at"]
+        assert store.health_snapshot()["durable_store"]["pending_records"] == 0
+
+    def test_duplicate_retry_is_idempotent_and_does_not_duplicate_stream_entries(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis()
+        store = HR.HeartbeatReceiverStore(
+            fake,
+            heartbeat_ttl_s=30,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        store.write_event(self._event())
+        store.write_event(self._event())
+        counts = self._counts(db)
+        assert counts["records"] == 1
+        assert counts["successes"] == 1
+        assert fake.execute_calls == 1
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+
+    def test_cache_failure_leaves_a_pending_record_and_retry_repairs_it(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis(failures_before_success=1)
+        store = HR.HeartbeatReceiverStore(
+            fake,
+            heartbeat_ttl_s=30,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        with pytest.raises(RuntimeError, match="simulated redis outage"):
+            store.write_event(self._event())
+        counts = self._counts(db)
+        assert counts["records"] == 1
+        assert counts["successes"] == 0
+        assert counts["failures"] == 1
+        assert fake.streams == {}
+
+        store.write_event(self._event())
+        counts = self._counts(db)
+        assert counts["records"] == 1
+        assert counts["successes"] == 1
+        assert counts["failures"] == 1
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+
+    def test_replay_pending_repairs_a_record_after_a_crash_window(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        with pytest.raises(RuntimeError, match="simulated redis outage"):
+            HR.HeartbeatReceiverStore(
+                FakeRedis(failures_before_success=1),
+                heartbeat_ttl_s=30,
+                redis_target="fake:6379",
+                durable_store=HR.make_durable_store("sqlite", str(db)),
+            ).write_heartbeat(self._heartbeat())
+
+        recovered_fake = FakeRedis()
+        recovered = HR.HeartbeatReceiverStore(
+            recovered_fake,
+            heartbeat_ttl_s=30,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        summary = recovered.replay_pending(limit=10)
+        counts = self._counts(db)
+        assert summary == {
+            "backend": "sqlite",
+            "attempted": 1,
+            "synced": 1,
+            "failed": 0,
+            "remaining_pending": 0,
+        }
+        assert counts["records"] == 1
+        assert counts["successes"] == 1
+        assert json.loads(recovered_fake.values["dama:hear:nyquist"])["device_id"] == "nyquist"
+
+    def test_bad_payload_does_not_append_any_durable_rows(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        with running_server(durable_store=durable) as (base_url, _fake, _addr, _server):
+            with pytest.raises(urllib.error.HTTPError) as ei:
+                TestHttpIntegration._post(
+                    base_url + "/api/hear/heartbeat",
+                    self._heartbeat(device_id="bad/id"),
+                )
+            assert ei.value.code == 400
+        counts = self._counts(db)
+        assert counts["records"] == 0
+        assert counts["successes"] == 0
+        assert counts["failures"] == 0
+
+    def test_healthz_reports_sqlite_outbox_status(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        with running_server(durable_store=durable) as (base_url, _fake, _addr, _server):
+            with urllib.request.urlopen(base_url + "/healthz", timeout=2) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        assert body["durable_store"]["backend"] == "sqlite"
+        assert body["durable_store"]["path"].endswith("heartbeats.sqlite3")
+        assert body["durable_store"]["pending_records"] == 0
+
+
 class TestStartupConfig:
     @pytest.mark.parametrize("token", [None, "", "   "])
     def test_configured_auth_token_rejects_missing_or_blank_values(self, token):
@@ -258,3 +419,7 @@ class TestStartupConfig:
 
     def test_configured_auth_token_trims_whitespace(self):
         assert HR._configured_auth_token("  secret  ") == "secret"
+
+    def test_make_durable_store_rejects_postgres_until_it_is_implemented(self):
+        with pytest.raises(ValueError, match="postgres"):
+            HR.make_durable_store("postgres", "postgresql://db.example/dama_hear")

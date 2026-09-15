@@ -11,14 +11,18 @@ def _docs():
     return list(yaml.safe_load_all(MANIFEST.read_text()))
 
 
-def test_it_declares_one_deployment_and_one_service():
+def _doc(kind):
+    return next(d for d in _docs() if d["kind"] == kind)
+
+
+def test_it_declares_one_pvc_one_deployment_and_one_service():
     docs = _docs()
     kinds = [d["kind"] for d in docs]
-    assert kinds == ["Deployment", "Service"]
+    assert kinds == ["PersistentVolumeClaim", "Deployment", "Service"]
 
 
-def test_the_receiver_runs_the_new_entrypoint_and_mounts_its_bundle():
-    dep = _docs()[0]
+def test_the_receiver_runs_the_new_entrypoint_and_mounts_its_bundle_and_state():
+    dep = _doc("Deployment")
     spec = dep["spec"]["template"]["spec"]
     assert spec["hostNetwork"] is True
     assert spec["dnsPolicy"] == "ClusterFirstWithHostNet"
@@ -26,12 +30,13 @@ def test_the_receiver_runs_the_new_entrypoint_and_mounts_its_bundle():
     assert c["name"] == "receiver"
     assert c["image"] == "python:3.13-slim"
     assert "hear_heartbeat_receiver.py --port 5051" in c["args"][0]
-    mounts = {m["subPath"]: m["mountPath"] for m in c["volumeMounts"] if m["name"] == "code"}
-    assert mounts == {"tools_hear_heartbeat_receiver.py": "/app/tools/hear_heartbeat_receiver.py"}
+    mounts = {(m["name"], m.get("subPath", m["mountPath"])): m["mountPath"] for m in c["volumeMounts"]}
+    assert mounts[("code", "tools_hear_heartbeat_receiver.py")] == "/app/tools/hear_heartbeat_receiver.py"
+    assert mounts[("state", "/state")] == "/state"
 
 
 def test_it_exposes_the_http_port_on_the_host_and_health_probe():
-    dep, svc = _docs()
+    dep, svc = _doc("Deployment"), _doc("Service")
     c = dep["spec"]["template"]["spec"]["containers"][0]
     assert c["ports"] == [{"name": "http", "containerPort": 5051, "hostPort": 5051}]
     for probe_name in ("livenessProbe", "readinessProbe"):
@@ -42,13 +47,17 @@ def test_it_exposes_the_http_port_on_the_host_and_health_probe():
     assert ports == [{"name": "http", "port": 5051, "targetPort": "http"}]
 
 
-def test_it_declares_the_expected_environment_and_required_token_secret():
-    dep = _docs()[0]
-    env = {item["name"]: item for item in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
+def test_it_declares_the_expected_environment_durable_outbox_and_required_token_secret():
+    dep = _doc("Deployment")
+    spec = dep["spec"]["template"]["spec"]
+    env = {item["name"]: item for item in spec["containers"][0]["env"]}
     assert env["HEAR_HEARTBEAT_TTL_S"]["value"] == "30"
     assert env["HEAR_HEARTBEAT_SOCKET_TIMEOUT_S"]["value"] == "0.5"
     assert env["REDIS_HOST"]["value"] == "audit-redis.infra.svc.cluster.local"
     assert env["REDIS_PORT"]["value"] == "6379"
+    assert env["HEAR_DURABLE_STORE"]["value"] == "sqlite"
+    assert env["HEAR_DURABLE_DB"]["value"] == "/state/heartbeat-receiver.sqlite3"
+    assert env["HEAR_DURABLE_REPLAY_LIMIT"]["value"] == "256"
     assert env["REDIS_PASS"]["valueFrom"]["secretKeyRef"] == {
         "name": "dama-redis-secret",
         "key": "REDIS_PASS",
@@ -58,3 +67,13 @@ def test_it_declares_the_expected_environment_and_required_token_secret():
         "name": "hear-heartbeat-token",
         "key": "token",
     }
+    volumes = {v["name"]: v for v in spec["volumes"]}
+    assert volumes["state"]["persistentVolumeClaim"] == {"claimName": "hear-heartbeat-state"}
+
+
+def test_it_declares_a_dedicated_state_pvc_for_rollback_safe_sqlite_storage():
+    pvc = _doc("PersistentVolumeClaim")
+    assert pvc["metadata"]["name"] == "hear-heartbeat-state"
+    assert pvc["metadata"]["namespace"] == "dama"
+    assert pvc["spec"]["accessModes"] == ["ReadWriteOnce"]
+    assert pvc["spec"]["resources"]["requests"]["storage"] == "5Gi"

@@ -228,7 +228,7 @@ def test_the_receiver_manifest_still_exposes_its_own_port_for_a_lan_only_build()
     # its manifest and firmware's non-default LAN path must agree on the port even though the
     # compiled-in default no longer points here.
     docs = list(yaml.safe_load_all(MANIFEST.read_text()))
-    dep = docs[0]
+    dep = next(d for d in docs if d["kind"] == "Deployment")
     ports = dep["spec"]["template"]["spec"]["containers"][0]["ports"]
     assert ports[0]["hostPort"] == 5051
     assert '"/api/hear/heartbeat"' in CODE

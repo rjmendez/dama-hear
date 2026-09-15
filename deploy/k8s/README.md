@@ -1,4 +1,4 @@
-# hear-drain / hear-score / hear-tag — pooled sketch ingestion, scoring and clip tagging
+# hear-drain / hear-score / hear-tag / hear-heartbeat / hear-mqtt-bridge — pooled ingest and live telemetry
 
 Runs in k3s (`namespace: dama`), **not** on a workstation: the pool has to keep being fed while
 nobody is logged in, and a laptop is not that.
@@ -25,6 +25,14 @@ kubectl -n dama create job --from=cronjob/hear-score hear-score-manual-1   # the
 #           --max-silence-frac set from that measured distribution.
 python3 deploy/k8s/gen_configmap.py hear-tag-code > deploy/k8s/hear-tag-code.yaml
 kubectl apply -f deploy/k8s/hear-tag-code.yaml -f deploy/k8s/hear-tag.yaml
+
+# hear-heartbeat
+python3 deploy/k8s/gen_configmap.py hear-heartbeat-code > deploy/k8s/hear-heartbeat-code.yaml
+kubectl apply -f deploy/k8s/hear-heartbeat-code.yaml -f deploy/k8s/hear-heartbeat.yaml
+
+# hear-mqtt-bridge
+python3 deploy/k8s/gen_configmap.py hear-mqtt-bridge-code > deploy/k8s/hear-mqtt-bridge-code.yaml
+kubectl apply -f deploy/k8s/hear-mqtt-bridge-code.yaml -f deploy/k8s/hear-mqtt-bridge.yaml
 
 # hear-tdoa  ⚠️--server-side ON THE CODE BUNDLE, AND IT IS NOT A STYLE PREFERENCE.
 #            A plain apply is REJECTED by the API server, not merely discouraged:
@@ -57,6 +65,10 @@ being remembered here.
 | `hear-score-check` CronJob | hourly: fails if scoring is not flowing |
 | `hear-tag` CronJob | **suspended.** 2x/hour: YAMNet over the collected clips, counting every refusal by reason. Touches the PVC and never a node — the ESP32 serves one client at a time |
 | `hear-tag-check` CronJob | **suspended.** hourly: fails if tagging is not flowing, or if the pinned model sha256 stopped verifying |
+| `hear-heartbeat-state` PVC | the phase-0 durable heartbeat/event SQLite outbox (`/state/*.sqlite3`) for the direct HTTP receiver |
+| `hear-heartbeat` Deployment | token-gated HTTP receiver: durable append, then Redis cache update; rollback is explicit via `HEAR_DURABLE_STORE=none` + removing the state PVC mount |
+| `hear-mqtt-bridge-state` PVC | the phase-0 durable heartbeat/event SQLite outbox for the MQTT/AWS relay path |
+| `hear-mqtt-bridge` Deployment | MQTT relay consumer: durable append, then Redis cache update; same Redis contract, same rollback switch |
 
 The PVC is declared **once**, in `hear-drain.yaml`. `hear-score.yaml` and `hear-tag.yaml` mount
 it and declare no storage of their own — two manifests claiming one PVC is how they come to
@@ -189,3 +201,16 @@ and the solvers read the pool with no adapter.
   `SKETCH_CORPUS_OUT_DIR`) and the live `hear-drain-check` captures `rc=$?`; the checked-in file
   has neither. Applying it would delete the phone leg and revert the staleness gate to one that
   always exits 0. Apply hear-score's two files by name and leave hear-drain's alone.
+
+## Phase-0 durable heartbeat/event outbox
+
+`tools/hear_heartbeat_receiver.py` now has a pluggable durability boundary. The manifests above
+set `HEAR_DURABLE_STORE=sqlite` and mount a dedicated RWO PVC at `/state`, so each accepted
+heartbeat/event is committed to SQLite WAL storage before Redis is touched. Redis remains the
+compatibility cache for current consumers, and startup replays any rows whose cache publish never
+recorded a success.
+
+Rollback is explicit: set `HEAR_DURABLE_STORE=none` and remove the `/state` PVC mount to restore
+the previous Redis-only behavior. PostgreSQL is the next step once a shared dependency and DDL
+ownership are ready: keep the same `DurableRecordStore` seam, move `durable_records` and
+`cache_attempts` there, and leave the Redis contract unchanged during the cut-over.
