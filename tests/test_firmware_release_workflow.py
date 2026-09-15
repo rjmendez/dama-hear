@@ -29,3 +29,7 @@ def test_release_workflow_publishes_per_board_class_assets():
         assert f'dist/{stem}-$TAG-partitions.bin' in yml
         assert f'dist/{stem}-$TAG-merged.bin' in yml
         assert f'dist/{stem}-$TAG.elf' in yml
+    assert "release-manifest.json" in yml
+    assert "release-manifest.schema.json" in yml
+    assert "release_manifest.py generate" in yml
+    assert "release_manifest.py verify" in yml

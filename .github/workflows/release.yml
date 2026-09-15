@@ -62,13 +62,23 @@ jobs:
               "esp32_core": "3.3.11",
               "arduino_cli": "1.5.1",
               "variants": [
-                  {"board_class": "xiao-s3-pps", "build_flags": ["-DHEAR_ALLOW_NO_WIFI"]},
+                  {"board_class": "xiao-s3-pps",
+                   "release_stem": "hear_node-xiao-s3-pps",
+                   "build_flags": ["-DHEAR_ALLOW_NO_WIFI"]},
                   {"board_class": "esp32s3-i2s-gps",
+                   "release_stem": "hear_node-esp32s3-i2s-gps",
                    "build_flags": ["-DHEAR_ALLOW_NO_WIFI", "-DHEAR_BOARD_ESP32S3_I2S_GPS"]},
               ],
               "credentials": "none compiled in; read from the node's NVS (enroll.py)",
           }, open("dist/build-info.json", "w"), indent=2)
           PY
+          python3 firmware/hear_node/release_manifest.py generate \
+            --dist dist \
+            --build-info dist/build-info.json
+          python3 firmware/hear_node/release_manifest.py verify \
+            --dist dist \
+            --tag "$TAG" \
+            --source-root .
           (cd dist && sha256sum * > SHA256SUMS)
           cat > notes.md <<EOF
           Firmware for \`firmware/hear_node\` at \`$GITHUB_SHA\`. \`/status\` reports it as \`fw: $TAG\`.
@@ -90,7 +100,13 @@ jobs:
           | \`hear_node-xiao-s3-pps-$TAG.*\` | Seeed XIAO ESP32-S3 Sense release set |
           | \`hear_node-esp32s3-i2s-gps-$TAG.*\` | ESP32-S3 + I2S mic + PMTK GPS release set |
           | \`build-info.json\` | toolchain and flags |
+          | \`release-manifest.json\` | immutable offline-verifiable release manifest |
+          | \`release-manifest.schema.json\` | manifest JSON schema |
           | \`SHA256SUMS\` | checksums of all of the above |
+
+          Verify a downloaded release offline:
+
+              python3 firmware/hear_node/release_manifest.py verify --dist dist --tag $TAG
           EOF
 
       - name: publish

@@ -139,11 +139,14 @@ scanned, and the run fails over it, naming the commit and path but never its con
 passing on incomplete coverage.
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the `hear_node` images
-for each supported board class, their `.elf`, `build-info.json` and `SHA256SUMS` as a GitHub
-release. This repo is public, so the images carry no Wi-Fi credentials and no node name. Each
-node keeps its own in NVS, written once over USB by `firmware/hear_node/enroll.py`, and
+for each supported board class, their `.elf`, `build-info.json`, `release-manifest.json`,
+`release-manifest.schema.json` and `SHA256SUMS` as a GitHub release. This repo is public, so the
+images carry no Wi-Fi credentials and no node name. Each node keeps its own in NVS, written once
+over USB by `firmware/hear_node/enroll.py`, and
 `firmware/hear_node/flash.py <node> <ip> --release <tag>` refuses unless it can match the node's
-live `/status class` to the right release asset. See `firmware/hear_node/README.md`.
+live `/status class` to the right release asset. Downloaded release directories can be checked
+offline with `python3 firmware/hear_node/release_manifest.py verify --dist <dir> --tag <tag>`.
+See `firmware/hear_node/README.md`.
 
 ## Licence
 

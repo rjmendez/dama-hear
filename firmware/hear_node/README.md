@@ -30,6 +30,17 @@ release asset whose name includes that class (`hear_node-xiao-s3-pps-<tag>.bin` 
 
     python3 firmware/hear_node/enroll.py <node> /dev/ttyACM0 --class <board-class> --release <tag>
 
+Every tagged release also ships `release-manifest.json` and `release-manifest.schema.json`. They
+bind the release to the source commit, dirty state, board/capture profile, build inputs, generated
+headers and every published artefact hash, and `flash.py` / `enroll.py` verify them when present.
+To check a downloaded release directory offline before you touch a node:
+
+    python3 firmware/hear_node/release_manifest.py verify --dist dist --tag <tag>
+
+Roll forward and back with the same command shape: `flash.py <node> <ip> --release <tag>`. The
+images are immutable and NVS keeps the node name and Wi-Fi outside both OTA slots, so a rollback
+to an older clean tag does not require re-enrollment; it only swaps the app/boot artefacts.
+
 `flash.py <node> <ip>` without `--release` still builds this tree with `secrets.h` compiled in.
 That build copies its credentials into NVS at boot, which is how a node flashed before enrollment
 existed becomes enrolled without the cable. A board with neither starts its own AP

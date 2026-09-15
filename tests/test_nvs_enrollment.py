@@ -4,6 +4,8 @@ The two ways in are enroll.py over USB and any build with compiled-in credential
 them into NVS at boot. The firmware is parsed with comments stripped, so this file's prose cannot
 satisfy it.
 """
+import hashlib
+import json
 import pathlib
 import re
 import sys
@@ -16,6 +18,7 @@ sys.path.insert(0, str(ROOT / "firmware" / "hear_node"))
 import board_profiles  # noqa: E402
 import flash  # noqa: E402
 import enroll  # noqa: E402
+import release_manifest  # noqa: E402
 
 
 def _code(p=INO):
@@ -128,6 +131,28 @@ def test_the_argument_check_would_catch_a_leak():
     assert re.search(r"\b(?:psk|ssid)\b", args)
 
 
+def _release_manifest_text(tag, board_class, assets, dirty=False):
+    return json.dumps({
+        "schema_version": release_manifest.SCHEMA_VERSION,
+        "manifest_type": release_manifest.MANIFEST_TYPE,
+        "tag": tag,
+        "source": {
+            "commit": "abc123",
+            "describe": tag,
+            "dirty": dirty,
+            "verifiable": not dirty,
+            "refusals": ["dirty tree"] if dirty else [],
+        },
+        "variants": [{
+            "board_class": board_class,
+            "artifacts": [{
+                "name": name,
+                "sha256": hashlib.sha256(data).hexdigest(),
+            } for name, data in assets.items()],
+        }],
+    })
+
+
 class TestReleaseRefusal:
     GOOD = {"node": "nyquist", "class": "xiao-s3-pps",
             "prov": {"src": "compiled", "nets": 2, "nvs": True, "loaded": True}}
@@ -211,17 +236,73 @@ class TestBoardClassSelection:
 
     def test_enroll_release_files_download_the_requested_board_class(self, monkeypatch, tmp_path):
         fetched = []
+        payloads = {
+            "hear_node-esp32s3-i2s-gps-v0.1.3.bin": b"app",
+            "hear_node-esp32s3-i2s-gps-v0.1.3-bootloader.bin": b"boot",
+            "hear_node-esp32s3-i2s-gps-v0.1.3-partitions.bin": b"parts",
+        }
+        manifest = _release_manifest_text("v0.1.3", "esp32s3-i2s-gps", payloads)
 
         def fake_fetch(url, timeout=60):
-            fetched.append(url.rsplit("/", 1)[-1])
-            return b"deadbeef  *file\n" if url.endswith("SHA256SUMS") else url.encode()
+            name = url.rsplit("/", 1)[-1]
+            fetched.append(name)
+            if name == release_manifest.MANIFEST_NAME:
+                return manifest.encode()
+            return payloads[name]
 
         monkeypatch.setattr(enroll, "fetch", fake_fetch)
-        monkeypatch.setattr(enroll, "check_sums", lambda *args: None)
         enroll.release_files("v0.1.3", str(tmp_path), "esp32s3-i2s-gps")
         assert fetched == [
+            release_manifest.MANIFEST_NAME,
+            "hear_node-esp32s3-i2s-gps-v0.1.3.bin",
+            "hear_node-esp32s3-i2s-gps-v0.1.3-bootloader.bin",
+            "hear_node-esp32s3-i2s-gps-v0.1.3-partitions.bin",
+        ]
+
+    def test_enroll_release_files_falls_back_to_sha256sums_for_legacy_releases(self, monkeypatch, tmp_path):
+        fetched = []
+
+        def fake_fetch(url, timeout=60):
+            name = url.rsplit("/", 1)[-1]
+            fetched.append(name)
+            if name == release_manifest.MANIFEST_NAME:
+                raise OSError("404")
+            return b"deadbeef  *file\n" if name == "SHA256SUMS" else name.encode()
+
+        checked = []
+        monkeypatch.setattr(enroll, "fetch", fake_fetch)
+        monkeypatch.setattr(enroll, "check_sums", lambda sums, name, data: checked.append((name, data)))
+        enroll.release_files("v0.1.3", str(tmp_path), "esp32s3-i2s-gps")
+        assert fetched == [
+            release_manifest.MANIFEST_NAME,
             "SHA256SUMS",
             "hear_node-esp32s3-i2s-gps-v0.1.3.bin",
             "hear_node-esp32s3-i2s-gps-v0.1.3-bootloader.bin",
             "hear_node-esp32s3-i2s-gps-v0.1.3-partitions.bin",
         ]
+        assert [name for name, _ in checked] == [
+            "hear_node-esp32s3-i2s-gps-v0.1.3.bin",
+            "hear_node-esp32s3-i2s-gps-v0.1.3-bootloader.bin",
+            "hear_node-esp32s3-i2s-gps-v0.1.3-partitions.bin",
+        ]
+
+    def test_flash_release_image_uses_the_manifest_when_present(self, monkeypatch, tmp_path):
+        name = "hear_node-esp32s3-i2s-gps-v0.1.3.bin"
+        payload = b"app"
+        manifest = _release_manifest_text("v0.1.3", "esp32s3-i2s-gps", {name: payload})
+        fetched = []
+
+        def fake_fetch(url, timeout=60):
+            tail = url.rsplit("/", 1)[-1]
+            fetched.append(tail)
+            if tail == release_manifest.MANIFEST_NAME:
+                return manifest.encode()
+            if tail == name:
+                return payload
+            raise AssertionError(tail)
+
+        monkeypatch.setattr(flash, "REPO", str(tmp_path))
+        monkeypatch.setattr(enroll, "fetch", fake_fetch)
+        path = flash.release_image("v0.1.3", "esp32s3-i2s-gps")
+        assert pathlib.Path(path).read_bytes() == payload
+        assert fetched == [release_manifest.MANIFEST_NAME, name]
