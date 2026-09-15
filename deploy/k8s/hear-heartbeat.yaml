@@ -26,6 +26,11 @@ metadata:
       Redis compatibility keys.
 spec:
   replicas: 1
+  # Recreate, not RollingUpdate: this pod holds hostPort 5051 AND a ReadWriteOnce state PVC, so a
+  # surge pod can never become ready alongside the outgoing one -- it stays Pending forever and
+  # the rollout hangs. Tear the old pod down first.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: hear-heartbeat
