@@ -195,34 +195,40 @@ static void selftest_mic_probe() {
 called immediately after `i2s.begin()` at `:4893` (PDM) and `:4910` (I2S). The result is latched in
 `selftest_mic` for the whole boot and is never re-probed.
 
-**Fix (narrow, in-place, no change to `mic_diagnostics.h` classification):**
-1. Add `#define MIC_SETTLE_MS 300` next to the existing `#define SELFTEST_SETTLE_MS 1500` — the
-   GPS path already establishes this pattern, so the settle idea is not new to this firmware.
-2. Before the measured read, discard whole `ABLOCK` reads for `MIC_SETTLE_MS`, calling
-   `boot_wdt_service()` each iteration (each read is 16 ms, so ~19 iterations; the stack buffer
-   stays one `ABLOCK`, no new allocation).
-3. Re-probe up to `MIC_PROBE_ATTEMPTS = 3` while the classification is `capture-failure` or
-   `stuck`, with one `ABLOCK` discard between attempts. Latch the last result.
-4. Publish the evidence in `/status`: `selftest.mic_settle_ms` and `selftest.mic_attempts`, so a
-   future reader can tell a settled probe from an unsettled one.
-5. Budget assertion: `MIC_SETTLE_MS` + attempts must stay well inside the existing
-   `boot_wdt_arm(15000)` window (worst case ≈ 0.4 s — two orders of margin).
+**Fix as shipped (bounded settle window, classification thresholds unchanged):**
+1. `mic_probe_settle()` in `firmware/hear_node/mic_diagnostics.h` reads one `ABLOCK` block,
+   classifies it, and **accepts the first healthy verdict** (`quiet` or `normal`). Anything else --
+   `capture-failure`, `stuck`, `floating`, `saturated` -- is a shape a not-yet-awake part produces,
+   so it is retried after `MIC_PROBE_RETRY_GAP_MS` (20 ms, ~one DMA block) until the budget or
+   `MIC_PROBE_MAX_ATTEMPTS` (16) runs out. The **last** classification is what is latched, so an
+   absent, stuck or floating microphone is reported exactly as before.
+2. The budget follows the reset reason, not a constant: `MIC_PROBE_SETTLE_COLD_MS` (750 ms) on a
+   power-on/brownout/external reset where the part comes up unpowered, `MIC_PROBE_SETTLE_WARM_MS`
+   (250 ms) after a software/OTA restart where the microphone kept its supply and answers the first
+   read. A healthy node therefore pays **nothing**: one read, no wait, on either path.
+3. The wait services the boot watchdog (`boot_wait_ms()`), and the worst case (750 ms) sits two
+   orders of magnitude inside the existing `boot_wdt_arm(15000)` window. Capture timing is
+   untouched: the probe only drains stale DMA before `loop()` starts counting samples.
+4. The evidence is published: `selftest.mic_stats.attempts` and `selftest.mic_stats.settle_ms` in
+   `/status`, plus a `selftest mic_state=... attempts=... settle_ms=...` boot log line, so a
+   settled probe is distinguishable from an unsettled one. `silent` after one read and `silent`
+   after the whole window are different claims and now read differently.
 
-**Tests:**
-- `tests/test_firmware_mic_diagnostics.py` — extend the existing source-contract test
-  (`test_status_contract_carries_legacy_and_explicit_mic_fields`) with:
-  - the settle loop appears **between** `i2s.begin(` and the `mic_diag_classify` call in both the
-    PDM and I2S branches;
-  - `boot_wdt_service()` is called inside the settle loop;
-  - `"mic_settle_ms"` and `"mic_attempts"` appear in the `/status` format string;
-  - a numeric assertion that `MIC_SETTLE_MS * (MIC_PROBE_ATTEMPTS+1) < 15000` (the armed WDT).
-- New pure-C unit (same `ctypes` harness already in that file) for a retry predicate
-  `mic_diag_should_retry(diag)`: true for `capture-failure`/`stuck`, false for
-  `normal`/`quiet`/`floating`/`saturated`.
-- `tests/test_nvs_enrollment.py:92` already asserts `boot_wdt_disarm()` comes after
-  `selftest_mic_probe();` — keep that ordering assertion passing.
+**Tests** (`tests/test_firmware_mic_settle.py`, pure C through the existing `ctypes` harness --
+no hardware, a scripted fake microphone and a fake clock):
+- cold all-zero block then real audio settles `normal` (ageev's boot);
+- cold repeated-sample blocks then real audio settles `normal` (kasami's boot);
+- a short/empty first read is retried rather than latched;
+- a microphone that never wakes is still `capture-failure/all_zero_samples`, one that never returns
+  samples is still `capture-failure/no_samples`, a stuck one is still `stuck`, a floating pin is
+  still `floating`;
+- the window is bounded in wall time and attempts, a zero budget is the old single-read behaviour,
+  and a warm budget is shorter than a cold one;
+- the firmware still wires the probe through the settle window and reports the new fields.
+`tests/test_firmware_mic_diagnostics.py` keeps the normal/quiet/marginal classification assertions
+unchanged, and `tests/test_nvs_enrollment.py:92`'s `boot_wdt_disarm()` ordering still holds.
 
-Run: `python3 -m pytest tests/test_firmware_mic_diagnostics.py tests/test_nvs_enrollment.py -q`
+Run: `python3 -m pytest tests/test_firmware_mic_settle.py tests/test_firmware_mic_diagnostics.py tests/test_nvs_enrollment.py -q`
 
 **Staged rollout, in this order:**
 

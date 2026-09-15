@@ -33,10 +33,15 @@ typedef struct {
   uint32_t unique;
   uint32_t sat_pct;
   uint32_t rail_hits;
+  // How the verdict was reached, not what it is: `attempts` counts probe reads and `settle_ms` is
+  // the milliseconds from the first read to the accepted one. A healthy mic on a warm restart
+  // reports 1 / 0; a cold ICS-43434 that needed the settle window reports >1 and the time it took.
+  uint32_t attempts;
+  uint32_t settle_ms;
 } mic_diag_t;
 
 #define MIC_DIAG_INIT \
-  { MIC_DIAG_CAPTURE_FAILURE, "capture-failure", "silent", "not_run", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+  { MIC_DIAG_CAPTURE_FAILURE, "capture-failure", "silent", "not_run", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
 
 #define MIC_DIAG_QUIET_SPAN_MAX 8u
 #define MIC_DIAG_QUIET_MEAN_ABS_MAX 2u
@@ -178,6 +183,78 @@ static inline mic_diag_t mic_diag_classify(const int16_t *samples, size_t n) {
 
   mic_diag_set(&diag, MIC_DIAG_NORMAL, "signal_variation_present");
   return diag;
+}
+
+// ---------------------------------------------------------------- bounded probe settle
+// ⚠️ONE READ TAKEN THE INSTANT i2s.begin() RETURNS IS NOT A MEASUREMENT OF THE MICROPHONE.
+// An ICS-43434-class part needs its own power-up plus a number of SCK cycles before it drives the
+// data line, and the ESP32's DMA descriptors are handed out already zeroed, so the first 16 ms
+// block off a perfectly good mic can be all zeros or a repeating value. That single latched read
+// is what reported `capture-failure` on ageev and 98% repeated samples on kasami while both nodes
+// were serving healthy 48 kHz audio and detections for the rest of the boot.
+//
+// The fix is a BOUNDED retry, not a blind delay: read, classify, accept the first healthy verdict,
+// and only pay the settle window when the microphone is still not answering. That keeps a warm OTA
+// restart (mic still powered, answers on the first read) at zero added boot time, while a cold
+// power-on gets the milliseconds it actually needs. It cannot mask an absent, stuck or floating
+// microphone either, because the LAST classification is what is reported -- a mic that never wakes
+// is classified exactly as it was before, after the window, with `attempts` and `settle_ms` saying
+// how hard the node tried.
+#define MIC_PROBE_SETTLE_COLD_MS 750u   // cold power-on / brownout: part is coming up from unpowered
+#define MIC_PROBE_SETTLE_WARM_MS 250u   // sw / OTA / panic restart: the mic kept its supply
+#define MIC_PROBE_RETRY_GAP_MS   20u    // ~one I2S DMA block at FS_ACQ; long enough to be new data
+#define MIC_PROBE_MAX_ATTEMPTS   16u
+
+typedef int (*mic_probe_read_fn)(void *ctx, int16_t *dst, size_t max_samples);
+typedef uint32_t (*mic_probe_now_ms_fn)(void *ctx);
+typedef void (*mic_probe_wait_ms_fn)(void *ctx, uint32_t ms);
+
+typedef struct {
+  mic_probe_read_fn read;        // required; returns samples read, <= 0 means nothing came back
+  mic_probe_now_ms_fn now_ms;    // optional; without it the probe is a single read, as before
+  mic_probe_wait_ms_fn wait_ms;  // optional; services the boot watchdog on the firmware side
+  void *ctx;
+  int16_t *buf;
+  size_t buf_samples;
+  uint32_t settle_budget_ms;     // 0 -> single read
+  uint32_t retry_gap_ms;         // 0 -> MIC_PROBE_RETRY_GAP_MS
+  uint32_t max_attempts;         // 0 -> MIC_PROBE_MAX_ATTEMPTS
+} mic_probe_cfg_t;
+
+// The two states a live microphone can legitimately be in at boot. `saturated`, `stuck`,
+// `floating` and `capture-failure` are all retried: each of them is a shape a not-yet-awake part
+// produces, and a genuinely broken one keeps producing it until the window closes.
+static inline int mic_diag_state_is_healthy(mic_diag_state_t state) {
+  return state == MIC_DIAG_QUIET || state == MIC_DIAG_NORMAL;
+}
+
+static inline uint32_t mic_probe_budget_ms(int cold_boot) {
+  return cold_boot ? MIC_PROBE_SETTLE_COLD_MS : MIC_PROBE_SETTLE_WARM_MS;
+}
+
+static inline mic_diag_t mic_probe_settle(const mic_probe_cfg_t *cfg) {
+  mic_diag_t diag = mic_diag_missing("no_probe");
+  if (!cfg || !cfg->read || !cfg->buf || cfg->buf_samples == 0) return diag;
+
+  const uint32_t gap = cfg->retry_gap_ms ? cfg->retry_gap_ms : MIC_PROBE_RETRY_GAP_MS;
+  const uint32_t max_attempts = cfg->max_attempts ? cfg->max_attempts : MIC_PROBE_MAX_ATTEMPTS;
+  const uint32_t t0 = cfg->now_ms ? cfg->now_ms(cfg->ctx) : 0u;
+  uint32_t attempts = 0;
+
+  for (;;) {
+    int n = cfg->read(cfg->ctx, cfg->buf, cfg->buf_samples);
+    attempts++;
+    diag = (n > 0) ? mic_diag_classify(cfg->buf, (size_t)n) : mic_diag_missing("no_samples");
+    uint32_t elapsed = cfg->now_ms ? (uint32_t)(cfg->now_ms(cfg->ctx) - t0) : 0u;
+    diag.attempts = attempts;
+    diag.settle_ms = elapsed;
+
+    if (mic_diag_state_is_healthy(diag.state)) return diag;
+    if (!cfg->now_ms) return diag;
+    if (attempts >= max_attempts) return diag;
+    if (elapsed + gap >= cfg->settle_budget_ms) return diag;
+    if (cfg->wait_ms) cfg->wait_ms(cfg->ctx, gap);
+  }
 }
 
 #ifdef __cplusplus

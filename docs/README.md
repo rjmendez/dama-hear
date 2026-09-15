@@ -54,6 +54,7 @@ what was chosen, the in-tree evidence it rests on, and what was deliberately lef
 | [faketec-pin-budget.md](faketec-pin-budget.md) | Board pin budget. |
 | [l86-reference.md](l86-reference.md) | L86 GNSS module reference. |
 | [hear-latency-calibration-runbook.md](hear-latency-calibration-runbook.md) | Latency calibration procedure. |
+| [pool-backup-restore.md](pool-backup-restore.md) | The backup and restore design for PVC `dama/hear-pool` and its explicit G0 acceptance test: measured storage facts (including that the node's ext4 root is a VHDX on a 95 %-full Windows disk), why no snapshot primitive exists here, generational encrypted archives to a second physical disk, per-class consistency rules for append-only JSONL and a live-WAL SQLite database, key custody, retention, and the restore-isolation boundary. Phase 3 import is blocked until its G0 passes. |
 | [bridge-durable-soak.md](bridge-durable-soak.md) | Durable-outbox soak runbook for `hear-mqtt-bridge`: what `tools/bridge_soak_evidence.py` records, the T+24h/7d/14d pass/fail criteria, and the read-only boundary it enforces. |
 
 ## Operations, policy, and cross-cutting design
@@ -65,6 +66,8 @@ what was chosen, the in-tree evidence it rests on, and what was deliberately lef
 | [data-governance.md](data-governance.md) | Self-hosted acoustic data governance: data classes, recording indicators, retention, access, export, and audit controls for captured and derived data. |
 | [resilience.md](resilience.md) | Failure-mode design: the invariants that must survive, degraded-mode behaviour per dependency, and how operators learn about failure without reading a stack trace. |
 | [durable-outbox-failure-drill-runbook.md](durable-outbox-failure-drill-runbook.md) | Maintenance-window procedure for the `hear-mqtt-bridge` durable-outbox induced-failure drill: gate, prechecks, backup, scoped fault injection, expected observations, abort triggers, recovery order, evidence receipt, and pass criteria. |
+| [ota-release-credentials.md](ota-release-credentials.md) | The tokenless-release incident, the firmware secret audit, and the NVS credential contract that keeps published images secret-free without making a node OTA-unrecoverable. |
+| [release-v0.1.6-readiness.md](release-v0.1.6-readiness.md) | The pre-cut gate for v0.1.6: required merged prerequisites, artifact variants and the `fs_acquisition_hz: 48000` manifest check, the unprovisioned-vs-fleet-ready public asset contract, operator-selected admin-token provisioning, pre-cut checks, per-node rollout order and no-go gates, the deliberate `nyquist` rollback receipt, and failure/rollback procedures. Not executed. |
 
 ## Field findings and calibration records
 
