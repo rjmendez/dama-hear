@@ -8,7 +8,8 @@ import pytest
 from hear.solve.soundspeed import (
     Budget, SoundSpeedUnrecoverable, absolute_budget, apparent_speed, determines_speed,
     fractional_speed_error, recover_from_baseline, recover_from_delays, sound_speed,
-    speed_from_baseline, speed_upper_bound, temperature_c, temperature_sigma_c,
+    sound_speed_provenance_from_statuses, speed_from_baseline, speed_upper_bound,
+    temperature_c, temperature_sigma_c,
 )
 
 # The three surveyed phone positions of 2026-09-05, ENU metres about the map origin.
@@ -16,6 +17,15 @@ FANCY = np.array([5.14398715, -19.75622501, 243.68])     # 'South triangle'
 FIN = np.array([13.74922948, -1.93390216, 240.76])       # 'triangle north'
 MYA = np.array([13.88748858, -14.87031993, 242.15])      # 'target'
 PHONES = np.array([FANCY, FIN, MYA])
+
+
+def _status(node: str, temp_c: float = 25.0, c_mps=None, utc_s: float = 1000.0,
+            cls: str = "xiao-s3-pps"):
+    env = {"temp_c": temp_c}
+    if c_mps is not None:
+        env["c_mps"] = c_mps
+    return {"node": node, "class": cls, "time": {"valid": True, "utc_us": int(utc_s * 1e6)},
+            "pps": {"edges": 100}, "env": env}
 
 
 # ── the relation and its inverse ────────────────────────────────────────────────────────────────
@@ -35,6 +45,66 @@ def test_one_degree_is_0_176_percent_of_c():
 
 def test_temperature_sigma_is_speed_sigma_over_0_606():
     assert temperature_sigma_c(345.0, 0.606) == pytest.approx(1.0)
+
+
+# ── live node environment provenance ────────────────────────────────────────────────────────────
+
+def test_measured_sound_speed_uses_median_env_c_mps_from_clock_disciplined_xiao_nodes():
+    got = sound_speed_provenance_from_statuses([
+        {"node": "nyquist", "source": "n", "at": 1000.0,
+         "status": _status("nyquist", 25.0, c_mps=346.45)},
+        {"node": "mach", "source": "m", "at": 1000.0,
+         "status": _status("mach", 26.0, c_mps=347.05)},
+        {"node": "rankine", "source": "r", "at": 1000.0,
+         "status": _status("rankine", 24.0, c_mps=345.85)},
+    ], assumed_temp_c=20.0, now=1000.0)
+    assert got["provenance"] == "MEASURED"
+    assert got["source"] == "node_env_median"
+    assert got["sound_speed_mps"] == pytest.approx(346.45)
+    assert got["temp_c"] == pytest.approx(temperature_c(346.45))
+    assert got["nodes"] == ["nyquist", "mach", "rankine"]
+
+
+def test_measured_sound_speed_falls_back_when_no_valid_temperature_exists():
+    got = sound_speed_provenance_from_statuses([
+        {"node": "nyquist", "at": 1000.0,
+         "status": {"node": "nyquist", "class": "xiao-s3-pps",
+                    "time": {"valid": True, "utc_us": 1000_000_000},
+                    "pps": {"edges": 100}, "env": {}}},
+    ], assumed_temp_c=20.0, now=1000.0)
+    assert got["provenance"] == "ASSUMED"
+    assert got["source"] == "assumed_temp_c"
+    assert got["sound_speed_mps"] == pytest.approx(sound_speed(20.0))
+    assert got["reason"] == "no_valid_measured_temperature"
+    assert got["refusals"][0]["reason"] == "no_env_temperature"
+
+
+@pytest.mark.parametrize("status,reason", [
+    (_status("nyquist", 25.0, utc_s=0.0), "stale_node_clock"),
+    (_status("nyquist", 200.0, utc_s=1000.0), "bad_sound_speed"),
+    (dict(_status("nyquist", 25.0, utc_s=1000.0), **{"time": {"valid": False}}),
+     "clock_not_disciplined"),
+    (_status("nyquist", 25.0, utc_s=1000.0, cls="puc-ntp"), "not_required_class"),
+])
+def test_stale_bad_or_not_clock_disciplined_nodes_do_not_masquerade_as_measured(status, reason):
+    got = sound_speed_provenance_from_statuses(
+        [{"node": "nyquist", "at": 1000.0, "status": status}],
+        assumed_temp_c=20.0, now=1000.0, max_age_s=10.0)
+    assert got["provenance"] == "ASSUMED"
+    assert got["reason"] == "no_valid_measured_temperature"
+    assert got["refusals"][0]["reason"] == reason
+
+
+def test_disagreeing_healthy_nodes_fall_back_to_assumed_with_both_candidates_reported():
+    got = sound_speed_provenance_from_statuses([
+        {"node": "nyquist", "at": 1000.0,
+         "status": _status("nyquist", 20.0, c_mps=343.42)},
+        {"node": "mach", "at": 1000.0,
+         "status": _status("mach", 35.0, c_mps=352.51)},
+    ], assumed_temp_c=20.0, now=1000.0, max_spread_mps=5.0)
+    assert got["provenance"] == "ASSUMED"
+    assert got["reason"] == "measured_nodes_disagree"
+    assert [c["node"] for c in got["candidates"]] == ["nyquist", "mach"]
 
 
 # ── the baseline inversion ──────────────────────────────────────────────────────────────────────

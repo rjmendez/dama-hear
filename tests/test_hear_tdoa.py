@@ -135,6 +135,12 @@ def planted(sv, source, t0, nodes=None, seed0=0, jitter_s=0.0, rng=None, bias=No
     return rows
 
 
+def status_doc(node, temp_c, c_mps, utc_s):
+    return {"node": node, "class": "xiao-s3-pps", "time": {"valid": True,
+            "utc_us": int(float(utc_s) * 1e6)}, "pps": {"edges": 100},
+            "env": {"temp_c": temp_c, "c_mps": c_mps}}
+
+
 T0 = 1_760_000_000.0          # a fixed absolute epoch; `now` is always passed explicitly
 
 
@@ -955,6 +961,38 @@ class TestSoundSpeedIsAssumed:
         assert d["determined"] is False and d["deficit"] >= 1
         assert "under-determined" in d["reason"]
         assert t["c"]["source"] == "assumed_temp_c"
+        assert t["c"]["provenance"] == "ASSUMED"
+
+    def test_measured_node_temperature_reaches_the_solver_and_manifest(self, tmp_path):
+        sv = SV.from_dict(survey_dict())
+        c_mps = 346.45
+        source = np.array([40.0, 30.0, 0.0])
+        rows = []
+        for k, nid in enumerate(sv.arrival_ids()):
+            p = np.asarray(sv.position(nid), float)
+            rows.append(node_row(sv.names[nid], T0 + float(np.linalg.norm(source - p)) / c_mps,
+                                 seed=k, sample=k))
+        statuses = [{"node": n, "at": T0 + 3600.0,
+                     "status": status_doc(n, 25.0 + k, c, T0 + 3600.0)}
+                    for k, (n, c) in enumerate([("nyquist", 345.85), ("mach", c_mps),
+                                                ("rankine", 347.05)])]
+        t = go(tmp_path, rows, now=T0 + 3600.0, sound_speed_statuses=statuses)
+        assert t["c"]["provenance"] == "MEASURED"
+        assert t["c"]["sound_speed_mps"] == pytest.approx(c_mps)
+        assert t["c"]["source"] == "node_env_median"
+        ev = json.loads((pathlib.Path(t["out"]) / "runs" / t["run_id"]
+                         / "events.jsonl").read_text().splitlines()[0])
+        assert ev["solution"]["sound_speed_mps"] == pytest.approx(c_mps)
+
+    def test_stale_measured_temperature_falls_back_and_says_so(self, tmp_path):
+        sv = SV.from_dict(survey_dict())
+        stale = [{"node": "nyquist", "at": T0 - 100.0,
+                  "status": status_doc("nyquist", 25.0, 346.45, T0 - 100.0)}]
+        t = go(tmp_path, planted(sv, (40.0, 30.0, 0.0), T0), now=T0 + 3600.0,
+               sound_speed_statuses=stale, sound_speed_env_max_age_s=10.0)
+        assert t["c"]["provenance"] == "ASSUMED"
+        assert t["c"]["reason"] == "no_valid_measured_temperature"
+        assert t["c"]["refusals"][0]["reason"] == "stale_fetch"
 
     WIDE = [{"node_id": i + 1, "name": "n%d" % i, "e_m": float(e), "n_m": float(n), "u_m": 0.0,
              "sigma_m": 0.1}

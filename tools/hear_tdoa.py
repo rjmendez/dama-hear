@@ -139,6 +139,7 @@ import math
 import os
 import sys
 import time
+import urllib.request
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -166,6 +167,9 @@ LEDGER_SCHEMA = "hear.tdoa_arrival.v1"
 RUN_RING = 64
 DEFAULT_RUN_WINDOW_S = 7200.0
 DEFAULT_MAX_STALE_S = 7200.0
+DEFAULT_SOUND_SPEED_ENV_MAX_AGE_S = 7200.0
+DEFAULT_SOUND_SPEED_ENV_MAX_SPREAD_MPS = 5.0
+DEFAULT_STATUS_TIMEOUT_S = 3.0
 
 #: How far back every run re-associates. Association is not a per-record function, so this is a
 #: real cost and it is measured rather than hidden: a record that arrives older than this can
@@ -227,6 +231,40 @@ DROP_REASONS = (D_UNANCHORED, D_OUTSIDE_WINDOW, D_OUTSIDE_LOOKBACK_EMITTED,
 
 CLOCK_STATES = frozenset({"LOCKED", "HOLDOVER", "DEGRADED", "FAULT"})
 TDOA_CLOCK_STATES = frozenset({"LOCKED", "HOLDOVER"})
+
+
+def _split_name_url(s: str) -> Tuple[str, str]:
+    if "=" in str(s):
+        name, url = str(s).split("=", 1)
+    else:
+        url = str(s)
+        name = ""
+    url = url.strip()
+    if url and not url.startswith(("http://", "https://")):
+        url = "http://%s/status" % url
+    return name.strip(), url
+
+
+def _fetch_status_report(spec: str, now: float, timeout: float) -> Dict[str, Any]:
+    name, url = _split_name_url(spec)
+    with urllib.request.urlopen(url, timeout=float(timeout)) as resp:
+        body = resp.read(1_000_000)
+    return {"node": name or None, "source": url, "at": now,
+            "status": json.loads(body.decode("utf-8"))}
+
+
+def sound_speed_status_reports(policy: Dict[str, Any], now: float) -> List[Dict[str, Any]]:
+    """Status reports explicitly supplied by tests plus optional live read-only `/status` polls."""
+    out = list(policy.get("sound_speed_statuses") or ())
+    timeout = float(policy.get("sound_speed_status_timeout_s") or DEFAULT_STATUS_TIMEOUT_S)
+    for spec in policy.get("sound_speed_nodes") or ():
+        try:
+            out.append(_fetch_status_report(str(spec), now, timeout))
+        except Exception as exc:
+            name, url = _split_name_url(str(spec))
+            out.append({"node": name or None, "source": url, "at": now,
+                        "status": {}, "error": repr(exc)})
+    return out
 
 # ---------------------------------------------------------------- heterogeneous receivers
 # WEIGHTING HANDLES VARIANCE. IT DOES NOT HANDLE BIAS, AND THIS DOOR IS THE ONE THE WEIGHTS DO
@@ -1692,10 +1730,14 @@ def model_card(sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
             "vertical spread is %.1f m against a %.1f m flatness tolerance, so the cone lane's "
             "2D projection mis-models node ranges by up to that and no residual can see it."
             % (arr_sv.vertical_spread_m(), SV.FLAT_TOL_M),
-            "`c` is ASSUMED from --temp-c %.1f (%.2f m/s). determines_speed(%d receivers, dim 2, "
-            "unknown source) says it can never be recovered here at any number of events. A 10 "
-            "degC error is %.3f%% of c = %.3f m over this %.2f m aperture."
-            % (policy["temp_c"], c, len(ids), 100.0 * SS.fractional_speed_error(10.0),
+            "`c` is %s (%.2f m/s). If node env telemetry is unavailable, stale, bad, or "
+            "disagrees, the tool falls back to ASSUMED --temp-c %.1f; no assumed value is "
+            "labeled measured. determines_speed(%d receivers, dim 2, unknown source) says c "
+            "can never be recovered from arrivals alone at any number of events. A 10 degC "
+            "error is %.3f%% of c = %.3f m over this %.2f m aperture."
+            % ((policy.get("c_provenance") or {}).get("provenance", "ASSUMED"),
+               c, policy.get("assumed_temp_c", policy["temp_c"]), len(ids),
+               100.0 * SS.fractional_speed_error(10.0),
                SS.fractional_speed_error(10.0) * aperture, aperture),
             "Timing is NOT the binding error term. %r is %.1f us = %.3f m of range against a "
             "worst node survey sigma of %.3f m -- position error is ~%.0fx the timing error, so "
@@ -1868,7 +1910,21 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
     if not plan_only:
         PT.is_point_source(policy["source_class"])           # its own ValueError, verbatim
 
-    c = SW.sound_speed(policy["temp_c"])
+    assumed_temp_c = float(policy["temp_c"])
+    c_report = SS.sound_speed_provenance_from_statuses(
+        sound_speed_status_reports(policy, now),
+        assumed_temp_c=assumed_temp_c,
+        now=now,
+        max_age_s=float(policy.get("sound_speed_env_max_age_s")
+                        or DEFAULT_SOUND_SPEED_ENV_MAX_AGE_S),
+        max_spread_mps=float(policy.get("sound_speed_env_max_spread_mps")
+                             or DEFAULT_SOUND_SPEED_ENV_MAX_SPREAD_MPS))
+    policy["assumed_temp_c"] = assumed_temp_c
+    policy["temp_c"] = float(c_report["temp_c"])
+    policy["c_provenance"] = {k: c_report.get(k) for k in
+                              ("provenance", "source", "reason", "sound_speed_mps",
+                               "temp_c", "n_measured", "spread_mps")}
+    c = float(c_report["sound_speed_mps"])
     bounds = pair_bounds(arr_sv, c)
     margin = derive_margin_s(bounds, policy["margin_frac"], policy.get("margin_s_override"),
                              bool(policy.get("force_margin")))
@@ -1891,7 +1947,7 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
         "at": now,
         "pool": pool_root, "out": out, "survey": survey_path,
         "policy": {k: v for k, v in sorted(policy.items())
-                   if k not in ("latency_cal", "gps_refused")},
+                   if k not in ("latency_cal", "gps_refused", "sound_speed_statuses")},
         # ⚠️MEASURED, NOT ASSERTED. Whether a stated per-arrival sigma actually reached the
         # solver is a fact about the code this run imported, and a report that only said the
         # sigma was "carried" would be true while every receiver still voted at par. `delivered`
@@ -1932,7 +1988,7 @@ def run(pool_root: str, survey_path: str, policy: Dict[str, Any], out: Optional[
             "pair_bounds_ms": {"%d|%d" % k: v["bound_s"] * 1e3 for k, v in sorted(bounds.items())},
         },
         "margin": margin,
-        "c": {"sound_speed_mps": c, "source": "assumed_temp_c", "temp_c": policy["temp_c"],
+        "c": {**c_report,
               "frac_error_per_10c": SS.fractional_speed_error(10.0),
               "metres_per_10c_on_aperture":
                   SS.fractional_speed_error(10.0) * arr_sv.diameter_m()},
@@ -2753,9 +2809,19 @@ def format_report(t: Dict[str, Any]) -> str:
                   json.dumps({k: v for k, v in (ass.get("by_reason") or {}).items() if v},
                              sort_keys=True)))
     d = t.get("determinacy") or {}
-    out.append("c        ASSUMED %.2f m/s from temp %.1f C; determines_speed: %s"
-               % ((t.get("c") or {}).get("sound_speed_mps") or 0.0,
-                  (t.get("policy") or {}).get("temp_c") or 0.0, d.get("reason")))
+    cb = t.get("c") or {}
+    if cb.get("provenance") == "MEASURED":
+        out.append("c        MEASURED %.2f m/s from %s (%d node(s), spread %.2f m/s); "
+                   "determines_speed: %s"
+                   % (cb.get("sound_speed_mps") or 0.0, cb.get("source"),
+                      cb.get("n_measured") or 0, cb.get("spread_mps") or 0.0,
+                      d.get("reason")))
+    else:
+        out.append("c        ASSUMED %.2f m/s from temp %.1f C (%s); determines_speed: %s"
+                   % (cb.get("sound_speed_mps") or 0.0, cb.get("assumed_temp_c") or
+                      (t.get("policy") or {}).get("assumed_temp_c") or
+                      (t.get("policy") or {}).get("temp_c") or 0.0,
+                      cb.get("reason") or cb.get("source"), d.get("reason")))
     cons = t.get("conservation") or {}
     out.append("conservation %s  (read %s == accounted %s; admitted %s in %s terminal state(s); "
                "%s event(s) == %s verdict(s); %s ungated candidate(s), %s lost to the gate)"
@@ -2838,6 +2904,19 @@ def main(argv=None) -> int:
                     help="DECLARE the source height (two unknowns, three receivers), or the "
                          "literal 'none' to attempt a 3D fit (three unknowns, four receivers)")
     ap.add_argument("--temp-c", type=float, default=20.0)
+    ap.add_argument("--sound-speed-node", action="append", default=[], metavar="NAME=URL",
+                    help="read-only /status endpoint to use for MEASURED c from healthy "
+                         "xiao-s3-pps env.c_mps/env.temp_c; repeatable. If none qualify, "
+                         "--temp-c is ASSUMED and labeled as such")
+    ap.add_argument("--sound-speed-env-max-age-s", type=float,
+                    default=DEFAULT_SOUND_SPEED_ENV_MAX_AGE_S,
+                    help="refuse measured node environment data older than this")
+    ap.add_argument("--sound-speed-env-max-spread-mps", type=float,
+                    default=DEFAULT_SOUND_SPEED_ENV_MAX_SPREAD_MPS,
+                    help="fall back to assumed --temp-c if healthy nodes disagree by more than "
+                         "this many m/s")
+    ap.add_argument("--sound-speed-status-timeout-s", type=float,
+                    default=DEFAULT_STATUS_TIMEOUT_S)
     ap.add_argument("--v-mps", type=float, default=900.0, help="cone lane only")
     ap.add_argument("--min-nodes", type=int, default=3)
     ap.add_argument("--margin-frac", type=float, default=DEFAULT_MARGIN_FRAC)
@@ -2909,9 +2988,19 @@ def main(argv=None) -> int:
             sv = SV.load_survey(os.path.expanduser(a.survey), min_nodes=3,
                                 require_real_origin=True)
             sv, _gps = _augment_with_node_gps(sv, gps_path, time.time())
+            c_policy = {
+                "sound_speed_nodes": list(a.sound_speed_node),
+                "sound_speed_status_timeout_s": a.sound_speed_status_timeout_s,
+            }
+            c_report = SS.sound_speed_provenance_from_statuses(
+                sound_speed_status_reports(c_policy, time.time()),
+                assumed_temp_c=a.temp_c,
+                now=time.time(),
+                max_age_s=a.sound_speed_env_max_age_s,
+                max_spread_mps=a.sound_speed_env_max_spread_mps)
             expect = AS.max_window_s(
-                arrival_survey(sv), a.temp_c,
-                derive_margin_s(pair_bounds(arrival_survey(sv), SW.sound_speed(a.temp_c)),
+                arrival_survey(sv), c_report["temp_c"],
+                derive_margin_s(pair_bounds(arrival_survey(sv), c_report["sound_speed_mps"]),
                                 a.margin_frac, a.margin_s, a.force_margin)["margin_s"])
         except SV.SiteOriginError as exc:
             print("refused: %s" % exc, file=sys.stderr)
@@ -2954,6 +3043,10 @@ def main(argv=None) -> int:
         "sources": sources, "days": list(a.day), "since": a.since, "until": a.until,
         "lookback_h": a.lookback_h, "settle_s": a.settle_s,
         "source_class": a.source_class, "fixed_up_m": fixed_up, "temp_c": a.temp_c,
+        "sound_speed_nodes": list(a.sound_speed_node),
+        "sound_speed_env_max_age_s": a.sound_speed_env_max_age_s,
+        "sound_speed_env_max_spread_mps": a.sound_speed_env_max_spread_mps,
+        "sound_speed_status_timeout_s": a.sound_speed_status_timeout_s,
         "v_mps": a.v_mps, "min_nodes": a.min_nodes, "margin_frac": a.margin_frac,
         "margin_s_override": a.margin_s, "force_margin": bool(a.force_margin),
         "bin_s": a.bin_s, "max_sync_sigma_ns": a.max_sync_sigma_ns,
