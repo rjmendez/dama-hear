@@ -39,7 +39,23 @@ def extract_selftest(record):
 
 def format_selftest(record) -> str:
     st = extract_selftest(record) or {}
-    return " ".join("%s=%s" % (k, st.get(k, "missing")) for k in SELFTEST_ORDER)
+    mic = st.get("mic", "missing")
+    mic_state = st.get("mic_state")
+    if mic_state:
+        mic = f"{mic}({mic_state})"
+    parts = [f"mic={mic}"]
+    parts.extend("%s=%s" % (k, st.get(k, "missing")) for k in SELFTEST_ORDER[1:])
+    return " ".join(parts)
+
+
+def _mic_ready_state(st):
+    mic = st.get("mic")
+    mic_state = st.get("mic_state")
+    if mic_state in {"quiet", "normal"}:
+        return True, mic, mic_state, st.get("mic_reason")
+    if mic_state in {"capture-failure", "stuck", "floating", "saturated"}:
+        return False, mic, mic_state, st.get("mic_reason")
+    return mic == "ok", mic, mic_state, st.get("mic_reason")
 
 
 def selftest_reasons(record, allow_gps_no_fix_indoors=False, allow_pps_absent=False):
@@ -48,9 +64,15 @@ def selftest_reasons(record, allow_gps_no_fix_indoors=False, allow_pps_absent=Fa
     if not isinstance(st, dict):
         return ["status has no selftest block"]
     reasons = []
-    mic = st.get("mic")
-    if mic != "ok":
-        reasons.append("selftest mic=%r (need 'ok')" % mic)
+    mic_ok, mic, mic_state, mic_reason = _mic_ready_state(st)
+    if not mic_ok:
+        detail = "selftest mic=%r" % mic
+        if mic_state:
+            detail += " state=%r" % mic_state
+        if mic_reason:
+            detail += " reason=%r" % mic_reason
+        detail += " (need 'ok' or mic_state in {'quiet', 'normal'})"
+        reasons.append(detail)
     gps = st.get("gps")
     if gps == "ok":
         pass
