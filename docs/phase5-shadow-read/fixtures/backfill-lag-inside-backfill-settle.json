@@ -1,0 +1,9 @@
+{
+  "case": "backfill-lag-inside-backfill-settle",
+  "description": "An SD backlog is being replayed hours late. Judged against the backfill settle horizon rather than the live one, so a day-late canonical row on an import lane is pending rather than loss. Judging a bulk replay on the live window pages on every drain run.",
+  "expected_classification": "pending",
+  "expected_gate_impact": "none",
+  "expected_repair_action": "none",
+  "expected_severity": "info",
+  "receipt": null
+}

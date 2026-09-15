@@ -1,0 +1,149 @@
+{
+  "case": "blind-comparison-hides-location-and-audio",
+  "description": "A localisation result and a clip body differ. Both are compared by the blind comparator: equality is decided in memory and only the verdict is durable, so the receipt records that the two surfaces disagreed without recording a coordinate, a credential or a sample. A stable hash of a coordinate is still an identifier for that coordinate, which is why blind differences carry null on both sides.",
+  "expected_classification": "value_divergence",
+  "expected_gate_impact": "blocks_cutover",
+  "expected_repair_action": "manual_review",
+  "expected_severity": "critical",
+  "receipt": {
+    "comparator": {
+      "name": "hear-shadow-read",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "coverage": {},
+    "differences": [
+      {
+        "blind": true,
+        "canonical": null,
+        "comparator": "blind",
+        "legacy": null,
+        "path": "solution.latitude",
+        "quoted": false,
+        "tolerance": "equality decided in memory; only the verdict is durable"
+      },
+      {
+        "blind": true,
+        "canonical": null,
+        "comparator": "blind",
+        "legacy": null,
+        "path": "clip.audio_samples",
+        "quoted": false,
+        "tolerance": "equality decided in memory; only the verdict is durable"
+      },
+      {
+        "blind": true,
+        "canonical": null,
+        "comparator": "blind",
+        "legacy": null,
+        "path": "bearer_token",
+        "quoted": false,
+        "tolerance": "equality decided in memory; only the verdict is durable"
+      }
+    ],
+    "differences_dropped": 0,
+    "disposition": {
+      "gate_impact": "blocks_cutover",
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "manual_review",
+      "repairable": false
+    },
+    "emitted_at": "2026-09-15T02:00:45Z",
+    "evidence": {
+      "canonical_result_ref": "hear/v1/blob/sha256/bb/canonical-answer",
+      "legacy_result_ref": "hear/v1/blob/sha256/aa/legacy-answer",
+      "redaction_profile": "hear.shadowread.redact.v1"
+    },
+    "grain": "row",
+    "query": {
+      "device_ids": [
+        "ageev"
+      ],
+      "evidence_class": "localization",
+      "filters": {
+        "bound": "half_open",
+        "kind": "gunshot"
+      },
+      "fingerprint": "q:a1b3384377309022121ffb3dfa86fd11de8d42ffdee1c18004d548b7ccc4cc6c",
+      "page_size": 50,
+      "projection_version": 1,
+      "site_id": "site-alpha",
+      "sort": {
+        "direction": "asc",
+        "field": "captured_at"
+      },
+      "time_from": "2026-09-14T00:00:00Z",
+      "time_to": "2026-09-15T01:45:00Z"
+    },
+    "read_authority": "legacy",
+    "read_mode": "compare",
+    "receipt_id": "012dc9f4-669a-584e-b355-c659c99ce1b9",
+    "row": {
+      "logical_id_present": true,
+      "row_key": "r:7f38f4950a13391f2cc05427608bc1f22cdd37e61d5792da812792560dfb277e"
+    },
+    "run_id": "shadow-2026-09-15T02",
+    "sampling": {
+      "forced_reason": "mismatches are never sampled",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.shadowread.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "cursor_stable": true,
+        "outcome": "answered",
+        "page_count": 1,
+        "projection_version": 1,
+        "read_contract_major": 1,
+        "reader": "hear.objectstore + durable postgres reader",
+        "reader_version": "0.1.6",
+        "reasons": [],
+        "result_hash": "sha256:322a0ec0d88c150406dbd24d3684a9b2ce1e639d485d486015b3677462d3a9cd",
+        "retention_class": "R0-derived",
+        "retention_horizon_s": 7776000,
+        "row_count": 1,
+        "row_state": "present",
+        "snapshot_at": "2026-09-15T02:00:00Z",
+        "state_hash": "sha256:0f451116bd5dbb7b13a479b25e4747cde252e72bb10fd4b45300c055bfcbdc69",
+        "truncated": false
+      },
+      "legacy": {
+        "cursor_stable": true,
+        "outcome": "answered",
+        "page_count": 1,
+        "projection_version": 1,
+        "read_contract_major": 1,
+        "reader": "hear/pool.py + tools/hear_heartbeat_receiver.py views",
+        "reader_version": "0.1.6",
+        "reasons": [],
+        "result_hash": "sha256:322a0ec0d88c150406dbd24d3684a9b2ce1e639d485d486015b3677462d3a9cd",
+        "retention_class": "R0-derived",
+        "retention_horizon_s": 7776000,
+        "row_count": 1,
+        "row_state": "present",
+        "snapshot_at": "2026-09-15T02:00:00Z",
+        "state_hash": "sha256:0f451116bd5dbb7b13a479b25e4747cde252e72bb10fd4b45300c055bfcbdc69",
+        "truncated": false
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "value_divergence",
+      "gate_impact": "blocks_cutover",
+      "notes": [
+        "3 compared field(s) outside tolerance"
+      ],
+      "repair_action": "manual_review",
+      "severity": "critical"
+    },
+    "window": {
+      "as_of": "2026-09-15T02:00:00Z",
+      "end": "2026-09-15T02:00:00Z",
+      "settle_s": 900.0,
+      "start": "2026-09-15T01:00:00Z"
+    }
+  }
+}

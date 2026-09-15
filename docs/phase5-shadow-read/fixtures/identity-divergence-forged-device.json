@@ -1,0 +1,121 @@
+{
+  "case": "identity-divergence-forged-device",
+  "description": "The two surfaces disagree about the producer behind a row. An authentication defect, not a data-quality one: judged before every content question, never sampled away, and cutover-blocking.",
+  "expected_classification": "identity_divergence",
+  "expected_gate_impact": "blocks_cutover",
+  "expected_repair_action": "manual_review",
+  "expected_severity": "critical",
+  "receipt": {
+    "comparator": {
+      "name": "hear-shadow-read",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "coverage": {},
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "gate_impact": "blocks_cutover",
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "manual_review",
+      "repairable": false
+    },
+    "emitted_at": "2026-09-15T02:00:45Z",
+    "evidence": {
+      "canonical_result_ref": "hear/v1/blob/sha256/bb/canonical-answer",
+      "legacy_result_ref": "hear/v1/blob/sha256/aa/legacy-answer",
+      "redaction_profile": "hear.shadowread.redact.v1"
+    },
+    "grain": "row",
+    "query": {
+      "device_ids": [
+        "gold"
+      ],
+      "evidence_class": "detection",
+      "filters": {
+        "bound": "half_open",
+        "kind": "gunshot"
+      },
+      "fingerprint": "q:8c2662f85c3a4f4418ff72e4b3201145e9a8fccdd68c6d4ee1e661957e399fd5",
+      "page_size": 50,
+      "projection_version": 1,
+      "site_id": "site-alpha",
+      "sort": {
+        "direction": "asc",
+        "field": "captured_at"
+      },
+      "time_from": "2026-09-14T00:00:00Z",
+      "time_to": "2026-09-15T01:45:00Z"
+    },
+    "read_authority": "legacy",
+    "read_mode": "compare",
+    "receipt_id": "3ee4ea22-2ec1-5745-ad97-4b8be54c2b6f",
+    "row": {
+      "logical_id_present": true,
+      "row_key": "r:2b1898b674fd5c664d689c25b497b359a361406f566133a908bb77ab66c3b6aa"
+    },
+    "run_id": "shadow-2026-09-15T02",
+    "sampling": {
+      "forced_reason": "mismatches are never sampled",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.shadowread.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "cursor_stable": true,
+        "outcome": "answered",
+        "page_count": 1,
+        "projection_version": 1,
+        "read_contract_major": 1,
+        "reader": "hear.objectstore + durable postgres reader",
+        "reader_version": "0.1.6",
+        "reasons": [],
+        "result_hash": "sha256:652999e2ccb4a413cbece6a9e5418a644c3525a2147dec48c3a98678fe69c66f",
+        "retention_class": "R0-derived",
+        "retention_horizon_s": 7776000,
+        "row_count": 1,
+        "row_state": "present",
+        "snapshot_at": "2026-09-15T02:00:00Z",
+        "state_hash": "sha256:42410202118d5279bc97dd2715ae132a0905a6b446cf77d608ce7ca5e04143c0",
+        "truncated": false
+      },
+      "legacy": {
+        "cursor_stable": true,
+        "outcome": "answered",
+        "page_count": 1,
+        "projection_version": 1,
+        "read_contract_major": 1,
+        "reader": "hear/pool.py + tools/hear_heartbeat_receiver.py views",
+        "reader_version": "0.1.6",
+        "reasons": [],
+        "result_hash": "sha256:652999e2ccb4a413cbece6a9e5418a644c3525a2147dec48c3a98678fe69c66f",
+        "retention_class": "R0-derived",
+        "retention_horizon_s": 7776000,
+        "row_count": 1,
+        "row_state": "present",
+        "snapshot_at": "2026-09-15T02:00:00Z",
+        "state_hash": "sha256:42410202118d5279bc97dd2715ae132a0905a6b446cf77d608ce7ca5e04143c0",
+        "truncated": false
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "identity_divergence",
+      "gate_impact": "blocks_cutover",
+      "notes": [
+        "the two surfaces disagree about the producer behind this row"
+      ],
+      "repair_action": "manual_review",
+      "severity": "critical"
+    },
+    "window": {
+      "as_of": "2026-09-15T02:00:00Z",
+      "end": "2026-09-15T02:00:00Z",
+      "settle_s": 900.0,
+      "start": "2026-09-15T01:00:00Z"
+    }
+  }
+}

@@ -1,0 +1,265 @@
+{
+  "cases": [
+    {
+      "description": "Both read surfaces answer the same settled query with the same rows, the same count and the same order-independent digest. Forced into the audit sample so the evidence bundle contains worked positives, not only failures.",
+      "emits_receipt": true,
+      "expected_classification": "match",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "match-both-surfaces-agree.json"
+    },
+    {
+      "description": "The legacy surface already returns a row whose write is minutes old. Two stores do not commit at the same instant, so anything newer than the settle horizon is excluded from comparison rather than reported. No receipt is emitted.",
+      "emits_receipt": false,
+      "expected_classification": "pending",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "pending-inside-settle-horizon.json"
+    },
+    {
+      "description": "The canonical row landed after the settle horizon but inside the late window. A freshness fact, warn severity, no repair and no cutover block -- but a rising late rate is the signal that precedes a real loss, which is why it is not 'match'.",
+      "emits_receipt": true,
+      "expected_classification": "late_arrival",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "warn",
+      "file": "late-arrival-after-settle-horizon.json"
+    },
+    {
+      "description": "Legacy answers and canonical does not, past both the settle horizon and the late window, with no tombstone and no retention explanation. Critical, replayable from the inbox, and it blocks a read cutover on its own.",
+      "emits_receipt": true,
+      "expected_classification": "missing_canonical_row",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "replay_inbox",
+      "expected_severity": "critical",
+      "file": "missing-canonical-row-after-late-window.json"
+    },
+    {
+      "description": "The canonical surface returns a row the authoritative surface never had. Legacy still holds everything it ever held, so this is not data loss -- it is a claimant with an extra answer, which is a review, not a replay.",
+      "emits_receipt": true,
+      "expected_classification": "missing_legacy_row",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "warn",
+      "file": "missing-legacy-row-canonical-only.json"
+    },
+    {
+      "description": "Identity-based dedup failed on the canonical side and one logical row is returned twice. Judged before any value comparison, because a duplicate makes every field-level verdict beneath it ambiguous.",
+      "emits_receipt": true,
+      "expected_classification": "duplicate_canonical_row",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "duplicate-canonical-rows.json"
+    },
+    {
+      "description": "The legacy surface returns one logical row twice -- pre-existing redelivery behaviour. Warn, not critical: the canonical side collapsing it is the designed outcome, and paging on the old path's shape is how a new counter gets ignored.",
+      "emits_receipt": true,
+      "expected_classification": "duplicate_legacy_row",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "warn",
+      "file": "duplicate-legacy-rows.json"
+    },
+    {
+      "description": "Both surfaces answered the same settled question and returned different row counts. Compared exhaustively per device and day rather than sampled, because sampling an aggregate deletes the only number anybody checks.",
+      "emits_receipt": true,
+      "expected_classification": "count_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "count-divergence-on-a-settled-window.json"
+    },
+    {
+      "description": "One counter in the compared projection differs. The projection is explicit rather than a whole stored row, so an additive field upstream cannot manufacture this finding -- which is the failure that makes people switch a comparator off.",
+      "emits_receipt": true,
+      "expected_classification": "value_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "value-divergence-on-a-counter.json"
+    },
+    {
+      "description": "A localisation result and a clip body differ. Both are compared by the blind comparator: equality is decided in memory and only the verdict is durable, so the receipt records that the two surfaces disagreed without recording a coordinate, a credential or a sample. A stable hash of a coordinate is still an identifier for that coordinate, which is why blind differences carry null on both sides.",
+      "emits_receipt": true,
+      "expected_classification": "value_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "blind-comparison-hides-location-and-audio.json"
+    },
+    {
+      "description": "The two surfaces return the same rows in a different sequence on the declared sort key, and the inversions have outlived the order grace window. Warn and no repair: an ordering difference is not a lost row, and the content digest is deliberately order-independent so the two findings stay separable.",
+      "emits_receipt": true,
+      "expected_classification": "order_divergence",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "warn",
+      "file": "order-divergence-outlived-the-grace-window.json"
+    },
+    {
+      "description": "The same inversions, inside the order grace window. Classified match: batches legitimately arrive out of order and a gap that closes itself was never a defect. This case exists to prove the comparator does not fire on correct behaviour.",
+      "emits_receipt": true,
+      "expected_classification": "match",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "order-inversions-inside-the-grace-window.json"
+    },
+    {
+      "description": "One surface stopped at the page cap and the other did not, so the two answers cover different amounts of the window. Warn, with a reindex request for the canonical index owner. A page boundary is never itself evidence; an unequal *extent* is.",
+      "emits_receipt": true,
+      "expected_classification": "pagination_divergence",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "reindex_request",
+      "expected_severity": "warn",
+      "file": "pagination-divergence-one-side-truncated.json"
+    },
+    {
+      "description": "Re-reading with the same opaque cursor returned a different row set. Critical and cutover-blocking, judged before any content comparison: if paging is not stable then every row-level verdict in this run is unfalsifiable.",
+      "emits_receipt": true,
+      "expected_classification": "cursor_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "reindex_request",
+      "expected_severity": "critical",
+      "file": "cursor-divergence-unstable-round-trip.json"
+    },
+    {
+      "description": "The two surfaces normalised the same request into different questions -- an inclusive versus half-open upper bound is the usual cause. Critical: every row verdict downstream of a different question is an artefact, not a finding.",
+      "emits_receipt": true,
+      "expected_classification": "filter_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "filter-divergence-same-request-two-questions.json"
+    },
+    {
+      "description": "A raw row has aged past the legacy surface's 7-day horizon while the canonical copy still holds it. Excluded from comparison rather than reported: a TTL that fires between two reads is correct behaviour on both sides, and reporting it is the most reliable way to turn two healthy stores into a permanently red board.",
+      "emits_receipt": true,
+      "expected_classification": "match",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "retention-edge-excluded-not-reported.json"
+    },
+    {
+      "description": "One surface has pruned a row that is nowhere near either declared horizon. Warn and manual review: the repair boundary is replay-only and nothing here may rewrite an authoritative retention clock to make the two agree.",
+      "emits_receipt": true,
+      "expected_classification": "retention_divergence",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "warn",
+      "file": "retention-divergence-far-from-any-horizon.json"
+    },
+    {
+      "description": "A row is tombstoned on one surface and still readable on the other. Judged before absence, because a tombstone is a recorded fact rather than a missing row, and critical because an unpropagated deletion is a governance failure that a read cutover would make permanent.",
+      "emits_receipt": true,
+      "expected_classification": "tombstone_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "tombstone-divergence-deleted-row-still-readable.json"
+    },
+    {
+      "description": "The two surfaces answer under different read-contract majors. Warn, not critical: a staged rollout *is* a mixed-version deployment, and comparison continues over the intersection of fields both majors define rather than being abandoned.",
+      "emits_receipt": true,
+      "expected_classification": "version_divergence",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "warn",
+      "file": "version-divergence-mixed-reader-majors.json"
+    },
+    {
+      "description": "The two surfaces disagree about the producer behind a row. An authentication defect, not a data-quality one: judged before every content question, never sampled away, and cutover-blocking.",
+      "emits_receipt": true,
+      "expected_classification": "identity_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "identity-divergence-forged-device.json"
+    },
+    {
+      "description": "The two reads are further apart than the permitted snapshot skew, so they describe different moments. The honest verdict is the comparator's own failure rather than a row-by-row report of the gap -- and it is critical, because a comparator that cannot compare has stopped being evidence.",
+      "emits_receipt": true,
+      "expected_classification": "comparator_fault",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "comparator-fault-snapshot-skew.json"
+    },
+    {
+      "description": "The comparator presented a cursor older than the 24 h lifetime the API contract gives it. That is the comparator's bug, and calling it a divergence would blame a store for the auditor's scheduling.",
+      "emits_receipt": true,
+      "expected_classification": "comparator_fault",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "comparator-fault-expired-cursor.json"
+    },
+    {
+      "description": "The authoritative surface was unreachable. Absence of an answer is not an answer about absence, so this is a fault rather than a missing row -- otherwise every legacy outage would be logged as canonical data loss, or worse, as a clean run.",
+      "emits_receipt": true,
+      "expected_classification": "comparator_fault",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "comparator-fault-legacy-surface-unavailable.json"
+    },
+    {
+      "description": "One surface published no digest for its answer. No verdict is derivable, so the comparison is unclassified and critical: a quiet unclassified bucket is how a dashboard goes green over a hole.",
+      "emits_receipt": true,
+      "expected_classification": "unclassified",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "unclassified-missing-result-digest.json"
+    },
+    {
+      "description": "Neither surface has a GPS-anchored instant for these rows. Time is compared as its clock tier and the value is ignored, so two honest readers with no fix agree. Without this rule the comparator manufactures a permanent red signal out of correct behaviour.",
+      "emits_receipt": true,
+      "expected_classification": "match",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "unanchored-clock-compared-as-tier.json"
+    },
+    {
+      "description": "An SD backlog is being replayed hours late. Judged against the backfill settle horizon rather than the live one, so a day-late canonical row on an import lane is pending rather than loss. Judging a bulk replay on the live window pages on every drain run.",
+      "emits_receipt": false,
+      "expected_classification": "pending",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "backfill-lag-inside-backfill-settle.json"
+    }
+  ],
+  "contract": "hear.shadowread.receipt.v1",
+  "contract_major": 1,
+  "generator": "tools/gen_shadow_read_contracts.py",
+  "read_authority": "legacy",
+  "shadow_modes": [
+    "shadow",
+    "compare"
+  ],
+  "source_of_truth": "hear/verify/shadow_read.py",
+  "staged_reason": "Publishing under contracts/ regenerates docs/data/phase0-freeze-contracts.v1.json. The Phase 4 reconcile receipt is already staged in front of this one and is promoted first; promoting both at once would regenerate one hashed baseline from two lanes. Promotion is a move plus a baseline regeneration and no content change; see docs/decisions/0006-phase5-shadow-read-comparator.md.",
+  "status": "staged",
+  "tolerances": {
+    "backfill_settle_s": 86400,
+    "cost_ceiling_s_per_10k_rows": 60.0,
+    "cursor_ttl_s": 86400,
+    "default_query_denominator": 50,
+    "default_row_denominator": 1000,
+    "late_arrival_s": 3600,
+    "max_differences": 32,
+    "max_pages": 20,
+    "max_receipt_bytes": 8192,
+    "max_rows_compared": 10000,
+    "order_grace_s": 300,
+    "retention_edge_s": 3600,
+    "settle_s": 900,
+    "snapshot_skew_s": 5
+  }
+}
