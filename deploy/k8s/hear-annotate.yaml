@@ -9,8 +9,8 @@ metadata:
   labels:
     app: hear-annotate
   annotations:
-    dama-hear/commit: '2fb28b3'
-    dama-hear/source-sha256: '7eec694a60bc35178237375bbc53a0db9ddcd04b94834200d2f40ea8baad4da4'
+    dama-hear/commit: '88af6bf'
+    dama-hear/source-sha256: '99d253a90d5fadc8ccef9e2ad3e506f464a898d21f2b5cd4813f344a39e057fd'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/embedded-in: deploy/k8s/hear-annotate.yaml
 data:
@@ -29,6 +29,7 @@ data:
     
     import argparse
     import array
+    import copy
     import datetime as dt
     import io
     import json
@@ -170,9 +171,22 @@ data:
         }
     
     
+    TAG_SOURCES = (("audioset", "tags.jsonl"), ("birdnet", "tags-birdnet_v24.jsonl"))
+    
+    
+    def corpus_source_paths(corpus_root: str) -> Tuple[str, ...]:
+        """Every file the queue is derived from, in a fixed order.
+    
+        The cache below is keyed on these files' identity, so a file the queue reads and this tuple
+        does not name is a file whose change would never invalidate the cache.
+        """
+        clips = os.path.join(corpus_root, "clips")
+        return (index_path(corpus_root),) + tuple(os.path.join(clips, name) for _lane, name in TAG_SOURCES)
+    
+    
     def load_tags(corpus_root: str) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
         clips = os.path.join(corpus_root, "clips")
-        specs = (("audioset", "tags.jsonl"), ("birdnet", "tags-birdnet_v24.jsonl"))
+        specs = TAG_SOURCES
         out: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     
         for lane, name in specs:
@@ -336,6 +350,15 @@ data:
                 raise ValueError("submission_id was already used for a different annotation")
             return existing
     
+        def check(self) -> None:
+            """Raise if the annotation store cannot serve the endpoints that depend on it.
+    
+            The cheap half of what `/api/queue` used to prove incidentally: the database opens, the
+            table is there and it is readable. Bounded work whatever the corpus does.
+            """
+            with self._connect() as con:
+                con.execute("SELECT 1 FROM annotations LIMIT 1").fetchone()
+    
         def export_rows(self) -> List[Dict[str, Any]]:
             with self._connect() as con:
                 rows = con.execute(
@@ -428,28 +451,110 @@ data:
         return buf.getvalue(), meta
     
     
-    def build_queue(corpus_root: str, store: AnnotateStore, limit: int) -> List[Dict[str, Any]]:
+    def queue_rows(corpus_root: str) -> List[Dict[str, Any]]:
+        """Every stored clip as a queue row, in queue order, before the annotated ones are removed.
+    
+        This is the whole O(corpus) part of the queue: parsing both JSONL sources, scoring and
+        sorting. It depends only on files on the pool, never on the annotation database, which is
+        what lets `CorpusCache` hold it across requests and still answer exactly.
+        """
         idx = load_index(corpus_root)
         tags = load_tags(corpus_root)
-        annotated = store.annotated_keys()
         rows: List[Dict[str, Any]] = []
         for key, row in idx.items():
-            if key in annotated:
-                continue
             joined = tags.get(key, {})
-            pri = queue_priority(row, joined)
             rows.append({
                 "clip_key": key,
                 "path": row.get("path"),
                 "node": row.get("node"),
                 "ts_utc_s": row.get("ts_utc_s"),
                 "duration_s": row.get("dur_s"),
-                "priority": pri,
+                "priority": queue_priority(row, joined),
                 "top_prediction": top_prediction(joined),
                 "tags": joined,
             })
         rows.sort(key=lambda r: (-float(r["priority"]), str(r.get("ts_utc_s") or ""), r["clip_key"]))
-        return rows[:limit]
+        return rows
+    
+    
+    class CorpusCache:
+        """Parsed corpus index and queue ordering, invalidated by the source files themselves.
+    
+        ⚠️THE READINESS PROBE IS A QUEUE REQUEST'S COST, AND THE CORPUS ONLY GROWS. `/api/queue`
+        re-parsed `clips/index.jsonl` plus both tag JSONLs on EVERY request -- 1.19 s median at 1,878
+        clips, over the 1 s readiness timeout, so the pod holding the only human ground truth in the
+        system went NotReady and the tailnet UI went down. Raising the probe timeout only moves the
+        same cliff further out.
+    
+        Invalidation is the source files' own identity -- `(mtime_ns, size, inode, device)` for each
+        path in `corpus_source_paths` -- so an append by the drain, an atomic replace by the tagger,
+        a truncation or a deletion are all a cache miss on the next request. Nothing here decides
+        when to expire: there is no TTL, because a TTL would serve a clip that is already annotated
+        (or hide one that just arrived) for as long as it ran.
+    
+        ⚠️THE ANNOTATION DATABASE IS DELIBERATELY NOT CACHED. `build_queue` re-reads the annotated
+        keys on every request, so a clip labelled a millisecond ago is gone from the very next queue
+        even though no file on the pool changed. That query is indexed and small; the JSONL parse is
+        what was expensive.
+        """
+    
+        def __init__(self, corpus_root: str) -> None:
+            self.corpus_root = corpus_root
+            self._lock = threading.Lock()
+            self._fingerprint: Optional[Tuple[Any, ...]] = None
+            self._index: Dict[str, Dict[str, Any]] = {}
+            self._rows: List[Dict[str, Any]] = []
+            self.builds = 0
+    
+        def fingerprint(self) -> Tuple[Any, ...]:
+            out: List[Any] = []
+            for path in corpus_source_paths(self.corpus_root):
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    out.append(None)
+                else:
+                    out.append((st.st_mtime_ns, st.st_size, st.st_ino, st.st_dev))
+            return tuple(out)
+    
+        def _snapshot(self) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+            before = self.fingerprint()
+            with self._lock:
+                if self._fingerprint is not None and before == self._fingerprint:
+                    return self._index, self._rows
+                index = load_index(self.corpus_root)
+                rows = queue_rows(self.corpus_root)
+                self.builds += 1
+                # ⚠️A SOURCE THAT MOVED WHILE IT WAS BEING PARSED IS NOT CACHEABLE. The reader may
+                # have crossed a concurrent write, so this result is returned but not kept: the next
+                # request rebuilds rather than serving a torn parse indefinitely.
+                if self.fingerprint() == before:
+                    self._fingerprint, self._index, self._rows = before, index, rows
+                else:
+                    self._fingerprint = None
+                return index, rows
+    
+        def index(self) -> Dict[str, Dict[str, Any]]:
+            return self._snapshot()[0]
+    
+        def ordered_rows(self) -> List[Dict[str, Any]]:
+            return self._snapshot()[1]
+    
+    
+    def build_queue(corpus_root: str, store: AnnotateStore, limit: int,
+                    cache: Optional[CorpusCache] = None) -> List[Dict[str, Any]]:
+        rows = (cache if cache is not None else CorpusCache(corpus_root)).ordered_rows()
+        annotated = store.annotated_keys()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            if row["clip_key"] in annotated:
+                continue
+            # The cache owns these dicts across requests; hand out copies so a later caller cannot
+            # mutate what the next request will serve.
+            out.append(copy.deepcopy(row))
+            if len(out) >= limit:
+                break
+        return out
     
     
     INDEX_HTML = """<!doctype html>
@@ -516,20 +621,47 @@ data:
         app.state.trusted_proxies = set(trusted_proxies)
         app.state.corpus_root = corpus_root
         app.state.store = store
+        app.state.cache = CorpusCache(corpus_root)
     
         @app.get("/", response_class=HTMLResponse)
         def index() -> str:
             return INDEX_HTML
     
+        @app.get("/healthz")
+        def api_healthz() -> Response:
+            """Readiness: the dependencies the service cannot serve without, and nothing else.
+    
+            ⚠️THE READINESS PROBE USED TO BE `GET /api/queue?limit=1`, which measured the whole
+            corpus parse on every probe period. That is how a growing corpus took the service out:
+            1.19 s of honest work against a 1 s probe timeout. This endpoint opens the annotation
+            database and stats the corpus sources -- O(1) in the corpus -- and never builds a queue.
+    
+            ⚠️IT REPORTS A MISSING CORPUS INDEX, IT DOES NOT FAIL ON ONE. `/api/queue` answers 200
+            with an empty list when `clips/index.jsonl` is absent (an empty or not-yet-drained pool),
+            so failing readiness there would take the service DOWN in a case the old probe called
+            healthy. Only an unusable annotation store -- the thing that made the old probe 500 --
+            is unready.
+            """
+            try:
+                app.state.store.check()
+            except Exception:
+                return Response(content=json.dumps({"status": "unready", "database": "unavailable"}),
+                                status_code=503, media_type="application/json",
+                                headers={"Cache-Control": "no-store"})
+            return Response(
+                content=json.dumps({"status": "ok", "database": "ok",
+                                    "corpus_index": os.path.exists(index_path(app.state.corpus_root))}),
+                media_type="application/json", headers={"Cache-Control": "no-store"})
+    
         @app.get("/api/queue")
         def api_queue(limit: int = 25) -> Dict[str, Any]:
             limit = max(1, min(200, int(limit)))
-            clips = build_queue(app.state.corpus_root, app.state.store, limit)
+            clips = build_queue(app.state.corpus_root, app.state.store, limit, app.state.cache)
             return {"clips": clips, "count": len(clips)}
     
         @app.get("/api/audio/{clip_key}")
         def api_audio(clip_key: str) -> Response:
-            row = load_index(app.state.corpus_root).get(clip_key)
+            row = app.state.cache.index().get(clip_key)
             if not row:
                 raise HTTPException(status_code=404, detail="clip not found")
             try:
@@ -551,7 +683,7 @@ data:
     
         @app.post("/api/annotations")
         def api_annotate(ann: AnnotationIn, request: Request) -> Dict[str, Any]:
-            if ann.clip_key not in load_index(app.state.corpus_root):
+            if ann.clip_key not in app.state.cache.index():
                 raise HTTPException(status_code=404, detail="clip not found")
             user_id = user_from_headers(request, app.state.trusted_proxies)
             try:
