@@ -1,4 +1,4 @@
-# 0006 - The Phase 5 shadow-read comparator
+# 0007 - The Phase 5 shadow-read comparator
 
 - Status: proposed
 - Date: 2026-09-15

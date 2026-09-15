@@ -244,7 +244,7 @@
     "compare"
   ],
   "source_of_truth": "hear/verify/shadow_read.py",
-  "staged_reason": "Publishing under contracts/ regenerates docs/data/phase0-freeze-contracts.v1.json. The Phase 4 reconcile receipt is already staged in front of this one and is promoted first; promoting both at once would regenerate one hashed baseline from two lanes. Promotion is a move plus a baseline regeneration and no content change; see docs/decisions/0006-phase5-shadow-read-comparator.md.",
+  "staged_reason": "Publishing under contracts/ regenerates docs/data/phase0-freeze-contracts.v1.json. The Phase 4 reconcile receipt is already staged in front of this one and is promoted first; promoting both at once would regenerate one hashed baseline from two lanes. Promotion is a move plus a baseline regeneration and no content change; see docs/decisions/0007-phase5-shadow-read-comparator.md.",
   "status": "staged",
   "tolerances": {
     "backfill_settle_s": 86400,
