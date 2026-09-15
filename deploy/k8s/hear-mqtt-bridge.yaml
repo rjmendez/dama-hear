@@ -26,6 +26,13 @@ metadata:
       into the same dama:hear:* Redis schema hear-heartbeat.yaml's LAN receiver writes.
 spec:
   replicas: 1
+  # The bridge is a single writer: it owns one RWO PVC holding the SQLite durable
+  # outbox and connects with a fixed MQTT client id. A RollingUpdate would surge a
+  # second pod before the old one exits, producing SQLite lock contention and an
+  # MQTT client-id takeover loop (repeated rc=7 disconnect/reconnect). Recreate
+  # guarantees the old pod is fully gone before the replacement starts.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: hear-mqtt-bridge
