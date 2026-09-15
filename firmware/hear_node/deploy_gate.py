@@ -146,7 +146,7 @@ def auth_reasons(status, require_nvs_credentials=False, require_push_success=Fal
         reasons.append("status has no auth.admin block")
     else:
         if not admin.get("configured"):
-            reasons.append("auth.admin.configured is false; /update and /reboot will fail closed")
+            reasons.append("auth.admin.configured is false; only tokenless /update recovery is open")
         if require_nvs_credentials and admin.get("src") != "nvs":
             reasons.append("auth.admin.src=%r, not 'nvs'; a secret-free release would lose it" %
                            admin.get("src"))

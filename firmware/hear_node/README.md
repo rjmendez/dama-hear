@@ -37,6 +37,12 @@ To check a downloaded release directory offline before you touch a node:
 
     python3 firmware/hear_node/release_manifest.py verify --dist dist --tag <tag>
 
+They also record what the image IS: `image_class: unprovisioned`, no compiled-in credentials, and
+the four things (`node_id`, `wifi`, `admin_token`, `push_token`) the node must already hold in NVS.
+The release workflow refuses to build from a tree with `secrets.h`, and the installers refuse any
+asset claiming to carry credentials -- a fleet token in a public binary is a published fleet
+token. An unprovisioned image is not a node-ready image: see `docs/ota-release-credentials.md`.
+
 Roll forward and back with the same command shape: `flash.py <node> <ip> --release <tag>`. The
 images are immutable and NVS keeps the node name and Wi-Fi outside both OTA slots, so a rollback
 to an older clean tag does not require re-enrollment; it only swaps the app/boot artefacts.

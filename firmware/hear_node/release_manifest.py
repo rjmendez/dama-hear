@@ -18,6 +18,16 @@ sys.path.insert(0, str(HERE))
 import board_profiles  # noqa: E402
 
 MANIFEST_NAME = "release-manifest.json"
+# What a published image IS, as a field rather than as prose in the release notes. "unprovisioned"
+# is the only value a public GitHub release may carry: the image has no Wi-Fi credentials, no node
+# name, no admin token and no push token compiled into it, and a node supplies all four from its
+# NVS record. An asset that claimed anything else would be an asset with a live fleet credential
+# inside it, which is why generate refuses to write one.
+IMAGE_CLASS_UNPROVISIONED = "unprovisioned"
+PROVISIONING_REQUIRED = ("node_id", "wifi", "admin_token", "push_token")
+# A tree that still has secrets.h may have compiled it in. Refusing here is cheaper than
+# discovering it after the assets are public and the tokens have to be rotated across the fleet.
+SECRETS_HEADER = "firmware/hear_node/secrets.h"
 SCHEMA_NAME = "release-manifest.schema.json"
 SCHEMA_VERSION = 1
 MANIFEST_TYPE = "dama-hear-hear_node-release"
@@ -178,6 +188,13 @@ def load_build_info(path: pathlib.Path):
     missing = [k for k in required if k not in info]
     if missing:
         raise ValueError("build-info.json is missing %s" % ", ".join(missing))
+    image_class = info.get("image_class", IMAGE_CLASS_UNPROVISIONED)
+    if image_class != IMAGE_CLASS_UNPROVISIONED:
+        raise ValueError("build-info.json declares image_class=%r; a published release must be %r"
+                         % (image_class, IMAGE_CLASS_UNPROVISIONED))
+    if info.get("compiled_in_credentials"):
+        raise ValueError("build-info.json says the images carry compiled-in credentials; a public "
+                         "release asset must never contain a fleet token")
     return info
 
 
@@ -297,6 +314,10 @@ def build_manifest(repo_root: pathlib.Path, dist_dir: pathlib.Path, build_info_p
         dirty_reasons.append("source tree is dirty: %s" % ", ".join(state["dirty_paths"]))
     if dirty_reasons and not allow_dirty:
         raise ValueError("refusing unverifiable release manifest: %s" % "; ".join(dirty_reasons))
+    if (repo_root / SECRETS_HEADER).exists():
+        raise ValueError("refusing to publish a release built from a tree that still has %s: the "
+                         "images may carry compiled-in Wi-Fi credentials and fleet tokens"
+                         % SECRETS_HEADER)
 
     inputs = [_record_path(repo_root, rel, role=role) for rel, role in COMMON_INPUTS]
     generated_files = []
@@ -334,6 +355,11 @@ def build_manifest(repo_root: pathlib.Path, dist_dir: pathlib.Path, build_info_p
             "arduino_cli_version": build_info["arduino_cli"],
             "esp32_core_version": build_info["esp32_core"],
             "credentials_policy": build_info.get("credentials", ""),
+            # The installer contract, in the manifest the installer already verifies: this image
+            # is node-ready only for a node that already holds these four things in NVS.
+            "image_class": IMAGE_CLASS_UNPROVISIONED,
+            "compiled_in_credentials": False,
+            "provisioning_required": list(PROVISIONING_REQUIRED),
         },
         "inputs": inputs,
         "generated_files": generated_files,
@@ -471,6 +497,27 @@ def _check_hash(name: str, data: bytes, want: str):
         raise ValueError("%s sha256 %s, manifest says %s" % (name, got, want))
 
 
+def image_provisioning_refusal(manifest):
+    """Why a downloaded release image must not be installed at all, or None.
+
+    Not "does this node have credentials" -- that is the installer's question -- but "does this
+    PUBLIC ASSET claim to carry any". It must not. A release whose manifest says its images have
+    credentials compiled in is a release that published a fleet token, and installing it would
+    spread that token to every node that takes the update.
+    """
+    build = manifest.get("build")
+    if not isinstance(build, dict):
+        return None                     # legacy manifest: no claim either way
+    if build.get("compiled_in_credentials"):
+        return ("its manifest says the images carry compiled-in credentials; a public release "
+                "asset must never contain a fleet token")
+    image_class = build.get("image_class")
+    if image_class is not None and image_class != IMAGE_CLASS_UNPROVISIONED:
+        return ("its manifest declares image_class=%r, and this installer only installs %r images"
+                % (image_class, IMAGE_CLASS_UNPROVISIONED))
+    return None
+
+
 def verify_downloaded_release_assets(manifest_source, tag: str, board_class: str,
                                      assets: dict[str, bytes], psram_mode: str | None = None):
     try:
@@ -490,6 +537,9 @@ def verify_downloaded_release_assets(manifest_source, tag: str, board_class: str
     if not source.get("verifiable", True):
         raise ValueError("manifest is marked unverifiable: %s"
                          % "; ".join(source.get("refusals") or ["no reason given"]))
+    why = image_provisioning_refusal(manifest)
+    if why:
+        raise ValueError("refusing release %s: %s" % (tag, why))
     variant = _variant_lookup(manifest, board_class, psram_mode)
     expected = _artifact_index(variant, board_class)
     missing = sorted(set(assets) - set(expected))
@@ -529,6 +579,9 @@ def verify_release_directory(manifest_path: pathlib.Path, dist_dir: pathlib.Path
     if not source.get("verifiable", True):
         problems.append("manifest is marked unverifiable: %s"
                         % "; ".join(source.get("refusals") or ["no reason given"]))
+    why = image_provisioning_refusal(manifest)
+    if why:
+        problems.append("release %s: %s" % (manifest.get("tag"), why))
     if expected_psram_mode and not expected_board_class:
         problems.append("--psram-mode requires --board-class")
         variant_checks = []
@@ -669,6 +722,9 @@ def schema_document():
                     "arduino_cli_version": {"type": "string"},
                     "esp32_core_version": {"type": "string"},
                     "credentials_policy": {"type": "string"},
+                    "image_class": {"type": "string"},
+                    "compiled_in_credentials": {"type": "boolean"},
+                    "provisioning_required": {"type": "array", "items": {"type": "string"}},
                 },
                 "additionalProperties": True,
             },

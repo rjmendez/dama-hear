@@ -43,6 +43,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Every artifact this job uploads can become a release asset, so it must be unprovisioned by
+      # construction: no secrets.h anywhere in the tree it compiles. Asserted rather than assumed,
+      # because the failure mode is a fleet token published in a public binary.
+      - name: no compiled-in credentials in the build tree
+        run: |
+          found=$(find firmware -name secrets.h -not -name '*.example' -print)
+          if [ -n "$found" ]; then
+            echo "::error::secrets.h in the build tree: $found"
+            exit 1
+          fi
+
       - name: build_info.h (what /status reports as fw)
         run: |
           printf '#pragma once\n#ifndef FW_BUILD\n#define FW_BUILD "%s"\n#endif\n' \
