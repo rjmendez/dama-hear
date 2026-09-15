@@ -24,9 +24,15 @@ import wave
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
+
+try:
+    from pydantic import field_validator
+except ImportError:  # Pydantic 1 compatibility.
+    from pydantic import validator as field_validator
 
 RMS_TARGET_DBFS = -20.0
 PEAK_TARGET_DBFS = -1.0
@@ -73,9 +79,13 @@ def index_path(corpus_root: str) -> str:
 def safe_join(root: str, rel: str) -> str:
     if not isinstance(rel, str) or os.path.isabs(rel):
         raise ValueError("clip path is not relative")
-    full = os.path.abspath(os.path.join(root, rel))
-    base = os.path.abspath(root) + os.sep
-    if not full.startswith(base):
+    base = os.path.realpath(root)
+    full = os.path.realpath(os.path.join(base, rel))
+    try:
+        inside = os.path.commonpath((base, full)) == base
+    except ValueError:
+        inside = False
+    if not inside or full == base:
         raise ValueError("clip path escapes pool")
     return full
 
@@ -116,7 +126,12 @@ def normalize_prediction(row: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(item, dict):
                 label = (item.get("label") or item.get("name") or item.get("display_name")
                          or item.get("common_name") or item.get("scientific_name"))
-                score = _score_value(item.get("score") or item.get("prob") or item.get("p"))
+                raw_score = item.get("score")
+                if raw_score is None:
+                    raw_score = item.get("prob")
+                if raw_score is None:
+                    raw_score = item.get("p")
+                score = _score_value(raw_score)
             elif isinstance(item, (list, tuple)) and len(item) >= 2:
                 label, score = item[0], _score_value(item[1])
             else:
@@ -142,6 +157,7 @@ def load_tags(corpus_root: str) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
     clips = os.path.join(corpus_root, "clips")
     specs = (("audioset", "tags.jsonl"), ("birdnet", "tags-birdnet_v24.jsonl"))
     out: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+
     for lane, name in specs:
         for row in _read_jsonl(os.path.join(clips, name)):
             key = row.get("clip_key") or row.get("key")
@@ -160,7 +176,8 @@ def top_prediction(tags: Dict[str, List[Dict[str, Any]]]) -> Optional[Dict[str, 
                 continue
             cand = preds[0]
             score = -1.0 if cand.get("score") is None else float(cand["score"])
-            if best is None or score > float(best.get("score") or -1.0):
+            best_score = -1.0 if best is None or best.get("score") is None else float(best["score"])
+            if best is None or score > best_score:
                 best = {"label": cand["label"], "score": cand.get("score"), "model": row.get("model")}
     return best
 
@@ -198,7 +215,14 @@ class AnnotationIn(BaseModel):
     clip_key: str = Field(min_length=1, max_length=128)
     label: str = Field(min_length=1, max_length=128)
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
-    notes: str = ""
+    notes: str = Field(default="", max_length=4096)
+    submission_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+
+    @field_validator("clip_key", "label", "submission_id")
+    def reject_blank_text(cls, value):
+        if value is not None and not value.strip():
+            raise ValueError("must not be blank")
+        return value.strip() if value is not None else None
 
 
 @dataclass
@@ -227,11 +251,19 @@ class AnnotateStore:
                     confidence REAL NOT NULL,
                     notes TEXT NOT NULL DEFAULT '',
                     user_id TEXT NOT NULL,
+                    submission_id TEXT,
                     provenance TEXT NOT NULL CHECK (provenance = 'human'),
                     created_at TEXT NOT NULL
                 )
             """)
+            columns = {row[1] for row in con.execute("PRAGMA table_info(annotations)")}
+            if "submission_id" not in columns:
+                con.execute("ALTER TABLE annotations ADD COLUMN submission_id TEXT")
             con.execute("CREATE INDEX IF NOT EXISTS annotations_clip_key ON annotations(clip_key)")
+            con.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS annotations_submission_id "
+                "ON annotations(submission_id) WHERE submission_id IS NOT NULL"
+            )
 
     def annotated_keys(self) -> set[str]:
         with self._connect() as con:
@@ -240,17 +272,52 @@ class AnnotateStore:
     def append(self, ann: AnnotationIn, user_id: str) -> Dict[str, Any]:
         created = _utc_now()
         with self._lock, self._connect() as con:
-            cur = con.execute(
-                """INSERT INTO annotations
-                   (schema_version, clip_key, label, confidence, notes, user_id, provenance, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'human', ?)""",
-                (ANNOTATION_SCHEMA_VERSION, ann.clip_key, ann.label, float(ann.confidence),
-                 ann.notes, user_id, created),
-            )
-            rowid = int(cur.lastrowid)
+            if ann.submission_id:
+                existing = con.execute(
+                    """SELECT id, clip_key, label, confidence, notes, user_id, provenance, created_at
+                       FROM annotations WHERE submission_id = ?""",
+                    (ann.submission_id,),
+                ).fetchone()
+                if existing is not None:
+                    return self._existing_submission(existing, ann, user_id)
+            try:
+                cur = con.execute(
+                    """INSERT INTO annotations
+                       (schema_version, clip_key, label, confidence, notes, user_id, submission_id,
+                        provenance, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'human', ?)""",
+                    (ANNOTATION_SCHEMA_VERSION, ann.clip_key, ann.label, float(ann.confidence),
+                     ann.notes, user_id, ann.submission_id, created),
+                )
+                rowid = int(cur.lastrowid)
+            except sqlite3.IntegrityError:
+                if not ann.submission_id:
+                    raise
+                existing = con.execute(
+                    """SELECT id, clip_key, label, confidence, notes, user_id, provenance, created_at
+                       FROM annotations WHERE submission_id = ?""",
+                    (ann.submission_id,),
+                ).fetchone()
+                if existing is None:
+                    raise
+                return self._existing_submission(existing, ann, user_id)
         return {"id": rowid, "clip_key": ann.clip_key, "label": ann.label,
                 "confidence": float(ann.confidence), "notes": ann.notes, "user_id": user_id,
                 "provenance": "human", "created_at": created}
+
+    @staticmethod
+    def _existing_submission(row: sqlite3.Row, ann: AnnotationIn, user_id: str) -> Dict[str, Any]:
+        existing = dict(row)
+        requested = {
+            "clip_key": ann.clip_key,
+            "label": ann.label,
+            "confidence": float(ann.confidence),
+            "notes": ann.notes,
+            "user_id": user_id,
+        }
+        if any(existing[key] != value for key, value in requested.items()):
+            raise ValueError("submission_id was already used for a different annotation")
+        return existing
 
     def export_rows(self) -> List[Dict[str, Any]]:
         with self._connect() as con:
@@ -261,16 +328,15 @@ class AnnotateStore:
         return [dict(r) for r in rows]
 
 
-def user_from_headers(request: Request, explicit: Optional[str]) -> str:
-    for name in ("tailscale-user-login", "tailscale-user-name", "x-webauth-user",
-                 "x-forwarded-user"):
-        val = request.headers.get(name)
-        if val:
-            return val.strip()[:256]
-    if explicit:
-        return explicit.strip()[:256]
+def user_from_headers(request: Request, trusted_proxies: set[str]) -> str:
     client = request.client.host if request.client else "local"
-    return "local:%s" % client
+    if client in trusted_proxies:
+        for name in ("tailscale-user-login", "tailscale-user-name", "x-webauth-user",
+                     "x-forwarded-user"):
+            val = request.headers.get(name)
+            if val and val.strip():
+                return val.strip()[:256]
+    return "client:%s" % client
 
 
 def measure_samples(samples: array.array) -> Tuple[float, float]:
@@ -314,7 +380,10 @@ def normalize_wav_bytes(body: bytes) -> Tuple[bytes, Dict[str, Any]]:
         if w.getsampwidth() != 2 or w.getnchannels() != 1:
             raise ValueError("expected mono int16 WAV")
         fs = w.getframerate()
-        frames = w.readframes(w.getnframes())
+        frame_count = w.getnframes()
+        if frame_count <= 0:
+            raise ValueError("WAV contains no audio frames")
+        frames = w.readframes(frame_count)
     samples = array.array("h")
     samples.frombytes(frames)
     if sys.byteorder == "big":
@@ -378,7 +447,7 @@ INDEX_HTML = """<!doctype html>
 <section class="panel"><div class="controls row" style="margin-bottom:12px"><button id="playBtn" onclick="togglePlay()">▶ Play / Pause</button><button onclick="replayAudio()">↺ Replay</button><span id="stats" class="muted" style="margin-left:auto"></span></div><div id="wave" class="audio"></div><div id="spec" class="spec"></div></section>
 <section class="panel"><div class="actions row" id="actions"></div><p><textarea id="notes" placeholder="Notes"></textarea></p><div id="status" class="muted"></div></section></div>
 <script>
-let queue=[], current=null, ws=null, fetching=false, sessionCount=0;
+let queue=[], current=null, ws=null, fetching=false, saving=false, sessionCount=0, submissionId=null;
 const labels=[['1','confirm_top1'],['G','gunshot'],['2','empty_silence'],['3','ambiguous'],['D','dog'],['O','owl'],['B','bird'],['V','vehicle'],['H','helicopter']];
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function fetchMore(limit=50){if(fetching)return; fetching=true; try{const r=await fetch(`/api/queue?limit=${limit}`); const data=await r.json(); const existing=new Set(queue.map(c=>c.clip_key)); if(current) existing.add(current.clip_key); for(const c of (data.clips||[])){ if(!existing.has(c.clip_key)){ queue.push(c); existing.add(c.clip_key); } }}catch(e){console.error(e);}finally{fetching=false;}}
@@ -388,8 +457,8 @@ function togglePlay(){if(ws) ws.playPause();}
 function replayAudio(){if(ws){ws.seekTo(0); ws.play();}}
 function updatePlayBtn(){const btn=document.getElementById('playBtn'); if(!btn||!ws)return; btn.textContent=ws.isPlaying()?'⏸ Pause':'▶ Play / Pause';}
 function updateStats(){const el=document.getElementById('stats'); if(el) el.textContent=`Tagged this session: ${sessionCount} | Buffer: ${queue.length}`;}
-function nextClip(){if(queue.length<=5) fetchMore(50); current=queue.shift(); updateStats(); document.getElementById('notes').value=''; if(!current){document.getElementById('meta').innerHTML='<div class="empty">Queue complete! (All clips in corpus tagged)<br><br><button onclick="loadQueue()" style="padding:10px 16px;font-size:15px;cursor:pointer;border-radius:8px;background:#263d74;color:#fff;border:0;">🔄 Refresh Queue</button></div>'; if(ws) ws.destroy(); return;} document.getElementById('meta').textContent=`${current.clip_key} | ${current.node||'?'} | priority ${current.priority}`; badges(current); if(ws) ws.destroy(); ws=WaveSurfer.create({container:'#wave',waveColor:'#6688cc',progressColor:'#9ec1ff',height:120,url:`/api/audio/${encodeURIComponent(current.clip_key)}`}); ws.registerPlugin(WaveSurfer.Spectrogram.create({container:'#spec',labels:true,height:256})); ws.on('play',updatePlayBtn); ws.on('pause',updatePlayBtn); ws.on('finish',updatePlayBtn);}
-async function label(v){if(!current)return; let lab=v==='confirm_top1'?(current.top_prediction?.label||'confirm_top1'):v; let body={clip_key:current.clip_key,label:lab,confidence:v==='ambiguous'?0.4:1.0,notes:document.getElementById('notes').value}; let r=await fetch('/api/annotations',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); document.getElementById('status').innerHTML=r.ok?'<span class="ok">Saved</span>':'<span class="err">Save failed</span>'; if(r.ok){sessionCount++; nextClip();}}
+function nextClip(){if(queue.length<=5) fetchMore(50); current=queue.shift(); submissionId=current?(globalThis.crypto?.randomUUID?.()||`${Date.now()}-${Math.random()}`):null; updateStats(); document.getElementById('notes').value=''; if(!current){document.getElementById('meta').innerHTML='<div class="empty">Queue complete! (All clips in corpus tagged)<br><br><button onclick="loadQueue()" style="padding:10px 16px;font-size:15px;cursor:pointer;border-radius:8px;background:#263d74;color:#fff;border:0;">🔄 Refresh Queue</button></div>'; if(ws) ws.destroy(); return;} document.getElementById('meta').textContent=`${current.clip_key} | ${current.node||'?'} | priority ${current.priority}`; badges(current); if(ws) ws.destroy(); ws=WaveSurfer.create({container:'#wave',waveColor:'#6688cc',progressColor:'#9ec1ff',height:120,url:`/api/audio/${encodeURIComponent(current.clip_key)}`}); ws.registerPlugin(WaveSurfer.Spectrogram.create({container:'#spec',labels:true,height:256})); ws.on('play',updatePlayBtn); ws.on('pause',updatePlayBtn); ws.on('finish',updatePlayBtn);}
+async function label(v){if(!current||saving)return; saving=true; const item=current; const sid=submissionId; let lab=v==='confirm_top1'?(item.top_prediction?.label||'confirm_top1'):v; let body={clip_key:item.clip_key,label:lab,confidence:v==='ambiguous'?0.4:1.0,notes:document.getElementById('notes').value,submission_id:sid}; try{let r=await fetch('/api/annotations',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); document.getElementById('status').innerHTML=r.ok?'<span class="ok">Saved</span>':'<span class="err">Save failed</span>'; if(r.ok&&current===item){sessionCount++; nextClip();}}finally{saving=false;}}
 document.getElementById('actions').innerHTML=labels.map(x=>`<button class="${x[1]==='gunshot'?'gunshot-btn':''}" onclick="label('${x[1]}')"><kbd>${x[0]}</kbd> ${x[1]}</button>`).join('');
 document.addEventListener('keydown',e=>{if(e.target.tagName==='TEXTAREA')return; const k=e.key.toUpperCase(); if(e.code==='Space'){e.preventDefault(); togglePlay(); return;} const hit=labels.find(x=>x[0]===k); if(hit){e.preventDefault(); label(hit[1]);}});
 loadQueue().catch(e=>{document.getElementById('meta').textContent='Queue failed: '+e});
@@ -397,11 +466,37 @@ loadQueue().catch(e=>{document.getElementById('meta').textContent='Queue failed:
 """
 
 
-def create_app(pool: str = "/pool", db_path: Optional[str] = None) -> FastAPI:
+def create_app(
+    pool: str = "/pool",
+    db_path: Optional[str] = None,
+    cors_origins: Optional[List[str]] = None,
+    trusted_proxies: Optional[List[str]] = None,
+) -> FastAPI:
     corpus_root = resolve_corpus_root(pool)
     db = db_path or os.path.join(corpus_root, "annotations.sqlite3")
     store = AnnotateStore(db)
     app = FastAPI(title="DAMA Hear Annotate")
+    if cors_origins is None:
+        cors_origins = [
+            origin.strip()
+            for origin in os.environ.get("HEAR_ANNOTATE_CORS_ORIGINS", "").split(",")
+            if origin.strip()
+        ]
+    if cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["Content-Type"],
+            expose_headers=["X-Gain-Db", "X-Gain-Bound-By"],
+        )
+    if trusted_proxies is None:
+        trusted_proxies = [
+            address.strip()
+            for address in os.environ.get("HEAR_ANNOTATE_TRUSTED_PROXIES", "").split(",")
+            if address.strip()
+        ]
+    app.state.trusted_proxies = set(trusted_proxies)
     app.state.corpus_root = corpus_root
     app.state.store = store
 
@@ -426,8 +521,11 @@ def create_app(pool: str = "/pool", db_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(e))
         if not os.path.exists(path):
             raise HTTPException(status_code=410, detail="clip audio has been pruned")
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=422, detail="clip audio is not a regular file")
         try:
-            data, meta = normalize_wav_bytes(open(path, "rb").read())
+            with open(path, "rb") as fh:
+                data, meta = normalize_wav_bytes(fh.read())
         except (OSError, wave.Error, ValueError) as e:
             raise HTTPException(status_code=422, detail="cannot normalize WAV: %s" % e)
         headers = {"Cache-Control": "no-store", "X-Gain-Db": "%.2f" % meta["gain_db"],
@@ -435,11 +533,14 @@ def create_app(pool: str = "/pool", db_path: Optional[str] = None) -> FastAPI:
         return Response(content=data, media_type="audio/wav", headers=headers)
 
     @app.post("/api/annotations")
-    def api_annotate(ann: AnnotationIn, request: Request,
-                     x_hear_user: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    def api_annotate(ann: AnnotationIn, request: Request) -> Dict[str, Any]:
         if ann.clip_key not in load_index(app.state.corpus_root):
             raise HTTPException(status_code=404, detail="clip not found")
-        return app.state.store.append(ann, user_from_headers(request, x_hear_user))
+        user_id = user_from_headers(request, app.state.trusted_proxies)
+        try:
+            return app.state.store.append(ann, user_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/export")
     def api_export() -> Dict[str, Any]:

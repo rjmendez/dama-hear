@@ -32,3 +32,4 @@ def test_json_model_inference_matches_training_shape(tmp_path):
     assert probabilities.shape == (12,); assert np.all((probabilities >= 0) & (probabilities <= 1))
     path = tmp_path / 'model.json'; TG.export_json(model, path)
     assert path.exists() and TG.evaluate(features, labels, model)['accuracy'] >= .5
+

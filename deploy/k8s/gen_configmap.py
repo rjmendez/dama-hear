@@ -99,6 +99,7 @@ TAG_CODE = [
     # The tagger's model is 32 kHz and the fleet writes 16 and 48; resample.py is the only way
     # across, and it is also what refuses a rate nobody configured.
     ("hear_resample.py", "hear/resample.py"),
+    ("hear_infrasound.py", "hear/infrasound.py"),
     ("tools_hear_tag.py", "tools/hear_tag.py"),
 ]
 
