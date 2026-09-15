@@ -48,6 +48,10 @@ is a closed route kept for why it closed.
 The field captures are not redistributable. Point `DAMA_HEAR_REAL_WAV` at your own single-channel
 WAV to run the recorded-audio test.
 
+`tools/estimate_geometry_from_claps.py` is an **experimental** self-calibration probe: it tries
+to infer relative node geometry and clap positions from clap TDOA alone. It is for feasibility
+work only; production calibration still depends on surveyed geometry.
+
 ## CI and releases
 
 Every push to `main` and every pull request runs `.github/workflows/ci.yml` on GitHub-hosted
