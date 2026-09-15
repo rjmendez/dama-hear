@@ -2433,6 +2433,20 @@ static void gps_wait_ms(uint32_t ms) {
 }
 
 // Pumps until the socket can take STREAM_CHUNK_B without blocking. false: gone or stalled.
+//
+// ⚠️ALSO SERVICES THE RUNTIME WATCHDOG, and it is the only place in a transfer that does.
+// loop_wdt_arm(5000) (PR #175) put the loop task under a 5 s task_wdt, but http.handleClient()
+// runs the handlers from inside loop(), so every byte of a response is sent between two of
+// loop()'s boot_wdt_service() calls. A whole-file /sd fetch of a rolled CSV -- rankine's card
+// held an 11.6 MB scene-20260915.csv -- spends tens of seconds in the transfer loop below, so
+// v0.1.5 panicked with reset=task_wdt a few minutes into every */15 hear-drain window and the
+// drain saw TimeoutError for exactly those files.
+//
+// Servicing here and nowhere else is deliberate: every long handler (/sd, /ls, /audio, /perf)
+// gates each chunk on this function, so one call covers all of them, and nothing ELSE in those
+// loops is covered. A card read, a socket write or any other call that actually blocks never
+// reaches this line, so a real hang still panics on schedule. The no-progress case is bounded by
+// STREAM_STALL_MS below, which returns false and ends the response rather than spinning forever.
 static bool stream_ready(WiFiClient &c, uint64_t *due) {
   uint32_t t0 = millis();
   for (;;) {
