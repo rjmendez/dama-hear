@@ -1533,13 +1533,14 @@ struct Det { uint32_t sample; uint32_t pps_n; int32_t us_since_pps; int64_t utc_
 #define DET_RING_MIN  512         // smallest PSRAM ring taken; below it, DET_RING_INT internal
 #define DET_RING_INT  128
 #define DET_RING_BOOT 8           // until setup() allocates, and the last resort
-#define DETS_HTTP_MAX 128         // newest rows /detections serves
+#define DETS_HTTP_MAX 128         // legacy newest-N cap, and the max rows one cursor page serves
 static Det det_boot[DET_RING_BOOT];
 static Det *dets = det_boot;
 static uint32_t det_cap = DET_RING_BOOT;
 static uint32_t det_n = 0;        // total ever detected
 static uint32_t det_flushed = 0;  // total written to the card
 static uint32_t det_lost = 0;     // overwritten in the ring before they could be written
+static uint64_t det_boot_id = 0;  // one boot's cursor namespace; changes on every reboot
 // The card the node is on exposes a 40 MB FAT partition, ~20 MB of it free. That is ~50k
 // detections -- ample for a long run, but not infinite, and a full card fails by returning a short
 // write, not by raising anything. Counting failures is what stops a card that filled at 03:00
@@ -3098,7 +3099,81 @@ static void h_root() {
   http.send(200, "text/html", p);
 }
 static void h_status() { http.send(200, "application/json", status_json()); }
-static void h_dets() {
+static void det_cursor_text(char *out, size_t n, uint32_t pos) {
+  snprintf(out, n, "%016llx:%lu", (unsigned long long)det_boot_id, (unsigned long)pos);
+}
+static bool det_boot_epoch_us(int64_t *out) {
+  int64_t now_utc = 0;
+  if (!local_to_utc((uint64_t)esp_timer_get_time(), &now_utc)) return false;
+  uint64_t up_us = (uint64_t)(millis() - boot_ms) * 1000ULL;
+  *out = now_utc - (int64_t)up_us;
+  return true;
+}
+static bool det_parse_u32(const String &s, uint32_t *out) {
+  const char *p = s.c_str();
+  if (!p || !*p) return false;
+  char *end = NULL;
+  unsigned long v = strtoul(p, &end, 10);
+  if (!end || *end) return false;
+  *out = (uint32_t)v;
+  return true;
+}
+static int det_hex_nybble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+  if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+  return -1;
+}
+static bool det_parse_cursor(const String &s, uint64_t *boot, uint32_t *pos) {
+  const char *p = s.c_str();
+  if (!p || strlen(p) < 18) return false;   // 16 hex + ":" + digit
+  uint64_t b = 0;
+  for (int i = 0; i < 16; i++) {
+    int v = det_hex_nybble(p[i]);
+    if (v < 0) return false;
+    b = (b << 4) | (uint64_t)v;
+  }
+  if (p[16] != ':') return false;
+  String tail = String(p + 17);
+  uint32_t n = 0;
+  if (!det_parse_u32(tail, &n)) return false;
+  *boot = b; *pos = n;
+  return true;
+}
+static void det_bad_request(const char *detail) {
+  char msg[240];
+  snprintf(msg, sizeof msg,
+           "{\"contract\":\"cursor-v1\",\"error\":\"bad cursor request\",\"detail\":\"%s\"}",
+           detail);
+  http.send(400, "application/json", msg);
+}
+static void det_send_row(uint32_t k, const char *prefix) {
+  const Det &d = dets[k % det_cap];
+  char b[240];
+  snprintf(b, sizeof b, "%s{\"i\":%lu,\"utc_us\":%lld,\"uptime_s\":%lu,\"sample\":%lu,\"pps_n\":%lu,"
+                        "\"us_since_pps\":%ld,\"trigger\":%d,\"flags\":%u,\"fs_hz\":%.3f,"
+                        "\"frame_len\":%d,\"frame\":\"",
+           prefix, (unsigned long)k, (long long)d.utc_us,
+           (unsigned long)d.uptime_s, (unsigned long)d.sample,
+           (unsigned long)d.pps_n, (long)d.us_since_pps, d.trigger, (unsigned)d.flags, d.fs_at,
+           MELIMP_FRAME_BYTES);
+  http.sendContent(b);
+  static const char hx[] = "0123456789abcdef";
+  String frame;
+  frame.reserve(MELIMP_FRAME_BYTES * 2);
+  for (int j = 0; j < MELIMP_FRAME_BYTES; j++) {
+    frame += hx[d.frame[j] >> 4]; frame += hx[d.frame[j] & 0xF];
+  }
+  // ⚠️tools/hear_bridge.py's rows_from_detections() selects DETS_COLUMNS[:-1], so these two keys
+  // are dropped on that path until that list grows. They are here anyway: /detections is also
+  // read by hand, and the live ring is the only place a still-PENDING clip is visible at all.
+  char t[120];
+  char cp[80] = "";
+  if (d.clip_st == CLIP_OK) clip_name(cp, sizeof cp, d.cseq, d.sample);
+  snprintf(t, sizeof t, "\",\"clip\":\"%s\",\"clip_why\":\"%s\"}", cp, clip_why(d.clip_st));
+  http.sendContent(frame + t);
+}
+static void h_dets_legacy() {
   uint32_t total = det_n;
   uint32_t n = total < det_cap ? total : det_cap;
   if (n > DETS_HTTP_MAX) n = DETS_HTTP_MAX;
@@ -3106,32 +3181,113 @@ static void h_dets() {
   http.setContentLength(CONTENT_LENGTH_UNKNOWN);
   http.send(200, "application/json", "[");
   for (uint32_t k = first; k < total; k++) {
-    const Det &d = dets[k % det_cap];
-    char b[240];
-    snprintf(b, sizeof b, "%s{\"i\":%lu,\"utc_us\":%lld,\"uptime_s\":%lu,\"sample\":%lu,\"pps_n\":%lu,"
-                          "\"us_since_pps\":%ld,\"trigger\":%d,\"flags\":%u,\"fs_hz\":%.3f,"
-                          "\"frame_len\":%d,\"frame\":\"",
-             k == first ? "" : ",", (unsigned long)k, (long long)d.utc_us,
-             (unsigned long)d.uptime_s, (unsigned long)d.sample,
-             (unsigned long)d.pps_n, (long)d.us_since_pps, d.trigger, (unsigned)d.flags, d.fs_at,
-             MELIMP_FRAME_BYTES);
-    http.sendContent(b);
-    static const char hx[] = "0123456789abcdef";
-    String frame;
-    frame.reserve(MELIMP_FRAME_BYTES * 2);
-    for (int j = 0; j < MELIMP_FRAME_BYTES; j++) {
-      frame += hx[d.frame[j] >> 4]; frame += hx[d.frame[j] & 0xF];
-    }
-    // ⚠️tools/hear_bridge.py's rows_from_detections() selects DETS_COLUMNS[:-1], so these two keys
-    // are dropped on that path until that list grows. They are here anyway: /detections is also
-    // read by hand, and the live ring is the only place a still-PENDING clip is visible at all.
-    char t[120];
-    char cp[80] = "";
-    if (d.clip_st == CLIP_OK) clip_name(cp, sizeof cp, d.cseq, d.sample);
-    snprintf(t, sizeof t, "\",\"clip\":\"%s\",\"clip_why\":\"%s\"}", cp, clip_why(d.clip_st));
-    http.sendContent(frame + t);
+    det_send_row(k, k == first ? "" : ",");
   }
   http.sendContent("]");
+  http.sendContent("");
+}
+static void h_dets() {
+  if (!http.hasArg("cursor") && !http.hasArg("limit") && !http.hasArg("until")) {
+    h_dets_legacy();
+    return;
+  }
+  uint32_t total = det_n;
+  uint32_t held = total < det_cap ? total : det_cap;
+  uint32_t oldest = total - held;
+  uint32_t start = oldest;
+  uint32_t limit = DETS_HTTP_MAX;
+  uint32_t snap = total;
+  uint64_t req_boot = det_boot_id, until_boot = det_boot_id;
+  uint32_t req_pos = oldest, until_pos = total;
+  bool have_cursor = http.hasArg("cursor") && http.arg("cursor").length();
+  bool gap = false;
+  bool gap_reboot = false;
+  const char *gap_kind = "";
+  uint32_t gap_lost = 0;
+  if (http.hasArg("limit")) {
+    if (!det_parse_u32(http.arg("limit"), &limit) || limit == 0) {
+      det_bad_request("limit must be a positive integer");
+      return;
+    }
+    if (limit > DETS_HTTP_MAX) limit = DETS_HTTP_MAX;
+  }
+  if (have_cursor) {
+    if (!det_parse_cursor(http.arg("cursor"), &req_boot, &req_pos)) {
+      det_bad_request("cursor must be <16 hex boot id>:<uint32>");
+      return;
+    }
+    start = req_pos;
+  }
+  if (http.hasArg("until") && http.arg("until").length()) {
+    if (!det_parse_cursor(http.arg("until"), &until_boot, &until_pos)) {
+      det_bad_request("until must be <16 hex boot id>:<uint32>");
+      return;
+    }
+    if (until_boot != det_boot_id) {
+      det_bad_request("until names a different boot");
+      return;
+    }
+    if (until_pos < snap) snap = until_pos;
+  }
+  if (have_cursor && req_boot != det_boot_id) {
+    gap = true; gap_reboot = true; gap_kind = "reboot"; gap_lost = oldest; start = oldest;
+  } else if (start < oldest) {
+    gap = true; gap_kind = "overrun"; gap_lost = oldest - start; start = oldest;
+  }
+  if (start > snap) snap = start;
+  if (start > total) {
+    det_bad_request("cursor is ahead of this boot's next row");
+    return;
+  }
+  uint32_t end = start + limit;
+  if (end < start || end > snap) end = snap;
+  char until_cur[32], oldest_cur[32], newest_cur[32], next_cur[32];
+  det_cursor_text(until_cur, sizeof until_cur, snap);
+  det_cursor_text(next_cur, sizeof next_cur, end);
+  bool have_rows = held > 0;
+  bool have_newest = total > 0;
+  if (have_rows) det_cursor_text(oldest_cur, sizeof oldest_cur, oldest);
+  if (have_newest) det_cursor_text(newest_cur, sizeof newest_cur, total - 1);
+  int64_t boot_epoch_us = 0;
+  bool boot_epoch_ok = det_boot_epoch_us(&boot_epoch_us);
+  char boot_epoch_json[32];
+  if (boot_epoch_ok) snprintf(boot_epoch_json, sizeof boot_epoch_json, "%lld", (long long)boot_epoch_us);
+  else snprintf(boot_epoch_json, sizeof boot_epoch_json, "null");
+  char cursor_json[80] = "null";
+  char oldest_json[40] = "null";
+  char newest_json[40] = "null";
+  if (have_cursor) snprintf(cursor_json, sizeof cursor_json, "\"%s\"", http.arg("cursor").c_str());
+  if (have_rows) snprintf(oldest_json, sizeof oldest_json, "\"%s\"", oldest_cur);
+  if (have_newest) snprintf(newest_json, sizeof newest_json, "\"%s\"", newest_cur);
+  http.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  http.send(200, "application/json", "{");
+  char head[640];
+  snprintf(head, sizeof head,
+           "\"contract\":\"cursor-v1\",\"node\":\"%s\",\"boot_id\":\"%016llx\","
+           "\"boot_epoch_us\":%s,\"cursor\":%s,\"oldest_cursor\":%s,\"newest_cursor\":%s,"
+           "\"next_cursor\":\"%s\",\"until_cursor\":\"%s\",\"limit\":%lu,\"returned\":%lu,"
+           "\"has_more\":%s",
+           node_id, (unsigned long long)det_boot_id,
+           boot_epoch_json, cursor_json, oldest_json, newest_json,
+           next_cur, until_cur, (unsigned long)limit, (unsigned long)(end - start),
+           end < snap ? "true" : "false");
+  http.sendContent(head);
+  if (gap) {
+    char req_cur[32], resume_cur[32], gb[320];
+    det_cursor_text(req_cur, sizeof req_cur, req_pos);
+    det_cursor_text(resume_cur, sizeof resume_cur, start);
+    snprintf(gb, sizeof gb,
+             ",\"gap\":{\"kind\":\"%s\",\"lost_rows\":%lu,\"requested_cursor\":\"%s\","
+             "\"resume_cursor\":\"%s\"%s}",
+             gap_kind, (unsigned long)gap_lost, have_cursor ? http.arg("cursor").c_str() : req_cur,
+             resume_cur, gap_reboot ? ",\"previous_boot_unmeasured\":true" : "");
+    http.sendContent(gb);
+  } else {
+    http.sendContent(",\"gap\":null");
+  }
+  http.sendContent(",\"rows\":[");
+  for (uint32_t k = start; k < end; k++) det_send_row(k, k == start ? "" : ",");
+  http.sendContent("]}");
   http.sendContent("");
 }
 
@@ -3435,6 +3591,8 @@ void setup() {
   Serial.setTxTimeoutMs(50);
   delay(1500);
   boot_ms = millis();
+  det_boot_id = ((uint64_t)esp_random() << 32) ^ (uint64_t)esp_random();
+  if (!det_boot_id) det_boot_id = 1;
   logf("boot  attempt %lu on partition %s\n", (unsigned long)hear_boot_try(),
                 esp_ota_get_running_partition()->label);
   node_identity();          // before anything logs or joins: the id names the log and the AP

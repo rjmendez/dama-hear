@@ -3,6 +3,7 @@
 No HTTP: /status, /sd, /ls and /detections are served by a fake, as in tests/test_hear_drain.py.
 """
 import json
+import math
 import os
 import sys
 
@@ -65,7 +66,7 @@ class CardlessNode(FakeNode):
                    "pos": dict(POS), "gps": {"fix": 3}, "audio": {"detections": self.det_n}})
         return st
 
-    def detections(self, ip, timeout=None):
+    def detections(self, ip, timeout=None, cursor=None, limit=None, until=None):
         self.detection_calls += 1
         return json.dumps(self.ring[-HD.LIVE_RING_HTTP_MAX:]).encode()
 
@@ -77,8 +78,83 @@ class TruncatingNode(CardlessNode):
         super().__init__(**kw)
         self.cap = cap
 
-    def detections(self, ip, timeout=None):
+    def detections(self, ip, timeout=None, cursor=None, limit=None, until=None):
         return super().detections(ip, timeout)[:self.cap]
+
+
+class CursorNode(CardlessNode):
+    """A firmware page that walks the whole ring by cursor while bare `/detections` stays legacy."""
+
+    def __init__(self, ring_cap=1024, boot_id="00000000000000a1", grow_after=None, **kw):
+        super().__init__(**kw)
+        self.ring_cap = ring_cap
+        self.boot_id = boot_id
+        self.grow_after = dict(grow_after or {})
+
+    def reboot(self):
+        super().reboot()
+        self.boot_id = "%016x" % ((int(self.boot_id, 16) + 1) & ((1 << 64) - 1) or 1)
+        return self
+
+    def _page(self, cursor, limit, until):
+        total = self.det_n
+        held = min(total, self.ring_cap)
+        oldest = total - held
+        start = oldest
+        gap = None
+        if limit is None:
+            limit = HD.LIVE_RING_HTTP_MAX
+        if cursor is not None:
+            boot, start = HD.parse_live_cursor(cursor)
+            if boot != self.boot_id:
+                gap = {"kind": "reboot", "lost_rows": oldest, "requested_cursor": cursor,
+                       "resume_cursor": HD.live_ring_cursor(self.boot_id, oldest),
+                       "previous_boot_unmeasured": True}
+                start = oldest
+            elif start < oldest:
+                gap = {"kind": "overrun", "lost_rows": oldest - start, "requested_cursor": cursor,
+                       "resume_cursor": HD.live_ring_cursor(self.boot_id, oldest)}
+                start = oldest
+        snap = total
+        if until is not None:
+            boot, snap = HD.parse_live_cursor(until)
+            assert boot == self.boot_id
+            snap = min(snap, total)
+        if start > snap:
+            snap = start
+        end = min(snap, start + int(limit))
+        rows = [dict(r) for r in self.ring if start <= r["i"] < end]
+        return {
+            "contract": HD.LIVE_RING_CURSOR_CONTRACT,
+            "node": self.node,
+            "boot_id": self.boot_id,
+            "boot_epoch_us": self.boot_epoch_us,
+            "cursor": cursor,
+            "oldest_cursor": None if not held else HD.live_ring_cursor(self.boot_id, oldest),
+            "newest_cursor": None if total == 0 else HD.live_ring_cursor(self.boot_id, total - 1),
+            "next_cursor": HD.live_ring_cursor(self.boot_id, end),
+            "until_cursor": HD.live_ring_cursor(self.boot_id, snap),
+            "limit": int(limit),
+            "returned": len(rows),
+            "has_more": end < snap,
+            "gap": gap,
+            "rows": rows,
+        }
+
+    def detections(self, ip, timeout=None, cursor=None, limit=None, until=None):
+        self.detection_calls += 1
+        if cursor is None and limit is None and until is None:
+            return super().detections(ip, timeout)
+        body = json.dumps(self._page(cursor, limit, until)).encode()
+        if self.detection_calls in self.grow_after:
+            self.tick(1).fire(self.grow_after[self.detection_calls])
+        return body
+
+
+class BrokenCursorNode(CardlessNode):
+    def detections(self, ip, timeout=None, cursor=None, limit=None, until=None):
+        self.detection_calls += 1
+        return b'{"contract":"cursor-v1","rows":"not-a-list"}'
 
 
 @pytest.fixture
@@ -208,6 +284,7 @@ class TestCardlessDrain:
         assert code == 0, lines
         assert "scene n/a (no card)" in line and "clips n/a (no card)" in line
         assert "NEVER" not in line and "live ring 8 row(s) read, +5 new over 2 run(s)" in line
+        assert "/ 2 page(s) (legacy)" in line
 
     def test_check_fails_on_a_live_ring_loss(self, tmp_path, cardless):
         root = str(tmp_path / "pool")
@@ -242,3 +319,100 @@ def test_a_truncated_live_ring_frame_is_counted_not_stored(tmp_path):
     e = pl.ingest_detections_json(str(p), default_node="gold")
     assert (e["rows"], e["added"], e["skip_reasons"]) == (2, 1, {"frame_len_mismatch": 1})
     assert pl.ingest_detections_json(str(p), default_node="gold")["added"] == 0
+
+
+class TestCursorDrain:
+    def test_cursor_paginates_the_whole_ring_in_one_run(self, tmp_path, cardless):
+        pl = P.Pool(str(tmp_path / "pool"))
+        n = cardless(cls=CursorNode)
+        _run(pl, n, T)  # seed cursor at 0 so the next run is measured, not a first sighting
+        r = _run(pl, n.tick(900).fire(260), T + 900)
+        assert r["ok"] and r["added"] == 260
+        assert r["live_ring_rows"] == 260
+        assert r["live_ring_lost"] == 0
+        assert r["live_ring_mode"] == HD.LIVE_RING_CURSOR_CONTRACT
+        assert r["live_ring_pages"] == math.ceil(260 / HD.LIVE_RING_HTTP_MAX)
+        assert r["live_ring_pending"] == 0
+
+    def test_cursor_snapshot_is_deterministic_and_leaves_later_rows_for_the_next_run(
+            self, tmp_path, cardless):
+        pl = P.Pool(str(tmp_path / "pool"))
+        n = cardless(cls=CursorNode, grow_after={2: 50})  # 2nd call = 1st paged call after the seed
+        _run(pl, n, T)
+        r1 = _run(pl, n.tick(900).fire(200), T + 900)
+        r2 = _run(pl, n.tick(900), T + 1800)
+        assert r1["added"] == 200 and r1["live_ring_pending"] == 0
+        assert r2["added"] == 50 and r2["live_ring_lost"] == 0
+
+    def test_cursor_overrun_is_explicit_and_counted(self, tmp_path, cardless):
+        pl = P.Pool(str(tmp_path / "pool"))
+        n = cardless(cls=CursorNode, ring_cap=16)
+        _run(pl, n, T)
+        r = _run(pl, n.tick(900).fire(40), T + 900)
+        assert r["added"] == 16
+        assert r["live_ring_lost"] == 24
+        assert r["live_ring_gap"]["kind"] == "overrun"
+        assert "aged behind" in r["live_ring_reason"]
+
+    def test_cursor_reboot_is_explicit_and_counts_current_boot_rows_that_aged_out(
+            self, tmp_path, cardless):
+        pl = P.Pool(str(tmp_path / "pool"))
+        n = cardless(cls=CursorNode, ring_cap=16)
+        _run(pl, n, T)
+        _run(pl, n.tick(900).fire(3), T + 900)
+        n.reboot().tick(400).fire(20)
+        r = _run(pl, n, T + 1800)
+        assert r["live_ring_lost"] == 4
+        assert r["live_ring_gap"]["kind"] == "reboot"
+        assert ("previous boot are unmeasured"
+                in r["live_ring_reason"].replace("the previous boot", "previous boot"))
+
+    def test_cursor_empty_ring_is_a_measured_zero(self, tmp_path, cardless):
+        pl = P.Pool(str(tmp_path / "pool"))
+        r = _run(pl, cardless(cls=CursorNode), T)
+        assert r["ok"] and r["added"] == 0
+        assert (r["live_ring_rows"], r["live_ring_lost"], r["live_ring_pages"]) == (0, 0, 1)
+
+    def test_cursor_node_keeps_the_legacy_array_for_a_bare_request(self, cardless):
+        n = cardless(cls=CursorNode).fire(3)
+        assert isinstance(json.loads(n.detections("10.0.0.9").decode()), list)
+        page = json.loads(n.detections("10.0.0.9", cursor=HD.live_ring_cursor(n.boot_id, 0),
+                                       limit=2).decode())
+        assert page["contract"] == HD.LIVE_RING_CURSOR_CONTRACT
+
+    def test_a_malformed_cursor_page_fails_cleanly(self, tmp_path, cardless):
+        pl = P.Pool(str(tmp_path / "pool"))
+        r = _run(pl, cardless(cls=BrokenCursorNode).fire(1), T)
+        assert not r["ok"]
+        assert "detections:" in r["errors"][0]
+
+
+class TestCursorParsing:
+    def test_parse_live_ring_salvages_a_truncated_cursor_page(self):
+        n = CardlessNode().fire(2)
+        body = {
+            "contract": HD.LIVE_RING_CURSOR_CONTRACT,
+            "node": "gold",
+            "boot_id": "00000000000000a1",
+            "boot_epoch_us": 1788900000000000,
+            "cursor": HD.live_ring_cursor("00000000000000a1", 0),
+            "oldest_cursor": HD.live_ring_cursor("00000000000000a1", 0),
+            "newest_cursor": HD.live_ring_cursor("00000000000000a1", 1),
+            "next_cursor": HD.live_ring_cursor("00000000000000a1", 2),
+            "until_cursor": HD.live_ring_cursor("00000000000000a1", 2),
+            "limit": 128,
+            "returned": 2,
+            "has_more": False,
+            "gap": None,
+            "rows": [n.ring[0], n.ring[1]],
+        }
+        text = json.dumps(body)
+        cut = text[:-2].rfind("}") + 1
+        got = HD.parse_live_ring(text[:cut].encode())
+        assert got["truncated"] == cut
+        assert got["returned"] == 2
+
+    def test_parse_live_ring_rejects_a_malformed_cursor_object(self):
+        bad = b'{"contract":"cursor-v1","boot_id":"00000000000000a1","rows":"nope"}'
+        with pytest.raises(ValueError):
+            HD.parse_live_ring(bad)

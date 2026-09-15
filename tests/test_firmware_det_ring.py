@@ -45,6 +45,7 @@ def _strip(src, strings=False):
 
 
 CODE = _strip(INO.read_text())
+SRC = _strip(INO.read_text(), strings=True)
 
 
 def _block(code, i):
@@ -64,6 +65,12 @@ def _fn(name):
     m = re.search(r"^(?:static\s+)?[\w:*&<> ]+?\b%s\s*\([^;{]*\)\s*\{" % re.escape(name), CODE, re.M)
     assert m, "%s() not found" % name
     return _block(CODE, m.end() - 1)
+
+
+def _fn_src(name):
+    m = re.search(r"^(?:static\s+)?[\w:*&<> ]+?\b%s\s*\([^;{]*\)\s*\{" % re.escape(name), SRC, re.M)
+    assert m, "%s() not found" % name
+    return _block(SRC, m.end() - 1)
 
 
 def _defines():
@@ -270,17 +277,39 @@ def test_every_slot_is_addressed_through_the_runtime_capacity():
     assert bounds == {"det_cap"}, bounds
 
 
-def test_the_detections_endpoint_stays_bounded():
-    """/detections caps the number of rows even though the body is streamed."""
-    b = _fn("h_dets")
+def test_the_legacy_detections_endpoint_stays_bounded():
+    """/detections with no query args still serves the newest fixed-size page."""
+    b = _fn("h_dets_legacy")
     m = re.search(r"if \(n > (\w+)\) n = \1;", b)
     assert m, "h_dets is not capped by a fixed count"
     assert _val(m.group(1)) <= OLD_RING
 
 
-def test_the_detections_endpoint_streams_without_one_growing_body():
-    b = _fn("h_dets")
+def test_the_legacy_detections_endpoint_streams_without_one_growing_body():
+    b = _fn("h_dets_legacy")
     assert "CONTENT_LENGTH_UNKNOWN" in b
-    assert b.count("sendContent") >= 3
+    assert "det_send_row(" in b
+    assert b.count("sendContent") >= 2
     assert "o.reserve(" not in b
     assert "http.send(200, \"application/json\", o)" not in b
+
+
+def test_the_cursor_mode_preserves_the_legacy_array_when_no_one_asks_for_more():
+    b = _fn_src("h_dets")
+    assert '!http.hasArg("cursor") && !http.hasArg("limit") && !http.hasArg("until")' in b
+    assert "h_dets_legacy();" in b
+
+
+def test_the_cursor_mode_names_the_resume_contract_and_keeps_rows_last_for_salvage():
+    b = _fn_src("h_dets")
+    for field in ("contract", "cursor-v1", "boot_id", "boot_epoch_us", "oldest_cursor",
+                  "newest_cursor", "next_cursor", "until_cursor", "gap", "rows"):
+        assert field in b, field
+    assert b.rfind('\\"rows\\":[') > b.rfind('\\"gap\\"'), "rows must be the last large field"
+
+
+def test_the_cursor_mode_bounds_each_page_and_refuses_bad_query_args():
+    b = _fn_src("h_dets")
+    assert "limit > DETS_HTTP_MAX" in b
+    assert b.count("det_bad_request(") >= 3
+    assert "cursor is ahead of this boot's next row" in b
