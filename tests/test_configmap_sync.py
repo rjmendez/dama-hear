@@ -777,3 +777,80 @@ class TestTheEmbeddedConfigMaps:
         assert live_data == want, (
             "live %s is stamped with this checkout's source digest but %s differ, so the object "
             "in the cluster was edited outside the generator" % (bundle, drifted))
+
+
+class TestTheDeploymentChecksumForcesARestart:
+    """R-mach: a subPath ConfigMap mount does not live-update a running pod.
+
+    mach's hear/event rows kept failing "time must be an object" for two hours after #203
+    (ffd2054) was merged and hear-mqtt-bridge-code.yaml regenerated and applied, because the
+    already-running bridge pod's two code files are subPath-mounted (see hear-mqtt-bridge.yaml)
+    -- a mount shape kubelet's own ConfigMap sync deliberately does not update in place -- and
+    nothing forced that pod to restart. The fix had shipped and was invisible from the cluster.
+
+    DEPLOYMENT_CHECKSUM_TARGETS pairs a bundle with the manifest whose pod-template annotations
+    carry a `checksum/<bundle>` value equal to that bundle's own `source_digest()`. Regenerating
+    the bundle changes the digest, which changes the pod template, which is what makes `kubectl
+    apply -f <manifest>` actually roll the pod instead of only rewriting the ConfigMap object.
+    """
+
+    @pytest.mark.parametrize("bundle", sorted(_gen()["DEPLOYMENT_CHECKSUM_TARGETS"]))
+    def test_the_checksum_annotation_matches_the_bundles_source_digest(self, bundle):
+        gen = _gen()
+        manifest = gen["DEPLOYMENT_CHECKSUM_TARGETS"][bundle]
+        _app, code, data = gen["BUNDLES"][bundle]
+        want = gen["source_digest"](code, data)
+        docs = list(yaml.safe_load_all((ROOT / manifest).read_text()))
+        dep = next(d for d in docs if d["kind"] == "Deployment")
+        annotations = dep["spec"]["template"]["metadata"]["annotations"]
+        got = annotations["checksum/%s" % bundle]
+        assert got == want, (
+            "%s's checksum/%s annotation (%r) does not match the current source digest (%r) -- "
+            "the pod template will not change on the next regeneration, so an already-running "
+            "pod would not restart. Regenerate:\n"
+            "    python3 deploy/k8s/gen_configmap.py %s > deploy/k8s/%s.yaml"
+            % (manifest, bundle, got, want, bundle, bundle))
+
+    @pytest.mark.parametrize("bundle", sorted(_gen()["DEPLOYMENT_CHECKSUM_TARGETS"]))
+    def test_syncing_an_unchanged_digest_touches_nothing(self, bundle, tmp_path):
+        gen = _gen()
+        manifest = gen["DEPLOYMENT_CHECKSUM_TARGETS"][bundle]
+        src = ROOT / manifest
+        work = tmp_path / src.name
+        work.write_text(src.read_text())
+        # sync_deployment_checksum() resolves paths under gen_configmap.py's own ROOT, so point
+        # it at a scratch copy directly rather than trying to relocate ROOT itself.
+        before = work.read_text()
+        _app, code, data = gen["BUNDLES"][bundle]
+        digest = gen["source_digest"](code, data)
+        real_root, real_targets = gen["ROOT"], gen["DEPLOYMENT_CHECKSUM_TARGETS"]
+        gen["ROOT"] = str(tmp_path)
+        gen["DEPLOYMENT_CHECKSUM_TARGETS"] = {bundle: work.name}
+        try:
+            changed = gen["sync_deployment_checksum"](bundle, digest)
+        finally:
+            gen["ROOT"], gen["DEPLOYMENT_CHECKSUM_TARGETS"] = real_root, real_targets
+        assert changed is False
+        assert work.read_text() == before
+
+    @pytest.mark.parametrize("bundle", sorted(_gen()["DEPLOYMENT_CHECKSUM_TARGETS"]))
+    def test_syncing_a_changed_digest_rewrites_only_that_one_line(self, bundle, tmp_path):
+        gen = _gen()
+        manifest = gen["DEPLOYMENT_CHECKSUM_TARGETS"][bundle]
+        src = ROOT / manifest
+        work = tmp_path / src.name
+        work.write_text(src.read_text())
+        before_lines = work.read_text().split("\n")
+        gen["ROOT"] = str(tmp_path)
+        real_targets = gen["DEPLOYMENT_CHECKSUM_TARGETS"]
+        gen["DEPLOYMENT_CHECKSUM_TARGETS"] = {bundle: work.name}
+        try:
+            changed = gen["sync_deployment_checksum"](bundle, "deadbeef" * 8)
+        finally:
+            gen["DEPLOYMENT_CHECKSUM_TARGETS"] = real_targets
+        assert changed is True
+        after_lines = work.read_text().split("\n")
+        assert len(after_lines) == len(before_lines)
+        diff = [i for i, (a, b) in enumerate(zip(before_lines, after_lines)) if a != b]
+        assert len(diff) == 1, "expected exactly one changed line, got %r" % diff
+        assert "checksum/%s: 'deadbeef" % bundle in after_lines[diff[0]]

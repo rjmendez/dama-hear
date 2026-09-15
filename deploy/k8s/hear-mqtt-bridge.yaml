@@ -40,6 +40,16 @@ spec:
     metadata:
       labels:
         app: hear-mqtt-bridge
+      annotations:
+        # Forces a new ReplicaSet (Recreate: a full pod restart) whenever
+        # hear-mqtt-bridge-code.yaml's content changes. Both volumeMounts below use
+        # subPath, which kubelet's ConfigMap sync does not live-update -- without this
+        # annotation changing too, `kubectl apply -f hear-mqtt-bridge-code.yaml` alone
+        # updates only the ConfigMap object and the already-running pod keeps executing
+        # whatever code it started with, indefinitely. Kept in sync by
+        # deploy/k8s/gen_configmap.py (DEPLOYMENT_CHECKSUM_TARGETS) whenever the bundle
+        # is regenerated; see tests/test_configmap_sync.py for the guard.
+        checksum/hear-mqtt-bridge-code: '2a1d9d91069c79ed0775299b0cb0d73b547943e0cbebbc65acce4f97faa14164'
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
