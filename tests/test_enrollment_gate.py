@@ -87,3 +87,14 @@ def test_a_fully_healthy_fresh_live_report_passes(monkeypatch):
     monkeypatch.setattr(enroll.urllib.request, "urlopen",
                         lambda *args, **kwargs: _Resp(json.dumps(good).encode()))
     assert enroll.main(["gold", "/dev/ttyACM0", "--no-flash"]) == 0
+
+
+def test_a_quiet_mic_state_is_accepted_during_the_compatibility_window(monkeypatch):
+    monkeypatch.setattr(enroll.wifi_store, "read_pairs", lambda _: [("field-net", "correcthorse")])
+    monkeypatch.setattr(enroll, "exchange", lambda *args, **kwargs: "172.16.100.50")
+    quiet = {"node": "gold", "fw": "v0.1.0", "prov": {"src": "nvs", "nets": 1, "nvs": True},
+             "selftest": {"mic": "ok", "mic_state": "quiet", "mic_reason": "low_variation",
+                           "gps": "ok", "pps": "ok", "wifi": "ok"}}
+    monkeypatch.setattr(enroll.urllib.request, "urlopen",
+                        lambda *args, **kwargs: _Resp(json.dumps(quiet).encode()))
+    assert enroll.main(["gold", "/dev/ttyACM0", "--no-flash"]) == 0

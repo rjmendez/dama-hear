@@ -188,6 +188,16 @@ class TestStatusParsing:
     def test_sd_free_space_is_read(self):
         assert H.parse_status(self._status(sd_free_mb=42))["sd_free_mb"] == 42
 
+    def test_explicit_mic_diagnostics_are_read_when_present(self):
+        s = H.parse_status(self._status(selftest={
+            "mic": "ok",
+            "mic_state": "quiet",
+            "mic_reason": "low_variation",
+        }))
+        assert s["mic"] == "ok"
+        assert s["mic_state"] == "quiet"
+        assert s["mic_reason"] == "low_variation"
+
     def test_gps_summary_carries_the_protocol_scale(self):
         pmtk = H.parse_status(self._status(**{
             "class": "esp32s3-i2s-gps",
@@ -296,6 +306,33 @@ class TestHealthEvaluation:
         r = H.evaluate_health("n", self._status(pps={"edges": 500, "spread_us": 4, "glitches": 2}))
         assert r["state"] == "degraded"
         assert "2 pps glitch(es)" in r["reasons"]
+
+    def test_quiet_mic_state_is_not_treated_as_hardware_failure(self):
+        r = H.evaluate_health("n", self._status(selftest={
+            "mic": "ok",
+            "mic_state": "quiet",
+            "mic_reason": "low_variation",
+        }))
+        assert r["state"] == "online"
+        assert all("mic=" not in why for why in r["reasons"])
+
+    def test_explicit_capture_failure_is_degraded_with_its_reason(self):
+        r = H.evaluate_health("n", self._status(selftest={
+            "mic": "silent",
+            "mic_state": "capture-failure",
+            "mic_reason": "no_samples",
+        }))
+        assert r["state"] == "degraded"
+        assert "mic=capture-failure (legacy silent): no_samples" in r["reasons"]
+
+    def test_explicit_floating_state_is_degraded(self):
+        r = H.evaluate_health("n", self._status(selftest={
+            "mic": "silent",
+            "mic_state": "floating",
+            "mic_reason": "two_level_toggle",
+        }))
+        assert r["state"] == "degraded"
+        assert "mic=floating (legacy silent): two_level_toggle" in r["reasons"]
 
     # -- degraded: layer 3 (link / capacity)
 

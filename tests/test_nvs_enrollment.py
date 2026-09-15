@@ -75,7 +75,9 @@ def test_status_says_where_the_credentials_came_from():
 
 def test_status_and_prov_report_the_boot_selftest():
     code = _code()
-    assert '\\"selftest\\":{\\"mic\\":\\"%s\\",\\"gps\\":\\"%s\\",\\"pps\\":\\"%s\\",\\"wifi\\":\\"%s\\"}' in code
+    assert '\\"selftest\\":{\\"mic\\":\\"%s\\",\\"mic_state\\":\\"%s\\",\\"mic_reason\\":\\"%s\\",' in code
+    assert '\\"mic_stats\\":{\\"samples\\":%lu,\\"lo\\":%d,\\"hi\\":%d,\\"span\\":%lu,' in code
+    assert '\\"gps\\":\\"%s\\",\\"pps\\":\\"%s\\",\\"wifi\\":\\"%s\\"}' in code
     assert "PROV STATE" in code and "selftest=mic:%s,gps:%s,pps:%s,wifi:%s" in code
 
 

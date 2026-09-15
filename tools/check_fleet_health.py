@@ -382,6 +382,9 @@ def parse_status(d: Mapping[str, Any]) -> Dict[str, Any]:
     rssi = _first(d, (("net", "rssi"), ("wifi", "rssi"), ("rssi",)))
     sd = _first(d, (("sd",),))
     sd_free_mb = _first(d, (("sd_free_mb",),))
+    mic = _first(d, (("selftest", "mic"), ("mic",)))
+    mic_state = _first(d, (("selftest", "mic_state"), ("mic_state",)))
+    mic_reason = _first(d, (("selftest", "mic_reason"), ("mic_reason",)))
     return {
         "class": node_class,
         "fix": fix,
@@ -395,6 +398,9 @@ def parse_status(d: Mapping[str, Any]) -> Dict[str, Any]:
         "rssi": rssi,
         "sd": sd,
         "sd_free_mb": sd_free_mb,
+        "mic": mic,
+        "mic_state": mic_state,
+        "mic_reason": mic_reason,
     }
 
 
@@ -441,6 +447,24 @@ def _gps_fix_ok(p: Mapping[str, Any]) -> bool:
     return n >= 1 if node_class in PMTK_STATUS_CLASSES else n >= 3
 
 
+def _mic_issue(p: Mapping[str, Any]) -> Optional[str]:
+    state = p.get("mic_state")
+    legacy = p.get("mic")
+    reason = p.get("mic_reason")
+    if state in {"quiet", "normal"}:
+        return None
+    if state in {"capture-failure", "stuck", "floating", "saturated"}:
+        detail = "mic=%s" % state
+        if legacy and legacy != state:
+            detail += " (legacy %s)" % legacy
+        if reason:
+            detail += ": %s" % reason
+        return detail
+    if legacy and legacy != "ok":
+        return "mic=%s" % legacy
+    return None
+
+
 def evaluate_health(target_name: str, status_data: Optional[Mapping[str, Any]],
                     err: Optional[Exception] = None) -> Dict[str, Any]:
     if status_data is None:
@@ -460,6 +484,9 @@ def evaluate_health(target_name: str, status_data: Optional[Mapping[str, Any]],
         reasons.append("timebase never locked")
     if _pps_expected(p) and p["pps_glitches"] and p["pps_glitches"] > 0:
         reasons.append("%d pps glitch(es)" % p["pps_glitches"])
+    mic_issue = _mic_issue(p)
+    if mic_issue:
+        reasons.append(mic_issue)
     if p["rssi"] is not None and p["rssi"] < -80:
         reasons.append("rssi=%d dBm" % p["rssi"])
     if _sd_expected(p) and p["sd"] is False:

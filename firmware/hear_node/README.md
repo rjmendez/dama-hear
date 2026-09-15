@@ -103,6 +103,14 @@ it from one latched boolean and a growing sigma: `state` is one of `LOCKED`, `HO
 `boot_epoch_us`, `boot_id`, and `discontinuity_flags` say how old the anchor is, which boot wrote
 the row, and whether the node is still settling from boot or another discontinuity.
 
+`/status selftest.mic` remains the legacy compatibility field (`ok` / `silent` / `saturated`),
+but it is no longer where quiet audio gets collapsed into hardware failure. The explicit fields
+are `selftest.mic_state` (`capture-failure`, `stuck`, `floating`, `quiet`, `saturated`,
+`normal`), `selftest.mic_reason`, and `selftest.mic_stats` (sample count, span, centred
+mean-absolute amplitude, zero-crossing rate, adjacent-repeat rate, unique values, and rail hits).
+Consumers can keep reading `selftest.mic` during the migration, while new ones stop treating
+quiet input as a broken microphone.
+
 The SD card is the actual record. WiFi is a convenience and a run must not depend on
 it. Everything below is fetchable over the same link with `/sd?file=/dets.csv&tail=20000`:
 
