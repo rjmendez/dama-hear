@@ -1,0 +1,125 @@
+{
+  "schema_id": "hear.ingest.v1",
+  "schema_major": 1,
+  "schema_file": "schemas/hear.ingest.v1.schema.json",
+  "codecs": {
+    "json": "application/vnd.dama.hear.ingest.v1+json"
+  },
+  "identity_inputs": [
+    "source",
+    "device_id",
+    "kind",
+    "observed_at",
+    "producer.boot_id",
+    "producer.sequence",
+    "producer.cursor",
+    "payload"
+  ],
+  "generator": "tools/gen_ingest_contracts.py",
+  "fixtures": [
+    {
+      "name": "valid-node-detection",
+      "file": "valid-node-detection.json",
+      "expect_status": "accepted",
+      "expect_dispatchable": true,
+      "expect_reasons": [],
+      "expect_unknown_fields": [],
+      "sha256": "3a43b833cd2ac44caebde0a151858527302b6b56308b6f710ba77681ae24dde2"
+    },
+    {
+      "name": "degraded-no-clock-anchor",
+      "file": "degraded-no-clock-anchor.json",
+      "expect_status": "accepted",
+      "expect_dispatchable": true,
+      "expect_reasons": [],
+      "expect_unknown_fields": [],
+      "sha256": "18034d456e4e359341501d1994edb791f39c383b0d43f81bbf13ab8f76e7bbc4"
+    },
+    {
+      "name": "minimal-legacy-producer",
+      "file": "minimal-legacy-producer.json",
+      "expect_status": "accepted",
+      "expect_dispatchable": true,
+      "expect_reasons": [],
+      "expect_unknown_fields": [],
+      "sha256": "4661e871a7ee4179a377bc60112ae0b1db8c53cf397a13a9d287772ecb922e1e"
+    },
+    {
+      "name": "gotchi-adapter-sketch",
+      "file": "gotchi-adapter-sketch.json",
+      "expect_status": "accepted",
+      "expect_dispatchable": true,
+      "expect_reasons": [],
+      "expect_unknown_fields": [],
+      "sha256": "101052206fdc405dbf9a862b8a2a84c74b76487d67fe32325aed7cfc4e1b8541"
+    },
+    {
+      "name": "forward-additive-unknown-fields",
+      "file": "forward-additive-unknown-fields.json",
+      "expect_status": "accepted",
+      "expect_dispatchable": false,
+      "expect_reasons": [],
+      "expect_unknown_fields": [
+        "adapter.commit",
+        "clock.holdover_s",
+        "ingest_hints"
+      ],
+      "sha256": "bf48c1df998bd7d8cf148fbe43c634f7b9c6691b70c3530dba91edc04c33f04d"
+    },
+    {
+      "name": "forward-additive-stripped",
+      "file": "forward-additive-stripped.json",
+      "expect_status": "accepted",
+      "expect_dispatchable": false,
+      "expect_reasons": [],
+      "expect_unknown_fields": [],
+      "sha256": "33fba79f29783a82372a055fd2dff9f855b55be440bbabbc6d705ae2e60a7a21"
+    },
+    {
+      "name": "unsupported-future-major",
+      "file": "unsupported-future-major.json",
+      "expect_status": "refused",
+      "expect_dispatchable": false,
+      "expect_reasons": [
+        "schema_version_unsupported"
+      ],
+      "expect_unknown_fields": [],
+      "sha256": "5ea74e18ec0396e5516c7f4b30ee98ef028c29cf3e69e74b5fdf08c3a6bd4afd"
+    },
+    {
+      "name": "malformed-missing-clock",
+      "file": "malformed-missing-clock.json",
+      "expect_status": "refused",
+      "expect_dispatchable": false,
+      "expect_reasons": [
+        "field_missing"
+      ],
+      "expect_unknown_fields": [],
+      "sha256": "a125694f01735174e471cb1c4c05240093ae63775cfcc1ca6bd88c955ef652a0"
+    },
+    {
+      "name": "malformed-field-types",
+      "file": "malformed-field-types.json",
+      "expect_status": "refused",
+      "expect_dispatchable": false,
+      "expect_reasons": [
+        "timestamp_not_rfc3339_utc",
+        "type_invalid",
+        "value_out_of_range"
+      ],
+      "expect_unknown_fields": [],
+      "sha256": "70c8b806332d9c82aad123cd5eae53fd996d30e8e76da8dd02cd182234f42225"
+    },
+    {
+      "name": "malformed-clock-valid-without-time",
+      "file": "malformed-clock-valid-without-time.json",
+      "expect_status": "refused",
+      "expect_dispatchable": false,
+      "expect_reasons": [
+        "clock_valid_without_observed_at"
+      ],
+      "expect_unknown_fields": [],
+      "sha256": "79923e2097b685727cd8fa17cd79629ee4ae27f46fcf3efea060ded97c5dfbb0"
+    }
+  ]
+}

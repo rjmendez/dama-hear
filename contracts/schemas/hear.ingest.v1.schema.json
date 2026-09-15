@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.dama.example/hear/ingest/v1/envelope.schema.json",
+  "title": "hear.ingest.v1",
+  "description": "Canonical DAMA Hear ingest envelope, major version 1. Normative wire codec is UTF-8 JSON (application/vnd.dama.hear.ingest.v1+json). Readers MUST accept unknown properties and unknown enum members within this major and MUST refuse an unsupported schema_version with a durable refusal record. event_id is derived only from source, device_id, kind, observed_at, producer.boot_id, producer.sequence, producer.cursor, payload.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "event_id",
+    "source",
+    "site_id",
+    "device_id",
+    "device_class",
+    "firmware_version",
+    "observed_at",
+    "received_at",
+    "clock",
+    "kind",
+    "schema_version",
+    "payload",
+    "raw_ref",
+    "adapter"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "description": "Stable content-derived UUID. See derive_event_id(); identity inputs are closed."
+    },
+    "source": {
+      "type": "string",
+      "x-known-values": [
+        "node-http",
+        "node-mqtt",
+        "gotchi",
+        "import"
+      ],
+      "description": "Ingress family that produced this envelope, not the transport endpoint."
+    },
+    "site_id": {
+      "type": "string",
+      "description": "Site token. Derived from the credential; never trusted from an untrusted body."
+    },
+    "device_id": {
+      "type": "string",
+      "description": "Node or producer identity as enrolled."
+    },
+    "device_class": {
+      "type": "string",
+      "description": "Board or producer class, e.g. esp32s3-i2s-gps."
+    },
+    "firmware_version": {
+      "type": "string",
+      "description": "Producer build identifier."
+    },
+    "observed_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "RFC3339 UTC instant of observation, or null when the producer had no usable clock."
+    },
+    "received_at": {
+      "type": "string",
+      "description": "RFC3339 UTC instant the adapter accepted the bytes. Never a producer claim."
+    },
+    "clock": {
+      "type": "object",
+      "properties": {
+        "valid": {
+          "type": "boolean",
+          "description": "False means observed_at is not usable for precise localization."
+        },
+        "tier": {
+          "type": "string",
+          "x-known-values": [
+            "gps_pps",
+            "wall",
+            "monotonic"
+          ],
+          "description": "Timebase class. wall/monotonic are never treated as PPS time."
+        },
+        "sigma_ns": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Declared 1-sigma UTC uncertainty in nanoseconds."
+        }
+      },
+      "required": [
+        "valid",
+        "tier",
+        "sigma_ns"
+      ],
+      "additionalProperties": true,
+      "description": "Clock evidence for observed_at."
+    },
+    "kind": {
+      "type": "string",
+      "x-known-values": [
+        "heartbeat",
+        "detection",
+        "scene",
+        "clip",
+        "sketch",
+        "health"
+      ],
+      "description": "Record family. An unknown member is preserved but not dispatchable."
+    },
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Envelope major version. Unsupported majors are refused, not coerced.",
+      "const": 1
+    },
+    "payload": {
+      "type": "object",
+      "description": "Kind-specific body. Binary frames travel here base64-encoded with their own version/profile fields; the envelope never reinterprets them."
+    },
+    "raw_ref": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Object-store key of the retained original bytes, or null when inlined."
+    },
+    "adapter": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Adapter name."
+        },
+        "version": {
+          "type": "string",
+          "description": "Adapter build."
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "additionalProperties": true,
+      "description": "Translating adapter identity, so a bad translation is attributable."
+    },
+    "producer": {
+      "type": "object",
+      "properties": {
+        "boot_id": {
+          "type": "string",
+          "description": "Producer boot identity; a change means cursors are not comparable."
+        },
+        "boot_epoch_us": {
+          "type": "integer",
+          "description": "Producer boot epoch in microseconds UTC."
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonic per-boot record counter."
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Opaque source partition/cursor token the record was read at."
+        }
+      },
+      "additionalProperties": true,
+      "description": "Optional producer continuity evidence. Additive in v1: absent means the producer exposes no boot/sequence/cursor, not that continuity is fine."
+    }
+  },
+  "x-schema-id": "hear.ingest.v1",
+  "x-schema-major": 1,
+  "x-codecs": {
+    "json": "application/vnd.dama.hear.ingest.v1+json"
+  },
+  "x-identity-inputs": [
+    "source",
+    "device_id",
+    "kind",
+    "observed_at",
+    "producer.boot_id",
+    "producer.sequence",
+    "producer.cursor",
+    "payload"
+  ]
+}

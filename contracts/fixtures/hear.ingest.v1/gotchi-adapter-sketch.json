@@ -1,0 +1,33 @@
+{
+  "event_id": "5221120f-c704-81b4-8d7e-eb45ce534b94",
+  "source": "gotchi",
+  "site_id": "site-quarry-north",
+  "device_id": "gotchi-phone-7f31",
+  "device_class": "gotchi-phone",
+  "firmware_version": "hear-node-2026.09.1",
+  "observed_at": "2026-09-14T18:03:11.250000Z",
+  "received_at": "2026-09-14T18:03:11.984000Z",
+  "clock": {
+    "valid": true,
+    "tier": "wall",
+    "sigma_ns": 250000000
+  },
+  "kind": "sketch",
+  "schema_version": 1,
+  "payload": {
+    "producer_schema": "gotchi.sketch.v3",
+    "surveyed": false,
+    "original": {
+      "t": 1789495391.25,
+      "rms": 0.031
+    }
+  },
+  "raw_ref": "raw/2026/09/14/gotchi/018f2c1b.json",
+  "adapter": {
+    "name": "gotchi-adapter",
+    "version": "0.4.1"
+  },
+  "producer": {
+    "cursor": "sqs:018f2c1b"
+  }
+}

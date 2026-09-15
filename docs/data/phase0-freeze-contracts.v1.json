@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "707cdfcdf509ad3ba168fd86fcc191c6a6f32e53accabcdb4403a572dd7f0e73",
+  "baseline_hash": "caa03479a17dd1eac412e9ed946f0bde1bd98ed478d899e5e0e44ac4339fc21c",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -2598,6 +2598,12 @@
         ]
       },
       {
+        "schema": "hear.ingest.v1",
+        "source_paths": [
+          "hear/ingest/envelope.py"
+        ]
+      },
+      {
         "schema": "hear.node_positions.v1",
         "source_paths": [
           "tools/hear_drain.py"
@@ -2642,7 +2648,7 @@
         ]
       }
     ],
-    "section_hash": "d154fa286b1f1cb8506ab5c36f0d6291dfeaab5f096512b7635d9582f833b5e1",
+    "section_hash": "427c86937d28bd12b6de71c3b4604eae609d2b24edfd4f1a761256bc74a6b580",
     "telemetry_routes": [
       {
         "http_path": "/api/hear/heartbeat",
