@@ -35,6 +35,7 @@ current code disagree, the design states the intended end state.
 | [faketec-pin-budget.md](faketec-pin-budget.md) | Board pin budget. |
 | [l86-reference.md](l86-reference.md) | L86 GNSS module reference. |
 | [hear-latency-calibration-runbook.md](hear-latency-calibration-runbook.md) | Latency calibration procedure. |
+| [bridge-durable-soak.md](bridge-durable-soak.md) | Durable-outbox soak runbook for `hear-mqtt-bridge`: what `tools/bridge_soak_evidence.py` records, the T+24h/7d/14d pass/fail criteria, and the read-only boundary it enforces. |
 
 ## Operations, policy, and cross-cutting design
 
