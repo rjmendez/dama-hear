@@ -301,7 +301,8 @@ class TestValidation:
 
 @contextmanager
 def running_server(auth_token=None, socket_timeout_s=0.2, durable_store=None, fake=None,
-                   durable_replay_interval_s=0.0, durable_replay_limit=HR.DURABLE_REPLAY_LIMIT):
+                   durable_replay_interval_s=0.0, durable_replay_limit=HR.DURABLE_REPLAY_LIMIT,
+                   durable_prune_interval_s=0.0, durable_retention_days=HR.DURABLE_RETENTION_DAYS):
     fake = fake if fake is not None else FakeRedis()
     store = HR.HeartbeatReceiverStore(
         fake,
@@ -314,6 +315,8 @@ def running_server(auth_token=None, socket_timeout_s=0.2, durable_store=None, fa
         auth_token=auth_token, socket_timeout_s=socket_timeout_s,
         durable_replay_interval_s=durable_replay_interval_s,
         durable_replay_limit=durable_replay_limit,
+        durable_prune_interval_s=durable_prune_interval_s,
+        durable_retention_days=durable_retention_days,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -762,6 +765,132 @@ class TestBackgroundReplayWorker:
 
         class StuckThread:
             name = "stuck-replay"
+
+            def join(self, timeout=None):
+                return None
+
+            def is_alive(self):
+                return True
+
+        worker.thread = StuckThread()
+        with pytest.raises(RuntimeError, match="did not stop"):
+            worker.stop(timeout=0)
+        assert worker.thread is not None
+
+
+class TestDurableRetentionPruning(TestValidation):
+    @staticmethod
+    def _counts(db_path):
+        with sqlite3.connect(db_path) as con:
+            return {
+                "records": con.execute("SELECT COUNT(*) FROM durable_records").fetchone()[0],
+                "attempts": con.execute("SELECT COUNT(*) FROM cache_attempts").fetchone()[0],
+            }
+
+    def test_prune_acknowledged_reclaims_only_old_cache_synced_records(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        store = HR.SqliteDurableRecordStore(str(db))
+        old_uid, new_uid, pending_uid = "old-uid", "new-uid", "pending-uid"
+        record = dict(self._heartbeat())
+        record["received_at"] = HR.utc_now()
+        record["receiver_schema_version"] = 1
+        for uid in (old_uid, new_uid, pending_uid):
+            store.persist(uid, record, json.dumps(record))
+        store.note_cache_success(old_uid, "fake:6379")
+        store.note_cache_success(new_uid, "fake:6379")
+        # pending_uid is left with no successful cache_attempts -- it must never be pruned.
+
+        old_cutoff = (HR.datetime.now(HR.timezone.utc) - HR.timedelta(days=45)).isoformat(
+            timespec="seconds").replace("+00:00", "Z")
+        with sqlite3.connect(db) as con:
+            con.execute("UPDATE durable_records SET created_at = ? WHERE record_uid = ?",
+                       (old_cutoff, old_uid))
+
+        pruned = store.prune_acknowledged(retention_days=30)
+
+        assert pruned == 1
+        with sqlite3.connect(db) as con:
+            con.row_factory = sqlite3.Row
+            remaining = {row["record_uid"] for row in con.execute(
+                "SELECT record_uid FROM durable_records")}
+        assert remaining == {new_uid, pending_uid}
+
+    def test_prune_acknowledged_is_a_no_op_when_retention_days_is_not_positive(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        store = HR.SqliteDurableRecordStore(str(db))
+        record = dict(self._heartbeat())
+        record["received_at"] = HR.utc_now()
+        record["receiver_schema_version"] = 1
+        store.persist("uid-1", record, json.dumps(record))
+        store.note_cache_success("uid-1", "fake:6379")
+        old_cutoff = (HR.datetime.now(HR.timezone.utc) - HR.timedelta(days=365)).isoformat(
+            timespec="seconds").replace("+00:00", "Z")
+        with sqlite3.connect(db) as con:
+            con.execute("UPDATE durable_records SET created_at = ?", (old_cutoff,))
+
+        assert store.prune_acknowledged(retention_days=0) == 0
+        assert store.prune_acknowledged(retention_days=-1) == 0
+        assert self._counts(db)["records"] == 1
+
+    def test_none_backend_prune_acknowledged_is_a_no_op(self):
+        assert HR.DurableRecordStore().prune_acknowledged(retention_days=30) == 0
+
+    def test_background_prune_worker_reclaims_old_records_while_the_server_is_up(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        with running_server(durable_store=durable,
+                            durable_prune_interval_s=0.05,
+                            durable_retention_days=30) as (base_url, _fake, _addr, server):
+            assert server._prune_worker.thread is not None
+            TestHttpIntegration._post(base_url + "/api/hear/event", self._event())
+            old_cutoff = (HR.datetime.now(HR.timezone.utc) - HR.timedelta(days=45)).isoformat(
+                timespec="seconds").replace("+00:00", "Z")
+            with sqlite3.connect(db) as con:
+                con.execute("UPDATE durable_records SET created_at = ?", (old_cutoff,))
+
+            pruned = False
+            for _ in range(50):
+                time.sleep(0.05)
+                if self._counts(db)["records"] == 0:
+                    pruned = True
+                    break
+            assert pruned, "background prune worker did not reclaim the old record in time"
+
+    def test_prune_worker_is_disabled_when_retention_days_is_not_positive(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        with running_server(durable_store=durable, durable_prune_interval_s=0.05,
+                            durable_retention_days=0) as (_base_url, _fake, _addr, server):
+            assert server._prune_worker.thread is None
+
+    def test_server_close_stops_the_prune_worker_and_leaves_no_thread_behind(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        store = HR.HeartbeatReceiverStore(
+            FakeRedis(), heartbeat_ttl_s=30, redis_target="fake:6379", durable_store=durable,
+        )
+        server = HR.create_server(
+            "127.0.0.1", 0, store, durable_prune_interval_s=0.02, durable_retention_days=30,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            prune_thread = server._prune_worker.thread
+            assert prune_thread is not None
+            assert prune_thread.is_alive()
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+        assert not prune_thread.is_alive()
+        assert server._prune_worker.thread is None
+
+    def test_stop_surfaces_a_prune_worker_that_does_not_terminate(self):
+        worker = object.__new__(HR.DurablePruneWorker)
+        worker._stop = threading.Event()
+
+        class StuckThread:
+            name = "stuck-prune"
 
             def join(self, timeout=None):
                 return None

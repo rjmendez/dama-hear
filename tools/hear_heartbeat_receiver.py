@@ -17,7 +17,7 @@ import socket
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Mapping, Optional
 from urllib.parse import urlparse
@@ -37,6 +37,12 @@ DURABLE_STORE = (os.environ.get("HEAR_DURABLE_STORE", "none") or "none").strip()
 DURABLE_DB = os.environ.get("HEAR_DURABLE_DB", "/state/heartbeats.sqlite3")
 DURABLE_REPLAY_LIMIT = int(os.environ.get("HEAR_DURABLE_REPLAY_LIMIT", "256"))
 DURABLE_REPLAY_INTERVAL_S = float(os.environ.get("HEAR_DURABLE_REPLAY_INTERVAL_S", "5.0"))
+# Only ever prunes records that already have a *successful* cache_attempts row -- a record
+# still pending replay is never eligible no matter how old, so a stalled Redis outage cannot
+# silently lose data to the retention sweep. 0 (or below) disables pruning entirely, which
+# keeps the phase-0 outbox's previous "grows forever" behavior for anyone not yet opted in.
+DURABLE_RETENTION_DAYS = int(os.environ.get("HEAR_DURABLE_RETENTION_DAYS", "30"))
+DURABLE_PRUNE_INTERVAL_S = float(os.environ.get("HEAR_DURABLE_PRUNE_INTERVAL_S", "3600"))
 DURABLE_SCHEMA_VERSION = 1
 
 
@@ -110,6 +116,9 @@ class DurableRecordStore:
 
     def pending_records(self, limit: int) -> list[DurableEntry]:
         return []
+
+    def prune_acknowledged(self, retention_days: int) -> int:
+        return 0
 
     def health(self) -> Dict[str, Any]:
         return {
@@ -229,6 +238,42 @@ class SqliteDurableRecordStore(DurableRecordStore):
 
     def note_cache_failure(self, record_uid: str, cache_target: str, exc: BaseException) -> None:
         self._append_attempt(record_uid, cache_target, "failed", _error_text(exc))
+
+    def prune_acknowledged(self, retention_days: int) -> int:
+        """Deletes durable_records (and their cache_attempts) older than ``retention_days``.
+
+        Only ever deletes a record that already has a successful cache_attempts row -- a record
+        still pending replay is kept regardless of age, so this can never discard data Redis
+        hasn't actually accepted yet. Without this the append-only ledger grows forever and
+        eventually fills its PVC; with it, the ledger keeps at least ``retention_days`` of
+        history for incident replay while old, already-synced rows are reclaimed.
+        """
+        if retention_days <= 0:
+            return 0
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat(
+            timespec="seconds").replace("+00:00", "Z")
+        with self._lock, self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT r.record_uid
+                FROM durable_records r
+                WHERE r.created_at < ?
+                  AND EXISTS (
+                      SELECT 1 FROM cache_attempts a
+                      WHERE a.record_uid = r.record_uid AND a.outcome = 'succeeded'
+                  )
+                """,
+                (cutoff,),
+            ).fetchall()
+            uids = [row["record_uid"] for row in rows]
+            if not uids:
+                return 0
+            placeholders = ",".join("?" for _ in uids)
+            con.execute(
+                f"DELETE FROM cache_attempts WHERE record_uid IN ({placeholders})", uids)
+            con.execute(
+                f"DELETE FROM durable_records WHERE record_uid IN ({placeholders})", uids)
+        return len(uids)
 
     def _append_attempt(self, record_uid: str, cache_target: str,
                         outcome: str, error_text: Optional[str]) -> None:
@@ -539,17 +584,66 @@ class DurableReplayWorker:
         return self.thread is not None and self.thread.is_alive()
 
 
+class DurablePruneWorker:
+    """Small stoppable background thread that periodically reclaims acknowledged durable rows.
+
+    Shared by ReceiverServer and hear_mqtt_bridge, mirroring DurableReplayWorker. A no-op (no
+    thread is started) when durability is disabled, ``interval_s`` is not positive, or
+    ``retention_days`` is not positive -- so the previous "keep everything forever" behavior is
+    preserved for anyone who does not opt in.
+    """
+
+    def __init__(self, store: HeartbeatReceiverStore, interval_s: float,
+                 retention_days: int = DURABLE_RETENTION_DAYS, name: str = "durable-prune"):
+        self.store = store
+        self.interval_s = interval_s
+        self.retention_days = retention_days
+        self._stop = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        if interval_s > 0 and retention_days > 0 and store.durable_store.enabled:
+            self.thread = threading.Thread(target=self._loop, name=name, daemon=True)
+            self.thread.start()
+
+    def _loop(self) -> None:
+        # Woken early (instead of a plain sleep) so stop() can return promptly.
+        while not self._stop.wait(self.interval_s):
+            try:
+                pruned = self.store.durable_store.prune_acknowledged(self.retention_days)
+                if pruned:
+                    logger.info("pruned %d acknowledged durable record(s) older than %dd",
+                                pruned, self.retention_days)
+            except Exception:
+                logger.exception("background durable prune attempt failed")
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=timeout)
+            if self.thread.is_alive():
+                raise RuntimeError(
+                    f"durable prune worker {self.thread.name!r} did not stop within {timeout}s")
+            self.thread = None
+
+    @property
+    def is_alive(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+
 class ReceiverServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 16
 
     def __init__(self, server_address, handler_cls, store: HeartbeatReceiverStore,
                  durable_replay_interval_s: float = 0.0,
-                 durable_replay_limit: int = DURABLE_REPLAY_LIMIT):
+                 durable_replay_limit: int = DURABLE_REPLAY_LIMIT,
+                 durable_prune_interval_s: float = 0.0,
+                 durable_retention_days: int = DURABLE_RETENTION_DAYS):
         super().__init__(server_address, handler_cls)
         self.store = store
         self._replay_worker = DurableReplayWorker(
             store, durable_replay_interval_s, durable_replay_limit, name="hear-heartbeat-replay")
+        self._prune_worker = DurablePruneWorker(
+            store, durable_prune_interval_s, durable_retention_days, name="hear-heartbeat-prune")
 
     @property
     def _replay_thread(self) -> Optional[threading.Thread]:
@@ -557,6 +651,7 @@ class ReceiverServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         self._replay_worker.stop()
+        self._prune_worker.stop()
         super().server_close()
 
 
@@ -594,6 +689,13 @@ def add_durable_store_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--durable-replay-interval-s", type=float, default=DURABLE_REPLAY_INTERVAL_S,
                     help="seconds between background replays of pending durable records while "
                          "the server is up; <= 0 disables the background worker")
+    ap.add_argument("--durable-retention-days", type=int, default=DURABLE_RETENTION_DAYS,
+                    help="days to keep an already cache-synced durable record before the "
+                         "background prune worker reclaims it; <= 0 disables pruning and keeps "
+                         "every record forever")
+    ap.add_argument("--durable-prune-interval-s", type=float, default=DURABLE_PRUNE_INTERVAL_S,
+                    help="seconds between background prune sweeps of acknowledged durable "
+                         "records; <= 0 disables the background worker")
 
 
 def make_durable_store(kind: str = DURABLE_STORE,
@@ -840,7 +942,9 @@ def create_server(bind: str, port: int, store: HeartbeatReceiverStore,
                   auth_token: Optional[str] = AUTH_TOKEN,
                   socket_timeout_s: float = SOCKET_TIMEOUT_S,
                   durable_replay_interval_s: float = 0.0,
-                  durable_replay_limit: int = DURABLE_REPLAY_LIMIT) -> ReceiverServer:
+                  durable_replay_limit: int = DURABLE_REPLAY_LIMIT,
+                  durable_prune_interval_s: float = 0.0,
+                  durable_retention_days: int = DURABLE_RETENTION_DAYS) -> ReceiverServer:
     return ReceiverServer(
         (bind, port),
         make_handler(store, max_body_bytes=max_body_bytes,
@@ -848,6 +952,8 @@ def create_server(bind: str, port: int, store: HeartbeatReceiverStore,
         store,
         durable_replay_interval_s=durable_replay_interval_s,
         durable_replay_limit=durable_replay_limit,
+        durable_prune_interval_s=durable_prune_interval_s,
+        durable_retention_days=durable_retention_days,
     )
 
 
@@ -893,6 +999,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         auth_token=auth_token, socket_timeout_s=args.socket_timeout_s,
         durable_replay_interval_s=args.durable_replay_interval_s,
         durable_replay_limit=args.durable_replay_limit,
+        durable_prune_interval_s=args.durable_prune_interval_s,
+        durable_retention_days=args.durable_retention_days,
     )
     try:
         server.serve_forever()
