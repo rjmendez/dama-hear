@@ -28,6 +28,13 @@ RELEASE MODE installs a published image instead of building one. Release images 
 credentials and no name; the node's NVS supplies both. So the node must already be enrolled, either
 by enroll.py or by any build of this tree flashed in the default mode, which copies its compiled-in
 credentials into NVS at boot. A node that does not report an NVS record is refused.
+
+/update IS A PRIVILEGED ENDPOINT. The firmware endpoint-auth change made /update, /reboot, /format
+and /gate require `X-Hear-Auth: <HEAR_ADMIN_TOKEN>`, and it fails CLOSED: a build with no token
+compiled in refuses every request from everyone, permanently, for that image. This script is the
+only OTA client there is, so it sends the token (from ~/.hear_push, never a tracked file) and it
+refuses to put a tokenless image on a node it can only reach over the air -- that flash would be
+the last one that does not need a USB cable.
 """
 import json
 import os
@@ -41,6 +48,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import board_profiles  # noqa: E402
+import gen_secrets  # noqa: E402
 import release_manifest  # noqa: E402
 
 SKETCH = os.path.relpath(HERE, REPO)
@@ -49,6 +57,74 @@ SKETCH = os.path.relpath(HERE, REPO)
 # not of its class: gold is quad, ageev is octal, and they share the class name esp32s3-i2s-gps.
 FQBN = board_profiles.FQBN
 REPO_SLUG = "rjmendez/dama-hear"
+# Opt-out for the tokenless-image refusal below. Spelled out rather than --force so that the thing
+# being accepted -- losing remote admin on this node -- is written in the command that accepts it.
+LOCKOUT_OPT_OUT = "--allow-admin-lockout"
+
+
+def admin_token(path=None):
+    """The admin token privileged endpoints require, from ~/.hear_push, or "" if none is set.
+
+    Same source and same reader as gen_secrets.py, so the value this script SENDS cannot drift
+    from the value it COMPILES IN: they are one line of one untracked file.
+    """
+    return (gen_secrets.read_push_config(path) or {}).get("HEAR_ADMIN_TOKEN", "").strip()
+
+
+def admin_lockout_refusal(token, argv, node, target):
+    """Why an over-the-air build-mode flash must not proceed with no admin token, or None.
+
+    HEAR_ADMIN_TOKEN is compile-time -- NVS carries the node id and its Wi-Fi, not this -- and
+    hear_auth_ok() returns false outright when the compiled-in token is empty. So an image built
+    with no token answers /status forever and refuses /update, /reboot, /format and /gate from
+    everyone, including this script. Over the air that is unrecoverable without physically
+    reaching the board, which is precisely the condition an OTA flash is chosen to avoid.
+    """
+    if token or LOCKOUT_OPT_OUT in argv:
+        return None
+    return ("this build has no HEAR_ADMIN_TOKEN, and the firmware fails closed: %s would come "
+            "back answering /status but refusing /update, /reboot, /format and /gate from "
+            "everyone -- including this script, so this would be the last flash %s can take "
+            "without a USB cable. Put HEAR_ADMIN_TOKEN=<token> in ~/.hear_push (untracked, same "
+            "file gen_secrets.py reads) and flash again, or pass %s if you can reach the board."
+            % (node, target, LOCKOUT_OPT_OUT))
+
+
+def reidentify_refusal(was, node, target, argv):
+    """Why the target must not be flashed as `node`, or None.
+
+    Flashing a node with someone else's identity is recoverable; doing it without noticing is not.
+    --force is the deliberate case (re-identifying a board on purpose) and must return None, not
+    an empty refusal -- an empty message is a refusal nobody can act on.
+    """
+    if was is None:
+        return None
+    got = was.get("node")
+    if got in (node, None) or "--force" in argv:
+        return None
+    return ("%s currently reports node=%r, not %r. Refusing: name the right target, or pass "
+            "--force if you really are re-identifying this board." % (target, got, node))
+
+
+def ota_curl_cmd(target, bin_path, token):
+    """The OTA upload command. The admin token goes in a HEADER, never the query string, so it
+    does not land in a URL that gets pasted into a log or a shell history."""
+    cmd = ["curl", "-s", "-m", "120", "-w", "\n%{http_code}"]
+    if token:
+        cmd += ["-H", "X-Hear-Auth: " + token]
+    return cmd + ["-F", "firmware=@" + bin_path, "http://%s/update" % target]
+
+
+def ota_post(target, bin_path, token):
+    """POST the image and return (body, http_status). Status is read explicitly because a 401 is
+    a different problem from a rejected image and telling an operator "OTA rejected" for a
+    missing token sends them to read the wrong log."""
+    r = subprocess.run(ota_curl_cmd(target, bin_path, token), capture_output=True, text=True)
+    out = r.stdout.rstrip("\n")
+    body, _, tail = out.rpartition("\n")
+    if not (len(tail) == 3 and tail.isdigit()):
+        body, tail = out, ""      # no status line came back; the body is all there is
+    return body.strip(), tail, (r.stderr or "").strip()
 
 
 def built_fw_version(path=None):
@@ -251,18 +327,24 @@ def main(argv):
 
         subprocess.run([sys.executable, os.path.join(HERE, "gen_secrets.py"), node, board_class],
                        cwd=REPO, check=True)
+        # An image with no admin token cannot be replaced over the air by its own successor. Check
+        # before the compile, not after: an operator who has to add a token should find that out in
+        # two seconds, not two minutes.
+        if not is_serial:
+            why = admin_lockout_refusal(admin_token(), argv, node, target)
+            if why:
+                die("refusing to flash %s over the air: %s" % (node, why))
         # What this build will report as fw, read from the secrets.h just written. Checked at
         # step 5 so a boot-guard revert cannot pass as a successful flash.
         expect_fw = built_fw_version()
 
         # 2. if the target is already reachable, refuse a target that is a DIFFERENT node.
-        #    Flashing a node with someone else's identity is recoverable; doing it without
-        #    noticing is not.
+        why = reidentify_refusal(was, node, target, argv)
+        if why:
+            die(why)
         if was is not None and was.get("node") not in (node, None):
-            die("%s currently reports node=%r, not %r. Refusing: name the right target, "
-                "or pass --force if you really are re-identifying this board."
-                % (target, was.get("node"), node)
-                if "--force" not in argv else "")
+            print("flash: --force -- %s reports node=%r and is being re-identified as %r"
+                  % (target, was.get("node"), node))
 
         # 3. build
         print("flash: building %s (%s, %s PSRAM) for %s"
@@ -292,11 +374,15 @@ def main(argv):
         if r.returncode:
             die("upload failed")
     else:
-        r = subprocess.run(["curl", "-s", "-m", "120", "-F", "firmware=@" + bin_path,
-                            "http://%s/update" % target], capture_output=True, text=True)
-        print("flash: %s" % r.stdout.strip())
-        if "OK" not in r.stdout:
-            die("OTA rejected: %s%s" % (r.stdout.strip(), r.stderr.strip()))
+        body, code, err = ota_post(target, bin_path, admin_token())
+        print("flash: %s" % body)
+        if code == "401":
+            die("OTA refused by %s with 401: /update requires the admin token. Put "
+                "HEAR_ADMIN_TOKEN=<token> in ~/.hear_push -- it must be the value the RUNNING "
+                "image was built with, not the one you are about to flash -- and try again. If "
+                "that value is lost, this node can only be reflashed over USB." % target)
+        if "OK" not in body:
+            die("OTA rejected (HTTP %s): %s%s" % (code or "?", body, err))
 
     # 5. verify the node that comes back is the node that was asked for
     host = target if not is_serial else None
