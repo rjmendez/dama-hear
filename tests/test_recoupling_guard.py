@@ -89,6 +89,19 @@ class TestItCatchesTheCouplings:
         assert _rules(_scan('C = "android.media.AudioTimestamp"\n')) == ["android_gotchi"]
         assert _rules(_scan("import dama_gotchi\n")) == ["android_gotchi"]
 
+    def test_a_dynamically_named_import(self):
+        """The repo already carries a function-local fail-open `import paho...` inside a `try`,
+        which is the shape that becomes `importlib.import_module` the first time a linter
+        objects. The dynamic spelling must not be the way out."""
+        assert _rules(_scan('import importlib\nm = importlib.import_module("redis")\n')) \
+            == ["redis"]
+        assert _rules(_scan('m = __import__("boto3")\n')) == ["aws"]
+
+    def test_a_dynamic_import_is_reported_once_as_an_import(self):
+        vs = _scan('import importlib\nm = importlib.import_module("boto3")\n')
+        assert len(vs) == 1
+        assert "import_module" in vs[0].token
+
     def test_a_deployment_client(self):
         assert _rules(_scan("from kubernetes import client\n")) == ["deployment_client"]
 
@@ -128,6 +141,19 @@ class TestItDoesNotCatchEvidence:
     def test_the_word_redis_inside_an_ordinary_word_is_not_a_client(self):
         assert _scan('MSG = "rediscover the origin"\n') == []
 
+    def test_a_raised_message_explaining_the_rule_is_not_the_rule_being_broken(self):
+        """⚠️THE PATTERN IS APPLIED TO A VALUE, NOT TO SOURCE TEXT. This repository's exception
+        strings are paragraphs, and several of them will end up naming `/pool` to say why a
+        caller must pass a root. A coupling is a string that IS the path."""
+        src = ('def f(root):\n'
+               '    if root is None:\n'
+               '        raise ValueError("no root: the core may not write to /pool directly")\n')
+        assert _scan(src) == []
+
+    def test_a_path_shaped_value_is_still_caught_whole(self):
+        assert _rules(_scan('P = "/pool"\n')) == ["pvc_path"]
+        assert _rules(_scan('P = "/pool/corpus/%s.jsonl"\n')) == ["pvc_path"]
+
 
 class TestTheAllowlistIsValueScoped:
     """Allowing a file would let the NEXT coupling into that file through unnoticed."""
@@ -159,6 +185,37 @@ class TestTheAllowlistIsValueScoped:
         allow = [("hear/a.py", "pvc_path", "/pool/shared", "one file's declared legacy default")]
         bad, _ = RG.check(roots=["hear"], repo=str(tmp_path), allow=allow)
         assert [v.path for v in bad] == ["hear/b.py"]
+
+
+class TestAMissingRootIsNotACleanRoot:
+    """`os.walk` on a path that is not there yields nothing and raises nothing."""
+
+    def test_a_renamed_or_mistyped_root_fails_instead_of_reporting_clean(self, tmp_path):
+        with pytest.raises(ValueError):
+            RG.python_files(["hear_core"], repo=str(tmp_path))
+
+    def test_the_command_line_exits_nonzero_rather_than_printing_clean(self, tmp_path,
+                                                                       monkeypatch, capsys):
+        monkeypatch.setattr(RG, "REPO", str(tmp_path))
+        assert RG.main(["--roots", "hear"]) == 2
+        out = capsys.readouterr()
+        assert "clean" not in out.out
+        assert "does not exist" in out.err
+
+
+class TestTheAllowlistBelongsToTheTreeScanned:
+    """An exemption is a statement about the code it exempts."""
+
+    def test_a_synthetic_tree_is_not_judged_against_this_repositorys_allowlist(self, tmp_path):
+        pkg = tmp_path / "hear"
+        pkg.mkdir()
+        (pkg / "m.py").write_text("A = 1\n")
+        bad, stale = RG.check(roots=["hear"], repo=str(tmp_path))
+        assert bad == [] and stale == []
+
+    def test_the_default_still_resolves_to_this_repositorys_allowlist(self):
+        assert RG.allow_file_for(None) == RG.ALLOW_FILE
+        assert RG.allow_file_for(RG.REPO) == RG.ALLOW_FILE
 
 
 class TestTheAllowFileParser:

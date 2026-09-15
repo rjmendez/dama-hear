@@ -59,10 +59,11 @@ No live service is touched. Frames are packed with `hear.wire`, bodies are writt
    a malformed cursor is refused rather than coerced to `0` or "latest"; and a cursor belongs to the
    boot that minted it.
 6. **Cross-profile event identity.** One detection drained off a card and out of a live ring lands
-   **once** — if the transports keyed it differently the corpus would hold one event twice. Two
-   frames that differ only in what their bytes *mean* (profiles 1 and 2 share a shape and disagree
-   about the rate) stay two events. The claimed profile is carried into the record. And an
-   unprovisioned board id still cannot be filed under a node the fetch disagrees with.
+   **once** — if the transports keyed it differently the corpus would hold one event twice — and it
+   lands with the *same stored schema*, although the card writes these scalars as CSV text and the
+   ring sends them as JSON numbers. Two frames that differ only in what their bytes *mean*
+   (profiles 1 and 2 share a shape and disagree about the rate) stay two events. The claimed profile
+   is carried into the record. And a row cannot be filed under a node the fetch disagrees with.
 7. **Recoupling import boundary.** Below.
 
 ## The recoupling boundary
@@ -73,6 +74,14 @@ classes or `gotchi-phone`; direct core writes to Redis/MQTT/PVC".
 
 `tools/recoupling_guard.py` enforces exactly that over `hear/` and `modules/`. Rules and the
 sentence behind each: `python tools/recoupling_guard.py --list-rules`.
+
+Two deliberate choices about what it will and will not chase. `importlib.import_module("redis")`
+and `__import__("boto3")` **are** caught, because the repository already contains the shape that
+drifts into them — a function-local fail-open import inside a `try`. A module name assembled from
+concatenated pieces is **not** caught, because that is deliberate evasion rather than drift and a
+checker that tried would be guessing. A scan root that does not exist is a failure, not an empty
+one: `os.walk` on a missing path raises nothing, so a renamed package would otherwise leave the
+gate exiting 0 having inspected nothing.
 
 **It parses, it does not grep.** `hear/nodeclass.py` cites dama-gotchi's own calibration files in
 twenty comments and `hear/corpus.py` quotes an Android source line, because that is where those

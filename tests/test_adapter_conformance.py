@@ -161,6 +161,26 @@ def _write_dets_csv(tmp_path, name: str, dets: List[Det], *, truncate_last: int 
     return str(p)
 
 
+#: `/detections` columns the firmware serialises as JSON NUMBERS. dets.csv carries the same
+#: quantities as text, and `hear/pool.py`'s `_raw_det_cell` exists precisely to stop the pooled
+#: schema from depending on WHICH node class drained the row. A double that sent everything as a
+#: string would never reach that code, and the one place the two adapters genuinely differ would
+#: be the one place the suite did not exercise.
+#:
+#: ⚠️`boot_id` IS NOT ON THIS LIST AND MUST NOT BE. It is 16 hex digits and leading zeros are
+#: significant -- as a number it stops being the id it names.
+_LIVE_RING_NUMERIC = frozenset({"utc_us", "uptime_s", "sample", "pps_n", "us_since_pps", "flags",
+                                "fs_hz", "sync_sigma_ns", "anchor_age_us", "boot_epoch_us",
+                                "clock_discontinuity_flags"})
+
+
+def _as_json_number(cell: str):
+    """One dets cell as the number the live ring puts on the wire."""
+    if "." in cell:
+        return float(cell)
+    return int(cell)
+
+
 def _write_live_ring(tmp_path, name: str, dets: List[Det], *, first_i: int = 0,
                      short_frame_last: int = 0) -> str:
     """The cardless adapter: one archived `/detections` cursor-v1 page.
@@ -172,7 +192,9 @@ def _write_live_ring(tmp_path, name: str, dets: List[Det], *, first_i: int = 0,
     rows = []
     for n, d in enumerate(dets):
         cells = d.cells()
-        row: Dict[str, Any] = {k: cells[k] for k in P.LIVE_RING_COLUMNS if cells.get(k) != ""}
+        row: Dict[str, Any] = {
+            k: (_as_json_number(cells[k]) if k in _LIVE_RING_NUMERIC else cells[k])
+            for k in P.LIVE_RING_COLUMNS if cells.get(k) != ""}
         fh = hexed(d.frame)
         row["frame_len"] = len(d.frame)
         if short_frame_last and n == len(dets) - 1:
@@ -328,7 +350,13 @@ class TestCase2TornCopyAndReaderLap:
 
     def test_the_arithmetic_closes_on_a_torn_file(self, pl, tmp_path, adapter):
         """`rows == added + duplicate + skipped`, per file, always. A deploy of this tool once
-        printed "0 new, 0 duplicate, 0 skipped" while discarding all five rows it read."""
+        printed "0 new, 0 duplicate, 0 skipped" while discarding all five rows it read.
+
+        Both ingests assert this internally, so this case cannot be the thing that catches a
+        regression -- the call raises first. It is here because the conformance contract is the
+        closing arithmetic itself: an adapter that reports totals which do not close has not
+        passed, whichever exception type it uses to say so.
+        """
         dets = [Det(sketch_frame(13), sample=str(i)) for i in range(4)]
         kw = {"truncate_last": 40} if adapter.name == "dets-csv" else {"short_frame_last": 40}
         entry = adapter.run(pl, tmp_path, "torn", dets, **kw)
@@ -584,6 +612,32 @@ class TestCase6CrossProfileIdentity:
         assert first["added"] == 1
         assert second["added"] == 0 and second["duplicate"] == 1
         assert pl.stats()["records"] == 1
+
+    def test_the_two_transports_store_one_detection_with_one_schema(self, tmp_path):
+        """⚠️THE WIRE TYPES DIFFER AND THE STORED ROW MUST NOT. A card writes these scalars as
+        CSV text and a live ring sends them as JSON numbers, so a store that kept whichever it
+        was handed would make the on-disk schema depend on WHICH NODE CLASS drained the row
+        rather than on what the row means -- and tonight's fleet is mixed.
+        """
+        det = Det(sketch_frame(54), sample="909", sync_sigma_ns="106000", clock_state="LOCKED",
+                  anchor_age_us="570000")
+        card = P.Pool(str(tmp_path / "card"))
+        ring = P.Pool(str(tmp_path / "ring"))
+        card.ingest_dets(_write_dets_csv(tmp_path, "card.csv", [det]), default_node=NODE)
+        ring.ingest_detections_json(_write_live_ring(tmp_path, "ring.json", [det]),
+                                    default_node=NODE)
+        a, b = _one(card), _one(ring)
+        # `dets_schema` names the reader generation and is the one field that MAY differ: it is
+        # provenance about the transport, which is exactly what must not leak into the rest.
+        assert a.pop("dets_schema") == "G7" and b.pop("dets_schema") == "live"
+        assert a.pop("node_from") == "file" and b.pop("node_from") is None
+        # ⚠️AND `sketch_back` IS THE ONE QUANTITY THE RING GENUINELY CANNOT STATE: it is a
+        # dets.csv column from G5 onward and `/detections` has no field for it, so the ring row
+        # is "not stated" rather than a value this layer filled in. Asserted as two values on
+        # purpose -- a transport that started inventing a default would pass a `!=` and fail here.
+        assert a.pop("sketch_back") == 192 and b.pop("sketch_back") is None
+        assert a == b
+        assert len(a) > 30, "the parity claim is only worth making over the whole record"
 
     def test_two_frames_that_differ_only_in_what_their_bytes_mean_stay_two_events(self, pl,
                                                                                   tmp_path,

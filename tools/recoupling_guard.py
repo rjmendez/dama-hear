@@ -84,7 +84,11 @@ RULES: Tuple[Rule, ...] = (
         "pvc_path",
         "A shared application volume is how two workloads started reading each other's "
         "directories. Storage location is a deployment decision handed in, not a constant.",
-        literal=re.compile(r"(?:^|[\"'\s=(,])/(?:pool|mnt/pool)(?:/|\b)"),
+        # ⚠️ANCHORED, BECAUSE THIS PATTERN IS APPLIED TO A VALUE AND NOT TO SOURCE TEXT. A
+        # pattern that also accepted `/pool` mid-string fires on every raise whose message
+        # explains the rule -- and this repository's exception strings are paragraphs. A
+        # coupling is a string that IS the path, not one that mentions it.
+        literal=re.compile(r"^/(?:mnt/)?pool(?:/|$)"),
     ),
     Rule(
         "android_gotchi",
@@ -140,9 +144,37 @@ def _docstring_nodes(tree: ast.AST) -> Set[int]:
     return out
 
 
+def _dynamic_import_arg(node: ast.AST) -> Optional[Tuple[str, str]]:
+    """(root distribution name, shown text) for `importlib.import_module("x")` / `__import__("x")`.
+
+    ⚠️THE ONE EVASION WORTH CLOSING, AND IT IS DRIFT RATHER THAN EVASION. `hear/spatial.py`
+    already carries a function-local fail-open `import paho.mqtt.client` inside a `try`, which is
+    exactly the shape that gets rewritten as `importlib.import_module` the first time a linter
+    objects to it. Building a module name out of concatenated pieces to get past this gate is a
+    different act, and a checker that tried to chase it would be guessing.
+    """
+    if not isinstance(node, ast.Call) or not node.args:
+        return None
+    fn = node.func
+    if isinstance(fn, ast.Attribute) and fn.attr == "import_module":
+        pass
+    elif isinstance(fn, ast.Name) and fn.id == "__import__":
+        pass
+    else:
+        return None
+    arg = node.args[0]
+    if not isinstance(arg, ast.Constant) or not isinstance(arg.value, str):
+        return None
+    shown = "%s(%r)" % (fn.attr if isinstance(fn, ast.Attribute) else fn.id, arg.value)
+    return arg.value.split(".")[0], shown
+
+
 def _import_roots(node: ast.AST) -> List[Tuple[str, str]]:
     """(root distribution name, the text a reader should see) for one import statement."""
     out: List[Tuple[str, str]] = []
+    dyn = _dynamic_import_arg(node)
+    if dyn is not None:
+        return [dyn]
     if isinstance(node, ast.Import):
         for a in node.names:
             out.append((a.name.split(".")[0], "import %s" % a.name))
@@ -161,6 +193,9 @@ def scan_source(path: str, text: str) -> List[Violation]:
     """Every coupling one file evaluates. Raises SyntaxError only on a file Python cannot parse."""
     tree = ast.parse(text, filename=path)
     docstrings = _docstring_nodes(tree)
+    # A dynamic import's argument is reported as the import it is, not a second time as a literal.
+    dynamic_args = {id(n.args[0]) for n in ast.walk(tree)
+                    if isinstance(n, ast.Call) and n.args and _dynamic_import_arg(n) is not None}
     found: List[Violation] = []
     for node in ast.walk(tree):
         for root, shown in _import_roots(node):
@@ -168,7 +203,7 @@ def scan_source(path: str, text: str) -> List[Violation]:
                 if root in rule.imports:
                     found.append(Violation(path, node.lineno, rule.name, shown))
         if isinstance(node, ast.Constant) and isinstance(node.value, str) \
-                and id(node) not in docstrings:
+                and id(node) not in docstrings and id(node) not in dynamic_args:
             for rule in RULES:
                 if rule.literal is None:
                     continue
@@ -193,6 +228,11 @@ def python_files(roots: Sequence[str], repo: Optional[str] = None) -> List[str]:
         if os.path.isfile(base) and base.endswith(".py"):
             out.append(os.path.relpath(base, repo).replace(os.sep, "/"))
             continue
+        # ⚠️A MISSING ROOT IS A FAILURE, NOT AN EMPTY ONE. `os.walk` on a path that is not there
+        # yields nothing and raises nothing, so a renamed or mistyped package would leave this
+        # gate printing "clean (0 file(s))" and exiting 0 while inspecting nothing at all.
+        if not os.path.isdir(base):
+            raise ValueError("scan root %r does not exist under %s" % (root, repo))
         for dirpath, dirnames, filenames in os.walk(base):
             dirnames[:] = sorted(d for d in dirnames
                                  if d not in {"__pycache__", ".git"} and not d.startswith("."))
@@ -233,6 +273,18 @@ def parse_allow(text: str) -> List[Tuple[str, str, str, str]]:
     return out
 
 
+def allow_file_for(repo: Optional[str] = None) -> str:
+    """The allowlist belonging to the tree being scanned.
+
+    The default resolves against this checkout; a caller that points `repo` at another tree gets
+    that tree's list, because an exemption is a statement about the code it exempts and reading
+    one repository's list against another's code reports every entry as stale.
+    """
+    if repo is None or os.path.abspath(repo) == os.path.abspath(REPO):
+        return ALLOW_FILE
+    return os.path.join(repo, "tools", "recoupling_allow.txt")
+
+
 def load_allow(path: Optional[str] = None) -> List[Tuple[str, str, str, str]]:
     path = ALLOW_FILE if path is None else path
     if not os.path.exists(path):
@@ -250,7 +302,7 @@ def check(roots: Sequence[str] = DEFAULT_ROOTS, repo: Optional[str] = None,
     nobody can see the subject of any more, and leaving it standing is how a value-scoped list
     turns into a file-scoped one.
     """
-    entries = list(load_allow() if allow is None else allow)
+    entries = list(load_allow(allow_file_for(repo)) if allow is None else allow)
     allowed = {(p, r, t) for p, r, t, _ in entries}
     hit: Set[Tuple[str, str, str]] = set()
     remaining: List[Violation] = []
