@@ -7,7 +7,7 @@
 The output is a JSON Schema, a worked fixture per classification and a manifest of expected
 outcomes, in the same shape `contracts/` uses -- but under `docs/phase5-shadow-read/`,
 because the receipt is **not published yet**.
-`docs/decisions/0006-phase5-shadow-read-comparator.md` records why (publishing a contract id
+`docs/decisions/0007-phase5-shadow-read-comparator.md` records why (publishing a contract id
 regenerates the Phase 0 freeze baseline, and the staged Phase 4 receipt in front of this one
 must be promoted first) and states the promotion procedure, which is a `git mv` plus a
 baseline regeneration and no content change.
@@ -587,7 +587,7 @@ def manifest(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             "The Phase 4 reconcile receipt is already staged in front of this one and is "
             "promoted first; promoting both at once would regenerate one hashed baseline from "
             "two lanes. Promotion is a move plus a baseline regeneration and no content "
-            "change; see docs/decisions/0006-phase5-shadow-read-comparator.md."
+            "change; see docs/decisions/0007-phase5-shadow-read-comparator.md."
         ),
         "generator": "tools/gen_shadow_read_contracts.py",
         "source_of_truth": "hear/verify/shadow_read.py",

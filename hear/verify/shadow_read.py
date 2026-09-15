@@ -32,7 +32,7 @@ Five positions carry the design, and each is asserted by a test rather than desc
 
 Deliberately **not** named `*SCHEMA*`: `tools/freeze_contracts.py` harvests published
 contract ids from `[A-Z_]*SCHEMA[A-Z_]*` assignments, and this receipt is staged rather than
-published. `docs/decisions/0006-phase5-shadow-read-comparator.md` records why and states the
+published. `docs/decisions/0007-phase5-shadow-read-comparator.md` records why and states the
 exact promotion procedure.
 """
 from __future__ import annotations
