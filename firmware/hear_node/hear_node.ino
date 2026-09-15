@@ -124,6 +124,13 @@ static hear_net_join_t net_join;
 static uint32_t loop_max_us = 0, loop_max_boot_us = 0;   // longest loop() pass: this health row, and since boot
 static uint32_t loop_max_boot_at_s = 0;                   // uptime at which the since-boot longest pass ended
 static uint32_t stream_stall_n = 0, stream_gone_n = 0;    // sends that gave up: stalled, client gone
+RTC_NOINIT_ATTR static uint32_t rtc_last_reset_reason = 0;
+RTC_NOINIT_ATTR static uint32_t rtc_last_panic_code = 0;
+RTC_NOINIT_ATTR static uint32_t rtc_last_boot_try = 0;
+static uint32_t rtc_prev_reset_reason = 0;
+static uint32_t rtc_prev_panic_code = 0;
+static uint32_t rtc_prev_boot_try = 0;
+static bool rtc_prev_valid = false;
 static const char *selftest_mic = "untested";
 static mic_diag_t selftest_mic_diag = MIC_DIAG_INIT;
 static const char *selftest_gps = "untested";
@@ -149,6 +156,38 @@ static const char *reset_reason_name() {
     case ESP_RST_SDIO:      return "sdio";
     default:                return "unknown";
   }
+}
+static const char *reset_reason_name_for(uint32_t reason) {
+  switch ((esp_reset_reason_t)reason) {
+    case ESP_RST_POWERON:   return "poweron";
+    case ESP_RST_EXT:       return "ext";
+    case ESP_RST_SW:        return "sw";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "int_wdt";
+    case ESP_RST_TASK_WDT:  return "task_wdt";
+    case ESP_RST_WDT:       return "wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_SDIO:      return "sdio";
+    default:                return "unknown";
+  }
+}
+static uint32_t panic_code_for_reset_reason(uint32_t reason) {
+  switch ((esp_reset_reason_t)reason) {
+    case ESP_RST_PANIC: return 0x0001u;
+    case ESP_RST_INT_WDT:
+    case ESP_RST_WDT: return 0x0002u;
+    case ESP_RST_TASK_WDT: return 0x0003u;
+    default: return 0;
+  }
+}
+static const char *rtc_postmortem_json() {
+  static char pm[160];
+  snprintf(pm, sizeof pm,
+           "{\"available\":%s,\"prev_reset\":\"%s\",\"prev_boot_try\":%lu,\"prev_panic_code\":%lu}",
+           rtc_prev_valid ? "true" : "false", reset_reason_name_for(rtc_prev_reset_reason),
+           (unsigned long)rtc_prev_boot_try, (unsigned long)rtc_prev_panic_code);
+  return pm;
 }
 // JSON and CSV spellings of "not associated": null and an empty field, never a number.
 static const char *rssi_json() {
@@ -1834,8 +1873,11 @@ static void boot_wdt_arm(uint32_t ms) {
   boot_wdt_live = true;
 }
 static void boot_wdt_disarm() { boot_wdt_live = false; esp_task_wdt_delete(NULL); }
-static void boot_wdt_service() {
+static void boot_wdt_kick() {
   if (boot_wdt_live) esp_task_wdt_reset();
+}
+static void boot_wdt_service() {
+  boot_wdt_kick();
   yield();
 }
 
@@ -2389,6 +2431,7 @@ static void gps_wait_ms(uint32_t ms) {
 static bool stream_ready(WiFiClient &c, uint64_t *due) {
   uint32_t t0 = millis();
   for (;;) {
+    boot_wdt_service();
     stream_pump(due);
     int fd = c.fd();
     if (fd < 0 || !c.connected()) { stream_gone_n++; return false; }
@@ -3315,7 +3358,7 @@ static String status_json() {
       "\"gps\":\"%s\",\"pps\":\"%s\",\"wifi\":\"%s\"},"
     "\"net\":{\"connected\":%s,\"rssi\":%s,\"rssi_join\":%d,\"ch\":%d,\"bssid\":\"%s\",\"joined\":%d,"
       "\"seen\":%d,\"join_ms\":%lu,\"disc\":%lu,\"reconn\":%lu,\"reason\":%d,\"disc_age_s\":%s},"
-    "\"sys\":{\"reset\":\"%s\",\"heap_min\":%lu,\"heap_max_alloc\":%lu,\"stack_high_watermark_words\":%lu,\"psram_min\":%lu,\"loop_max_ms\":%lu,"
+    "\"sys\":{\"reset\":\"%s\",\"postmortem\":%s,\"heap_min\":%lu,\"heap_max_alloc\":%lu,\"stack_high_watermark_words\":%lu,\"psram_min\":%lu,\"loop_max_ms\":%lu,"
       // psram_fault: the image was built expecting PSRAM and the chip has none it can talk to,
       // i.e. the binary's PSRAM bus mode does not match this board. Everything that wanted PSRAM
       // is now on the internal heap and this node is on its way to an allocation failure.
@@ -3409,7 +3452,8 @@ static String status_json() {
     bssid_str(), net_join.joined, net_join.seen, (unsigned long)net_join.join_ms,
     (unsigned long)hear_net_disconnects(), (unsigned long)hear_net_reconnects(),
     hear_net_last_reason(), disc_age_json(),
-    reset_reason_name(), (unsigned long)ESP.getMinFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(),
+    reset_reason_name(), rtc_postmortem_json(),
+    (unsigned long)ESP.getMinFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(),
     (unsigned long)uxTaskGetStackHighWaterMark(NULL), (unsigned long)ESP.getMinFreePsram(),
     (unsigned long)(loop_max_us / 1000), (unsigned long)(loop_max_boot_us / 1000),
     (unsigned long)loop_max_boot_at_s, temperatureRead(),
@@ -4082,20 +4126,18 @@ void setup() {
        prov_src, prov_nvs ? ", in NVS" : "");
   logf("boot  reset reason %s\n", reset_reason_name());
   psram_boot_check();
-  RTC_NOINIT_ATTR static uint32_t last_reset_reason = 0;
-  RTC_NOINIT_ATTR static uint32_t last_panic_code = 0;
-  RTC_NOINIT_ATTR static uint32_t last_boot_try = 0;
   uint32_t reset_reason = (uint32_t)esp_reset_reason();
-  last_reset_reason = reset_reason;
-  last_boot_try = (uint32_t)hear_boot_try();
-  switch (reset_reason) {
-    case ESP_RST_PANIC: last_panic_code = 0x0001u; break;
-    case ESP_RST_INT_WDT: case ESP_RST_WDT: last_panic_code = 0x0002u; break;
-    case ESP_RST_TASK_WDT: last_panic_code = 0x0003u; break;
-    default: last_panic_code = 0; break;
-  }
-  logf("boot  rtc postmortem reset=%s boot_try=%lu panic_code=0x%08lx\n",
-       reset_reason_name(), (unsigned long)last_boot_try, (unsigned long)last_panic_code);
+  rtc_prev_reset_reason = rtc_last_reset_reason;
+  rtc_prev_panic_code = rtc_last_panic_code;
+  rtc_prev_boot_try = rtc_last_boot_try;
+  rtc_prev_valid = rtc_prev_reset_reason || rtc_prev_panic_code || rtc_prev_boot_try;
+  rtc_last_reset_reason = reset_reason;
+  rtc_last_panic_code = panic_code_for_reset_reason(reset_reason);
+  rtc_last_boot_try = (uint32_t)hear_boot_try();
+  logf("boot  rtc postmortem prev_reset=%s prev_boot_try=%lu prev_panic_code=0x%08lx current_reset=%s current_boot_try=%lu current_panic_code=0x%08lx\n",
+       reset_reason_name_for(rtc_prev_reset_reason), (unsigned long)rtc_prev_boot_try,
+       (unsigned long)rtc_prev_panic_code, reset_reason_name_for(rtc_last_reset_reason),
+       (unsigned long)rtc_last_boot_try, (unsigned long)rtc_last_panic_code);
 
   // Strongest configured network first, and the strongest access point within it. An outdoor node
   // may reach several, and the first to answer is not the one it hears best.
@@ -4216,9 +4258,12 @@ void setup() {
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
       } else if (u.status == UPLOAD_FILE_WRITE) {
         if (!ota_authorized) return;
+        boot_wdt_service();
         if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
+        boot_wdt_service();
       } else if (u.status == UPLOAD_FILE_END) {
         if (!ota_authorized) return;
+        boot_wdt_service();
         if (Update.end(true)) snprintf(ota_msg, sizeof ota_msg, "wrote %u B", (unsigned)u.totalSize);
         else { Update.printError(Serial); snprintf(ota_msg, sizeof ota_msg, "write failed"); }
       }

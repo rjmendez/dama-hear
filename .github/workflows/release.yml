@@ -43,6 +43,18 @@ jobs:
           name: fw-hear_node-esp32s3-i2s-gps-qspi
           path: ${{ runner.temp }}/hear-node-release/esp32s3-i2s-gps-qspi
 
+      # A release asset must never contain a fleet credential. CI has no secrets.h -- that is why
+      # every published image is unprovisioned -- but "must not exist" is worth asserting rather
+      # than assuming, because the failure mode is a published token and a fleet-wide rotation.
+      - name: the release tree carries no compiled-in credentials
+        run: |
+          for f in firmware/hear_node/secrets.h firmware/puc_node/secrets.h; do
+            if [ -e "$f" ]; then
+              echo "::error::$f exists in the release checkout; the images may carry fleet credentials"
+              exit 1
+            fi
+          done
+
       - name: assemble
         run: |
           mkdir dist
@@ -88,6 +100,14 @@ jobs:
                    "psram_mode": "quad",
                    "build_flags": ["-DHEAR_ALLOW_NO_WIFI", "-DHEAR_BOARD_ESP32S3_I2S_GPS"]},
               ],
+              # THE INSTALLER CONTRACT, in a field rather than in prose. These images are
+              # unprovisioned: no Wi-Fi credentials, no node name, no admin token, no push
+              # token. A node supplies all four from its NVS record, and flash.py refuses to
+              # install this image on a node that does not report holding them -- the check
+              # that v0.1.5 did not have when rankine lost admin and telemetry auth to it.
+              "image_class": "unprovisioned",
+              "compiled_in_credentials": False,
+              "provisioning_required": ["node_id", "wifi", "admin_token", "push_token"],
               "credentials": "none compiled in; read from the node's NVS (enroll.py)",
           }, open("dist/build-info.json", "w"), indent=2)
           PY
@@ -102,7 +122,9 @@ jobs:
           cat > notes.md <<EOF
           Firmware for \`firmware/hear_node\` at \`$GITHUB_SHA\`. \`/status\` reports it as \`fw: $TAG\`.
 
-          These images carry **no Wi-Fi credentials and no node name**. Each node keeps its own in NVS, which OTA does not touch, so the release publishes one image per board class/PSRAM-bus variant and \`flash.py --release\` chooses the one that matches the node's live \`/status\`.
+          These images are **unprovisioned**: no Wi-Fi credentials, no node name, **no admin token and no push token**. A fleet token compiled into a public asset would be a published fleet credential. Each node keeps its own in NVS, which OTA does not touch, so the release publishes one image per board class/PSRAM-bus variant and \`flash.py --release\` chooses the one that matches the node's live \`/status\`.
+
+          **An unprovisioned image is not a node-ready image.** A node whose NVS holds no tokens comes up on this firmware answering \`/status\`, having every heartbeat rejected with 401, and refusing \`/reboot\`, \`/format\` and \`/gate\` from everyone. \`/update\` alone stays open while no admin token is configured, as a recovery valve for a tokenless image. \`flash.py\` refuses that combination: it requires the node's live \`/status\` to report \`auth.admin.src\` and \`auth.push.src\` of \`nvs\` before it downloads anything, and checks the node's auth again, including a 2xx backend push, after the flash.
 
           An enrolled node, over the air:
 
@@ -112,7 +134,7 @@ jobs:
 
               python3 firmware/hear_node/enroll.py <node> /dev/ttyACM0 --class <board-class> --release $TAG
 
-          A board that was never enrolled comes up as its own access point and says so in \`/status\`.
+          A board that was never enrolled comes up as its own access point and says so in \`/status\`. Its \`auth\` block reports whether credentials are configured and where they come from (\`compiled\` or \`nvs\`), never what they are.
 
           | file | what it is |
           |---|---|

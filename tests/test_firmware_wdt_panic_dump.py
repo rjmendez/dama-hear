@@ -32,9 +32,14 @@ def test_hear_node_keeps_watchdog_and_rtc_postmortem_state_live():
     assert "esp_task_wdt.h" in src
     assert "loop_wdt_arm(5000);" in src
     assert "boot_wdt_service();" in _block(HEAR.read_text(), "loop")
-    assert "RTC_NOINIT_ATTR static uint32_t last_reset_reason" in src
-    assert "RTC_NOINIT_ATTR static uint32_t last_panic_code" in src
-    assert "esp_reset_reason()" in src and "last_boot_try" in src
+    assert "RTC_NOINIT_ATTR static uint32_t rtc_last_reset_reason" in src
+    assert "RTC_NOINIT_ATTR static uint32_t rtc_last_panic_code" in src
+    rtc = _block(HEAR.read_text(), "setup")
+    assert "rtc_prev_reset_reason = rtc_last_reset_reason;" in rtc
+    assert "rtc_last_reset_reason = reset_reason;" in rtc
+    assert '\\"postmortem\\":%s' in src
+    assert "boot_wdt_service();" in _block(HEAR.read_text(), "stream_ready")
+    assert "Update.write(u.buf, u.currentSize)" in src and src.count("boot_wdt_service();") >= 2
 
 
 def test_puc_node_has_runtime_watchdog_and_reset_logging():
@@ -42,6 +47,11 @@ def test_puc_node_has_runtime_watchdog_and_reset_logging():
     assert "esp_task_wdt.h" in src
     assert "task_wdt_arm(5000);" in src
     assert "task_wdt_service();" in _block(PUC.read_text(), "loop")
-    assert "RTC_NOINIT_ATTR static uint32_t last_reset_reason" in src
-    assert "RTC_NOINIT_ATTR static uint32_t last_panic_code" in src
-    assert "esp_reset_reason()" in src and "reset_name()" in src
+    assert "RTC_NOINIT_ATTR static uint32_t rtc_last_reset_reason" in src
+    assert "RTC_NOINIT_ATTR static uint32_t rtc_last_panic_code" in src
+    assert "rtc_prev_reset_reason = rtc_last_reset_reason;" in src
+    assert '\\"postmortem\\":%s' in src
+    assert "task_wdt_wait_ms(3000);" in src
+    assert "task_wdt_wait_ms(1500);" in src
+    assert "task_wdt_kick();" in _block(PUC.read_text(), "ntp_query")
+    assert src.count("Update.write(u.buf, u.currentSize)") == 1 and src.count("task_wdt_service();") >= 3
