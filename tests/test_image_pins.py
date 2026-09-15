@@ -16,6 +16,7 @@ import re
 import sys
 
 import pytest
+import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 IMAGES = ROOT / "deploy" / "images"
@@ -210,3 +211,25 @@ def test_no_image_is_referenced_by_a_moving_tag_in_the_workflow():
     wf = (ROOT / ".github" / "workflows" / "images.yml").read_text()
     assert ":latest" not in wf, "a manifest references a digest; `latest` is not a version"
     assert "${{ github.sha }}" in wf, "images are tagged with the commit that built them"
+
+
+def test_the_scan_gates_and_its_exceptions_expire():
+    """⚠️An ignore with no expiry is a permanent allowlist, and a scanner with one is a badge."""
+    wf = (ROOT / ".github" / "workflows" / "images.yml").read_text()
+    assert 'exit-code: "1"' in wf, "the Trivy step must fail the build, not decorate it"
+    assert "trivyignores: deploy/images/trivyignore.yaml" in wf
+
+    ignore = yaml.safe_load((IMAGES / "trivyignore.yaml").read_text())
+    locked = set()
+    for lock in sorted((ROOT / "requirements" / "lock").glob("*.txt")):
+        locked |= {p.lower().replace("_", "-") for p in pins(lock)}
+    for entry in ignore.get("vulnerabilities", []):
+        assert entry.get("expired_at"), (
+            "%s has no expired_at -- an accepted finding is accepted until a date"
+            % entry.get("id"))
+        assert entry.get("statement"), (
+            "%s has no statement -- why it is accepted is the whole record" % entry.get("id"))
+        for pkg in locked:
+            assert pkg not in entry["statement"].split(), (
+                "%s accepts a finding in %s, which is in a lock file: move the pin instead"
+                % (entry.get("id"), pkg))

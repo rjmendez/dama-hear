@@ -186,3 +186,5 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
           format: table
+          # dated, reviewed exceptions -- each one expires
+          trivyignores: deploy/images/trivyignore.yaml

@@ -63,10 +63,13 @@ Claimed:
 
 Not claimed:
 
-- ⚠️**Not bit-identical images.** `apt` metadata, timestamps and layer ordering still vary. What
-  is reproducible is the *contents contract*: same base digest, same artifacts, same versions.
-  Bit-identical layers would need a snapshot Debian mirror and `SOURCE_DATE_EPOCH`; the images
-  install no apt packages precisely so that this gap stays small.
+- ⚠️**Not bit-identical images, and the OS layer is deliberately not frozen.** `hear-runtime`
+  runs `apt-get upgrade` — *upgrade*, never *install* — so two builds a month apart can carry
+  different Debian package versions. That is the intended trade: the first scan of this chain
+  found 12 fixable HIGH/CRITICAL CVEs (perl, gzip, pcre2, sqlite3) that Debian had already fixed
+  and the pinned base had not yet picked up, and a digest pin freezes the fix out exactly as
+  well as it freezes the bug in. **The Python closure is locked; the OS tracks security.**
+  Bit-identical layers would additionally need a snapshot Debian mirror and `SOURCE_DATE_EPOCH`.
 - ⚠️**One platform.** The locks are `linux/amd64`, which is what the k3s nodes are. A second
   architecture is a second lock file, not a re-resolve of these.
 - ⚠️**`ml-gpu` is not Python 3.13.** It inherits TensorFlow's interpreter, so its lock is not
@@ -82,11 +85,14 @@ indexes, or telemetry endpoints". The pieces that makes possible are here:
   verifiable rather than trusted.
 - The base digests are exact, so `docker save` of those two images plus the built variants is a
   complete build input set.
-- No `apt-get install` in any variant. The only network the build needs is the index and the
-  registry.
+- No `apt-get install` in any variant: nothing new enters the image from a distro mirror, so the
+  set of OS packages to mirror is fixed and known from the base image alone.
 
-What is still missing for a true air-gapped build is a mirrored Debian snapshot for the base
-image itself — which is why the base is *vendored by digest* rather than rebuilt.
+⚠️What is still missing for a true air-gapped build is a Debian security mirror, which the
+`apt-get upgrade` in `hear-runtime` does need. An air-gapped site either points `apt` at its own
+mirror or drops that layer and accepts the base image's patch level — and then has to say so,
+because the choice is between an unpatched OS and a mirrored one, not between a mirror and
+nothing.
 
 ## The model boundary
 
@@ -130,8 +136,12 @@ The images workflow (`.github/workflows/images.yml`) attaches, for every variant
 - an **SBOM** (SPDX, via buildx's `--sbom=true`),
 - a **provenance attestation** (SLSA, via `--provenance=mode=max`) naming the workflow, the
   commit and the build inputs,
-- a **vulnerability scan** (Trivy, `--exit-code 1` on HIGH/CRITICAL with a dated, reviewed
-  ignore file — not a permanent allowlist).
+- a **vulnerability scan** (Trivy, `--exit-code 1` on *fixable* HIGH/CRITICAL). Unfixable
+  findings are reported and not gated on: a base image cannot be patched for a CVE upstream has
+  not fixed. Accepted findings live in `trivyignore.yaml`, and ⚠️**every entry carries an
+  `expired_at`** — after that date Trivy reports it again and the build fails, which is the only
+  thing that makes anyone look at it twice. Nothing in a lock file may be listed there: a
+  vulnerable pin is fixed by moving the pin.
 
 ⚠️**On a pull request nothing is published.** The same chain is built, with the same SBOM and
 provenance, into a registry service that lives and dies with the job — so a fork cannot push an
