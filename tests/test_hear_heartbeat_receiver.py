@@ -1090,10 +1090,10 @@ class TestDurableOutboxCorrectness(TestValidation):
             thread.join(timeout=10)
 
         assert len(self._rows(db, "SELECT id FROM durable_records")) == 1
-        # One publish for the winner; every later *sequential* duplicate re-arms the TTL (D3),
-        # so the bound that matters is "no more than one publish per caller, never a fan-out
-        # from a single claim" -- and nothing was left pending.
-        assert fake.execute_calls <= 8
+        # Exactly one caller won the claim and published: a second recorded success would mean a
+        # single durable row fanned out into several Redis writes, which is D2 itself.
+        assert len(self._rows(
+            db, "SELECT id FROM cache_attempts WHERE outcome='succeeded'")) == 1
         assert fake.ttls["dama:hear:nyquist"] == 30
         assert store.health_snapshot()["durable_store"]["pending_records"] == 0
 
@@ -1142,6 +1142,24 @@ class TestDurableOutboxCorrectness(TestValidation):
         assert len(self._rows(db, "SELECT id FROM durable_records")) == 1
         assert len(self._rows(
             db, "SELECT id FROM cache_attempts WHERE outcome='succeeded'")) == 1
+
+    def test_a_redelivered_older_heartbeat_does_not_roll_the_cache_backwards(self, tmp_path):
+        # The D3 refresh must not become a stale-overwrite of its own: an older heartbeat can be
+        # redelivered (MQTT QoS-1, a node draining its local outbox, an out-of-order retry) after
+        # a newer one was cached. Re-arming the TTL with that older body would walk the fleet
+        # view backwards, so a superseded duplicate refreshes nothing.
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis()
+        store = self._store(db, fake)
+        older = self._heartbeat(uptime_s=100, idempotency_key="hb-old")
+        store.write_heartbeat(older)
+        store.write_heartbeat(self._heartbeat(uptime_s=200, idempotency_key="hb-new"))
+        assert json.loads(fake.values["dama:hear:nyquist"])["uptime_s"] == 200
+
+        store.write_heartbeat(older)
+
+        assert json.loads(fake.values["dama:hear:nyquist"])["uptime_s"] == 200
+        assert json.loads(fake.values["dama:hear:latest"])["uptime_s"] == 200
 
     def test_a_duplicate_heartbeat_surfaces_a_cache_outage_instead_of_a_false_ack(self, tmp_path):
         db = tmp_path / "heartbeats.sqlite3"

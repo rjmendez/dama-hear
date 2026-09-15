@@ -194,7 +194,11 @@ class SqliteDurableRecordStore(DurableRecordStore):
             try:
                 yield con
             except BaseException:
-                con.execute("ROLLBACK")
+                try:
+                    con.execute("ROLLBACK")
+                except sqlite3.Error:
+                    # Never mask the real failure with a rollback-of-nothing error.
+                    logger.debug("rollback after a failed durable transaction was a no-op")
                 raise
             con.execute("COMMIT")
         finally:
@@ -716,6 +720,13 @@ class HeartbeatReceiverStore:
         stream is append-only and already deduped Redis-side, so a duplicate must stay a no-op.
         """
         if stored.telemetry_path != "hear/heartbeat":
+            return
+        if self.durable_store.is_superseded(stored):
+            # An *older* heartbeat can be redelivered after a newer one was already cached (MQTT
+            # QoS-1 redelivery, a node draining its local outbox, an out-of-order retry). Writing
+            # its body back would roll dama:hear:<id> and dama:hear:latest backwards, which is the
+            # same hazard replay_pending refuses. The newer record already armed this device's TTL
+            # with current state, so the correct refresh here is none at all.
             return
         try:
             self.cache.write(stored.record, stored.body_json, stored.record_uid)
