@@ -206,6 +206,17 @@ class TestAClipIsNotACsv:
         monkeypatch.setattr(HD, "_get", boom)
         assert HD.fetch_clip("10.0.0.1", CLIP_A) == (None, "transport")
 
+    def test_a_bounded_fetch_stops_after_the_cap(self, monkeypatch):
+        seen = []
+
+        def bounded(url, timeout, max_bytes):
+            seen.append(max_bytes)
+            return b"x" * (max_bytes + 1), True
+
+        monkeypatch.setattr(HD, "_get_bounded", bounded)
+        assert HD.fetch_clip("10.0.0.1", CLIP_A, max_bytes=123) == (None, "byte_cap")
+        assert seen == [123]
+
 
 # ---------------------------------------------------------------- S2: names out of dets.csv
 

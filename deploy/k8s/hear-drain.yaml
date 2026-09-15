@@ -40,7 +40,12 @@ spec:
   # only for scene.csv, every run reporting `ok` over a 3.27 h hole -- is fixed in the drain, not
   # in this file: tools/hear_drain.py now DISCOVERS the names from /ls. See
   # docs/acoustic-stack.md section 0.1.
-  # THE CLIP LANE. Clips are 480,044 B. The observed burst is 350-370 clips/hour, so a
+  # PRIVACY MODE, enabled 2026-09-15: do not retain human-audible WAV audio. The drain still
+  # ingests sketches, scenes and the phone corpus, but `--clip-max-per-node 0` prevents new raw
+  # clip fetches and `--clip-store-max-b 0` keeps the cache target at zero. Tags/embeddings already
+  # written remain usable as derived data; the WAV cache is not the durable record.
+  #
+  # THE CLIP LANE, when privacy mode is relaxed. Clips are 480,044 B. The observed burst is
   # 15-minute interval creates 88-93 clips/node. The firmware clip cache is 128 clips (61.5 MiB),
   # a 20.8-minute wall window at 370/hour; this job may fetch 96/run, which is 384/hour. That
   # closes the measured 7x mismatch as long as the clip transfer path stays at the measured
@@ -93,8 +98,9 @@ spec:
                     --node gold=172.16.100.82 \
                     --node kasami=172.16.100.90 \
                     --node ageev=172.16.100.83 \
-                    --clip-max-per-node 96 \
-                    --clip-deadline-s 270
+                    --clip-max-per-node 0 \
+                    --clip-deadline-s 270 \
+                    --clip-store-max-b 0
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py,  subPath: hear__init__.py }
                 - { name: code, mountPath: /app/hear/wire.py,      subPath: hear_wire.py }
@@ -194,8 +200,8 @@ spec:
                     --node ageev=172.16.100.83 \
                     --unfetched-window-s 7200 \
                     --max-ring-wall-span 1.02 \
-                    --max-clips-deferred 0 \
-                    --max-clips-lost 0
+                    --max-clips-deferred -1 \
+                    --max-clips-lost -1
                   rc=$?
                   # --stats runs EVEN WHEN THE CHECK FAILED: a failure is exactly when the pool
                   # summary is wanted. Its own status is discarded so it cannot mask rc.

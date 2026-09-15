@@ -300,6 +300,13 @@ def _get(url: str, timeout: float = DEFAULT_TIMEOUT_S) -> bytes:
         return r.read()
 
 
+def _get_bounded(url: str, timeout: float, max_bytes: int) -> Tuple[bytes, bool]:
+    """Read at most max_bytes + 1 so callers can prove a response crossed their byte cap."""
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        body = r.read(max_bytes + 1)
+    return body, len(body) > max_bytes
+
+
 def fetch_status(ip: str, timeout: float = DEFAULT_TIMEOUT_S) -> Dict[str, Any]:
     return json.loads(_get("http://%s/status" % ip, timeout).decode("utf-8"))
 
@@ -1116,7 +1123,8 @@ def drain_context_file(pl: "P.Pool", node: str, ip: str, name: str, sizes: Optio
 # ---------------------------------------------------------------- the clip lane
 
 
-def fetch_clip(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S
+def fetch_clip(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S,
+               max_bytes: Optional[int] = None
                ) -> Tuple[Optional[bytes], Optional[str]]:
     """One clip WAV off the card: `(body, None)` on a real clip, `(None, reason)` otherwise.
 
@@ -1133,11 +1141,19 @@ def fetch_clip(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S
     """
     url = "http://%s/sd?file=%s" % (ip, name)
     try:
-        body = _get(url, timeout)
+        if max_bytes is None:
+            body = _get(url, timeout)
+            over_cap = False
+        else:
+            if max_bytes < 0:
+                raise ValueError("max_bytes must be >= 0")
+            body, over_cap = _get_bounded(url, timeout, max_bytes)
     except urllib.error.HTTPError as e:
         return None, ("http_404" if e.code == 404 else "http_%d" % e.code)
     except Exception:
         return None, "transport"
+    if over_cap:
+        return None, "byte_cap"
     if not body:
         return None, "empty"
     if body[:4] != b"RIFF":

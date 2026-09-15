@@ -102,6 +102,37 @@ from the drain's `/pool/pylib`, so a tagger dependency cannot break the collecto
 the 16 MB YAMNet weights live at `/pool/models/yamnet` and are verified against a sha256 pinned
 in `tools/hear_tag.py` before anything is tagged.
 
+## Bounded debug recording
+
+`tools/hear_debug_record.py` is the only supported exception path while the live drain remains in
+privacy mode (`--clip-max-per-node 0 --clip-store-max-b 0`). It accepts exactly one node from the
+checked-in fleet allowlist and refuses to run without a grant ID, operator, reason, the literal
+acknowledgement `I_ACKNOWLEDGE_RAW_AUDIO_IS_TEMPORARY`, an explicit UTC window of at most five
+minutes, a clip cap of at most six, a TTL of at most 300 seconds, and a raw-byte cap.
+
+The tool never writes to `/pool`: each fetched WAV is placed in a mode-0700 temporary workspace
+(or a pod's `emptyDir` when run there), converted immediately to non-audio measurements, unlinked,
+and followed by deletion proof in the durable JSON audit. Example:
+
+```
+python3 tools/hear_debug_record.py \
+  --grant-id INC-1234 \
+  --operator operator@example \
+  --reason 'debug unexplained detector burst' \
+  --ack I_ACKNOWLEDGE_RAW_AUDIO_IS_TEMPORARY \
+  --node nyquist \
+  --window-start 2026-09-15T18:00:00Z \
+  --window-end 2026-09-15T18:05:00Z \
+  --clip-count 2 \
+  --ttl-s 300 \
+  --byte-cap 1000000 \
+  --output debug-recording-audit.json
+```
+
+Run it only after confirming no other node reader overlaps the selected node. The ESP32 serves one
+client at a time, so this operator workflow must not overlap `hear-drain` even though the scheduled
+drain's audio lane is disabled.
+
 ## hear-score — the consumer that was missing
 
 `modules/supersonic/classify.score_sketch` was trained, versioned and shipped with **zero callers
