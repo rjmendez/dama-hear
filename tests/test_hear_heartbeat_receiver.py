@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from typing import Dict
 
 import pytest
 
@@ -16,27 +17,91 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools import hear_heartbeat_receiver as HR  # noqa: E402
 
 
-class _FakeDedupeScript:
+def redis_cluster_key_slot(key: str) -> int:
+    """Mirrors Redis Cluster's real key-slot hashing (CRC16/XMODEM over the {tag} substring if
+    present, else the whole key) so tests can assert that a script's declared KEYS are actually
+    cluster-safe (all map to one slot) rather than merely "happen to work" against a single node.
+    """
+    start = key.find("{")
+    if start != -1:
+        end = key.find("}", start + 1)
+        if end != -1 and end != start + 1:
+            key = key[start + 1:end]
+    crc = 0
+    for byte in key.encode("utf-8"):
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc % 16384
+
+
+class _FakeScript:
     """Stands in for the redis-py Script object returned by ``client.register_script``."""
 
     def __init__(self, client: "FakeRedis"):
         self._client = client
 
     def __call__(self, keys=None, args=None):
-        return self._client._eval_dedupe_write(keys or [], args or [])
+        return self._client._eval_event_dedupe_write(keys or [], args or [])
+
+
+class _FakePipeline:
+    """Stands in for ``client.pipeline(transaction=False)``: queues single-key commands and
+    applies them all on ``execute()``. Used only by the heartbeat path, which never needs
+    cross-key atomicity (a retried overwrite is a no-op in effect)."""
+
+    def __init__(self, client: "FakeRedis"):
+        self._client = client
+        self._ops: list = []
+
+    def setex(self, key, ttl, value):
+        self._ops.append(("setex", key, ttl, value))
+        return self
+
+    def sadd(self, key, *members):
+        self._ops.append(("sadd", key, members))
+        return self
+
+    def set(self, key, value):
+        self._ops.append(("set", key, value))
+        return self
+
+    def execute(self):
+        self._client.execute_calls += 1
+        ops, self._ops = self._ops, []
+        if self._client.failures_before_success > 0:
+            self._client.failures_before_success -= 1
+            raise RuntimeError("simulated redis outage")
+        for kind, *rest in ops:
+            if kind == "setex":
+                key, ttl, value = rest
+                self._client.values[key] = value
+                self._client.ttls[key] = ttl
+            elif kind == "sadd":
+                key, members = rest
+                self._client.sets.setdefault(key, set()).update(members)
+            elif kind == "set":
+                key, value = rest
+                self._client.values[key] = value
+        return []
 
 
 class FakeRedis:
-    """A minimal in-memory double for the one Redis surface RedisHeartbeatCache uses: a single
-    atomic dedupe-and-write Lua script (``register_script`` + a callable ``Script``-like object).
+    """A minimal in-memory double for the two Redis surfaces RedisHeartbeatCache uses:
 
-    ``failures_before_success`` simulates a clean outage: the script never reaches Redis (or
-    Redis rejects it outright), so nothing is mutated before the exception is raised.
+    * a plain non-transactional pipeline for heartbeats (``pipeline`` / ``sadd``), and
+    * a single atomic event-dedupe-and-write Lua script (``register_script``), keyed only by the
+      declared KEYS the real script takes -- no key is ever built by string concatenation here,
+      mirroring the production script's cluster-safety contract.
+
+    ``failures_before_success`` simulates a clean outage: the write never reaches Redis (or Redis
+    rejects it outright), so nothing is mutated before the exception is raised.
     ``ambiguous_failures_before_success`` simulates the crash/ambiguous-ACK window this receiver
     must tolerate: Redis fully applies the script (including the dedupe marker) but the caller
     never learns of the success (e.g. the connection drops before the reply arrives), so the
     caller retries. Because the dedupe marker is already recorded, the retry must no-op instead
-    of duplicating the stream/event write.
+    of duplicating the stream/event write. This mode only applies to the event path -- heartbeat
+    writes have no dedupe marker to lose track of.
     """
 
     def __init__(self, failures_before_success: int = 0,
@@ -48,44 +113,55 @@ class FakeRedis:
         self.failures_before_success = failures_before_success
         self.ambiguous_failures_before_success = ambiguous_failures_before_success
         self.execute_calls = 0
-        self.dedupe = {}
-        self._dedupe_seq = 0
+        # dedupe_key -> {record_uid: seq}; seq_key -> int. Keyed by the *declared* KEYS values
+        # themselves (not a single flat structure) so a test can assert isolation between an
+        # event stream's dedupe metadata and anything else.
+        self.dedupe: Dict[str, Dict[str, int]] = {}
+        self._seq_counters: Dict[str, int] = {}
 
-    def register_script(self, script: str) -> _FakeDedupeScript:
-        return _FakeDedupeScript(self)
+    def register_script(self, script: str) -> _FakeScript:
+        return _FakeScript(self)
 
-    def _eval_dedupe_write(self, keys, args):
+    def pipeline(self, transaction=False):
+        assert transaction is False
+        return _FakePipeline(self)
+
+    def sadd(self, key, *members):
+        # Direct (non-pipelined) call used by the event write path; idempotent, so no queuing
+        # or atomicity is needed.
+        self.sets.setdefault(key, set()).update(members)
+
+    def set(self, key, value):
+        # Direct (non-pipelined) call used by the event write path's per-device "last event"
+        # cache; idempotent, so it stays outside the atomic dedupe script.
+        self.values[key] = value
+
+    def _eval_event_dedupe_write(self, keys, args):
         self.execute_calls += 1
         if self.failures_before_success > 0:
             self.failures_before_success -= 1
             raise RuntimeError("simulated redis outage")
 
-        dedupe_key, hb_key, devices_key, latest_key, event_key, stream_key = keys
-        record_uid, telemetry_path, node_id, body_json, ttl_s, maxlen = args
-        ttl_s, maxlen = int(ttl_s), int(maxlen)
+        dedupe_key, seq_key, stream_key = keys
+        record_uid, node_id, body_json, maxlen = args
+        maxlen = int(maxlen)
 
-        if record_uid in self.dedupe:
+        dedupe_zset = self.dedupe.setdefault(dedupe_key, {})
+        if record_uid in dedupe_zset:
             return 0
 
-        if telemetry_path == "hear/heartbeat":
-            self.values[hb_key] = body_json
-            self.ttls[hb_key] = ttl_s
-            self.sets.setdefault(devices_key, set()).add(node_id)
-            self.values[latest_key] = body_json
-        else:
-            self.sets.setdefault(devices_key, set()).add(node_id)
-            self.values[event_key] = body_json
-            stream = self.streams.setdefault(stream_key, [])
-            stream.append({"device_id": node_id, "payload": body_json})
-            if len(stream) > maxlen:
-                del stream[:-maxlen]
+        stream = self.streams.setdefault(stream_key, [])
+        stream.append({"device_id": node_id, "payload": body_json})
+        if len(stream) > maxlen:  # exact MAXLEN trim, no '~' slack.
+            del stream[:-maxlen]
 
-        self._dedupe_seq += 1
-        self.dedupe[record_uid] = self._dedupe_seq
-        if len(self.dedupe) > maxlen:
-            oldest = sorted(self.dedupe.items(), key=lambda kv: kv[1])[:len(self.dedupe) - maxlen]
-            for stale_uid, _ in oldest:
-                del self.dedupe[stale_uid]
+        seq = self._seq_counters.get(seq_key, 0) + 1
+        self._seq_counters[seq_key] = seq
+        dedupe_zset[record_uid] = seq
+        if len(dedupe_zset) > maxlen:
+            stale = sorted(dedupe_zset.items(), key=lambda kv: kv[1])[:len(dedupe_zset) - maxlen]
+            for stale_uid, _ in stale:
+                del dedupe_zset[stale_uid]
 
         if self.ambiguous_failures_before_success > 0:
             self.ambiguous_failures_before_success -= 1
@@ -482,8 +558,73 @@ class TestDurableSqlite(TestValidation):
         )
         for seq in range(10):
             store.write_event(self._event(event_seq=seq, idempotency_key=f"evt-{seq}"))
-        assert len(fake.dedupe) <= 3
-        assert len(fake.streams[HR.EVENT_STREAM_KEY]) <= 3
+        dedupe_zset = fake.dedupe[store.cache.event_dedupe_key]
+        stream = fake.streams[HR.EVENT_STREAM_KEY]
+        assert len(dedupe_zset) == 3
+        assert len(stream) == 3
+        # Exact retention alignment: the record_uids still tracked for dedupe are exactly the
+        # ones whose payloads are still physically present in the (exactly, not approximately)
+        # trimmed stream -- nothing lingers past what XADD actually retained, and nothing that
+        # is still retained has silently lost its dedupe marker.
+        retained_seqs = {json.loads(entry["payload"])["event_seq"] for entry in stream}
+        assert retained_seqs == {7, 8, 9}
+        assert set(dedupe_zset) == {f"evt-{seq}" for seq in retained_seqs}
+
+    def test_event_dedupe_script_keys_are_fully_declared_and_share_one_cluster_slot(self):
+        # Regression guard for the original bug: a key built by string concatenation inside the
+        # Lua script (e.g. ``dedupe_key .. ':seq'``) is an *undeclared* key access that Redis
+        # Cluster cannot route correctly, and any KEYS that don't share a hash tag will land on
+        # different slots and make the script fail outright against a real cluster. Assert both
+        # structurally (no concatenation operator building a key name in the script body) and
+        # by replaying Redis's own CRC16 hash-slot algorithm over the actual keys the cache uses.
+        script = HR._EVENT_DEDUPE_SCRIPT
+        assert "..'" not in script.replace(" ", "") and '.."' not in script.replace(" ", ""), (
+            "script must not build key names by string concatenation")
+        assert script.count("KEYS[") == 3, "script must declare exactly its three used keys"
+
+        cache = HR.RedisHeartbeatCache(FakeRedis(), event_stream_key="dama:hear:events")
+        slots = {
+            "stream": redis_cluster_key_slot(cache.event_stream_key),
+            "dedupe": redis_cluster_key_slot(cache.event_dedupe_key),
+            "dedupe_seq": redis_cluster_key_slot(cache.event_dedupe_seq_key),
+        }
+        assert len(set(slots.values())) == 1, f"all script keys must share one slot: {slots}"
+        # The per-device "last event" cache key is intentionally *not* part of the atomic
+        # script (see write()'s comment) precisely because it can never share that fixed slot:
+        # its natural tag depends on device_id, so it must stay a plain single-key command.
+        for device_id in ("nyquist", "totally-different-node"):
+            per_device_key = f"dama:hear:event:{device_id}"
+            assert per_device_key not in (cache.event_dedupe_key, cache.event_dedupe_seq_key)
+
+    def test_heavy_heartbeat_traffic_does_not_touch_or_evict_event_dedupe_metadata(self, tmp_path):
+        # Blocker: heartbeat writes must never share (and thus can never crowd out) the event
+        # stream's dedupe ZSET/sequence counter, however much heartbeat volume is interleaved.
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis()
+        store = HR.HeartbeatReceiverStore(
+            fake,
+            heartbeat_ttl_s=30,
+            event_stream_maxlen=3,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        store.write_event(self._event(event_seq=0, idempotency_key="evt-0"))
+        dedupe_key = store.cache.event_dedupe_key
+        before = dict(fake.dedupe[dedupe_key])
+
+        for i in range(500):
+            # uptime_s varies per call so each payload gets a distinct record_uid -- otherwise
+            # the durable store's own SQLite-level idempotency (not the thing under test here)
+            # would skip most of these as already-cached duplicates before they ever reach Redis.
+            store.write_heartbeat(self._heartbeat(device_id=f"node-{i % 5}", uptime_s=12345 + i))
+
+        assert fake.dedupe[dedupe_key] == before, "heartbeat traffic must not mutate event dedupe"
+        assert dedupe_key not in fake.sets and dedupe_key not in fake.ttls
+        assert fake.execute_calls == 501  # 1 event script call + 500 heartbeat pipeline.execute()
+
+        # The original marker is still recognized: replaying the same event is still a no-op.
+        store.write_event(self._event(event_seq=0, idempotency_key="evt-0"))
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
 
     def test_bad_payload_does_not_append_any_durable_rows(self, tmp_path):
         db = tmp_path / "heartbeats.sqlite3"

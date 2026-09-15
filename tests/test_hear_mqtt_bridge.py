@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 
 import pytest
 
@@ -248,7 +249,82 @@ class TestMakeClient:
             "--durable-store", "sqlite",
             "--durable-db", "/state/mqtt-bridge.sqlite3",
             "--durable-replay-limit", "17",
+            "--durable-replay-interval-s", "2.5",
         ])
         assert args.durable_store == "sqlite"
         assert args.durable_db == "/state/mqtt-bridge.sqlite3"
         assert args.durable_replay_limit == 17
+        assert args.durable_replay_interval_s == 2.5
+
+
+class TestBackgroundReplayWorker:
+    def test_a_failed_live_mqtt_write_is_replayed_after_redis_recovers_without_a_restart(
+        self, tmp_path,
+    ):
+        # Blocker: hear_mqtt_bridge previously only replayed pending durable records once, at
+        # process startup. A Redis outage that starts *after* that startup replay (as this test
+        # simulates) must still self-heal while the bridge process stays up.
+        db = tmp_path / "mqtt-bridge.sqlite3"
+        fake = FakeRedis(failures_before_success=1)
+        store = HR.HeartbeatReceiverStore(
+            fake,
+            heartbeat_ttl_s=30,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        stats = B.BridgeStats()
+        raw = json.dumps(_batch_ingest_wrapped(_event())).encode()
+        # This live dispatch hits the simulated outage. The write already reached the durable
+        # ledger before the Redis attempt (see HeartbeatReceiverStore._write), so the record is
+        # left pending regardless of how the caller handles this exception -- in the real bridge,
+        # paho-mqtt's message-callback dispatch logs and swallows it, keeping the network loop
+        # (and this worker) alive rather than crashing the process.
+        with pytest.raises(RuntimeError, match="simulated redis outage"):
+            B.dispatch_message(store, raw, "dama/nyquist/telemetry", stats)
+        assert stats.rejected == 0 and stats.accepted == 0
+        with sqlite3.connect(db) as con:
+            assert con.execute(
+                "SELECT COUNT(*) FROM cache_attempts WHERE outcome='failed'"
+            ).fetchone()[0] == 1
+            assert con.execute(
+                "SELECT COUNT(*) FROM cache_attempts WHERE outcome='succeeded'"
+            ).fetchone()[0] == 0
+
+        worker = HR.DurableReplayWorker(store, interval_s=0.05, limit=8,
+                                        name="test-mqtt-bridge-replay")
+        try:
+            assert worker.thread is not None
+            synced = False
+            for _ in range(50):
+                time.sleep(0.05)
+                with sqlite3.connect(db) as con:
+                    successes = con.execute(
+                        "SELECT COUNT(*) FROM cache_attempts WHERE outcome='succeeded'"
+                    ).fetchone()[0]
+                if successes:
+                    synced = True
+                    break
+            assert synced, "background replay worker did not repair the pending record in time"
+        finally:
+            worker.stop()
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+        assert not worker.is_alive
+
+    def test_worker_is_disabled_for_the_default_none_durable_backend(self):
+        store = HR.HeartbeatReceiverStore(FakeRedis(), heartbeat_ttl_s=30, redis_target="fake:6379")
+        worker = HR.DurableReplayWorker(store, interval_s=0.05)
+        assert worker.thread is None
+        worker.stop()  # no-op, must not raise
+
+    def test_worker_stop_leaves_no_thread_behind(self, tmp_path):
+        db = tmp_path / "mqtt-bridge.sqlite3"
+        store = HR.HeartbeatReceiverStore(
+            FakeRedis(), heartbeat_ttl_s=30, redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        worker = HR.DurableReplayWorker(store, interval_s=0.02, limit=8)
+        thread = worker.thread
+        assert thread is not None and thread.is_alive()
+        worker.stop()
+        assert not thread.is_alive()
+        assert worker.thread is None

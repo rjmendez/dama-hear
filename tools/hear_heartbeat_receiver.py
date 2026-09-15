@@ -305,81 +305,101 @@ class SqliteDurableRecordStore(DurableRecordStore):
         }
 
 
-# Applies a heartbeat/event write and records a durable-record-uid dedupe marker in a single
-# atomic Redis Lua invocation. Redis executes scripts single-threaded and atomically, so either
-# every write it makes (including the dedupe marker) lands, or none of it does. That closes the
-# ambiguous-ACK window between "Redis accepted the write" and "SQLite recorded cache success": if
-# the process crashes or the response is lost after Redis already applied the script, the retry
-# with the same record_uid finds the dedupe marker already set and no-ops instead of re-appending
-# to the event stream. The dedupe ZSET is trimmed to event_stream_maxlen on every call, using the
-# same bound as EVENT_STREAM_MAXLEN, so it cannot grow unbounded.
-_DEDUPE_WRITE_SCRIPT = """
+# Closes the crash/ambiguous-ACK window between "Redis accepted the write" and "SQLite recorded
+# cache success" for hear/event telemetry specifically. Heartbeat writes (SETEX/SET) are plain
+# overwrites -- replaying the same body is harmless -- so only the append-only event stream needs
+# Redis-side atomicity to avoid a duplicate XADD entry; heartbeats stay on a regular pipeline
+# below and never touch this script or its dedupe metadata.
+#
+# Cluster-safety: a Lua script may only touch keys that live on the same Redis Cluster hash slot,
+# and every key it touches must be declared via KEYS (never built by string concatenation inside
+# the script, which is an undeclared-key access that breaks cluster routing/redirection). All
+# three keys here (the dedupe ZSET, its sequence counter, and the stream itself) are declared and
+# hash-tagged to the *literal* event stream key: for an untagged key Redis hashes the whole key
+# name, but for a "{tag}suffix" key it hashes only the tag. Using the stream key's own text as
+# that tag (see _hash_tagged_to) makes CRC16(tag) identical to CRC16(stream_key), so the dedupe
+# ZSET/seq counter always land on the same slot as the stream itself -- without changing the
+# stream key's own literal name or behavior. The per-device "last event" cache key is
+# deliberately kept *out* of this script: its natural hash tag would depend on device_id, which
+# cannot share a fixed slot with the stream's tag, and it does not need atomicity anyway (see
+# RedisHeartbeatCache.write).
+#
+# Retention alignment: the dedupe ZSET is trimmed to the *exact* same MAXLEN bound as the event
+# stream (no APPROX/'~' trimming on either side), scored by a monotonic event-only sequence
+# counter. Because this script is the sole writer of both, the dedupe ZSET always reflects
+# exactly the set of record_uids physically retained in the stream -- unrelated heartbeat traffic
+# never adds entries here and can never evict an event's dedupe marker.
+_EVENT_DEDUPE_SCRIPT = """
 local dedupe_key = KEYS[1]
-local hb_key = KEYS[2]
-local devices_key = KEYS[3]
-local latest_key = KEYS[4]
-local event_key = KEYS[5]
-local stream_key = KEYS[6]
+local seq_key = KEYS[2]
+local stream_key = KEYS[3]
 
 local record_uid = ARGV[1]
-local telemetry_path = ARGV[2]
-local node_id = ARGV[3]
-local body_json = ARGV[4]
-local ttl_s = tonumber(ARGV[5])
-local maxlen = tonumber(ARGV[6])
+local node_id = ARGV[2]
+local body_json = ARGV[3]
+local maxlen = tonumber(ARGV[4])
 
 if redis.call('ZSCORE', dedupe_key, record_uid) then
     return 0
 end
 
-if telemetry_path == 'hear/heartbeat' then
-    redis.call('SETEX', hb_key, ttl_s, body_json)
-    redis.call('SADD', devices_key, node_id)
-    redis.call('SET', latest_key, body_json)
-else
-    redis.call('SADD', devices_key, node_id)
-    redis.call('SET', event_key, body_json)
-    redis.call('XADD', stream_key, 'MAXLEN', '~', maxlen, '*', 'device_id', node_id, 'payload', body_json)
-end
+redis.call('XADD', stream_key, 'MAXLEN', maxlen, '*', 'device_id', node_id, 'payload', body_json)
 
-local seq = redis.call('INCR', dedupe_key .. ':seq')
+local seq = redis.call('INCR', seq_key)
 redis.call('ZADD', dedupe_key, seq, record_uid)
-local count = redis.call('ZCARD', dedupe_key)
-if count > maxlen then
-    redis.call('ZREMRANGEBYRANK', dedupe_key, 0, count - maxlen - 1)
-end
+redis.call('ZREMRANGEBYRANK', dedupe_key, 0, -1 - maxlen)
 return 1
 """
+
+
+def _hash_tagged_to(stream_key: str, suffix: str) -> str:
+    """Builds ``stream_key``-derived key that Redis Cluster always routes to the same hash slot
+    as ``stream_key`` itself, without altering ``stream_key``'s own literal name. See
+    _EVENT_DEDUPE_SCRIPT's docstring for why this is required for cluster-safe multi-key scripts.
+    """
+    return "{" + stream_key + "}" + suffix
 
 
 class RedisHeartbeatCache:
     def __init__(self, client: Any, heartbeat_ttl_s: int = HEARTBEAT_TTL_S,
                  event_stream_key: str = EVENT_STREAM_KEY,
-                 event_stream_maxlen: int = EVENT_STREAM_MAXLEN,
-                 dedupe_key: str = "dama:hear:dedupe"):
+                 event_stream_maxlen: int = EVENT_STREAM_MAXLEN):
         self.client = client
         self.heartbeat_ttl_s = heartbeat_ttl_s
         self.event_stream_key = event_stream_key
         self.event_stream_maxlen = event_stream_maxlen
-        self.dedupe_key = dedupe_key
-        self._dedupe_script = client.register_script(_DEDUPE_WRITE_SCRIPT)
+        self.event_dedupe_key = _hash_tagged_to(event_stream_key, ":dedupe")
+        self.event_dedupe_seq_key = _hash_tagged_to(event_stream_key, ":dedupe:seq")
+        self._event_dedupe_script = client.register_script(_EVENT_DEDUPE_SCRIPT)
 
     def write(self, record: Dict[str, Any], body_json: str, record_uid: str) -> None:
         telemetry_path = record["telemetry_path"]
         node_id = record["device_id"]
         if telemetry_path == "hear/heartbeat":
-            hb_key, latest_key = f"dama:hear:{node_id}", "dama:hear:latest"
-            event_key, stream_key = "", ""
+            # A retry overwriting the same TTL key / latest snapshot with the same body is a
+            # no-op in effect, so a plain (non-atomic, single-key-per-command) pipeline is
+            # sufficient here and keeps this path entirely cluster-friendly.
+            pipe = self.client.pipeline(transaction=False)
+            pipe.setex(f"dama:hear:{node_id}", self.heartbeat_ttl_s, body_json)
+            pipe.sadd("dama:hear:devices", node_id)
+            pipe.set("dama:hear:latest", body_json)
+            pipe.execute()
         elif telemetry_path == "hear/event":
-            hb_key, latest_key = "", ""
-            event_key, stream_key = f"dama:hear:event:{node_id}", self.event_stream_key
+            # Only the append-only stream write plus its dedupe marker need Redis-side atomicity
+            # (a duplicate XADD is the one non-idempotent risk here). The per-device devices-set
+            # membership and "last event" cache value are plain overwrites -- a retry rewriting
+            # the same value is harmless -- so they stay outside the script as ordinary single-
+            # key commands instead of adding cross-slot keys (this per-device key's hash tag
+            # would depend on node_id, which cannot share a slot with the stream's fixed tag) to
+            # a multi-key Lua invocation.
+            self._event_dedupe_script(
+                keys=[self.event_dedupe_key, self.event_dedupe_seq_key, self.event_stream_key],
+                args=[record_uid, node_id, body_json, self.event_stream_maxlen],
+            )
+            self.client.sadd("dama:hear:devices", node_id)
+            self.client.set(f"dama:hear:event:{node_id}", body_json)
         else:  # pragma: no cover - validators own this in practice.
             raise ValueError(f"unsupported telemetry_path {telemetry_path!r}")
-        self._dedupe_script(
-            keys=[self.dedupe_key, hb_key, "dama:hear:devices", latest_key, event_key, stream_key],
-            args=[record_uid, telemetry_path, node_id, body_json,
-                  self.heartbeat_ttl_s, self.event_stream_maxlen],
-        )
 
 
 class HeartbeatReceiverStore:
@@ -454,6 +474,44 @@ class HeartbeatReceiverStore:
         }
 
 
+class DurableReplayWorker:
+    """Small stoppable background thread that periodically retries pending durable records.
+
+    Shared by ReceiverServer and hear_mqtt_bridge so a durable record left behind by a Redis
+    outage is replayed while the process stays up, not only at the next process startup. A no-op
+    (no thread is started) when durability is disabled or ``interval_s`` is not positive.
+    """
+
+    def __init__(self, store: HeartbeatReceiverStore, interval_s: float,
+                 limit: int = DURABLE_REPLAY_LIMIT, name: str = "durable-replay"):
+        self.store = store
+        self.interval_s = interval_s
+        self.limit = limit
+        self._stop = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        if interval_s > 0 and store.durable_store.enabled:
+            self.thread = threading.Thread(target=self._loop, name=name, daemon=True)
+            self.thread.start()
+
+    def _loop(self) -> None:
+        # Woken early (instead of a plain sleep) so stop() can return promptly.
+        while not self._stop.wait(self.interval_s):
+            try:
+                self.store.replay_pending(limit=self.limit)
+            except Exception:
+                logger.exception("background durable replay attempt failed")
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=timeout)
+            self.thread = None
+
+    @property
+    def is_alive(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+
 class ReceiverServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 16
@@ -463,30 +521,15 @@ class ReceiverServer(ThreadingHTTPServer):
                  durable_replay_limit: int = DURABLE_REPLAY_LIMIT):
         super().__init__(server_address, handler_cls)
         self.store = store
-        self._replay_interval_s = durable_replay_interval_s
-        self._replay_limit = durable_replay_limit
-        self._replay_stop = threading.Event()
-        self._replay_thread: Optional[threading.Thread] = None
-        if durable_replay_interval_s > 0 and store.durable_store.enabled:
-            self._replay_thread = threading.Thread(
-                target=self._replay_loop, name="hear-heartbeat-replay", daemon=True)
-            self._replay_thread.start()
+        self._replay_worker = DurableReplayWorker(
+            store, durable_replay_interval_s, durable_replay_limit, name="hear-heartbeat-replay")
 
-    def _replay_loop(self) -> None:
-        # Runs for the life of the server so pending durable records left behind by a Redis
-        # outage get replayed while the process stays up, not only at the next startup. Woken
-        # early (instead of a plain sleep) so server_close() can stop it promptly.
-        while not self._replay_stop.wait(self._replay_interval_s):
-            try:
-                self.store.replay_pending(limit=self._replay_limit)
-            except Exception:
-                logger.exception("background durable replay attempt failed")
+    @property
+    def _replay_thread(self) -> Optional[threading.Thread]:
+        return self._replay_worker.thread
 
     def server_close(self) -> None:
-        self._replay_stop.set()
-        if self._replay_thread is not None:
-            self._replay_thread.join(timeout=5)
-            self._replay_thread = None
+        self._replay_worker.stop()
         super().server_close()
 
 
