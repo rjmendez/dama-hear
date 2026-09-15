@@ -59,39 +59,68 @@ CREATE INDEX IF NOT EXISTS refused_messages_received
 CREATE INDEX IF NOT EXISTS refused_messages_source
     ON hear.refused_messages (tenant_id, source, device_id, refusal_id);
 
--- Counters live in hear.durable_counters like every other health count, so the refusal surface is
--- O(1) reads and not a COUNT(*) on a probe path.
+-- Counters and the last-refusal timestamp get their own tables rather than extending
+-- hear.durable_counters / hear.durable_events. Those objects belong to the outbox: widening their
+-- CHECK constraint or their column list would make this migration a rewrite of 0001's contract
+-- and its rollback a partial restore of it. Additive tables keep 0006 reversible by dropping only
+-- what it created, and keep the quarantine's blast radius inside the quarantine.
+CREATE TABLE IF NOT EXISTS hear.refusal_counters (
+    tenant_id  text        NOT NULL,
+    counter    text        NOT NULL
+        CHECK (counter IN ('messages_refused', 'messages_refused_repeat', 'refusals_evicted')),
+    value      bigint      NOT NULL DEFAULT 0 CHECK (value >= 0),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, counter)
+);
+
+COMMENT ON TABLE hear.refusal_counters IS
+    'Monotonic quarantine counters, read in O(1) by hear.refusal_health_snapshot().';
+
+CREATE TABLE IF NOT EXISTS hear.refusal_events (
+    tenant_id       text        NOT NULL,
+    last_refusal_at timestamptz,
+    PRIMARY KEY (tenant_id)
+);
+
+COMMENT ON TABLE hear.refusal_events IS
+    'Last-occurrence timestamp behind refusal_health(); the outbox equivalent is hear.durable_events.';
+
+CREATE OR REPLACE FUNCTION hear.bump_refusal_counter(p_tenant_id text, p_counter text,
+                                                     p_delta bigint DEFAULT 1)
+RETURNS void
+LANGUAGE sql
+AS $$
+    INSERT INTO hear.refusal_counters (tenant_id, counter, value, updated_at)
+    VALUES (p_tenant_id, p_counter, greatest(p_delta, 0), now())
+    ON CONFLICT (tenant_id, counter) DO UPDATE
+        SET value = hear.refusal_counters.value + greatest(p_delta, 0),
+            updated_at = now();
+$$;
+
+-- Counters are maintained by a trigger, not by record_refusal(), so a writer that inserts
+-- directly still cannot make the refusal health surface lie.
 CREATE OR REPLACE FUNCTION hear.tg_refused_messages_counters()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
-        PERFORM hear.bump_counter(NEW.tenant_id, 'messages_refused', 1);
-        INSERT INTO hear.durable_events (tenant_id, last_refusal_at)
+        PERFORM hear.bump_refusal_counter(NEW.tenant_id, 'messages_refused', 1);
+        INSERT INTO hear.refusal_events (tenant_id, last_refusal_at)
         VALUES (NEW.tenant_id, NEW.received_at)
         ON CONFLICT (tenant_id) DO UPDATE SET last_refusal_at = EXCLUDED.last_refusal_at;
     ELSIF TG_OP = 'UPDATE' THEN
         IF NEW.occurrences > OLD.occurrences THEN
-            PERFORM hear.bump_counter(NEW.tenant_id, 'messages_refused_repeat',
-                                      NEW.occurrences - OLD.occurrences);
-            INSERT INTO hear.durable_events (tenant_id, last_refusal_at)
+            PERFORM hear.bump_refusal_counter(NEW.tenant_id, 'messages_refused_repeat',
+                                              NEW.occurrences - OLD.occurrences);
+            INSERT INTO hear.refusal_events (tenant_id, last_refusal_at)
             VALUES (NEW.tenant_id, NEW.received_at)
             ON CONFLICT (tenant_id) DO UPDATE SET last_refusal_at = EXCLUDED.last_refusal_at;
         END IF;
     ELSIF TG_OP = 'DELETE' THEN
-        PERFORM hear.bump_counter(OLD.tenant_id, 'refusals_evicted', 1);
+        PERFORM hear.bump_refusal_counter(OLD.tenant_id, 'refusals_evicted', 1);
     END IF;
     RETURN NULL;
-END;
-$$;
-
--- last_refusal_at is an additive, nullable column on the existing per-tenant events row. Additive
--- and IF NOT EXISTS, so re-applying the file is a no-op and an older writer that never sets it
--- keeps working unchanged.
-DO $$
-BEGIN
-    ALTER TABLE hear.durable_events ADD COLUMN IF NOT EXISTS last_refusal_at timestamptz;
 END;
 $$;
 
@@ -168,6 +197,12 @@ COMMENT ON FUNCTION hear.record_refusal(text, text, text, text, text, text, text
 -- flooding publisher evicts its own history before anybody else's, and one loud node cannot erase
 -- the evidence of a quiet one. Only hear.refused_messages is touched; accepted records are not
 -- reachable from here.
+-- SECURITY DEFINER, deliberately: 0004's rule is that the writer role may never DELETE, because
+-- retention must be the only sanctioned deletion path for *records*. The ring still has to evict,
+-- so the eviction lives in one auditable function that can only ever delete from
+-- hear.refused_messages and only within the tenant it is given -- rather than handing the writer
+-- a DELETE grant it could point anywhere. search_path is pinned so the body cannot be resolved
+-- against a caller-controlled schema.
 CREATE OR REPLACE FUNCTION hear.enforce_refusal_bounds(
     p_tenant_id text,
     p_max_rows  integer DEFAULT 5000,
@@ -175,6 +210,8 @@ CREATE OR REPLACE FUNCTION hear.enforce_refusal_bounds(
 )
 RETURNS bigint
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, hear
 AS $$
 DECLARE
     v_rows    bigint;
@@ -277,7 +314,7 @@ AS $$
         SELECT coalesce(p_tenant_id, nullif(current_setting('hear.tenant_id', true), ''), 'default') AS tenant_id
     ),
     counters AS (
-        SELECT c.counter, c.value FROM hear.durable_counters c, scope s
+        SELECT c.counter, c.value FROM hear.refusal_counters c, scope s
          WHERE c.tenant_id = s.tenant_id
     ),
     stored AS (
@@ -291,7 +328,7 @@ AS $$
         'tenant_id', (SELECT tenant_id FROM scope),
         'refused_messages', (SELECT n FROM stored),
         'refused_bytes', (SELECT bytes FROM stored),
-        'last_refusal_at', (SELECT e.last_refusal_at FROM hear.durable_events e, scope s
+        'last_refusal_at', (SELECT e.last_refusal_at FROM hear.refusal_events e, scope s
                              WHERE e.tenant_id = s.tenant_id),
         'evicted_refusals', coalesce((SELECT value FROM counters WHERE counter = 'refusals_evicted'), 0),
         'repeat_refusals', coalesce((SELECT value FROM counters WHERE counter = 'messages_refused_repeat'), 0)
@@ -309,16 +346,24 @@ COMMENT ON FUNCTION hear.refusal_health_snapshot(text) IS
 -- the body. A refused body is unvalidated device input -- it may contain anything the publisher
 -- put there -- so the default read surface excludes it and only the writer/admin can see it.
 ALTER TABLE hear.refused_messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hear.refusal_counters  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hear.refusal_events    ENABLE ROW LEVEL SECURITY;
 
 DO $$
+DECLARE
+    v_table text;
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_policies
-                    WHERE schemaname = 'hear' AND tablename = 'refused_messages'
-                      AND policyname = 'tenant_isolation') THEN
-        CREATE POLICY tenant_isolation ON hear.refused_messages
-            USING (tenant_id = coalesce(nullif(current_setting('hear.tenant_id', true), ''), 'default'))
-            WITH CHECK (tenant_id = coalesce(nullif(current_setting('hear.tenant_id', true), ''), 'default'));
-    END IF;
+    FOREACH v_table IN ARRAY ARRAY['refused_messages', 'refusal_counters', 'refusal_events'] LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_policies
+                        WHERE schemaname = 'hear' AND tablename = v_table
+                          AND policyname = 'tenant_isolation') THEN
+            EXECUTE format($ddl$
+                CREATE POLICY tenant_isolation ON hear.%I
+                    USING (tenant_id = coalesce(nullif(current_setting('hear.tenant_id', true), ''), 'default'))
+                    WITH CHECK (tenant_id = coalesce(nullif(current_setting('hear.tenant_id', true), ''), 'default'))
+            $ddl$, v_table);
+        END IF;
+    END LOOP;
 END;
 $$;
 
@@ -340,6 +385,10 @@ COMMENT ON VIEW hear.refused_messages_audit IS
     'Refusal metadata without the quarantined body; the auditor/operator read surface.';
 
 GRANT SELECT, INSERT, UPDATE ON hear.refused_messages TO hear_durable_writer;
+GRANT SELECT, INSERT, UPDATE ON hear.refusal_counters, hear.refusal_events TO hear_durable_writer;
+GRANT SELECT ON hear.refusal_counters, hear.refusal_events
+    TO hear_durable_reader, hear_durable_auditor, hear_durable_admin;
+GRANT EXECUTE ON FUNCTION hear.bump_refusal_counter(text, text, bigint) TO hear_durable_writer;
 GRANT SELECT, DELETE ON hear.refused_messages TO hear_durable_admin;
 GRANT SELECT ON hear.refused_messages_audit TO hear_durable_reader, hear_durable_auditor;
 GRANT EXECUTE ON FUNCTION hear.record_refusal(text, text, text, text, text, text, text, boolean, integer, bigint)

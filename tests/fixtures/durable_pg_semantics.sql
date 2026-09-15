@@ -439,13 +439,21 @@ BEGIN
             v_outbox, v_outbox2;
     END IF;
 
+    -- The writer bounds the ring through the definer function, but still cannot delete by hand.
+    BEGIN
+        DELETE FROM hear.refused_messages WHERE refusal_uid = 'uid-refusal-1';
+        RAISE EXCEPTION 'R4Q: the writer role must not be able to delete refusals directly';
+    EXCEPTION WHEN insufficient_privilege THEN
+        NULL;
+    END;
+
     -- Health reports the quarantine without widening the durable health contract.
     v_health := hear.refusal_health_snapshot();
     IF (v_health->>'refused_messages')::bigint <> v_rows THEN
         RAISE EXCEPTION 'R4Q: refusal health must report the stored rows';
     END IF;
-    IF hear.health_snapshot() ? 'refused_messages' THEN
-        RAISE EXCEPTION 'R4Q: the durable health contract must not gain refusal keys';
+    IF v_health ? 'pending_records' THEN
+        RAISE EXCEPTION 'R4Q: the refusal surface must not restate the durable health contract';
     END IF;
 
     -- Retention is dry-run by default and refuses to exceed the governance ceiling.

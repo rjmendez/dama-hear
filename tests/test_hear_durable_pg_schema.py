@@ -249,7 +249,8 @@ class TestSchemaShape:
     def test_refusals_are_tenant_isolated_and_readable_without_the_body(self, migrations):
         refusals = _sql(migrations, 6)
         assert "ALTER TABLE hear.refused_messages ENABLE ROW LEVEL SECURITY" in refusals
-        assert "CREATE POLICY tenant_isolation ON hear.refused_messages" in refusals
+        assert "CREATE POLICY tenant_isolation ON hear.%I" in refusals
+        assert "'refused_messages', 'refusal_counters', 'refusal_events'" in refusals
         audit_view = refusals.split("CREATE OR REPLACE VIEW hear.refused_messages_audit")[1]
         assert "security_invoker = true" in audit_view
         # A refused body is unvalidated device input: it stays off the reader/auditor surface.

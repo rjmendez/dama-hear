@@ -5,16 +5,21 @@
 -- file references them -- so unlike the outbox there is nothing here whose loss could be
 -- mistaken for losing data a device successfully delivered.
 --
--- durable_events.last_refusal_at is deliberately left in place: a column added with
--- ADD COLUMN IF NOT EXISTS is inert once nothing writes it, and dropping a column from a live
--- table shared with the outbox is a far bigger act than reversing this migration.
+-- Nothing outside this file is modified by 0006, so nothing outside it has to be restored here:
+-- the quarantine's counters and last-refusal timestamp live in their own tables rather than in
+-- hear.durable_counters / hear.durable_events.
 DROP VIEW IF EXISTS hear.refused_messages_audit;
 
 DO $$
+DECLARE
+    v_table text;
 BEGIN
-    EXECUTE 'DROP POLICY IF EXISTS tenant_isolation ON hear.refused_messages';
-EXCEPTION
-    WHEN undefined_table THEN NULL;
+    FOREACH v_table IN ARRAY ARRAY['refused_messages', 'refusal_counters', 'refusal_events'] LOOP
+        IF to_regclass(format('hear.%I', v_table)) IS NOT NULL THEN
+            EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON hear.%I', v_table);
+            EXECUTE format('ALTER TABLE hear.%I DISABLE ROW LEVEL SECURITY', v_table);
+        END IF;
+    END LOOP;
 END;
 $$;
 
@@ -28,4 +33,7 @@ DROP FUNCTION IF EXISTS hear.enforce_refusal_retention(integer, boolean);
 DROP FUNCTION IF EXISTS hear.record_refusal(text, text, text, text, text, text, text, boolean, integer, bigint);
 DROP FUNCTION IF EXISTS hear.enforce_refusal_bounds(text, integer, bigint);
 DROP FUNCTION IF EXISTS hear.tg_refused_messages_counters();
+DROP FUNCTION IF EXISTS hear.bump_refusal_counter(text, text, bigint);
 DROP TABLE IF EXISTS hear.refused_messages;
+DROP TABLE IF EXISTS hear.refusal_counters;
+DROP TABLE IF EXISTS hear.refusal_events;
