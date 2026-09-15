@@ -343,6 +343,25 @@ if redis.call('ZSCORE', dedupe_key, record_uid) then
     return 0
 end
 
+-- Streams written before the dedupe rollout have no marker. A pending SQLite record may refer
+-- to one of them after an ambiguous ACK, so recognize the exact legacy payload before appending.
+local existing = redis.call('XRANGE', stream_key, '-', '+')
+for _, entry in ipairs(existing) do
+    local fields = entry[2]
+    local existing_node = nil
+    local existing_payload = nil
+    for i = 1, #fields, 2 do
+        if fields[i] == 'device_id' then existing_node = fields[i + 1] end
+        if fields[i] == 'payload' then existing_payload = fields[i + 1] end
+    end
+    if existing_node == node_id and existing_payload == body_json then
+        local seq = redis.call('INCR', seq_key)
+        redis.call('ZADD', dedupe_key, seq, record_uid)
+        redis.call('ZREMRANGEBYRANK', dedupe_key, 0, -1 - maxlen)
+        return 0
+    end
+end
+
 redis.call('XADD', stream_key, 'MAXLEN', maxlen, '*', 'device_id', node_id, 'payload', body_json)
 
 local seq = redis.call('INCR', seq_key)
@@ -357,6 +376,11 @@ def _hash_tagged_to(stream_key: str, suffix: str) -> str:
     as ``stream_key`` itself, without altering ``stream_key``'s own literal name. See
     _EVENT_DEDUPE_SCRIPT's docstring for why this is required for cluster-safe multi-key scripts.
     """
+    start = stream_key.find("{")
+    if start >= 0:
+        end = stream_key.find("}", start + 1)
+        if end > start + 1:
+            return stream_key[:start] + stream_key[start:end + 1] + suffix
     return "{" + stream_key + "}" + suffix
 
 
@@ -505,6 +529,9 @@ class DurableReplayWorker:
         self._stop.set()
         if self.thread is not None:
             self.thread.join(timeout=timeout)
+            if self.thread.is_alive():
+                raise RuntimeError(
+                    f"durable replay worker {self.thread.name!r} did not stop within {timeout}s")
             self.thread = None
 
     @property

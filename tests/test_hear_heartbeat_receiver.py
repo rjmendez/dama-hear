@@ -151,6 +151,18 @@ class FakeRedis:
             return 0
 
         stream = self.streams.setdefault(stream_key, [])
+        if any(entry.get("device_id") == node_id and entry.get("payload") == body_json
+               for entry in stream):
+            seq = self._seq_counters.get(seq_key, 0) + 1
+            self._seq_counters[seq_key] = seq
+            dedupe_zset[record_uid] = seq
+            if len(dedupe_zset) > maxlen:
+                stale = sorted(dedupe_zset.items(), key=lambda kv: kv[1])[
+                    :len(dedupe_zset) - maxlen]
+                for stale_uid, _ in stale:
+                    del dedupe_zset[stale_uid]
+            return 0
+
         stream.append({"device_id": node_id, "payload": body_json})
         if len(stream) > maxlen:  # exact MAXLEN trim, no '~' slack.
             del stream[:-maxlen]
@@ -589,6 +601,14 @@ class TestDurableSqlite(TestValidation):
             "dedupe_seq": redis_cluster_key_slot(cache.event_dedupe_seq_key),
         }
         assert len(set(slots.values())) == 1, f"all script keys must share one slot: {slots}"
+        tagged = HR.RedisHeartbeatCache(FakeRedis(), event_stream_key="{tenant}:events")
+        tagged_slots = {
+            redis_cluster_key_slot(tagged.event_stream_key),
+            redis_cluster_key_slot(tagged.event_dedupe_key),
+            redis_cluster_key_slot(tagged.event_dedupe_seq_key),
+        }
+        assert len(tagged_slots) == 1
+        assert tagged.event_dedupe_key == "{tenant}:dedupe"
         # The per-device "last event" cache key is intentionally *not* part of the atomic
         # script (see write()'s comment) precisely because it can never share that fixed slot:
         # its natural tag depends on device_id, so it must stay a plain single-key command.
@@ -625,6 +645,31 @@ class TestDurableSqlite(TestValidation):
         # The original marker is still recognized: replaying the same event is still a no-op.
         store.write_event(self._event(event_seq=0, idempotency_key="evt-0"))
         assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+
+    def test_pending_event_from_before_dedupe_rollout_is_not_appended_twice(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        payload = self._event(event_seq=77, idempotency_key="legacy-event")
+        fake = FakeRedis(failures_before_success=1)
+        store = HR.HeartbeatReceiverStore(
+            fake,
+            heartbeat_ttl_s=30,
+            event_stream_maxlen=8,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        with pytest.raises(RuntimeError, match="simulated redis outage"):
+            store.write_event(payload)
+
+        pending = store.durable_store.pending_records(1)[0]
+        fake.streams[HR.EVENT_STREAM_KEY] = [{
+            "device_id": pending.record["device_id"],
+            "payload": pending.body_json,
+        }]
+        summary = store.replay_pending(limit=8)
+
+        assert summary["synced"] == 1
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+        assert pending.record_uid in fake.dedupe[store.cache.event_dedupe_key]
 
     def test_bad_payload_does_not_append_any_durable_rows(self, tmp_path):
         db = tmp_path / "heartbeats.sqlite3"
@@ -710,6 +755,24 @@ class TestBackgroundReplayWorker:
             server.server_close()
         assert not replay_thread.is_alive()
         assert server._replay_thread is None
+
+    def test_stop_surfaces_a_worker_that_does_not_terminate(self):
+        worker = object.__new__(HR.DurableReplayWorker)
+        worker._stop = threading.Event()
+
+        class StuckThread:
+            name = "stuck-replay"
+
+            def join(self, timeout=None):
+                return None
+
+            def is_alive(self):
+                return True
+
+        worker.thread = StuckThread()
+        with pytest.raises(RuntimeError, match="did not stop"):
+            worker.stop(timeout=0)
+        assert worker.thread is not None
 
 
 class TestStartupConfig:
