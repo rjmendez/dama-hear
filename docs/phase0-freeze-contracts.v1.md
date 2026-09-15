@@ -14,9 +14,9 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | 59d87f4423f6ca7f9b6b33a7db1f8dd00a9d65c9a0fd154385ef77bd42160b58 |
+| baseline | 8341753350e68fb2d7896ff4b856d76065394f00cb749e360377e227030782f2 |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
-| firmware_build_metadata | af9ba585abe4af010b45e0a7aeb3a1061dac602cd8123b15b85588922fd37b34 |
+| firmware_build_metadata | 7d4cebf77c468cc00b7b1de02aca62b62cd35287c3910f8549380d83acaba665 |
 | schemas | 248d557d9051b2f32b5e89018296b180cf2772b602b7ed3ad3761989cc412519 |
 | published_contracts | a87c434d400f4f31ec4cc252761fff18ee14355a8170cf80133ef72315c082f3 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |

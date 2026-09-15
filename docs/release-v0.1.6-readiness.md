@@ -69,7 +69,9 @@ Three `hear_node` variants, one per board class / PSRAM bus mode, plus the metad
 | `hear_node-esp32s3-i2s-gps-qspi-v0.1.6` | `esp32s3-i2s-gps` | **quad** | `gold` only (8 MB flash / 2 MB quad PSRAM) |
 
 Each stem publishes `.bin`, `-bootloader.bin`, `-partitions.bin`, `-merged.bin` and `.elf`, plus
-`build-info.json`, `release-manifest.json`, `release-manifest.schema.json` and `SHA256SUMS`.
+`build-info.json`, `release-manifest.json`, `release-manifest.schema.json`,
+`release-sbom.cdx.json`, `release-provenance.intoto.jsonl` and `SHA256SUMS` (§6,
+[release-provenance.md](release-provenance.md)).
 
 **The quad variant is a build requirement of the cut, not a follow-up.** `gold` has quad PSRAM;
 the octal class image leaves it with `psramFound() == false` and no raw ring.
@@ -199,12 +201,13 @@ node.
 ```sh
 python3 -m pytest -q \
   tests/test_release_manifest.py tests/test_firmware_release_workflow.py \
+  tests/test_release_image_provenance.py tests/test_release_provenance_attestation.py \
   tests/test_flash_ota_auth.py tests/test_nvs_enrollment.py tests/test_enrollment_gate.py \
   tests/test_firmware_admin_auth.py tests/test_boot_failback_per_image.py \
   tests/test_shared_boot_failback.py tests/test_clip_header_rate.py
 ```
 
-Green on `60f07c0`: **129 passed**.
+Green on `60f07c0`: **129 passed**, before the provenance suite was added; re-run the block above on the candidate commit and record the new count.
 
 | Check | How | Pass condition |
 |---|---|---|
@@ -219,14 +222,40 @@ Green on `60f07c0`: **129 passed**.
 | Working tree clean | `git status --porcelain` | empty; the manifest records dirty state and a dirty cut is not reproducible |
 | Manifest self-verify | `release_manifest.py verify` in `release.yml` | the release job fails the release, not the fleet |
 
-**Provenance and SBOM.** The manifest is the provenance record: it binds tag, commit, dirty state,
-FQBN, esp32 core `3.3.11`, `arduino-cli` `1.5.1`, build flags, board header, partition table,
-capture profile and a per-artifact SHA-256, with a published JSON schema, and `SHA256SUMS` covers
-the manifest itself. `build-info.json` records the toolchain and states `credentials: none compiled
-in`. There is **no** SPDX/CycloneDX SBOM and **no** Sigstore/`actions/attest-build-provenance`
-attestation today. That is a known gap; it is recorded here rather than fixed, because changing
-`release.yml` is out of scope for this gate and would collide with #212. Do not claim SLSA
-provenance for v0.1.6.
+**Provenance, SBOM and signature.** The manifest is the provenance record: it binds tag, commit,
+dirty state, FQBN, esp32 core `3.3.11`, `arduino-cli` `1.5.1`, build flags, board header,
+partition table, capture profile and a per-artifact SHA-256, with a published JSON schema.
+`build-info.json` records the toolchain and states `credentials: none compiled in`.
+
+The SBOM and attestation gap this section used to record is closed by
+[release-provenance.md](release-provenance.md), which is the design, the procedure and the
+failure/revocation handling in full. In short, a release now also publishes:
+
+* `release-sbom.cdx.json` — CycloneDX 1.6, derived from the same tree as the manifest and
+  deterministic, covering the binaries, the source closure, the vendored `firmware/lib` libraries
+  and the toolchain pins, and stating what it does **not** enumerate (the esp32 board package's
+  contents);
+* `release-provenance.intoto.jsonl` — a SLSA v1 provenance attestation over every published file,
+  signed keyless through the release job's GitHub OIDC identity. **No signing key exists**:
+  `release.yml` reads no repository secret, and the bundle is published as an asset so
+  verification needs no GitHub credential.
+
+`SHA256SUMS` is written last and covers all of it. Pre-cut checks:
+
+```sh
+python3 -m pytest -q tests/test_release_provenance_attestation.py
+python3 firmware/hear_node/release_manifest.py verify --dist dist --tag v0.1.6 --attestation
+gh attestation verify hear_node-esp32s3-i2s-gps-v0.1.6.bin --repo rjmendez/dama-hear \
+  --signer-workflow rjmendez/dama-hear/.github/workflows/release.yml \
+  --bundle release-provenance.intoto.jsonl
+```
+
+The offline `verify --attestation` checks structure and subject coverage only — it does not check
+the signature, and says so. `gh attestation verify` is the cryptographic check.
+
+⚠️Still do **not** claim a SLSA *level* for v0.1.6: the release carries SLSA v1 provenance from
+GitHub's hosted builder, and a level is an audit conclusion, not a field. And the build is not
+claimed to be bit-reproducible — the inputs are pinned, the outputs are attested.
 
 ## 7. Rollout order and per-node no-go gates
 
@@ -294,7 +323,8 @@ node that quietly marked itself healthy, and the gate stays open.
 | Node still unreachable after the failback window | It hung before `setup()` returned or faulted in a global constructor — the failback cannot save either. USB recovery, like `rankine`. |
 | PSRAM variant mismatch asserted at boot | `board_profiles` refused for a reason. Do not force the other asset; scan the board and record it in `NODE_PSRAM_MODES` with its evidence. |
 | `hear-drain-check` still exit 1 after `mach` | The split build was not the only cause. Stop and re-diagnose; do not continue to `kasami`. |
-| Published manifest fails offline `verify` | Do not flash anything from that release. Delete the release, fix, re-cut with a new tag. A tag is cheap; a mis-signed fleet is not. |
+| Published manifest fails offline `verify` | Do not flash anything from that release. Record it in `firmware/hear_node/release_revocations.json` (a PR, merged first — deleting the release does not reach an operator's cached copy), fix, re-cut with a **new** tag. Never re-cut the same tag: the attestation binds it. |
+| `gh attestation verify` fails, or the bundle does not cover an asset | Stop. Do not flash. Treat it as a compromised or mis-built release until disproved, and revoke as above. |
 | Rollout must be abandoned mid-way | The fleet tolerates a mixed v0.1.5/v0.1.6 lineage (it is in one today). Stop where you are, record which node is on which tag, and do **not** revert provisioned nodes to a tokenless asset. |
 
 ## 10. Release notes requirements
@@ -313,7 +343,10 @@ must additionally state, explicitly:
    tokens, and never will.
 5. **Verification**: the offline `release_manifest.py verify` command, and that all three variants
    declare `fs_acquisition_hz: 48000`.
-6. **Provenance limits**: manifest + `SHA256SUMS` only; no SBOM, no signed attestation (§6).
+6. **Provenance**: manifest, `release-sbom.cdx.json` (CycloneDX 1.6) and a keyless SLSA v1
+   attestation bundle, all covered by `SHA256SUMS`, with the `gh attestation verify` command
+   spelled out and the limits stated — no SLSA level claimed, build not bit-reproducible, board
+   package pinned by version rather than enumerated (§6, [release-provenance.md](release-provenance.md)).
 7. **`rankine` is excluded** from OTA and is USB-recovery only.
 
 ## 11. Open decisions blocking the cut
