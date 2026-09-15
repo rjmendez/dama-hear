@@ -92,8 +92,12 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/base-runtime:${{ github.sha }}
           load: ${{ !inputs.publish }}
           push: ${{ inputs.publish }}
-          sbom: true
-          provenance: mode=max
+          # ⚠️ATTESTATIONS ONLY ON THE PUBLISHING PATH. An SBOM or a provenance statement makes
+          # the build emit a manifest list, and `load: true` (the docker exporter) cannot export
+          # one: `docker exporter does not currently support exporting manifest lists`. A PR
+          # therefore proves the image BUILDS and RUNS; main is what proves its provenance.
+          sbom: ${{ inputs.publish }}
+          provenance: ${{ inputs.publish && 'mode=max' || 'false' }}
           cache-from: type=gha,scope=base-runtime
           cache-to: type=gha,mode=max,scope=base-runtime
 
@@ -118,8 +122,12 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/base-numeric:${{ github.sha }}
           load: ${{ !inputs.publish }}
           push: ${{ inputs.publish }}
-          sbom: true
-          provenance: mode=max
+          # ⚠️ATTESTATIONS ONLY ON THE PUBLISHING PATH. An SBOM or a provenance statement makes
+          # the build emit a manifest list, and `load: true` (the docker exporter) cannot export
+          # one: `docker exporter does not currently support exporting manifest lists`. A PR
+          # therefore proves the image BUILDS and RUNS; main is what proves its provenance.
+          sbom: ${{ inputs.publish }}
+          provenance: ${{ inputs.publish && 'mode=max' || 'false' }}
           cache-from: type=gha,scope=base-numeric
           cache-to: type=gha,mode=max,scope=base-numeric
 
@@ -142,8 +150,12 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/base-ml-cpu:${{ github.sha }}
           load: ${{ !inputs.publish }}
           push: ${{ inputs.publish }}
-          sbom: true
-          provenance: mode=max
+          # ⚠️ATTESTATIONS ONLY ON THE PUBLISHING PATH. An SBOM or a provenance statement makes
+          # the build emit a manifest list, and `load: true` (the docker exporter) cannot export
+          # one: `docker exporter does not currently support exporting manifest lists`. A PR
+          # therefore proves the image BUILDS and RUNS; main is what proves its provenance.
+          sbom: ${{ inputs.publish }}
+          provenance: ${{ inputs.publish && 'mode=max' || 'false' }}
           cache-from: type=gha,scope=base-ml-cpu
           cache-to: type=gha,mode=max,scope=base-ml-cpu
 

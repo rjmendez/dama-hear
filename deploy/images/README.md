@@ -134,9 +134,13 @@ The images workflow (`.github/workflows/images.yml`) attaches, for every variant
   ignore file — not a permanent allowlist).
 
 ⚠️**On a pull request the workflow builds but does not push.** Nothing reaches a registry from a
-branch, so a fork cannot publish an image; the scan and the SBOM are still produced as artifacts
-so the review has them. Publishing is a `main`/tag-only job, which is where the digest that
-manifests will reference is recorded.
+branch, so a fork cannot publish an image. Publishing is a `main`-only job, which is where the
+digest that manifests will reference is recorded.
+
+⚠️**A pull request gets no SBOM, and that is a buildx constraint, not a choice.** An attestation
+makes the build emit a manifest list, and the docker exporter that `load: true` uses cannot
+export one — `docker exporter does not currently support exporting manifest lists`. So a PR
+proves the image *builds, runs and scans clean*, and `main` proves its *provenance*.
 
 ## Rollout and rollback compatibility
 
