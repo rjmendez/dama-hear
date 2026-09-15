@@ -177,6 +177,14 @@ ANNOTATE_CODE = [
     ("server.py", "tools/hear_annotate/server.py"),
 ]
 
+# ⚠️ONE FILE, AND IT HAS TO STAY ONE FILE. tools/hear_pool_backup.py is stdlib-only by design:
+# the backup is the thing that must still work when the rest of the tree is what was lost, so it
+# imports nothing from `hear/` and drags no bundle behind it. An import added there adds a key
+# here, and gen_configmap.check() is what says so before the cluster does.
+POOL_BACKUP_CODE = [
+    ("tools_hear_pool_backup.py", "tools/hear_pool_backup.py"),
+]
+
 #: name -> (app label, code files, data files). The first entry is the default, so the command
 #: documented in deploy/k8s/README.md keeps working with no argument.
 BUNDLES = {
@@ -186,6 +194,7 @@ BUNDLES = {
     "hear-tdoa-code": ("hear-tdoa", TDOA_CODE, TDOA_DATA),
     "hear-heartbeat-code": ("hear-heartbeat", HEARTBEAT_CODE, []),
     "hear-mqtt-bridge-code": ("hear-mqtt-bridge", MQTT_BRIDGE_CODE, []),
+    "hear-pool-backup-code": ("hear-pool-backup", POOL_BACKUP_CODE, []),
 }
 DEFAULT_BUNDLE = "hear-drain-code"
 

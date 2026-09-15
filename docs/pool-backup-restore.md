@@ -557,3 +557,68 @@ writes `heartbeat.json` next to `index.jsonl`, mirroring the pool's own heartbea
    (a) is recommended and must be confirmed against the actual `hear-annotate` write pattern.
 5. **Retention vs erasure** — how fast must an erasure request reach backups? §8 assumes
    "on generation expiry"; `docs/data-governance.md:120` may require faster for a legal request.
+
+---
+
+## 15. What is implemented, and what it deliberately still refuses to do
+
+Added 2026-09-15: `tools/hear_pool_backup.py`, `deploy/k8s/hear-pool-backup.yaml`,
+`deploy/k8s/hear-pool-backup-code.yaml` (generated) and `tests/test_pool_backup.py`.
+
+**This is scaffolding, and no backup of the live pool exists yet.** §14.2 (who holds the offline
+passphrase copy) and §14.3 (`F:` ownership) are unanswered, and a scheduled job that writes
+archives nobody can prove is decryptable would be worse than the gap it closes: it would look
+like a backup. So every path is fail-closed by construction rather than by operator discipline.
+
+| Guard | Where | Exercised by |
+| --- | --- | --- |
+| Dry-run is the default; `--execute` is required before any byte is written | `run_backup`, `run_restore` | G0.2b |
+| No passphrase is created, derived, defaulted, logged or stored — only a path handed in from outside, streamed to `gpg` on a pipe fd | `require_key`, `encrypt`, `redact` | G0.9, G0.9b |
+| A `--pool` that resolves to `/pool` is refused before anything is read | `refuse_live_pool` | G0.12 |
+| Sentinel-before-write: `.hear-backup-target` must exist and its uuid must match `--sentinel-uuid` | `read_sentinel` | G0.1a, G0.1b |
+| Target must not share a device with the source (non-synthetic sentinels) | `refuse_same_device` | §2.2 |
+| Plaintext archives are reachable only on a sentinel marked `synthetic`, for fixtures | `require_key` | G0.9 |
+| Allowlisted roots, `pylib*`/`*.tmp` excluded, live WAL triple never read as a file | `select`, `snapshot_sqlite` | G0.2 |
+| Frozen-prefix reads; `unstable`/`vanished` recorded, never fatal, never torn | `build_payload` | G0.8, G0.11c |
+| Canonical JSONL manifest, digest recorded in the receipt | `manifest_bytes` | G0.6 |
+| Cleartext receipt carries counts and digests, never a path or a coordinate | `_receipt_safe` | G0.9 |
+| Whole generation published by `os.replace`; failure removes the staging directory and appends no index row | `run_backup` | G0.11d |
+| Restore requires `--i-understand`, an empty target, and refuses `/pool` or the source tree | `refuse_unsafe_restore_target` | G0.3 |
+| Restore drill mounts no `hear-pool` volume; destination is a fresh `local-path-retain` claim | manifest | G0.3b |
+| Every CronJob ships `suspend: true`, `readOnly: true` on the pool volume *and* mount, `hostPath type: Directory` | manifest | G0.12 |
+| No passphrase value in any shipped manifest; no `secretKeyRef` in this namespace | manifest | G0.12b |
+
+`tests/test_pool_backup.py` runs the whole ladder on synthetic fixtures built in `tmp_path`: a
+miniature pool with each class the plan treats differently, a live-WAL SQLite database with an
+open writer, a torn JSONL tail, multi-member gzip, a pruned clip and a flipped archive byte.
+
+### 15.1 Two deviations from §4, both forced
+
+1. **Namespace `dama`, not `backups`.** A PVC is only mountable from its own namespace, and
+   `hear-pool` is in `dama`; the job the plan describes could not have read the volume it exists
+   to back up. Isolation comes from the restore job mounting no pool volume, not the namespace.
+2. **SQLite is staged, then snapshotted.** §5.4 offers a narrow read-write `subPath` or
+   `immutable=1`. Neither is used: `sqlite3.connect("file:…?mode=ro")` *creates* `-shm` next to
+   the source, which both writes to a pool this job promises not to write to and fails outright
+   on a read-only mount. The triple is copied into the job's own `emptyDir`, the copy is opened
+   read-write, and the backup API produces the archived artifact from it. A torn copy is caught
+   by `PRAGMA integrity_check` and fails the run.
+
+### 15.2 Exactly what is needed before `--execute` may run against the live pool
+
+Until all four are recorded in this document, the CronJobs stay suspended and G0 stays open:
+
+1. **A named passphrase holder and a physical location for the offline copy** (§14.2). Without
+   this, G0.9 cannot pass by definition, and an encrypted archive is a data-loss event in waiting.
+2. **A decision that `F:` is owned by this system**, with the stale Syncthing `.stfolder`
+   re-checked on the day of the first run (§14.3, G0.1c), and the sentinel uuid written by hand
+   into `F:\hear-backup\.hear-backup-target` and into `hear-pool-backup-config`.
+3. **A custody delivery path for `/custody/passphrase`** that is not a plain `Secret` in `dama`,
+   because `k3s-manifest-backup` dumps every Secret in cleartext nightly (§6, §13.4).
+4. **The erasure-latency answer** (§14.5), because it decides whether generation expiry is a
+   sufficient deletion mechanism or retention must be re-cut on request.
+
+Retention/GFS enforcement (§8) and the `--stats` V5 semantic ladder (§9.3) are **not implemented**:
+both act on generations that do not exist yet, and V5 needs the pool modules shipped alongside the
+tool, which would make the one thing that must work when everything else is broken depend on the
+rest of the tree. Both land with the unsuspend commit.

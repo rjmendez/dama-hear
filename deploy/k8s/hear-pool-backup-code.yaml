@@ -1,0 +1,1074 @@
+# kubectl apply -f deploy/k8s/hear-pool-backup-code.yaml
+# apply-mode client: 44452 B serialised; 44716 B of annotations against a 262144 B cap.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hear-pool-backup-code
+  namespace: dama
+  labels:
+    app: hear-pool-backup
+  annotations:
+    dama-hear/commit: '1f7c5e0'
+    dama-hear/source-sha256: '7ef3e88f66ed17f149220f7d93819331f2c3f0cda149bc10aab50944d66091b4'
+    dama-hear/generated-by: deploy/k8s/gen_configmap.py
+    dama-hear/apply-mode: client
+    dama-hear/serialised-bytes: '44452'
+data:
+  tools_hear_pool_backup.py: |
+    #!/usr/bin/env python3
+    """Generational encrypted backup and isolated restore for the `dama/hear-pool` PVC.
+    
+        python3 tools/hear_pool_backup.py backup  --pool P --target T --sentinel-uuid U \
+                                                  --passphrase-file K [--level l0|l1] [--execute]
+        python3 tools/hear_pool_backup.py verify  --target T --gen GEN
+        python3 tools/hear_pool_backup.py restore --target T --gen GEN --into D \
+                                                  --passphrase-file K --i-understand [--execute]
+    
+    ⚠️THIS IS SCAFFOLDING, AND IT REFUSES TO BE ANYTHING ELSE UNTIL A PERSON DECIDES TWO THINGS.
+    `docs/pool-backup-restore.md` §6 and §14 leave passphrase custody and `F:` ownership unanswered,
+    so every path here is fail-closed by construction rather than by convention:
+    
+      * **Dry-run is the default.** `backup` and `restore` plan, refuse and report; without
+        `--execute` not one byte is written anywhere.
+      * **No key material is ever created, derived, defaulted, logged or stored.** The passphrase is
+        only ever a path handed in from outside, opened, streamed to `gpg` on a pipe and dropped. It
+        is never an argv value, never an env var this tool sets, never part of a receipt, and
+        `redact()` scrubs anything that resembles one out of every string this tool emits.
+      * **The live pool is refused.** A `--pool` that resolves to `/pool` or anything under it exits
+        non-zero before a single `stat`: this tool is exercised on synthetic trees only, until the
+        custody questions are answered.
+      * **Sentinel-before-write.** `/mnt/f` still exists as an empty ext4 directory when `F:` fails to
+        mount, so a `hostPath` backup would silently land on the very disk it exists to escape --
+        while inflating the VHDX that has ~52 G of headroom (§2.2). The target must carry
+        `.hear-backup-target` whose uuid matches `--sentinel-uuid` exactly, and the run must be on a
+        different `st_dev` from the source. Both are checked before the first write.
+    
+    Everything below implements §4-§9 of the plan against those guards: allowlisted roots, frozen-
+    prefix reads of the append-only streams, the SQLite backup API for the live-WAL database, a
+    canonical JSONL manifest, a path-free cleartext receipt, atomic publication of a whole generation
+    directory, and a restore that can only ever write into an empty, isolated target.
+    
+    Stdlib only (`tarfile`, `gzip`, `hashlib`, `sqlite3`, `json`) plus one `subprocess` call to `gpg`.
+    """
+    from __future__ import annotations
+    
+    import argparse
+    import fnmatch
+    import gzip
+    import hashlib
+    import io
+    import json
+    import os
+    import re
+    import shutil
+    import sqlite3
+    import subprocess
+    import sys
+    import tarfile
+    import tempfile
+    import time
+    import uuid as uuidlib
+    from dataclasses import dataclass, field
+    
+    TOOL_VERSION = "hear_pool_backup/0.1-scaffolding"
+    SENTINEL_NAME = ".hear-backup-target"
+    INDEX_NAME = "index.jsonl"
+    
+    # An ALLOWLIST, not a denylist: a new 4 GiB vendored directory cannot silently enter the backup.
+    ALLOWED_ROOTS = ("corpus", "models", "sketch_corpus")
+    EXCLUDE_GLOBS = (
+        "*.tmp",
+        "*.part",
+        "*.swp",
+        "pylib*",
+        "*/pylib*/*",
+        ".stfolder",
+        "*/.stfolder/*",
+        "annotations.sqlite3-wal",
+        "annotations.sqlite3-shm",
+        "annotations.sqlite3-journal",
+    )
+    # Opened "a" and only ever grown, so ANY PREFIX IS A VALID EARLIER STATE (plan §5.1).
+    APPEND_ONLY_GLOBS = (
+        "corpus/ledger.jsonl",
+        "corpus/clips/index.jsonl",
+        "corpus/clips/tags*.jsonl",
+        "corpus/records/*.jsonl",
+        "corpus/records/*/*.jsonl",
+        "corpus/scores/*.jsonl",
+        "corpus/scores/*/*.jsonl",
+        "corpus/tdoa/arrivals/*",
+        "corpus/tdoa/arrivals/*/*",
+        "corpus/scene/*/*.jsonl.gz",
+    )
+    SQLITE_REL = "corpus/annotations.sqlite3"
+    # `/pool` is the live PVC mount in every hear workload. Refused outright; see the module docstring.
+    LIVE_POOL_PREFIXES = ("/pool",)
+    DEFAULT_MIN_AGE_SECONDS = 120  # drain's non-atomic raw write window (plan §5.2).
+    
+    EXIT_OK = 0
+    EXIT_REFUSED = 3
+    EXIT_FAILED = 4
+    
+    
+    class Refusal(Exception):
+        """A guard said no. Never a stack trace, never a partial artifact, always exit 3."""
+    
+        def __init__(self, code, message):
+            super().__init__(f"{code}: {message}")
+            self.code = code
+            self.message = message
+    
+    
+    # --------------------------------------------------------------------------- redaction
+    
+    _SECRETISH = re.compile(
+        r"(?i)(passphrase|password|secret|token|key)\s*[:=]\s*\S+|-----BEGIN[^-]+-----"
+    )
+    
+    
+    def redact(value):
+        """Scrub anything that looks like key material out of a string, list or mapping.
+    
+        Applied to every log line and every receipt field. It is cheap, and the alternative is a
+        passphrase in a cleartext receipt on an unencrypted NTFS volume.
+        """
+        if isinstance(value, dict):
+            return {k: redact(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [redact(v) for v in value]
+        if isinstance(value, str):
+            return _SECRETISH.sub(lambda m: m.group(0).split("=")[0].split(":")[0] + "=<redacted>", value)
+        return value
+    
+    
+    def log(message):
+        sys.stderr.write(redact(str(message)) + "\n")
+    
+    
+    # --------------------------------------------------------------------------- guards
+    
+    
+    def _resolve(path):
+        return os.path.realpath(os.path.abspath(str(path)))
+    
+    
+    def refuse_live_pool(pool):
+        """A source under /pool is refused: this tool never reads the live corpus."""
+        real = _resolve(pool)
+        for prefix in LIVE_POOL_PREFIXES:
+            if real == prefix or real.startswith(prefix.rstrip("/") + "/"):
+                raise Refusal(
+                    "LIVE_POOL_REFUSED",
+                    "the live pool is out of scope for this scaffolding; pass a synthetic tree",
+                )
+        if not os.path.isdir(real):
+            raise Refusal("POOL_NOT_A_DIRECTORY", "--pool does not resolve to a directory")
+        return real
+    
+    
+    def read_sentinel(target, expect_uuid, expect_mount=None):
+        """Sentinel-before-write. Returns the parsed sentinel or raises.
+    
+        The sentinel is a JSON document created once, by hand, on the real removable volume:
+    
+            {"uuid": "<uuid4>", "volume": "F:", "synthetic": false}
+        """
+        real = _resolve(target)
+        if not os.path.isdir(real):
+            raise Refusal("TARGET_NOT_A_DIRECTORY", "--target does not resolve to a directory")
+        if not expect_uuid:
+            raise Refusal("SENTINEL_UUID_REQUIRED", "--sentinel-uuid must be supplied explicitly")
+        path = os.path.join(real, SENTINEL_NAME)
+        if not os.path.isfile(path):
+            raise Refusal(
+                "SENTINEL_MISSING",
+                f"{SENTINEL_NAME} is absent; the target volume is not mounted or is the wrong one",
+            )
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                sentinel = json.load(handle)
+        except (OSError, ValueError) as exc:
+            raise Refusal("SENTINEL_UNREADABLE", f"sentinel is not readable JSON ({exc.__class__.__name__})")
+        if not isinstance(sentinel, dict) or not sentinel.get("uuid"):
+            raise Refusal("SENTINEL_MALFORMED", "sentinel carries no uuid")
+        if str(sentinel["uuid"]) != str(expect_uuid):
+            raise Refusal("SENTINEL_MISMATCH", "sentinel uuid does not match --sentinel-uuid")
+        if expect_mount:
+            want = _resolve(expect_mount)
+            if not (real == want or real.startswith(want.rstrip("/") + "/")):
+                raise Refusal("TARGET_OFF_EXPECTED_MOUNT", "--target is not under --expect-mount")
+        return sentinel
+    
+    
+    def refuse_same_device(source, target, synthetic):
+        """A backup on the source's own disk is not a backup (plan §2.2).
+    
+        Relaxed only for a sentinel explicitly marked synthetic, which is how the test fixtures and
+        any local dry run are allowed to keep both trees in one temporary directory.
+        """
+        if synthetic:
+            return
+        if os.stat(source).st_dev == os.stat(target).st_dev:
+            raise Refusal(
+                "TARGET_SHARES_DEVICE",
+                "target is on the same device as the source; a hostPath that landed on ext4 is the "
+                "failure the sentinel exists to catch",
+            )
+    
+    
+    @dataclass
+    class KeyRef:
+        """A passphrase file handed in from outside. The value is never held on this object."""
+    
+        path: str
+        key_ref: str
+    
+        def open_fd(self):
+            return os.open(self.path, os.O_RDONLY)
+    
+    
+    def require_key(passphrase_file, key_ref, cipher, sentinel, allow_plaintext):
+        """Resolve the external key, or refuse. Never creates, derives or defaults one."""
+        if cipher == "none":
+            if not (allow_plaintext and sentinel.get("synthetic")):
+                raise Refusal(
+                    "PLAINTEXT_REFUSED",
+                    "--cipher none needs --insecure-plaintext AND a sentinel marked synthetic; "
+                    "real archives are AES-256 or they do not exist",
+                )
+            return None
+        if not passphrase_file:
+            raise Refusal(
+                "KEY_REQUIRED",
+                "--passphrase-file is mandatory; this tool never generates or derives a passphrase",
+            )
+        path = _resolve(passphrase_file)
+        if not os.path.isfile(path):
+            raise Refusal("KEY_MISSING", "--passphrase-file does not exist")
+        info = os.stat(path)
+        if info.st_size == 0:
+            raise Refusal("KEY_EMPTY", "--passphrase-file is empty")
+        if info.st_mode & 0o077:
+            raise Refusal("KEY_PERMISSIONS", "--passphrase-file is group- or world-readable")
+        if shutil.which("gpg") is None:
+            raise Refusal("GPG_MISSING", "gpg is not installed; fail closed rather than write plaintext")
+        return KeyRef(path=path, key_ref=key_ref or "unlabelled")
+    
+    
+    # --------------------------------------------------------------------------- selection
+    
+    
+    def classify(rel):
+        head = rel.split("/")
+        if head[0] == "models":
+            return "models"
+        if head[0] == "sketch_corpus":
+            return "sketch"
+        if len(head) < 2:
+            return "other"
+        if head[1] == "ledger.jsonl":
+            return "ledger"
+        if head[1] in ("raw", "clips", "tdoa", "scene", "scores", "records", "state"):
+            return head[1]
+        if head[1].startswith("annotations.sqlite3"):
+            return "annotations"
+        return "other"
+    
+    
+    def is_excluded(rel):
+        name = rel.split("/")[-1]
+        for pattern in EXCLUDE_GLOBS:
+            if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern):
+                return True
+        return any(part.startswith("pylib") for part in rel.split("/"))
+    
+    
+    def is_append_only(rel):
+        return any(fnmatch.fnmatch(rel, pattern) for pattern in APPEND_ONLY_GLOBS)
+    
+    
+    def select(pool):
+        """Walk the allowlisted roots and yield relative paths, sorted, exclusions applied."""
+        out = []
+        for root in ALLOWED_ROOTS:
+            base = os.path.join(pool, root)
+            if not os.path.isdir(base):
+                continue
+            for dirpath, dirnames, filenames in os.walk(base):
+                dirnames[:] = sorted(
+                    d for d in dirnames if not is_excluded(os.path.relpath(os.path.join(dirpath, d), pool))
+                )
+                for name in sorted(filenames):
+                    full = os.path.join(dirpath, name)
+                    rel = os.path.relpath(full, pool).replace(os.sep, "/")
+                    if is_excluded(rel):
+                        continue
+                    if rel == SQLITE_REL:
+                        # The live database is never read as a file: §5.4's snapshot enters the same
+                        # tar stream through the SQLite backup API instead. A raw copy of a WAL
+                        # triple is a torn database that restores as "present" and opens as garbage.
+                        continue
+                    if os.path.islink(full) or not os.path.isfile(full):
+                        continue
+                    out.append(rel)
+        return sorted(out)
+    
+    
+    # --------------------------------------------------------------------------- manifest
+    
+    
+    def canonical(row):
+        """`tools/freeze_contracts.py`'s convention, so digests are comparable with Phase 3 work."""
+        return json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    
+    
+    def manifest_bytes(rows):
+        return ("".join(canonical(row) + "\n" for row in rows)).encode("utf-8")
+    
+    
+    def sha256_hex(data):
+        return hashlib.sha256(data).hexdigest()
+    
+    
+    @dataclass
+    class Stored:
+        rows: list = field(default_factory=list)
+        stored: int = 0
+        unchanged: int = 0
+        vanished: int = 0
+        unstable: int = 0
+        bytes_in: int = 0
+    
+    
+    def _read_frozen(path, size, hasher):
+        """Read exactly `size` bytes, hashing. Never to EOF: the tail may be a half-written row."""
+        remaining = size
+        chunks = []
+        with open(path, "rb") as handle:
+            while remaining > 0:
+                chunk = handle.read(min(1 << 20, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                hasher.update(chunk)
+                chunks.append(chunk)
+        return b"".join(chunks)
+    
+    
+    def snapshot_sqlite(pool, workdir):
+        """A consistent copy of the live-WAL database, taken without writing to the source.
+    
+        ⚠️`sqlite3.connect("file:...?mode=ro")` IS NOT READ-ONLY ON DISK. It creates
+        `annotations.sqlite3-shm` (and touches `-wal`) NEXT TO THE SOURCE, which is both a write to a
+        pool this job promises never to write to, and an outright failure on the read-only mount the
+        CronJob uses. The test that says so is G0.12: it fingerprints every file in the source tree
+        before and after a run.
+    
+        So the whole triple is copied into the job's own scratch volume first, the COPY is opened
+        read-write (recovery and checkpointing happen there, where writes are allowed), and the
+        backup API then produces the archived artifact from it. A copy of a live triple can be torn;
+        `PRAGMA integrity_check` on the copy is what catches that, and the run fails closed rather
+        than archiving a database that restores as garbage.
+        """
+        source = os.path.join(pool, SQLITE_REL)
+        if not os.path.isfile(source):
+            return None, {}
+        staged = os.path.join(workdir, "staged.sqlite3")
+        for suffix in ("", "-wal", "-shm"):
+            part = source + suffix
+            if os.path.exists(part):
+                shutil.copyfile(part, staged + suffix)
+        dest = os.path.join(workdir, "annotations.sqlite3")
+        staged_conn = sqlite3.connect(staged)
+        try:
+            out = sqlite3.connect(dest)
+            try:
+                staged_conn.backup(out)
+            finally:
+                out.close()
+        except sqlite3.DatabaseError:
+            raise Refusal("SQLITE_SNAPSHOT_TORN", "the staged copy of the database is not readable")
+        finally:
+            staged_conn.close()
+        check = sqlite3.connect(dest)
+        try:
+            status = check.execute("PRAGMA integrity_check").fetchone()[0]
+            if status != "ok":
+                raise Refusal("SQLITE_SNAPSHOT_CORRUPT", "integrity_check on the snapshot is not ok")
+            tables = [
+                r[0]
+                for r in check.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            ]
+            counts = {t: check.execute(f"SELECT count(*) FROM '{t}'").fetchone()[0] for t in sorted(tables)}
+        finally:
+            check.close()
+        return dest, counts
+    
+    
+    def build_payload(pool, rels, gen_id, parent_rows, level, min_age_seconds, now=None, extra=()):
+        """One pass: freeze, hash, tar, gzip. Returns (gzip bytes, Stored).
+    
+        `extra` carries members that are NOT read from the live tree -- today only the SQLite backup
+        API snapshot, which must enter the same single tar stream rather than a second one appended
+        after its end-of-archive marker (which no reader would ever see).
+        """
+        now = time.time() if now is None else now
+        parent = {row["path"]: row for row in parent_rows}
+        result = Stored()
+        raw = io.BytesIO()
+        with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=1, mtime=0) as gz:
+            with tarfile.open(fileobj=gz, mode="w|") as tar:
+                for rel in rels:
+                    full = os.path.join(pool, rel)
+                    klass = classify(rel)
+                    append_only = is_append_only(rel)
+                    try:
+                        handle = open(full, "rb")
+                    except FileNotFoundError:
+                        result.rows.append(
+                            {"gen_id": gen_id, "path": rel, "class": klass, "state": "vanished"}
+                        )
+                        result.vanished += 1
+                        continue
+                    with handle:
+                        before = os.fstat(handle.fileno())
+                    size = before.st_size
+                    if (
+                        level == "l1"
+                        and not append_only
+                        and (now - before.st_mtime) < min_age_seconds
+                    ):
+                        result.rows.append(
+                            {
+                                "gen_id": gen_id,
+                                "path": rel,
+                                "class": klass,
+                                "state": "unstable",
+                                "reason": "younger-than-write-window",
+                            }
+                        )
+                        result.unstable += 1
+                        continue
+                    previous = parent.get(rel)
+                    if (
+                        level == "l1"
+                        and not append_only
+                        and previous
+                        and previous.get("state") in ("stored", "unchanged")
+                        and previous.get("bytes") == size
+                        and previous.get("mtime_ns") == before.st_mtime_ns
+                        and previous.get("inode") == before.st_ino
+                    ):
+                        result.rows.append(
+                            {
+                                "gen_id": gen_id,
+                                "path": rel,
+                                "class": klass,
+                                "state": "unchanged",
+                                "bytes": size,
+                                "mtime_ns": before.st_mtime_ns,
+                                "inode": before.st_ino,
+                                "sha256": previous.get("sha256"),
+                                "stored_in": previous.get("stored_in", previous.get("gen_id")),
+                            }
+                        )
+                        result.unchanged += 1
+                        continue
+                    hasher = hashlib.sha256()
+                    try:
+                        body = _read_frozen(full, size, hasher)
+                    except FileNotFoundError:
+                        result.rows.append(
+                            {"gen_id": gen_id, "path": rel, "class": klass, "state": "vanished"}
+                        )
+                        result.vanished += 1
+                        continue
+                    try:
+                        after = os.stat(full)
+                    except FileNotFoundError:
+                        result.rows.append(
+                            {"gen_id": gen_id, "path": rel, "class": klass, "state": "vanished"}
+                        )
+                        result.vanished += 1
+                        continue
+                    torn = after.st_ino != before.st_ino or after.st_dev != before.st_dev
+                    if not append_only and (after.st_size != size or after.st_mtime_ns != before.st_mtime_ns):
+                        torn = True
+                    if len(body) != size:
+                        torn = True
+                    if torn:
+                        result.rows.append(
+                            {
+                                "gen_id": gen_id,
+                                "path": rel,
+                                "class": klass,
+                                "state": "unstable",
+                                "reason": "changed-under-read",
+                            }
+                        )
+                        result.unstable += 1
+                        continue
+                    member = tarfile.TarInfo(name="pool/" + rel)
+                    member.size = size
+                    member.mtime = int(before.st_mtime)
+                    member.mode = 0o600
+                    tar.addfile(member, io.BytesIO(body))
+                    result.rows.append(
+                        {
+                            "gen_id": gen_id,
+                            "path": rel,
+                            "class": klass,
+                            "state": "stored",
+                            "stored_in": gen_id,
+                            "bytes": size,
+                            "mtime_ns": before.st_mtime_ns,
+                            "inode": before.st_ino,
+                            "sha256": hasher.hexdigest(),
+                            "append_only": append_only,
+                            "tar_member": "pool/" + rel,
+                        }
+                    )
+                    result.stored += 1
+                    result.bytes_in += size
+                for rel, source, klass, note in extra:
+                    with open(source, "rb") as handle:
+                        body = handle.read()
+                    member = tarfile.TarInfo(name="pool/" + rel)
+                    member.size = len(body)
+                    member.mode = 0o600
+                    tar.addfile(member, io.BytesIO(body))
+                    result.rows.append(
+                        {
+                            "gen_id": gen_id,
+                            "path": rel,
+                            "class": klass,
+                            "state": "stored",
+                            "stored_in": gen_id,
+                            "bytes": len(body),
+                            "sha256": sha256_hex(body),
+                            "snapshot": note,
+                            "tar_member": "pool/" + rel,
+                        }
+                    )
+                    result.stored += 1
+                    result.bytes_in += len(body)
+        return raw.getvalue(), result
+    
+    
+    # --------------------------------------------------------------------------- encryption
+    
+    
+    def encrypt(data, key, cipher):
+        if cipher == "none" or key is None:
+            return data
+        fd = key.open_fd()
+        try:
+            proc = subprocess.run(
+                [
+                    "gpg", "--symmetric", "--cipher-algo", "AES256", "--digest-algo", "SHA512",
+                    "--s2k-mode", "3", "--s2k-count", "65011712", "--compress-algo", "none",
+                    "--batch", "--yes", "--passphrase-fd", str(fd), "--output", "-",
+                ],
+                input=data,
+                capture_output=True,
+                pass_fds=(fd,),
+            )
+        finally:
+            os.close(fd)
+        if proc.returncode != 0:
+            raise Refusal("ENCRYPT_FAILED", "gpg refused to encrypt the stream")
+        return proc.stdout
+    
+    
+    def decrypt(data, key, cipher):
+        if cipher == "none" or key is None:
+            return data
+        fd = key.open_fd()
+        try:
+            proc = subprocess.run(
+                ["gpg", "--decrypt", "--batch", "--yes", "--passphrase-fd", str(fd), "--output", "-"],
+                input=data,
+                capture_output=True,
+                pass_fds=(fd,),
+            )
+        finally:
+            os.close(fd)
+        if proc.returncode != 0:
+            raise Refusal("DECRYPT_FAILED", "gpg could not decrypt the archive with the supplied key")
+        return proc.stdout
+    
+    
+    # --------------------------------------------------------------------------- generations
+    
+    
+    def generations(target):
+        """Rows of index.jsonl, oldest first. The chain ledger; never rewritten, only appended."""
+        path = os.path.join(target, INDEX_NAME)
+        if not os.path.isfile(path):
+            return []
+        rows = []
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+        return rows
+    
+    
+    def gen_dir(target, gen_id):
+        return os.path.join(target, "generations", gen_id)
+    
+    
+    def read_manifest(target, index_row, key, cipher):
+        """Manifest rows of a generation, located through ITS OWN receipt.
+    
+        ⚠️THE NAME IS READ FROM THE INDEX ROW, NEVER REBUILT FROM THE gen_id. A guessed
+        `manifest-<gen>.jsonl.gpg` silently missed every plaintext-fixture manifest, and a level-1
+        whose parent manifest "does not exist" does not fail -- it quietly re-stores the whole pool
+        and calls it an incremental.
+        """
+        path = os.path.join(gen_dir(target, index_row["gen_id"]), index_row["manifest_name"])
+        if not os.path.isfile(path):
+            raise Refusal("MANIFEST_MISSING", "a manifest named by index.jsonl is not on the target")
+        with open(path, "rb") as handle:
+            blob = decrypt(handle.read(), key, cipher)
+        return [json.loads(line) for line in blob.decode("utf-8").splitlines() if line.strip()]
+    
+    
+    def new_gen_id(level, now=None):
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now if now is not None else time.time()))
+        return f"{level}-{stamp}-{uuidlib.uuid4().hex[:8]}"
+    
+    
+    # --------------------------------------------------------------------------- backup
+    
+    
+    def run_backup(args):
+        pool = refuse_live_pool(args.pool)
+        sentinel = read_sentinel(args.target, args.sentinel_uuid, args.expect_mount)
+        target = _resolve(args.target)
+        refuse_same_device(pool, target, bool(sentinel.get("synthetic")))
+        key = require_key(
+            args.passphrase_file, args.key_ref, args.cipher, sentinel, args.insecure_plaintext
+        )
+    
+        index = generations(target)
+        parent = None
+        parent_rows = []
+        if args.level == "l1":
+            parent_row = None
+            for row in reversed(index):
+                if row.get("ok"):
+                    parent_row = row
+                    break
+            if parent_row is None:
+                raise Refusal("NO_PARENT", "a level-1 generation needs a level-0 parent in index.jsonl")
+            parent = parent_row["gen_id"]
+            parent_rows = read_manifest(target, parent_row, key, args.cipher)
+    
+        rels = select(pool)
+        if not args.execute:
+            plan = {
+                "mode": "dry-run",
+                "would_write": gen_dir(target, f"{args.level}-<stamp>-<uuid8>"),
+                "level": args.level,
+                "parent_gen_id": parent,
+                "candidate_files": len(rels),
+                "candidate_bytes": sum(
+                    os.path.getsize(os.path.join(pool, r))
+                    for r in rels
+                    if os.path.exists(os.path.join(pool, r))
+                ),
+                "cipher": args.cipher,
+                "key_ref": (key.key_ref if key else None),
+                "sentinel_uuid": sentinel["uuid"],
+                "note": "nothing written; re-run with --execute once custody and target are decided",
+            }
+            print(json.dumps(redact(plan), indent=2, sort_keys=True))
+            return EXIT_OK
+    
+        started = time.time()
+        gen_id = new_gen_id(args.level, started)
+        final = gen_dir(target, gen_id)
+        staging = final + ".part"
+        os.makedirs(os.path.dirname(final), exist_ok=True)
+        if os.path.exists(final):
+            raise Refusal("GENERATION_EXISTS", "refusing to overwrite an existing generation")
+        work = tempfile.mkdtemp(prefix="hear-pool-backup-", dir=args.work_dir or None)
+        try:
+            os.makedirs(staging, exist_ok=False)
+            snapshot, table_counts = snapshot_sqlite(pool, work)
+            extra = (
+                ((SQLITE_REL, snapshot, "annotations", "sqlite-backup-api"),) if snapshot else ()
+            )
+            payload, stored = build_payload(
+                pool, rels, gen_id, parent_rows, args.level, args.min_age_seconds, extra=extra
+            )
+            blob = encrypt(payload, key, args.cipher)
+            manifest = manifest_bytes(stored.rows)
+            manifest_blob = encrypt(manifest, key, args.cipher)
+            archive_name = f"pool-{gen_id}.tar.gz" + (".gpg" if args.cipher != "none" else "")
+            manifest_name = f"manifest-{gen_id}.jsonl" + (".gpg" if args.cipher != "none" else "")
+            _write_atomic(os.path.join(staging, archive_name), blob)
+            _write_atomic(os.path.join(staging, manifest_name), manifest_blob)
+            receipt = {
+                "gen_id": gen_id,
+                "level": args.level,
+                "parent_gen_id": parent,
+                "started_at": _iso(started),
+                "ended_at": _iso(time.time()),
+                "files_stored": stored.stored,
+                "files_unchanged": stored.unchanged,
+                "files_vanished": stored.vanished,
+                "files_unstable": stored.unstable,
+                "bytes_in": stored.bytes_in,
+                "bytes_out": len(blob),
+                "archive_sha256": sha256_hex(blob),
+                "archive_name": archive_name,
+                "manifest_sha256": sha256_hex(manifest_blob),
+                "manifest_plaintext_sha256": sha256_hex(manifest),
+                "manifest_name": manifest_name,
+                "manifest_rows": len(stored.rows),
+                "tool_version": TOOL_VERSION,
+                "cipher": args.cipher,
+                "key_ref": (key.key_ref if key else None),
+                "sentinel_uuid": sentinel["uuid"],
+                "sqlite_table_rows": table_counts,
+                "target_free_bytes": shutil.disk_usage(target).free,
+                "ok": True,
+            }
+            receipt = _receipt_safe(redact(receipt))
+            _write_atomic(
+                os.path.join(staging, f"receipt-{gen_id}.json"),
+                json.dumps(receipt, indent=2, sort_keys=True).encode("utf-8"),
+            )
+            os.replace(staging, final)
+        except BaseException:
+            # FAILURE CLEANUP: a half-written generation must not exist, and index.jsonl -- the only
+            # thing a restore trusts -- is appended to strictly after the directory is in place.
+            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(work, ignore_errors=True)
+            raise
+        shutil.rmtree(work, ignore_errors=True)
+        with open(os.path.join(target, INDEX_NAME), "a", encoding="utf-8") as handle:
+            handle.write(canonical(receipt) + "\n")
+        print(json.dumps(receipt, indent=2, sort_keys=True))
+        return EXIT_OK
+    
+    
+    def _write_atomic(path, data):
+        tmp = path + ".inflight"
+        with open(tmp, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    
+    
+    def _iso(when):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when))
+    
+    
+    _PATHISH = re.compile(r"(corpus|models|sketch_corpus)/")
+    
+    
+    def _receipt_safe(receipt):
+        """Receipts are cleartext so monitoring can read them without the key: no paths, no coords."""
+        for key, value in receipt.items():
+            if isinstance(value, str) and _PATHISH.search(value):
+                raise Refusal("RECEIPT_LEAK", f"receipt field {key} carries a pool path")
+        return receipt
+    
+    
+    # --------------------------------------------------------------------------- verify / restore
+    
+    
+    def chain_for(index, gen_id):
+        by_id = {row["gen_id"]: row for row in index}
+        if gen_id not in by_id:
+            raise Refusal("GENERATION_UNKNOWN", "index.jsonl has no such generation")
+        chain = []
+        cursor = gen_id
+        seen = set()
+        while cursor:
+            if cursor in seen:
+                raise Refusal("CHAIN_CYCLE", "index.jsonl chain loops")
+            seen.add(cursor)
+            row = by_id.get(cursor)
+            if row is None:
+                raise Refusal("CHAIN_BROKEN", "a retained generation names a missing parent")
+            chain.append(row)
+            cursor = row.get("parent_gen_id")
+        return list(reversed(chain))
+    
+    
+    def run_verify(args):
+        target = _resolve(args.target)
+        index = generations(target)
+        chain = chain_for(index, args.gen)
+        report = {"gen_id": args.gen, "chain": [row["gen_id"] for row in chain], "v1": []}
+        for row in chain:
+            path = os.path.join(gen_dir(target, row["gen_id"]), row["archive_name"])
+            if not os.path.isfile(path):
+                raise Refusal("ARCHIVE_MISSING", "an archive named by index.jsonl is not on the target")
+            with open(path, "rb") as handle:
+                digest = sha256_hex(handle.read())
+            ok = digest == row["archive_sha256"]
+            report["v1"].append({"gen_id": row["gen_id"], "archive_sha256_matches": ok})
+            if not ok:
+                report["ok"] = False
+                print(json.dumps(report, indent=2, sort_keys=True))
+                raise Refusal("ARCHIVE_DIGEST_MISMATCH", "bit rot or a truncated write on the target")
+        report["ok"] = True
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return EXIT_OK
+    
+    
+    def refuse_unsafe_restore_target(into, pool_hint=None):
+        real = _resolve(into)
+        for prefix in LIVE_POOL_PREFIXES:
+            if real == prefix or real.startswith(prefix.rstrip("/") + "/"):
+                raise Refusal("RESTORE_INTO_POOL", "restore never writes into the live pool")
+        if pool_hint:
+            hint = _resolve(pool_hint)
+            if real == hint or real.startswith(hint.rstrip("/") + "/"):
+                raise Refusal("RESTORE_INTO_SOURCE", "restore target is inside the backup source")
+        if os.path.exists(real) and os.listdir(real):
+            raise Refusal("RESTORE_TARGET_NOT_EMPTY", "restore requires a fresh, empty target")
+        return real
+    
+    
+    def _trim_jsonl(body):
+        """Tail repair (§5.1): a prefix of an append-only file ends mid-row after a torn read."""
+        cut = body.rfind(b"\n")
+        if cut == -1:
+            return b"", len(body)
+        return body[: cut + 1], len(body) - (cut + 1)
+    
+    
+    def _trim_gzip_members(body):
+        """Keep whole gzip members only; a partial member is not decompressible."""
+        try:
+            gzip.decompress(body)
+            return body, 0
+        except (OSError, EOFError):
+            pass
+        for end in range(len(body) - 1, 0, -1):
+            head = body[:end]
+            try:
+                gzip.decompress(head)
+            except (OSError, EOFError):
+                continue
+            return head, len(body) - end
+        return b"", len(body)
+    
+    
+    def _safe_extract(tar_bytes, into):
+        """Path-traversal-proof extraction: every member must land under `into`."""
+        root = _resolve(into)
+        written = []
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:*") as tar:
+            while True:
+                member = tar.next()
+                if member is None:
+                    break
+                if not member.isfile():
+                    continue
+                name = member.name
+                if not name.startswith("pool/"):
+                    raise Refusal("ARCHIVE_MEMBER_UNEXPECTED", "archive member is outside pool/")
+                rel = name[len("pool/") :]
+                dest = _resolve(os.path.join(root, rel))
+                if not dest.startswith(root + os.sep):
+                    raise Refusal("ARCHIVE_PATH_TRAVERSAL", "archive member escapes the restore target")
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                source = tar.extractfile(member)
+                with open(dest, "wb") as handle:
+                    shutil.copyfileobj(source, handle)
+                written.append(rel)
+        return written
+    
+    
+    def run_restore(args):
+        target = _resolve(args.target)
+        if not args.i_understand:
+            raise Refusal("CONFIRMATION_REQUIRED", "--i-understand is mandatory for a restore")
+        into = refuse_unsafe_restore_target(args.into, args.pool)
+        index = generations(target)
+        chain = chain_for(index, args.gen)
+        sentinel_uuid = chain[-1].get("sentinel_uuid")
+        cipher = chain[-1].get("cipher", args.cipher)
+        key = None
+        if cipher != "none":
+            if not args.passphrase_file:
+                raise Refusal("KEY_REQUIRED", "the chain is encrypted; --passphrase-file is mandatory")
+            key = require_key(
+                args.passphrase_file,
+                chain[-1].get("key_ref"),
+                cipher,
+                {"synthetic": False},
+                False,
+            )
+        if not args.execute:
+            plan = {
+                "mode": "dry-run",
+                "chain": [row["gen_id"] for row in chain],
+                "would_restore_into": into,
+                "cipher": cipher,
+                "key_ref": chain[-1].get("key_ref"),
+                "sentinel_uuid": sentinel_uuid,
+                "note": "nothing written; re-run with --execute",
+            }
+            print(json.dumps(redact(plan), indent=2, sort_keys=True))
+            return EXIT_OK
+    
+        started = time.time()
+        os.makedirs(into, exist_ok=True)
+        report = {
+            "test_id": args.test_id or f"restore-{int(started)}",
+            "gen_id": args.gen,
+            "chain": [row["gen_id"] for row in chain],
+            "started_at": _iso(started),
+            "v1_archive": [],
+            "v2_objects": {"checked": 0, "mismatched": 0},
+            "v4_structural": {"jsonl_parsed": 0, "gzip_members_ok": 0, "sqlite": None},
+            "trimmed_bytes": {},
+            "isolated_from_pool": True,
+            "ok": False,
+        }
+        manifest_by_path = {}
+        for row in chain:
+            archive = os.path.join(gen_dir(target, row["gen_id"]), row["archive_name"])
+            with open(archive, "rb") as handle:
+                blob = handle.read()
+            if sha256_hex(blob) != row["archive_sha256"]:
+                raise Refusal("ARCHIVE_DIGEST_MISMATCH", "V1 failed; refusing to produce a partial tree")
+            report["v1_archive"].append({"gen_id": row["gen_id"], "ok": True})
+            payload = decrypt(blob, key, cipher)
+            try:
+                tar_bytes = gzip.decompress(payload)
+            except (OSError, EOFError):
+                raise Refusal("ARCHIVE_STREAM_TRUNCATED", "the gzip stream does not terminate cleanly")
+            _safe_extract(tar_bytes, into)
+            for mrow in read_manifest_named(target, row, key, cipher):
+                manifest_by_path[mrow["path"]] = mrow
+    
+        for rel, mrow in sorted(manifest_by_path.items()):
+            if mrow.get("state") not in ("stored", "unchanged"):
+                continue
+            dest = os.path.join(into, rel)
+            if not os.path.isfile(dest):
+                report["v2_objects"]["mismatched"] += 1
+                continue
+            with open(dest, "rb") as handle:
+                body = handle.read()
+            trimmed = 0
+            if rel.endswith(".jsonl.gz"):
+                repaired, trimmed = _trim_gzip_members(body)
+            elif rel.endswith(".jsonl"):
+                repaired, trimmed = _trim_jsonl(body)
+            else:
+                repaired = body
+            if trimmed:
+                with open(dest, "wb") as handle:
+                    handle.write(repaired)
+                report["trimmed_bytes"][rel.rsplit("/", 1)[-1]] = trimmed
+            report["v2_objects"]["checked"] += 1
+            if mrow.get("sha256") and sha256_hex(body) != mrow["sha256"]:
+                report["v2_objects"]["mismatched"] += 1
+            if rel.endswith(".jsonl"):
+                for line in repaired.decode("utf-8").splitlines():
+                    if line.strip():
+                        json.loads(line)
+                        report["v4_structural"]["jsonl_parsed"] += 1
+            elif rel.endswith(".jsonl.gz"):
+                gzip.decompress(repaired)
+                report["v4_structural"]["gzip_members_ok"] += 1
+    
+        sqlite_path = os.path.join(into, SQLITE_REL)
+        if os.path.isfile(sqlite_path):
+            conn = sqlite3.connect(sqlite_path)
+            try:
+                report["v4_structural"]["sqlite"] = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            finally:
+                conn.close()
+    
+        report["ended_at"] = _iso(time.time())
+        report["rto_seconds"] = round(time.time() - started, 3)
+        report["ok"] = report["v2_objects"]["mismatched"] == 0
+        reports = os.path.join(target, "restore-tests", report["test_id"])
+        os.makedirs(reports, exist_ok=True)
+        _write_atomic(
+            os.path.join(reports, "report.json"),
+            json.dumps(redact(report), indent=2, sort_keys=True).encode("utf-8"),
+        )
+        print(json.dumps(redact(report), indent=2, sort_keys=True))
+        return EXIT_OK if report["ok"] else EXIT_FAILED
+    
+    
+    def read_manifest_named(target, row, key, cipher):
+        """Back-compatible alias used by the restore path and the tests."""
+        return read_manifest(target, row, key, cipher)
+    
+    
+    # --------------------------------------------------------------------------- cli
+    
+    
+    def build_parser():
+        parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+        sub = parser.add_subparsers(dest="command", required=True)
+    
+        def common(p):
+            p.add_argument("--target", required=True, help="backup target directory (carries the sentinel)")
+            p.add_argument("--cipher", choices=("gpg", "none"), default="gpg")
+            p.add_argument("--passphrase-file", help="path to an EXTERNALLY provisioned passphrase file")
+            p.add_argument("--key-ref", help="non-secret custody label, e.g. pool-backup-2026Q3")
+    
+        backup = sub.add_parser("backup", help="plan (default) or take a generation")
+        common(backup)
+        backup.add_argument("--pool", required=True)
+        backup.add_argument("--sentinel-uuid", required=True)
+        backup.add_argument("--expect-mount", default=None)
+        backup.add_argument("--level", choices=("l0", "l1"), default="l0")
+        backup.add_argument("--min-age-seconds", type=int, default=DEFAULT_MIN_AGE_SECONDS)
+        backup.add_argument("--work-dir", default=None)
+        backup.add_argument("--insecure-plaintext", action="store_true",
+                            help="synthetic fixtures only; needs a sentinel marked synthetic")
+        backup.add_argument("--execute", action="store_true", help="without this, nothing is written")
+    
+        verify = sub.add_parser("verify", help="V1: archives on the target match their receipts")
+        verify.add_argument("--target", required=True)
+        verify.add_argument("--gen", required=True)
+    
+        restore = sub.add_parser("restore", help="plan (default) or restore into an empty target")
+        common(restore)
+        restore.add_argument("--gen", required=True)
+        restore.add_argument("--into", required=True)
+        restore.add_argument("--pool", default=None, help="source tree, refused as a restore target")
+        restore.add_argument("--test-id", default=None)
+        restore.add_argument("--i-understand", action="store_true")
+        restore.add_argument("--execute", action="store_true", help="without this, nothing is written")
+        return parser
+    
+    
+    def main(argv=None):
+        args = build_parser().parse_args(argv)
+        try:
+            if args.command == "backup":
+                return run_backup(args)
+            if args.command == "verify":
+                return run_verify(args)
+            if args.command == "restore":
+                return run_restore(args)
+        except Refusal as refusal:
+            log(f"refused: {refusal.message} [{refusal.code}]")
+            return EXIT_REFUSED
+        return EXIT_FAILED
+    
+    
+    if __name__ == "__main__":
+        raise SystemExit(main())
+    
