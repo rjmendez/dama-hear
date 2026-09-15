@@ -156,3 +156,12 @@ jobs:
 
   firmware:
     uses: ./.github/workflows/firmware.yml
+
+  images:
+    # Publishes only from main: a pull request builds, scans and throws the image away.
+    uses: ./.github/workflows/images.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}

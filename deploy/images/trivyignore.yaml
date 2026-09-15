@@ -1,0 +1,24 @@
+# Findings the images workflow will not fail on, and the date each stops being accepted.
+#
+# ⚠️EVERY ENTRY EXPIRES. An ignore without an expiry is a permanent allowlist, which is how a
+# scanner becomes a badge. After `expired_at` Trivy reports the finding again and the build
+# fails, which is the intended way to be forced to look at it a second time.
+#
+# ⚠️NOTHING HERE MAY BE A DEPENDENCY WE CHOSE. A vulnerable pin in requirements/image-*.txt is
+# fixed by moving the pin and regenerating the lock, never by listing it below. Both current
+# entries are inside pip's own vendored tree -- code that is not imported by any worker, is not
+# in any lock file, and can only be changed by upstream pip.
+vulnerabilities:
+  - id: GHSA-6v7p-g79w-8964
+    statement: >-
+      msgpack 1.1.2 vendored inside pip (/usr/local/lib/python3.13/site-packages/pip/_vendor).
+      It is pip's wheel cache codec, not a worker dependency: no shipped module imports msgpack,
+      and the images run pip only at build time. Fixed by a pip release that revendors 1.2.1.
+    expired_at: 2027-03-15
+  - id: CVE-2025-47273
+    statement: >-
+      setuptools PackageIndex path traversal, reachable only when setuptools downloads from an
+      index. The images install from a hash-pinned lock with PIP_ONLY_BINARY=:all:, so no sdist
+      is built and PackageIndex is never exercised; at runtime the workers do not install
+      anything at all. Fixed by an upstream base image that ships setuptools >= 78.1.1.
+    expired_at: 2027-03-15

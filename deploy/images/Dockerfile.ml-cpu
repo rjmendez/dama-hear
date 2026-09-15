@@ -1,0 +1,21 @@
+# hear-ml-cpu -- hear-numeric plus the CPU inference runtimes (onnxruntime, ai-edge-litert).
+#
+# Replaces the per-lane `pip install --target /pool/pylib-tag` and `--target /pool/pylib-birdnet`
+# in hear-tag.yaml and hear-birdnet.yaml.
+#
+# ⚠️IT CARRIES NO WEIGHTS. mn10_as.onnx and the BirdNET model are data, sha256-pinned in
+# tools/hear_tag.py and staged on the PVC; baking them in would put a 16 MB-plus blob with its
+# own lifecycle inside an artifact whose identity is supposed to be the code. The runtime is the
+# image, the weights are configuration: deploy/images/README.md, "the model boundary".
+ARG NUMERIC_IMAGE=hear-numeric:dev
+FROM ${NUMERIC_IMAGE}
+
+LABEL org.opencontainers.image.title="hear-ml-cpu"
+LABEL org.opencontainers.image.description="hear-numeric + onnxruntime/ai-edge-litert, from requirements/lock/ml-cpu.txt."
+
+USER root
+COPY requirements/lock/ml-cpu.txt /etc/hear/lock/ml-cpu.txt
+RUN set -eux; \
+    pip install --no-cache-dir --require-hashes --no-deps -r /etc/hear/lock/ml-cpu.txt; \
+    python -c "import onnxruntime, ai_edge_litert; print(onnxruntime.__version__)"
+USER 65532:65532
