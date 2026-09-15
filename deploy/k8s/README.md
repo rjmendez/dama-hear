@@ -34,6 +34,14 @@ kubectl apply -f deploy/k8s/hear-heartbeat-code.yaml -f deploy/k8s/hear-heartbea
 python3 deploy/k8s/gen_configmap.py hear-mqtt-bridge-code > deploy/k8s/hear-mqtt-bridge-code.yaml
 kubectl apply -f deploy/k8s/hear-mqtt-bridge-code.yaml -f deploy/k8s/hear-mqtt-bridge.yaml
 
+# hear-annotate  ⚠️REGENERATED IN PLACE, NOT REDIRECTED. Its ConfigMap lives INSIDE the
+#                workload manifest -- one file carrying ConfigMap + Deployment + Service --
+#                so the generator rewrites that one document and leaves the rest alone.
+#                Redirecting stdout into the file would truncate the other two documents,
+#                which is why this command has no `>`.
+python3 deploy/k8s/gen_configmap.py hear-annotate-code
+kubectl apply -f deploy/k8s/hear-annotate.yaml
+
 # hear-tdoa  ⚠️--server-side ON THE CODE BUNDLE, AND IT IS NOT A STYLE PREFERENCE.
 #            A plain apply is REJECTED by the API server, not merely discouraged:
 #              The ConfigMap "hear-tdoa-code" is invalid: metadata.annotations:
@@ -193,6 +201,22 @@ and the solvers read the pool with no adapter.
   bundles and compares the `data` mapping — ⚠️`data` only: the commit annotation is
   `git rev-parse --short HEAD` plus a `-dirty` flag, so it changes on every commit and flips in
   any tree with uncommitted work, i.e. in the exact state a developer runs pytest in.
+- ⚠️**A ConfigMap that was not in `BUNDLES` was in no guard at all.** `hear-annotate`'s
+  `server.py` was hand-embedded in its manifest, so every test above walked past it: they
+  iterate `BUNDLES`. It drifted at commit `fa5a589` — `tools/hear_annotate/server.py` gained
+  path-traversal, proxy-trust, submission-idempotency and WAV-frame hardening, and the embedded
+  copy did not — so the pod that owns `annotations.sqlite3`, the only human-labelled ground
+  truth in the system, ran the pre-hardening code while the checkout, the tests and every
+  reviewer read the hardened one. It is now generated from the checkout
+  (`EMBEDDED_BUNDLES`) and guarded by `tests/test_configmap_sync.py::TestTheEmbeddedConfigMaps`,
+  which requires the sources to reproduce the committed manifest **byte for byte**.
+  ⚠️**Applying it is a deliberate act, not a formality**: the regenerated ConfigMap carries the
+  hardened server, which adds the `submission_id` column (additive `ALTER TABLE`, existing rows
+  untouched) and stops trusting `tailscale-user-*` / `x-webauth-user` headers from clients that
+  are not listed in `HEAR_ANNOTATE_TRUSTED_PROXIES` — unset today, so attribution becomes
+  `client:<ip>` until the proxy address is configured. Back up `annotations.sqlite3` with the
+  SQLite backup API (never a raw copy of a live WAL) before applying.
+
 - **`/pool/pylib` is shared between the two workloads.** A guard that only tests whether the
   numpy directory exists means whichever workload reaches an empty PVC first decides the version
   and the other silently uses what it finds — both pins then read as discipline while enforcing
