@@ -21,7 +21,7 @@ release.
 | `hear_node` | Fallback AP password (`AP_PASS_OVERRIDE` / `ap`) | NVS from `enroll.py`; otherwise MAC-derived | Runtime | Still unique per device, but not operator-chosen secret strength |
 | `hear_node` | Backend push host (`HEAR_PUSH_HOST`) | compiled public default or NVS `phost` override | Runtime config, not secret | Pushes go to the default ingest host |
 | `hear_node` | Backend push token (`HEAR_PUSH_TOKEN`) | `~/.hear_push` -> `secrets.h`, now copied/provisioned into NVS `ptoken` | Runtime secret | Pushes are sent without credentials and the backend returns `401` |
-| `hear_node` | Admin token (`HEAR_ADMIN_TOKEN`) | `~/.hear_push` -> `secrets.h`, now copied/provisioned into NVS `atoken` | Runtime secret | Privileged endpoints fail closed: `/update`, `/reboot`, `/format`, `/gate` writes and hardware probes reject every request |
+| `hear_node` | Admin token (`HEAR_ADMIN_TOKEN`) | `~/.hear_push` -> `secrets.h`, now copied/provisioned into NVS `atoken` | Runtime secret | Non-OTA privileged endpoints fail closed; `/update` stays open only when no admin token exists so a bad generic image is recoverable |
 | `hear_node` | Push TLS CA / insecure override (`HEAR_PUSH_CA_CERT`, `HEAR_PUSH_TLS_INSECURE`) | tracked Amazon Root CA default, optional `secrets.h` override | Build-time policy/config | Default remains verified TLS; insecure must be explicit |
 | `puc_node` | Wi-Fi SSIDs/PSKs (`WIFI_*`) | `secrets.h`; CI can compile with `-DHEAR_ALLOW_NO_WIFI` | Runtime | AP-only/unreachable on LAN |
 | `puc_node` | Node identity (`NODE_ID`) | `secrets.h`, else MAC-derived | Runtime | Unique but not enrolled fleet identity |
@@ -39,6 +39,12 @@ PROV ... [phost=<hex>] [ptoken=<hex>] [atoken=<hex>] crc=<crc32>
 masked summary, and never prints credential values. A build with `secrets.h` remains compatible:
 on boot it copies compiled Wi-Fi/name/push/admin credentials into NVS, then later secret-free
 release images use the NVS values.
+
+Admin auth remains fail-closed for `/reboot`, `/format`, `/gate` writes and hardware probes. `/update`
+is the only exception: if neither NVS nor the compiled image has an admin token, the firmware allows
+an unauthenticated OTA as a recovery valve. That is intentionally less secure than a provisioned
+node, but it avoids the unrecoverable state that stranded rankine. `flash.py --release` still refuses
+to create that state on purpose; this valve exists for manual mistakes, old assets and lab recovery.
 
 ## Safe migration
 

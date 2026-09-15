@@ -1750,15 +1750,15 @@ static bool psram_fault = false;
 #endif
 #ifndef HEAR_ADMIN_TOKEN
 // Per-device secret, from secrets.h (gen_secrets.py / enroll.py's provisioning), never the same
-// across the fleet. Empty means "nothing can authenticate" -- HEAR_REQUIRE_ADMIN_AUTH fails
-// CLOSED when a build forgot to set one, rather than quietly falling open.
+// across the fleet. Empty means regular admin endpoints fail closed; /update has a last-resort
+// tokenless recovery valve so a bad generic image can be replaced instead of stranding the node.
 #define HEAR_ADMIN_TOKEN ""
 #endif
 static bool hear_auth_ok() {
 #if !HEAR_REQUIRE_ADMIN_AUTH
   return true;
 #else
-  static const char *want = admin_token_runtime();
+  const char *want = admin_token_runtime();
   size_t wn = strlen(want);
   if (!wn) return false;
   String given = http.hasHeader("X-Hear-Auth") ? http.header("X-Hear-Auth")
@@ -1774,6 +1774,21 @@ static bool hear_auth_ok() {
     diff |= (uint32_t)(uint8_t)(a ^ b);
   }
   return diff == 0;
+#endif
+}
+static bool hear_ota_auth_ok() {
+#if !HEAR_REQUIRE_ADMIN_AUTH
+  return true;
+#else
+  if (!admin_token_runtime()[0]) return true;
+  return hear_auth_ok();
+#endif
+}
+static bool hear_ota_recovery_open() {
+#if !HEAR_REQUIRE_ADMIN_AUTH
+  return false;
+#else
+  return !admin_token_runtime()[0];
 #endif
 }
 static void hear_auth_reject() {
@@ -3292,7 +3307,7 @@ static String status_json() {
     "\"prov\":{\"src\":\"%s\",\"nets\":%d,\"nvs\":%s,\"loaded\":%s},"
     "\"auth\":{\"push\":{\"configured\":%s,\"src\":\"%s\",\"last_code\":%d,"
       "\"last_attempt_s\":%lu,\"last_ok_s\":%lu},"
-      "\"admin\":{\"configured\":%s,\"src\":\"%s\"}},"
+      "\"admin\":{\"configured\":%s,\"src\":\"%s\",\"ota_recovery_open\":%s}},"
     "\"selftest\":{\"mic\":\"%s\",\"mic_state\":\"%s\",\"mic_reason\":\"%s\","
       "\"mic_stats\":{\"samples\":%lu,\"lo\":%d,\"hi\":%d,\"span\":%lu,\"mean\":%ld,"
         "\"mean_abs\":%lu,\"zero_cross_pct\":%lu,\"same_adj_pct\":%lu,\"unique\":%lu,"
@@ -3382,6 +3397,7 @@ static String status_json() {
     (unsigned long)push_last_attempt_s, (unsigned long)push_last_ok_s,
     admin_token_runtime()[0] ? "true" : "false",
     runtime_secret_src(prov.admin_token, HEAR_ADMIN_TOKEN),
+    hear_ota_recovery_open() ? "true" : "false",
     selftest_mic, selftest_mic_diag.state_name, selftest_mic_diag.reason,
     (unsigned long)selftest_mic_diag.samples, (int)selftest_mic_diag.lo, (int)selftest_mic_diag.hi,
     (unsigned long)selftest_mic_diag.span, (long)selftest_mic_diag.mean,
@@ -4194,7 +4210,7 @@ void setup() {
       if (u.status == UPLOAD_FILE_START) {
         // Checked once, before Update.begin() -- an unauthorized upload must not write a single
         // byte of flash, not merely be refused after the fact by the completion handler above.
-        ota_authorized = hear_auth_ok();
+        ota_authorized = hear_ota_auth_ok();
         if (!ota_authorized) { snprintf(ota_msg, sizeof ota_msg, "unauthorized"); return; }
         snprintf(ota_msg, sizeof ota_msg, "receiving %s", u.filename.c_str());
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
