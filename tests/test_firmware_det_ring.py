@@ -250,14 +250,35 @@ def test_no_detection_ring_sits_in_internal_ram():
 
 
 def test_the_ring_comes_from_psram_after_the_raw_ring_and_leaves_the_same_reserve():
+    """⚠️ONE NAMED RESERVE, AND THE RAW RING NOW ALSO STANDS OFF THIS RING.
+
+    Both allocations still keep PSRAM_KEEP_B back for WiFi and the web server, and the detection
+    ring is still taken after the raw ring so a short PSRAM part costs audio span rather than
+    detections. What changed with the small-PSRAM tiers is that the raw ring's stand-off is no
+    longer only PSRAM_KEEP_B: a tier below PRAW_DET_RESERVE_BELOW_S also holds DET_RING_MIN slots
+    back, because on a part small enough to reach those tiers `praw` would otherwise take the
+    PSRAM this ring needs and push it onto MALLOC_CAP_INTERNAL -- the internal-heap load that
+    drove gold to heap_min 108 B. The reserve is still ONE named quantity in both places; the
+    small tiers add a second named one on top of it, never a literal.
+    """
     setup = _fn("setup")
     m = re.search(r"heap_caps_calloc\(\w+\[k\],\s*sizeof\(Det\),\s*MALLOC_CAP_SPIRAM\)", setup)
     assert m, "the detection ring is not allocated from PSRAM"
     assert setup.index("ps_malloc(") < m.start(), "the ring must not take PSRAM ahead of the raw ring"
     guards = re.findall(
         r"heap_caps_get_largest_free_block\(MALLOC_CAP_SPIRAM\)\s*<\s*want\s*\+\s*(\w+)", setup)
-    assert len(guards) == 2 and len(set(guards)) == 1, guards
-    assert not guards[0].isdigit(), "both allocations must keep ONE named reserve"
+    assert guards == ["PSRAM_KEEP_B"], guards      # the detection ring's own guard, unchanged
+
+    keep = re.search(r"size_t keep = (\w+) \+\s*\(PRAW_TIERS_S\[k\] < (\w+) \? (\w+) : 0\);", setup)
+    assert keep, "the raw ring no longer composes its stand-off from named reserves"
+    assert keep.group(1) == "PSRAM_KEEP_B", keep.group(1)
+    assert keep.group(2) == "PRAW_DET_RESERVE_BELOW_S", keep.group(2)
+    assert keep.group(3) == "PRAW_DET_RESERVE_B", keep.group(3)
+    assert re.search(r"\bneed = want \+ keep;", setup), "the raw ring must test want + keep"
+    assert re.search(r"if \(largest < need\) continue;", setup)
+    reserve = re.search(r"PRAW_DET_RESERVE_B = \(size_t\)(\w+) \* sizeof\(Det\)", CODE)
+    assert reserve and reserve.group(1) == "DET_RING_MIN", \
+        "the raw ring must reserve a whole DET_RING_MIN, the smallest ring this file will take"
 
 
 def test_every_psram_step_holds_the_burst_and_survives_the_counter_wrap():

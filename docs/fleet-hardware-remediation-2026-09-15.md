@@ -129,7 +129,8 @@ curl -s http://172.16.100.82/audio          # must report ring:true, addressable
 | `node` | `"gold"` | gold |
 | `fw` | the version just built/installed, `prov.src` unchanged | v0.1.4-123 |
 | `psram` / `sys.psram_min` | **> 0** | 0 / 0 |
-| `raw.span_s` | **> 0 and stable** (2 MB quad is a much shorter ring than ageev's 80 s; take whatever the boot log reports as the baseline rather than assuming a number — `docs/REDESIGN-LESSONS.md` item 12 says "~15 s on Gold/Kasami", but kasami measurably holds 80 s today, so that figure is not a specification) | 0 |
+| `raw.span_s` / `raw.want_s` | **> 0 and stable.** 2 MB quad is a much shorter ring than ageev's 80 s: an image carrying `PRAW_TIERS_S` continues below 30 s to 20/15/10 (`firmware/hear_node/README.md`), so the expected landing is **10 s or 15 s** — `raw.want_s` names the tier exactly. Take whatever the boot log reports as the baseline rather than assuming a number; `docs/REDESIGN-LESSONS.md` item 12 says "~15 s on Gold/Kasami", but kasami measurably holds 80 s today, so that figure is not a specification. An image WITHOUT the small tiers gives 0 here on this part no matter how healthy it is. | 0 |
+| `sys.psram_total` | **2 097 152** (2 MiB) once the quad image answers; it is the field that makes a short ring readable as silicon rather than as a fault | absent (pre-change image) |
 | `sys.heap_min` | **> 20 000 B** after ≥ 1 h uptime | 108 |
 | `sys.loop_max_ms` | **< 1000** after ≥ 1 h uptime | 5117 |
 | boot log | `psram <n> kB, quad bus (as built)`, and **no** `psram FAULT` | FAULT expected today |

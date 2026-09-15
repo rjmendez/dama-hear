@@ -452,8 +452,11 @@ would be a clean ÷4 and needs 4.096 MHz, which the mic does not support. 48 kHz
 inside a documented mode.
 
 **The ring and the clip budget, at 48 kHz.** The PSRAM raw ring asks for 80 s (7.68 MB) and steps
-down to 60/45/30 s if PSRAM is short; firmware before
+down to 60/45/30 s if PSRAM is short, then 20/15/10 s on a part too small for any of those (a 2 MiB
+quad board such as `gold`: 30 s alone is 2.88 MB); firmware before
 this change stepped straight to 60 s, which is what all three nodes report (`raw.span_s: 60.0`).
+The tiers below 30 s are only reachable where every tier above already failed, so no node that
+holds a ring today can lose span to them — `raw.want_s` in `/status` says which tier landed.
 A clip is 480,044 B and the on-node SD cache tracks 128 clip names (61.5 MiB of WAVs).
 
 **Nyquist is 24 kHz, and nothing above 10 kHz is characterised.** The datasheet's frequency
