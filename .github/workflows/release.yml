@@ -22,6 +22,15 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # ⚠️THE ONLY TWO PERMISSIONS THE SIGNATURE NEEDS, AND NEITHER IS A SECRET. `id-token: write`
+      # lets the job mint a short-lived GitHub OIDC token, which Sigstore exchanges for a
+      # certificate bound to this repository, this workflow file and this commit;
+      # `attestations: write` records the result. There is no signing key in `secrets`, nothing to
+      # rotate and nothing an operator can leak -- which is the only reason this repository can
+      # sign releases at all. A fork's pull request cannot reach either: this workflow runs on tag
+      # pushes only.
+      id-token: write
+      attestations: write
     env:
       TAG: ${{ github.ref_name }}
       GH_TOKEN: ${{ github.token }}
@@ -111,6 +120,9 @@ jobs:
               "credentials": "none compiled in; read from the node's NVS (enroll.py)",
           }, open("dist/build-info.json", "w"), indent=2)
           PY
+          python3 firmware/hear_node/release_sbom.py generate \
+            --dist dist \
+            --build-info dist/build-info.json
           python3 firmware/hear_node/release_manifest.py generate \
             --dist dist \
             --build-info dist/build-info.json
@@ -118,7 +130,7 @@ jobs:
             --dist dist \
             --tag "$TAG" \
             --source-root .
-          (cd dist && sha256sum * > SHA256SUMS)
+          python3 firmware/hear_node/release_sbom.py verify --dist dist --tag "$TAG"
           cat > notes.md <<EOF
           Firmware for \`firmware/hear_node\` at \`$GITHUB_SHA\`. \`/status\` reports it as \`fw: $TAG\`.
 
@@ -144,12 +156,48 @@ jobs:
           | \`build-info.json\` | toolchain and flags |
           | \`release-manifest.json\` | immutable offline-verifiable release manifest |
           | \`release-manifest.schema.json\` | manifest JSON schema |
+          | \`release-sbom.cdx.json\` | CycloneDX 1.6 SBOM: binaries, source closure, vendored libraries, toolchain pins |
+          | \`release-provenance.intoto.jsonl\` | Sigstore bundle: SLSA provenance attestation over every file above |
           | \`SHA256SUMS\` | checksums of all of the above |
 
-          Verify a downloaded release offline:
+          **Provenance.** Every asset in this release is covered by a SLSA v1 provenance attestation, signed by this repository's \`release.yml\` through GitHub OIDC (keyless Sigstore -- no signing key exists to leak). The bundle is published here, so verification needs no GitHub credential:
 
-              python3 firmware/hear_node/release_manifest.py verify --dist dist --tag $TAG
+              gh attestation verify hear_node-<variant>-$TAG.bin \\
+                --repo $GITHUB_REPOSITORY \\
+                --signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml \\
+                --bundle release-provenance.intoto.jsonl
+
+          **SBOM.** \`release-sbom.cdx.json\` (CycloneDX 1.6) lists the published binaries, the source files they were built from, the vendored \`firmware/lib\` libraries and the pinned toolchain (arduino-cli, esp32 core), all by SHA-256. It is derived from the same tree the manifest is, and its own hash is recorded in the manifest. It does **not** enumerate the contents of the esp32 board package: that is pinned by version, not built here.
+
+          Verify a downloaded release offline (hashes, manifest, SBOM, and that the attestation covers every asset):
+
+              python3 firmware/hear_node/release_manifest.py verify --dist dist --tag $TAG --attestation
+
+          The offline check does not check the signature -- \`gh attestation verify\` above does.
           EOF
+
+      # ⚠️SIGNED AFTER THE MANIFEST AND THE SBOM EXIST, AND OVER ALL OF THEM. The subject set is
+      # every file that will be published, so the signature covers the images, the manifest that
+      # describes them, the SBOM and build-info.json together -- an attacker cannot swap one of
+      # them for a matching set from another build. Keyless: the identity is this workflow at this
+      # tag, minted from the job's OIDC token. No secret is read, written or printed.
+      - name: sign the release with a SLSA provenance attestation
+        id: attest
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
+      # The bundle becomes a release asset so an operator can verify a download without a GitHub
+      # credential (`gh attestation verify --bundle`). SHA256SUMS is written last, after the
+      # bundle is in place, so it covers every published file. The manifest deliberately does not
+      # hash the bundle -- the bundle's subjects include the manifest.
+      - name: publish the attestation bundle with the release
+        run: |
+          cp "${{ steps.attest.outputs.bundle-path }}" "dist/release-provenance.intoto.jsonl"
+          python3 firmware/hear_node/release_manifest.py verify \
+            --dist dist --tag "$TAG" --attestation
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls -l dist
 
       - name: publish
         run: gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes-file notes.md

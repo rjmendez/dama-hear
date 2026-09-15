@@ -140,13 +140,17 @@ passing on incomplete coverage.
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the `hear_node` images
 for each supported board class, their `.elf`, `build-info.json`, `release-manifest.json`,
-`release-manifest.schema.json` and `SHA256SUMS` as a GitHub release. This repo is public, so the
+`release-manifest.schema.json`, a CycloneDX SBOM (`release-sbom.cdx.json`), a keyless SLSA
+provenance attestation (`release-provenance.intoto.jsonl`) and `SHA256SUMS` as a GitHub release. This repo is public, so the
 images carry no Wi-Fi credentials and no node name. Each node keeps its own in NVS, written once
 over USB by `firmware/hear_node/enroll.py`, and
 `firmware/hear_node/flash.py <node> <ip> --release <tag>` refuses unless it can match the node's
 live `/status class` to the right release asset. Downloaded release directories can be checked
-offline with `python3 firmware/hear_node/release_manifest.py verify --dist <dir> --tag <tag>`.
-See `firmware/hear_node/README.md`.
+offline with `python3 firmware/hear_node/release_manifest.py verify --dist <dir> --tag <tag>
+--attestation`, and the signature with `gh attestation verify ... --bundle
+release-provenance.intoto.jsonl` (no GitHub credential needed; there is no signing key -- the
+release job signs through its own OIDC identity). See `firmware/hear_node/README.md` and
+`docs/release-provenance.md`.
 
 ## Licence
 

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "type": "dama-hear-hear_node-release-revocations",
+  "why_this_file_exists": [
+    "A published GitHub release cannot be recalled: mirrors, caches and an operator's .otabuild",
+    "copy outlive any deletion, and deleting the release also deletes the manifest that would",
+    "have explained why. So a revocation is recorded HERE, in the repository the installers run",
+    "from, and flash.py/enroll.py refuse a revoked tag before downloading anything.",
+    "An entry must name the tag, the date, the reason, and the release that supersedes it.",
+    "Pull before a rollout: an operator on a stale checkout gets the stale answer.",
+    "See docs/release-provenance.md."
+  ],
+  "revoked": []
+}

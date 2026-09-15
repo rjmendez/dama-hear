@@ -33,9 +33,28 @@ release asset whose name includes that class (`hear_node-xiao-s3-pps-<tag>.bin` 
 Every tagged release also ships `release-manifest.json` and `release-manifest.schema.json`. They
 bind the release to the source commit, dirty state, board/capture profile, build inputs, generated
 headers and every published artefact hash, and `flash.py` / `enroll.py` verify them when present.
+
+It also ships `release-sbom.cdx.json` (CycloneDX 1.6: the binaries, the source closure, the
+vendored `firmware/lib` libraries and the pinned toolchain) whose hash the manifest records, and
+`release-provenance.intoto.jsonl`, a SLSA v1 provenance attestation over every published file,
+signed keyless through the release workflow's GitHub OIDC identity. No signing key exists and the
+bundle is a published asset, so verifying needs no GitHub credential.
+
 To check a downloaded release directory offline before you touch a node:
 
-    python3 firmware/hear_node/release_manifest.py verify --dist dist --tag <tag>
+    python3 firmware/hear_node/release_manifest.py verify --dist dist --tag <tag> --attestation
+
+That checks hashes, the SBOM and the attestation's subject coverage, but NOT the signature. For
+the signature:
+
+    gh attestation verify hear_node-<variant>-<tag>.bin --repo rjmendez/dama-hear \
+      --signer-workflow rjmendez/dama-hear/.github/workflows/release.yml \
+      --bundle release-provenance.intoto.jsonl
+
+`flash.py --release --verify-signature` runs that check for you as part of the install, and
+refuses the flash if it fails. Without the flag the installer prints `signature NOT checked`
+rather than implying otherwise. A release listed in `release_revocations.json` is refused before
+anything is downloaded -- see `docs/release-provenance.md` for the revocation procedure.
 
 They also record what the image IS: `image_class: unprovisioned`, no compiled-in credentials, and
 the four things (`node_id`, `wifi`, `admin_token`, `push_token`) the node must already hold in NVS.
