@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 348768 B serialised; 349033 B of annotations against a 262144 B cap.
+# apply-mode server: 348815 B serialised; 349080 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: '4379a58'
-    dama-hear/source-sha256: '9ee9bc8a0c473b4c1798f149d665f740b058f6ffef8a74e7f8ad5b4c9874cc7d'
+    dama-hear/commit: 'e05b98c'
+    dama-hear/source-sha256: '614cec856e9ed4705378551f3b021face67e261676abfcd4d8c97f5798256c68'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '348768'
+    dama-hear/serialised-bytes: '348815'
 data:
   hear__init__.py: |
     
@@ -5296,6 +5296,12 @@ data:
                                "clips_unknown": True,
                                "clips_reason": "the run ended before the clip lane ran",
                                "prune": None}
+        if clip_max_per_node <= 0:
+            try:
+                out["prune"] = CL.prune(pl.root, clip_store_max_bytes, stamp)
+            except Exception as e:
+                out["errors"].append("clips prune: %r" % (e,))
+                out["clips_reason"] = "privacy-mode pruning failed: %r" % (e,)
         try:
             st = fetch_status(ip, timeout)
         except Exception as e:
@@ -5501,11 +5507,6 @@ data:
         # clips/<day>/<node>/.
         if clip_max_per_node <= 0:
             out["clips_reason"] = "the clip lane is disabled (--clip-max-per-node 0)"
-            try:
-                out["prune"] = CL.prune(pl.root, clip_store_max_bytes, stamp)
-            except Exception as e:
-                out["errors"].append("clips prune: %r" % (e,))
-                out["clips_reason"] += "; pruning failed: %r" % (e,)
         elif DETS_FILES[0] in dets_failed:
             # No live dets file means no discoverable names. That is an UNMEASURED run for the clip
             # lane, not a clean one: the clips are still on the card and nothing here looked.
