@@ -19,6 +19,13 @@ def test_it_declares_one_pvc_and_one_deployment():
     assert [d["kind"] for d in _docs()] == ["PersistentVolumeClaim", "Deployment"]
 
 
+def test_it_rolls_out_with_recreate_so_only_one_writer_exists():
+    dep = _doc("Deployment")
+    assert dep["spec"]["replicas"] == 1
+    assert dep["spec"]["strategy"] == {"type": "Recreate"}
+    assert "rollingUpdate" not in dep["spec"]["strategy"]
+
+
 def test_the_bridge_runs_the_expected_entrypoint_and_mounts_code_and_state():
     dep = _doc("Deployment")
     spec = dep["spec"]["template"]["spec"]
