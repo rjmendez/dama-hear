@@ -40,14 +40,12 @@ spec:
   # only for scene.csv, every run reporting `ok` over a 3.27 h hole -- is fixed in the drain, not
   # in this file: tools/hear_drain.py now DISCOVERS the names from /ls. See
   # docs/acoustic-stack.md section 0.1.
-  # THE CLIP LANE. `--clip-max-per-node 13` is the card's own rolling window (6291456 // 480044),
-  # so a backlog is bounded at 13 per node however long this was down -- the difference from
-  # scene.csv, which grows without bound.
-  #
-  # Raising CLIP_BUDGET_B changes how long a clip stays on the card, not whether the drain fetches
-  # it: the card is a rolling window either way.
-  # Raise the node budget and this cap in the SAME change, and only after >= 7 days of
-  # `clips_deferred_by_cap == 0` read off the heartbeat ring rather than off one run.
+  # THE CLIP LANE. Clips are 480,044 B. The observed burst is 350-370 clips/hour, so a
+  # 15-minute interval creates 88-93 clips/node. The firmware clip cache is 128 clips (61.5 MiB),
+  # a 20.8-minute wall window at 370/hour; this job may fetch 96/run, which is 384/hour. That
+  # closes the measured 7x mismatch as long as the clip transfer path stays at the measured
+  # ~168 KB/s. It does NOT promise the 40 KB/s contended floor can keep everything: at that floor
+  # the 270 s deadline fetches only ~22 clips/run (~89/hour) and `clips_deferred_by_cap` pages.
   #
   # Every 15 minutes. The nodes roll dets.csv to dets-prev.csv on reflash, so the window a
   # missed run can lose is bounded well under one boot; the fetch is tens of KB.
@@ -63,7 +61,7 @@ spec:
       # 30-minute one. Simulated against the measured write rate: 15 min loses 0 clips, 30 min
       # loses 0, 45 min loses 3 of nyquist's 321. The margin is exactly two missed runs, and the
       # clip lane below is what spends part of it, so the bound goes in WITH it.
-      activeDeadlineSeconds: 780
+      activeDeadlineSeconds: 840
       backoffLimit: 2
       template:
         metadata:
@@ -95,8 +93,8 @@ spec:
                     --node gold=172.16.100.82 \
                     --node kasami=172.16.100.90 \
                     --node ageev=172.16.100.83 \
-                    --clip-max-per-node 13 \
-                    --clip-deadline-s 120
+                    --clip-max-per-node 96 \
+                    --clip-deadline-s 270
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py,  subPath: hear__init__.py }
                 - { name: code, mountPath: /app/hear/wire.py,      subPath: hear_wire.py }

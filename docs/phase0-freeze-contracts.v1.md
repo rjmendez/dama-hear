@@ -14,13 +14,13 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | 3714b465d6b6ee0e0b8b8651ea4195b06e1f09ba26206e449e535370703b1ffa |
+| baseline | 1f96d28e9d3e2cf89b19b894621cc82e4b6d119112615d2bee8f0c6f66566ad2 |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
-| firmware_build_metadata | 8882c57e9c5f8042be883e4149d324c2a82d0d13c94472a8caa55bf09de5d14d |
+| firmware_build_metadata | b39faa85108f494d66c2f81ab768d94261fa4ffeed08b1a0bda765c236c9805d |
 | schemas | d154fa286b1f1cb8506ab5c36f0d6291dfeaab5f096512b7635d9582f833b5e1 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |
 | redis_keys | d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03 |
-| kubernetes_and_pvc_layout | b790bb9bc8c95389b5028097ee2d1d35b2af012ee512c7ca17e254b5a8eeba9f |
+| kubernetes_and_pvc_layout | bdb533d240b5d6e94791a9d2bd8c34f68ab035d67917073f151e572767f2d3df |
 | corpus_fixture_metadata | 5a27ffc150822a94847095b765d20e4f0299ec4d9e58f2ea1af05d6ecf470d77 |
 
 ## Compatibility
@@ -139,7 +139,7 @@ Manifest hashes:
 | --- | --- | --- |
 | deploy/k8s/hear-annotate.yaml | 27683 | 626e06637419460bc35de39328e1a75e072946d0c192a12ce9f1c8ea079a4061 |
 | deploy/k8s/hear-birdnet.yaml | 7474 | 9a4265e78c5c03e10a563b1a178582492e3f0aeef0c47f630f56fe23c06c6aa5 |
-| deploy/k8s/hear-drain.yaml | 13587 | 2e23e8c35af37b0830d73ff36135be4ad59721e655966401dc30229a53adee78 |
+| deploy/k8s/hear-drain.yaml | 13594 | 38e02f09e8b124e5d321a7c51a97e93b898b03e27de6d19a0d38fb9b00cedf4e |
 | deploy/k8s/hear-embed.yaml | 9190 | 1f3e86e8d5d1f57f4bc5d8d4ca6adb958671f5a65c7db7b21e47225916d465ad |
 | deploy/k8s/hear-heartbeat.yaml | 3663 | 2fe073497c87d1b0de637a5adba377f84cf1b18cf6a3cb2d0c47bec4016dd3e8 |
 | deploy/k8s/hear-mqtt-bridge.yaml | 4352 | 3134036c192d570bdae35260ccc051f4116a2e843d8b9b0ada129c8921431c3b |

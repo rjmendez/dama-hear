@@ -2437,7 +2437,7 @@ static uint32_t clip_skip_dedupe = 0;
 static uint32_t clip_skip_ring = 0;      // window not in the ring, or no PSRAM ring at all
 static uint32_t clip_nocard = 0;
 static uint32_t clip_fail = 0;           // short write or failed open
-#define CLIP_Q_MAX 64
+#define CLIP_Q_MAX 128
 struct ClipEnt { char nm[64]; clip_key_t k; uint32_t size; };
 static ClipEnt   clip_q[CLIP_Q_MAX];     // the clips on the card, oldest first
 static int       clip_q_n = 0;

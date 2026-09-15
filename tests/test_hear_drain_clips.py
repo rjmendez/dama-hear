@@ -11,6 +11,7 @@ is a correctness property here and not a performance one.
 """
 import binascii
 import json
+import math
 import os
 import struct
 import sys
@@ -622,9 +623,12 @@ class TestItReachesTheGate:
         assert seen == {"clip_max_per_node": 7, "clip_deadline_s": 5.0,
                         "clip_store_max_bytes": 123}
 
-    def test_the_defaults_are_the_card_ceiling(self):
-        # 6291456 // 480044 = 13: the card's rolling window of clips.
-        assert HD.CLIP_MAX_PER_NODE_DEFAULT == 6291456 // CLIP_BYTES == 13
+    def test_the_defaults_cover_the_measured_burst(self):
+        # 370 clips/hour for 15 minutes is 92.5 clips; the configured budget is the next
+        # operationally round number and must move with the manifest arithmetic guard.
+        assert HD.CLIP_MAX_PER_NODE_DEFAULT == 96
+        assert HD.CLIP_MAX_PER_NODE_DEFAULT >= math.ceil(370 * 900 / 3600)
+        assert HD.CLIP_DEADLINE_S_DEFAULT == 270.0
         assert HD.DEFAULT_MAX_CLIPS_DEFERRED == 0, "deferral is a design invariant, not a range"
         assert HD.DEFAULT_MAX_CLIPS_LOST == -1, (
             "666 clips are already destroyed and still named in current dets.csv files; a gate "
@@ -669,8 +673,8 @@ class TestPruneRunsBeforeTheFetch:
 # ---------------------------------------------------------------- the ledger is never behind
 
 class TestTheIndexIsNeverBehindTheBytes:
-    """⚠️`activeDeadlineSeconds: 780` makes the kill a DESIGNED event: a run already takes
-    218-307 s plus 3 x (120 s clip deadline + a 30 s final fetch). Pre-change `drain_clips`
+    """⚠️`activeDeadlineSeconds` makes the kill a DESIGNED event: a run already takes
+    218-307 s plus the bounded clip lane. Pre-change `drain_clips`
     buffered every index row and appended once after the whole loop, so a kill between
     `os.replace` and that append kept the audio and lost the ledger -- and the next run's 404 then
     wrote the terminal `evicted_before_fetch` over clips whose bytes were on the PVC."""

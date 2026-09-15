@@ -56,16 +56,17 @@ Measured on the live fleet 2026-09-09:
 | rankine | 249 | ~200 |
 | **fleet** | **625** | **~478** |
 
-Each node writes a 5.0 s, 48 kHz, 16-bit mono WAV (480,044 B) into `/clips` under a 6,291,456 B
-budget (`CLIP_BUDGET_B`): a rolling window of 13 clips, where the next one evicts the oldest. The
+Each node writes a 5.0 s, 48 kHz, 16-bit mono WAV (480,044 B) into `/clips`. The SD card is a
+rolling cache: the firmware keeps the newest 128 clip names in its FIFO (61.5 MiB of WAVs), and
+PR #183 prunes oldest cache objects across clips/scene/dets/health to preserve card headroom. The
 drain fetches each clip before it rolls off; eviction is the design, not a loss.
 
 Two things kept them there. The `/ls` handler hardcoded `SD.open("/")` and ignored every argument,
 so it listed root only and clip names — which embed a boot id and a millis counter — were
 undiscoverable. And `tools/hear_drain.py` contained zero mentions of clips.
 
-⚠️**A bigger `CLIP_BUDGET_B` would not have saved one clip.** Without collection it changes *which*
-478 are destroyed and how long each survives before being destroyed anyway. See §7.
+⚠️**A bigger node cache alone would not have saved one clip.** Without collection it changes
+*which* 478 are destroyed and how long each survives before being destroyed anyway. See §7.
 
 ---
 
@@ -123,8 +124,8 @@ a real timestamped event.
 ## 4. Running the drain
 
 ```
---clip-max-per-node   49            0 disables the clip lane entirely
---clip-deadline-s     120
+--clip-max-per-node   96            covers 370 clips/hour on a 15-minute schedule
+--clip-deadline-s     270
 --clip-store-max-b    2147483648    2 GiB audio cap
 --max-clips-deferred  0             --check fails above this over the window
 --max-clips-lost      -1            report, never fail
@@ -134,9 +135,9 @@ a real timestamped event.
 dets.csv files. A gate armed today would fire on that backlog and be muted on day one, which is
 worse than no gate. Set it deliberately after 7 days of measured distribution.
 
-The CronJob carries `activeDeadlineSeconds: 780`. Runs already take 218–307 s of the 900 s interval
-under `concurrencyPolicy: Forbid`, so an overrun silently *skips* the next tick; the margin is
-exactly two missed runs and the clip lane spends part of it.
+The CronJob carries `activeDeadlineSeconds: 840`. Runs already take 218–307 s of the 900 s interval
+under `concurrencyPolicy: Forbid`, so an overrun silently *skips* the next tick; the deadline keeps
+that failure bounded and visible before the next 15-minute slot.
 
 ⚠️`deploy/k8s/hear-drain.yaml` is applied **whole** and must be a superset of the live object.
 `--phone-corpus /pool/sketch_corpus` was added to the live CronJob by hand once already. Check
@@ -194,9 +195,9 @@ The fleet flashed before FIFO eviction writes a `%02u-` priority prefix and evic
 `..`-rejecting, 404 on a non-directory, capped at `LS_MAX_ENTRIES 256` with an explicit
 `! truncated at <n> entries` marker. **It compiles and stops there. No node has been flashed.**
 
-The cap is not sized to 49: a card that ran the priority-eviction firmware can hold ~155 older clips
-(~19 MiB free), and `clip_rescan()` reads `CLIP_DIR` in one pass of at most `LS_MAX_ENTRIES` at boot
-before evicting down to the budget.
+The cache is now sized to the measured burst rather than the old priority-eviction budget:
+`clip_rescan()` reads `CLIP_DIR` in one pass of at most `LS_MAX_ENTRIES` at boot before evicting
+down to the firmware FIFO depth.
 
 `dir` is deliberately **not** restricted to `/clips`. `/sd?file=` already opens any absolute path
 with no authentication, as do `/reboot`, `/update` and `/log`. Filename-guessing was accidental
@@ -327,15 +328,15 @@ Never a silent match. A 64000-sample clip spans `64000/16384 = 3.906` scene rows
 
 ## 7. ⚠️THE ORDERING CONSTRAINT
 
-**Draining must precede any budget increase.** The node is not the archive; the pool is. Until
+**Draining must precede any cache increase.** The node is not the archive; the pool is. Until
 something collects, every byte of budget is a byte of delay before the same loss — and a larger
-`CLIP_BUDGET_B` also consumes SD space.
+clip cache also consumes SD space.
 
 1. Land collection. Clips flow into `clips/index.jsonl`.
 2. Observe **≥ 7 days** of `clips_deferred_by_cap == 0` and `clips_cap_hit == false` across all three
    nodes, read off the heartbeat ring, **not** off a single run.
-3. Only then raise `CLIP_BUDGET_B` — and raise `--clip-max-per-node` **in the same change**. The cap
-   and the budget are one number in two places.
+3. Only then raise the firmware clip cache depth — and raise `--clip-max-per-node` **in the same
+   change**. The cap and the cache depth are one number in two places.
 4. Any reflash **re-opens the residency measurement**. The checkout's eviction is priority-first with
    a refuse-if-not-better gate, not the FIFO the live fleet runs, so high-priority clips will live
    much longer and low-priority ones much shorter than the measured FIFO median. The 45-minute
@@ -343,14 +344,12 @@ something collects, every byte of budget is a byte of delay before the same loss
 
 ### The budget arithmetic
 
-A backlog is **bounded at 49 per node** however long the drain was down — the crucial difference
-from scene.csv, which grows without bound. 3 × 49 = 147 clips = 18.8 MB: 112 s at the measured
-168 KB/s, 164 s at 115 KB/s, and **470 s** at the 40 KB/s contended floor. 307 + 470 = 777 s of a
-900 s interval is too tight, which is what `--clip-deadline-s 120` is for. That deadline buys 176
-clips at 168 KB/s, 108 at 115 KB/s and **37 at 40 KB/s** — and nyquist's worst measured 15-minute
-burst was **43 clips**, so on a slow link during a burst the deadline binds *below* the burst. That
-is precisely why `clips_cap_hit` and `clips_deferred_by_cap` must reach the gate: a cap that binds
-silently while the run reports success is the failure this codebase exists to prevent.
+A backlog is **bounded at 128 per SD-bearing node** by the firmware FIFO — the crucial difference
+from scene.csv, which grows without bound. At the measured 370 clips/hour burst, 128 clips last
+20.8 minutes and one 15-minute interval produces 93 clips. The drain fetches 96/run (384/hour) and
+has a 270 s per-node clip deadline: 93 clips need ~165 KB/s, just under the measured 168 KB/s clip
+path. At the 40 KB/s contended floor the same deadline fetches only ~22 clips/run (~89/hour), so
+that condition still drops clips and is reported by `clips_cap_hit`/`clips_deferred_by_cap`.
 
 Steady state is 46.2 clips/h fleet-wide = 1,109/day = 142 MB/day, so the 2 GiB audio cap is about
 14 days of rolling audio. Tags plus embeddings are ~5 KB/clip = ~5.5 MB/day, kept indefinitely.
@@ -455,7 +454,7 @@ inside a documented mode.
 **The ring and the clip budget, at 48 kHz.** The PSRAM raw ring asks for 80 s (7.68 MB) and steps
 down to 60/45/30 s if PSRAM is short; firmware before
 this change stepped straight to 60 s, which is what all three nodes report (`raw.span_s: 60.0`).
-A clip is 480,044 B and the on-node budget is a rolling window of 13.
+A clip is 480,044 B and the on-node SD cache tracks 128 clip names (61.5 MiB of WAVs).
 
 **Nyquist is 24 kHz, and nothing above 10 kHz is characterised.** The datasheet's frequency
 response plot ends at 10 kHz; SNR is quoted over a 20 kHz bandwidth. Response above that is

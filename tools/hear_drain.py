@@ -27,7 +27,7 @@ files themselves, because its header sniff reads a `RIFF` body as an ABSENT file
 is strictly sequential, capped per run, and indexed by name in `clips/index.jsonl` so a clip is
 never asked for twice and a destroyed one is never re-probed. Every refusal is counted by reason.
 See `drain_clips` and docs/acoustic-stack.md section 0.3, which states the ordering constraint:
-draining must precede any increase of the node's CLIP_BUDGET_B.
+the drain's per-run budget must move with the node's clip cache depth.
 
 ⚠️IDENTITY IS CHECKED, NOT ASSUMED. A node is named by `--node <name>=<ip>`, and `/status` is
 read back before anything it served is ingested. DHCP moves; two nodes swapping leases would
@@ -271,14 +271,14 @@ RING_WALL_SPAN_SELF_TEST_S = 0.003
 
 # ---------------------------------------------------------------- clip lane budget
 #
-# The card holds a rolling window of clips: 6291456 // 480044 = 13. A backlog is therefore bounded
-# at 13 per node however long the drain was down -- the difference from scene.csv -- and a clip
-# that rolls off before it is fetched is the design working, not a loss.
-CLIP_MAX_PER_NODE_DEFAULT = 13
-# 3 x 13 clips is 18.7 MB: 112 s at the measured 168 KB/s, 470 s at the 40 KB/s contended floor.
-# 307 + 470 = 777 s of a 900 s interval is too tight, so the per-node deadline binds instead of
-# the schedule; at 40 KB/s it buys about 10 clips. `clips_cap_hit` reaches the heartbeat ring.
-CLIP_DEADLINE_S_DEFAULT = 120.0
+# PR #183 made the SD card an intentional rolling cache instead of a fixed 6 MiB clip island, and
+# this firmware keeps 128 clip names in its on-card FIFO. The drain fetches enough per 15-minute
+# run to cover a measured 370 clip/hour burst: ceil(370 * 900 / 3600) = 93, rounded to 96.
+CLIP_MAX_PER_NODE_DEFAULT = 96
+# 96 clips is 46.1 MB. A 270 s clip lane needs ~171 KB/s to fetch all 96, or ~165 KB/s for the
+# 93 clips a 370/hour burst produces in 15 minutes. That is inside the measured 168 KB/s clip
+# path but above the 40 KB/s contended floor; at the floor the lane honestly caps near 90/hour.
+CLIP_DEADLINE_S_DEFAULT = 270.0
 # 142 MB/day fleet-wide; 2 GiB is ~14 days of rolling audio on a PVC shared with scene/ and raw/.
 CLIP_STORE_MAX_BYTES_DEFAULT = 2 * 1024 ** 3
 # A floor the clip lane will not eat into, whatever the audio cap says. The PVC also carries the
@@ -1376,7 +1376,7 @@ def drain_clips(pl: "P.Pool", node: str, ip: str, candidates: List[Dict[str, Any
     # bytes durable immediately; buffering the ledger meant a pod killed between the two kept the
     # audio and lost the row, and the NEXT run's 404 then wrote `evicted_before_fetch` -- which is
     # terminal -- over clips whose bytes were sitting on the PVC. `activeDeadlineSeconds: 780`
-    # against a 218-307 s run plus 3 x (120 s clip deadline + a 30 s final fetch) makes that kill
+    # against a 218-307 s run plus the bounded clip lane makes that kill
     # a designed event. append_index opens and closes per call; 49 appends per node is nothing.
     def emit(**kw) -> None:
         CL.append_index(pl.root, (CL.index_row(node=node, fetched_at=now, **kw),))
@@ -2619,9 +2619,9 @@ def main(argv=None) -> int:
                          "many seconds. Must cover every drain since the previous check ran or "
                          "the measurements in between are never looked at")
     ap.add_argument("--clip-max-per-node", type=int, default=CLIP_MAX_PER_NODE_DEFAULT,
-                    help="most clips to fetch from one node in one run. The card physically "
-                         "holds 6291456 // 480044 = 13, so a backlog is bounded at 13 however long "
-                         "the drain was down. 0 disables the clip lane entirely")
+                    help="most clips to fetch from one node in one run. The default covers a "
+                         "370 clip/hour burst on a 15-minute schedule when the node firmware's "
+                         "rolling clip cache holds at least 128 clips. 0 disables the clip lane")
     ap.add_argument("--clip-deadline-s", type=float, default=CLIP_DEADLINE_S_DEFAULT,
                     help="stop fetching clips from one node after this much wall clock. The "
                          "remainder is indexed `deferred_by_cap` and retried next run -- the "

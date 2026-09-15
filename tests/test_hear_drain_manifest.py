@@ -16,6 +16,7 @@ Both defects were live on 2026-09-09 and both were silent:
                                  this manifest would have deleted it, and the phone leg would have
                                  gone quiet with nothing reporting the loss.
 """
+import math
 import os
 import re
 import subprocess
@@ -31,6 +32,9 @@ MANIFEST = os.path.join(ROOT, "deploy", "k8s", "hear-drain.yaml")
 #: this same path on this same PVC. It is written here as a literal rather than read from that
 #: repo on purpose -- a test that reaches into a sibling checkout tests that checkout.
 PHONE_CORPUS_PATH = "/pool/sketch_corpus"
+CLIP_BYTES = 480_044
+BURST_CLIPS_PER_H = 370
+MEASURED_CLIP_BPS = 168_000
 
 
 def _containers(text):
@@ -68,6 +72,12 @@ def _script(block):
     """The shell body, de-indented, with the leading `- |` stripped."""
     lines = [l for l in block.splitlines() if l.strip() and not l.strip().startswith("- |")]
     return textwrap.dedent("\n".join(lines))
+
+
+def _arg_value(block, flag):
+    m = re.search(r"%s\s+([0-9.]+)" % re.escape(flag), block)
+    assert m, "%s present but with no value" % flag
+    return float(m.group(1)) if "." in m.group(1) else int(m.group(1))
 
 
 class TestTheCheckJobCanActuallyFail:
@@ -238,7 +248,7 @@ class TestTheClipLaneIsBounded:
             "a run from eating the next tick" % m.group(1))
 
     def test_the_clip_cap_is_declared_rather_than_defaulted(self, blocks):
-        # The cap and the node's CLIP_BUDGET_B are one number in two places; a manifest that
+        # The cap and the node's clip cache depth are coupled; a manifest that
         # leaves it implicit lets them drift without any diff to see.
         assert "--clip-max-per-node" in blocks["drain"], blocks["drain"]
         assert "--clip-deadline-s" in blocks["drain"], blocks["drain"]
@@ -247,3 +257,37 @@ class TestTheClipLaneIsBounded:
         assert "--max-clips-deferred" in blocks["check"], (
             "deferral by cap is a design invariant, so the gate has to see it; without this flag "
             "the cap can bind every run while the check stays green")
+
+
+class TestTheBurstArithmeticIsEncoded:
+    """Measured production was 350-370 clips/hour/node. The manifest must fetch that many before
+    the firmware's rolling SD clip cache evicts them, or the old 80% loss mode returns silently."""
+
+    def test_the_per_run_cap_covers_a_370_clip_per_hour_burst(self, blocks):
+        schedule_s = 15 * 60
+        cap = _arg_value(blocks["drain"], "--clip-max-per-node")
+        burst_per_run = math.ceil(BURST_CLIPS_PER_H * schedule_s / 3600)
+        assert burst_per_run == 93
+        assert cap >= burst_per_run, (
+            "%d clips/run cannot drain a %d clips/hour burst on a 15-minute schedule (%d/run)"
+            % (cap, BURST_CLIPS_PER_H, burst_per_run))
+
+    def test_the_deadline_matches_the_measured_clip_transfer_rate(self, blocks):
+        deadline_s = _arg_value(blocks["drain"], "--clip-deadline-s")
+        burst_per_run = math.ceil(BURST_CLIPS_PER_H * 15 * 60 / 3600)
+        required_bps = burst_per_run * CLIP_BYTES / deadline_s
+        assert required_bps <= MEASURED_CLIP_BPS, (
+            "%.0f B/s is needed to drain %d burst clips in %.0f s; measured clip path is %.0f B/s"
+            % (required_bps, burst_per_run, deadline_s, MEASURED_CLIP_BPS))
+
+    def test_the_firmware_cache_lasts_longer_than_the_schedule(self):
+        ino = os.path.join(ROOT, "firmware", "hear_node", "hear_node.ino")
+        with open(ino) as fh:
+            text = fh.read()
+        m = re.search(r"#define\s+CLIP_Q_MAX\s+(\d+)", text)
+        assert m, "firmware clip cache depth is not declared"
+        held = int(m.group(1))
+        lifetime_s = held * 3600 / BURST_CLIPS_PER_H
+        assert lifetime_s >= 20 * 60, (
+            "%d clips last only %.1f minutes at %d/hour; the 15-minute drain has no miss margin"
+            % (held, lifetime_s / 60, BURST_CLIPS_PER_H))
