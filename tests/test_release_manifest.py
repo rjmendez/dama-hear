@@ -30,11 +30,22 @@ def _build_info():
             {
                 "board_class": "xiao-s3-pps",
                 "release_stem": "hear_node-xiao-s3-pps",
+                "fqbn": board_profiles.FQBN,
+                "psram_mode": "octal",
                 "build_flags": ["-DHEAR_ALLOW_NO_WIFI"],
             },
             {
                 "board_class": "esp32s3-i2s-gps",
                 "release_stem": "hear_node-esp32s3-i2s-gps",
+                "fqbn": board_profiles.FQBN,
+                "psram_mode": "octal",
+                "build_flags": ["-DHEAR_ALLOW_NO_WIFI", "-DHEAR_BOARD_ESP32S3_I2S_GPS"],
+            },
+            {
+                "board_class": "esp32s3-i2s-gps",
+                "release_stem": "hear_node-esp32s3-i2s-gps-qspi",
+                "fqbn": board_profiles.PSRAM_MODES["quad"]["fqbn"],
+                "psram_mode": "quad",
                 "build_flags": ["-DHEAR_ALLOW_NO_WIFI", "-DHEAR_BOARD_ESP32S3_I2S_GPS"],
             },
         ],
@@ -56,10 +67,14 @@ def _source_state(dirty=False):
 def _write_dist(tmp_path):
     dist = tmp_path / "dist"
     dist.mkdir()
-    for board_class in board_profiles.known_board_classes():
+    for board_class, psram_mode in (
+        ("xiao-s3-pps", "octal"),
+        ("esp32s3-i2s-gps", "octal"),
+        ("esp32s3-i2s-gps", "quad"),
+    ):
         for kind in release_manifest.UPLOAD_KINDS:
-            name = board_profiles.release_asset_name(TAG, board_class, kind)
-            (dist / name).write_bytes(("%s:%s\n" % (board_class, kind)).encode("utf-8"))
+            name = board_profiles.release_asset_name(TAG, board_class, kind, psram_mode)
+            (dist / name).write_bytes(("%s:%s:%s\n" % (board_class, psram_mode, kind)).encode("utf-8"))
     build_info = dist / "build-info.json"
     build_info.write_text(json.dumps(_build_info(), indent=2) + "\n", encoding="utf-8")
     return dist, build_info
@@ -133,6 +148,18 @@ def test_downloaded_assets_verify_against_a_well_formed_manifest(monkeypatch, tm
     assert summary["tag"] == TAG
     assert summary["commit"] == COMMIT
     assert summary["verified_assets"] == sorted(names)
+
+
+def test_qspi_assets_verify_only_against_the_quad_variant(monkeypatch, tmp_path):
+    manifest, dist = _generated_manifest(monkeypatch, tmp_path)
+    name = board_profiles.release_asset_name(TAG, "esp32s3-i2s-gps", "app", "quad")
+    data = (dist / name).read_bytes()
+    summary = release_manifest.verify_downloaded_release_assets(
+        json.dumps(manifest), TAG, "esp32s3-i2s-gps", {name: data}, psram_mode="quad")
+    assert summary["psram_mode"] == "quad"
+    with pytest.raises(ValueError, match="does not declare"):
+        release_manifest.verify_downloaded_release_assets(
+            json.dumps(manifest), TAG, "esp32s3-i2s-gps", {name: data}, psram_mode="octal")
 
 
 @pytest.mark.parametrize("section", ["build", "inputs", "variants", "source"])

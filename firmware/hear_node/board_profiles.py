@@ -153,25 +153,26 @@ def build_variant(board_class, node=None):
     return board_class + PSRAM_MODES[mode]["variant_suffix"]
 
 
-def release_variant_refusal(board_class, node):
-    """Why this node must not take the board class's published release image, or None.
+def release_variant_refusal(board_class, node, release_psram_mode=None):
+    """Why this node must not take this release variant, or None.
 
-    Published releases are built once per board class at the class default bus mode. A node that
-    overrides that mode would be handed a binary its PSRAM cannot answer, which is the exact
-    failure this module now exists to prevent -- so say no rather than flash it.
+    Release assets are named by board class plus PSRAM bus variant. The safety property is that
+    the variant selected for a node must match the bus mode recorded for that physical board; a
+    quad board must never receive the default octal asset, and vice versa.
     """
-    mode = psram_mode(board_class, node)
-    default = require_psram_mode(BOARD_PROFILES[board_class].get("psram_mode", DEFAULT_PSRAM_MODE))
-    if mode == default:
+    want = psram_mode(board_class, node)
+    got = want if release_psram_mode is None else require_psram_mode(release_psram_mode)
+    if got == want:
         return None
-    return ("%s needs a %s-PSRAM image and the published %s release is built %s; build and flash "
-            "it from this tree (flash.py %s <ip>) until a %s release variant exists"
-            % (node, mode, board_class, default, node, mode))
+    return ("%s needs a %s-PSRAM image for %s, not the %s-PSRAM release variant"
+            % (node, want, board_class, got))
 
 
-def release_stem(board_class):
+def release_stem(board_class, psram_mode_name=None):
     require_board_class(board_class)
-    return BOARD_PROFILES[board_class]["release_stem"]
+    mode = require_psram_mode(psram_mode_name or BOARD_PROFILES[board_class].get(
+        "psram_mode", DEFAULT_PSRAM_MODE))
+    return BOARD_PROFILES[board_class]["release_stem"] + PSRAM_MODES[mode]["variant_suffix"]
 
 
 def board_header(board_class):
@@ -179,12 +180,12 @@ def board_header(board_class):
     return BOARD_PROFILES[board_class]["board_header"]
 
 
-def release_asset_name(tag, board_class, kind="app"):
+def release_asset_name(tag, board_class, kind="app", psram_mode_name=None):
     require_board_class(board_class)
     if kind not in UPLOAD_SUFFIXES:
         raise ValueError("unknown release asset kind %r" % kind)
     suffix, _ = UPLOAD_SUFFIXES[kind]
-    return "%s-%s%s" % (release_stem(board_class), tag, suffix)
+    return "%s-%s%s" % (release_stem(board_class, psram_mode_name), tag, suffix)
 
 
 def upload_filename(kind):

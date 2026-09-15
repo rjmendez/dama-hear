@@ -185,11 +185,30 @@ def _expected_build_flags(board_class: str):
     return ["-DHEAR_ALLOW_NO_WIFI", *board_profiles.BOARD_PROFILES[board_class]["cpp_flags"]]
 
 
-def _variant_from_build_info(info, board_class: str):
+def _variant_from_build_info(info, board_class: str, psram_mode: str):
     for variant in info["variants"]:
-        if variant.get("board_class") == board_class:
+        if variant.get("board_class") == board_class and variant.get("psram_mode") == psram_mode:
             return variant
-    raise ValueError("build-info.json has no variant for %s" % board_class)
+    raise ValueError("build-info.json has no %s/%s variant" % (board_class, psram_mode))
+
+
+def _release_variants_from_build_info(info):
+    variants = []
+    seen = set()
+    for item in info["variants"]:
+        stem = item.get("release_stem")
+        if not stem:
+            continue
+        board_class = item.get("board_class")
+        psram_mode = item.get("psram_mode")
+        board_profiles.require_board_class(board_class)
+        board_profiles.require_psram_mode(psram_mode)
+        key = (board_class, psram_mode)
+        if key in seen:
+            raise ValueError("build-info.json repeats release variant %s/%s" % key)
+        seen.add(key)
+        variants.append(key)
+    return variants
 
 
 def capture_profile(repo_root: pathlib.Path, board_class: str):
@@ -216,17 +235,18 @@ def _release_artifact(dist_dir: pathlib.Path, name: str, kind: str):
     return _record_release_path(dist_dir, name, kind=kind)
 
 
-def _variant_manifest(repo_root: pathlib.Path, dist_dir: pathlib.Path, tag: str, build_info, board_class: str):
+def _variant_manifest(repo_root: pathlib.Path, dist_dir: pathlib.Path, tag: str, build_info,
+                      board_class: str, psram_mode: str):
     prof = capture_profile(repo_root, board_class)
-    variant_info = _variant_from_build_info(build_info, board_class)
-    expected_stem = board_profiles.release_stem(board_class)
+    variant_info = _variant_from_build_info(build_info, board_class, psram_mode)
+    expected_stem = board_profiles.release_stem(board_class, psram_mode)
     if variant_info.get("release_stem") != expected_stem:
-        raise ValueError("build-info.json release_stem for %s is %r, expected %r"
-                         % (board_class, variant_info.get("release_stem"), expected_stem))
+        raise ValueError("build-info.json release_stem for %s/%s is %r, expected %r"
+                         % (board_class, psram_mode, variant_info.get("release_stem"), expected_stem))
     build_flags = variant_info.get("build_flags") or []
     if build_flags != _expected_build_flags(board_class):
-        raise ValueError("build-info.json build_flags for %s are %r, expected %r"
-                         % (board_class, build_flags, _expected_build_flags(board_class)))
+        raise ValueError("build-info.json build_flags for %s/%s are %r, expected %r"
+                         % (board_class, psram_mode, build_flags, _expected_build_flags(board_class)))
     if prof["board_name"] != board_class:
         raise ValueError("%s declares BOARD_NAME=%r, expected %r"
                          % (prof["board_header"], prof["board_name"], board_class))
@@ -234,12 +254,14 @@ def _variant_manifest(repo_root: pathlib.Path, dist_dir: pathlib.Path, tag: str,
     for kind in UPLOAD_KINDS:
         artifacts.append(_release_artifact(
             dist_dir,
-            board_profiles.release_asset_name(tag, board_class, kind),
+            board_profiles.release_asset_name(tag, board_class, kind, psram_mode),
             kind))
     partitions = next(a for a in artifacts if a["kind"] == "partitions")
     return {
         "board_class": board_class,
+        "psram_mode": psram_mode,
         "release_stem": expected_stem,
+        "fqbn": variant_info.get("fqbn"),
         "build_flags": build_flags,
         "board_header": _record_path(repo_root, board_profiles.board_header(board_class)),
         "capture_profile": prof,
@@ -284,8 +306,8 @@ def build_manifest(repo_root: pathlib.Path, dist_dir: pathlib.Path, build_info_p
         rec["generator_sha256"] = _sha256_path(repo_root / generator)
         generated_files.append(rec)
     schema_guards = [_record_path(repo_root, rel, role=role) for rel, role in SCHEMA_GUARDS]
-    variants = [_variant_manifest(repo_root, dist_dir, tag, build_info, board_class)
-                for board_class in board_profiles.known_board_classes()]
+    variants = [_variant_manifest(repo_root, dist_dir, tag, build_info, board_class, psram_mode)
+                for board_class, psram_mode in _release_variants_from_build_info(build_info)]
 
     schema_obj = schema_document()
     schema_text = _json_text(schema_obj)
@@ -434,11 +456,13 @@ def _artifact_index(variant, board_class: str):
     return index
 
 
-def _variant_lookup(manifest, board_class: str):
+def _variant_lookup(manifest, board_class: str, psram_mode: str | None = None):
+    if psram_mode is None:
+        psram_mode = board_profiles.psram_mode(board_class)
     for variant in manifest.get("variants", []):
-        if variant.get("board_class") == board_class:
+        if variant.get("board_class") == board_class and variant.get("psram_mode") == psram_mode:
             return variant
-    raise ValueError("release manifest has no board_class %r" % board_class)
+    raise ValueError("release manifest has no %s/%s variant" % (board_class, psram_mode))
 
 
 def _check_hash(name: str, data: bytes, want: str):
@@ -447,7 +471,8 @@ def _check_hash(name: str, data: bytes, want: str):
         raise ValueError("%s sha256 %s, manifest says %s" % (name, got, want))
 
 
-def verify_downloaded_release_assets(manifest_source, tag: str, board_class: str, assets: dict[str, bytes]):
+def verify_downloaded_release_assets(manifest_source, tag: str, board_class: str,
+                                     assets: dict[str, bytes], psram_mode: str | None = None):
     try:
         manifest = _load_manifest(manifest_source)
     except json.JSONDecodeError as e:
@@ -465,7 +490,7 @@ def verify_downloaded_release_assets(manifest_source, tag: str, board_class: str
     if not source.get("verifiable", True):
         raise ValueError("manifest is marked unverifiable: %s"
                          % "; ".join(source.get("refusals") or ["no reason given"]))
-    variant = _variant_lookup(manifest, board_class)
+    variant = _variant_lookup(manifest, board_class, psram_mode)
     expected = _artifact_index(variant, board_class)
     missing = sorted(set(assets) - set(expected))
     if missing:
@@ -477,12 +502,14 @@ def verify_downloaded_release_assets(manifest_source, tag: str, board_class: str
         "tag": manifest["tag"],
         "commit": source.get("commit"),
         "board_class": board_class,
+        "psram_mode": variant.get("psram_mode"),
         "verified_assets": sorted(assets),
     }
 
 
 def verify_release_directory(manifest_path: pathlib.Path, dist_dir: pathlib.Path,
-                             expected_tag=None, expected_board_class=None, source_root=None):
+                             expected_tag=None, expected_board_class=None, expected_psram_mode=None,
+                             source_root=None):
     try:
         manifest = _load_manifest(manifest_path)
     except json.JSONDecodeError as e:
@@ -502,11 +529,16 @@ def verify_release_directory(manifest_path: pathlib.Path, dist_dir: pathlib.Path
     if not source.get("verifiable", True):
         problems.append("manifest is marked unverifiable: %s"
                         % "; ".join(source.get("refusals") or ["no reason given"]))
-    board_classes = [expected_board_class] if expected_board_class else [
-        v.get("board_class") for v in manifest.get("variants", [])]
-    for board_class in board_classes:
+    if expected_psram_mode and not expected_board_class:
+        problems.append("--psram-mode requires --board-class")
+        variant_checks = []
+    elif expected_board_class:
+        variant_checks = [(expected_board_class, expected_psram_mode)]
+    else:
+        variant_checks = [(v.get("board_class"), v.get("psram_mode")) for v in manifest.get("variants", [])]
+    for board_class, psram_mode in variant_checks:
         try:
-            variant = _variant_lookup(manifest, board_class)
+            variant = _variant_lookup(manifest, board_class, psram_mode)
         except ValueError as e:
             problems.append(str(e))
             continue
@@ -561,8 +593,9 @@ def verify_release_directory(manifest_path: pathlib.Path, dist_dir: pathlib.Path
         raise ValueError("\n".join(problems))
     return {
         "tag": manifest["tag"],
-        "board_classes": board_classes,
-        "artifacts_checked": sum(len(_variant_lookup(manifest, cls)["artifacts"]) for cls in board_classes)
+        "board_classes": [board_class for board_class, _ in variant_checks],
+        "artifacts_checked": sum(len(_variant_lookup(manifest, cls, mode)["artifacts"])
+                                 for cls, mode in variant_checks)
                              + len(manifest.get("release_artifacts", [])),
         "source_checked": bool(source_root),
     }
@@ -647,12 +680,14 @@ def schema_document():
                 "items": {
                     "type": "object",
                     "required": [
-                        "board_class", "release_stem", "build_flags", "board_header",
+                        "board_class", "psram_mode", "release_stem", "fqbn", "build_flags", "board_header",
                         "capture_profile", "partition_table", "artifacts",
                     ],
                     "properties": {
                         "board_class": {"type": "string"},
+                        "psram_mode": {"type": "string"},
                         "release_stem": {"type": "string"},
+                        "fqbn": {"type": "string"},
                         "build_flags": {"type": "array", "items": {"type": "string"}},
                         "board_header": path_file_record,
                         "capture_profile": {
@@ -725,6 +760,7 @@ def _cmd_verify(args):
         dist_dir,
         expected_tag=args.tag,
         expected_board_class=args.board_class,
+        expected_psram_mode=args.psram_mode,
         source_root=pathlib.Path(args.source_root).resolve() if args.source_root else None,
     )
     print("release-manifest: verified %s (%d artefacts%s)"
@@ -751,6 +787,7 @@ def main(argv=None):
     verify.add_argument("--dist", required=True)
     verify.add_argument("--tag")
     verify.add_argument("--board-class")
+    verify.add_argument("--psram-mode", choices=board_profiles.known_psram_modes())
     verify.add_argument("--source-root")
     verify.set_defaults(func=_cmd_verify)
 
