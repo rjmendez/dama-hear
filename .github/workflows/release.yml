@@ -31,26 +31,26 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: fw-hear_node-xiao-s3-pps
-          path: build/xiao-s3-pps
+          path: ${{ runner.temp }}/hear-node-release/xiao-s3-pps
 
       - uses: actions/download-artifact@v8
         with:
           name: fw-hear_node-esp32s3-i2s-gps
-          path: build/esp32s3-i2s-gps
+          path: ${{ runner.temp }}/hear-node-release/esp32s3-i2s-gps
 
       - name: assemble
         run: |
           mkdir dist
-          cp build/xiao-s3-pps/hear_node.ino.bin            "dist/hear_node-xiao-s3-pps-$TAG.bin"
-          cp build/xiao-s3-pps/hear_node.ino.bootloader.bin "dist/hear_node-xiao-s3-pps-$TAG-bootloader.bin"
-          cp build/xiao-s3-pps/hear_node.ino.partitions.bin "dist/hear_node-xiao-s3-pps-$TAG-partitions.bin"
-          cp build/xiao-s3-pps/hear_node.ino.merged.bin     "dist/hear_node-xiao-s3-pps-$TAG-merged.bin"
-          cp build/xiao-s3-pps/hear_node.ino.elf            "dist/hear_node-xiao-s3-pps-$TAG.elf"
-          cp build/esp32s3-i2s-gps/hear_node.ino.bin            "dist/hear_node-esp32s3-i2s-gps-$TAG.bin"
-          cp build/esp32s3-i2s-gps/hear_node.ino.bootloader.bin "dist/hear_node-esp32s3-i2s-gps-$TAG-bootloader.bin"
-          cp build/esp32s3-i2s-gps/hear_node.ino.partitions.bin "dist/hear_node-esp32s3-i2s-gps-$TAG-partitions.bin"
-          cp build/esp32s3-i2s-gps/hear_node.ino.merged.bin     "dist/hear_node-esp32s3-i2s-gps-$TAG-merged.bin"
-          cp build/esp32s3-i2s-gps/hear_node.ino.elf            "dist/hear_node-esp32s3-i2s-gps-$TAG.elf"
+          cp "$RUNNER_TEMP/hear-node-release/xiao-s3-pps/hear_node.ino.bin"            "dist/hear_node-xiao-s3-pps-$TAG.bin"
+          cp "$RUNNER_TEMP/hear-node-release/xiao-s3-pps/hear_node.ino.bootloader.bin" "dist/hear_node-xiao-s3-pps-$TAG-bootloader.bin"
+          cp "$RUNNER_TEMP/hear-node-release/xiao-s3-pps/hear_node.ino.partitions.bin" "dist/hear_node-xiao-s3-pps-$TAG-partitions.bin"
+          cp "$RUNNER_TEMP/hear-node-release/xiao-s3-pps/hear_node.ino.merged.bin"     "dist/hear_node-xiao-s3-pps-$TAG-merged.bin"
+          cp "$RUNNER_TEMP/hear-node-release/xiao-s3-pps/hear_node.ino.elf"            "dist/hear_node-xiao-s3-pps-$TAG.elf"
+          cp "$RUNNER_TEMP/hear-node-release/esp32s3-i2s-gps/hear_node.ino.bin"            "dist/hear_node-esp32s3-i2s-gps-$TAG.bin"
+          cp "$RUNNER_TEMP/hear-node-release/esp32s3-i2s-gps/hear_node.ino.bootloader.bin" "dist/hear_node-esp32s3-i2s-gps-$TAG-bootloader.bin"
+          cp "$RUNNER_TEMP/hear-node-release/esp32s3-i2s-gps/hear_node.ino.partitions.bin" "dist/hear_node-esp32s3-i2s-gps-$TAG-partitions.bin"
+          cp "$RUNNER_TEMP/hear-node-release/esp32s3-i2s-gps/hear_node.ino.merged.bin"     "dist/hear_node-esp32s3-i2s-gps-$TAG-merged.bin"
+          cp "$RUNNER_TEMP/hear-node-release/esp32s3-i2s-gps/hear_node.ino.elf"            "dist/hear_node-esp32s3-i2s-gps-$TAG.elf"
           python3 - <<'PY'
           import json, os
           tag = os.environ["TAG"]

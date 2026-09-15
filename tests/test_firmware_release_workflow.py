@@ -33,3 +33,10 @@ def test_release_workflow_publishes_per_board_class_assets():
     assert "release-manifest.schema.json" in yml
     assert "release_manifest.py generate" in yml
     assert "release_manifest.py verify" in yml
+
+
+def test_release_artifacts_do_not_dirty_the_source_checkout():
+    yml = _text(".github/workflows/release.yml")
+    assert "path: ${{ runner.temp }}/hear-node-release/" in yml
+    assert "path: build/" not in yml
+    assert "$RUNNER_TEMP/hear-node-release/" in yml
