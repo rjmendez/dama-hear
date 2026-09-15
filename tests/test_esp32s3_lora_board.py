@@ -262,13 +262,13 @@ class TestThePpsPinClaimsNothingItHasNotEarned:
     def test_pps_is_not_wired_yet(self):
         """⚠️A NODE WITH AN UNPROVEN PPS MUST NOT BE TRUSTED AS A TDoA ARRIVAL SOURCE.
 
-        puc.h says the same thing: PPS_WIRED flips to 1 only when /pps has reported edges. The
-        board does not exist, so the honest value is 0 and this test fails the day somebody
-        optimistically sets it before the scan.
+        puc.h says the same thing: PPS_WIRED stays 0 until the source is independently proven. A
+        one-hertz waveform is not enough to identify GNSS versus the DS3231 SQW, so this test fails
+        the day somebody optimistically enables the class before the physical trace is verified.
         """
         assert _define_int("PPS_WIRED") == 0, (
-            "PPS_WIRED is 1 on a board nobody has built. It means edges have ARRIVED, not that a "
-            "pin was chosen.")
+            "PPS_WIRED is 1 without independent source evidence. It means the pin was chosen, not "
+            "that a timing-shaped signal is GNSS PPS.")
 
     def test_pps_names_a_candidate_pad_rather_than_nothing(self):
         # -1 would also be honest, but then the build doc has no pad to scan; a named candidate

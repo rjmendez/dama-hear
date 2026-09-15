@@ -21,19 +21,13 @@
 // $PMTK161,0 standby, $PMTK104 full cold start. The vendor also calls the part "L80" in one log
 // string while the module answers Quectel-L86; the round-trip answer is the one to trust.
 
-// ⚠️1PPS IS NOT ROUTED ON STOCK HARDWARE. The L86 exposes it on pin 11; it was forced on with
-// $PMTK285,4,100 (always, regardless of fix) and NO GPIO saw a 1 Hz edge across repeated
-// whole-bank scans. The vendor firmware has no PPS string, no PMTK285 and no interrupt configured
-// on any pin, which is consistent: there was never a trace to write code for.
-//
-// GPIO18 is where the wire should land -- held low, not a strapping pin, clear of the flash
-// (26-32), PSRAM (33-37) and USB (19-20) ranges. Set to -1 until the joint exists; a node with
-// PPS_PIN -1 must be refused as a TDoA arrival source rather than quietly trusted.
-// ⚠️STALE AND INCONSISTENT WITH ITS OWN COMMENT, kept only because nothing compiles this file.
-// The measured pad is GPIO17 (see puc_node.ino, which is what builds); 18 was a guess from before
-// the pin scan, and the comment above says to use -1 until the joint exists. Do not copy this line.
-#define PPS_PIN        -1
-#define PPS_WIRED      0         // flip to 1 only when /pps has actually reported edges
+// ⚠️1PPS IS NOT ROUTED ON STOCK HARDWARE. The L86 exposes it on module pin 11; the vendor firmware
+// never configured a PPS interrupt and repeated scans found no GNSS edge. GPIO17 is the measured
+// safe landing pad for a future diagnostic wire. GPIO18 is held low by another circuit and must
+// never be used for this push-pull signal. The compiled source is firmware/puc_node/puc_node.ino.
+#define PPS_PIN        17
+#define PPS_WIRED      0         // compile-time capability stays off until source is proven
+#define PPS_SOURCE_CONFIRMED 0   // a frequency-shaped edge is not source identification
 
 // ---- the tick that DOES exist ---------------------------------------------------------------
 // ⚠️FOUND 2026-09-08: the DS3231's SQW/INT pin is on GPIO38 and it emits 1 Hz. The GPS route to a
