@@ -12,6 +12,7 @@ bool hear_prov_load(hear_prov_t *p) {
   if (ok && n >= 1 && n <= HEAR_PROV_MAX_NETS) {
     ok = pr.getString("node", p->node, sizeof p->node) > 0;
     pr.getString("class", p->cls, sizeof p->cls);
+    pr.getString("appass", p->ap_pass, sizeof p->ap_pass);   // absent -> stays "", handled by caller
     for (int k = 0; ok && k < n; k++) {
       char ks[16], kp[16];
       snprintf(ks, sizeof ks, "s%d", k);
@@ -38,6 +39,7 @@ bool hear_prov_save(const hear_prov_t *p) {
   bool ok = pr.clear();
   ok = ok && pr.putString("node", p->node) == strlen(p->node);
   if (ok && p->cls[0]) ok = pr.putString("class", p->cls) == strlen(p->cls);
+  if (ok && p->ap_pass[0]) ok = pr.putString("appass", p->ap_pass) == strlen(p->ap_pass);
   for (int k = 0; ok && k < p->n; k++) {
     char ks[16], kp[16];
     snprintf(ks, sizeof ks, "s%d", k);

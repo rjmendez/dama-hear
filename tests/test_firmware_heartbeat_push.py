@@ -296,6 +296,11 @@ def test_the_receiver_manifest_still_exposes_its_own_port_for_a_lan_only_build()
 def test_push_post_json_uses_tls_and_wraps_the_batch_envelope_for_the_ingest_api():
     body = _fn("push_post_json")
     assert "WiFiClientSecure client;" in body
+    # Alert 3 remediation: the default path verifies the chain against a pinned root CA
+    # rather than calling setInsecure(). setInsecure() only appears at all behind the
+    # explicit, off-by-default HEAR_PUSH_TLS_INSECURE opt-in (see hear_push_ca.h).
+    assert "client.setCACert(HEAR_PUSH_CA_CERT);" in body
+    assert "#if HEAR_PUSH_TLS_INSECURE" in body
     assert "client.setInsecure();" in body
     assert '"{\\"device_id\\":\\"%s\\",\\"messages\\":[%.*s]}"' in body
     assert "node_id," in body
@@ -441,6 +446,20 @@ def test_the_loop_task_gets_headroom_on_top_of_the_static_buffers_not_instead_of
 def test_the_sketch_records_why_the_push_buffers_are_static():
     assert "static`, NOT A STACK LOCAL" in INO.read_text()
 
+
+def test_the_ca_header_pins_a_root_not_a_leaf_and_defaults_to_verified_tls():
+    hdr = (ROOT / "firmware" / "hear_node" / "hear_push_ca.h").read_text()
+    assert "BEGIN CERTIFICATE" in hdr and "END CERTIFICATE" in hdr
+    assert "#ifndef HEAR_PUSH_CA_CERT" in hdr, (
+        "a build must be able to override the pinned CA in secrets.h for a non-default "
+        "HEAR_PUSH_HOST")
+    assert "#ifndef HEAR_PUSH_TLS_INSECURE" in hdr
+    assert "#define HEAR_PUSH_TLS_INSECURE 0" in hdr, (
+        "the insecure escape hatch must default OFF; only secrets.h may turn it on")
+    assert '#include "hear_push_ca.h"' in CODE
+    assert CODE.index('#include "hear_push_ca.h"') > CODE.index('#include "secrets.h"'), (
+        "hear_push_ca.h must be included after secrets.h so a build can override "
+        "HEAR_PUSH_CA_CERT / HEAR_PUSH_TLS_INSECURE there")
 
 def test_the_connect_timeout_is_long_enough_to_complete_a_real_tcp_handshake():
     # HEAR_PUSH_CONNECT_TIMEOUT_MS was 15 -- 15 milliseconds, not 1.5 seconds -- which meant

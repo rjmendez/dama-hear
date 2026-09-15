@@ -21,7 +21,8 @@ import enroll  # noqa: E402
 
 class Prov(ctypes.Structure):
     _fields_ = [("node", ctypes.c_char * 24), ("cls", ctypes.c_char * 24), ("n", ctypes.c_int),
-                ("ssid", (ctypes.c_char * 33) * 8), ("psk", (ctypes.c_char * 65) * 8)]
+                ("ssid", (ctypes.c_char * 33) * 8), ("psk", (ctypes.c_char * 65) * 8),
+                ("ap_pass", ctypes.c_char * 65)]
 
 
 @pytest.fixture(scope="module")
@@ -76,6 +77,43 @@ def test_what_enroll_sends_the_firmware_reads_back_exactly(lib):
     assert (p.node, p.cls, p.n) == (b"rankine", b"xiao-s3-pps", 3)
     for k, (s, k2) in enumerate(PAIRS):
         assert p.ssid[k].value == s.encode() and p.psk[k].value == k2.encode()
+    assert p.ap_pass == b"", "no ap_pass was sent; the record must not invent one"
+
+
+class TestFallbackApPassword:
+    """Alert 5: the node's own fallback-AP password travels the same signed PROV line and NVS
+    record as its Wi-Fi credentials, so no build has to fall back to a fleet-wide default."""
+
+    def test_an_ap_pass_round_trips_through_the_signed_line(self, lib):
+        err, p = parse(lib, enroll.prov_line("rankine", "xiao-s3-pps", PAIRS, ap_pass="correct horse battery"))
+        assert err is None
+        assert p.ap_pass == b"correct horse battery"
+
+    def test_a_short_ap_pass_is_refused_by_enroll_before_it_reaches_the_wire(self):
+        with pytest.raises(ValueError):
+            enroll.prov_line("rankine", "", PAIRS, ap_pass="short")
+
+    def test_a_too_long_ap_pass_is_refused_by_enroll(self):
+        with pytest.raises(ValueError):
+            enroll.prov_line("rankine", "", PAIRS, ap_pass="x" * 65)
+
+    def test_the_firmware_parser_also_refuses_a_short_ap_password(self, lib):
+        body = "PROV v=1 node=a " + NET + " ap=" + b"short".hex()
+        err, p = parse(lib, signed(body))
+        assert err == "bad ap password"
+        assert p.ap_pass == b""
+
+    def test_same_treats_a_different_ap_pass_as_a_different_record(self, lib):
+        _, a = parse(lib, enroll.prov_line("a", "c", PAIRS, ap_pass="password one"))
+        _, b = parse(lib, enroll.prov_line("a", "c", PAIRS, ap_pass="password one"))
+        assert lib.w_same(ctypes.byref(a), ctypes.byref(b)) == 1
+        _, c = parse(lib, enroll.prov_line("a", "c", PAIRS, ap_pass="password two"))
+        assert lib.w_same(ctypes.byref(a), ctypes.byref(c)) == 0
+
+    def test_random_ap_pass_is_a_valid_wpa2_length(self):
+        got = enroll.random_ap_pass()
+        assert 8 <= len(got) <= 64
+        assert enroll.prov_line("a", "", PAIRS, ap_pass=got)  # does not raise
 
 
 def test_a_line_damaged_in_transit_is_refused_not_saved(lib):
