@@ -9,10 +9,24 @@ static size_t s_w = 0;
 static bool s_wrapped = false;
 
 void hear_log_put(const char *s, size_t n) {
-  for (size_t i = 0; i < n; i++) {
-    s_buf[s_w] = s[i];
-    s_w = (s_w + 1) % HEAR_LOG_CAP;
-    if (s_w == 0) s_wrapped = true;
+  if (!s || n == 0) return;
+  if (n >= HEAR_LOG_CAP) {
+    s += (n - HEAR_LOG_CAP);
+    n = HEAR_LOG_CAP;
+  }
+  size_t right = HEAR_LOG_CAP - s_w;
+  if (n <= right) {
+    memcpy(s_buf + s_w, s, n);
+    s_w += n;
+    if (s_w == HEAR_LOG_CAP) {
+      s_w = 0;
+      s_wrapped = true;
+    }
+  } else {
+    memcpy(s_buf + s_w, s, right);
+    memcpy(s_buf, s + right, n - right);
+    s_w = n - right;
+    s_wrapped = true;
   }
 }
 
@@ -34,7 +48,11 @@ void hear_logln(const String &s) { hear_logf("%s\n", s.c_str()); }
 String hear_log_text() {
   String o;
   o.reserve(HEAR_LOG_CAP + 1);
-  if (s_wrapped) for (size_t i = s_w; i < HEAR_LOG_CAP; i++) o += s_buf[i];
-  for (size_t i = 0; i < s_w; i++) o += s_buf[i];
+  if (s_wrapped) {
+    o.concat(s_buf + s_w, (unsigned int)(HEAR_LOG_CAP - s_w));
+  }
+  if (s_w > 0) {
+    o.concat(s_buf, (unsigned int)s_w);
+  }
   return o;
 }

@@ -2844,6 +2844,7 @@ static void push_init() {
 }
 
 static void push_pump() {
+  if (!sta_ok || WiFi.status() != WL_CONNECTED) return;
   if (push_clip_event.pending) {
     struct HearPushEvent ev = push_clip_event;
     push_clip_event.pending = false;
@@ -4719,6 +4720,8 @@ void setup() {
     }
   });
   fft_init();
+  const char *auth_headers[] = {"X-Hear-Auth"};
+  http.collectHeaders(auth_headers, 1);
   http.begin();
   logln("http  up\n");
 

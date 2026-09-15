@@ -200,3 +200,63 @@ class TestTheSdEndpointIsAllowlisted:
         body = _fn("sd_path_allowed")
         assert body.strip().endswith("return false;\n}") or "return false;" in body.splitlines()[-2:][-1] \
             or "return false;" in body
+
+
+class TestPucNodeAdminAuth:
+    """puc_node.ino must mirror hear_node.ino's fail-closed admin authentication."""
+    PUC_SRC = (ROOT / "firmware" / "puc_node" / "puc_node.ino").read_text()
+
+    def _puc_handler(self, marker, occurrence=0):
+        idx = -1
+        for _ in range(occurrence + 1):
+            idx = self.PUC_SRC.index(marker, idx + 1)
+        return _strip_comments(_braces_body(self.PUC_SRC, idx))
+
+    def _puc_full_call(self, marker, occurrence=0):
+        idx = -1
+        for _ in range(occurrence + 1):
+            idx = self.PUC_SRC.index(marker, idx + 1)
+        i = self.PUC_SRC.index("(", idx)
+        depth, j = 0, i
+        while j < len(self.PUC_SRC):
+            if self.PUC_SRC[j] == "(":
+                depth += 1
+            elif self.PUC_SRC[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        return _strip_comments(self.PUC_SRC[i:j])
+
+    def test_puc_admin_auth_defaults_on(self):
+        assert "#define HEAR_REQUIRE_ADMIN_AUTH 1" in self.PUC_SRC
+
+    def test_puc_privileged_handlers_call_auth(self):
+        for marker in (
+            'http.on("/reboot", HTTP_POST',
+            'http.on("/timesync", HTTP_POST',
+            'http.on("/gpshold", HTTP_POST',
+            'http.on("/gpsreset", HTTP_POST',
+            'http.on("/pmtk"',
+            'http.on("/scan"',
+            'http.on("/scanpd"',
+            'http.on("/scanpu"',
+            'http.on("/i2creg"',
+            'http.on("/pdmscan"',
+        ):
+            b = self._puc_handler(marker)
+            assert "HEAR_REQUIRE_AUTH();" in b, "puc_node %s is missing admin auth" % marker
+
+    def test_puc_update_checks_auth_before_flash(self):
+        b = self._puc_full_call('http.on("/update", HTTP_POST')
+        assert "ota_authorized = hear_auth_ok();" in b
+        assert b.index("ota_authorized = hear_auth_ok();") < b.index("Update.begin(")
+        assert b.count("if (!ota_authorized) return;") >= 2
+        assert "if (!ota_authorized) { hear_auth_reject(); return; }" in b
+
+    def test_header_collection_registered(self):
+        assert 'const char *auth_headers[] = {"X-Hear-Auth"};' in SRC
+        assert 'http.collectHeaders(auth_headers, 1);' in SRC
+        assert 'const char *auth_headers[] = {"X-Hear-Auth"};' in self.PUC_SRC
+        assert 'http.collectHeaders(auth_headers, 1);' in self.PUC_SRC
+
