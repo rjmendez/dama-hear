@@ -86,6 +86,39 @@ static char node_id[24];
 static WebServer http(80);
 static bool sta_ok = false;
 
+// ---------------------------------------------------------------- admin auth
+#ifndef HEAR_REQUIRE_ADMIN_AUTH
+#define HEAR_REQUIRE_ADMIN_AUTH 1
+#endif
+#ifndef HEAR_ADMIN_TOKEN
+#define HEAR_ADMIN_TOKEN ""
+#endif
+static bool hear_auth_ok() {
+#if !HEAR_REQUIRE_ADMIN_AUTH
+  return true;
+#else
+  static const char *want = HEAR_ADMIN_TOKEN;
+  size_t wn = strlen(want);
+  if (!wn) return false;
+  String given = http.hasHeader("X-Hear-Auth") ? http.header("X-Hear-Auth")
+               : (http.hasArg("token") ? http.arg("token") : String());
+  size_t gn = given.length();
+  size_t n = wn > gn ? wn : gn;
+  uint32_t diff = (uint32_t)(wn ^ gn);
+  for (size_t i = 0; i < n; i++) {
+    char a = i < wn ? want[i] : '\0';
+    char b = i < gn ? given[i] : '\0';
+    diff |= (uint32_t)(uint8_t)(a ^ b);
+  }
+  return diff == 0;
+#endif
+}
+static void hear_auth_reject() {
+  http.sendHeader("WWW-Authenticate", "X-Hear-Auth realm=\"puc-node\"");
+  http.send(401, "text/plain", "unauthorized: set header X-Hear-Auth: <token> or ?token=<token>\n");
+}
+#define HEAR_REQUIRE_AUTH() do { if (!hear_auth_ok()) { hear_auth_reject(); return; } } while (0)
+
 // ---------------------------------------------------------------- boot failback
 // Same shape as hear_node: count boots in RTC memory, and flip back if a new image never proves
 // itself. It does NOT rely on the bootloader's rollback, which this core's prebuilt bootloader may
@@ -746,9 +779,9 @@ static void routes() {
     http.send(200, "text/plain", b);
   });
 
-  http.on("/scan",   []() { http.send(200, "text/plain", pin_scan(4000, 0)); });
-  http.on("/scanpd", []() { http.send(200, "text/plain", pin_scan(4000, 1)); });
-  http.on("/scanpu", []() { http.send(200, "text/plain", pin_scan(4000, 2)); });
+  http.on("/scan",   []() { HEAR_REQUIRE_AUTH(); http.send(200, "text/plain", pin_scan(4000, 0)); });
+  http.on("/scanpd", []() { HEAR_REQUIRE_AUTH(); http.send(200, "text/plain", pin_scan(4000, 1)); });
+  http.on("/scanpu", []() { HEAR_REQUIRE_AUTH(); http.send(200, "text/plain", pin_scan(4000, 2)); });
 
   // /i2c sweeps the pullup candidates; /i2c?sda=N&scl=M tries exactly one pair, which is how a
   // find gets re-checked without waiting for all 110 again.
@@ -766,6 +799,7 @@ static void routes() {
   // /i2creg?addr=0x39&reg=0x92[&n=1][&sda=47&scl=48][&raw=1] -- raw skips the register write, for
   // parts that answer a bare read. Defaults to the bus /i2c found.
   http.on("/i2creg", []() {
+    HEAR_REQUIRE_AUTH();
     int sda = http.hasArg("sda") ? http.arg("sda").toInt() : 47;
     int scl = http.hasArg("scl") ? http.arg("scl").toInt() : 48;
     long addr = strtol(http.arg("addr").c_str(), nullptr, 0);
@@ -777,6 +811,7 @@ static void routes() {
   });
 
   http.on("/pdmscan", []() {
+    HEAR_REQUIRE_AUTH();
     http.send(200, "text/plain", pdm_scan(http.hasArg("clk") ? http.arg("clk").toInt() : -1));
   });
 
@@ -791,6 +826,7 @@ static void routes() {
   // /timesync -- POST because it WRITES the system clock and the RTC. Reports the bound it
   // achieved, not just that it succeeded.
   http.on("/timesync", HTTP_POST, []() {
+    HEAR_REQUIRE_AUTH();
     String host = http.hasArg("server") ? http.arg("server") : String(NTP_DEFAULT_SERVER);
     NtpResult r = ntp_query(host.c_str(), NTP_SAMPLES);
     if (!r.ok) { http.send(503, "text/plain", String("ntp ") + host + ": " + r.err + "\n"); return; }
@@ -906,6 +942,7 @@ static void routes() {
   });
 
   http.on("/gpshold", HTTP_POST, []() {
+    HEAR_REQUIRE_AUTH();
     // FORCE_ON must be HELD logic high to leave backup mode -- Hardware Design 3.4.3: "FORCE_ON
     // logic high can turn off the switch (backup -> full on)". /gpsreset pulsed each candidate low
     // then high then RELEASED it to floating, which is the right shape for an active-low RESET and
@@ -949,6 +986,7 @@ static void routes() {
   });
 
   http.on("/gpsreset", HTTP_POST, []() {
+    HEAR_REQUIRE_AUTH();
     // I hung the L86 with PMTK285,4,500 and it will not answer anything, so the only way back is
     // to cycle its power or reset line. The vendor firmware configured GPIO2, 10, 21, 40, 41 and
     // 42 as OUTPUTS at boot and this firmware drives none of them -- so one of them plausibly
@@ -1043,6 +1081,7 @@ static void routes() {
   });
 
   http.on("/pmtk", []() {
+    HEAR_REQUIRE_AUTH();
     // e.g. /pmtk?cmd=PMTK285,4,100  -- forces the timepulse on regardless of fix, which is how
     // you test a newly-added PPS wire without waiting for a sky view.
     if (!http.hasArg("cmd")) {
@@ -1106,19 +1145,30 @@ static void routes() {
     http.send(200, "text/plain", b);
   });
 
-  http.on("/reboot", HTTP_POST, []() { http.send(200, "text/plain", "rebooting\n"); delay(200); ESP.restart(); });
+  http.on("/reboot", HTTP_POST, []() {
+    HEAR_REQUIRE_AUTH();
+    http.send(200, "text/plain", "rebooting\n");
+    delay(200); ESP.restart();
+  });
 
+  static bool ota_authorized = false;
   http.on("/update", HTTP_POST, []() {
-    http.send(200, "text/plain", Update.hasError() ? "FAILED\n" : "OK, rebooting into the new image\n");
+    if (!ota_authorized) { hear_auth_reject(); return; }
+    bool bad = Update.hasError();
+    http.send(bad ? 500 : 200, "text/plain", bad ? "FAILED\n" : "OK, rebooting into the new image\n");
     delay(300); ESP.restart();
   }, []() {
     HTTPUpload &u = http.upload();
     if (u.status == UPLOAD_FILE_START) {
+      ota_authorized = hear_auth_ok();
+      if (!ota_authorized) return;
       Serial.printf("ota   %s\n", u.filename.c_str());
       if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
     } else if (u.status == UPLOAD_FILE_WRITE) {
+      if (!ota_authorized) return;
       if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
     } else if (u.status == UPLOAD_FILE_END) {
+      if (!ota_authorized) return;
       if (Update.end(true)) Serial.printf("ota   %u bytes ok\n", u.totalSize);
       else Update.printError(Serial);
     }
@@ -1157,6 +1207,8 @@ void setup() {
   if (MDNS.begin(node_id)) Serial.printf("mdns  http://%s.local/\n", node_id);
 
   routes();
+  const char *auth_headers[] = {"X-Hear-Auth"};
+  http.collectHeaders(auth_headers, 1);
   http.begin();
   Serial.println("http  up -- this board never needs the cable again\n");
 }
