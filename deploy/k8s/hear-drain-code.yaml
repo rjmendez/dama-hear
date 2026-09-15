@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 335664 B serialised; 335842 B of annotations against a 262144 B cap.
+# apply-mode server: 336991 B serialised; 337169 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: '5ed1dfc'
+    dama-hear/commit: '99f38dd'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '335664'
+    dama-hear/serialised-bytes: '336991'
 data:
   hear__init__.py: |
     
@@ -1191,7 +1191,7 @@ data:
     
   hear_detsfile.py: |
     #!/usr/bin/env python3
-    """Read a node's `dets.csv` at any of the five column layouts the firmware has written.
+    """Read a node's `dets.csv` at any of the seven column layouts the firmware has written.
     
     WHY THIS IS NOT `csv.DictReader`. Five generations of `dets.csv` exist on the cards and in the
     drains, and one of them writes a header that does not describe its own rows:
@@ -1202,6 +1202,7 @@ data:
         G4  12 cols   node_id, ...                               fs/layout build, node_id populated
         G5  13 cols   + sketch_back before frame_hex             the window fix
         G6  14 cols   + sync_sigma_ns appended                    the declared-uncertainty stamp
+        G7  19 cols   + explicit clock state / anchor / boot metadata appended
     
     ⚠️G3 IS THE WHOLE REASON THIS MODULE EXISTS. `csv.DictReader` on a G3 file silently shifts every
     value one column left of its name: `utc_us` gets the node name, `uptime_s` gets the timestamp,
@@ -1267,9 +1268,12 @@ data:
     # as a perfect clock -- which hear/nodeclass.py refuses as a claim no hardware supports.
     _G6 = ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why", "sync_sigma_ns")
     G6 = Generation("G6", _G6, _G6)
+    _G7 = _G6 + ("clock_state", "anchor_age_us", "boot_epoch_us", "boot_id",
+                 "clock_discontinuity_flags")
+    G7 = Generation("G7", _G7, _G7)
     
-    GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5, G6)
-    LATEST = G6
+    GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5, G6, G7)
+    LATEST = G7
     
     # One packed v1 sketch is 172 bytes (344 hex); v2 is 173 bytes (346 hex).
     FRAME_HEX_LEN = 344
@@ -1398,6 +1402,13 @@ data:
             # are None -- "not stated" -- and neither is 0. See hear/pool.py's record builder and
             # hear/backend/associate.py, where absent means usable and a number is a claim.
             d["sync_sigma_ns"] = stated_sigma_ns(d.get("sync_sigma_ns"))
+            for key in ("clock_state", "anchor_age_us", "boot_epoch_us", "boot_id",
+                        "clock_discontinuity_flags"):
+                d.setdefault(key, None)
+                if isinstance(d.get(key), str):
+                    d[key] = d[key].strip() or None
+            if isinstance(d.get("clock_state"), str):
+                d["clock_state"] = d["clock_state"].upper()
             out.rows.append(d)
         return out
     
@@ -2041,6 +2052,13 @@ data:
         return None if v in (None, "") else str(v)
     
     
+    def _clock_state(v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s.upper() if s else None
+    
+    
     def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
         fh = (row.get("frame_hex") or "").strip()
@@ -2101,6 +2119,11 @@ data:
             # would claim a perfect clock, and `hear.corpus.Record.sync_sigma_ns` is read by gates
             # that treat absent and stated differently.
             "sync_sigma_ns": _sync_sigma_ns(row.get("sync_sigma_ns")),
+            "clock_state": _clock_state(row.get("clock_state")),
+            "anchor_age_us": _raw_det_cell(row.get("anchor_age_us")),
+            "boot_epoch_us": _raw_det_cell(row.get("boot_epoch_us")),
+            "boot_id": _raw_det_cell(row.get("boot_id")),
+            "clock_discontinuity_flags": _raw_det_cell(row.get("clock_discontinuity_flags")),
             "sample": _raw_det_cell(row.get("sample")),
             "uptime_s": _raw_det_cell(row.get("uptime_s")),
             # ⚠️THE INGEST USED TO DROP THESE TWO, WHICH IS WHY AN UNANCHORED ROW WAS UNRECOVERABLE
@@ -2128,7 +2151,8 @@ data:
     
     #: The /detections (hear_node.ino: h_dets) fields that map straight onto a dets.csv row.
     LIVE_RING_COLUMNS = ("utc_us", "uptime_s", "sample", "pps_n", "us_since_pps", "trigger",
-                         "flags", "fs_hz")
+                         "flags", "fs_hz", "sync_sigma_ns", "clock_state", "anchor_age_us",
+                         "boot_epoch_us", "boot_id", "clock_discontinuity_flags")
     
     
     class Pool:
@@ -6084,14 +6108,15 @@ data:
         # rssi and disc are absent on firmware before v0.1.1, and rssi is null when not associated.
         n = d.get("net") or {}
         rssi = n.get("rssi")
+        clock = t.get("state") or ("yes" if t.get("valid") else "NO")
         # Keep the raw fix number, but NEVER bare: PMTK GGA quality 1 and UBX fixType 3 are both
         # healthy fixes on different scales, so the protocol travels with the number in the report.
         return ("%-9s %-14s up %6ds  gps %-12s tAcc %5s ns  pps %6d sp %5s us g%-3d  "
-                "utc %-5s rej %-4s  dets %4d floor %-5s amb %-5s  rssi %4s disc %-3s  sd %-5s %s"
+                "utc %-9s rej %-4s  dets %4d floor %-5s amb %-5s  rssi %4s disc %-3s  sd %-5s %s"
                 % (name, d.get("fw", "?")[:14], int(d.get("uptime_s") or 0),
                    _gps_summary(d), g.get("tacc_ns", "?"),
                    int(p.get("edges") or 0), p.get("spread_us", "?"), int(p.get("glitches") or 0),
-                   "yes" if t.get("valid") else "NO", t.get("label_rejects", "?"),
+                   clock, t.get("label_rejects", "?"),
                    int(a.get("detections") or 0), gate.get("floor", "?"), a.get("ambient", "?"),
                    "?" if rssi is None else rssi, n.get("disc", "?"),
                    d.get("sd_free_mb", "?"), "" if d.get("sd") else "NO CARD"))
