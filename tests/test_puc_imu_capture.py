@@ -71,12 +71,30 @@ def test_burst_timestamps_are_assigned_after_successful_drain_only_to_read_sampl
     assert '"timestamp_basis":"last_sample_estimate_post_drain_us"' in src
 
 
+def test_partial_fifo_drains_do_not_clear_consecutive_i2c_failures():
+    code = _code()
+    assert "if (!got) { imu_fifo_level = IMU_FIFO_LEVEL_UNKNOWN; return; }" in code
+    assert "if (got == n && post_level_ok) imu_consecutive_i2c_errors = 0" in code
+    assert "if (!lis3dh_read_sample(&xs[got], &ys[got], &zs[got])) { imu_note_i2c_error(); break; }" in code
+    assert "imu_consecutive_i2c_errors = 0" in code
+
+
 def test_lis3dh_full_fifo_fss_value_is_drained_as_32_samples():
     code = _code()
     assert "fss == 0x1F ? IMU_FIFO_CAPACITY : fss" in code, (
         "LIS3DH FIFO_SRC_REG FSS=0x1f means a full 32-sample FIFO, not 31")
     assert "imu_fifo_lost_min++" in code, "FIFO overrun must account at least one overwritten sample"
     assert '"fifo_lost_min"' in _json_literals()
+
+
+def test_fifo_level_is_post_drain_or_explicitly_unknown():
+    code = _code()
+    poll = code[code.index("static void imu_poll()"):code.index("static uint32_t imu_available")]
+    assert "imu_fifo_level = n;" not in poll
+    assert "bool post_level_ok = lis3dh_read_reg(LIS3DH_FIFO_SRC_REG, &src)" in poll
+    assert "imu_fifo_level = lis3dh_fifo_count(src)" in poll
+    assert "imu_fifo_level = IMU_FIFO_LEVEL_UNKNOWN" in poll
+    assert _define_int("IMU_FIFO_LEVEL_UNKNOWN") == 255
 
 
 def test_status_reports_health_rate_drops_and_fifo_overruns():

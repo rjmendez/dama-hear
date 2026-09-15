@@ -645,6 +645,7 @@ static String mic_capture(int clk, int din, int fs, bool stereo) {
 #define IMU_BURST_MAX            32
 #define IMU_MAX_CONSEC_I2C_ERRORS 3
 #define IMU_STALE_US             1000000ULL
+#define IMU_FIFO_LEVEL_UNKNOWN   255
 #define LIS3DH_MPS2_PER_LSB      (9.80665f * 0.001f / 16.0f)
 
 struct ImuSample {
@@ -735,6 +736,12 @@ static const char *imu_state(uint64_t now_us) {
   return "ok";
 }
 
+static uint8_t lis3dh_fifo_count(uint8_t src) {
+  if (src & 0x20) return 0;                         // EMPTY
+  uint8_t fss = src & 0x1F;
+  return fss == 0x1F ? IMU_FIFO_CAPACITY : fss;      // FSS=31 is the full 32-sample FIFO
+}
+
 static bool imu_init() {
   imu_ok = false;
   imu_fault = "bus begin failed";
@@ -760,14 +767,11 @@ static void imu_poll() {
   if (!imu_ok) return;
   uint8_t src = 0;
   if (!lis3dh_read_reg(LIS3DH_FIFO_SRC_REG, &src)) { imu_note_i2c_error(); return; }
-  uint8_t fss = src & 0x1F;
-  bool empty = src & 0x20;
   bool overrun = src & 0x40;
-  uint8_t n = empty ? 0 : (fss == 0x1F ? IMU_FIFO_CAPACITY : fss);
-  imu_fifo_level = n;
+  uint8_t n = lis3dh_fifo_count(src);
   if (overrun) { imu_fifo_overruns++; imu_fifo_lost_min++; }
   if (n > IMU_BURST_MAX) n = IMU_BURST_MAX;
-  if (!n) return;
+  if (!n) { imu_fifo_level = 0; return; }
   int16_t xs[IMU_BURST_MAX], ys[IMU_BURST_MAX], zs[IMU_BURST_MAX];
   uint8_t got = 0;
   uint64_t read_start_us = (uint64_t)esp_timer_get_time();
@@ -775,7 +779,7 @@ static void imu_poll() {
     if (!lis3dh_read_sample(&xs[got], &ys[got], &zs[got])) { imu_note_i2c_error(); break; }
     got++;
   }
-  if (!got) return;
+  if (!got) { imu_fifo_level = IMU_FIFO_LEVEL_UNKNOWN; return; }
   uint64_t drain_done_us = (uint64_t)esp_timer_get_time();
   uint64_t read_latency_us = drain_done_us - read_start_us;
   imu_last_read_latency_us = read_latency_us > 0xFFFFFFFFULL ? 0xFFFFFFFF : (uint32_t)read_latency_us;
@@ -783,7 +787,14 @@ static void imu_poll() {
     uint64_t sample_us = drain_done_us - (uint64_t)(got - 1 - i) * IMU_DT_US;
     imu_note_sample(sample_us, xs[i], ys[i], zs[i]);
   }
-  imu_consecutive_i2c_errors = 0;
+  bool post_level_ok = lis3dh_read_reg(LIS3DH_FIFO_SRC_REG, &src);
+  if (post_level_ok)
+    imu_fifo_level = lis3dh_fifo_count(src);
+  else {
+    imu_note_i2c_error();
+    imu_fifo_level = IMU_FIFO_LEVEL_UNKNOWN;
+  }
+  if (got == n && post_level_ok) imu_consecutive_i2c_errors = 0;
   imu_bursts++;
 }
 

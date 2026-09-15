@@ -12,7 +12,7 @@ The PUC firmware now has a narrow LIS3DH vibration path for bench/on-device vali
 
 ## HTTP surfaces
 
-- `GET /status` includes `imu`: `ok`, `state`, `fault`, `odr_hz`, bus pins/rate, FIFO level, sample count, ring drops, FIFO overruns, `fifo_lost_min`, I2C errors, `consecutive_i2c_errors`, short reads, freshness, read latency, timestamp basis, and register readbacks.
+- `GET /status` includes `imu`: `ok`, `state`, `fault`, `odr_hz`, bus pins/rate, post-drain FIFO level (`255` means the post-drain status read failed), sample count, ring drops, FIFO overruns, `fifo_lost_min`, I2C errors, `consecutive_i2c_errors`, short reads, freshness, read latency, timestamp basis, and register readbacks.
 - `GET /imu/status` returns the same health block.
 - `GET /imu/features` returns `phone-vibration-features-v1` with `source:"imu"`, LIS3DH sensor identity, and `vibration_onset` when a high-crest impulse is present. `crest_factor`, `dc_offset`, and `rms` are computed over calibrated `accel_mag` in m/s² (`raw * 0.001 g / 16`, then vector magnitude), matching the phone/gotchi accelerometer contract instead of raw LIS3DH counts. Onset peak magnitude is `peak_mag_mps2`; there is no legacy consumer for the earlier misleading `peak_abs_raw` name. Disabled/not-ready responses keep the explicit `claim` block with `is_microphone:false` and `is_seismic:true`.
 - `GET /imu?limit=N` returns `puc-lis3dh-raw-v1`: recent raw XYZ samples with `seq` and `mono_us`, health, and the feature block. `limit` is capped by the firmware ring.
