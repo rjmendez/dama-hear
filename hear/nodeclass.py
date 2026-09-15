@@ -788,6 +788,40 @@ register(NodeClass(
 
 
 register(NodeClass(
+    name="esp32s3-speaker",
+    time_source="gps_pps",
+    t_sigma_s=100e-6,
+    path_bias_s=None,
+    mic_count=2,
+    fs_hz=48000.0,
+    band_hz=(50.0, 20000.0),
+    env=("rtc",),
+    raw_retain_s=120.0,
+    power_profile="mains_continuous",
+    notes="Waveshare ESP32-S3-AUDIO-Board with 2x mics (ES7210 ADC), ES8311 speaker DAC, "
+          "TCA9555 expander, and PPS input on GPIO4 over bidirectional USB datalink. Refused "
+          "for TDoA arrivals until its capture-path latency is measured against a reference node.",
+))
+
+
+register(NodeClass(
+    name="esp32s3-box3",
+    time_source="gps_pps",
+    t_sigma_s=100e-6,
+    path_bias_s=None,
+    mic_count=2,
+    fs_hz=48000.0,
+    band_hz=(50.0, 20000.0),
+    env=(),
+    raw_retain_s=120.0,
+    power_profile="mains_continuous",
+    notes="Espressif ESP32-S3-BOX-3 with 2x microphones (ES7210 ADC), ES8311 DAC, ST7789 LCD "
+          "display, and PPS on GPIO13 over bidirectional USB datalink. Refused for TDoA arrivals "
+          "until its capture-path latency is measured against a reference node.",
+))
+
+
+register(NodeClass(
     name="hugbot-array",
     time_source="ntp",
     # ⚠️HUGBOT IS NOT AN ARRIVAL SOURCE.

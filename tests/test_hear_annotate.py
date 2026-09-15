@@ -9,6 +9,9 @@ import sqlite3
 import struct
 import sys
 import wave
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -141,7 +144,9 @@ def test_export_endpoint_returns_only_human_ground_truth_and_no_model_tags(tmp_p
         [_row("a")],
         tags=[{"clip_key": "a", "scores": [{"label": "Vehicle", "score": 0.99}], "provenance": "model"}],
     )
-    client = TestClient(HA.create_app(str(pool), str(tmp_path / "ann.sqlite3")))
+    client = TestClient(HA.create_app(
+        str(pool), str(tmp_path / "ann.sqlite3"), trusted_proxies=["testclient"]
+    ))
     client.post("/api/annotations", json={"clip_key": "a", "label": "dog", "confidence": 0.8, "notes": "human heard bark"},
                 headers={"Tailscale-User-Login": "alice@example"})
     data = client.get("/api/export").json()
@@ -150,3 +155,98 @@ def test_export_endpoint_returns_only_human_ground_truth_and_no_model_tags(tmp_p
     assert data["annotations"][0]["label"] == "dog"
     assert data["annotations"][0]["user_id"] == "alice@example"
     assert "Vehicle" not in json.dumps(data)
+
+
+def test_safe_join_rejects_parent_and_symlink_escape(tmp_path):
+    root = tmp_path / "corpus"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "link").symlink_to(outside, target_is_directory=True)
+
+    for rel in ("../secret.wav", "link/secret.wav"):
+        with pytest.raises(ValueError):
+            HA.safe_join(str(root), rel)
+
+
+def test_audio_endpoint_rejects_empty_wav(tmp_path):
+    pool = _pool(tmp_path, [_row("empty")], audios={"empty": []})
+    client = TestClient(HA.create_app(str(pool), str(tmp_path / "ann.sqlite3")))
+    response = client.get("/api/audio/empty")
+    assert response.status_code == 422
+    assert "no audio frames" in response.json()["detail"]
+
+
+def test_annotation_validation_rejects_blank_fields_and_oversized_notes(tmp_path):
+    pool = _pool(tmp_path, [_row("a")])
+    client = TestClient(HA.create_app(str(pool), str(tmp_path / "ann.sqlite3")))
+    assert client.post("/api/annotations", json={"clip_key": "a", "label": "   "}).status_code == 422
+    response = client.post(
+        "/api/annotations",
+        json={"clip_key": "a", "label": "dog", "notes": "x" * 4097},
+    )
+    assert response.status_code == 422
+
+
+def test_submission_id_is_idempotent_across_concurrent_store_instances(tmp_path):
+    db = tmp_path / "ann.sqlite3"
+    first = HA.AnnotateStore(str(db))
+    second = HA.AnnotateStore(str(db))
+    ann = HA.AnnotationIn(clip_key="a", label="dog", submission_id="mobile-request-1")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        rows = list(executor.map(lambda store: store.append(ann, "alice"), (first, second)))
+
+    assert rows[0]["id"] == rows[1]["id"]
+    assert len(first.export_rows()) == 1
+
+
+def test_cors_preflight_and_audio_headers_for_configured_mobile_origin(tmp_path):
+    pool = _pool(tmp_path, [_row("a")], audios={"a": _tone(1000, 45)})
+    client = TestClient(HA.create_app(
+        str(pool), str(tmp_path / "ann.sqlite3"), cors_origins=["https://mobile.example"]
+    ))
+    preflight = client.options(
+        "/api/annotations",
+        headers={
+            "Origin": "https://mobile.example",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert preflight.status_code == 200
+    assert preflight.headers["access-control-allow-origin"] == "https://mobile.example"
+    assert "content-type" in preflight.headers["access-control-allow-headers"].lower()
+
+    audio = client.get("/api/audio/a", headers={"Origin": "https://mobile.example"})
+    assert audio.headers["access-control-allow-origin"] == "https://mobile.example"
+    exposed = audio.headers["access-control-expose-headers"].lower()
+    assert "x-gain-db" in exposed and "x-gain-bound-by" in exposed
+
+
+def test_untrusted_client_cannot_spoof_proxy_identity_header(tmp_path):
+    pool = _pool(tmp_path, [_row("a")])
+    client = TestClient(HA.create_app(str(pool), str(tmp_path / "ann.sqlite3")))
+    response = client.post(
+        "/api/annotations",
+        json={"clip_key": "a", "label": "dog"},
+        headers={"Tailscale-User-Login": "victim@example"},
+    )
+    assert response.status_code == 200
+    assert response.json()["user_id"] == "client:testclient"
+
+
+def test_reused_submission_id_with_different_payload_is_conflict(tmp_path):
+    pool = _pool(tmp_path, [_row("a")])
+    client = TestClient(HA.create_app(str(pool), str(tmp_path / "ann.sqlite3")))
+    first = client.post(
+        "/api/annotations",
+        json={"clip_key": "a", "label": "dog", "submission_id": "same-request"},
+    )
+    second = client.post(
+        "/api/annotations",
+        json={"clip_key": "a", "label": "bird", "submission_id": "same-request"},
+    )
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert client.get("/api/export").json()["count"] == 1

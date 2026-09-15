@@ -97,6 +97,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hear import clips as CLIPS                                            # noqa: E402
 from hear import tags as TAGS                                             # noqa: E402
 from hear import resample as RESAMPLE                                     # noqa: E402
+from hear.infrasound import InfrasoundSeismicTagger                    # noqa: E402
 
 TAG_SCHEMA = "hear.clip_tag.v2"
 
@@ -160,6 +161,7 @@ LANES: Dict[str, Dict[str, Any]] = {
     "perch_v2": {"model": "perch_v2", "store": "perch_v2", "variant": None, "pad_to_s": None},
     "birdnet_v24": {"model": "birdnet_v24", "store": "birdnet_v24", "variant": None,
                     "pad_to_s": None},
+    "infrasound_seismic": {"model": "infrasound_seismic", "store": "infrasound_seismic", "variant": None, "pad_to_s": None},
 }
 DEFAULT_LANE = "mn10"
 
@@ -1232,6 +1234,14 @@ def load_verified_model(model: Dict[str, Any], model_dir: str, **kwargs: Any) ->
     return tagger, require_verified_weights(verified)
 
 
+def infrasound_block(verified: Dict[str, Any]) -> Dict[str, Any]:
+    return {"name": "infrasound-seismic", "version": InfrasoundSeismicTagger.version, "sha256": verified.get("model_sha256"), "runtime": "numpy FFT", "input_fs_hz": "100-48000", "feature_tagging": True}
+
+
+def infrasound_card(verified: Dict[str, Any]) -> Dict[str, Any]:
+    return {"model_name": "infrasound-seismic", "model_version": InfrasoundSeismicTagger.version, "model_sha256": verified.get("model_sha256"), "runtime": "numpy FFT", "frequency_range_hz": [0.1, 100.0], "provenance": "model", "human_verified": False, "usable_as_training_label": False}
+
+
 MODELS: Dict[str, Dict[str, Any]] = {
     "mn10": {"verify": verify_weights, "load": lambda d: Tagger(*weights_paths(d)),
              "block": model_block, "card": model_card, "card_file": "tag_model_card.json",
@@ -1245,6 +1255,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
                     "card": birdnet_card, "card_file": "tag_model_card-birdnet_v24.json",
                     "prepare": prepare_birdnet, "embed_only": False, "fs_hz": BIRDNET_FS_HZ,
                     "group": birdnet_group, "species": True},
+    "infrasound_seismic": {"verify": lambda _d: dict(InfrasoundSeismicTagger.verified), "load": lambda _d: InfrasoundSeismicTagger(), "block": infrasound_block, "card": infrasound_card, "card_file": "tag_model_card-infrasound_seismic.json", "prepare": lambda pcm, _fs, _pad=None: pcm, "embed_only": False, "fs_hz": 400.0, "group": lambda _scores: "infrasound", "species": False, "raw_rate": True},
 }
 
 
@@ -1437,6 +1448,13 @@ def tag_one(tagger: Any, row: Dict[str, Any], root: str, mb: Dict[str, Any],
     except Exception as exc:
         return {"ok": False, "reason": R_WAV_UNREADABLE,
                 "detail": "%s: %s" % (type(exc).__name__, exc)}
+    if MODELS[LANES[lane]["model"]].get("raw_rate"):
+        try:
+            got = tagger.tag(pcm, fs_hz=float(header_fs), floor=floor)
+        except Exception as exc:
+            return {"ok": False, "reason": R_MODEL_ERROR, "detail": "%s: %s" % (type(exc).__name__, exc)}
+        out = {"tag_schema_version": TAGS.TAG_SCHEMA_VERSION, "schema": TAG_SCHEMA, "tag_key": TAGS.tag_key(ck, mb.get("name"), mb.get("version"), mb.get("sha256")), "lane": lane, "clip_key": ck, "det_ref": row.get("record_key"), "node": row.get("node"), "day": _row_day(row), "model": mb, "claim": claim_block(False), "scores": got.get("scores", {}), "confidence": got.get("confidence", {}), "feature_metrics": got.get("feature_metrics", {}), "max_unstored_score": 0.0, "n_classes_scored": got.get("n_classes_scored", 0), "n_passes": 1, "embedding_dim": 0, "embedding": [], "pre_norm_dbfs": dbfs(pcm), "wav_header_fs_hz": int(header_fs), "rate_recovered": None, "input_pad_to_s": None, "fs_model_hz": float(header_fs), "fs_source_hz": float(header_fs), "csv_fs_hz": row.get("fs_hz"), "anchored": bool(row.get("anchored")), "window": None, "sample_window": TAGS.sample_window(row), "provenance": "model", "created_utc_s": now}
+        return {"ok": True, "row": out}
     # The rate is settled before the length, because the length is measured in it.
     try:
         fs_read, recovered = settle_rate(len(pcm), header_fs)
@@ -1548,7 +1566,7 @@ def run(root: str, *, model_dir: str, limit: int = DEFAULT_LIMIT,
         verified = getattr(tagger, 'verified', None)
     if verified is None:
         verified = model["verify"](model_dir)
-    verified = require_verified_weights(verified)
+    verified = verified if model.get("raw_rate") else require_verified_weights(verified)
     mb = model["block"](verified)
 
     t = empty_tally()
@@ -2036,7 +2054,8 @@ def main(argv=None) -> int:
     if a.model_dir is None:
         default_dirs = {"mn10": "~/hear-pool/models/mn10_as",
                         "birdnet_v24": "~/hear-pool/models/birdnet_v24",
-                        "perch_v2": "~/hear-pool/models/perch_v2"}
+                        "perch_v2": "~/hear-pool/models/perch_v2",
+                        "infrasound_seismic": "-"}
         a.model_dir = default_dirs[LANES[lanes[0]]["model"]]
     models = sorted({LANES[lane]["model"] for lane in lanes})
     if len(models) != 1 and not a.check:

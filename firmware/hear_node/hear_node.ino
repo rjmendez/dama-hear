@@ -101,8 +101,7 @@ static bool prov_loaded = false;    // ...and it was read back from NVS, not onl
 
 #include <hear_net.h>
 static hear_net_join_t net_join;
-static uint32_t loop_max_us = 0, loop_max_boot_us = 0;   // longest loop() pass: this health row, and since boot
-static uint32_t loop_max_boot_at_s = 0;                   // uptime at which the since-boot longest pass ended
+static uint32_t loop_max_us = 0, loop_max_boot_us = 0;   // longest loop() pass: this health row, and boot
 static uint32_t stream_stall_n = 0, stream_gone_n = 0;    // sends that gave up: stalled, client gone
 static const char *selftest_mic = "untested";
 static const char *selftest_gps = "untested";
@@ -402,18 +401,52 @@ static volatile uint32_t time_glitch   = 0;    // labellings rejected as inconsi
 static volatile uint32_t pmtk_glitch = 0; // same check, PMTK RMC branch -- its own name, not shared
 static int64_t  prev_unix_s = 0;               // last accepted label, for the +1s/edge check
 static uint32_t prev_edge_n = 0;
-static void pending_pps_label(uint64_t *local_us, uint32_t *edge_n) {
-  // The PPS ISR can advance between any two volatile reads here. Snapshot the pair once so the
-  // consistency check and the commit talk about the SAME edge rather than whichever one happened
-  // to be current at each read.
-  noInterrupts();
-  *local_us = pend_local_us;
-  *edge_n = pend_edge_n;
-  interrupts();
-}
 // millis() at the end of setup's first statement. It lived below, in the `state` block, and is
 // here now because the UBX parser above needs it to stamp first_label_s.
 static uint32_t boot_ms = 0;
+
+static portMUX_TYPE time_mux = portMUX_INITIALIZER_UNLOCKED;
+struct PendingEdgeSnapshot { uint64_t local_us; uint32_t edge_n; };
+struct TimeAnchorSnapshot { uint64_t local_us; int64_t unix_us; bool valid; };
+struct PpsCaptureSnapshot { uint32_t count; uint64_t prev_us; uint64_t last_us; uint32_t prev_sample; };
+
+static PendingEdgeSnapshot pending_edge_snapshot() {
+  PendingEdgeSnapshot s;
+  portENTER_CRITICAL(&time_mux);
+  s.local_us = pend_local_us;
+  s.edge_n = pend_edge_n;
+  portEXIT_CRITICAL(&time_mux);
+  return s;
+}
+
+static PpsCaptureSnapshot pps_capture_snapshot() {
+  PpsCaptureSnapshot s;
+  portENTER_CRITICAL(&time_mux);
+  s.count = pps_count;
+  s.prev_us = pps_us_prev;
+  s.last_us = pps_us_last;
+  s.prev_sample = pps_samp_prev_exact;
+  portEXIT_CRITICAL(&time_mux);
+  return s;
+}
+
+static void time_anchor_commit(uint64_t local_us, int64_t unix_us) {
+  portENTER_CRITICAL(&time_mux);
+  edge_local_us = local_us;
+  edge_unix_us = unix_us;
+  time_valid = true;
+  portEXIT_CRITICAL(&time_mux);
+}
+
+static TimeAnchorSnapshot time_anchor_snapshot() {
+  TimeAnchorSnapshot s;
+  portENTER_CRITICAL(&time_mux);
+  s.local_us = edge_local_us;
+  s.unix_us = edge_unix_us;
+  s.valid = time_valid && edge_unix_us != 0;
+  portEXIT_CRITICAL(&time_mux);
+  return s;
+}
 
 // ⚠️time_glitch (published as `label_rejects`) IS NOT THE LOSS COUNTER, AND IT WAS READ AS ONE.
 // It counts exactly one branch -- a NAV-PVT whose second did not advance one-per-edge -- and
@@ -435,7 +468,12 @@ static volatile uint32_t ubx_silent_max  = 0;  // longest such run this boot -- 
 static void IRAM_ATTR pps_isr() {
   uint64_t now = (uint64_t)esp_timer_get_time();
   uint32_t sm = g_samples;
-  if (pps_count && (uint32_t)(now - pps_us_last) < PPS_MIN_GAP_US) { pps_glitch++; return; }
+  portENTER_CRITICAL_ISR(&time_mux);
+  if (pps_count && (uint32_t)(now - pps_us_last) < PPS_MIN_GAP_US) {
+    pps_glitch++;
+    portEXIT_CRITICAL_ISR(&time_mux);
+    return;
+  }
   if (pps_count && !pps_resync) {
     uint32_t d = (uint32_t)(now - pps_us_last);
     if (d < pps_int_min) pps_int_min = d;
@@ -456,7 +494,8 @@ static void IRAM_ATTR pps_isr() {
   pps_samp_exact = blk_end_samp + since;
   pps_us_last = now; pps_samp_last = sm;
   pps_count++;
-  pend_local_us = now; pend_edge_n = pps_count;   // pending: named by the NAV-PVT that follows.
+  pend_local_us = now; pend_edge_n = pps_count;     // pending: named by the NAV-PVT that follows.
+  portEXIT_CRITICAL_ISR(&time_mux);
   // The previous anchor stays VALID meanwhile -- blanking it here left the node unable to
   // timestamp for the ~200 ms each second before the report arrived.
 }
@@ -616,26 +655,23 @@ static void pmtk_parse_rmc(const char *s) {
   int dy = nmea_dec2(dt), mo = nmea_dec2(dt + 2), yy = nmea_dec2(dt + 4);
   if (hh < 0 || mi < 0 || ss < 0 || dy < 1 || mo < 1 || mo > 12 || yy < 0) return;
   long long unix_s = civil_to_unix_s(2000 + yy, mo, dy, hh, mi, ss);
-  uint64_t pend_local = 0; uint32_t pend_edge = 0;
-  pending_pps_label(&pend_local, &pend_edge);
   uint64_t now_us = (uint64_t)esp_timer_get_time();
-  if (pend_edge && (now_us - pend_local) < 900000ULL) {
+  PendingEdgeSnapshot pend = pending_edge_snapshot();
+  if (pend.edge_n && (now_us - pend.local_us) < 900000ULL) {
     bool ok = true;
     if (prev_edge_n && prev_unix_s) {
       long long d_sec = unix_s - prev_unix_s;
-      long long d_edge = (long long)pend_edge - (long long)prev_edge_n;
+      long long d_edge = (long long)pend.edge_n - (long long)prev_edge_n;
       if (d_sec != d_edge) { ok = false; pmtk_glitch++; }
     }
     if (ok) {
-      edge_local_us = pend_local;
-      edge_unix_us = (int64_t)unix_s * 1000000LL;
-      time_valid = true;
+      time_anchor_commit(pend.local_us, (int64_t)unix_s * 1000000LL);
       if (!first_label_s) {
         uint32_t up = (millis() - boot_ms) / 1000;
         first_label_s = up ? up : 1;
       }
     }
-    prev_unix_s = unix_s; prev_edge_n = pend_edge;
+    prev_unix_s = unix_s; prev_edge_n = pend.edge_n;
   }
 }
 
@@ -1055,22 +1091,30 @@ static void ubx_send(uint8_t cls, uint8_t id, const uint8_t *pl, uint16_t n) {
 }
 
 static uint16_t vs_i;
-static void vs_begin() { vs_i = 0; ubx_buf[vs_i++] = 0; ubx_buf[vs_i++] = 0x01;   // version 0, RAM layer
+static bool vs_overflow;
+static void vs_begin() { vs_i = 0; vs_overflow = false; ubx_buf[vs_i++] = 0; ubx_buf[vs_i++] = 0x01;   // version 0, RAM layer
                          ubx_buf[vs_i++] = 0; ubx_buf[vs_i++] = 0; }
 static void vs_add(uint32_t key, uint32_t val) {
   // Key size lives in bits 30-28: 1=bit, 2=U1, 3=U2, 4=U4. U2 was not needed until CFG-RATE, and
   // sending a U2 key with one byte of payload gets the whole VALSET NAKed.
   int st = (key >> 28) & 0x7;
   int w = st == 4 ? 4 : st == 3 ? 2 : 1;
+  if ((size_t)vs_i + 4u + (size_t)w > sizeof(ubx_buf)) {
+    vs_overflow = true;
+    return;
+  }
   for (int i = 0; i < 4; i++) ubx_buf[vs_i++] = (key >> (8 * i)) & 0xFF;
   for (int i = 0; i < w; i++) ubx_buf[vs_i++] = (val >> (8 * i)) & 0xFF;
 }
-static void vs_send() { ubx_send(0x06, 0x8A, ubx_buf, vs_i); }
+static void vs_send() {
+  if (vs_overflow) { logln("gps   UBX VALSET overflow -- config not sent"); return; }
+  ubx_send(0x06, 0x8A, ubx_buf, vs_i);
+}
 
 // Applied at every boot into the RAM layer only -- the module's own flash is never written, so
 // nothing here is a permanent change to the operator's hardware. Power-cycle and it is stock.
 static void gps_valget() {           // ask the module what TP1 is actually set to
-  vs_i = 0; ubx_buf[vs_i++] = 0; ubx_buf[vs_i++] = 0x00;   // version 0, layer 0 = RAM
+  vs_i = 0; vs_overflow = false; ubx_buf[vs_i++] = 0; ubx_buf[vs_i++] = 0x00;   // version 0, layer 0 = RAM
   ubx_buf[vs_i++] = 0; ubx_buf[vs_i++] = 0;
   const uint32_t keys[] = {K_TP1_ENA, K_PULSE_DEF, K_PERIOD_TP1, K_PERIOD_LOCK,
                            K_LEN_TP1, K_LEN_LOCK, K_USE_LOCKED_TP1,
@@ -1079,8 +1123,11 @@ static void gps_valget() {           // ask the module what TP1 is actually set 
                            // that could invalidate the reading was not a useful read-back.
                            K_POL_TP1, K_ALIGN_TOW_TP1, K_SYNC_GNSS_TP1,
                            K_RATE_MEAS, K_RATE_NAV};
-  for (unsigned k = 0; k < sizeof(keys) / sizeof(keys[0]); k++)
+  for (unsigned k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+    if ((size_t)vs_i + 4u > sizeof(ubx_buf)) { vs_overflow = true; break; }
     for (int i = 0; i < 4; i++) ubx_buf[vs_i++] = (keys[k] >> (8 * i)) & 0xFF;
+  }
+  if (vs_overflow) { logln("gps   UBX VALGET overflow -- request not sent"); return; }
   ubx_send(0x06, 0x8B, ubx_buf, vs_i);
 }
 
@@ -1149,13 +1196,12 @@ static void ubx_msg() {
         unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
         long long days = (long long)era * 146097 + (long long)doe - 719468;
         long long unix_s = days * 86400LL + hh * 3600LL + mi * 60LL + ss;
-        uint64_t pend_local = 0; uint32_t pend_edge = 0;
-        pending_pps_label(&pend_local, &pend_edge);
         uint64_t now_us = (uint64_t)esp_timer_get_time();
         // Only label an edge we actually saw, and only if this solution is for THAT second: the
         // report follows its own epoch by well under a second. Outside that window we do not
         // guess -- an unlabelled edge is honest, a mislabelled one is 343 m of lie.
-        if (pend_edge && (now_us - pend_local) < 900000ULL) {
+        PendingEdgeSnapshot pend = pending_edge_snapshot();
+        if (pend.edge_n && (now_us - pend.local_us) < 900000ULL) {
           // The time window alone is not enough. NAV-PVT's own epoch sits ~200 ms past the second
           // here, so a LATE report can arrive just after the NEXT edge and land inside the window
           // -- labelling that edge with the previous second. That is the 343 m error, and it looks
@@ -1163,13 +1209,11 @@ static void ubx_msg() {
           bool ok = true;
           if (prev_edge_n && prev_unix_s) {
             long long d_sec = (long long)unix_s - prev_unix_s;
-            long long d_edge = (long long)pend_edge - (long long)prev_edge_n;
+            long long d_edge = (long long)pend.edge_n - (long long)prev_edge_n;
             if (d_sec != d_edge) { ok = false; time_glitch++; }
           }
           if (ok) {                                   // commit local+utc as one matched pair
-            edge_local_us = pend_local;
-            edge_unix_us = (int64_t)unix_s * 1000000LL;
-            time_valid = true;
+            time_anchor_commit(pend.local_us, (int64_t)unix_s * 1000000LL);
             // Latched once. The gap between this and 0 is the node's real time-to-first-label,
             // and until now the only way to bound it was to notice that a detection had no
             // stamp -- which needs a detection to have happened.
@@ -1178,7 +1222,7 @@ static void ubx_msg() {
               first_label_s = up ? up : 1;            // 0 stays reserved for "never"
             }
           }
-          prev_unix_s = unix_s; prev_edge_n = pend_edge;   // re-sync either way
+          prev_unix_s = unix_s; prev_edge_n = pend.edge_n;     // re-sync either way
         }
       }
     }
@@ -1575,8 +1619,10 @@ static float env_peak_seen = 0;
 // is worth more than no stamp. stamp_sigma_ns() below is that number, and it is what makes the
 // silence visible instead of invisible.
 static bool local_to_utc(uint64_t local_us, int64_t *utc_us) {
-  if (!time_valid || !edge_unix_us) return false;
-  *utc_us = edge_unix_us + (int64_t)(local_us - edge_local_us);
+  if (!utc_us) return false;
+  TimeAnchorSnapshot a = time_anchor_snapshot();
+  if (!a.valid) return false;
+  *utc_us = a.unix_us + (int64_t)(local_us - a.local_us);
   return true;
 }
 
@@ -1639,11 +1685,12 @@ static bool local_to_utc(uint64_t local_us, int64_t *utc_us) {
 // 0 means NO STAMP: the caller writes an empty column rather than a number, because 0 ns of
 // uncertainty is a claim no hardware supports and hear/nodeclass.py refuses it as one.
 static uint64_t stamp_sigma_ns(uint64_t local_us) {
-  if (!time_valid || !edge_unix_us) return 0;
-  uint64_t anchor = (uint64_t)edge_local_us;
+  TimeAnchorSnapshot a = time_anchor_snapshot();
+  if (!a.valid) return 0;
+  uint64_t edge_local_us = a.local_us;
   // A back-dated capture can precede the anchor edge; the magnitude of the interpolation is what
   // carries the drift either way.
-  uint64_t age_us = local_us >= anchor ? local_us - anchor : anchor - local_us;
+  uint64_t age_us = local_us >= edge_local_us ? local_us - edge_local_us : edge_local_us - local_us;
   double drift_ns = (double)age_us * STAMP_DRIFT_PPM_MAX / 1000.0;
   return (uint64_t)STAMP_ANCHOR_SIGMA_US * 1000ULL + (uint64_t)(drift_ns + 0.5);
 }
@@ -1725,6 +1772,11 @@ static uint64_t praw_oldest64() {
 static uint32_t praw_oldest() { return (uint32_t)praw_oldest64(); }   // oldest sample the ring holds
 static uint64_t praw_floor() { return praw_oldest64() * DECIM; }      // the same, as a praw index
 static uint32_t praw_mark_first() { return praw_mark_n > PRAW_MARKS ? praw_mark_n - PRAW_MARKS : 0; }
+static void praw_mark_push(int64_t utc_us, uint32_t sample) {
+  praw_mark[praw_mark_n % PRAW_MARKS].utc_us = utc_us;
+  praw_mark[praw_mark_n % PRAW_MARKS].sample = sample;
+  praw_mark_n = (praw_mark_n == UINT32_MAX) ? PRAW_MARKS : praw_mark_n + 1u;
+}
 
 // What a mark is worth. Its sample index is interpolated from the last completed block to the
 // edge and clamped to one block, so in steady running it is good to about a sample; if the reader
@@ -2837,7 +2889,8 @@ static String status_json() {
   uint32_t esp_n = 0; double esp_ppm = esp_clock_ppm(&esp_n);
   int64_t utc_now = 0; uint64_t nowl = (uint64_t)esp_timer_get_time();
   bool tv = local_to_utc(nowl, &utc_now);
-  uint64_t since_edge = pps_count ? (nowl - edge_local_us) : 0;
+  TimeAnchorSnapshot anchor = time_anchor_snapshot();
+  uint64_t since_edge = (pps_count && anchor.valid) ? (nowl - anchor.local_us) : 0;
   (void)tv;
   uint32_t r_new = g_samples, r_old = praw_oldest();
   uint32_t r_held = praw_cap ? r_new - r_old : 0;
@@ -2877,7 +2930,7 @@ static String status_json() {
     "\"net\":{\"connected\":%s,\"rssi\":%s,\"rssi_join\":%d,\"ch\":%d,\"bssid\":\"%s\",\"joined\":%d,"
       "\"seen\":%d,\"join_ms\":%lu,\"disc\":%lu,\"reconn\":%lu,\"reason\":%d,\"disc_age_s\":%s},"
     "\"sys\":{\"reset\":\"%s\",\"heap_min\":%lu,\"psram_min\":%lu,\"loop_max_ms\":%lu,"
-      "\"loop_max_boot_ms\":%lu,\"loop_max_boot_at_s\":%lu,\"chip_c\":%.1f,\"stream_stalls\":%lu,\"stream_gone\":%lu},"
+      "\"loop_max_boot_ms\":%lu,\"chip_c\":%.1f,\"stream_stalls\":%lu,\"stream_gone\":%lu},"
     "\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"pmtk_ack\":%lu,\"pmtk_nak\":%lu,\"pmtk_glitch\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
@@ -2952,8 +3005,7 @@ static String status_json() {
     (unsigned long)hear_net_disconnects(), (unsigned long)hear_net_reconnects(),
     hear_net_last_reason(), disc_age_json(),
     reset_reason_name(), (unsigned long)ESP.getMinFreeHeap(), (unsigned long)ESP.getMinFreePsram(),
-    (unsigned long)(loop_max_us / 1000), (unsigned long)(loop_max_boot_us / 1000),
-    (unsigned long)loop_max_boot_at_s, temperatureRead(),
+    (unsigned long)(loop_max_us / 1000), (unsigned long)(loop_max_boot_us / 1000), temperatureRead(),
     (unsigned long)stream_stall_n, (unsigned long)stream_gone_n,
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
@@ -2979,7 +3031,7 @@ static String status_json() {
     fs_timebase(), (unsigned long)drop_seconds,
     (unsigned long)drop_samples, (unsigned long)over_seconds, (unsigned long)samp_sec_last,
     esp_ppm, (unsigned long)esp_n,
-    time_valid ? "true" : "false", (long long)utc_now, (unsigned long long)since_edge,
+    anchor.valid ? "true" : "false", (long long)utc_now, (unsigned long long)since_edge,
     (unsigned long long)stamp_sigma_ns(nowl),
     (long)last_nano, (unsigned long)time_glitch,
     (unsigned long)dets_unlabelled, (unsigned long)first_label_s,
@@ -3054,8 +3106,8 @@ static void h_dets() {
   uint32_t n = total < det_cap ? total : det_cap;
   if (n > DETS_HTTP_MAX) n = DETS_HTTP_MAX;
   uint32_t first = total - n;                 // ring: the newest n, oldest first
-  http.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  http.send(200, "application/json", "[");
+  String o = "[";
+  o.reserve(n * (MELIMP_FRAME_BYTES * 2 + 280) + 64);
   for (uint32_t k = first; k < total; k++) {
     const Det &d = dets[k % det_cap];
     char b[240];
@@ -3066,12 +3118,10 @@ static void h_dets() {
              (unsigned long)d.uptime_s, (unsigned long)d.sample,
              (unsigned long)d.pps_n, (long)d.us_since_pps, d.trigger, (unsigned)d.flags, d.fs_at,
              MELIMP_FRAME_BYTES);
-    http.sendContent(b);
+    o += b;
     static const char hx[] = "0123456789abcdef";
-    String frame;
-    frame.reserve(MELIMP_FRAME_BYTES * 2);
     for (int j = 0; j < MELIMP_FRAME_BYTES; j++) {
-      frame += hx[d.frame[j] >> 4]; frame += hx[d.frame[j] & 0xF];
+      o += hx[d.frame[j] >> 4]; o += hx[d.frame[j] & 0xF];
     }
     // ⚠️tools/hear_bridge.py's rows_from_detections() selects DETS_COLUMNS[:-1], so these two keys
     // are dropped on that path until that list grows. They are here anyway: /detections is also
@@ -3080,10 +3130,10 @@ static void h_dets() {
     char cp[80] = "";
     if (d.clip_st == CLIP_OK) clip_name(cp, sizeof cp, d.cseq, d.sample);
     snprintf(t, sizeof t, "\",\"clip\":\"%s\",\"clip_why\":\"%s\"}", cp, clip_why(d.clip_st));
-    http.sendContent(frame + t);
+    o += t;
   }
-  http.sendContent("]");
-  http.sendContent("");
+  o += "]";
+  http.send(200, "application/json", o);
 }
 
 // Hoisted above setup(): /format must close this before it unmounts, and the section that
@@ -3186,41 +3236,24 @@ static bool gps_autobaud() {
       logf("gps   measured %lu us/bit -> %lu baud (%.1f%% off standard), trying it first\n",
            (unsigned long)bit_us, (unsigned long)measured, (double)snap_err);
     uint32_t best_b = 0; int best_score = 0; bool best_ubx = false;
-    int cnm = 0, cub = 0;
-    bool confirmed = false;
-    for (unsigned k = 0; k < nc && !confirmed; k++) {
+    for (unsigned k = 0; k < nc; k++) {
       Serial1.begin(cand[k], SERIAL_8N1, gps_rx_pin, gps_tx_pin);
       int nm = 0, ub = 0;
       gps_listen(1200, &nm, &ub);
       logf("gps   %6lu baud -> %d NMEA, %d UBX\n", (unsigned long)cand[k], nm, ub);
       int score = nm + ub;
       if (score > best_score) { best_score = score; best_b = cand[k]; best_ubx = (ub > nm); }
-      // A rate that already reaches the quorum is confirmed here, and a confirmed rate ends the
-      // sweep: the remaining dwells cannot beat a link that has decoded twice.
-      if (score >= GPS_DECODE_QUORUM) {
-        cnm = 0; cub = 0;
-        gps_listen(GPS_CONFIRM_MS, &cnm, &cub);
-        confirmed = (cnm + cub) >= GPS_DECODE_QUORUM;
-        if (confirmed) {
-          best_b = cand[k]; best_ubx = (cub > cnm); gps_baud = cand[k];
-          logf("gps   %lu baud confirmed after %u of %u rates\n",
-               (unsigned long)cand[k], k + 1, nc);
-        }
-      }
-      if (!confirmed) Serial1.end();
+      Serial1.end();
       boot_wdt_service();
     }
-    if (!confirmed) {
-      gps_baud = best_b ? best_b : 9600;
-      Serial1.begin(gps_baud, SERIAL_8N1, gps_rx_pin, gps_tx_pin);
-      // Confirm the winner rather than trusting its sweep score. A rate that only ever scored
-      // once has not been distinguished from noise, and reporting it as a decoded link is what
-      // stops the caller trying the other pin order.
-      cnm = 0; cub = 0;
-      gps_listen(GPS_CONFIRM_MS, &cnm, &cub);
-      confirmed = best_b && (cnm + cub) >= GPS_DECODE_QUORUM;
-      if (cnm + cub) best_ubx = (cub > cnm);
-    }
+    gps_baud = best_b ? best_b : 9600;
+    Serial1.begin(gps_baud, SERIAL_8N1, gps_rx_pin, gps_tx_pin);
+    // Confirm the winner rather than trusting its sweep score. A rate that only ever scored
+    // once has not been distinguished from noise, and reporting it as a decoded link is what
+    // stops the caller trying the other pin order.
+    int cnm = 0, cub = 0;
+    gps_listen(GPS_CONFIRM_MS, &cnm, &cub);
+    bool confirmed = best_b && (cnm + cub) >= GPS_DECODE_QUORUM;
     logf("gps   using %lu baud (%s) -- confirm %d NMEA, %d UBX in %d ms: %s\n",
                   (unsigned long)gps_baud, best_ubx ? "UBX binary" : "NMEA",
                   cnm, cub, GPS_CONFIRM_MS,
@@ -4182,6 +4215,7 @@ void setup() {
     uint64_t s = acq_of((uint32_t)got0);                        // acquisition domain
     uint32_t left = nout * DECIM;
     while (left && stream_ready(c, &due)) {
+      if (!praw || !praw_cap) break;
       if (s < praw_floor()) break;
       uint32_t nsamp = left > STREAM_CHUNK_B / 2 ? STREAM_CHUNK_B / 2 : left;
       uint32_t idx = (uint32_t)(s % praw_cap);
@@ -4698,7 +4732,7 @@ void loop() {
     if (last_us) {
       uint32_t d = now - last_us;
       if (d > loop_max_us) loop_max_us = d;
-      if (d > loop_max_boot_us) { loop_max_boot_us = d; loop_max_boot_at_s = (millis() - boot_ms) / 1000; }
+      if (d > loop_max_boot_us) loop_max_boot_us = d;
     }
     last_us = now; }
   http.handleClient();
@@ -4809,27 +4843,20 @@ void loop() {
         // or refuses.) Only when exactly one edge has passed, because a blocking handler can
         // straddle two, and then the timestamp and the sample count describe different seconds.
         if (span == 1) {
-          // The ISR writes the timestamp and the sample index as a set. Read them, then re-read
-          // the edge counter: if an edge landed between the two reads, the pair is mismatched by
-          // a whole second -- 343 m -- so throw it away rather than record it.
-          uint64_t mus = pps_us_prev;
-          uint32_t msamp = pps_samp_prev_exact;
-          uint64_t lus = pps_us_last;
-          if (pps_count == e) {
+          PpsCaptureSnapshot cap = pps_capture_snapshot();
+          if (cap.count == e) {
             // The crystal figure, accumulated where the pair can be validated rather than in the
             // ISR. An interval that is not about a second means an EDGE WENT MISSING -- pps_count
             // did not advance for it, so anything computed per counted edge is short by one. Both
             // it and the interval that spans a timepulse probe are counted and excluded, never
             // averaged: that exclusion IS the fix to esp_clock_ppm.
-            uint32_t iv = (uint32_t)(lus - mus);
+            uint32_t iv = (uint32_t)(cap.last_us - cap.prev_us);
             if (probed)                     { /* the probe moved the clock: measures nothing */ }
             else if (iv > 1500000u)         { pps_gaps++; }
             else                            { esp_iv_sum_us += iv; esp_iv_n++; }
             int64_t mu;
-            if (local_to_utc(mus, &mu)) {
-              praw_mark[praw_mark_n % PRAW_MARKS].utc_us = mu;
-              praw_mark[praw_mark_n % PRAW_MARKS].sample = msamp;
-              praw_mark_n++;
+            if (local_to_utc(cap.prev_us, &mu)) {
+              praw_mark_push(mu, cap.prev_sample);
             }
           }
         }

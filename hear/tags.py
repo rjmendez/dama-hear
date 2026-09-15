@@ -58,11 +58,12 @@ BASIS_SAMPLE = "sample"
 BASIS_NONE = "none"
 
 # Stable deployment names remain separate from versioned lane/artifact names.
-MODEL_BACKENDS = ("yamnet", "birdnet", "perch")
+MODEL_BACKENDS = ("yamnet", "birdnet", "perch", "infrasound")
 MODEL_BACKEND_LANES = {
     "yamnet": "mn10",
     "birdnet": "birdnet_v24",
     "perch": "perch_v2",
+    "infrasound": "infrasound_seismic",
 }
 
 

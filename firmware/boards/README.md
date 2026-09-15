@@ -20,6 +20,8 @@ Roughly 2000 of those 2702 lines are platform. About 700 are board. This is the 
 |---|---|---|
 | `xiao_s3_sense.h` | Seeed XIAO ESP32-S3 Sense | built — nyquist, mach, rankine. Compiled by `night_node.ino`. |
 | `esp32s3_i2s_gps.h` | ESP32-S3 breakout + I2S mic + PMTK GPS | built — gold, ageev, kasami. Compiled by `hear_node.ino` with `-DHEAR_BOARD_ESP32S3_I2S_GPS`; release assets are published separately for this class. |
+| `esp32s3_speaker.h` | Waveshare ESP32-S3-AUDIO-Board (2 mics, speaker DAC, PPS GPIO4) | built — hugbot edge audio node over bidirectional USB datalink. |
+| `esp32s3_box3.h` | Espressif ESP32-S3-BOX-3 (2 mics, speaker DAC, ST7789 LCD, PPS GPIO13) | built — hugbot edge audio node + LCD interface over bidirectional USB datalink. |
 | `puc.h` | BirdWeather PUC | built — but ⚠️**compiled by nothing**; `puc_node.ino` carries its own copy of the pins, and that divergence let a wrong PPS pin survive two months. `tests/test_puc_pps_pin.py` is the comparison that now holds them together. |
 | `esp32s3_lora.h` | full-size ESP32-S3 + RFM95W (Meshtastic) | ⚠️**not built, and no pin in it is measured.** Every value is derived from the ESP-IDF headers, a datasheet or another board's convention. `docs/esp32s3-lora-node.md` is the build procedure and step 1 is a whole-bank pin scan, not a soldering iron. `tests/test_esp32s3_lora_board.py` checks it against what the silicon forbids. |
 
