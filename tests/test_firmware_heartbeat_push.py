@@ -262,12 +262,13 @@ def test_loop_marks_real_events_where_they_happen():
     assert "push_pump();" in _fn("loop")
 
 
-def test_heartbeat_backoff_is_tens_of_seconds_capped_at_one_minute():
-    assert '#define HEAR_PUSH_HEARTBEAT_MS      10000UL' in CODE
+def test_heartbeat_backoff_uses_exponential_full_jitter_capped_at_one_minute():
+    assert '#define HEAR_PUSH_RETRY_BASE_MS     1000UL' in CODE
     assert '#define HEAR_PUSH_HEARTBEAT_MAX_MS  60000UL' in CODE
     body = _fn("push_backoff_ms")
-    assert "ms *= 2;" in body
-    assert "return HEAR_PUSH_HEARTBEAT_MAX_MS;" in body
+    assert "cap * 2" in body
+    assert "random((long)cap + 1L)" in body
+    assert "return delay_ms ? delay_ms : 1;" in body
 
 
 def test_firmware_defaults_to_the_public_ingest_api_over_tls():
