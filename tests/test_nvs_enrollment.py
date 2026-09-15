@@ -262,6 +262,10 @@ class TestPostFlashVersionCheck:
         monkeypatch.setattr(flash.os.path, "exists", lambda path: path.endswith("hear_node.ino.bin"))
         monkeypatch.setattr(flash.time, "sleep", lambda _: None)
         monkeypatch.setattr(flash, "built_fw_version", lambda path=None: built)
+        # An over-the-air build-mode flash refuses an image with no admin token, because that
+        # image would refuse /update from everyone afterwards. This lane is about the version
+        # check, so give it the token it needs to get that far.
+        monkeypatch.setattr(flash, "admin_token", lambda path=None: "s3cr3t")
         monkeypatch.setattr(flash.subprocess, "run", lambda cmd, **kw: type(
             "R", (), {"stdout": "OK", "stderr": "", "returncode": 0})())
         return flash.main(["flash.py", "gold", "172.16.100.50"])
@@ -381,6 +385,7 @@ class TestBoardClassSelection:
         monkeypatch.setattr(flash, "status", lambda host: next(states))
         monkeypatch.setattr(flash.os.path, "exists", lambda path: path.endswith("hear_node.ino.bin"))
         monkeypatch.setattr(flash.time, "sleep", lambda _: None)
+        monkeypatch.setattr(flash, "admin_token", lambda path=None: "s3cr3t")
         # gen_secrets.py is stubbed out below, so no secrets.h is written for this build and the
         # version assertion has nothing to assert against; that is the skip case, not a failure.
         monkeypatch.setattr(flash, "built_fw_version", lambda path=None: None)
