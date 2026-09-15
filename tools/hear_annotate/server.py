@@ -157,12 +157,6 @@ def load_tags(corpus_root: str) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
     clips = os.path.join(corpus_root, "clips")
     specs = (("audioset", "tags.jsonl"), ("birdnet", "tags-birdnet_v24.jsonl"))
     out: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-    gunshot_head = None
-    try:
-        from hear.gunshot import GunshotHead
-        gunshot_head = GunshotHead.load()
-    except Exception:
-        pass
 
     for lane, name in specs:
         for row in _read_jsonl(os.path.join(clips, name)):
@@ -170,15 +164,6 @@ def load_tags(corpus_root: str) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
             if not isinstance(key, str) or not key:
                 continue
             out.setdefault(key, {}).setdefault(lane, []).append(normalize_prediction(row))
-            if lane == "audioset" and gunshot_head is not None and "embedding" in row:
-                g_pred = gunshot_head.evaluate_tag_row(row)
-                if g_pred is not None:
-                    out.setdefault(key, {}).setdefault("gunshot", []).append({
-                        "model": g_pred["model"],
-                        "version": "1.0",
-                        "provenance": "model",
-                        "predictions": [{"label": "Gunshot", "score": g_pred["score"]}],
-                    })
     return out
 
 
