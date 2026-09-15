@@ -8,7 +8,7 @@ metadata:
   labels:
     app: hear-pool-backup
   annotations:
-    dama-hear/commit: 'd51f617'
+    dama-hear/commit: '1f7c5e0'
     dama-hear/source-sha256: '7ef3e88f66ed17f149220f7d93819331f2c3f0cda149bc10aab50944d66091b4'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
