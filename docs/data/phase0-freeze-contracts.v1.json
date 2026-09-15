@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "8cabf697fd30024ae21e07ba768ee2d5aac3d7ae20c53dc0de6b03add4aaf4b3",
+  "baseline_hash": "124d733e896fd748811999ad23bcb4f6443d82491dec5aad6fd817c1ab80080b",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -251,12 +251,12 @@
     ],
     "default_board_class": "xiao-s3-pps",
     "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
-    "section_hash": "810f0994fa8de3f73157e581e8033c47511536e71946a714a9f3b43cd03921d9",
+    "section_hash": "127af3f4fa499dbceba49a4225f46919c6567284e329c3511bb7460b63aa651d",
     "source_files": [
       {
         "path": ".github/workflows/firmware.yml",
-        "sha256": "cc883e24286073e7535935ae2bda67ce3df57f5abb09fb4b51f4c413eb3446de",
-        "size_bytes": 5125
+        "sha256": "3700ce1d3b1a8e7802e353d91428d8f846faf379eb03557bd864bf5d5049df10",
+        "size_bytes": 6254
       },
       {
         "path": ".github/workflows/release.yml",
@@ -270,13 +270,13 @@
       },
       {
         "path": "firmware/hear_node/README.md",
-        "sha256": "84b885a8c20edcc90870e0f2517ed69fa8e926f0736ac37143d0684913537e49",
-        "size_bytes": 50518
+        "sha256": "18af9d76aaa5fdf420d2311fe28429a1741ed52c779c8a4f97f740dae141c8c2",
+        "size_bytes": 53135
       },
       {
         "path": "firmware/hear_node/board_profiles.py",
-        "sha256": "c542aa4980fe021f5c75f36f7b24a19707dca6f0c39473bc49e9cb9b3142310b",
-        "size_bytes": 2146
+        "sha256": "7bacb23e11938ec0762beb43b6001b8e63b32191f0111ff7cf4f3c46e049b3e3",
+        "size_bytes": 7813
       },
       {
         "path": "firmware/hear_node/gen_secrets.py",
@@ -285,8 +285,8 @@
       },
       {
         "path": "firmware/hear_node/hear_node.ino",
-        "sha256": "811850c38da135ad1256293e077190e102c132dcd05b20b85c739bea8530f1bb",
-        "size_bytes": 319664
+        "sha256": "7f562253b40227566704297c079fb217240742d3bec540cb2c07ec9e46271928",
+        "size_bytes": 322334
       },
       {
         "path": "firmware/hear_node/hear_push_payload.h",
@@ -350,6 +350,21 @@
         ],
         "guarded": true,
         "release_stem": "hear_node-esp32s3-i2s-gps",
+        "sketch": "hear_node"
+      },
+      {
+        "artifact": "fw-hear_node-esp32s3-i2s-gps-qspi",
+        "board_class": "esp32s3-i2s-gps",
+        "build_flags": [
+          "-DHEAR_ALLOW_NO_WIFI",
+          "-DHEAR_BOARD_ESP32S3_I2S_GPS"
+        ],
+        "fqbn": "esp32:esp32:esp32s3:PSRAM=enabled,FlashSize=8M,PartitionScheme=default_8MB,USBMode=default,CDCOnBoot=cdc",
+        "guard_flags": [
+          "-DHEAR_BOARD_ESP32S3_I2S_GPS"
+        ],
+        "guarded": true,
+        "release_stem": null,
         "sketch": "hear_node"
       },
       {

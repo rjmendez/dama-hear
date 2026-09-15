@@ -14,9 +14,9 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | 8cabf697fd30024ae21e07ba768ee2d5aac3d7ae20c53dc0de6b03add4aaf4b3 |
+| baseline | 124d733e896fd748811999ad23bcb4f6443d82491dec5aad6fd817c1ab80080b |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
-| firmware_build_metadata | 810f0994fa8de3f73157e581e8033c47511536e71946a714a9f3b43cd03921d9 |
+| firmware_build_metadata | 127af3f4fa499dbceba49a4225f46919c6567284e329c3511bb7460b63aa651d |
 | schemas | d154fa286b1f1cb8506ab5c36f0d6291dfeaab5f096512b7635d9582f833b5e1 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |
 | redis_keys | d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03 |
@@ -74,6 +74,7 @@ Source hashes:
 | --- | --- | --- | --- | --- |
 | hear_node | xiao-s3-pps | yes | fw-hear_node-xiao-s3-pps | -DHEAR_ALLOW_NO_WIFI |
 | hear_node | esp32s3-i2s-gps | yes | fw-hear_node-esp32s3-i2s-gps | -DHEAR_ALLOW_NO_WIFI -DHEAR_BOARD_ESP32S3_I2S_GPS |
+| hear_node | esp32s3-i2s-gps | yes | fw-hear_node-esp32s3-i2s-gps-qspi | -DHEAR_ALLOW_NO_WIFI -DHEAR_BOARD_ESP32S3_I2S_GPS |
 | puc_node | (none) | yes | fw-puc_node | -DHEAR_ALLOW_NO_WIFI |
 | hear_poc | (none) | no | fw-hear_poc | -DHEAR_ALLOW_NO_WIFI |
 | path_test | (none) | no | fw-path_test | -DHEAR_ALLOW_NO_WIFI |

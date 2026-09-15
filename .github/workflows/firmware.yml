@@ -21,18 +21,25 @@ env:
 
 jobs:
   build:
-    name: build ${{ matrix.sketch }}${{ matrix.board_class && format(' ({0})', matrix.board_class) || '' }}
+    name: build ${{ matrix.sketch }}${{ matrix.board_class && format(' ({0})', matrix.board_class) || '' }}${{ matrix.psram_mode == 'quad' && ' [quad psram]' || '' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { sketch: hear_node,     fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: true,  board_class: "xiao-s3-pps",      release_stem: "hear_node-xiao-s3-pps",      build_flags: "-DHEAR_ALLOW_NO_WIFI",                                guard_flags: "",                              artifact: "fw-hear_node-xiao-s3-pps" }
-          - { sketch: hear_node,     fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: true,  board_class: "esp32s3-i2s-gps", release_stem: "hear_node-esp32s3-i2s-gps", build_flags: "-DHEAR_ALLOW_NO_WIFI -DHEAR_BOARD_ESP32S3_I2S_GPS", guard_flags: "-DHEAR_BOARD_ESP32S3_I2S_GPS", artifact: "fw-hear_node-esp32s3-i2s-gps" }
-          - { sketch: puc_node,      fqbn: "esp32:esp32:esp32s3:PSRAM=opi",      guarded: true,  board_class: "",                 release_stem: "",                            build_flags: "-DHEAR_ALLOW_NO_WIFI",                                guard_flags: "",                              artifact: "fw-puc_node" }
-          - { sketch: hear_poc,      fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false, board_class: "",                 release_stem: "",                            build_flags: "-DHEAR_ALLOW_NO_WIFI",                                guard_flags: "",                              artifact: "fw-hear_poc" }
-          - { sketch: path_test,     fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false, board_class: "",                 release_stem: "",                            build_flags: "-DHEAR_ALLOW_NO_WIFI",                                guard_flags: "",                              artifact: "fw-path_test" }
-          - { sketch: sense_bringup, fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false, board_class: "",                 release_stem: "",                            build_flags: "-DHEAR_ALLOW_NO_WIFI",                                guard_flags: "",                              artifact: "fw-sense_bringup" }
+          - { sketch: hear_node,     fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: true,  board_class: "xiao-s3-pps",      release_stem: "hear_node-xiao-s3-pps",      build_flags: "-DHEAR_ALLOW_NO_WIFI",                                guard_flags: "",                              artifact: "fw-hear_node-xiao-s3-pps", psram_mode: "octal" }
+          - { sketch: hear_node,     fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: true,  board_class: "esp32s3-i2s-gps", release_stem: "hear_node-esp32s3-i2s-gps", build_flags: "-DHEAR_ALLOW_NO_WIFI -DHEAR_BOARD_ESP32S3_I2S_GPS", guard_flags: "-DHEAR_BOARD_ESP32S3_I2S_GPS", artifact: "fw-hear_node-esp32s3-i2s-gps", psram_mode: "octal" }
+          # ⚠️SAME board class, DIFFERENT silicon. esp32s3-i2s-gps covers boards wired alike that
+          # do not carry the same memory: ageev is 8MB OCTAL PSRAM, gold is 2MB QUAD. PSRAM bus
+          # mode is compiled in, so one FQBN cannot serve both -- gold ran the octal image with
+          # psramFound()==false and no raw ring. This leg keeps the quad build compiling; it is
+          # NOT published (release_stem is empty), so flash.py builds it per node from this tree
+          # and refuses to hand gold the octal class release.
+          - { sketch: hear_node,     fqbn: "esp32:esp32:esp32s3:PSRAM=enabled,FlashSize=8M,PartitionScheme=default_8MB,USBMode=default,CDCOnBoot=cdc", guarded: true, board_class: "esp32s3-i2s-gps", release_stem: "", build_flags: "-DHEAR_ALLOW_NO_WIFI -DHEAR_BOARD_ESP32S3_I2S_GPS", guard_flags: "-DHEAR_BOARD_ESP32S3_I2S_GPS", artifact: "fw-hear_node-esp32s3-i2s-gps-qspi", psram_mode: "quad" }
+          - { sketch: puc_node,      fqbn: "esp32:esp32:esp32s3:PSRAM=opi",      guarded: true,  board_class: "",                 release_stem: "",                            build_flags: "-DHEAR_ALLOW_NO_WIFI",                                guard_flags: "",                              artifact: "fw-puc_node", psram_mode: "octal" }
+          - { sketch: hear_poc,      fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false, board_class: "",                 release_stem: "",                            build_flags: "-DHEAR_ALLOW_NO_WIFI",                                guard_flags: "",                              artifact: "fw-hear_poc", psram_mode: "octal" }
+          - { sketch: path_test,     fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false, board_class: "",                 release_stem: "",                            build_flags: "-DHEAR_ALLOW_NO_WIFI",                                guard_flags: "",                              artifact: "fw-path_test", psram_mode: "octal" }
+          - { sketch: sense_bringup, fqbn: "esp32:esp32:XIAO_ESP32S3:PSRAM=opi", guarded: false, board_class: "",                 release_stem: "",                            build_flags: "-DHEAR_ALLOW_NO_WIFI",                                guard_flags: "",                              artifact: "fw-sense_bringup", psram_mode: "octal" }
     steps:
       - uses: actions/checkout@v7
         with:

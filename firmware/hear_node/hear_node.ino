@@ -1699,6 +1699,8 @@ static bool i2s_up = false;
 static WebServer http(80);
 static bool sd_ok = false, sta_ok = false;
 static int sd_cs = 0;
+// PSRAM the build was told to expect and the chip did not answer for. See psram_boot_check().
+static bool psram_fault = false;
 
 // ---------------------------------------------------------------- admin auth (Alert 1)
 // Every privileged endpoint below -- OTA upload, reboot, SD format, gate-floor writes, and the
@@ -3188,7 +3190,10 @@ static String status_json() {
     "\"net\":{\"connected\":%s,\"rssi\":%s,\"rssi_join\":%d,\"ch\":%d,\"bssid\":\"%s\",\"joined\":%d,"
       "\"seen\":%d,\"join_ms\":%lu,\"disc\":%lu,\"reconn\":%lu,\"reason\":%d,\"disc_age_s\":%s},"
     "\"sys\":{\"reset\":\"%s\",\"heap_min\":%lu,\"heap_max_alloc\":%lu,\"stack_high_watermark_words\":%lu,\"psram_min\":%lu,\"loop_max_ms\":%lu,"
-      "\"loop_max_boot_ms\":%lu,\"loop_max_boot_at_s\":%lu,\"chip_c\":%.1f,\"stream_stalls\":%lu,\"stream_gone\":%lu},"
+      // psram_fault: the image was built expecting PSRAM and the chip has none it can talk to,
+      // i.e. the binary's PSRAM bus mode does not match this board. Everything that wanted PSRAM
+      // is now on the internal heap and this node is on its way to an allocation failure.
+      "\"loop_max_boot_ms\":%lu,\"loop_max_boot_at_s\":%lu,\"chip_c\":%.1f,\"stream_stalls\":%lu,\"stream_gone\":%lu,\"psram_fault\":%s},"
     "\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"pmtk_ack\":%lu,\"pmtk_nak\":%lu,\"pmtk_glitch\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
@@ -3274,6 +3279,7 @@ static String status_json() {
     (unsigned long)(loop_max_us / 1000), (unsigned long)(loop_max_boot_us / 1000),
     (unsigned long)loop_max_boot_at_s, temperatureRead(),
     (unsigned long)stream_stall_n, (unsigned long)stream_gone_n,
+    psram_fault ? "true" : "false",
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
     gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences,
@@ -3882,6 +3888,43 @@ static bool sd_path_allowed(const String &name) {
   return false;
 }
 
+// PSRAM the build expects must actually be there. BOARD_HAS_PSRAM is defined by the FQBN's PSRAM
+// option (`PSRAM=opi` octal, `PSRAM=enabled` quad); a build made without it -- a board with no
+// PSRAM fitted -- skips this entirely and is unaffected.
+//
+// WHY THIS IS LOUD. PSRAM bus mode is compile-time. An octal image on a quad board does not fail
+// at psramInit with a message anyone reads: psramFound() simply returns false, ps_malloc returns
+// null, the raw ring is skipped with one line in a log nobody tails, and the node runs on its
+// internal heap until it does not. Gold did exactly that in production -- heap_min 92 B,
+// loop_max_ms past 1.4 s, psram_min 0 -- and the only trace was `praw  NO PSRAM ring`.
+//
+// It does NOT panic. A node that refuses to boot cannot be reached to be corrected, and the boot
+// guard would revert to the previous image, which is the same wrong image. Staying up, reachable
+// and unambiguously faulty is what makes the fix flashable.
+static void psram_boot_check() {
+#ifdef BOARD_HAS_PSRAM
+#ifdef CONFIG_SPIRAM_MODE_OCT
+  const char *bus = "octal";
+#else
+  const char *bus = "quad";
+#endif
+  if (psramFound() && ESP.getPsramSize() > 0) {
+    logf("psram %lu kB, %s bus (as built)\n",
+         (unsigned long)(ESP.getPsramSize() / 1024UL), bus);
+    return;
+  }
+  psram_fault = true;
+  logf("psram FAULT -- this image was built for a %s PSRAM bus and the chip answers with none.\n",
+       bus);
+  logln("psram The PSRAM bus mode (quad vs octal) is compiled in, so this board is running the");
+  logln("psram wrong binary for its silicon. /audio and the detection ring are gone and the");
+  logln("psram internal heap is now carrying loads it was never sized for: expect heap_min to");
+  logln("psram fall and loop_max_ms to climb until something fails to allocate.");
+  logln("psram FIX: record this node's bus mode in firmware/hear_node/board_profiles.py");
+  logln("psram (NODE_PSRAM_MODES) and reflash it with flash.py, which builds the matching FQBN.");
+#endif
+}
+
 void setup() {
   hear_boot_guard();                    // first statement: a later fault still counts as a failed boot
   // The USB CDC default is 256 B, and a full queue drops the rest of a packet: a real PROV line is
@@ -3898,6 +3941,7 @@ void setup() {
   logf("\n=== dama-hear node %s (%s) fw %s, credentials %s%s ===\n", node_id, node_class, FW_BUILD,
        prov_src, prov_nvs ? ", in NVS" : "");
   logf("boot  reset reason %s\n", reset_reason_name());
+  psram_boot_check();
   RTC_NOINIT_ATTR static uint32_t last_reset_reason = 0;
   RTC_NOINIT_ATTR static uint32_t last_panic_code = 0;
   RTC_NOINIT_ATTR static uint32_t last_boot_try = 0;
@@ -4812,6 +4856,9 @@ void setup() {
       logf("praw  raw ring %lu s = %lu kB PSRAM, %lu kB PSRAM still free\n",
            (unsigned long)praw_want_s, (unsigned long)(praw_cap * 2UL / 1024UL),
            (unsigned long)(ESP.getFreePsram() / 1024UL));
+    else if (psram_fault)
+      logln("praw  NO PSRAM ring -- this board has no usable PSRAM at all (see psram FAULT above); "
+            "/audio is disabled");
     else
       logln("praw  NO PSRAM ring -- /audio is disabled; capture, gate and logging are unaffected");
   }
