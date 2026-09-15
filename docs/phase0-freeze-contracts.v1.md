@@ -14,14 +14,14 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | 354d36cce22b3837cacdbf751fe46d15d2451719f1d9384945a67976ebc0470f |
+| baseline | 1d77cdbb8c878ba8724c2a0f0a64c4ff66d10f4618a2c1b51a6cd63d21b2a92f |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
 | firmware_build_metadata | 7d4cebf77c468cc00b7b1de02aca62b62cd35287c3910f8549380d83acaba665 |
 | schemas | 5123ef87ca6f5acd864c955667205e6c34835eddb58ba678b727355ed9840239 |
 | published_contracts | a87c434d400f4f31ec4cc252761fff18ee14355a8170cf80133ef72315c082f3 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |
 | redis_keys | d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03 |
-| kubernetes_and_pvc_layout | 89ab4e9c77d06decdf4c68e02777e489f0fbf8487c001f623cd6727f8fc518b6 |
+| kubernetes_and_pvc_layout | cc477848f10c3ae883e1332934535e1180e9ca544a876c188e04ad32a32ca4ec |
 | corpus_fixture_metadata | 466b3b2d681cbeee4ed0d49edf24fff01ad829e5c00c60bf20e2b64c51b1b4cb |
 
 ## Compatibility
@@ -228,6 +228,7 @@ Manifest hashes:
 | deploy/k8s/hear-embed.yaml | 9190 | 1f3e86e8d5d1f57f4bc5d8d4ca6adb958671f5a65c7db7b21e47225916d465ad |
 | deploy/k8s/hear-heartbeat.yaml | 3663 | 2fe073497c87d1b0de637a5adba377f84cf1b18cf6a3cb2d0c47bec4016dd3e8 |
 | deploy/k8s/hear-mqtt-bridge.yaml | 5560 | 43f53a0ec58056e08a5104dd8fdb5ed51f6ea4f700363777a94468e050ca8538 |
+| deploy/k8s/hear-pool-backup.yaml | 15918 | 269a57100ca6078c5b5321cf2d13780fb70d46b440c2b2ecd3db940cb45efb26 |
 | deploy/k8s/hear-score.yaml | 11126 | 03c0713d22b23d3f06177c79ca6d612925768c98d566f012fc01d209de5dcf0d |
 | deploy/k8s/hear-tag.yaml | 15625 | 367ed67528bb15a5dd652bf924db0af409a8f65c1b00128c0a3b14e990be1890 |
 | deploy/k8s/hear-tdoa.yaml | 17920 | 8ff0135e4b56f76d7b0d69ccdc4f9129efd3050047698cc9161b002cfaae2cc8 |
@@ -239,7 +240,8 @@ Manifest hashes:
 | --- | --- | --- | --- | --- |
 | hear-heartbeat-state | 5Gi | ReadWriteOnce | Deployment hear-heartbeat receiver:/state | (none) |
 | hear-mqtt-bridge-state | 5Gi | ReadWriteOnce | Deployment hear-mqtt-bridge bridge:/state | (none) |
-| hear-pool | 5Gi | ReadWriteOnce | CronJob hear-drain drain:/pool<br>CronJob hear-drain-check check:/pool<br>CronJob hear-embed embed:/pool<br>CronJob hear-embed-check check:/pool<br>CronJob hear-score score:/pool<br>CronJob hear-score-check check:/pool<br>CronJob hear-tag tag:/pool<br>CronJob hear-tag-check check:/pool<br>CronJob hear-tdoa tdoa:/pool<br>CronJob hear-tdoa-check check:/pool | /pool<br>/pool/corpus<br>/pool/corpus/clips/tags.jsonl<br>/pool/corpus/scores<br>/pool/corpus/tdoa<br>/pool/corpus/tdoa/arrivals<br>/pool/corpus/tdoa/model_card.json<br>/pool/corpus/tdoa/runs<br>/pool/models/mn10_as<br>/pool/models/perch_v2<br>/pool/pylib<br>/pool/pylib-perch<br>/pool/pylib-tag<br>/pool/sketch_corpus |
+| hear-pool | 5Gi | ReadWriteOnce | CronJob hear-drain drain:/pool<br>CronJob hear-drain-check check:/pool<br>CronJob hear-embed embed:/pool<br>CronJob hear-embed-check check:/pool<br>CronJob hear-pool-backup-l0 backup:/pool<br>CronJob hear-pool-backup-l1 backup:/pool<br>CronJob hear-score score:/pool<br>CronJob hear-score-check check:/pool<br>CronJob hear-tag tag:/pool<br>CronJob hear-tag-check check:/pool<br>CronJob hear-tdoa tdoa:/pool<br>CronJob hear-tdoa-check check:/pool | /pool<br>/pool/corpus<br>/pool/corpus/clips/tags.jsonl<br>/pool/corpus/scores<br>/pool/corpus/tdoa<br>/pool/corpus/tdoa/arrivals<br>/pool/corpus/tdoa/model_card.json<br>/pool/corpus/tdoa/runs<br>/pool/models/mn10_as<br>/pool/models/perch_v2<br>/pool/pylib<br>/pool/pylib-perch<br>/pool/pylib-tag<br>/pool/sketch_corpus |
+| hear-pool-restore | 20Gi | ReadWriteOnce | (none) | (none) |
 
 ### Objects
 
@@ -260,6 +262,13 @@ Manifest hashes:
 | deploy/k8s/hear-heartbeat.yaml | Service | hear-heartbeat | (n/a) | no | (n/a) |
 | deploy/k8s/hear-mqtt-bridge.yaml | PersistentVolumeClaim | hear-mqtt-bridge-state | (n/a) | no | (n/a) |
 | deploy/k8s/hear-mqtt-bridge.yaml | Deployment | hear-mqtt-bridge | (n/a) | yes | bridge |
+| deploy/k8s/hear-pool-backup.yaml | ServiceAccount | pool-backup | (n/a) | no | (n/a) |
+| deploy/k8s/hear-pool-backup.yaml | ConfigMap | hear-pool-backup-config | (n/a) | no | (n/a) |
+| deploy/k8s/hear-pool-backup.yaml | CronJob | hear-pool-backup-l0 | 2 2 * * 0 | no | backup |
+| deploy/k8s/hear-pool-backup.yaml | CronJob | hear-pool-backup-l1 | 32 3,9,15,21 * * * | no | backup |
+| deploy/k8s/hear-pool-backup.yaml | CronJob | hear-pool-backup-check | 2 */3 * * * | no | check |
+| deploy/k8s/hear-pool-backup.yaml | PersistentVolumeClaim | hear-pool-restore | (n/a) | no | (n/a) |
+| deploy/k8s/hear-pool-backup.yaml | Job | hear-pool-restore-drill | (n/a) | no | (n/a) |
 | deploy/k8s/hear-score.yaml | CronJob | hear-score | 7,22,37,52 * * * * | no | score |
 | deploy/k8s/hear-score.yaml | CronJob | hear-score-check | 27 * * * * | no | check |
 | deploy/k8s/hear-tag.yaml | CronJob | hear-tag | 12,42 * * * * | no | tag |
