@@ -645,8 +645,45 @@ to timestamp for the ~200 ms each second before the report arrived -- the last g
 persists, and local and UTC are committed together as one matched pair. And it is the PENDING edge
 that must be named, not "the most recent edge", or a late report renames the wrong one.
 
+## PSRAM bus mode is per BOARD, not per board class
+
+⚠️`esp32s3-i2s-gps` is one wiring, not one part. **ageev** is 16MB flash / 8MB **octal** PSRAM;
+**gold** is 8MB flash / 2MB **quad**. The bus mode is compiled into the image (it is a pin-mux and
+ROM setting, not a runtime probe), so one class-wide FQBN necessarily mis-builds one of them --
+and it did: gold ran the octal image with `psramFound()` false, no raw ring (`praw  NO PSRAM
+ring`), `psram_min` 0, and its internal heap carrying the load until `heap_min` reached 92 B.
+
+`firmware/hear_node/board_profiles.py` therefore chooses the FQBN from **(board class, node id)**:
+
+| node | class | PSRAM | FQBN |
+|---|---|---|---|
+| everything not listed below | its class | class default (octal) | `esp32:esp32:XIAO_ESP32S3:PSRAM=opi` |
+| gold | esp32s3-i2s-gps | quad | `esp32:esp32:esp32s3:PSRAM=enabled,FlashSize=8M,PartitionScheme=default_8MB,USBMode=default,CDCOnBoot=cdc` |
+
+`XIAO_ESP32S3` has no quad option at all (`PSRAM` is `opi` or `disabled`), which is why the quad
+build uses the generic `esp32s3` definition; the extra options restate what the XIAO definition
+sets by default, so the only intended difference is the bus.
+
+**Adding a board.** Put it in `NODE_PSRAM_MODES` with the evidence that classified it, and add a
+CI leg for its mode if one does not exist -- `tests/test_board_psram_modes.py` fails if a mode a
+node can be flashed with is never compiled. A node that is NOT listed keeps its class default, so
+an unscanned board never silently changes binary. **kasami is deliberately unlisted**: it is the
+same class as gold and ageev and has never had a bare-board PSRAM scan, so its bus mode is unknown
+(docs/REDESIGN-LESSONS.md §4). If the default is wrong for it, its next boot now says so.
+
+**Published releases are still one image per class, at the class default mode.** `flash.py
+--release` and `enroll.py --release` refuse a node whose mode differs (today: gold) and tell you to
+build from the tree instead, because handing it the class image is the original bug.
+
+**The node no longer degrades quietly.** `psram_boot_check()` runs in the first moments of
+`setup()`: if the image was built with `BOARD_HAS_PSRAM` and `psramFound()` is false, it logs the
+mismatch in full and reports `sys.psram_fault: true` on `/status`. It does **not** panic -- a node
+that refuses to boot cannot be reached to be corrected, and the boot guard would only put the same
+wrong image back. Builds made without PSRAM expectations skip the check entirely.
+
 ## OTA, and what happens when a bad image lands
 
+    # ⚠️use flash.py: it picks this node's FQBN. The line below is the class default (octal).
     arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi \
       --output-dir .otabuild/out firmware/hear_node
     curl -F firmware=@.otabuild/out/hear_node.ino.bin http://<ip>/update

@@ -139,9 +139,9 @@ def release_files(tag, dest, board_class, repo=REPO_SLUG):
               % (tag, board_class))
 
 
-def upload(port, input_dir):
+def upload(port, input_dir, fqbn=None):
     sketch = os.path.join(REPO, "firmware", SKETCH)
-    r = subprocess.run(["arduino-cli", "upload", "-p", port, "--fqbn", FQBN,
+    r = subprocess.run(["arduino-cli", "upload", "-p", port, "--fqbn", fqbn or FQBN,
                         "--input-dir", input_dir, sketch])
     if r.returncode:
         die("upload failed. A board not running this firmware needs BOOT held while it is plugged "
@@ -268,16 +268,31 @@ def main(argv=None):
     print("enroll: %s (%s) with %d network(s): %s"
           % (a.node, a.cls, len(pairs), ", ".join(wifi_store.mask(s) for s, _ in pairs)))
 
+    # The FQBN follows the NODE, not just its class: a quad-PSRAM board in an octal class takes a
+    # different binary, and the class release image is not it. Resolved only when an image is
+    # actually being written -- --no-flash touches no binary and needs no opinion about the bus.
+    def node_fqbn():
+        try:
+            return board_profiles.fqbn(a.cls, a.node)
+        except ValueError as e:
+            die(str(e))
+
     if a.release:
+        try:
+            refusal = board_profiles.release_variant_refusal(a.cls, a.node)
+        except ValueError as e:
+            die(str(e))
+        if refusal:
+            die("refusing release %s: %s" % (a.release, refusal))
         d = os.path.join(REPO, ".otabuild", "release-%s-%s-usb" % (a.release, a.cls))
         os.makedirs(d, exist_ok=True)
         try:
             release_files(a.release, d, a.cls)
         except (OSError, ValueError) as e:
             die("release %s (%s): %s" % (a.release, a.cls, e))
-        upload(a.port, d)
+        upload(a.port, d, node_fqbn())
     elif a.input_dir:
-        upload(a.port, a.input_dir)
+        upload(a.port, a.input_dir, node_fqbn())
 
     ip = exchange(a.port, line)
     print("enroll: %s joined Wi-Fi at %s" % (a.node, ip))

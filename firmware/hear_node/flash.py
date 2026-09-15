@@ -44,6 +44,9 @@ import board_profiles  # noqa: E402
 import release_manifest  # noqa: E402
 
 SKETCH = os.path.relpath(HERE, REPO)
+# Kept for callers that ask for "the" FQBN. The one this script COMPILES with is chosen per node
+# by board_profiles.fqbn(), because PSRAM bus mode is a property of the board in front of you and
+# not of its class: gold is quad, ageev is octal, and they share the class name esp32s3-i2s-gps.
 FQBN = board_profiles.FQBN
 REPO_SLUG = "rjmendez/dama-hear"
 
@@ -194,6 +197,12 @@ def main(argv):
         why = release_refusal(was, node, board_class)
         if why:
             die("refusing to install %s on %s: %s" % (release, target, why))
+        try:
+            why = board_profiles.release_variant_refusal(board_class, node)
+        except ValueError as e:
+            die(str(e))
+        if why:
+            die("refusing to install %s on %s: %s" % (release, target, why))
         bin_path = release_image(release, board_class)
     else:
         # 1. identity, for THIS node, immediately before the build that carries it
@@ -203,7 +212,12 @@ def main(argv):
             except Exception:
                 was = None          # not up yet, or first flash. Not a reason to refuse.
         board_class = resolve_board_class(board_class, was)
-        outdir = os.path.join(REPO, ".otabuild", "%s-%s" % (node, board_class))
+        try:
+            variant = board_profiles.build_variant(board_class, node)
+            node_fqbn = board_profiles.fqbn(board_class, node)
+        except ValueError as e:
+            die(str(e))
+        outdir = os.path.join(REPO, ".otabuild", "%s-%s" % (node, variant))
 
         subprocess.run([sys.executable, os.path.join(HERE, "gen_secrets.py"), node, board_class],
                        cwd=REPO, check=True)
@@ -221,10 +235,11 @@ def main(argv):
                 if "--force" not in argv else "")
 
         # 3. build
-        print("flash: building %s (%s) for %s" % (node, board_class, target))
+        print("flash: building %s (%s, %s PSRAM) for %s"
+              % (node, board_class, board_profiles.psram_mode(board_class, node), target))
         # --libraries: the shared platform code lives in firmware/lib/hear_platform and
         # arduino-cli will not find it otherwise.
-        cmd = ["arduino-cli", "compile", "--fqbn", FQBN,
+        cmd = ["arduino-cli", "compile", "--fqbn", node_fqbn,
                "--libraries", os.path.join(REPO, "firmware", "lib"),
                "--output-dir", outdir]
         flags = board_profiles.build_extra_flags(board_class)
@@ -241,7 +256,8 @@ def main(argv):
 
     # 4. flash
     if is_serial:
-        r = subprocess.run(["arduino-cli", "upload", "-p", target, "--fqbn", FQBN,
+        upload_fqbn = board_profiles.fqbn(board_class, node) if board_class else FQBN
+        r = subprocess.run(["arduino-cli", "upload", "-p", target, "--fqbn", upload_fqbn,
                             "--input-dir", outdir, SKETCH], cwd=REPO)
         if r.returncode:
             die("upload failed")

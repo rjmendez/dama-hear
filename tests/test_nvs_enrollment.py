@@ -265,7 +265,9 @@ class TestPostFlashVersionCheck:
         return flash.main(["flash.py", "gold", "172.16.100.50"])
 
     def _live(self, fw, uptime=4):
-        return {"node": "gold", "class": "xiao-s3-pps", "fw": fw, "uptime_s": uptime,
+        # gold's class is esp32s3-i2s-gps: board_profiles records its silicon (2MB quad PSRAM)
+        # against that class, and flash.py refuses a node/class pair that contradicts the record.
+        return {"node": "gold", "class": "esp32s3-i2s-gps", "fw": fw, "uptime_s": uptime,
                 "prov": {"src": "compiled", "nets": 1, "nvs": True}}
 
     def test_a_node_that_reverted_to_the_old_firmware_is_not_reported_as_ok(self, monkeypatch, capsys):
@@ -308,7 +310,7 @@ class TestPostFlashVersionCheck:
 
     def test_the_release_path_still_verifies_against_the_release_tag(self, monkeypatch):
         # Untouched: a release image's version is the tag, and its prov must come from NVS.
-        good = {"node": "gold", "class": "xiao-s3-pps", "prov": {"src": "nvs", "nets": 1, "nvs": True}}
+        good = {"node": "mach", "class": "xiao-s3-pps", "prov": {"src": "nvs", "nets": 1, "nvs": True}}
         states = iter([good] + [dict(good, fw="v0.1.4-122-g794e3f5", uptime_s=90)] * 200)
         monkeypatch.setattr(flash, "status", lambda host: next(states))
         monkeypatch.setattr(flash.time, "sleep", lambda _: None)
@@ -316,7 +318,7 @@ class TestPostFlashVersionCheck:
         monkeypatch.setattr(flash.subprocess, "run", lambda cmd, **kw: type(
             "R", (), {"stdout": "OK", "stderr": "", "returncode": 0})())
         with pytest.raises(SystemExit):
-            flash.main(["flash.py", "gold", "172.16.100.50", "--release", "v0.1.5"])
+            flash.main(["flash.py", "mach", "172.16.100.50", "--release", "v0.1.5"])
 
 
 class TestBoardClassSelection:
