@@ -117,20 +117,42 @@ versioning.
 
 ## Gaps that belong to the importer, not to any backend
 
-Reading the merged scaffold surfaced three things that block a live run whichever backend is
-chosen, and one of them should be fixed while the Protocol still has a single implementation.
+Reading the merged scaffold surfaced four things that block a live run whichever backend is
+chosen. All four were fixed while the Protocol still had a single implementation, which was the
+point of fixing them then: each one changes the Protocol, and changing it once is cheaper than
+changing it after an adapter exists. None of this selects, provisions or configures a backend.
 
-* **Bodies are whole objects in memory.** The staging call takes `bytes`, and the source read is a
-  single `read()`. The perch model is 392 MB. This is a correctness problem under a pod memory
-  limit, not a tuning one, and fixing it changes the Protocol.
-* **No encryption exists.** The envelope, the per-tenant-per-class KEK and the HMAC blob ids are
-  design only. Importing ambient audio and precise coordinates into a second unencrypted location,
-  on a host with no volume encryption, widens the exposure the design was written to close.
-* **`head()` carries no digest, and there is no republish path.** Verification therefore costs a
-  second full read, and the rollback ladder's "republish the previous generation" rung has no
-  mechanism yet; the two cheaper rungs do.
-* **`acquire_lease` is read-then-write.** Adequate while the importer is single-process — the
-  conditional put is the real safety property — and not to be mistaken for a distributed lock.
+| Gap | What it was | What closed it |
+| --- | --- | --- |
+| Bodies were whole objects in memory | `put_staged(bytes)` and a single `read()`; the perch model is 392 MB | `hear/objectstore/streaming.py`: a payload is a `ChunkSource` (a factory of chunk iterators), digests accumulate in flight, and `put_staged_stream`/`put_immutable_stream`/`iter_range` are the payload calls. `tests/test_objectstore_streaming.py` imports a 64 MiB object under an 8 MiB `tracemalloc` ceiling. |
+| No encryption existed | envelope, per-(tenant, class) KEK and HMAC blob ids were design only | `hear/objectstore/crypto.py`: an injected `KeyProvider`/`Cipher` boundary. The **default refuses**, so a restricted class is quarantined `key_provider_unavailable` rather than published in the clear; with a provider, the blob id is `HMAC-SHA256(K_tenant_index, plaintext digest)` and the plaintext digest exists only inside the sealed metadata. |
+| No republish path | the rollback ladder's "republish the previous generation" rung had no mechanism | `commit_pointer(..., expect_generation=...)` plus immutable per-generation records under `hear/v1/ptrgen/`. The open tail is the only object written twice, at most once per (class, partition) per run, and `superseded_by` is *derived* from the next generation rather than written back onto an immutable record. |
+| `acquire_lease` was read-then-write | two racers could be handed the same epoch, which fences neither | acquisition is now an `O_CREAT|O_EXCL` claim on an epoch-named record: one winner, and the loser is told `None`. `LocalDirBackend(conditional_put=False)` models the store that has no conditional put — its writes really do lose an update, and a commit without a live fencing lease is refused outright. |
+
+### The review of that first cut, and what it changed
+
+Review of the scaffold found five defects in the fixes themselves. None of them was reachable from
+a production path — there is still no backend, no KMS and no live data — but three of them
+invalidated security claims the scaffold was making in its own docstrings, so they are recorded
+here rather than only in a commit message.
+
+| Defect | Why it mattered | What it is now |
+| --- | --- | --- |
+| The sealed metadata was encrypted with the body's `(key, nonce)` | In a CTR construction two messages under one keystream publish `P1 XOR P2`, and the metadata plaintext is a schema-shaped document an attacker can write out — so the body came back in the clear | One DEK, four values: `hkdf_expand` (RFC 5869, HMAC-SHA256, with the published test vector asserted) derives an independent key *and* nonce for `body` and for `metadata`, each bound to the tenant, class, key id and cipher name. The attack is executed in `test_xoring_the_body_against_the_sealed_metadata_recovers_nothing` and must fail. |
+| The nonce was `sha256("nonce/" + plaintext digest + wrapped key)`, and both inputs were published | That is a confirmation oracle requiring **no key at all**: guess the plaintext, recompute, compare | Every nonce comes out of the HKDF over the secret DEK and is **not published** — a reader derives it after unwrapping. `test_no_published_field_confirms_a_guessed_plaintext` searches every key and every stored byte for a keyless derivation of the guess, including the old formula, with a key-holding positive control so the negative result means something. |
+| `ObjectCrypto`'s default built `HmacCtrCipher` and passed `allow_test_cipher=True` itself | The guard against a not-production-ready cipher was defeated by the constructor meant to enforce it | The default is `RefusingCipher`: no algorithm, raises on `seal`. A key provider alone no longer makes an importer able to encrypt, and `HmacCtrCipher` must still be named *and* admitted explicitly. `production_ready = False` is unchanged — it was not renamed or relabelled. |
+| A generation claim followed by a failed pointer write wedged the object forever | The retry found generation N claimed, called it someone else's, and could never reach N+1 either because the pointer never advanced | The claim is compared against the document being written on the identity that matters (object, blob, generation, predecessor). A match rolls forward and publishes the claimed record; a different blob is still a real conflict. Injected mid-commit failures cover both, at the backend and end to end. |
+| The re-stage after a bad readback sat outside the per-object handler | A source or key failure on the *second* read aborted the whole import with no report, no `run_close` and no quarantine record | One table maps per-object failures to quarantine reasons and every read goes through it. Two tests kill a source and a key provider mid-retry and require the run to close, the object to be quarantined and the next object to publish. |
+
+One further defect fell out of writing those tests: an interrupted write left a truncated file
+behind — fatal under create-if-absent, because every later run would find it, re-read it, and
+quarantine it as corrupt forever. An interrupted write now removes the key it created, which is
+not the `delete_object` the importer is denied: nothing ever pointed at it.
+
+What is still **not** closed, and is not this lane's to close: `head()` still carries no digest, so
+verification costs a second read (it is a streamed read now, not a buffered one); there is no
+capability probe against a real store, because there is no store; and nothing here has been run
+against anything but synthetic fixtures.
 
 ## Where an S3 adapter may live
 
@@ -149,8 +171,12 @@ backend is ever chosen, that is a decision to take deliberately, not a lint resu
 
 1. The pool has a restore-tested backup. Unchanged, and still the hard blocker; nothing below
    matters until it passes.
-2. Staging streams instead of buffering, proven with a fixture larger than the chunk size.
-3. The encryption boundary exists in code.
+2. ~~Staging streams instead of buffering~~ — done: proven against a fixture 1,024 chunks long,
+   under a memory ceiling a buffered body cannot pass.
+3. ~~The encryption boundary exists in code~~ — the *boundary* does, and it refuses by default. A
+   **key provider and a reviewed AEAD still have to be chosen and wired**: the only cipher in the
+   repository is `HmacCtrCipher`, which declares `production_ready = False`, and the only provider
+   is `InMemoryTestKeyProvider`, whose material is a test seed that never reaches disk.
 4. The capacity reservation is renegotiated against the 52 GB figure rather than the 240 G one.
 
 ## The open questions, stated as choices

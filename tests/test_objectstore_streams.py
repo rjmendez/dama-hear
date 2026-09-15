@@ -140,3 +140,50 @@ def test_reading_a_stream_does_not_modify_the_source(pool):
     S.segment(S.freeze_gzip_range(pool["scene_path"]), "scene-seg", ("2026-09-12", "mach"), 1,
               gzipped=True)
     assert census(pool["root"]) == before
+
+
+def test_an_open_tail_republish_supersedes_and_does_not_duplicate_a_row(pool, tmp_path):
+    """Three runs over a growing file publish one object, three generations, and no row twice.
+
+    The sealed rows keep their identity across the republishes -- the stream digest is over the
+    record *set*, so growth extends the set instead of renaming what was already published, and a
+    reader walking the generations sees every row exactly once.
+    """
+    from hear.objectstore import backend as B
+    from hear.objectstore import stage as ST
+    from hear.objectstore import streaming as SS
+
+    path = str(tmp_path / "records.jsonl")
+    rows = MINI.record_rows(6)
+    store = B.LocalDirBackend(str(tmp_path / "store"))
+    okey = K.object_key("record-seg", ("2026-09-12", "mach"), "0")
+    digests = []
+    start = 0
+
+    for run, upto in enumerate((2, 4, 6), start=1):
+        with open(path, "ab") as fh:  # the drain appending, mid-import
+            for row in rows[upto - 2:upto]:
+                fh.write(json.dumps(row, sort_keys=True).encode("utf-8") + b"\n")
+        frozen = S.freeze_range(path, start=0)
+        seg = S.segment(frozen, "record-seg", ("2026-09-12", "mach"), seq=0)
+        digests.append(seg.record_digests)
+        task = ST.ImportTask(object_class="record-seg", logical_id="0",
+                             partition=("2026-09-12", "mach"),
+                             chunks=SS.bytes_chunks(frozen.body),
+                             byte_range=(start, frozen.end), digest_source="stream-digest",
+                             republish=True)
+        report = ST.Importer(store, str(tmp_path / "work" / str(run) / "ledger.jsonl"),
+                             "run-%d" % run, git_commit="0000000").run([task])
+        assert report.counters["published"] == 1
+
+    assert [len(d) for d in digests] == [2, 4, 6]
+    assert digests[0] == digests[1][:2] == digests[2][:2]  # sealed rows keep their identity
+    assert len(store.keys_under("hear/v1/obj/")) == 1
+    gens = store.pointer_generations(okey)
+    assert [g["generation"] for g in gens] == [1, 2, 3]
+    assert [g["superseded_by"] for g in gens] == [2, 3, None]
+
+    # The published generation is the whole frozen range, so no row is carried twice: the newest
+    # generation holds each of the six rows exactly once.
+    body = store.get_range(json.loads(store.get_range(okey))["blob_key"])
+    assert body.count(b'"key"') == 6
