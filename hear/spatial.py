@@ -27,6 +27,7 @@ from . import nodeclass as NC
 from .backend import associate as AS
 from .backend import survey as SV
 from .detsfile import read_file, read_text
+from .loci_validation import LociSpatialMemory
 from .solve import placement as PL
 from .solve import point as PT
 from .solve import shockwave as SW
@@ -81,7 +82,7 @@ def calculate_gdop_bounds(
             raise ValueError("position_sigma_m values must be finite and non-negative")
         range_sigma_m = np.hypot(sigma_r, position_sigma_m)
 
-    d3 = PL.dop3(P, s)
+    d3 = PL.dop3(P, s) if len(P) >= 4 else {}
     hdop = d3.get("hdop", float("inf"))
     vdop = d3.get("vdop", float("inf"))
     pdop = d3.get("pdop", float("inf"))
@@ -541,6 +542,7 @@ class SpatialEventPipeline:
         mqtt_topic: str = DEFAULT_MQTT_TOPIC,
         geojsonl_path: str = DEFAULT_GEOJSONL_PATH,
         publish_mqtt: bool = False,
+        loci_memory: Optional[LociSpatialMemory] = None,
     ) -> None:
         self.survey = survey
         self.temp_c = temp_c
@@ -550,6 +552,10 @@ class SpatialEventPipeline:
         self.mqtt_topic = mqtt_topic
         self.geojsonl_path = geojsonl_path
         self.publish_mqtt_enabled = publish_mqtt
+        self.loci_memory = loci_memory
+        self.loci_rogue_nodes = (
+            loci_memory.rogue_nodes({node_id: survey.position(node_id) for node_id in survey.ids})
+            if loci_memory is not None else {})
 
         try:
             self.origin = survey.origin_geodetic()
@@ -585,7 +591,25 @@ class SpatialEventPipeline:
         for ev in events:
             node_ids = ev["node_ids"]
             arrivals = ev["arrivals"]
+            loci_rejections = []
+            eligible = list(range(len(node_ids)))
+            if self.loci_memory is not None:
+                loci_rejections.extend(
+                    {"node_id": node_ids[i], "reason": "loci_anchor_drift", **self.loci_rogue_nodes[node_ids[i]]}
+                    for i in eligible if node_ids[i] in self.loci_rogue_nodes)
+                eligible = [i for i in eligible if node_ids[i] not in self.loci_rogue_nodes]
+                arrival_check = self.loci_memory.filter_arrivals(
+                    [node_ids[i] for i in eligible], [arrivals[i] for i in eligible],
+                    self.survey.positions([node_ids[i] for i in eligible]), self.temp_c)
+                eligible = [eligible[i] for i in arrival_check["indices"]]
+                loci_rejections.extend(arrival_check["rejected"])
+                if len(eligible) < 3:
+                    continue
+                node_ids = [node_ids[i] for i in eligible]
+                arrivals = [arrivals[i] for i in eligible]
             sigmas = _event_arrival_sigmas(ev, self.survey, self.temp_c)
+            if self.loci_memory is not None and sigmas is not None:
+                sigmas = [sigmas[i] for i in eligible]
 
             positions = self.survey.positions(node_ids)
 
@@ -606,6 +630,8 @@ class SpatialEventPipeline:
 
             east_m, north_m, up_m = sol["east_m"], sol["north_m"], sol["up_m"]
             enu = (east_m, north_m, up_m)
+            if self.loci_memory is not None and not self.loci_memory.accepts_position(enu):
+                continue
 
             if self.origin != (0.0, 0.0, 0.0):
                 lat, lon, h = GEO.enu_to_geodetic(east_m, north_m, up_m, *self.origin)
@@ -653,8 +679,9 @@ class SpatialEventPipeline:
                         self.survey.position_sources.get(node_id, "survey")
                         for node_id in node_ids
                     },
-                    "n_nodes": ev["n_nodes"],
+                    "n_nodes": len(node_ids),
                     "point_source_possible": ev.get("point_source_possible", True),
+                    "loci_memory_rejections": loci_rejections,
                 },
             )
 

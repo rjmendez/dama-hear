@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from decimal import Decimal, InvalidOperation
 import gzip
 import hashlib
 import json
@@ -251,13 +252,6 @@ def _raw_det_cell(v: Any) -> Optional[str]:
     return None if v in (None, "") else str(v)
 
 
-def _clock_state(v: Any) -> Optional[str]:
-    if v is None:
-        return None
-    s = str(v).strip()
-    return s.upper() if s else None
-
-
 def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
     fh = (row.get("frame_hex") or "").strip()
@@ -265,10 +259,22 @@ def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         fh = fh[:-1]
     frame = binascii.unhexlify(fh)
     d = WR.decode(frame)
-    try:
-        utc_us = int(float(row.get("utc_us") or 0))
-    except (TypeError, ValueError):
+    raw_utc_us = row.get("utc_us")
+    if raw_utc_us in (None, ""):
         utc_us = 0
+    else:
+        # Do not round through float: it loses low-order bits of a 64-bit clock and turns an
+        # injected fractional value into an apparently valid timestamp. Zero is the sole
+        # unanchored sentinel; a negative or out-of-range stated clock is malformed.
+        try:
+            utc_decimal = Decimal(str(raw_utc_us).strip())
+            if utc_decimal != utc_decimal.to_integral_value():
+                raise ValueError("utc_us is not an integer: %r" % (raw_utc_us,))
+            utc_us = int(utc_decimal)
+        except (InvalidOperation, TypeError, ValueError) as e:
+            raise ValueError("utc_us is not an integer: %r" % (raw_utc_us,)) from e
+        if not 0 <= utc_us <= 253402300799999999:
+            raise ValueError("utc_us outside the supported UTC range: %d" % utc_us)
     node = row["node"]
     # fs: the FRAME is authoritative when it states a rate; the CSV column is only the node's
     # running estimate.
@@ -318,11 +324,6 @@ def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         # would claim a perfect clock, and `hear.corpus.Record.sync_sigma_ns` is read by gates
         # that treat absent and stated differently.
         "sync_sigma_ns": _sync_sigma_ns(row.get("sync_sigma_ns")),
-        "clock_state": _clock_state(row.get("clock_state")),
-        "anchor_age_us": _raw_det_cell(row.get("anchor_age_us")),
-        "boot_epoch_us": _raw_det_cell(row.get("boot_epoch_us")),
-        "boot_id": _raw_det_cell(row.get("boot_id")),
-        "clock_discontinuity_flags": _raw_det_cell(row.get("clock_discontinuity_flags")),
         "sample": _raw_det_cell(row.get("sample")),
         "uptime_s": _raw_det_cell(row.get("uptime_s")),
         # ⚠️THE INGEST USED TO DROP THESE TWO, WHICH IS WHY AN UNANCHORED ROW WAS UNRECOVERABLE
@@ -350,8 +351,7 @@ def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
 #: The /detections (hear_node.ino: h_dets) fields that map straight onto a dets.csv row.
 LIVE_RING_COLUMNS = ("utc_us", "uptime_s", "sample", "pps_n", "us_since_pps", "trigger",
-                     "flags", "fs_hz", "sync_sigma_ns", "clock_state", "anchor_age_us",
-                     "boot_epoch_us", "boot_id", "clock_discontinuity_flags")
+                     "flags", "fs_hz")
 
 
 class Pool:
@@ -483,29 +483,17 @@ class Pool:
         """Ingest one archived `/detections` body, the live ring of a node with no card.
 
         Idempotent like ingest_dets: consecutive runs overlap and re-reading a row adds 0. The
-        body carries no per-row node name, so `default_node` is required and every row is filed
-        under it. Cursor-paged firmware wraps the rows in a `{"contract":"cursor-v1", ...}`
-        envelope; the legacy bare array stays accepted for mixed-version rollout and rollback.
+        body carries no node name, so `default_node` is required and every row is filed under it.
         """
         with open(path, "rb") as fh:
             raw = fh.read()
         sha = hashlib.sha256(raw).hexdigest()
         obj = json.loads(raw.decode("utf-8", "replace"))
-        if isinstance(obj, dict):
-            rows = obj.get("rows")
-            if not isinstance(rows, list):
-                raise ValueError("%s: /detections object carries rows=%r, not a list"
-                                 % (path, type(rows).__name__))
-            generation = str(obj.get("contract") or "live")
-        elif isinstance(obj, list):
-            rows = obj
-            generation = "live"
-        else:
-            raise ValueError("%s: /detections body is %s, not a list or object"
-                             % (path, type(obj).__name__))
+        if not isinstance(obj, list):
+            raise ValueError("%s: /detections body is %s, not a list" % (path, type(obj).__name__))
         recs: List[Dict[str, Any]] = []
         bad: Dict[str, int] = {}
-        for d in rows:
+        for d in obj:
             if not isinstance(d, dict):
                 bad["not_an_object"] = bad.get("not_an_object", 0) + 1
                 continue
@@ -532,7 +520,7 @@ class Pool:
         added = self._append(recs)
         entry = {"kind": "detections.json", "path": os.path.abspath(path),
                  "origin": origin or path, "sha256": sha, "bytes": len(raw),
-                 "generation": generation, "rows": len(rows), "decoded": len(recs), "added": added,
+                 "generation": "live", "rows": len(obj), "decoded": len(recs), "added": added,
                  "duplicate": len(recs) - added, "skipped": sum(bad.values()),
                  "skip_reasons": bad, "schema_version": SCHEMA_VERSION}
         assert entry["rows"] == added + entry["duplicate"] + entry["skipped"], entry
