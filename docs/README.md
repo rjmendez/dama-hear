@@ -1,0 +1,50 @@
+# DAMA Hear documentation index
+
+The documents in the first section below are the **agreed target architecture** for the
+migration of DAMA Hear to a standalone, self-hosted acoustic platform — a system that runs
+without AWS, without a shared PVC as an interchange, and without `dama-gotchi` as a
+dependency. Phase 0 (contract freeze and baseline) is implemented and merged; Phase 1 and
+later phases are in progress. These are design records, not runbooks: where a design and the
+current code disagree, the design states the intended end state.
+
+## Migration and target architecture
+
+| Document | What it defines |
+|---|---|
+| [standalone-migration.md](standalone-migration.md) | The phased, reversible expand/migrate/verify/rollback path from the current AWS + PVC + Redis coupling to a site-owned platform. Start here. |
+| [api-boundaries.md](api-boundaries.md) | The northbound service map and contract conventions: which service owns which durable resource, its API style, and the events it publishes. |
+| [repository-structure.md](repository-structure.md) | The target repository layout and the extraction plan: one platform monorepo, `dama-gotchi` kept as a separate consumer application. |
+| [deployment.md](deployment.md) | Progressive deployment profiles (single machine/Compose, small HA cluster, multi-site Kubernetes) sharing one image, config schema, and data layout. |
+| [fleet-management.md](fleet-management.md) | The standalone fleet control plane: device identity, desired vs reported state, signed firmware compatibility, staged rollouts, and lifecycle audit. |
+| [ml-lifecycle.md](ml-lifecycle.md) | The minimal self-hosted acoustic ML lifecycle: corpus and retention, labelling, reproducible training, promotion, edge deployment, and rollback. |
+| [phase0-freeze-contracts.v1.md](phase0-freeze-contracts.v1.md) | The Phase 0 contract freeze: the hashed, reproducible inventory of wire profiles, schemas, and firmware build metadata that later phases must not silently break. |
+| [REDESIGN-LESSONS.md](REDESIGN-LESSONS.md) | Postmortem of the existing fleet: observed failure modes and the systems-design lessons that constrain the redesign. Evidence-tagged. |
+| [loci-memory-validation.md](loci-memory-validation.md) | Validation of the Loci spatial/memory behaviour used by the localization lane. |
+
+## System and subsystem references
+
+| Document | What it covers |
+|---|---|
+| [architecture.md](architecture.md) | Current system overview. |
+| [acoustic-stack.md](acoustic-stack.md) | The acoustic processing stack end to end. |
+| [clip-pipeline.md](clip-pipeline.md) | Clip capture, drain, indexing, and retention. |
+| [timing.md](timing.md) | Clocking, boot-relative time, and trusted UTC. |
+| [uplink.md](uplink.md) | Node uplink transports and envelopes. |
+| [esp32s3-lora-node.md](esp32s3-lora-node.md) | ESP32-S3 LoRa node design. |
+| [node-hardware.md](node-hardware.md) | Node hardware reference. |
+| [faketec-pin-budget.md](faketec-pin-budget.md) | Board pin budget. |
+| [l86-reference.md](l86-reference.md) | L86 GNSS module reference. |
+| [hear-latency-calibration-runbook.md](hear-latency-calibration-runbook.md) | Latency calibration procedure. |
+
+## Field findings and calibration records
+
+Dated, point-in-time evidence; superseded only by a later dated record.
+
+* [findings-2026-09-05.md](findings-2026-09-05.md), [findings-2026-09-06.md](findings-2026-09-06.md)
+* [crack-blast-2026-09-05.md](crack-blast-2026-09-05.md)
+* [field-pull-2026-09-08.md](field-pull-2026-09-08.md)
+* [localisation-2026-09-08.md](localisation-2026-09-08.md)
+* [placement-weekend-2026-09-08.md](placement-weekend-2026-09-08.md)
+* [clip-calibration-2026-09-10.md](clip-calibration-2026-09-10.md)
+* [findings-clap-calibration-2026-09-14.md](findings-clap-calibration-2026-09-14.md)
+* [validation-full-captures.md](validation-full-captures.md)
