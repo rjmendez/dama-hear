@@ -1,0 +1,370 @@
+# ⚠️SCAFFOLDING. EVERY SCHEDULE IN THIS FILE IS `suspend: true`, AND THAT IS NOT A DRAFTING
+# ACCIDENT. docs/pool-backup-restore.md §6 and §14 leave two things to a person: who holds the
+# offline copy of the passphrase, and whether `F:` is owned by this system. Until both are
+# answered, a scheduled job that writes an encrypted archive it cannot prove anyone can decrypt
+# is worse than no job -- it manufactures the appearance of a backup. Unsuspend in the commit
+# that records the answers, not before.
+#
+# ⚠️NOT APPLIED BY ANY AUTOMATION, AND APPLYING IT IS NOT A NO-OP. It creates a namespace-local
+# ServiceAccount and three suspended CronJobs; it mounts `hear-pool` READ-ONLY and never writes
+# to it in any mode. `kubectl apply -f deploy/k8s/hear-pool-backup.yaml` only after the sentinel
+# at `F:\hear-backup\.hear-backup-target` exists and its uuid is in the ConfigMap below.
+#
+# The pool volume is `readOnly: true` on BOTH the volume and the mount. docs/pool-backup-restore.md
+# §13.5 records that the existing `*-check` jobs do not do this; this one does, and G0.12 is the
+# test that says so.
+# ⚠️NAMESPACE `dama`, NOT `backups` AS THE PLAN SAYS. A PVC can only be mounted by a pod in its
+# own namespace, and `hear-pool` lives in `dama`; a CronJob in `backups` could not read the volume
+# it exists to back up, and would have failed at first schedule with an unbound claim. The
+# isolation the plan asks for is provided by the restore job mounting NO `hear-pool` volume, not
+# by the namespace boundary.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pool-backup
+  namespace: dama
+  labels:
+    app: hear-pool-backup
+  annotations:
+    dama-hear/what: >-
+      Runs the hear-pool backup jobs. Deliberately has NO Role, RoleBinding or ClusterRole: the
+      job reads a mounted PVC and writes a hostPath, and needs no API access at all.
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hear-pool-backup-config
+  namespace: dama
+  labels:
+    app: hear-pool-backup
+  annotations:
+    dama-hear/what: >-
+      Non-secret configuration only. The sentinel uuid is not a secret (it proves WHICH volume is
+      mounted, it does not authorise anything) and the passphrase is NOT here, not in any Secret
+      in this namespace, and not in any image -- see the note on HEAR_POOL_BACKUP_PASSPHRASE_FILE.
+data:
+  # Replace with the uuid written into F:\hear-backup\.hear-backup-target by hand, once.
+  # PLACEHOLDER ON PURPOSE: with this value in place every job refuses, which is the correct
+  # behaviour for a cluster whose target volume ownership has not been decided.
+  sentinel_uuid: "00000000-0000-0000-0000-000000000000"
+  expect_mount: "/mnt/f"
+  key_ref: "UNDECIDED-see-docs/pool-backup-restore.md-section-14"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-pool-backup-l0
+  namespace: dama
+  labels:
+    app: hear-pool-backup
+    level: l0
+  annotations:
+    dama-hear/what: >-
+      Weekly level-0 of the dama/hear-pool PVC to an encrypted archive on a DIFFERENT physical
+      disk. Suspended until passphrase custody and F: ownership are decided.
+spec:
+  suspend: true
+  schedule: "2 2 * * 0"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 7200
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 1800
+      template:
+        spec:
+          serviceAccountName: pool-backup
+          restartPolicy: Never
+          containers:
+            - name: backup
+              image: python:3.13-slim
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  # FAIL CLOSED: no gpg, no run. Never fall through to a plaintext archive.
+                  apt-get update >/dev/null && apt-get install -y --no-install-recommends gnupg >/dev/null
+                  command -v gpg >/dev/null || { echo "gpg missing; refusing"; exit 1; }
+                  # The passphrase file is projected from custody by the operator; the tool
+                  # refuses to start when it is absent. Nothing here reads, echoes or derives it.
+                  test -r "$HEAR_POOL_BACKUP_PASSPHRASE_FILE" || {
+                    echo "no passphrase file at the custody path; refusing"; exit 1; }
+                  exec python3 /app/tools/hear_pool_backup.py backup \
+                    --pool /pool \
+                    --target /target \
+                    --sentinel-uuid "$HEAR_POOL_BACKUP_SENTINEL_UUID" \
+                    --expect-mount "$HEAR_POOL_BACKUP_EXPECT_MOUNT" \
+                    --passphrase-file "$HEAR_POOL_BACKUP_PASSPHRASE_FILE" \
+                    --key-ref "$HEAR_POOL_BACKUP_KEY_REF" \
+                    --level l0 \
+                    --work-dir /work \
+                    --execute
+              env:
+                - name: HEAR_POOL_BACKUP_SENTINEL_UUID
+                  valueFrom:
+                    configMapKeyRef: { name: hear-pool-backup-config, key: sentinel_uuid }
+                - name: HEAR_POOL_BACKUP_EXPECT_MOUNT
+                  valueFrom:
+                    configMapKeyRef: { name: hear-pool-backup-config, key: expect_mount }
+                - name: HEAR_POOL_BACKUP_KEY_REF
+                  valueFrom:
+                    configMapKeyRef: { name: hear-pool-backup-config, key: key_ref }
+                # A PATH, NEVER A VALUE. The passphrase is never an env var, never an argv word
+                # (both are world-readable in a pod), and never lands in a receipt or a log.
+                - name: HEAR_POOL_BACKUP_PASSPHRASE_FILE
+                  value: /custody/passphrase
+              resources:
+                requests: { cpu: 500m, memory: 512Mi }
+                limits: { cpu: "4", memory: 2Gi }
+              volumeMounts:
+                - { name: code, mountPath: /app/tools/hear_pool_backup.py, subPath: tools_hear_pool_backup.py }
+                - { name: pool, mountPath: /pool, readOnly: true }
+                - { name: target, mountPath: /target }
+                - { name: work, mountPath: /work }
+                - { name: custody, mountPath: /custody, readOnly: true }
+          volumes:
+            - name: code
+              configMap: { name: hear-pool-backup-code, optional: false }
+            # THE POOL IS READ-ONLY. This is the whole point of the job.
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool
+                readOnly: true
+            # `Directory`, NEVER `DirectoryOrCreate`: if F: is not mounted, /mnt/f still exists as
+            # an empty ext4 directory and the "backup" would land on the disk it exists to escape.
+            # The sentinel check inside the tool is the second, load-bearing half of this guard.
+            - name: target
+              hostPath:
+                path: /mnt/f/hear-backup
+                type: Directory
+            - name: work
+              emptyDir: { sizeLimit: 2Gi }
+            # ⚠️PLACEHOLDER SOURCE. Deliberately NOT a Secret in this namespace: the existing
+            # k3s-manifest-backup CronJob dumps `kubectl get secret -A -o yaml` in cleartext to an
+            # unencrypted disk every night (docs/pool-backup-restore.md §6, §13.4). Wire this to
+            # Infisical, or amend that job, before unsuspending.
+            - name: custody
+              emptyDir: {}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-pool-backup-l1
+  namespace: dama
+  labels:
+    app: hear-pool-backup
+    level: l1
+  annotations:
+    dama-hear/what: >-
+      6-hourly level-1 (new and changed bodies only), giving RPO <= 6 h. Suspended; same gate.
+spec:
+  suspend: true
+  schedule: "32 3,9,15,21 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 1800
+      template:
+        spec:
+          serviceAccountName: pool-backup
+          restartPolicy: Never
+          containers:
+            - name: backup
+              image: python:3.13-slim
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  apt-get update >/dev/null && apt-get install -y --no-install-recommends gnupg >/dev/null
+                  command -v gpg >/dev/null || { echo "gpg missing; refusing"; exit 1; }
+                  test -r "$HEAR_POOL_BACKUP_PASSPHRASE_FILE" || {
+                    echo "no passphrase file at the custody path; refusing"; exit 1; }
+                  exec python3 /app/tools/hear_pool_backup.py backup \
+                    --pool /pool \
+                    --target /target \
+                    --sentinel-uuid "$HEAR_POOL_BACKUP_SENTINEL_UUID" \
+                    --expect-mount "$HEAR_POOL_BACKUP_EXPECT_MOUNT" \
+                    --passphrase-file "$HEAR_POOL_BACKUP_PASSPHRASE_FILE" \
+                    --key-ref "$HEAR_POOL_BACKUP_KEY_REF" \
+                    --level l1 \
+                    --work-dir /work \
+                    --execute
+              env:
+                - name: HEAR_POOL_BACKUP_SENTINEL_UUID
+                  valueFrom:
+                    configMapKeyRef: { name: hear-pool-backup-config, key: sentinel_uuid }
+                - name: HEAR_POOL_BACKUP_EXPECT_MOUNT
+                  valueFrom:
+                    configMapKeyRef: { name: hear-pool-backup-config, key: expect_mount }
+                - name: HEAR_POOL_BACKUP_KEY_REF
+                  valueFrom:
+                    configMapKeyRef: { name: hear-pool-backup-config, key: key_ref }
+                - name: HEAR_POOL_BACKUP_PASSPHRASE_FILE
+                  value: /custody/passphrase
+              resources:
+                requests: { cpu: 500m, memory: 512Mi }
+                limits: { cpu: "4", memory: 2Gi }
+              volumeMounts:
+                - { name: code, mountPath: /app/tools/hear_pool_backup.py, subPath: tools_hear_pool_backup.py }
+                - { name: pool, mountPath: /pool, readOnly: true }
+                - { name: target, mountPath: /target }
+                - { name: work, mountPath: /work }
+                - { name: custody, mountPath: /custody, readOnly: true }
+          volumes:
+            - name: code
+              configMap: { name: hear-pool-backup-code, optional: false }
+            - name: pool
+              persistentVolumeClaim:
+                claimName: hear-pool
+                readOnly: true
+            - name: target
+              hostPath:
+                path: /mnt/f/hear-backup
+                type: Directory
+            - name: work
+              emptyDir: { sizeLimit: 2Gi }
+            - name: custody
+              emptyDir: {}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hear-pool-backup-check
+  namespace: dama
+  labels:
+    app: hear-pool-backup
+    level: check
+  annotations:
+    dama-hear/what: >-
+      Staleness, sentinel and V1 archive-digest gate. A failed Job IS the alert (docs/resilience.md
+      invariant 4). Needs no key: it verifies digests recorded in cleartext receipts.
+spec:
+  suspend: true
+  schedule: "2 */3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 900
+      template:
+        spec:
+          serviceAccountName: pool-backup
+          restartPolicy: Never
+          containers:
+            - name: check
+              image: python:3.13-slim
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  test -f /target/.hear-backup-target || { echo "sentinel missing; F: not mounted"; exit 1; }
+                  exec python3 /app/tools/hear_pool_backup.py verify \
+                    --target /target \
+                    --gen "$(python3 -c 'import json,sys;print(json.loads(open("/target/index.jsonl").read().splitlines()[-1])["gen_id"])')"
+              resources:
+                requests: { cpu: 100m, memory: 128Mi }
+                limits: { cpu: "1", memory: 512Mi }
+              volumeMounts:
+                - { name: code, mountPath: /app/tools/hear_pool_backup.py, subPath: tools_hear_pool_backup.py }
+                - { name: target, mountPath: /target, readOnly: true }
+          volumes:
+            - name: code
+              configMap: { name: hear-pool-backup-code, optional: false }
+            - name: target
+              hostPath:
+                path: /mnt/f/hear-backup
+                type: Directory
+---
+# The restore drill. NO `hear-pool` VOLUME APPEARS ANYWHERE IN THIS OBJECT, and that absence is
+# asserted by tests/test_pool_backup.py (G0.3): a restore pod that can see the live pool is one
+# typo away from being the data-loss event the backup exists to prevent. The destination is a
+# FRESH claim on `local-path-retain`, so a deleted PVC does not delete the restored evidence.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hear-pool-restore
+  namespace: dama
+  labels:
+    app: hear-pool-backup
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path-retain
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hear-pool-restore-drill
+  namespace: dama
+  labels:
+    app: hear-pool-backup
+  annotations:
+    dama-hear/what: >-
+      G0 restore drill, run by hand with `kubectl create -f` after editing GEN. Writes a receipt
+      to F:\hear-backup\restore-tests\<test id>\report.json. Never touches the live pool.
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  suspend: true
+  template:
+    spec:
+      serviceAccountName: pool-backup
+      restartPolicy: Never
+      containers:
+        - name: restore
+          image: python:3.13-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              apt-get update >/dev/null && apt-get install -y --no-install-recommends gnupg >/dev/null
+              command -v gpg >/dev/null || { echo "gpg missing; refusing"; exit 1; }
+              test -r "$HEAR_POOL_BACKUP_PASSPHRASE_FILE" || { echo "no passphrase; refusing"; exit 1; }
+              test -z "$(ls -A /restore)" || { echo "restore target is not empty; refusing"; exit 1; }
+              exec python3 /app/tools/hear_pool_backup.py restore \
+                --target /target \
+                --gen "$GEN" \
+                --into /restore \
+                --passphrase-file "$HEAR_POOL_BACKUP_PASSPHRASE_FILE" \
+                --test-id "$TEST_ID" \
+                --i-understand \
+                --execute
+          env:
+            - { name: GEN, value: "REPLACE-WITH-A-GEN-ID-FROM-index.jsonl" }
+            - { name: TEST_ID, value: "g0-drill" }
+            - { name: HEAR_POOL_BACKUP_PASSPHRASE_FILE, value: /custody/passphrase }
+          resources:
+            requests: { cpu: 500m, memory: 512Mi }
+            limits: { cpu: "4", memory: 2Gi }
+          volumeMounts:
+            - { name: code, mountPath: /app/tools/hear_pool_backup.py, subPath: tools_hear_pool_backup.py }
+            # READ-WRITE, narrowly: the drill's only write is the receipt it must leave behind,
+            # restore-tests/<test id>/report.json. The tool itself refuses to touch anything in
+            # generations/ and never opens the live pool in any mode.
+            - { name: target, mountPath: /target }
+            - { name: restore, mountPath: /restore }
+            - { name: custody, mountPath: /custody, readOnly: true }
+      volumes:
+        - name: code
+          configMap: { name: hear-pool-backup-code, optional: false }
+        - name: target
+          hostPath:
+            path: /mnt/f/hear-backup
+            type: Directory
+        - name: restore
+          persistentVolumeClaim:
+            claimName: hear-pool-restore
+        - name: custody
+          emptyDir: {}
