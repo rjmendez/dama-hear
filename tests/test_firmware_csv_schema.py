@@ -95,6 +95,19 @@ def test_a_row_states_what_its_own_stamp_is_worth():
     assert "d.clock_state" in call or "clock_state_name(d.clock_state)" in call
 
 
+def test_detection_clock_metadata_is_capture_time_and_64_bit():
+    src = _source()
+    start = src.index("struct Det {")
+    det = src[start:src.index("};", start)]
+    assert "uint64_t anchor_age_us;" in det
+    assert "(uint32_t)clock_anchor_age_us(cap_us)" not in src
+    assert "clock_snapshot_at(local_us" in src
+    state_fn = src[src.index("static uint8_t clock_state_at"):
+                   src.index("static uint64_t clock_anchor_age_us")]
+    assert "(void)local_us" not in state_fn
+    assert '"anchor_age_us\\":%llu' in src
+
+
 def test_zero_is_not_a_value_the_sigma_column_may_carry():
     """0 ns reads as a perfect clock, which hear/nodeclass.py refuses as a claim no hardware
     supports. A row with no anchor must write an EMPTY cell instead."""
