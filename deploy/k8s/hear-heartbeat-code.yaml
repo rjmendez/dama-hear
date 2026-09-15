@@ -8,7 +8,7 @@ metadata:
   labels:
     app: hear-heartbeat
   annotations:
-    dama-hear/commit: 'd1336dc'
+    dama-hear/commit: 'b54798f'
     dama-hear/source-sha256: '9efbe8d63375bff6fb5004dc5ef41ebdd22f9c4533f58788e3e0f99b4e2a47e4'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
