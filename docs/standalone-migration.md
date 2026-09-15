@@ -133,6 +133,12 @@ compatibility window and conformance result in the same change.
 
 ### Adapter conformance tests
 
+Implemented: `tests/test_adapter_conformance.py` runs one parametrised suite against every ingress
+that exists (card-backed `dets.csv`, cardless `/detections` `cursor-v1`), and
+`tools/recoupling_guard.py` enforces the boundary above as a merge-blocking CI job. See
+[adapter-conformance.md](adapter-conformance.md) for the seven cases, the value-scoped allowlist of
+couplings that shipped before the gate, and how a new adapter joins the suite.
+
 Every adapter must pass the same suite with no external services:
 
 1. valid and malformed `hear.ingest.v1` envelopes, schema/version/type rejection, and durable

@@ -1,0 +1,15 @@
+# path :: rule :: token :: reason
+#
+# One line per (file, rule, EXACT token). Never a whole file: allowing a file lets the NEXT
+# coupling into the same module unnoticed, which is the failure tools/recoupling_guard.py exists
+# to stop. An entry that stops matching is an error, so this list cannot rot into a blanket
+# exemption. Same discipline as tools/coord_guard_allow.txt.
+#
+# Everything below is a coupling that SHIPPED before the gate existed. It is recorded rather than
+# edited because changing where a running service publishes or writes is a rollout with a
+# rollback plan, not a lint fix -- docs/standalone-migration.md puts each of these in a later
+# phase. What the gate buys today is that a SECOND one cannot arrive silently.
+
+hear/nodeclass.py :: android_gotchi :: gotchi-phone :: The registered name of a PRODUCER CLASS, not a dependency: nodeclass.py is the timing taxonomy every source of arrivals is measured against, and a phone is one of them. Nothing here imports, dials or requires dama-gotchi; deleting the adapter leaves the class unused, not broken.
+hear/spatial.py :: pvc_path :: /pool/spatial/events.geojsonl :: Shipped default of append_geojsonl(), overridable today by SPATIAL_GEOJSONL_PATH. The consumers of that file are live (deploy/k8s spatial lane), so the path moves in the phase 3 object-store import with a dual-read window, not here.
+hear/spatial.py :: mqtt :: import paho.mqtt.client :: Function-local, fail-open publish_mqtt_event(); the import is inside the try and its failure returns False, so neither the core import graph nor any solve depends on a broker being installed. It moves behind ResultSink.publish in the phase 4 adapter work.
