@@ -32,3 +32,23 @@ def test_json_model_inference_matches_training_shape(tmp_path):
     assert probabilities.shape == (12,); assert np.all((probabilities >= 0) & (probabilities <= 1))
     path = tmp_path / 'model.json'; TG.export_json(model, path)
     assert path.exists() and TG.evaluate(features, labels, model)['accuracy'] >= .5
+
+
+def test_gunshot_head_evaluator():
+    from hear.gunshot import GunshotHead
+    head = GunshotHead.load()
+    assert head.embedding_dim == 960
+    assert head.cv_roc_auc is not None and head.cv_roc_auc > 0.95
+
+    # Test scoring with dummy zero embedding
+    zero_emb = [0.0] * 960
+    score = head.predict_score(zero_emb)
+    assert 0.0 <= score <= 1.0
+
+    # Test tag row evaluation
+    row = {"embedding": zero_emb}
+    pred = head.evaluate_tag_row(row)
+    assert pred is not None
+    assert pred["label"] == "Gunshot"
+    assert "score" in pred
+

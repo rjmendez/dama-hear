@@ -442,3 +442,33 @@ class TestGotchiPhone:
         microphone with a wider band than either XIAO node can reach."""
         phone = nc.get("gotchi-phone")
         assert phone.usable_band_hz()[1] > nc.get("xiao-s3-pps").usable_band_hz()[1]
+
+
+class TestSpeakerAndBox3Nodes:
+    """The ESP32-S3 speaker board and ESP32-S3-BOX-3 are stereo 48kHz listeners with PPS capability."""
+
+    def test_both_classes_are_registered(self):
+        spk = nc.get("esp32s3-speaker")
+        box = nc.get("esp32s3-box3")
+        assert spk.name == "esp32s3-speaker"
+        assert box.name == "esp32s3-box3"
+        assert spk.mic_count == 2
+        assert box.mic_count == 2
+        assert spk.fs_hz == 48000.0
+        assert box.fs_hz == 48000.0
+
+    def test_can_bear_because_they_are_two_mic_arrays(self):
+        assert nc.get("esp32s3-speaker").can_bear()
+        assert nc.get("esp32s3-box3").can_bear()
+
+    def test_both_have_pps_clocks_and_unmeasured_capture_bias(self):
+        for name in ("esp32s3-speaker", "esp32s3-box3"):
+            node = nc.get(name)
+            assert node.time_source == "gps_pps"
+            assert node.clock_admissible()
+            assert not node.capture_bias_bounded()
+            assert not node.contributes_arrival()
+            with pytest.raises(nc.CapabilityError) as e:
+                nc.require_arrival(name)
+            assert "NEVER BEEN MEASURED" in str(e.value)
+
