@@ -106,14 +106,17 @@ def test_the_pump_can_only_append_while_a_handler_holds_the_card():
             continue
         seen.add(f)
         todo += [c for c in re.findall(r"\b(\w+)\s*\(", fns[f]) if c in fns and c != f]
-    touching = {f for f in seen if re.search(r"\bSD\.|\bcsv_open\(|\bprune_oldest\(", fns[f])}
-    assert touching == {"scene_emit", "csv_open", "prune_oldest"}, (
+    touching = {f for f in seen if re.search(r"\bSD\.|\bcsv_open\(|\bsd_cache_|"
+                                             r"\bclip_remove\(|\bclip_rescan\(", fns[f])}
+    assert touching == {"scene_emit", "csv_open", "sd_cache_prune", "sd_cache_add",
+                        "sd_cache_above_target", "clip_remove", "clip_rescan"}, (
         "card access reachable from the pump changed: %s" % sorted(touching))
     b = fns["scene_emit"]
     g = b.index("if ((strcmp(day, cur_day) != 0 || !scenef) && !sd_streaming)")
     guarded = _block(b, g)
-    for call in ("prune_oldest(", "csv_open(", "scenef.close()"):
+    for call in ("sd_cache_prune(", "csv_open(", "scenef.close()"):
         assert b.count(call) == guarded.count(call) + (1 if call == "scenef.close()" else 0), call
+    assert "sd_streaming || clip_busy" in fns["sd_cache_prune"]
     assert "if (sd_streaming) scene_stream_skip++; else scene_write_fail++;" in b
 
 
