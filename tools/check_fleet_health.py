@@ -504,6 +504,11 @@ def parse_status(d: Mapping[str, Any]) -> Dict[str, Any]:
     rssi = _first(d, (("net", "rssi"), ("wifi", "rssi"), ("rssi",)))
     sd = _first(d, (("sd",),))
     sd_free_mb = _first(d, (("sd_free_mb",),))
+    sd_total_mb = _first(d, (("sd_total_mb",),))
+    cache = d.get("cache") if isinstance(d.get("cache"), Mapping) else {}
+    cache_target_free_mb = _first(cache, (("target_free_mb",),))
+    cache_evicted_files = _first(cache, (("evicted_files",),))
+    cache_last_evicted = _first(cache, (("last_evicted",),))
     mic = _first(d, (("selftest", "mic"), ("mic",)))
     mic_state = _first(d, (("selftest", "mic_state"), ("mic_state",)))
     mic_reason = _first(d, (("selftest", "mic_reason"), ("mic_reason",)))
@@ -520,6 +525,10 @@ def parse_status(d: Mapping[str, Any]) -> Dict[str, Any]:
         "rssi": rssi,
         "sd": sd,
         "sd_free_mb": sd_free_mb,
+        "sd_total_mb": sd_total_mb,
+        "cache_target_free_mb": cache_target_free_mb,
+        "cache_evicted_files": cache_evicted_files,
+        "cache_last_evicted": cache_last_evicted,
         "mic": mic,
         "mic_state": mic_state,
         "mic_reason": mic_reason,
@@ -613,8 +622,12 @@ def evaluate_health(target_name: str, status_data: Optional[Mapping[str, Any]],
         reasons.append("rssi=%d dBm" % p["rssi"])
     if _sd_expected(p) and p["sd"] is False:
         reasons.append("no SD card")
-    elif _sd_expected(p) and p["sd_free_mb"] is not None and p["sd_free_mb"] < 100:
-        reasons.append("%d MB free" % p["sd_free_mb"])
+    elif _sd_expected(p) and p["sd_free_mb"] is not None:
+        target = p.get("cache_target_free_mb")
+        if target is not None and p["sd_free_mb"] < target:
+            reasons.append("%d MB free below cache target %d MB" % (p["sd_free_mb"], target))
+        elif target is None and p["sd_free_mb"] < 100:
+            reasons.append("%d MB free" % p["sd_free_mb"])
 
     reported_node = str(status_data.get("node") or target_name)
     state = "degraded" if reasons else "online"
@@ -1194,6 +1207,22 @@ def build_data_report(nodes: Sequence[str], statuses: Mapping[str, Mapping[str, 
             "clock": clock,
             "anchor_age_s": anchor_age,
             "mic_state": mic_state,
+            "sd_cache": {
+                "free_mb": parsed.get("sd_free_mb"),
+                "total_mb": parsed.get("sd_total_mb"),
+                "target_free_mb": parsed.get("cache_target_free_mb"),
+                "evicted_files": parsed.get("cache_evicted_files"),
+                "last_evicted": parsed.get("cache_last_evicted"),
+                "state": (
+                    "unknown" if parsed.get("sd") is not True
+                    else "healthy" if (
+                        parsed.get("cache_target_free_mb") is None
+                        or parsed.get("sd_free_mb") is None
+                        or parsed.get("sd_free_mb") >= parsed.get("cache_target_free_mb")
+                    )
+                    else "degraded"
+                ),
+            },
             "heartbeat": _drain_node_report(node, sensor, now, window_s) if sensor else {
                 "state": "unknown", "last_success_age_s": None,
             },
@@ -1246,8 +1275,8 @@ def build_data_report(nodes: Sequence[str], statuses: Mapping[str, Mapping[str, 
 
 def format_data_report(report: Mapping[str, Any]) -> str:
     lines = []
-    lines.append("node                 fw           class              clock      anchor   mic        hb_age   det+  clips(named/fetch/defer/lost) scene_gap")
-    lines.append("-------------------- ------------ ------------------ ---------- -------- ---------- -------- ----- ----------------------------- ---------")
+    lines.append("node                 fw           class              clock      anchor   mic        sd_cache       hb_age   det+  clips(named/fetch/defer/lost) scene_gap")
+    lines.append("-------------------- ------------ ------------------ ---------- -------- ---------- -------------- -------- ----- ----------------------------- ---------")
     for node in sorted((report.get("nodes") or {})):
         n = report["nodes"][node]
         hb = n.get("heartbeat") or {}
@@ -1256,13 +1285,18 @@ def format_data_report(report: Mapping[str, Any]) -> str:
         clock = (n.get("clock") or {}).get("value")
         anchor = (n.get("anchor_age_s") or {}).get("value")
         mic = (n.get("mic_state") or {}).get("value")
-        lines.append("%-20s %-12s %-18s %-10s %-8s %-10s %-8s %-5s %5s/%-5s/%-5s/%-5s %-9s" % (
+        sd = n.get("sd_cache") or {}
+        sd_txt = "UNKNOWN"
+        if sd.get("free_mb") is not None and sd.get("target_free_mb") is not None:
+            sd_txt = "%s/%sMB" % (sd.get("free_mb"), sd.get("target_free_mb"))
+        lines.append("%-20s %-12s %-18s %-10s %-8s %-10s %-14s %-8s %-5s %5s/%-5s/%-5s/%-5s %-9s" % (
             node,
             str(n.get("firmware") or "UNKNOWN")[:12],
             str(n.get("class") or "UNKNOWN")[:18],
             str(clock or "UNKNOWN")[:10],
             "UNKNOWN" if anchor is None else _fmt_age(float(anchor)),
             str(mic or "UNKNOWN")[:10],
+            sd_txt[:14],
             _fmt_age(hb.get("last_success_age_s")),
             str(hb.get("last_detection_added") if hb.get("last_detection_added") is not None else "?"),
             str(clips.get("named_window") if clips.get("named_window") is not None else "?"),

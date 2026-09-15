@@ -188,6 +188,17 @@ class TestStatusParsing:
     def test_sd_free_space_is_read(self):
         assert H.parse_status(self._status(sd_free_mb=42))["sd_free_mb"] == 42
 
+    def test_sd_cache_policy_is_read(self):
+        s = H.parse_status(self._status(sd_total_mb=239, cache={
+            "target_free_mb": 23,
+            "evicted_files": 7,
+            "last_evicted": "/kernel.img",
+        }))
+        assert s["sd_total_mb"] == 239
+        assert s["cache_target_free_mb"] == 23
+        assert s["cache_evicted_files"] == 7
+        assert s["cache_last_evicted"] == "/kernel.img"
+
     def test_explicit_mic_diagnostics_are_read_when_present(self):
         s = H.parse_status(self._status(selftest={
             "mic": "ok",
@@ -265,7 +276,10 @@ class TestFleetDataReport:
         }]}
         durable = {"durable_store": {"backend": "sqlite", "enabled": True,
                                      "pending_records": 9}}
-        report = H.build_data_report(["nyquist"], {"nyquist": self._status()}, drain, score, tag,
+        report = H.build_data_report(["nyquist"], {"nyquist": self._status(
+            sd=True, sd_free_mb=216, sd_total_mb=239,
+            cache={"target_free_mb": 23, "evicted_files": 2, "last_evicted": "/scene-20260913.csv"},
+        )}, drain, score, tag,
                                      durable, now=self.NOW, window_s=7200)
 
         node = report["nodes"]["nyquist"]
@@ -274,6 +288,8 @@ class TestFleetDataReport:
         assert node["clock"] == {"state": "healthy", "value": "LOCKED"}
         assert node["anchor_age_s"] == {"state": "healthy", "value": 1.5}
         assert node["mic_state"] == {"state": "healthy", "value": "normal"}
+        assert node["sd_cache"]["free_mb"] == 216
+        assert node["sd_cache"]["target_free_mb"] == 23
         assert node["heartbeat"]["last_success_age_s"] == 60
         assert node["heartbeat"]["clips"]["named_window"] == 3
         assert node["heartbeat"]["scene"]["unfetched_bytes_window"] == 0
