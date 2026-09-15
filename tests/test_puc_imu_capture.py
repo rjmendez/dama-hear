@@ -50,7 +50,8 @@ def test_hardware_configuration_fails_closed_on_identity_and_readback():
 def test_fifo_bounded_burst_raw_ring_and_monotonic_clock_are_exposed():
     src = _json_literals()
     assert _define_int("IMU_FIFO_WATERMARK") == 24
-    assert _define_int("IMU_BURST_MAX") == 24
+    assert _define_int("IMU_FIFO_CAPACITY") == 32
+    assert _define_int("IMU_BURST_MAX") == 32
     assert "LIS3DH_FIFO_SRC_REG" in src
     assert "IMU_RING_N" in src
     assert '"schema":"puc-lis3dh-raw-v1"' in src
@@ -58,9 +59,17 @@ def test_fifo_bounded_burst_raw_ring_and_monotonic_clock_are_exposed():
     assert "sample-clock-reconstructed-from-burst-end-monotonic-us" in src
 
 
+def test_lis3dh_full_fifo_fss_value_is_drained_as_32_samples():
+    code = _code()
+    assert "fss == 0x1F ? IMU_FIFO_CAPACITY : fss" in code, (
+        "LIS3DH FIFO_SRC_REG FSS=0x1f means a full 32-sample FIFO, not 31")
+    assert "imu_fifo_lost_min++" in code, "FIFO overrun must account at least one overwritten sample"
+    assert '"fifo_lost_min"' in _json_literals()
+
+
 def test_status_reports_health_rate_drops_and_fifo_overruns():
     src = _json_literals()
-    for token in ('"imu":', '"odr_hz"', '"drops"', '"fifo_overruns"', '"i2c_errors"', '"short_reads"'):
+    for token in ('"imu":', '"odr_hz"', '"drops"', '"fifo_overruns"', '"fifo_lost_min"', '"i2c_errors"', '"short_reads"'):
         assert token in src
 
 
@@ -70,6 +79,27 @@ def test_feature_contract_marks_imu_seismic_not_microphone():
     assert '"source":"imu"' in src
     assert '"seismic.rayleigh_wave"' in src
     assert '"is_microphone":false' in src
+    assert '"is_seismic":true' in src
+
+
+def test_disabled_feature_response_keeps_the_fail_closed_claim():
+    src = _json_literals()
+    feature_fn = src[src.index("static String imu_features_json()"):src.index("static String imu_samples_json")]
+    disabled = feature_fn[feature_fn.index('if (!imu_ok || n < 8)'):feature_fn.index('double sum = 0')]
+    for token in ('"claim"', '"is_microphone":false', '"is_seismic":true', '"provenance":"sensor"'):
+        assert token in disabled
+
+
+def test_phone_feature_names_are_computed_from_calibrated_accel_mag_mps2():
+    src = _json_literals()
+    code = _code()
+    assert "LIS3DH_MPS2_PER_LSB" in code
+    assert "9.80665f * 0.001f / 16.0f" in INO.read_text()
+    assert '"input":"accel_mag"' in src
+    assert '"units":"m/s2"' in src
+    assert "sqrt(ax * ax + ay * ay + az * az)" in code
+    assert "sqrt((double)s.x * s.x + (double)s.y * s.y + (double)s.z * s.z)" not in code, (
+        "phone-compatible crest_factor/dc_offset must not be computed over raw LIS3DH counts")
 
 
 def test_operator_doc_names_required_on_device_validation():

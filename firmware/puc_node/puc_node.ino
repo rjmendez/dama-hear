@@ -640,8 +640,10 @@ static String mic_capture(int clk, int din, int fs, bool stereo) {
 #define IMU_ODR_HZ               400
 #define IMU_DT_US                2500
 #define IMU_RING_N               512
+#define IMU_FIFO_CAPACITY        32
 #define IMU_FIFO_WATERMARK       24
-#define IMU_BURST_MAX            24
+#define IMU_BURST_MAX            32
+#define LIS3DH_MPS2_PER_LSB      (9.80665f * 0.001f / 16.0f)
 
 struct ImuSample {
   uint32_t seq;
@@ -653,7 +655,7 @@ struct ImuSample {
 
 static ImuSample imu_ring[IMU_RING_N];
 static uint32_t imu_seq = 0, imu_seen = 0, imu_bursts = 0, imu_fifo_overruns = 0;
-static uint32_t imu_ring_drops = 0, imu_i2c_errors = 0, imu_short_reads = 0;
+static uint32_t imu_fifo_lost_min = 0, imu_ring_drops = 0, imu_i2c_errors = 0, imu_short_reads = 0;
 static uint64_t imu_last_us = 0;
 static uint8_t imu_who = 0, imu_fifo_level = 0, imu_ctrl1 = 0, imu_ctrl4 = 0, imu_ctrl5 = 0, imu_fifo_ctrl = 0;
 static bool imu_ok = false;
@@ -733,11 +735,12 @@ static void imu_poll() {
   if (!imu_ok) return;
   uint8_t src = 0;
   if (!lis3dh_read_reg(LIS3DH_FIFO_SRC_REG, &src)) { imu_i2c_errors++; return; }
-  imu_fifo_level = src & 0x1F;
-  if (src & 0x40) imu_fifo_overruns++;
-  if ((src & 0x20) && imu_fifo_level == 0) return;      // EMPTY
-  uint8_t n = imu_fifo_level;
-  if (n == 0 && (src & 0x40)) n = 32;                   // full FIFO reports overrun, not empty
+  uint8_t fss = src & 0x1F;
+  bool empty = src & 0x20;
+  bool overrun = src & 0x40;
+  uint8_t n = empty ? 0 : (fss == 0x1F ? IMU_FIFO_CAPACITY : fss);
+  imu_fifo_level = n;
+  if (overrun) { imu_fifo_overruns++; imu_fifo_lost_min++; }
   if (n > IMU_BURST_MAX) n = IMU_BURST_MAX;
   if (!n) return;
   uint64_t end_us = (uint64_t)esp_timer_get_time();
@@ -762,13 +765,14 @@ static String imu_health_json() {
     "\"bus\":{\"sda\":%d,\"scl\":%d,\"hz\":%d},\"odr_hz\":%d,\"dt_us\":%d,"
     "\"mode\":\"high_resolution_fifo_stream_poll\",\"fifo_watermark\":%d,\"fifo_level\":%u,"
     "\"samples\":%lu,\"ring_samples\":%lu,\"burst_reads\":%lu,\"drops\":%lu,"
-    "\"fifo_overruns\":%lu,\"i2c_errors\":%lu,\"short_reads\":%lu,\"last_age_s\":%.3f,"
+    "\"fifo_overruns\":%lu,\"fifo_lost_min\":%lu,\"i2c_errors\":%lu,\"short_reads\":%lu,\"last_age_s\":%.3f,"
     "\"ctrl\":{\"reg1\":\"0x%02X\",\"reg4\":\"0x%02X\",\"reg5\":\"0x%02X\",\"fifo\":\"0x%02X\"}}",
     imu_ok ? "true" : "false", imu_fault, imu_who, IMU_I2C_SDA, IMU_I2C_SCL, IMU_I2C_HZ,
     IMU_ODR_HZ, IMU_DT_US, IMU_FIFO_WATERMARK, imu_fifo_level,
     (unsigned long)imu_seen, (unsigned long)imu_available(), (unsigned long)imu_bursts,
-    (unsigned long)imu_ring_drops, (unsigned long)imu_fifo_overruns, (unsigned long)imu_i2c_errors,
-    (unsigned long)imu_short_reads, age_s, imu_ctrl1, imu_ctrl4, imu_ctrl5, imu_fifo_ctrl);
+    (unsigned long)imu_ring_drops, (unsigned long)imu_fifo_overruns, (unsigned long)imu_fifo_lost_min,
+    (unsigned long)imu_i2c_errors, (unsigned long)imu_short_reads, age_s, imu_ctrl1, imu_ctrl4, imu_ctrl5,
+    imu_fifo_ctrl);
   return String(b);
 }
 
@@ -778,21 +782,28 @@ static String imu_features_json() {
     return "{\"schema\":\"phone-vibration-features-v1\",\"source\":\"imu\",\"sensor\":\"lis3dh\","
            "\"fs_hz\":400,\"feature_metrics\":{\"source\":\"imu\",\"source_fs_hz\":400,"
            "\"analysis_fs_hz\":400,\"duration_s\":0,\"rms\":0,\"crest_factor\":0},"
-           "\"vibration_onset\":null,\"scores\":{}}";
+           "\"vibration_onset\":null,\"scores\":{},\"claim\":{\"is_microphone\":false,"
+           "\"is_seismic\":true,\"provenance\":\"sensor\"}}";
   }
-  double sum = 0, sum2 = 0, peak_abs = 0, zsum = 0;
+  double sum = 0, peak_abs = 0, zsum = 0;
   int peak_i = 0;
   uint32_t start = imu_seq - n;
   for (uint32_t i = 0; i < n; i++) {
     ImuSample &s = imu_ring[(start + i) % IMU_RING_N];
-    double mag = sqrt((double)s.x * s.x + (double)s.y * s.y + (double)s.z * s.z);
-    sum += mag; sum2 += mag * mag; zsum += s.z;
+    double ax = s.x * (double)LIS3DH_MPS2_PER_LSB;
+    double ay = s.y * (double)LIS3DH_MPS2_PER_LSB;
+    double az = s.z * (double)LIS3DH_MPS2_PER_LSB;
+    double accel_mag = sqrt(ax * ax + ay * ay + az * az);
+    sum += accel_mag; zsum += az;
   }
   double mean = sum / n, zmean = zsum / n, var = 0, zvar = 0, z4 = 0;
   for (uint32_t i = 0; i < n; i++) {
     ImuSample &s = imu_ring[(start + i) % IMU_RING_N];
-    double mag = sqrt((double)s.x * s.x + (double)s.y * s.y + (double)s.z * s.z);
-    double c = mag - mean, zc = s.z - zmean;
+    double ax = s.x * (double)LIS3DH_MPS2_PER_LSB;
+    double ay = s.y * (double)LIS3DH_MPS2_PER_LSB;
+    double az = s.z * (double)LIS3DH_MPS2_PER_LSB;
+    double accel_mag = sqrt(ax * ax + ay * ay + az * az);
+    double c = accel_mag - mean, zc = az - zmean;
     var += c * c; zvar += zc * zc; z4 += zc * zc * zc * zc;
     double a = fabs(c);
     if (a > peak_abs) { peak_abs = a; peak_i = i; }
@@ -812,6 +823,7 @@ static String imu_features_json() {
   snprintf(b, sizeof b,
     "{\"schema\":\"phone-vibration-features-v1\",\"source\":\"imu\",\"sensor\":\"lis3dh\","
     "\"fs_hz\":%d,\"feature_metrics\":{\"source\":\"imu\",\"source_fs_hz\":%d,"
+    "\"input\":\"accel_mag\",\"units\":\"m/s2\","
     "\"analysis_fs_hz\":%d,\"duration_s\":%.4f,\"rms\":%.3f,\"crest_factor\":%.3f,"
     "\"dc_offset\":%.3f,\"z_kurtosis\":%.3f},"
     "\"vibration_onset\":%s,"

@@ -6,7 +6,7 @@ The PUC firmware now has a narrow LIS3DH vibration path for bench/on-device vali
 
 - Sensor: LIS3DH at `0x18`, raw signed XYZ retained from `OUT_X/Y/Z`.
 - Rate: **400 Hz**. This is an exact LIS3DH ODR (`CTRL_REG1=0x77`) and matches the existing phone/infrasound analysis rate closely enough that no synthetic resampling contract is needed; Nyquist is 200 Hz, above the current 0.1-100 Hz seismic feature band.
-- Mode: high-resolution, +/-2 g, block-data-update enabled, FIFO stream mode with watermark 24. The INT1/INT2 route is not yet identified, so the sketch uses bounded FIFO polling (`IMU_BURST_MAX=24`) rather than guessing an interrupt GPIO.
+- Mode: high-resolution, +/-2 g, block-data-update enabled, FIFO stream mode with watermark 24. The INT1/INT2 route is not yet identified, so the sketch uses bounded FIFO polling rather than guessing an interrupt GPIO. A bounded drain may read the full 32-sample LIS3DH FIFO; `FSS=0x1f` is treated as 32 samples, and FIFO overrun records both an event count and a minimum overwritten-sample count.
 - Clock: samples carry `mono_us` timestamps reconstructed from the monotonic burst-end time and the 2500 us sample period. This is a local sample clock, not a UTC/PPS arrival claim.
 - Safety: identity failure, I2C failure, or config readback mismatch leaves `imu.ok=false`; runtime read faults are counted in health rather than hidden.
 
@@ -14,7 +14,7 @@ The PUC firmware now has a narrow LIS3DH vibration path for bench/on-device vali
 
 - `GET /status` includes `imu`: `ok`, `fault`, `odr_hz`, bus pins/rate, FIFO level, sample count, ring drops, FIFO overruns, I2C errors, short reads, and register readbacks.
 - `GET /imu/status` returns the same health block.
-- `GET /imu/features` returns `phone-vibration-features-v1` with `source:"imu"`, LIS3DH sensor identity, RMS/crest/z-kurtosis fields compatible with the existing phone vibration feature vocabulary, and `vibration_onset` when a high-crest impulse is present. It explicitly sets `is_microphone:false`.
+- `GET /imu/features` returns `phone-vibration-features-v1` with `source:"imu"`, LIS3DH sensor identity, and `vibration_onset` when a high-crest impulse is present. `crest_factor`, `dc_offset`, and `rms` are computed over calibrated `accel_mag` in m/s² (`raw * 0.001 g / 16`, then vector magnitude), matching the phone/gotchi accelerometer contract instead of raw LIS3DH counts. Disabled/not-ready responses keep the explicit `claim` block with `is_microphone:false` and `is_seismic:true`.
 - `GET /imu?limit=N` returns `puc-lis3dh-raw-v1`: recent raw XYZ samples with `seq` and `mono_us`, health, and the feature block. `limit` is capped by the firmware ring.
 
 ## Required on-device validation before field use
