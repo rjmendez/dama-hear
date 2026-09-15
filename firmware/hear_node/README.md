@@ -121,6 +121,18 @@ mean-absolute amplitude, zero-crossing rate, adjacent-repeat rate, unique values
 Consumers can keep reading `selftest.mic` during the migration, while new ones stop treating
 quiet input as a broken microphone.
 
+**The boot probe is a bounded settle window, not one latched read.** A single 768-sample read taken
+the instant `i2s.begin()` returns measures the DMA, not the microphone: an ICS-43434-class part is
+not driving data that early, so a healthy node booted cold reported `capture-failure` (all-zero
+probe) or `stuck` (98% repeated samples) while its live audio, I2S counters and detections stayed
+healthy for the rest of the boot. `mic_probe_settle()` reads, classifies, and accepts the first
+`quiet`/`normal` verdict; any other verdict is retried every 20 ms until the budget expires — 750 ms
+after a cold power-on, 250 ms after a software/OTA restart, where the mic kept its supply and
+answers the first read. The **last** classification is what is latched, so an absent, stuck or
+floating microphone still fails exactly as before; it simply fails after the node has tried.
+`selftest.mic_stats.attempts` and `selftest.mic_stats.settle_ms` say which happened, and the boot
+log carries the same on a `selftest mic_state=...` line.
+
 The SD card is the actual record. WiFi is a convenience and a run must not depend on
 it. Everything below is fetchable over the same link with `/sd?file=/dets.csv&tail=20000`:
 
