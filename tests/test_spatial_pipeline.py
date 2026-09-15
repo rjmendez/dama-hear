@@ -345,6 +345,38 @@ class TestSpatialPipelineIntegration:
         features = pipeline.process_coincidences(detections)
         assert features[0]["properties"]["position_sources"]["gps-node"] == SV.POSITION_SOURCE_GPS
 
+    def test_gps_fallback_sigma_is_folded_into_solver_weights(self, sample_survey):
+        gps_id = SV.gps_node_id("gps-node")
+        pipeline_survey = SV.Survey(
+            {**{node_id: sample_survey.position(node_id) for node_id in sample_survey.ids},
+             gps_id: np.array([300.0, 0.0, 0.0])},
+            names={**sample_survey.names, gps_id: "gps-node"},
+            sigma_m={**sample_survey.sigma_m, gps_id: 3.0},
+            classes={**sample_survey.classes, gps_id: "xiao-s3-pps"},
+            position_sources={**sample_survey.position_sources, gps_id: SV.POSITION_SOURCE_GPS},
+            origin=sample_survey.origin,
+        )
+        pipeline = SpatialEventPipeline(pipeline_survey, temp_c=TEMP_C, fixed_up_m=0.0,
+                                        geojsonl_path=None)
+        source = np.array([120.0, 60.0, 0.0])
+        detections = [
+            {"node_id": node_id, "seq": 1,
+             "t_utc_s": 1757772000.0 + np.linalg.norm(source - pipeline_survey.position(node_id))
+             / SOUND_SPEED, "onset_found": True, "utc_trusted": True, "stamp_admissible": True,
+             "sync_sigma_ns": 50.0}
+            for node_id in pipeline_survey.ids if node_id != 104
+        ]
+
+        with patch("hear.spatial.PT.solve", wraps=PT.solve) as solve_spy:
+            features = pipeline.process_coincidences(detections)
+
+        assert features
+        sigmas = solve_spy.call_args.kwargs["sigmas"]
+        k = len(sigmas) - 1
+        other = sigmas[0]
+        assert math.isclose(sigmas[k], math.hypot(other, 3.0 / SOUND_SPEED), rel_tol=1e-9)
+        assert sigmas[:k] == pytest.approx([other] * k)
+
     def test_pipeline_stationary_coincidence_processing(self, sample_survey, tmp_path):
         geojsonl_file = tmp_path / "events.geojsonl"
 

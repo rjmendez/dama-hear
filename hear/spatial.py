@@ -23,6 +23,7 @@ import numpy as np
 from scipy.signal import correlate
 
 from . import geodesy as GEO
+from . import nodeclass as NC
 from .backend import associate as AS
 from .backend import survey as SV
 from .detsfile import read_file, read_text
@@ -339,6 +340,44 @@ def estimate_trajectory_from_clips(
     }
 
 
+def _event_arrival_sigmas(
+    event: Dict[str, Any],
+    survey: SV.Survey,
+    temp_c: float,
+) -> Optional[List[float]]:
+    """Per-receiver sigma vector for one solve, or None when not every receiver states one.
+
+    `associate()` carries `t_sigma_s` through when the caller already resolved it, but
+    tools/hear_spatial.py reads raw dets.csv rows that often only carry `sync_sigma_ns`. When
+    every receiver in the event states that clock sigma, resolve it here through nodeclass and
+    fold any GPS-positioned receiver's own position sigma into the same range budget
+    hear-tdoa uses. A partial vector stays unweighted: the solvers refuse mixed stated/unstated
+    sigmas rather than inventing the missing ones.
+    """
+    node_ids = event["node_ids"]
+    detections = event.get("detections", [])
+    sigmas = list(event.get("arrival_sigma_s") or [None] * len(node_ids))
+    if len(sigmas) != len(node_ids):
+        raise ValueError("arrival_sigma_s must align with node_ids")
+    if len(detections) != len(node_ids):
+        raise ValueError("detections must align with node_ids")
+    if any(s is None for s in sigmas):
+        for i, (node_id, det) in enumerate(zip(node_ids, detections)):
+            if sigmas[i] is None and det.get("sync_sigma_ns") is not None:
+                sigmas[i] = NC.stamp_t_sigma_s(
+                    det["sync_sigma_ns"], survey.classes.get(int(node_id))
+                )
+    if any(s is None for s in sigmas):
+        return None
+    c_mps = SW.sound_speed(temp_c)
+    return [
+        math.hypot(float(sigmas[i]), float(survey.sigma_m[int(node_id)]) / c_mps)
+        if survey.position_sources.get(int(node_id), "survey") == SV.POSITION_SOURCE_GPS
+        else float(sigmas[i])
+        for i, node_id in enumerate(node_ids)
+    ]
+
+
 @dataclass
 class SpatialEvent:
     """Dataclass representing a localized spatial event."""
@@ -546,12 +585,9 @@ class SpatialEventPipeline:
         for ev in events:
             node_ids = ev["node_ids"]
             arrivals = ev["arrivals"]
-            sigmas = ev.get("arrival_sigma_s")
+            sigmas = _event_arrival_sigmas(ev, self.survey, self.temp_c)
 
             positions = self.survey.positions(node_ids)
-
-            if sigmas and all(s is None for s in sigmas):
-                sigmas = None
 
             try:
                 sol = PT.solve(
