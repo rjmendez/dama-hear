@@ -9,7 +9,7 @@ metadata:
   labels:
     app: hear-annotate
   annotations:
-    dama-hear/commit: 'e26bd62'
+    dama-hear/commit: 'ace2c15'
     dama-hear/source-sha256: '99d253a90d5fadc8ccef9e2ad3e506f464a898d21f2b5cd4813f344a39e057fd'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/embedded-in: deploy/k8s/hear-annotate.yaml
