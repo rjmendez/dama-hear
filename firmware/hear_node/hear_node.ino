@@ -2477,6 +2477,16 @@ static char clip_rand[CLIP_RAND_HEX + 1] = "000000";
 // +request headers. Growing the payload's contents can no longer silently outgrow the next
 // buffer, and tests/test_firmware_heartbeat_push.py recomputes the worst case from the encoders
 // themselves.
+// ⚠️AND EVERY ONE OF THEM IS `static`, NOT A STACK LOCAL. Sizing them correctly (above) made the
+// push call chain hold body + wrapped + req live at once -- ~2.7 kB -- in the same frame that
+// push_post_json() stands up a WiFiClientSecure, whose mbedtls handshake wants several kB of the
+// 8 kB Arduino loop task stack for itself. Node "nyquist" panicked ~20-25 s after boot on real
+// hardware, twice; hear_boot_guard() saw `reset=panic` before HEAR_BOOT_HEALTHY_MS and reverted
+// the slot, so nothing bricked, but the image could not run. Static storage keeps the derived
+// sizes below exactly as they are and removes them from the frame entirely. Safe because this
+// path is single-threaded: push_pump() is called only from loop(), never from an ISR or a second
+// task, and push_send_heartbeat()/push_send_event() never overlap -- see
+// tests/test_firmware_heartbeat_push.py, which holds both halves of that.
 #define HEAR_PUSH_BODY_MAX          768u
 // `{"device_id":"","messages":[]}` around the body, plus the node id it interpolates and the NUL.
 #define HEAR_PUSH_ENVELOPE_OVERHEAD (sizeof "{\"device_id\":\"\",\"messages\":[]}" + sizeof node_id)
@@ -2602,7 +2612,7 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
 #if HEAR_PUSH_WRAP_BATCH
   // The ingest Lambda expects one batch envelope per POST; hear_push_payload.h's encoders build
   // hear_node's own bare object, so wrap it here rather than teach them about this one backend.
-  char wrapped[HEAR_PUSH_WRAPPED_MAX];
+  static char wrapped[HEAR_PUSH_WRAPPED_MAX];
   static_assert(sizeof wrapped >= HEAR_PUSH_BODY_MAX +
                                    sizeof "{\"device_id\":\"\",\"messages\":[]}" + sizeof node_id - 1,
                 "the batch envelope must hold a full-size body, the wrapper, the node id and NUL");
@@ -2633,7 +2643,7 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
   const bool have_token = HEAR_PUSH_TOKEN[0];
   // Sized from the wrapped body it carries inline plus its own headers, not independently: the
   // envelope fix below would otherwise just move the truncation (-3) one buffer downstream.
-  char req[HEAR_PUSH_REQ_MAX];
+  static char req[HEAR_PUSH_REQ_MAX];
   static_assert(sizeof req > HEAR_PUSH_WRAPPED_MAX,
                 "the request buffer must hold the whole wrapped body plus its headers");
   int n;
@@ -2716,7 +2726,7 @@ static void push_mark_dets_ready(uint32_t batch_rows) {
 
 static bool push_send_heartbeat() {
   hear_push_heartbeat_t hb = {};
-  char body[HEAR_PUSH_BODY_MAX];
+  static char body[HEAR_PUSH_BODY_MAX];
   push_fill_heartbeat(&hb);
   if (!hear_push_heartbeat_json(&hb, body, sizeof body)) {
     push_note_failure("heartbeat encode", -5);
@@ -2738,7 +2748,7 @@ static bool push_send_heartbeat() {
 
 static bool push_send_event(const struct HearPushEvent *src) {
   hear_push_event_t ev = {};
-  char body[HEAR_PUSH_BODY_MAX];
+  static char body[HEAR_PUSH_BODY_MAX];
   push_fill_event(src, &ev);
   if (!hear_push_event_json(&ev, body, sizeof body)) {
     push_note_failure("event encode", -6);
@@ -3750,6 +3760,13 @@ static void selftest_mic_probe() {
   }
   selftest_mic_set_diag(mic_diag_classify(probe, (size_t)n));
 }
+
+// DEFENCE IN DEPTH, NOT THE FIX. The push buffers are `static` (see HEAR_PUSH_BODY_MAX) so this
+// path no longer depends on stack headroom to be correct. But the loop task's 8 kB default is
+// shared by setup()'s 2.6 kB frame, loop()'s own ~1.2 kB and an mbedtls TLS handshake that wants
+// several kB of it, and nothing warns before it becomes a panic 20 s after boot. 12 kB costs
+// 4 kB of heap on a node with ~180 kB free and buys room for the next thing that lands here.
+SET_LOOP_TASK_STACK_SIZE(12 * 1024);
 
 void setup() {
   hear_boot_guard();                    // first statement: a later fault still counts as a failed boot
