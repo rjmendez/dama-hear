@@ -312,6 +312,24 @@ def legacy_collisions(rows: Iterable[tuple[str, str]]) -> dict[str, list[str]]:
     return {uid: devices for uid, devices in seen.items() if len(devices) > 1}
 
 
+# The event stream's dedupe marker is a single ZSET member (_EVENT_DEDUPE_SCRIPT in
+# tools/hear_heartbeat_receiver.py), and today that member is the bare record_uid. Once Postgres
+# stops merging two devices that share a uid, the *records* are distinct but the Redis marker
+# would not be: the first device's event would suppress the second one's XADD, reinstating the
+# same defect one layer further out. The marker therefore has to carry the same scope the
+# durable identity does, which is what this function builds.
+DEDUPE_TOKEN_SEPARATOR = "|"
+
+
+def redis_dedupe_token(device_id: str, record_uid: str, tenant_id: str = "default") -> str:
+    """The Redis-side dedupe member for a record, scoped exactly like its durable identity."""
+    tenant_id, device_id, record_uid = scoped_identity(device_id, record_uid, tenant_id)
+    for part, label in ((tenant_id, "tenant_id"), (device_id, "device_id")):
+        if DEDUPE_TOKEN_SEPARATOR in part:
+            raise ValueError(f"{label} may not contain {DEDUPE_TOKEN_SEPARATOR!r}")
+    return DEDUPE_TOKEN_SEPARATOR.join((tenant_id, device_id, record_uid))
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--list", action="store_true", help="list migrations and their checksums")

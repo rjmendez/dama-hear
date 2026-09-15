@@ -90,5 +90,46 @@ jobs:
       - name: frozen baseline matches the tree
         run: python tools/freeze_contracts.py --check
 
+  durable-postgres:
+    name: durable outbox on an ephemeral postgres
+    runs-on: ubuntu-latest
+    # The Phase 2 migration plan's gate G7: the ephemeral-Postgres suite runs in CI, or the
+    # schema's behaviour is only ever checked by reading it. The service container is created
+    # and destroyed with the job, and every test creates its own scratch database inside it.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: hear-ephemeral-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      HEAR_PG_TEST_DSN: postgresql://postgres:hear-ephemeral-ci@127.0.0.1:5432/postgres
+      # Without this the live tests would skip, and a skipped suite is a green tick for nothing.
+      HEAR_PG_REQUIRE_LIVE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/ci-dev.txt
+      - run: python -m pip install -r requirements/ci-dev.txt
+      - name: postgres client
+        run: psql --version || (sudo apt-get update && sudo apt-get install -y postgresql-client)
+      - name: apply, re-apply, exercise and roll back on a scratch database
+        run: python tools/hear_durable_pg_testdb.py --self-test
+      - name: migration files are still additive and reversible
+        run: python tools/hear_durable_pg.py --check
+      - run: >-
+          python -m pytest -q -rs --color=yes
+          tests/test_hear_durable_pg_schema.py
+          tests/test_hear_durable_pg_store_parity.py
+
   firmware:
     uses: ./.github/workflows/firmware.yml
