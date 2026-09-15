@@ -86,6 +86,7 @@ jobs:
           python tools/gen_ingest_contracts.py
           python tools/gen_reconcile_contracts.py
           python tools/gen_shadow_read_contracts.py
+          python tools/gen_list_read_contracts.py
       - name: nothing changed
         run: |
           if ! git diff --quiet; then

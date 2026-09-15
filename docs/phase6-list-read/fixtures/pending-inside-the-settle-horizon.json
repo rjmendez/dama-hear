@@ -1,0 +1,9 @@
+{
+  "case": "pending-inside-the-settle-horizon",
+  "description": "The canonical list has not caught up with rows minutes old; no receipt is written.",
+  "expected_classification": "pending",
+  "expected_gate_impact": "none",
+  "expected_repair_action": "none",
+  "expected_severity": "info",
+  "receipt": null
+}
