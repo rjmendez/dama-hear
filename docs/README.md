@@ -15,6 +15,7 @@ current code disagree, the design states the intended end state.
 | [migration-risk-register.md](migration-risk-register.md) | The dated, evidence-backed register of what is currently true: architecture blockers versus operational debts, their owners, exit gates, and which of them gate the next phase. |
 | [api-boundaries.md](api-boundaries.md) | The northbound service map and contract conventions: which service owns which durable resource, its API style, and the events it publishes. |
 | [repository-structure.md](repository-structure.md) | The target repository layout and the extraction plan: one platform monorepo, `dama-gotchi` kept as a separate consumer application. |
+| [decisions/](decisions/) | Numbered, append-only decision records. One per contract or layout decision: what was decided, what evidence forced it, and what it means for forward/rollback/mixed-version behaviour. |
 | [deployment.md](deployment.md) | Progressive deployment profiles (single machine/Compose, small HA cluster, multi-site Kubernetes) sharing one image, config schema, and data layout. |
 | [fleet-management.md](fleet-management.md) | The standalone fleet control plane: device identity, desired vs reported state, signed firmware compatibility, staged rollouts, and lifecycle audit. |
 | [ml-lifecycle.md](ml-lifecycle.md) | The minimal self-hosted acoustic ML lifecycle: corpus and retention, labelling, reproducible training, promotion, edge deployment, and rollback. |
