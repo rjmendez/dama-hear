@@ -51,6 +51,7 @@ current code disagree, the design states the intended end state.
 | [cost-capacity.md](cost-capacity.md) | The fleet sizing model: uplink, storage, and clip/audio cost formulas with stated default variables, to be recalculated per deployment. |
 | [data-governance.md](data-governance.md) | Self-hosted acoustic data governance: data classes, recording indicators, retention, access, export, and audit controls for captured and derived data. |
 | [resilience.md](resilience.md) | Failure-mode design: the invariants that must survive, degraded-mode behaviour per dependency, and how operators learn about failure without reading a stack trace. |
+| [durable-outbox-failure-drill-runbook.md](durable-outbox-failure-drill-runbook.md) | Maintenance-window procedure for the `hear-mqtt-bridge` durable-outbox induced-failure drill: gate, prechecks, backup, scoped fault injection, expected observations, abort triggers, recovery order, evidence receipt, and pass criteria. |
 
 ## Field findings and calibration records
 
