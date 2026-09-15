@@ -510,6 +510,8 @@ def test_readiness_fails_when_the_annotation_store_is_unusable(tmp_path):
     client = TestClient(HA.create_app(str(pool), str(db)))
     assert client.get("/healthz").status_code == 200
 
+    for suffix in ("-wal", "-shm"):
+        (tmp_path / ("ann.sqlite3" + suffix)).unlink(missing_ok=True)
     db.write_bytes(b"this is not a database")
     response = client.get("/healthz")
     assert response.status_code == 503
