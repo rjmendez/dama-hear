@@ -1,0 +1,48 @@
+{
+  "batch_schema_version": 1,
+  "batch_id": "018f2c1a-batch-0007",
+  "received_at": "2026-09-14T18:03:12.100000Z",
+  "ack_through_index": 2,
+  "counts": {
+    "submitted": 3,
+    "accepted": 3,
+    "duplicate": 0,
+    "refused": 0,
+    "deferred": 0
+  },
+  "results": [
+    {
+      "index": 0,
+      "status": "accepted",
+      "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+      "dispatchable": true,
+      "reasons": [],
+      "raw_ref": null,
+      "classification": "canonical"
+    },
+    {
+      "index": 1,
+      "status": "accepted",
+      "event_id": "e083f81e-7ee3-85a4-87e6-1790aa1185a1",
+      "dispatchable": true,
+      "reasons": [],
+      "raw_ref": null,
+      "classification": "canonical"
+    },
+    {
+      "index": 2,
+      "status": "accepted",
+      "event_id": "25c4998a-4f9f-8e79-a040-344a8204196a",
+      "dispatchable": true,
+      "reasons": [],
+      "raw_ref": null,
+      "classification": "canonical"
+    }
+  ],
+  "retry_after_s": null,
+  "server": {
+    "adapter": "ingest-batch",
+    "version": "0.1.0-design",
+    "envelope_major": 1
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "batch_schema_version": 1,
+  "batch_id": "018f2c1a-batch-forged-1",
+  "received_at": "2026-09-14T18:03:12.100000Z",
+  "ack_through_index": 1,
+  "counts": {
+    "submitted": 2,
+    "accepted": 1,
+    "duplicate": 0,
+    "refused": 1,
+    "deferred": 0
+  },
+  "results": [
+    {
+      "index": 0,
+      "status": "accepted",
+      "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+      "dispatchable": true,
+      "reasons": [],
+      "raw_ref": null,
+      "classification": "canonical"
+    },
+    {
+      "index": 1,
+      "status": "refused",
+      "event_id": null,
+      "dispatchable": false,
+      "reasons": [
+        "item_identity_mismatch"
+      ],
+      "raw_ref": null,
+      "classification": "canonical"
+    }
+  ],
+  "retry_after_s": null,
+  "server": {
+    "adapter": "ingest-batch",
+    "version": "0.1.0-design",
+    "envelope_major": 1
+  }
+}

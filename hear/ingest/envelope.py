@@ -186,6 +186,11 @@ def canonical_bytes(value: Any) -> bytes:
                       ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
+def _reject_json_constant(token: str) -> None:
+    """Refuse the `NaN`/`Infinity` JSON literals rather than decoding them into floats."""
+    raise ValueError("non-finite literal %r is not representable in the envelope" % (token,))
+
+
 def _reject_non_finite(value: Any) -> None:
     if isinstance(value, float):
         if value != value or value in (float("inf"), float("-inf")):
@@ -349,8 +354,13 @@ def decode(raw: bytes, codec: str = DEFAULT_CODEC) -> Dict[str, Any]:
     if codec not in CODEC_MEDIA_TYPES:
         raise EnvelopeError("unregistered codec %r" % (codec,))
     try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # `NaN`/`Infinity` are JSON literals Python accepts by default but the canonical
+        # form cannot represent, so a body carrying one could never be given an event_id.
+        # Refusing it here makes that a clean, attributable refusal instead of a surprise
+        # much later. RecursionError is not a ValueError, so it needs naming explicitly:
+        # a deeply nested body is a refusal, never an unhandled crash with no accounting.
+        value = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise EnvelopeError("undecodable %s body: %s" % (codec, exc)) from exc
     if not isinstance(value, dict):
         raise EnvelopeError("envelope body is %s, not an object" % type(value).__name__)

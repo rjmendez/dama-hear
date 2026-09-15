@@ -23,9 +23,22 @@ current code disagree, the design states the intended end state.
 | [durable-postgres-schema.md](durable-postgres-schema.md) | The Phase 2 canonical Postgres schema for the durable heartbeat/event outbox: device-scoped identity, claim leases, partitions and retention, O(1) health, access control, backfill and rollback. Design and DDL only; not deployed. |
 | [phase2-postgres-migration-plan.md](phase2-postgres-migration-plan.md) | The Phase 2 execution plan for moving the durable outbox onto that schema: the measured SQLite→Postgres data map, the expand/migrate/verify/contract stages, feature flags, write ordering and dual-write error semantics, backfill watermarks, hash reconciliation, shadow compare, observability, rollback, and the entry/exit gates. Plan only; nothing is provisioned or cut over. |
 | [object-store-backend.md](object-store-backend.md) | The Phase 3 object-store backend capability audit: what `hear/objectstore/backend.py` demands of a store, the measured host limits behind it (the ext4 root is a VHDX on a disk with 52 GB left, not the 240 G `df` reports), probed filesystem semantics on both candidate roots, a backend comparison grounded in upstream evidence, the importer gaps that block a live run whichever backend wins, and the choices still owed to an operator. Audit only; no backend is selected, provisioned or configured. |
-| [decisions/](decisions/) | Numbered, append-only decision records. One per contract or layout decision: what was decided, what evidence forced it, and what it means for forward/rollback/mixed-version behaviour. [0001](decisions/0001-hear-ingest-v1-envelope-and-codec.md) the `hear.ingest.v1` envelope and codec; [0002](decisions/0002-contract-repository-layout.md) the canonical home for published contracts; [0003](decisions/0003-phase2-durable-outbox-postgres-cutover.md) the Phase 2 durable-outbox cut-over (dual-write, backfill, reversal). |
+| [decisions/](decisions/) | Numbered, append-only decision records. One per contract or layout decision: what was decided, what evidence forced it, and what it means for forward/rollback/mixed-version behaviour. [0001](decisions/0001-hear-ingest-v1-envelope-and-codec.md) the `hear.ingest.v1` envelope and codec; [0002](decisions/0002-contract-repository-layout.md) the canonical home for published contracts; [0003](decisions/0003-phase2-durable-outbox-postgres-cutover.md) the Phase 2 durable-outbox cut-over (dual-write, backfill, reversal); [0004](decisions/0004-phase4-https-batch-ingest-adapter.md) the Phase 4 additive HTTPS batch ingest adapter. |
 | [REDESIGN-LESSONS.md](REDESIGN-LESSONS.md) | Postmortem of the existing fleet: observed failure modes and the systems-design lessons that constrain the redesign. Evidence-tagged. |
 | [loci-memory-validation.md](loci-memory-validation.md) | Validation of the Loci spatial/memory behaviour used by the localization lane. |
+
+## Decision records
+
+Numbered, dated records of decisions that constrain later phases. A decision record states
+what was chosen, the in-tree evidence it rests on, and what was deliberately left open.
+
+| Record | What it decides |
+|---|---|
+| [0001 - `hear.ingest.v1` envelope and codec](decisions/0001-hear-ingest-v1-envelope-and-codec.md) | The canonical ingest envelope as a codec-agnostic logical schema, UTF-8 JSON as the only normative v1 wire codec, and a closed identity tuple for `event_id`. |
+| [0002 - contract repository layout](decisions/0002-contract-repository-layout.md) | The canonical home for a published contract: schema, fixtures, generator, and the decision record that names it. |
+| [0003 - Phase 2 durable outbox Postgres cut-over](decisions/0003-phase2-durable-outbox-postgres-cutover.md) | The dual-write, backfill and reversal plan for moving the heartbeat outbox from SQLite to Postgres. |
+| [0004 - Phase 4 HTTPS batch ingest adapter](decisions/0004-phase4-https-batch-ingest-adapter.md) | An additive HTTPS batch ingest path: frame versioned separately from items, receipt-based contiguous acknowledgement, identity-based replay safety, and no broker or queue at this scale. |
+| [phase4-https-batch-ingest.md](phase4-https-batch-ingest.md) | The operational specification behind 0004: API and auth, sizing and limits, retry/offline durability, timestamp and version semantics, refusal visibility, TLS/key lifecycle, observability, dual-write comparison and rollback. |
 
 ## System and subsystem references
 

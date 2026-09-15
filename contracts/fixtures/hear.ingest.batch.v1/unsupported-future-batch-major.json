@@ -1,0 +1,116 @@
+{
+  "batch_schema_version": 2,
+  "batch_id": "018f2c1a-batch-v2-1",
+  "device_id": "nyquist",
+  "sent_at": "2026-09-14T18:03:11.990000Z",
+  "messages": [
+    {
+      "event_id": "ebee7b5c-237d-86dc-a75e-f0a79b676815",
+      "source": "node-http",
+      "site_id": "site-quarry-north",
+      "device_id": "nyquist",
+      "device_class": "esp32s3-i2s-gps",
+      "firmware_version": "hear-node-2026.09.1",
+      "observed_at": "2026-09-14T18:03:11.250000Z",
+      "received_at": "2026-09-14T18:03:11.984000Z",
+      "clock": {
+        "valid": true,
+        "tier": "gps_pps",
+        "sigma_ns": 420000
+      },
+      "kind": "detection",
+      "schema_version": 1,
+      "payload": {
+        "wire_version": 2,
+        "profile_id": 0,
+        "frame_b64": "AAECAwQFBgcICQoLDA0ODw==",
+        "peak_db": -12.5
+      },
+      "raw_ref": "raw/2026/09/14/nyquist/018f2c1a.bin",
+      "adapter": {
+        "name": "node-http",
+        "version": "1.0.0"
+      },
+      "producer": {
+        "boot_id": "018f2b90-5f3c-7c21-9a7e-1d2c3b4a5e6f",
+        "boot_epoch_us": 1789495200000000,
+        "sequence": 4471,
+        "cursor": "dets:4471"
+      }
+    },
+    {
+      "event_id": "e083f81e-7ee3-85a4-87e6-1790aa1185a1",
+      "source": "node-http",
+      "site_id": "site-quarry-north",
+      "device_id": "nyquist",
+      "device_class": "esp32s3-i2s-gps",
+      "firmware_version": "hear-node-2026.09.1",
+      "observed_at": "2026-09-14T18:03:11.250000Z",
+      "received_at": "2026-09-14T18:03:11.984000Z",
+      "clock": {
+        "valid": true,
+        "tier": "gps_pps",
+        "sigma_ns": 420000
+      },
+      "kind": "detection",
+      "schema_version": 1,
+      "payload": {
+        "wire_version": 2,
+        "profile_id": 0,
+        "frame_b64": "AAECAwQFBgcICQoLDA0ODw==",
+        "peak_db": -12.5
+      },
+      "raw_ref": "raw/2026/09/14/nyquist/018f2c1a.bin",
+      "adapter": {
+        "name": "node-http",
+        "version": "1.0.0"
+      },
+      "producer": {
+        "boot_id": "018f2b90-5f3c-7c21-9a7e-1d2c3b4a5e6f",
+        "boot_epoch_us": 1789495200000000,
+        "sequence": 4472,
+        "cursor": "dets:4472"
+      }
+    },
+    {
+      "event_id": "25c4998a-4f9f-8e79-a040-344a8204196a",
+      "source": "node-http",
+      "site_id": "site-quarry-north",
+      "device_id": "nyquist",
+      "device_class": "esp32s3-i2s-gps",
+      "firmware_version": "hear-node-2026.09.1",
+      "observed_at": "2026-09-14T18:03:11.250000Z",
+      "received_at": "2026-09-14T18:03:11.984000Z",
+      "clock": {
+        "valid": true,
+        "tier": "gps_pps",
+        "sigma_ns": 420000
+      },
+      "kind": "detection",
+      "schema_version": 1,
+      "payload": {
+        "wire_version": 2,
+        "profile_id": 0,
+        "frame_b64": "AAECAwQFBgcICQoLDA0ODw==",
+        "peak_db": -12.5
+      },
+      "raw_ref": "raw/2026/09/14/nyquist/018f2c1a.bin",
+      "adapter": {
+        "name": "node-http",
+        "version": "1.0.0"
+      },
+      "producer": {
+        "boot_id": "018f2b90-5f3c-7c21-9a7e-1d2c3b4a5e6f",
+        "boot_epoch_us": 1789495200000000,
+        "sequence": 4473,
+        "cursor": "dets:4473"
+      }
+    }
+  ],
+  "producer": {
+    "boot_id": "018f2b90-5f3c-7c21-9a7e-1d2c3b4a5e6f",
+    "boot_epoch_us": 1789495200000000,
+    "batch_sequence": 7,
+    "spool_backlog": 118
+  }
+}
