@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "4609e8fb228c7c29b5f1da7b461d56f75381d70c215a4789a402acc46009c32b",
+  "baseline_hash": "eab0200f2c1fe4cf9988ff3c1ec17ac2725c5143442dbc5ad7f0bc011d2ca2db",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -462,8 +462,8 @@
       },
       {
         "path": "deploy/k8s/README.md",
-        "sha256": "5c4aa09a4232e6b872ccb70a6d255db7b03775816524f57adc32dc1b65776166",
-        "size_bytes": 14978
+        "sha256": "a7f7487543e350ef79649f441e0b3c7439cadcdf5d073b9072babbfd99a5bc18",
+        "size_bytes": 15104
       }
     ],
     "objects": [
@@ -2082,7 +2082,7 @@
         "storage_request": "5Gi"
       }
     ],
-    "section_hash": "214cca2a3146a0da2bf84aab555fc173e5be0a01085a07353c0375cbd62034c0"
+    "section_hash": "24a0c203649aa2c0885434f458ed909b6531487afe9b7c60a97244033b356725"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",
