@@ -8,7 +8,7 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'e05b98c'
+    dama-hear/commit: '7af464a'
     dama-hear/source-sha256: '614cec856e9ed4705378551f3b021face67e261676abfcd4d8c97f5798256c68'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
