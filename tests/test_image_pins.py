@@ -10,7 +10,6 @@ Four things have to keep agreeing, and none of them agree by themselves:
 ⚠️These run WITHOUT docker and WITHOUT the network, so they belong in the ordinary pytest job.
 The half that needs a daemon -- regenerating a lock and diffing it -- is the images workflow.
 """
-import os
 import pathlib
 import re
 import sys
