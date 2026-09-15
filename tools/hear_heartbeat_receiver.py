@@ -49,9 +49,16 @@ DURABLE_PRUNE_INTERVAL_S = float(os.environ.get("HEAR_DURABLE_PRUNE_INTERVAL_S",
 # that dies mid-publish cannot strand a record forever; long enough that a slow-but-alive Redis
 # write is not raced by a second publisher.
 DURABLE_CLAIM_LEASE_S = int(os.environ.get("HEAR_DURABLE_CLAIM_LEASE_S", "60"))
-# 1 -> record_uid was the bare idempotency_key (collided across devices).
-# 2 -> record_uid is scoped by (telemetry_path, device_id, idempotency_key); see _record_uid.
-DURABLE_SCHEMA_VERSION = 2
+# Durable *generation*: 1 is this SQLite ledger, 2 is the Postgres schema in
+# deploy/postgres/migrations (see tools/hear_durable_pg.py). Deliberately unchanged here -- the
+# identity fix below is a revision of the SQLite generation, not a new generation, and a row
+# stamped 2 must keep meaning "written by the Postgres store".
+DURABLE_SCHEMA_VERSION = 1
+# Revision of *how record_uid is computed* for this SQLite ledger, tracked per database file in
+# durable_meta rather than per row. 1 = the bare idempotency_key (collided across devices),
+# 2 = scoped by (telemetry_path, device_id, idempotency_key). See _record_uid.
+DURABLE_IDENTITY_VERSION = 2
+DURABLE_IDENTITY_META_KEY = "record_uid_identity_version"
 
 
 def _configured_auth_token(token: Optional[str]) -> str:
@@ -272,56 +279,69 @@ class SqliteDurableRecordStore(DurableRecordStore):
                 )
                 """
             )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS durable_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
         self._migrate_record_uids()
 
     def _migrate_record_uids(self) -> None:
-        """Rewrites schema-v1 rows whose record_uid was the bare (device-agnostic) idempotency key.
+        """Rewrites identity-v1 rows whose record_uid was the bare (device-agnostic) idempotency key.
 
         v1 stored ``record_uid = idempotency_key``, so two devices reporting the same key collided:
         the second device's payload was silently dropped as a duplicate. v2 scopes the identity by
         telemetry_path + device_id (see _record_uid). Existing rows already carry both columns, so
         the correct new identity is computable in place and no record is dropped or rewritten in
-        content. Idempotent (rows are stamped with their schema version) and safe to re-run.
+        content. Gated on durable_meta so it runs once per database file, and the whole rewrite is
+        one transaction, so an interrupted process leaves the file wholly un-migrated, never half.
 
         Foreign keys are disabled for this transaction only: cache_attempts references
         durable_records(record_uid) and both sides are renamed together here.
         """
         with self._transaction(foreign_keys=False) as con:
+            row = con.execute("SELECT value FROM durable_meta WHERE key = ?",
+                              (DURABLE_IDENTITY_META_KEY,)).fetchone()
+            previous = int(row["value"]) if row is not None else 1
+            # The scan runs on every open rather than being gated on ``previous``: if an older
+            # binary is rolled back onto a migrated file and writes bare-key rows, the next
+            # start-up still scopes them. The predicate is self-limiting -- a scoped uid is a
+            # sha256 hex digest and can never equal the device's own key -- so a fully migrated
+            # ledger matches no rows and the scan is a one-off cost at start-up.
             rows = con.execute(
                 "SELECT record_uid, telemetry_path, device_id, idempotency_key "
-                "FROM durable_records WHERE durable_schema_version < ?",
-                (DURABLE_SCHEMA_VERSION,),
+                "FROM durable_records "
+                "WHERE idempotency_key IS NOT NULL AND record_uid = idempotency_key"
             ).fetchall()
             for row in rows:
                 old_uid = str(row["record_uid"])
-                key = row["idempotency_key"]
-                new_uid = old_uid
-                if key and old_uid == key:
-                    new_uid = _scoped_record_uid(
-                        str(row["telemetry_path"]), str(row["device_id"]), str(key))
-                    collision = con.execute(
-                        "SELECT 1 FROM durable_records WHERE record_uid = ?", (new_uid,)
-                    ).fetchone()
-                    if collision is not None:
-                        # Cannot happen from a v1 ledger (the colliding write was dropped), but a
-                        # rolled-back-then-forward mixed-version file could produce it. Leave the
-                        # legacy row exactly as it is rather than lose it to a UNIQUE violation.
-                        logger.warning(
-                            "durable record %s already migrated under %s; leaving legacy row",
-                            old_uid, new_uid)
-                        continue
-                    con.execute("UPDATE cache_attempts SET record_uid = ? WHERE record_uid = ?",
-                                (new_uid, old_uid))
-                    con.execute("UPDATE cache_claims SET record_uid = ? WHERE record_uid = ?",
-                                (new_uid, old_uid))
-                con.execute(
-                    "UPDATE durable_records SET record_uid = ?, durable_schema_version = ? "
-                    "WHERE record_uid = ?",
-                    (new_uid, DURABLE_SCHEMA_VERSION, old_uid),
-                )
+                new_uid = _scoped_record_uid(
+                    str(row["telemetry_path"]), str(row["device_id"]), str(row["idempotency_key"]))
+                collision = con.execute(
+                    "SELECT 1 FROM durable_records WHERE record_uid = ?", (new_uid,)
+                ).fetchone()
+                if collision is not None:
+                    # Cannot happen from a v1 ledger (the colliding write was dropped), but a
+                    # rolled-back-then-forward mixed-version file could produce it. Leave the
+                    # legacy row exactly as it is rather than lose it to a UNIQUE violation.
+                    logger.warning(
+                        "durable record %s already migrated under %s; leaving legacy row",
+                        old_uid, new_uid)
+                    continue
+                con.execute("UPDATE cache_attempts SET record_uid = ? WHERE record_uid = ?",
+                            (new_uid, old_uid))
+                con.execute("UPDATE cache_claims SET record_uid = ? WHERE record_uid = ?",
+                            (new_uid, old_uid))
+                con.execute("UPDATE durable_records SET record_uid = ? WHERE record_uid = ?",
+                            (new_uid, old_uid))
+            con.execute("INSERT OR REPLACE INTO durable_meta (key, value) VALUES (?, ?)",
+                        (DURABLE_IDENTITY_META_KEY, str(DURABLE_IDENTITY_VERSION)))
             if rows:
-                logger.info("migrated %d durable record(s) to schema v%d",
-                            len(rows), DURABLE_SCHEMA_VERSION)
+                logger.info("scoped %d durable record identit(ies) from identity v%d to v%d",
+                            len(rows), previous, DURABLE_IDENTITY_VERSION)
 
     def persist(self, record_uid: str, record: Dict[str, Any], body_json: str) -> DurableEntry:
         with self._lock, self._transaction() as con:

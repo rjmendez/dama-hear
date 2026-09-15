@@ -22,24 +22,30 @@ Redis contract in `docs/phase0-freeze-contracts.v1.md`, and the retention/access
 | `cached` suppresses a second publish | yes | The event stream append is the one non-idempotent Redis operation. |
 | Attempts are an append-only log | yes | `hear.cache_attempts`, partitioned. |
 | Pending = "no successful attempt" | **no** | Replaced by an explicit `state` column. Deriving liveness from an anti-join is what makes `/healthz` a table scan. |
-| Identity is the bare `record_uid` | **no** | See §2. |
+| Identity is scoped by device | yes | The SQLite ledger now hashes `(telemetry_path, device_id, idempotency_key)` into `record_uid` (D1 below); Postgres keeps the tuple unhashed. See §2. |
 | Retention deletes rows | **no** | Replaced by partition drops. Same rule, cheaper mechanism. |
 
-Three defects were confirmed against the shipping code. The schema closes the first; the second
-is already mitigated in Redis by the event dedupe script; the third is receiver-side and is
-named here so it is not lost.
+Three defects were confirmed against the shipping code. All three have since been closed on the
+SQLite store itself (M1 below); the schema keeps the same guarantees on the Postgres side with a
+cheaper mechanism.
 
-* **D1 — cross-device identity collision.** `_record_uid()` returns the device's own
-  `idempotency_key` unchanged, and `durable_records.record_uid` is `UNIQUE` over the whole
-  ledger. Two devices that emit the same key collide: the second device's record is discarded
-  and the caller is handed the *first device's* payload. Closed by §2.
+* **D1 — cross-device identity collision.** `_record_uid()` used to return the device's own
+  `idempotency_key` unchanged while `durable_records.record_uid` is `UNIQUE` over the whole
+  ledger, so two devices emitting the same key collided: the second device's record was discarded
+  and the caller was handed the *first device's* payload. SQLite now hashes
+  `(telemetry_path, device_id, idempotency_key)` into `record_uid` and migrates existing rows in
+  place, gated on `durable_meta`. Postgres keeps the identity as an unhashed tuple (§2), which is
+  additionally queryable and tenant-scoped.
 * **D2 — duplicate publish under concurrency.** Mitigated on the Redis side by
-  `_EVENT_DEDUPE_SCRIPT`. The schema adds the second half: a publish is a lease (§4), so N
-  workers and `replicas > 1` are safe without relying on the cache to deduplicate.
-* **D3 — a deduplicated heartbeat does not re-arm the liveness TTL.** `_write()` returns early
-  on `stored.cached` and never touches Redis, so a node emitting byte-identical heartbeats can
-  go "offline" while heartbeating. This is a change to `_write()`/`RedisHeartbeatCache`, not to
-  the schema, and belongs to the store-implementation task. The schema supports the fix by
+  `_EVENT_DEDUPE_SCRIPT`, and now also durably: SQLite claims the publish right in the same
+  transaction that commits the record, with a bounded lease (`cache_claims`). The schema is the
+  scalable form of the same idea -- a publish is a `SKIP LOCKED` lease (§4), so N workers and
+  `replicas > 1` are safe without relying on the cache to deduplicate.
+* **D3 — a deduplicated heartbeat does not re-arm the liveness TTL.** `_write()` returned early
+  on `stored.cached` and never touched Redis, so a node emitting byte-identical heartbeats could
+  go "offline" while heartbeating. A duplicate heartbeat now rewrites the same stored body
+  (unless a newer heartbeat for that device already reached the cache, which would roll the fleet
+  view backwards); duplicate *events* stay a no-op. The schema supports the same shape by
   returning `state` and `cached` separately, so the caller can always refresh state and only
   suppress the stream append.
 
@@ -235,7 +241,7 @@ Additive at every step. The SQLite ledgers are never written to by any of this.
 | Step | Action | Reversal |
 |---|---|---|
 | M0 | **Gate**: live bridge soak enabled and green. | — |
-| M1 | Land D3 (always refresh the liveness key) and the monotonic replay guard on SQLite; soak. | revert |
+| M1 | **Done.** D1 (device-scoped `record_uid` + in-place migration), D2 (durable publish claim) and D3 (refresh the liveness key, monotonic replay guard) landed on SQLite; soak. | revert |
 | M2 | Apply `0001`–`0005` to an empty database; schedule `ensure_partitions()`. No app change. | `rollback/0001…_down.sql` drops the schema |
 | M3 | Implement `PostgresDurableRecordStore`; enable it on the **MQTT bridge only**, SQLite PVC still mounted. | env back to `sqlite` |
 | M4 | Soak ≥ 72 h: Redis surface, pending, duplicates, liveness. | as M3 |
@@ -247,9 +253,11 @@ Additive at every step. The SQLite ledgers are never written to by any of this.
 **Mixed SQLite/Postgres is a supported state**, and M3–M6 are exactly that state. While it
 lasts:
 
-* the two backends have **different identity semantics**. A uid collision that Postgres keeps is
-  still dropped by whichever writer is still on SQLite. Cross-writer dedupe does not exist until
-  both are on Postgres, so `xadd` volume drops only at M6;
+* both backends now scope identity by device, so a uid collision is kept on either side -- but
+  they express it differently (SQLite hashes the tuple into `record_uid`, Postgres stores it as a
+  tuple), and a backfill must therefore pass the payload's own `idempotency_key` as
+  `p_record_uid`, not the SQLite ledger's hashed uid. Cross-writer dedupe still does not exist
+  until both writers are on Postgres, so `xadd` volume drops only at M6;
 * `health()` reports its own backend's counts. Absolute counters restart from zero on the
   Postgres side; the dashboards compare rates, not totals, across the cut-over;
 * Redis remains the single mixed-version compatibility surface and is byte-identical throughout;
@@ -262,7 +270,9 @@ re-send month-old heartbeats to Redis and overwrite live state. A row SQLite nev
 imported as `pending` and will be published exactly once. Backfilled rows are counted separately
 (`records_backfilled`) and never inflate `cache_successes` — the metric the soak is watching.
 The legacy uid is preserved in `legacy_record_uid`; scoping comes from the `device_id` column,
-so no string rewriting is needed. `hear.legacy_uid_collisions` shows, before anything is
+so no string rewriting is needed. For a ledger already migrated to device-scoped identity, feed
+`p_record_uid` from the payload's `idempotency_key` (the hashed SQLite uid is an implementation
+detail of that file, and `hear.legacy_uid_collisions` is computed from what the devices sent). `hear.legacy_uid_collisions` shows, before anything is
 imported, how many records the unscoped ledger could not keep.
 
 Rollback is per migration, in reverse, in `deploy/postgres/rollback/`. Only `0001`'s rollback is

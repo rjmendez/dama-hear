@@ -1021,14 +1021,49 @@ class TestDurableOutboxCorrectness(TestValidation):
                                  "FROM durable_records")
         attempts = self._rows(db, "SELECT record_uid, outcome FROM cache_attempts")
         assert [row["record_uid"] for row in records] == [migrated_uid]
-        assert records[0]["durable_schema_version"] == HR.DURABLE_SCHEMA_VERSION
+        assert records[0]["durable_schema_version"] == HR.DURABLE_SCHEMA_VERSION == 1, (
+            "the SQLite generation stamp is not what changed; identity revision is tracked "
+            "in durable_meta so a row stamped 2 keeps meaning 'written by the Postgres store'")
         assert records[0]["payload_json"] == legacy, "record content must never be rewritten"
         assert attempts == [{"record_uid": migrated_uid, "outcome": "succeeded"}]
+        assert self._rows(db, "SELECT value FROM durable_meta WHERE key = ?",
+                          (HR.DURABLE_IDENTITY_META_KEY,)) == [
+            {"value": str(HR.DURABLE_IDENTITY_VERSION)}]
         assert store.health_snapshot()["durable_store"]["pending_records"] == 0
 
         store.write_event(payload)
         assert len(self._rows(db, "SELECT id FROM durable_records")) == 1
         assert fake.execute_calls == 0, "an already-synced legacy record must not be republished"
+
+    def test_a_bare_key_row_written_by_a_rolled_back_binary_is_scoped_on_the_next_start(
+            self, tmp_path):
+        # Rollback/forward safety: an older receiver rolled back onto a migrated file writes rows
+        # keyed by the bare idempotency_key again. The next start-up must still scope them rather
+        # than skip the sweep because the file was already stamped.
+        db = tmp_path / "heartbeats.sqlite3"
+        payload = self._event(idempotency_key="rolled-back")
+        store = self._store(db, FakeRedis())
+        body = HR.encode_json({**payload, "received_at": "2026-09-01T00:00:00Z",
+                               "receiver_schema_version": 1})
+        con = sqlite3.connect(db)
+        with con:
+            con.execute(
+                "INSERT INTO durable_records (record_uid, telemetry_path, device_id, "
+                "idempotency_key, payload_json, received_at, receiver_schema_version, "
+                "created_at, durable_schema_version) VALUES (?,?,?,?,?,?,?,?,1)",
+                ("rolled-back", "hear/event", "nyquist", "rolled-back", body,
+                 "2026-09-01T00:00:00Z", 1, "2026-09-01T00:00:00Z"))
+        con.close()
+        assert self._rows(db, "SELECT value FROM durable_meta WHERE key = ?",
+                          (HR.DURABLE_IDENTITY_META_KEY,)) == [
+            {"value": str(HR.DURABLE_IDENTITY_VERSION)}]
+
+        self._store(db, FakeRedis())
+
+        assert [row["record_uid"] for row in
+                self._rows(db, "SELECT record_uid FROM durable_records")] == [
+            HR._record_uid(payload)]
+        del store
 
     def test_migration_is_idempotent_across_repeated_opens(self, tmp_path):
         db = tmp_path / "heartbeats.sqlite3"
