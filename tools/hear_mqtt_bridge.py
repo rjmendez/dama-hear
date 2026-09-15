@@ -22,7 +22,7 @@ import os
 import ssl
 import sys
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import paho.mqtt.client as mqtt
 
@@ -130,6 +130,12 @@ def configure_tls(client: mqtt.Client, *, ca_certs: Optional[str] = None,
     return True
 
 
+def _stated_time_is_invalid(payload: Mapping[str, Any]) -> bool:
+    """True only when the payload explicitly states ``time.valid`` is false."""
+    time_state = payload.get("time")
+    return isinstance(time_state, Mapping) and time_state.get("valid") is False
+
+
 def device_id_from_topic(topic: str) -> Optional[str]:
     """Extract the device_id segment from a ``dama/<device_id>/telemetry`` topic."""
     parts = topic.split("/")
@@ -174,8 +180,20 @@ def dispatch_message(store: HeartbeatReceiverStore, raw: bytes, topic: str,
         ts = payload.get("ts")
         if isinstance(ts, (int, float)) and not isinstance(ts, bool):
             payload = dict(payload)
-            payload["ts"] = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(
-                timespec="seconds").replace("+00:00", "Z")
+            if _stated_time_is_invalid(payload):
+                # A node without a GPS fix sends "ts":null and a monotonic
+                # "ts_ms" (uptime-derived) purely to clear the upstream ingest
+                # gate, which rejects a non-positive numeric timestamp. That
+                # ingest then copies ts_ms back over the null ts, so what
+                # arrives here claims a wall-clock time the node never had.
+                # Restore the node's own contract -- no valid clock, no ts --
+                # so the heartbeat lands as degraded-but-visible instead of
+                # being rejected outright. received_at stays the trustworthy
+                # time for these records.
+                payload["ts"] = None
+            else:
+                payload["ts"] = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(
+                    timespec="seconds").replace("+00:00", "Z")
         body = validator(payload)
     except RequestError as exc:
         stats.rejected += 1
