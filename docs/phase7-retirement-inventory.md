@@ -172,6 +172,9 @@ same Redis. gotchi coupling in tree: `hear-drain --phone-corpus /pool/sketch_cor
 of who actually touches `dama:hear:*` was taken (it would need a longer read window than this
 inventory); no audit of operator scripts outside the repository; no confirmation that the AWS-side
 Lambda/SQS resources have no second subscriber.
+[phase7-redis-lifecycle-evidence.md](phase7-redis-lifecycle-evidence.md) designs the read-only
+census, classification, lifecycle and dual-read evidence that would close these unknowns; it
+authorizes no action either.
 
 ---
 
