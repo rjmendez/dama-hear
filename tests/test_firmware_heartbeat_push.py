@@ -94,15 +94,45 @@ def hb(tmp_path_factory):
           "    .dets_rows_written = 812, .batch_rows = 16};\n"
           "  return hear_push_event_json(&ev, out, n);}\n"
           "int ts_json(char *out, size_t n){ return hear_push_rfc3339(1789256584000000LL, out, n); }\n"
+          # The heartbeat a real node emits at its WIDEST: a 23-char node id and class (the
+          # sizeof node_id/node_class the sketch declares, minus the NUL), a full commit fw
+          # string, the longest clock state name, a saturated sigma/anchor age/boot epoch,
+          # a 16-hex boot_id, every discontinuity flag set and counters at their type maxima.
+          # Phase 0's "time" object is what pushed this past the old envelope buffer.
+          "int hb_max_json(char *out, size_t n){\n"
+          "  hear_push_heartbeat_t hb = {\n"
+          '    .device_id = "nyquist-bravo-00000007", .node_class = "esp32s3-i2s-gps-lora",\n'
+          '    .fw_version = "7f84d2946bf1c0a3e5d7", .uptime_s = 4294967295UL,\n'
+          "    .gps_fix = 3, .time_valid = 1, .utc_us = 9223372036854775807LL,\n"
+          '    .clock_state = "HOLDOVER", .sync_sigma_ns = 18446744073709551615ULL,\n'
+          "    .anchor_age_us = 18446744073709551615ULL,\n"
+          "    .boot_epoch_us = 9223372036854775807LL,\n"
+          '    .boot_id = "ffffffffffffffff", .discontinuity_flags = 4294967295U,\n'
+          "    .wifi_has_rssi = 1, .wifi_rssi_dbm = -2147483647,\n"
+          "    .scene_rows_written = 4294967295UL, .dets_rows_written = 4294967295UL,\n"
+          "    .clips_written = 4294967295UL, .clips_evicted = 4294967295UL};\n"
+          "  return hear_push_heartbeat_json(&hb, out, n);}\n"
+          # The firmware's own envelope wrap, byte for byte -- the assertion below checks this
+          # format literal is still the one in hear_node.ino.
+          "int wrap_body(const char *device_id, const char *body, size_t body_len,\n"
+          "              char *out, size_t n){\n"
+          '  int wn = snprintf(out, n, "{\\"device_id\\":\\"%s\\",\\"messages\\":[%.*s]}",\n'
+          "                    device_id, (int)body_len, body);\n"
+          "  if (wn <= 0 || wn >= (int)n) return -8;\n"
+          "  return wn;}\n"
     )
     so = d / "w.so"
     r = subprocess.run([cc, "-O2", "-fPIC", "-shared", "-Wall", "-Werror",
                         str(d / "w.c"), "-o", str(so)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     lib = ctypes.CDLL(str(so))
-    for name in ("hb_json", "hb_null_json", "clip_event_json", "det_event_json", "ts_json"):
+    for name in ("hb_json", "hb_null_json", "clip_event_json", "det_event_json", "ts_json",
+                 "hb_max_json"):
         getattr(lib, name).argtypes = [ctypes.c_char_p, ctypes.c_size_t]
         getattr(lib, name).restype = ctypes.c_int
+    lib.wrap_body.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t,
+                              ctypes.c_char_p, ctypes.c_size_t]
+    lib.wrap_body.restype = ctypes.c_int
     return lib
 
 
@@ -269,9 +299,78 @@ def test_push_post_json_uses_tls_and_wraps_the_batch_envelope_for_the_ingest_api
     assert "client.setInsecure();" in body
     assert '"{\\"device_id\\":\\"%s\\",\\"messages\\":[%.*s]}"' in body
     assert "node_id," in body
-    assert "char wrapped[1024];" in body
+    assert "char wrapped[HEAR_PUSH_WRAPPED_MAX];" in body
     assert "Authorization: Bearer %s" in body
 
+
+# ------------------------------------------------------- envelope buffer sizing (nyquist, -8)
+# Phase 0's expanded "time" object pushed a real heartbeat body to ~520 bytes; wrapping it in
+# {"device_id":...,"messages":[...]} needs ~560, and the wrapper buffer was an independently
+# chosen 512. snprintf caught it -- push_post_json returns -8 rather than sending a truncated
+# body -- so node "nyquist" logged `push heartbeat failed (-8)` every cycle through a whole OTA
+# rollout and went heartbeat-blind. The buffers are derived from each other now; these tests are
+# what keeps them derived.
+
+def _push_sizes():
+    """The declared sizes of the push chain, read from the sketch rather than restated here."""
+    body_max = int(re.search(r"#define HEAR_PUSH_BODY_MAX\s+(\d+)u", CODE).group(1))
+    node_id = int(re.search(r"char\s+node_id\[(\d+)\]", CODE).group(1))
+    envelope = len('{"device_id":"","messages":[]}') + 1 + node_id
+    return body_max, node_id, body_max + envelope
+
+
+def test_the_push_buffers_are_derived_from_what_they_hold_not_from_magic_numbers():
+    assert ("#define HEAR_PUSH_WRAPPED_MAX       "
+            "(HEAR_PUSH_BODY_MAX + HEAR_PUSH_ENVELOPE_OVERHEAD)") in CODE
+    assert ("#define HEAR_PUSH_REQ_MAX           "
+            "(HEAR_PUSH_WRAPPED_MAX + HEAR_PUSH_REQ_HEADER_MAX)") in CODE
+    # The body buffers the encoders fill, the envelope that carries them and the request that
+    # carries that are ONE number, spelled once. A literal here is the defect this stops.
+    assert CODE.count("char body[HEAR_PUSH_BODY_MAX];") == 2
+    assert not re.search(r"char (body|wrapped|req)\[\d+\];", CODE)
+    assert "char req[HEAR_PUSH_REQ_MAX];" in _fn("push_post_json")
+
+
+def test_the_firmware_static_asserts_the_envelope_can_hold_a_full_size_body():
+    body = _fn("push_post_json")
+    assert "static_assert(sizeof wrapped >= HEAR_PUSH_BODY_MAX +" in body
+    assert "static_assert(sizeof req > HEAR_PUSH_WRAPPED_MAX," in body
+
+
+def test_a_maximally_populated_phase0_heartbeat_wraps_without_truncation(hb):
+    body_max, node_id_size, wrapped_max = _push_sizes()
+    body = _call(hb, "hb_max_json", body_max).encode()
+    got = json.loads(body)
+    assert got["time"]["state"] == "HOLDOVER"
+    assert got["time"]["discontinuity_flags"] == 4294967295
+    assert got["time"]["boot_id"] == "ffffffffffffffff"
+    assert len(body) < body_max, "the encoder itself must fit the body buffer"
+
+    device_id = b"n" * (node_id_size - 1)
+    out = ctypes.create_string_buffer(wrapped_max)
+    wn = hb.wrap_body(device_id, body, len(body), out, len(out))
+    assert wn > 0, "the derived envelope buffer must not truncate a worst-case heartbeat"
+    assert json.loads(out.value)["messages"][0] == got
+    # the buffer the fleet was actually running is what this heartbeat could not fit into
+    assert hb.wrap_body(device_id, body, len(body), out, 512) == -8
+
+
+def test_the_envelope_buffer_bounds_the_worst_case_the_encoders_can_emit_with_margin():
+    body_max, node_id_size, wrapped_max = _push_sizes()
+    worst = body_max - 1 + len('{"device_id":"","messages":[]}') + (node_id_size - 1)
+    assert wrapped_max > worst, (
+        "a full %d-byte body wraps to %d bytes into a %d-byte buffer"
+        % (body_max, worst, wrapped_max))
+    # The 512 the fleet shipped could not hold even the body it was handed, let alone the wrapper.
+    assert 512 < worst
+
+
+def test_truncation_still_fails_the_push_instead_of_sending_half_a_message():
+    body = _fn("push_post_json")
+    assert "if (wn <= 0 || wn >= (int)sizeof wrapped) {" in body
+    assert "*code_out = -8;" in body
+    assert "if (n <= 0 || n >= (int)sizeof req) {" in body
+    assert "*code_out = -3;" in body
 
 def test_the_connect_timeout_is_long_enough_to_complete_a_real_tcp_handshake():
     # HEAR_PUSH_CONNECT_TIMEOUT_MS was 15 -- 15 milliseconds, not 1.5 seconds -- which meant

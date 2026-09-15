@@ -2468,6 +2468,24 @@ static char clip_rand[CLIP_RAND_HEX + 1] = "000000";
 #define HEAR_PUSH_HEARTBEAT_PATH    "/api/hear/heartbeat"
 #define HEAR_PUSH_EVENT_PATH        "/api/hear/event"
 #endif
+// ⚠️EVERY BUFFER ON THE PUSH PATH IS SIZED FROM WHAT IT MUST HOLD, not from a sample of one
+// payload. Phase 0's expanded "time" object (state/anchor_age_us/boot_epoch_us/boot_id/
+// discontinuity_flags) grew a real heartbeat body by ~160 bytes, and the envelope wrapper -- an
+// independently chosen 512 bytes at the time -- began truncating. snprintf reports that rather
+// than sending it ("push heartbeat failed (-8)" on node nyquist, every cycle, for a whole OTA
+// rollout), so the node went heartbeat-blind. The chain below is DERIVED: body -> +envelope ->
+// +request headers. Growing the payload's contents can no longer silently outgrow the next
+// buffer, and tests/test_firmware_heartbeat_push.py recomputes the worst case from the encoders
+// themselves.
+#define HEAR_PUSH_BODY_MAX          768u
+// `{"device_id":"","messages":[]}` around the body, plus the node id it interpolates and the NUL.
+#define HEAR_PUSH_ENVELOPE_OVERHEAD (sizeof "{\"device_id\":\"\",\"messages\":[]}" + sizeof node_id)
+#define HEAR_PUSH_WRAPPED_MAX       (HEAR_PUSH_BODY_MAX + HEAR_PUSH_ENVELOPE_OVERHEAD)
+// Request line + Host + Content-Type + Connection + auth header + Content-Length + blank line,
+// each at the widest its own compiled-in argument can be, then the whole wrapped body inline.
+#define HEAR_PUSH_REQ_HEADER_MAX    (160u + sizeof HEAR_PUSH_HOST + sizeof HEAR_PUSH_TOKEN + \
+                                     sizeof HEAR_PUSH_HEARTBEAT_PATH + sizeof HEAR_PUSH_EVENT_PATH)
+#define HEAR_PUSH_REQ_MAX           (HEAR_PUSH_WRAPPED_MAX + HEAR_PUSH_REQ_HEADER_MAX)
 #define HEAR_PUSH_CONNECT_TIMEOUT_MS 3000u
 #define HEAR_PUSH_READ_TIMEOUT_MS   2000u
 #define HEAR_PUSH_FAIL_LOG_MS       60000UL
@@ -2584,7 +2602,10 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
 #if HEAR_PUSH_WRAP_BATCH
   // The ingest Lambda expects one batch envelope per POST; hear_push_payload.h's encoders build
   // hear_node's own bare object, so wrap it here rather than teach them about this one backend.
-  char wrapped[1024];
+  char wrapped[HEAR_PUSH_WRAPPED_MAX];
+  static_assert(sizeof wrapped >= HEAR_PUSH_BODY_MAX +
+                                   sizeof "{\"device_id\":\"\",\"messages\":[]}" + sizeof node_id - 1,
+                "the batch envelope must hold a full-size body, the wrapper, the node id and NUL");
   int wn = snprintf(wrapped, sizeof wrapped, "{\"device_id\":\"%s\",\"messages\":[%.*s]}",
                      node_id, (int)body_len, body);
   if (wn <= 0 || wn >= (int)sizeof wrapped) {
@@ -2610,7 +2631,11 @@ static bool push_post_json(const char *path, const char *body, size_t body_len, 
     return false;
   }
   const bool have_token = HEAR_PUSH_TOKEN[0];
-  char req[1024];
+  // Sized from the wrapped body it carries inline plus its own headers, not independently: the
+  // envelope fix below would otherwise just move the truncation (-3) one buffer downstream.
+  char req[HEAR_PUSH_REQ_MAX];
+  static_assert(sizeof req > HEAR_PUSH_WRAPPED_MAX,
+                "the request buffer must hold the whole wrapped body plus its headers");
   int n;
   if (have_token && HEAR_PUSH_AUTH_BEARER) {
     n = snprintf(req, sizeof req,
@@ -2691,7 +2716,7 @@ static void push_mark_dets_ready(uint32_t batch_rows) {
 
 static bool push_send_heartbeat() {
   hear_push_heartbeat_t hb = {};
-  char body[768];
+  char body[HEAR_PUSH_BODY_MAX];
   push_fill_heartbeat(&hb);
   if (!hear_push_heartbeat_json(&hb, body, sizeof body)) {
     push_note_failure("heartbeat encode", -5);
@@ -2713,7 +2738,7 @@ static bool push_send_heartbeat() {
 
 static bool push_send_event(const struct HearPushEvent *src) {
   hear_push_event_t ev = {};
-  char body[768];
+  char body[HEAR_PUSH_BODY_MAX];
   push_fill_event(src, &ev);
   if (!hear_push_event_json(&ev, body, sizeof body)) {
     push_note_failure("event encode", -6);
