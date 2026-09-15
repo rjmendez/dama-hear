@@ -57,7 +57,10 @@ def hb(tmp_path_factory):
           "  hear_push_heartbeat_t hb = {\n"
           '    .device_id = "nyquist", .node_class = "xiao-s3-pps", .fw_version = "7f84d29",\n'
           "    .uptime_s = 12345, .gps_fix = 3, .time_valid = 1,\n"
-          "    .utc_us = 1789256584000000LL, .wifi_has_rssi = 1, .wifi_rssi_dbm = -67,\n"
+          "    .utc_us = 1789256584000000LL, .clock_state = \"LOCKED\", .sync_sigma_ns = 41000,\n"
+          "    .anchor_age_us = 250000, .boot_epoch_us = 1789244239000000LL,\n"
+          "    .boot_id = \"0011223344556677\", .discontinuity_flags = 0,\n"
+          "    .wifi_has_rssi = 1, .wifi_rssi_dbm = -67,\n"
           "    .scene_rows_written = 456789, .dets_rows_written = 812,\n"
           "    .clips_written = 233, .clips_evicted = 41};\n"
           "  return hear_push_heartbeat_json(&hb, out, n);}\n"
@@ -65,6 +68,8 @@ def hb(tmp_path_factory):
           "  hear_push_heartbeat_t hb = {\n"
           '    .device_id = "mach", .node_class = "xiao-s3-pps", .fw_version = "unset",\n'
           "    .uptime_s = 22, .gps_fix = 0, .time_valid = 0, .utc_us = 0,\n"
+          "    .clock_state = \"FAULT\", .sync_sigma_ns = 0, .anchor_age_us = 0,\n"
+          "    .boot_epoch_us = 0, .boot_id = \"8899aabbccddeeff\", .discontinuity_flags = 1,\n"
           "    .wifi_has_rssi = 0, .wifi_rssi_dbm = 0, .scene_rows_written = 1,\n"
           "    .dets_rows_written = 2, .clips_written = 3, .clips_evicted = 4};\n"
           "  return hear_push_heartbeat_json(&hb, out, n);}\n"
@@ -72,7 +77,10 @@ def hb(tmp_path_factory):
           "  hear_push_event_t ev = {\n"
           '    .device_id = "nyquist", .node_class = "xiao-s3-pps", .fw_version = "7f84d29",\n'
           '    .uptime_s = 12349, .event_type = "clip_written", .event_seq = 234,\n'
-          "    .time_valid = 1, .utc_us = 1789256584000000LL,\n"
+          "    .time_valid = 1, .utc_us = 1789256584000000LL, .clock_state = \"HOLDOVER\",\n"
+          "    .sync_sigma_ns = 625000, .anchor_age_us = 30000000,\n"
+          "    .boot_epoch_us = 1789244235000000LL, .boot_id = \"0011223344556677\",\n"
+          "    .discontinuity_flags = 16,\n"
           '    .clip_basename = "nyquist-db21acd5-1082530195.wav",\n'
           "    .clips_written = 234, .clips_evicted = 41};\n"
           "  return hear_push_event_json(&ev, out, n);}\n"
@@ -80,7 +88,9 @@ def hb(tmp_path_factory):
           "  hear_push_event_t ev = {\n"
           '    .device_id = "nyquist", .node_class = "xiao-s3-pps", .fw_version = "7f84d29",\n'
           '    .uptime_s = 12350, .event_type = "detection_batch_ready", .event_seq = 812,\n'
-          "    .time_valid = 0, .utc_us = 0, .clip_basename = \"\",\n"
+          "    .time_valid = 0, .utc_us = 0, .clock_state = \"FAULT\", .sync_sigma_ns = 0,\n"
+          "    .anchor_age_us = 0, .boot_epoch_us = 0, .boot_id = \"0011223344556677\",\n"
+          "    .discontinuity_flags = 1, .clip_basename = \"\",\n"
           "    .dets_rows_written = 812, .batch_rows = 16};\n"
           "  return hear_push_event_json(&ev, out, n);}\n"
           "int ts_json(char *out, size_t n){ return hear_push_rfc3339(1789256584000000LL, out, n); }\n"
@@ -96,7 +106,7 @@ def hb(tmp_path_factory):
     return lib
 
 
-def _call(lib, name, size=512):
+def _call(lib, name, size=1024):
     buf = ctypes.create_string_buffer(size)
     n = getattr(lib, name)(buf, len(buf))
     assert n > 0
@@ -120,7 +130,15 @@ def test_heartbeat_payload_matches_the_design_shape(hb):
         "fw_version": "7f84d29",
         "uptime_s": 12345,
         "gps": {"fix": 3},
-        "time": {"valid": True},
+        "time": {
+            "valid": True,
+            "state": "LOCKED",
+            "sync_sigma_ns": 41000,
+            "anchor_age_us": 250000,
+            "boot_epoch_us": 1789244239000000,
+            "boot_id": "0011223344556677",
+            "discontinuity_flags": 0,
+        },
         "wifi": {"rssi_dbm": -67},
         "counters": {
             "scene_rows_written": 456789,
@@ -134,7 +152,15 @@ def test_heartbeat_payload_matches_the_design_shape(hb):
 def test_heartbeat_omits_untrusted_time_as_null(hb):
     got = json.loads(_call(hb, "hb_null_json"))
     assert got["ts"] is None
-    assert got["time"] == {"valid": False}
+    assert got["time"] == {
+        "valid": False,
+        "state": "FAULT",
+        "sync_sigma_ns": None,
+        "anchor_age_us": None,
+        "boot_epoch_us": None,
+        "boot_id": "8899aabbccddeeff",
+        "discontinuity_flags": 1,
+    }
     assert got["wifi"] == {"rssi_dbm": None}
     # AWS's ingest Lambda quarantines any message without a positive ts_ms/ts/timestamp, so a
     # bare "ts": null would silently drop every heartbeat sent before first GPS fix. ts_ms must
@@ -147,7 +173,8 @@ def test_heartbeat_omits_untrusted_time_as_null(hb):
 def test_clip_event_payload_stays_small_and_names_only_the_clip(hb):
     raw = _call(hb, "clip_event_json")
     got = json.loads(raw)
-    assert len(raw) < 384
+    assert len(raw) < 640
+    assert got["time"]["state"] == "HOLDOVER"
     assert got["event_type"] == "clip_written"
     assert got["event_seq"] == 234
     assert got["event"] == {
@@ -160,6 +187,7 @@ def test_clip_event_payload_stays_small_and_names_only_the_clip(hb):
 def test_detection_batch_event_is_a_hint_not_the_csv_body(hb):
     got = json.loads(_call(hb, "det_event_json"))
     assert got["ts"] is None
+    assert got["time"]["state"] == "FAULT"
     assert got["event_type"] == "detection_batch_ready"
     assert got["event"] == {"dets_rows_written": 812, "batch_rows": 16}
     assert "csv" not in json.dumps(got).lower()

@@ -21,8 +21,8 @@ INO = pathlib.Path(__file__).resolve().parents[1] / "firmware" / "hear_node" / "
 
 #: (header constant, the literal that starts the row, trailing fields appended after the payload)
 CASES = [
-    # frame_hex + clip + clip_why + sync_sigma_ns
-    ("DETS_HDR", '"%s,%lld,%lu,%lu,%lu,%ld,%d,%u,%.3f,%lu,"', 4),
+    # frame_hex + clip + clip_why + sync_sigma_ns + explicit clock metadata
+    ("DETS_HDR", '"%s,%lld,%lu,%lu,%lu,%ld,%d,%u,%.3f,%lu,"', 9),
     ("SCENE_HDR", '"%s,%lld,%lu,%lu,%d,%d,%d,%d,%d,%lu,"', 3),   # mel_hex + f_lo_hz + f_hi_hz
 ]
 
@@ -81,15 +81,18 @@ def test_a_row_states_what_its_own_stamp_is_worth():
     to hold together."""
     src = _source()
     fields = _header_fields(src, "DETS_HDR")
-    assert fields[-1] == "sync_sigma_ns", (
-        "the declared uncertainty must be the LAST column: tools/hear_bridge.py documents "
+    assert fields[-6:] == [
+        "sync_sigma_ns", "clock_state", "anchor_age_us", "boot_epoch_us", "boot_id",
+        "clock_discontinuity_flags",
+    ], ("explicit clock metadata must stay APPENDED at the tail: tools/hear_bridge.py documents "
         "trailing columns as the supported growth path and hear/detsfile.py's identify() says "
         "an inserted column is not safe")
     # the writer's tail, parsed rather than grepped: the format literal and its arguments
     src_nc = _strip_comments(src)
-    i = src_nc.index('",%s,%s,%s"')
+    i = src_nc.index('",%s,%s,%s,%s,%s,%s,%s,%s"')
     call = src_nc[i:src_nc.index(";", i)]
     assert "d.sync_sigma_ns" in call or "sg" in call, "the sigma column is declared but not written"
+    assert "d.clock_state" in call or "clock_state_name(d.clock_state)" in call
 
 
 def test_zero_is_not_a_value_the_sigma_column_may_carry():

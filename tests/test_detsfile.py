@@ -1,4 +1,4 @@
-"""The five dets.csv generations, and the one whose header lies about its own rows."""
+"""The dets.csv generations, and the one whose header lies about its own rows."""
 import binascii
 
 import numpy as np
@@ -48,7 +48,7 @@ class TestIdentify:
         # G5 inserted a column BEFORE frame_hex. So "starts with a known generation" does not
         # imply the frame is where that generation puts it, and extension cannot be waved through.
         with pytest.raises(DF.UnknownSchema, match="temp_c"):
-            DF.identify(list(DF.G5.declared) + ["temp_c"])
+            DF.identify(list(DF.G7.declared) + ["temp_c"])
 
 
 class TestG3:
@@ -138,3 +138,15 @@ class TestRefusals:
         assert len(got.rows) == 1
         assert not got.skips
         assert got.rows[0]["utc_us"] == "1788763952189911.0"
+
+
+class TestG7:
+    def test_explicit_clock_state_columns_are_recognised_and_normalised(self):
+        row = (
+            f"nyquist,{_BODY},64,{_frame_hex()},,,41000,holdover,30000000,"
+            "1788763951000000,0011223344556677,16"
+        )
+        got = DF.read_text(_csv(DF.G7.declared, [row]))
+        assert got.generation is DF.G7
+        assert got.rows[0]["clock_state"] == "HOLDOVER"
+        assert got.rows[0]["boot_id"] == "0011223344556677"

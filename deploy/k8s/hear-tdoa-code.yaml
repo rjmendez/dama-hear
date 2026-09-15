@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 675602 B serialised; 675780 B of annotations against a 262144 B cap.
+# apply-mode server: 678126 B serialised; 678304 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: '5ed1dfc'
+    dama-hear/commit: '99f38dd'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '675602'
+    dama-hear/serialised-bytes: '678126'
 data:
   hear__init__.py: |
     
@@ -831,7 +831,7 @@ data:
     
   hear_detsfile.py: |
     #!/usr/bin/env python3
-    """Read a node's `dets.csv` at any of the five column layouts the firmware has written.
+    """Read a node's `dets.csv` at any of the seven column layouts the firmware has written.
     
     WHY THIS IS NOT `csv.DictReader`. Five generations of `dets.csv` exist on the cards and in the
     drains, and one of them writes a header that does not describe its own rows:
@@ -842,6 +842,7 @@ data:
         G4  12 cols   node_id, ...                               fs/layout build, node_id populated
         G5  13 cols   + sketch_back before frame_hex             the window fix
         G6  14 cols   + sync_sigma_ns appended                    the declared-uncertainty stamp
+        G7  19 cols   + explicit clock state / anchor / boot metadata appended
     
     ⚠️G3 IS THE WHOLE REASON THIS MODULE EXISTS. `csv.DictReader` on a G3 file silently shifts every
     value one column left of its name: `utc_us` gets the node name, `uptime_s` gets the timestamp,
@@ -907,9 +908,12 @@ data:
     # as a perfect clock -- which hear/nodeclass.py refuses as a claim no hardware supports.
     _G6 = ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why", "sync_sigma_ns")
     G6 = Generation("G6", _G6, _G6)
+    _G7 = _G6 + ("clock_state", "anchor_age_us", "boot_epoch_us", "boot_id",
+                 "clock_discontinuity_flags")
+    G7 = Generation("G7", _G7, _G7)
     
-    GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5, G6)
-    LATEST = G6
+    GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5, G6, G7)
+    LATEST = G7
     
     # One packed v1 sketch is 172 bytes (344 hex); v2 is 173 bytes (346 hex).
     FRAME_HEX_LEN = 344
@@ -1038,6 +1042,13 @@ data:
             # are None -- "not stated" -- and neither is 0. See hear/pool.py's record builder and
             # hear/backend/associate.py, where absent means usable and a number is a claim.
             d["sync_sigma_ns"] = stated_sigma_ns(d.get("sync_sigma_ns"))
+            for key in ("clock_state", "anchor_age_us", "boot_epoch_us", "boot_id",
+                        "clock_discontinuity_flags"):
+                d.setdefault(key, None)
+                if isinstance(d.get(key), str):
+                    d[key] = d[key].strip() or None
+            if isinstance(d.get("clock_state"), str):
+                d["clock_state"] = d["clock_state"].upper()
             out.rows.append(d)
         return out
     
@@ -1681,6 +1692,13 @@ data:
         return None if v in (None, "") else str(v)
     
     
+    def _clock_state(v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s.upper() if s else None
+    
+    
     def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
         fh = (row.get("frame_hex") or "").strip()
@@ -1741,6 +1759,11 @@ data:
             # would claim a perfect clock, and `hear.corpus.Record.sync_sigma_ns` is read by gates
             # that treat absent and stated differently.
             "sync_sigma_ns": _sync_sigma_ns(row.get("sync_sigma_ns")),
+            "clock_state": _clock_state(row.get("clock_state")),
+            "anchor_age_us": _raw_det_cell(row.get("anchor_age_us")),
+            "boot_epoch_us": _raw_det_cell(row.get("boot_epoch_us")),
+            "boot_id": _raw_det_cell(row.get("boot_id")),
+            "clock_discontinuity_flags": _raw_det_cell(row.get("clock_discontinuity_flags")),
             "sample": _raw_det_cell(row.get("sample")),
             "uptime_s": _raw_det_cell(row.get("uptime_s")),
             # ⚠️THE INGEST USED TO DROP THESE TWO, WHICH IS WHY AN UNANCHORED ROW WAS UNRECOVERABLE
@@ -1768,7 +1791,8 @@ data:
     
     #: The /detections (hear_node.ino: h_dets) fields that map straight onto a dets.csv row.
     LIVE_RING_COLUMNS = ("utc_us", "uptime_s", "sample", "pps_n", "us_since_pps", "trigger",
-                         "flags", "fs_hz")
+                         "flags", "fs_hz", "sync_sigma_ns", "clock_state", "anchor_age_us",
+                         "boot_epoch_us", "boot_id", "clock_discontinuity_flags")
     
     
     class Pool:
@@ -9201,6 +9225,7 @@ data:
     D_NOT_ARRIVAL = "not_arrival_class"
     D_CLOCK_UNSTATED = "clock_unstated"
     D_CLOCK_UNTRUSTED = "clock_untrusted"
+    D_CLOCK_STATE = "clock_state_inadmissible"
     D_SYNC_SIGMA = "sync_sigma_exceeds"
     D_STAMP_SIGMA = "stamp_sigma_over_class_budget"
     #: ⚠️A SECOND, DIFFERENT REFUSAL ON THE SAME RECEIVER, AND IT MUST NOT BE FOLDED INTO THE FIRST.
@@ -9219,9 +9244,12 @@ data:
     
     DROP_REASONS = (D_UNANCHORED, D_OUTSIDE_WINDOW, D_OUTSIDE_LOOKBACK_EMITTED,
                     D_OUTSIDE_LOOKBACK_UNASSOC, D_PENDING_SETTLE, D_UNSURVEYED, D_NOT_ARRIVAL,
-                    D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_SYNC_SIGMA, D_STAMP_SIGMA,
+                    D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_CLOCK_STATE, D_SYNC_SIGMA, D_STAMP_SIGMA,
                     D_PATH_BIAS, D_ONSET, D_ONSET_UNSTATED, D_LATENCY, D_HETEROGENEOUS_CLASS,
                     D_UNPARSEABLE)
+    
+    CLOCK_STATES = frozenset({"LOCKED", "HOLDOVER", "DEGRADED", "FAULT"})
+    TDOA_CLOCK_STATES = frozenset({"LOCKED", "HOLDOVER"})
     
     # ---------------------------------------------------------------- heterogeneous receivers
     # WEIGHTING HANDLES VARIANCE. IT DOES NOT HANDLE BIAS, AND THIS DOOR IS THE ONE THE WEIGHTS DO
@@ -9845,6 +9873,25 @@ data:
                       _detail(row, "clock_tier %r is not a UTC measurement (trusted tiers %s)"
                               % (row.get("clock_tier"), sorted(C.TRUSTED_CLOCK_TIERS))))
                 continue
+            cstate = row.get("clock_state")
+            if cstate not in (None, ""):
+                cstate = str(cstate).strip().upper()
+                if cstate not in CLOCK_STATES:
+                    _drop(day, row, D_CLOCK_STATE,
+                          _detail(row, "clock_state %r is not one of %s"
+                                       % (row.get("clock_state"), sorted(CLOCK_STATES))))
+                    continue
+                if cstate not in TDOA_CLOCK_STATES:
+                    detail = "clock_state %s is not TDoA-admissible; wait for LOCKED/HOLDOVER" % cstate
+                    boot_id = row.get("boot_id")
+                    if boot_id not in (None, ""):
+                        detail += " (boot %s" % boot_id
+                        disc = row.get("clock_discontinuity_flags")
+                        if disc not in (None, ""):
+                            detail += ", discontinuity_flags %s" % disc
+                        detail += ")"
+                    _drop(day, row, D_CLOCK_STATE, _detail(row, detail))
+                    continue
             ssig = row.get("sync_sigma_ns")
             # ⚠️TWO GATES ON ONE QUANTITY, AND THEY ASK DIFFERENT QUESTIONS. --max-sync-sigma-ns is
             # APERTURE-relative (DEFAULT_SYNC_SIGMA_FRAC of the tightest pair bound: "is this

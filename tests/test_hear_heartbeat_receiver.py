@@ -130,6 +130,19 @@ class TestValidation:
         assert got["ts"] is None
         assert got["time"]["valid"] is False
 
+    def test_explicit_clock_state_metadata_is_accepted(self):
+        got = HR.validate_heartbeat_payload(self._heartbeat(time={
+            "valid": True,
+            "state": "LOCKED",
+            "sync_sigma_ns": 41000,
+            "anchor_age_us": 250000,
+            "boot_epoch_us": 1789244239000000,
+            "boot_id": "0011223344556677",
+            "discontinuity_flags": 0,
+        }))
+        assert got["time"]["state"] == "LOCKED"
+        assert got["time"]["boot_id"] == "0011223344556677"
+
     def test_true_time_requires_ts(self):
         with pytest.raises(HR.RequestError, match="ts is required"):
             HR.validate_heartbeat_payload(self._heartbeat(ts=None))
@@ -158,6 +171,25 @@ class TestValidation:
     def test_unknown_event_type_is_rejected(self):
         with pytest.raises(HR.RequestError, match="event_type"):
             HR.validate_event_payload(self._event(event_type="surprise"))
+
+    def test_fault_state_requires_time_invalid(self):
+        with pytest.raises(HR.RequestError, match="FAULT"):
+            HR.validate_heartbeat_payload(self._heartbeat(time={
+                "valid": True,
+                "state": "FAULT",
+                "sync_sigma_ns": 1,
+                "anchor_age_us": 2,
+                "boot_epoch_us": 3,
+                "boot_id": "0011223344556677",
+            }))
+
+    def test_invalid_time_requires_fault_when_state_is_stated(self):
+        with pytest.raises(HR.RequestError, match="time.valid false requires time.state FAULT"):
+            HR.validate_event_payload(self._event(ts=None, time={
+                "valid": False,
+                "state": "HOLDOVER",
+                "boot_id": "0011223344556677",
+            }))
 
 
 @contextmanager

@@ -461,6 +461,29 @@ class TestAdmit:
                              heterogeneous_receivers=True)
         assert r.get(HT.D_CLOCK_UNTRUSTED) == 1
 
+    def test_a_fault_clock_state_is_refused_before_sigma(self, tmp_path):
+        rec = dict(P._record_from_node_row(node_row("nyquist", T0, seed=61)),
+                   clock_state="FAULT", boot_id="0011223344556677",
+                   clock_discontinuity_flags="1", sync_sigma_ns=37_000.0)
+        r, _ = self._reasons(tmp_path, [], extra=[rec])
+        assert r.get(HT.D_CLOCK_STATE) == 1
+        assert r.get(HT.D_STAMP_SIGMA) is None
+
+    def test_a_degraded_clock_state_is_refused_even_if_the_sigma_is_small(self, tmp_path):
+        rec = dict(P._record_from_node_row(node_row("nyquist", T0, seed=62)),
+                   clock_state="DEGRADED", boot_id="0011223344556677",
+                   clock_discontinuity_flags="9", sync_sigma_ns=37_000.0)
+        r, _ = self._reasons(tmp_path, [], extra=[rec])
+        assert r.get(HT.D_CLOCK_STATE) == 1
+
+    def test_a_holdover_clock_state_is_admitted_and_left_to_the_sigma_gate(self, tmp_path):
+        rec = dict(P._record_from_node_row(node_row("nyquist", T0, seed=63)),
+                   clock_state="HOLDOVER", boot_id="0011223344556677",
+                   clock_discontinuity_flags="16", sync_sigma_ns=37_000.0)
+        r, t = self._reasons(tmp_path, [], extra=[rec])
+        assert r.get(HT.D_CLOCK_STATE) is None
+        assert t["funnel"]["admitted"] == 1
+
     def test_an_explicit_onset_not_found_is_refused(self, tmp_path):
         rec = dict(P._record_from_node_row(node_row("nyquist", T0, seed=7)), onset_found=False)
         r, _ = self._reasons(tmp_path, [], extra=[rec])

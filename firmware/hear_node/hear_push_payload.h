@@ -14,6 +14,12 @@ typedef struct {
   int gps_fix;
   int time_valid;
   int64_t utc_us;
+  const char *clock_state;
+  uint64_t sync_sigma_ns;
+  uint64_t anchor_age_us;
+  int64_t boot_epoch_us;
+  const char *boot_id;
+  unsigned int discontinuity_flags;
   int wifi_has_rssi;
   int wifi_rssi_dbm;
   unsigned long scene_rows_written;
@@ -31,6 +37,12 @@ typedef struct {
   unsigned long event_seq;
   int time_valid;
   int64_t utc_us;
+  const char *clock_state;
+  uint64_t sync_sigma_ns;
+  uint64_t anchor_age_us;
+  int64_t boot_epoch_us;
+  const char *boot_id;
+  unsigned int discontinuity_flags;
   const char *clip_basename;
   unsigned long clips_written;
   unsigned long clips_evicted;
@@ -71,10 +83,40 @@ static inline long long hear_push_ts_ms(int time_valid, int64_t utc_us, unsigned
   return (long long)uptime_s * 1000 + 1;
 }
 
+static inline int hear_push_time_json(int time_valid, const char *clock_state,
+                                      uint64_t sync_sigma_ns, uint64_t anchor_age_us,
+                                      int64_t boot_epoch_us, const char *boot_id,
+                                      unsigned int discontinuity_flags, char *out, size_t n) {
+  if (!out || !n || !clock_state || !clock_state[0] || !boot_id || !boot_id[0]) return 0;
+  char sync[32], age[32], boot[32];
+  if (time_valid) {
+    int m = snprintf(sync, sizeof sync, "%llu", (unsigned long long)sync_sigma_ns);
+    if (m <= 0 || (size_t)m >= sizeof sync) return 0;
+    m = snprintf(age, sizeof age, "%llu", (unsigned long long)anchor_age_us);
+    if (m <= 0 || (size_t)m >= sizeof age) return 0;
+    m = snprintf(boot, sizeof boot, "%lld", (long long)boot_epoch_us);
+    if (m <= 0 || (size_t)m >= sizeof boot) return 0;
+  } else {
+    if (snprintf(sync, sizeof sync, "null") != 4) return 0;
+    if (snprintf(age, sizeof age, "null") != 4) return 0;
+    if (snprintf(boot, sizeof boot, "null") != 4) return 0;
+  }
+  int m = snprintf(out, n,
+                   "{\"valid\":%s,\"state\":\"%s\",\"sync_sigma_ns\":%s,"
+                   "\"anchor_age_us\":%s,\"boot_epoch_us\":%s,\"boot_id\":\"%s\","
+                   "\"discontinuity_flags\":%u}",
+                   time_valid ? "true" : "false", clock_state, sync, age, boot, boot_id,
+                   discontinuity_flags);
+  return (m > 0 && (size_t)m < n) ? m : 0;
+}
+
 static inline int hear_push_heartbeat_json(const hear_push_heartbeat_t *hb, char *out, size_t n) {
   if (!hb || !out || !n || !hb->device_id || !hb->node_class || !hb->fw_version) return 0;
-  char ts[40], rssi[16];
+  char ts[40], rssi[16], time_json[224];
   if (!hear_push_ts_field(hb->time_valid, hb->utc_us, ts, sizeof ts)) return 0;
+  if (!hear_push_time_json(hb->time_valid, hb->clock_state, hb->sync_sigma_ns,
+                           hb->anchor_age_us, hb->boot_epoch_us, hb->boot_id,
+                           hb->discontinuity_flags, time_json, sizeof time_json)) return 0;
   if (hb->wifi_has_rssi) {
     int m = snprintf(rssi, sizeof rssi, "%d", hb->wifi_rssi_dbm);
     if (m <= 0 || (size_t)m >= sizeof rssi) return 0;
@@ -86,12 +128,12 @@ static inline int hear_push_heartbeat_json(const hear_push_heartbeat_t *hb, char
       out, n,
       "{\"telemetry_path\":\"hear/heartbeat\",\"telemetry_schema_version\":1,"
       "\"device_id\":\"%s\",\"ts\":%s,\"ts_ms\":%lld,\"class\":\"%s\",\"fw_version\":\"%s\","
-      "\"uptime_s\":%lu,\"gps\":{\"fix\":%d},\"time\":{\"valid\":%s},"
+      "\"uptime_s\":%lu,\"gps\":{\"fix\":%d},\"time\":%s,"
       "\"wifi\":{\"rssi_dbm\":%s},\"counters\":{\"scene_rows_written\":%lu,"
       "\"dets_rows_written\":%lu,\"clips_written\":%lu,\"clips_evicted\":%lu}}",
       hb->device_id, ts, hear_push_ts_ms(hb->time_valid, hb->utc_us, hb->uptime_s),
       hb->node_class, hb->fw_version, hb->uptime_s, hb->gps_fix,
-      hb->time_valid ? "true" : "false", rssi, hb->scene_rows_written, hb->dets_rows_written,
+      time_json, rssi, hb->scene_rows_written, hb->dets_rows_written,
       hb->clips_written, hb->clips_evicted);
   return (m > 0 && (size_t)m < n) ? m : 0;
 }
@@ -99,8 +141,11 @@ static inline int hear_push_heartbeat_json(const hear_push_heartbeat_t *hb, char
 static inline int hear_push_event_json(const hear_push_event_t *ev, char *out, size_t n) {
   if (!ev || !out || !n || !ev->device_id || !ev->node_class || !ev->fw_version || !ev->event_type)
     return 0;
-  char ts[40];
+  char ts[40], time_json[224];
   if (!hear_push_ts_field(ev->time_valid, ev->utc_us, ts, sizeof ts)) return 0;
+  if (!hear_push_time_json(ev->time_valid, ev->clock_state, ev->sync_sigma_ns,
+                           ev->anchor_age_us, ev->boot_epoch_us, ev->boot_id,
+                           ev->discontinuity_flags, time_json, sizeof time_json)) return 0;
   long long ts_ms = hear_push_ts_ms(ev->time_valid, ev->utc_us, ev->uptime_s);
   int m = 0;
   if (ev->clip_basename && ev->clip_basename[0]) {
@@ -108,20 +153,21 @@ static inline int hear_push_event_json(const hear_push_event_t *ev, char *out, s
         out, n,
         "{\"telemetry_path\":\"hear/event\",\"telemetry_schema_version\":1,"
         "\"device_id\":\"%s\",\"ts\":%s,\"ts_ms\":%lld,\"class\":\"%s\",\"fw_version\":\"%s\","
-        "\"uptime_s\":%lu,\"event_type\":\"%s\",\"event_seq\":%lu,"
+        "\"uptime_s\":%lu,\"time\":%s,\"event_type\":\"%s\",\"event_seq\":%lu,"
         "\"event\":{\"clip_basename\":\"%s\",\"clips_written\":%lu,\"clips_evicted\":%lu}}",
-        ev->device_id, ts, ts_ms, ev->node_class, ev->fw_version, ev->uptime_s, ev->event_type,
+        ev->device_id, ts, ts_ms, ev->node_class, ev->fw_version, ev->uptime_s, time_json,
+        ev->event_type,
         ev->event_seq, ev->clip_basename, ev->clips_written, ev->clips_evicted);
   } else {
     m = snprintf(
         out, n,
         "{\"telemetry_path\":\"hear/event\",\"telemetry_schema_version\":1,"
         "\"device_id\":\"%s\",\"ts\":%s,\"ts_ms\":%lld,\"class\":\"%s\",\"fw_version\":\"%s\","
-        "\"uptime_s\":%lu,\"event_type\":\"%s\",\"event_seq\":%lu,"
+        "\"uptime_s\":%lu,\"time\":%s,\"event_type\":\"%s\",\"event_seq\":%lu,"
         "\"event\":{\"dets_rows_written\":%lu,\"batch_rows\":%lu}}",
-        ev->device_id, ts, ts_ms, ev->node_class, ev->fw_version, ev->uptime_s, ev->event_type,
+        ev->device_id, ts, ts_ms, ev->node_class, ev->fw_version, ev->uptime_s, time_json,
+        ev->event_type,
         ev->event_seq, ev->dets_rows_written, ev->batch_rows);
   }
   return (m > 0 && (size_t)m < n) ? m : 0;
 }
-

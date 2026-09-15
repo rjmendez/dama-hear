@@ -69,7 +69,9 @@ RECEIVER_SCHEMA_VERSION = 1
 _DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 _CLASS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 _FW_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,62}$")
+_BOOT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,31}$")
 _EVENT_TYPES = {"clip_written", "detection_batch_ready"}
+_CLOCK_STATES = frozenset({"LOCKED", "HOLDOVER", "DEGRADED", "FAULT"})
 
 
 class RequestError(ValueError):
@@ -492,6 +494,33 @@ def _require_bool(payload: Mapping[str, Any], key: str) -> bool:
     return value
 
 
+def _validate_time_block(body: Mapping[str, Any]) -> Dict[str, Any]:
+    time_state = _require_object(body.get("time"), "time")
+    time_valid = _require_bool(time_state, "valid")
+    state = time_state.get("state")
+    if state is not None:
+        if not isinstance(state, str) or state not in _CLOCK_STATES:
+            raise RequestError("time.state must be one of %s" % ", ".join(sorted(_CLOCK_STATES)))
+        _require_ident(time_state, "boot_id", _BOOT_ID_RE, "boot id")
+        for key in ("discontinuity_flags",):
+            if time_state.get(key) is not None:
+                _require_int(time_state, key)
+        if time_valid:
+            if state == "FAULT":
+                raise RequestError("time.state FAULT requires time.valid false")
+            for key in ("sync_sigma_ns", "anchor_age_us", "boot_epoch_us"):
+                if time_state.get(key) is None:
+                    raise RequestError(f"time.{key} is required when time.state is present")
+                _require_int(time_state, key)
+        else:
+            if state != "FAULT":
+                raise RequestError("time.valid false requires time.state FAULT when stated")
+            for key in ("sync_sigma_ns", "anchor_age_us", "boot_epoch_us"):
+                if time_state.get(key) is not None:
+                    raise RequestError(f"time.{key} must be null when time.valid is false")
+    return time_state
+
+
 def _validate_common(payload: Any, telemetry_path: str, *, require_gps: bool = True) -> Dict[str, Any]:
     body = _require_object(payload, "payload")
     if body.get("telemetry_path") != telemetry_path:
@@ -507,8 +536,8 @@ def _validate_common(payload: Any, telemetry_path: str, *, require_gps: bool = T
         gps = _require_object(body.get("gps"), "gps")
         _require_int(gps, "fix")
 
-    time_state = _require_object(body.get("time"), "time")
-    time_valid = _require_bool(time_state, "valid")
+    time_state = _validate_time_block(body)
+    time_valid = time_state["valid"]
     ts = body.get("ts")
     if time_valid:
         if ts is None:

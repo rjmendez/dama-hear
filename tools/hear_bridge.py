@@ -168,6 +168,8 @@ V1_FLAG_NO_CONTEXT = 0x0002
 # tests build by hand.
 DETS_COLUMNS = ["utc_us", "uptime_s", "sample", "pps_n", "us_since_pps",
                 "trigger", "flags", "fs_hz", "frame_hex"]
+DETS_CLOCK_COLUMNS = ["sync_sigma_ns", "clock_state", "anchor_age_us", "boot_epoch_us", "boot_id",
+                      "clock_discontinuity_flags"]
 
 # The literal header the firmware writes for the scene feature (hear_node.ino: SCENE_HDR),
 # checked for the same reason.
@@ -394,7 +396,7 @@ def rows_from_detections(obj: Any) -> List[Dict]:
                          % type(obj).__name__)
     out = []
     for d in obj:
-        r = {k: d[k] for k in DETS_COLUMNS[:-1] if k in d}
+        r = {k: d[k] for k in DETS_COLUMNS[:-1] + DETS_CLOCK_COLUMNS if k in d}
         hexs = d.get("frame", d.get("frame_hex", ""))
         n = d.get("frame_len")
         if n is not None and len(hexs) != 2 * int(n):
@@ -834,6 +836,14 @@ def to_record(row: Dict, node: str, node_id: Optional[int] = None,
             "fs_hz": fs_hz if fs_hz > 1000.0 else None,
             "sample": _int_or_none(row, "sample"),
             "uptime_s": _int_or_none(row, "uptime_s"),
+            "state": (str(row.get("clock_state")).strip().upper()
+                      if row.get("clock_state") not in (None, "") else None),
+            "sync_sigma_ns": _float_or_none(row, "sync_sigma_ns"),
+            "anchor_age_us": _int_or_none(row, "anchor_age_us"),
+            "boot_epoch_us": _int_or_none(row, "boot_epoch_us"),
+            "boot_id": (str(row.get("boot_id")).strip() if row.get("boot_id") not in (None, "")
+                        else None),
+            "discontinuity_flags": _int_or_none(row, "clock_discontinuity_flags"),
         },
         "src": row.get("src"),
     }
