@@ -107,7 +107,7 @@ so a wrong-denominator implementation fails immediately instead of reading perma
 > **`docs/clip-pipeline.md`**. Read that before quoting anything out of `clips/tags.jsonl`.
 
 Every node writes 5.0 s WAVs (1.0 s pre-trigger + 4.0 s post, 48 kHz 16-bit mono, 480,044 B) into
-`/clips`, a rolling window of 13 clips (6,291,456 B) that evicts its oldest; `tools/hear_drain.py`
+`/clips`, a rolling SD cache whose firmware FIFO tracks the newest 128 clip names; `tools/hear_drain.py`
 fetches them before they roll off.
 
 Two fetch traps:
@@ -124,17 +124,15 @@ name in `dets.csv` is a clip that already landed. `/ls?dir=` is compile-only and
 candidate source at the next reflash — it closes exactly one case, a clip that outlives the dets
 file that named it.
 
-⚠️**THE ORDERING CONSTRAINT.** *Draining clips must precede any budget increase. A bigger
-`CLIP_BUDGET_B` without collection just evicts faster.* Today the card holds 49 and the node
-destroys the 50th; raising the budget to 196 without a drain does not save a single clip. It
-changes *which* 478 are destroyed and how long each survives before it is destroyed anyway, while
-consuming SD space. **The node is not
-the archive; the pool is.** Until something collects, every byte of budget is a byte of delay
-before the same loss. The permitted sequence: land collection → observe ≥ 7 days of
+⚠️**THE ORDERING CONSTRAINT.** *Draining clips must precede any cache increase.* A bigger firmware
+cache without collection does not save a single clip; it changes which clips are destroyed and how
+long each survives before it is destroyed anyway, while consuming SD space. **The node is not the
+archive; the pool is.** Until something collects, every byte of cache is a byte of delay before
+the same loss. The permitted sequence: land collection → observe ≥ 7 days of
 `clips_deferred_by_cap == 0` and `clips_cap_hit == false` across all three nodes, read off the
-heartbeat *ring* and not off one run → only then raise `CLIP_BUDGET_B` **and**
-`--clip-max-per-node` in the same change, because the cap and the budget are one number in two
-places. `activeDeadlineSeconds` goes in **with** the clip lane for the same reason: the clip
+heartbeat *ring* and not off one run → only then raise the firmware clip cache depth **and**
+`--clip-max-per-node` in the same change, because the cap and the cache depth are coupled.
+`activeDeadlineSeconds` goes in **with** the clip lane for the same reason: the clip
 margin *is* the schedule margin.
 
 Fetch is **strictly sequential**. The ESP32 serves one client at a time and refuses the rest

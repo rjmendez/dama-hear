@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "51cd97507f1777c8267e591c0731f0e2f690293a912063b846b573c878aa8ecb",
+  "baseline_hash": "707cdfcdf509ad3ba168fd86fcc191c6a6f32e53accabcdb4403a572dd7f0e73",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -251,7 +251,7 @@
     ],
     "default_board_class": "xiao-s3-pps",
     "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
-    "section_hash": "8882c57e9c5f8042be883e4149d324c2a82d0d13c94472a8caa55bf09de5d14d",
+    "section_hash": "b39faa85108f494d66c2f81ab768d94261fa4ffeed08b1a0bda765c236c9805d",
     "source_files": [
       {
         "path": ".github/workflows/firmware.yml",
@@ -285,8 +285,8 @@
       },
       {
         "path": "firmware/hear_node/hear_node.ino",
-        "sha256": "22fff8a77f28633a154f75fb3912047e17933f190e0b8ad1e8757b39d8af6ecc",
-        "size_bytes": 325406
+        "sha256": "562719fde36eb8dae052eee21516457328828849c20194ded703a8e4291bcb73",
+        "size_bytes": 325407
       },
       {
         "path": "firmware/hear_node/hear_push_payload.h",
@@ -442,8 +442,8 @@
       },
       {
         "path": "deploy/k8s/hear-drain.yaml",
-        "sha256": "2e23e8c35af37b0830d73ff36135be4ad59721e655966401dc30229a53adee78",
-        "size_bytes": 13587
+        "sha256": "38e02f09e8b124e5d321a7c51a97e93b898b03e27de6d19a0d38fb9b00cedf4e",
+        "size_bytes": 13594
       },
       {
         "path": "deploy/k8s/hear-embed.yaml",
@@ -2123,7 +2123,7 @@
         "storage_request": "5Gi"
       }
     ],
-    "section_hash": "8846e7b80b9ef8a6962c70870cc696fc4fb4b9409a09f03752a52f79d0fbe283"
+    "section_hash": "bad6a937b5aa2dc1b51c48b9979ec4360ff2d6157b6df400d27dbffd1df92ee9"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",

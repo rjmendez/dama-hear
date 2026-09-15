@@ -133,8 +133,8 @@ is acked-and-lost (consumer offset only commits after durable write).
 
 **Invariant at risk:** #5 (bounded backlog) and #4 (loud, not quiet).
 
-**Policy:** node-side, clips are already bounded by a measured rolling window
-(`--clip-max-per-node 13`, "the card's own rolling window") — the fix for exhaustion is
+**Policy:** node-side, clips are already bounded by a measured rolling cache
+(`--clip-max-per-node 96`, backed by a 128-clip firmware FIFO) — the fix for exhaustion is
 eviction-with-counting, not silent overwrite: every eviction refusal is counted by reason
 (`hear_drain.py`) so "we are losing clips to the cap" is a number, not a guess. The unbounded
 case (`scene.csv`, which "grows without bound") is the one that must be fixed at the source
