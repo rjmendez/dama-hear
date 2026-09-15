@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from decimal import Decimal, InvalidOperation
 import gzip
 import hashlib
 import json
@@ -265,10 +266,19 @@ def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         fh = fh[:-1]
     frame = binascii.unhexlify(fh)
     d = WR.decode(frame)
-    try:
-        utc_us = int(float(row.get("utc_us") or 0))
-    except (TypeError, ValueError):
+    raw_utc_us = row.get("utc_us")
+    if raw_utc_us in (None, ""):
         utc_us = 0
+    else:
+        try:
+            utc_decimal = Decimal(str(raw_utc_us).strip())
+            if utc_decimal != utc_decimal.to_integral_value():
+                raise ValueError("utc_us is not an integer: %r" % (raw_utc_us,))
+            utc_us = int(utc_decimal)
+        except (InvalidOperation, TypeError, ValueError) as e:
+            raise ValueError("utc_us is not an integer: %r" % (raw_utc_us,)) from e
+        if not 0 <= utc_us <= 253402300799999999:
+            raise ValueError("utc_us outside the supported UTC range: %d" % utc_us)
     node = row["node"]
     # fs: the FRAME is authoritative when it states a rate; the CSV column is only the node's
     # running estimate.

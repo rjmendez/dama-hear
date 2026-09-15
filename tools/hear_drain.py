@@ -301,7 +301,7 @@ def _get(url: str, timeout: float = DEFAULT_TIMEOUT_S) -> bytes:
 
 
 def fetch_status(ip: str, timeout: float = DEFAULT_TIMEOUT_S) -> Dict[str, Any]:
-    return json.loads(_get("http://%s/status" % ip, timeout).decode("utf-8", "replace"))
+    return json.loads(_get("http://%s/status" % ip, timeout).decode("utf-8"))
 
 
 def fetch_audio_status(ip: str, timeout: float = DEFAULT_TIMEOUT_S) -> Dict[str, Any]:

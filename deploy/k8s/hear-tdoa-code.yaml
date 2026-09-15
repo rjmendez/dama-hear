@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-tdoa-code.yaml
-# apply-mode server: 678219 B serialised; 678484 B of annotations against a 262144 B cap.
+# apply-mode server: 678809 B serialised; 679074 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-tdoa
   annotations:
-    dama-hear/commit: 'e63d980'
-    dama-hear/source-sha256: 'aeba3cc680797374f7e3bf3333989d5cf472cbf99e5889f322e437e37a4c1ad3'
+    dama-hear/commit: 'b25eefb'
+    dama-hear/source-sha256: '332f660e6ea0d3b9bfa463c120e36a20a7bbf9656c77cec79a47093377444b5e'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '678219'
+    dama-hear/serialised-bytes: '678809'
 data:
   hear__init__.py: |
     
@@ -1487,6 +1487,7 @@ data:
     
     import base64
     import binascii
+    from decimal import Decimal, InvalidOperation
     import gzip
     import hashlib
     import json
@@ -1707,10 +1708,19 @@ data:
             fh = fh[:-1]
         frame = binascii.unhexlify(fh)
         d = WR.decode(frame)
-        try:
-            utc_us = int(float(row.get("utc_us") or 0))
-        except (TypeError, ValueError):
+        raw_utc_us = row.get("utc_us")
+        if raw_utc_us in (None, ""):
             utc_us = 0
+        else:
+            try:
+                utc_decimal = Decimal(str(raw_utc_us).strip())
+                if utc_decimal != utc_decimal.to_integral_value():
+                    raise ValueError("utc_us is not an integer: %r" % (raw_utc_us,))
+                utc_us = int(utc_decimal)
+            except (InvalidOperation, TypeError, ValueError) as e:
+                raise ValueError("utc_us is not an integer: %r" % (raw_utc_us,)) from e
+            if not 0 <= utc_us <= 253402300799999999:
+                raise ValueError("utc_us outside the supported UTC range: %d" % utc_us)
         node = row["node"]
         # fs: the FRAME is authoritative when it states a rate; the CSV column is only the node's
         # running estimate.
