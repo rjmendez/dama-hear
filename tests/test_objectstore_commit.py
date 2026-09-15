@@ -309,3 +309,135 @@ def test_a_republish_under_the_lease_primitive_is_fenced_without_a_live_lease(tm
         [_tail_task(b'{"a":1}{"b":2}\n', start=8, republish=True)])
     assert report.outcome == "aborted"
     assert _pointer(store, OKEY)["generation"] == 1
+
+
+# ------------------------------------------- the claim/write window (roll-forward)
+
+
+def _doc(gen: int, blob: str, *, supersedes=None):
+    doc = {"object_key": OKEY, "blob_key": blob, "meta_key": "m", "generation": gen,
+           "state": "published", "lease_epoch": None}
+    if supersedes is not None:
+        doc["supersedes"] = supersedes
+    return doc
+
+
+def test_a_first_publish_interrupted_between_its_claim_and_its_pointer_can_be_finished(tmp_path):
+    """The claim is one write and the pointer is another; dying in between must not wedge the key.
+
+    Before the fix the retry found generation 1 already claimed, read that as "someone else owns
+    it", and returned a conflict -- forever, because the pointer it was conflicting with had never
+    been written and so could never advance.
+    """
+    store = B.LocalDirBackend(str(tmp_path / "store"))
+    store.fail_after_claim = [B.BackendTransient("evicted between the claim and the pointer")]
+
+    try:
+        store.commit_pointer(OKEY, _doc(1, "hear/v1/blob/sha256/aa"))
+        raise AssertionError("the injected failure did not fire")
+    except B.BackendTransient:
+        pass
+    assert store.head(OKEY) is None                       # nothing observable
+    assert store._read_generation(OKEY, 1) is not None    # but the claim is on disk
+
+    again = store.commit_pointer(OKEY, _doc(1, "hear/v1/blob/sha256/aa"))
+    assert again.outcome == "committed" and again.generation == 1
+    assert _pointer(store, OKEY)["blob_key"] == "hear/v1/blob/sha256/aa"
+    assert [g["generation"] for g in store.pointer_generations(OKEY)] == [1]
+
+
+def test_a_generation_claimed_by_a_different_document_is_still_a_real_conflict(tmp_path):
+    """Roll-forward is only for *our own* interrupted work: byte-identical, or it is a conflict."""
+    store = B.LocalDirBackend(str(tmp_path / "store"))
+    store.fail_after_claim = [B.BackendTransient("evicted")]
+    try:
+        store.commit_pointer(OKEY, _doc(1, "hear/v1/blob/sha256/aa"))
+    except B.BackendTransient:
+        pass
+
+    other = store.commit_pointer(OKEY, _doc(1, "hear/v1/blob/sha256/bb"))
+    assert other.outcome == "conflict"
+    assert other.existing_blob == "hear/v1/blob/sha256/aa"
+    assert store.head(OKEY) is None  # and it did not overwrite the claim or publish a pointer
+
+
+def test_a_republish_interrupted_between_its_claim_and_its_pointer_rolls_forward(tmp_path):
+    store = B.LocalDirBackend(str(tmp_path / "store"))
+    assert store.commit_pointer(OKEY, _doc(1, "blob-1")).outcome == "committed"
+
+    store.fail_after_claim = [B.BackendTransient("evicted")]
+    doc2 = _doc(2, "blob-2", supersedes=1)
+    try:
+        store.commit_pointer(OKEY, doc2, expect_generation=1)
+        raise AssertionError("the injected failure did not fire")
+    except B.BackendTransient:
+        pass
+    assert _pointer(store, OKEY)["generation"] == 1
+
+    finished = store.commit_pointer(OKEY, doc2, expect_generation=1)
+    assert finished.outcome == "committed" and finished.generation == 2
+    assert _pointer(store, OKEY)["blob_key"] == "blob-2"
+    assert [g["generation"] for g in store.pointer_generations(OKEY)] == [1, 2]
+
+
+def test_a_republished_generation_claimed_by_another_writer_still_loses_the_cas(tmp_path):
+    store = B.LocalDirBackend(str(tmp_path / "store"))
+    store.commit_pointer(OKEY, _doc(1, "blob-1"))
+    store.fail_after_claim = [B.BackendTransient("evicted")]
+    try:
+        store.commit_pointer(OKEY, _doc(2, "blob-other", supersedes=1), expect_generation=1)
+    except B.BackendTransient:
+        pass
+
+    lost = store.commit_pointer(OKEY, _doc(2, "blob-mine", supersedes=1), expect_generation=1)
+    assert lost.outcome == "generation_conflict"
+    assert _pointer(store, OKEY)["blob_key"] == "blob-1"
+
+
+def test_an_importer_rerun_finishes_a_republish_whose_process_died_after_the_claim(tmp_path):
+    """End to end: the wedge was an object no future run could ever publish again."""
+    store = B.LocalDirBackend(str(tmp_path / "store"))
+    rows = [{"key": "%032x" % i} for i in range(4)]
+    _run_tail(store, tmp_path, rows[:2], RUN + "-w1", republish=True)
+
+    store.fail_after_claim = [B.BackendTransient("the pod was evicted mid-commit")]
+    try:
+        _run_tail(store, tmp_path, rows, RUN + "-w2", republish=True)
+        raise AssertionError("the injected failure did not fire")
+    except B.BackendTransient:
+        pass
+    assert _pointer(store, OKEY)["generation"] == 1
+
+    report, body = _run_tail(store, tmp_path, rows, RUN + "-w3", republish=True)
+    assert report.counters["published"] == 1 and report.counters["quarantined"] == 0
+    head = _pointer(store, OKEY)
+    assert head["generation"] == 2 and head["supersedes"] == 1
+    assert head["blob_key"] == K.blob_key(S.digest_source(S.bytes_chunks(body)).digest)
+    assert [g["generation"] for g in store.pointer_generations(OKEY)] == [1, 2]
+
+
+def test_a_write_that_dies_halfway_leaves_no_truncated_object_behind(tmp_path):
+    """A partial immutable object is worse than none: every later run finds it and refuses.
+
+    Create-if-absent means the truncated body would be treated as the real one forever -- read
+    back, found to disagree with its own digest, and quarantined on every run. The interrupted
+    write removes the key it created, which is not the `delete_object` the importer is denied
+    because nothing ever pointed at it.
+    """
+    store = B.LocalDirBackend(str(tmp_path / "store"))
+
+    def dying():
+        yield b"a" * 1024
+        raise OSError("the source went away mid-write")
+
+    key = "hear/v1/blob/sha256/aa/bbbb/" + "c" * 64
+    try:
+        store.put_immutable_stream(key, dying)
+        raise AssertionError("the injected failure did not fire")
+    except OSError:
+        pass
+    assert store.head(key) is None
+    assert store.keys_under("hear/v1/blob/") == []
+
+    assert store.put_immutable_stream(key, S.bytes_chunks(b"the real body")).created is True
+    assert store.get_range(key) == b"the real body"

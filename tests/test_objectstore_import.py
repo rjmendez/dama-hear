@@ -429,3 +429,83 @@ def test_a_restage_that_reads_different_bytes_is_refused_rather_than_published(s
     assert store.keys_under("hear/v1/obj/") == []
     assert store.keys_under("hear/v1/blob/") == []
     assert store.keys_under("hear/v1/staging/") == []
+
+
+# ------------------------------------- a failure inside the re-stage is still one object's
+
+
+def _flaky_readback(store, monkeypatch):
+    """Make the *first* staging readback lie, so the object takes the re-stage path exactly once."""
+    real = store.iter_range
+    state = {"lied": False}
+
+    def lying(key, offset=0, length=None, **kw):
+        if "/staging/" in key and not state["lied"]:
+            state["lied"] = True
+            return iter([b"not what you wrote"])
+        return real(key, offset, length, **kw)
+
+    monkeypatch.setattr(store, "iter_range", lying)
+    return state
+
+
+def test_a_source_that_dies_during_the_re_stage_quarantines_and_the_run_still_closes(
+        pool, store, tmp_path, monkeypatch):
+    """⚠️THE RE-STAGE WAS OUTSIDE THE HANDLER, so a second-read failure aborted the whole import.
+
+    The re-stage after a bad readback is a fresh read of the source and can fail in every way the
+    first read could. When only the first read was wrapped, an `OSError` there escaped the object,
+    escaped the run, and left no report, no `run_close` and no quarantine record -- one bad file
+    taking down an import of thousands. One object's failure aborts one object.
+    """
+    reads = {"n": 0}
+
+    def dying():
+        reads["n"] += 1
+        if reads["n"] >= 2:
+            raise OSError("the source went away between the two reads")
+        return iter([b"first read bytes\n"])
+
+    bad = ST.ImportTask(object_class="record-seg", logical_id="0", partition=("2026-09-12", "mach"),
+                        chunks=dying, digest_source="stream-digest")
+    good = ST.ImportTask(object_class="record-seg", logical_id="1", partition=("2026-09-12", "mach"),
+                         source_path=pool["records_path"], digest_source="computed-at-import")
+    _flaky_readback(store, monkeypatch)
+
+    report = _importer(store, tmp_path).run([bad, good])
+
+    assert [q["error_class"] for q in report.quarantined] == ["source_unreadable"]
+    assert report.quarantined[0]["logical_id"] == "0"
+    assert report.counters["published"] == 1          # the next object was still imported
+    assert report.outcome == "partial" and report.exit_code == 1
+    rows = [json.loads(l) for l in open(_ledger_path(tmp_path))]
+    assert rows[-1]["type"] == "run_close"           # the run closed instead of vanishing
+    assert store.keys_under("hear/v1/staging/") == []  # and the half-written stage was cleaned up
+
+
+def test_a_key_provider_that_fails_during_the_re_stage_quarantines_that_object_only(
+        pool, store, tmp_path, monkeypatch):
+    """The same window, reached through the crypto boundary instead of the filesystem."""
+    crypto = _crypto()
+    real_data_key = crypto.provider.data_key
+    calls = {"n": 0}
+
+    def flaky(tenant_id, data_class, context):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise C.KeyUnavailable("the KMS went away mid-import")
+        return real_data_key(tenant_id, data_class, context)
+
+    monkeypatch.setattr(crypto.provider, "data_key", flaky)
+    clip = _clip_task(pool["clip_paths"][0], pool["clip_digest"], pool["clip_bytes"],
+                      "9f2c" + "0" * 28, "2026-09-12")
+    _flaky_readback(store, monkeypatch)
+
+    report = _importer(store, tmp_path, crypto=crypto).run([clip])
+
+    assert [q["error_class"] for q in report.quarantined] == ["key_provider_unavailable"]
+    assert report.counters["published"] == 0
+    assert store.keys_under("hear/v1/obj/") == []
+    assert store.keys_under("hear/v1/staging/") == []
+    rows = [json.loads(l) for l in open(_ledger_path(tmp_path))]
+    assert rows[-1]["type"] == "run_close"
