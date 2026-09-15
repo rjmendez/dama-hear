@@ -339,15 +339,22 @@ def self_test(admin_dsn: str) -> int:
         print(f"re-apply is a no-op: {before == after}")
         if before != after:
             return 1
-        for fixture in fixtures:
-            if not fixture.exists():
-                continue
-            out = db.run_file(fixture)
-            print(f"{fixture.name}: {out.strip().splitlines()[-1] if out.strip() else 'ran'}")
         db.rollback_migrations(migrations)
         left = db.value("SELECT count(*) FROM pg_namespace WHERE nspname = 'hear'")
         print(f"rolled back; hear schemas left: {left}")
-        return 0 if left == "0" else 1
+        if left != "0":
+            return 1
+
+    # Both fixtures count rows and health counters absolutely, so each one gets a database
+    # nothing else has written to - the same isolation the pytest suite gives them.
+    for fixture in fixtures:
+        if not fixture.exists():
+            continue
+        with ephemeral_database(admin_dsn) as db:
+            db.apply_migrations()
+            out = db.run_file(fixture)
+            print(f"{fixture.name}: {out.strip().splitlines()[-1] if out.strip() else 'ran'}")
+    return 0
 
 
 def main(argv: Optional[list[str]] = None) -> int:

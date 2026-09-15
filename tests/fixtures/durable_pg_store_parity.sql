@@ -21,6 +21,34 @@ SELECT set_config('hear.tenant_id', 'default', false);
 SELECT count(*) FROM hear.ensure_partitions(2, 2);
 
 -- ------------------------------------------------------------------------------------------
+-- PAR00: this file counts rows and health counters absolutely, so it requires a ledger that
+-- nothing else has written to. Say so here rather than fail later with a confusing message.
+-- ------------------------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_records  bigint := (SELECT count(*) FROM hear.durable_records);
+    v_attempts bigint := (SELECT count(*) FROM hear.cache_attempts);
+    v_health   jsonb  := hear.health_snapshot();
+    v_counter  text;
+BEGIN
+    IF v_records <> 0 OR v_attempts <> 0 THEN
+        RAISE EXCEPTION
+            'PAR00: this fixture needs a freshly migrated database (found % record(s), % attempt(s))',
+            v_records, v_attempts;
+    END IF;
+    FOREACH v_counter IN ARRAY ARRAY['cache_successes', 'cache_failures', 'claims_expired',
+                                     'dead_letter_records', 'records_backfilled',
+                                     'unrouted_records', 'records_pruned'] LOOP
+        IF coalesce((v_health ->> v_counter)::bigint, 0) <> 0 THEN
+            RAISE EXCEPTION
+                'PAR00: this fixture needs zeroed health counters (% is %)',
+                v_counter, v_health ->> v_counter;
+        END IF;
+    END LOOP;
+END;
+$$;
+
+-- ------------------------------------------------------------------------------------------
 -- PAR01: the replayed bytes are the arrived bytes
 --
 -- The SQLite store hands back payload_json verbatim, and the Phase 0 contract freeze declares

@@ -369,6 +369,13 @@ class TestAgainstAnEphemeralDatabase:
             db.run_file(PARITY_FIXTURE)
         assert "PAR07" in str(excinfo.value)
 
+    def test_the_parity_fixture_refuses_a_ledger_someone_else_wrote_to(self, db):
+        """Its counts are absolute, so a shared database must fail loudly, not confusingly."""
+        db.run_file(SEMANTICS_FIXTURE)
+        with pytest.raises(TESTDB.PsqlError) as excinfo:
+            db.run_file(PARITY_FIXTURE)
+        assert "PAR00" in str(excinfo.value)
+
     # -- concurrency ------------------------------------------------------------------------
     def test_two_workers_claim_disjoint_sets(self, db):
         """D2c: SKIP LOCKED, proven from two connections, which is the only place it exists."""
