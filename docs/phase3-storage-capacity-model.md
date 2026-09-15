@@ -96,7 +96,7 @@ apart, which is what makes it safe to use as a planning constant: **content-addr
 `dets.csv`/`scene-*.csv` tails every 15 minutes), so the ratio holds as long as the drain behaves
 this way.
 
-### 3.2 An observation that changes the clip term, and is not diagnosed here
+### 3.2 An observation that changes the clip term (diagnosed after the fact — see §3.2.1)
 
 `corpus/clips/**` currently contains **zero `.wav` files**. `index.jsonl` records 3932 `stored`
 rows, 1966 of which carry `audio_pruned_at`, plus 1961 `deferred_by_cap` and 6003
@@ -110,8 +110,37 @@ This lane does not diagnose it — the capacity consequence is what matters here
 * it is **+1.9 GB** the moment stored audio is present again (3932 rows × 480 044 B),
 
 so both are carried as a named conditional, and no reservation is sized as if audio were
-permanently absent. That a 2 GiB cap emptied a 0.74 GiB store while deferring new fetches is a
-correctness question for the clip lane, recorded here as evidence and raised in §13.
+permanently absent. That a 2 GiB cap appeared to empty a 0.74 GiB store while deferring new fetches
+was recorded here as a correctness question for the clip lane; §3.2.1 answers it.
+
+### 3.2.1 The answer: an operator privacy prune, not the 2 GiB cap
+
+A read-only follow-up (fresh clone, live cluster read only, replay of `clips/index.jsonl` and
+`corpus/heartbeat.json`) found the clip audio was deleted deliberately, on operator instruction not
+to retain voice audio, and the clip lane was then switched off. **The 2 GiB cap never bound.**
+
+* All 1966 `audio_pruned_at` values are one identical timestamp, `2026-09-15T18:27:15.225627Z` —
+  a single `prune()` call, not a cap grinding the class down.
+* The live `hear-drain` CronJob was patched out of band to `--clip-max-per-node 0` and
+  `--clip-store-max-b 0`. `clips.prune()` with `max_bytes = 0` deletes every WAV by construction;
+  `--clip-max-per-node 0` then skips `drain_clips()` entirely (`tools/hear_drain.py`), so nothing
+  refills the class and nothing prunes it now either.
+* The heartbeat `clips_recent` ring shows a normal clip run at 18:20:47Z (clips fetched, 0
+  deferred) and `"the clip lane is disabled (--clip-max-per-node 0)"` for every run from 18:26:08Z
+  onward.
+* The 1961 `deferred_by_cap` rows are **not rising and not related**: the index is append-only and
+  never compacted, the newest deferral pre-dates the prune, and the reasons are `deadline` (1595)
+  and `count` (366) — never `disk`. Deferral was binding on `rankine` for transport reasons well
+  before this change.
+
+Capacity consequence, corrected: the audio term is **0 for as long as the clip lane stays
+disabled**, and the **+1.9 GB conditional applies only if audio retention is deliberately turned
+back on**. It is a policy state, not a pending anomaly.
+
+Two states now disagree and the disagreement is the live risk: the repo manifest
+`deploy/k8s/hear-drain.yaml` still carries `--clip-max-per-node 96` and no `--clip-store-max-b`, and
+the CronJob's `last-applied-configuration` carries `--clip-max-per-node 13`. A routine
+`kubectl apply` of the manifest would silently resume retaining raw audio.
 
 ### 3.3 Growth
 
@@ -419,7 +448,7 @@ space on the backing Windows volume** — because the filesystem-level number is
 | `raw/` growth | > 3.5 GB/day for 2 consecutive days | capacity review; re-run this model before any import |
 | `/pool` total | **> 20 GiB** | **block the Phase 3 import** until `raw/` retention exists |
 | `D:` physical free | < 20 GiB | operational incident: the node, not just hear, is at risk |
-| Clip class | `deferred_by_cap` rising while stored audio is 0 | investigate before sizing any audio term (§3.2) |
+| Clip class | `deferred_by_cap` rising **while the clip lane is enabled** and stored audio is 0 | investigate before sizing any audio term (§3.2.1); today the lane is off by policy |
 | Duplicate fraction | drifts below 40 % | the 0.41 × planning constant is invalid; re-measure |
 
 ---
@@ -474,8 +503,9 @@ following were **not** measured, and each one moves a number:
    the `raw/` ratio is ±0.9 GiB per level-0 and ±7 GiB on the lean chain.
 2. **The first real level-0.** Runtime, `files_unstable`, and actual `bytes_out` are unknown until
    G0 executes, and G0 is blocked on policy input (passphrase custody, `F:` ownership), not on code.
-3. **The clip-class anomaly (§3.2).** Until it is explained, the audio term is 0 or +1.9 GB and the
-   model cannot choose.
+3. **The clip-class anomaly (§3.2).** Answered in §3.2.1: an operator privacy prune with the cap set
+   to 0, followed by the clip lane being disabled. The audio term is 0 while that policy stands, and
+   +1.9 GB only if audio retention is turned back on.
 4. **Growth stationarity.** Eight days of data, spanning a fleet that was still being expanded, does
    not establish a rate. G-low and G-high differ by 2.2 × and by 189 GiB at the 90-day chain.
 5. **Segment count and size.** The ~7.6 k pointer / ~4.4 k blob counts come from the import plan's
@@ -503,8 +533,10 @@ following were **not** measured, and each one moves a number:
    that was deliberately not performed here.
 4. **Is the shadow store backed up?** §8.2 recommends not during the shadow phase. That is a
    durability trade, and it belongs to whoever owns R6.
-5. **The clip cap (§3.2).** A 2 GiB cap that emptied a 0.74 GiB store while deferring 1961 fetches
-   needs a look from the clip lane before the audio term of this model can be trusted.
+5. **Clip audio retention (§3.2.1).** Audio retention is currently off by operator instruction,
+   applied only to the live CronJob. Whether that decision is encoded in
+   `deploy/k8s/hear-drain.yaml` — so an apply cannot revert it — is an operator decision, and the
+   audio term of this model follows it.
 
 ---
 
