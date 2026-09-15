@@ -1,0 +1,97 @@
+{
+  "case": "stale-canonical-row",
+  "description": "Both rows exist and agree field by field, but the canonical row was written against an earlier revision of the legacy record. Replayable from the outbox; a stale row is not a lost row.",
+  "expected_classification": "stale_canonical",
+  "expected_repair_action": "replay_outbox",
+  "expected_severity": "warn",
+  "receipt": {
+    "comparator": {
+      "name": "hear-reconcile",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "correlation": {
+      "binding": "bound",
+      "correlation_id": "legacy:d5945cf2c5eaa6a4943211a789a0ae91b930ff74c4b5b15f5c5f0e4fea26c910",
+      "device_id": "mach",
+      "event_id": "cccccccc-cccc-5ccc-8ccc-cccccccccccc",
+      "legacy_uid": "8888888888888888888888888888888888888888888888888888888888888888",
+      "site_id": "site-alpha",
+      "source": "node-http",
+      "telemetry_path": "hear/heartbeat"
+    },
+    "credential": {
+      "canonical": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:mach",
+        "scope": "device"
+      },
+      "legacy": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:mach",
+        "scope": "device"
+      },
+      "matched": true
+    },
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "replay_outbox",
+      "repairable": true
+    },
+    "emitted_at": "2026-09-15T01:00:30Z",
+    "evidence": {
+      "canonical_raw_ref": null,
+      "legacy_raw_ref": null,
+      "redaction_profile": "hear.reconcile.redact.v1"
+    },
+    "receipt_id": "5a028c44-e2c5-534d-98fa-7d3b4883fcd5",
+    "run_id": "recon-2026-09-15T00",
+    "sampling": {
+      "forced_reason": "mismatches are never sampled",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.reconcile.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:4978670df2fae3cd7066047bc7a723cc0b5feb38a871c0abbc8af933c5ae2109",
+        "writer": "hear.ingest.batch",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:10:00Z"
+      },
+      "legacy": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:4978670df2fae3cd7066047bc7a723cc0b5feb38a871c0abbc8af933c5ae2109",
+        "writer": "tools/hear_heartbeat_receiver.py",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "stale_canonical",
+      "notes": [
+        "canonical row is older than the legacy row it mirrors"
+      ],
+      "repair_action": "replay_outbox",
+      "severity": "warn"
+    },
+    "window": {
+      "end": "2026-09-15T01:00:00Z",
+      "start": "2026-09-15T00:00:00Z"
+    }
+  }
+}

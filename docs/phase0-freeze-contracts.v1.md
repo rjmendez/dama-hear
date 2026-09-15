@@ -14,15 +14,15 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | 68bb14208259d80df1503ac9d08f2abc971bbde2128b759c1f2bc874e7a284db |
+| baseline | 59d87f4423f6ca7f9b6b33a7db1f8dd00a9d65c9a0fd154385ef77bd42160b58 |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
 | firmware_build_metadata | af9ba585abe4af010b45e0a7aeb3a1061dac602cd8123b15b85588922fd37b34 |
 | schemas | 248d557d9051b2f32b5e89018296b180cf2772b602b7ed3ad3761989cc412519 |
 | published_contracts | a87c434d400f4f31ec4cc252761fff18ee14355a8170cf80133ef72315c082f3 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |
 | redis_keys | d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03 |
-| kubernetes_and_pvc_layout | c95e3ae220c4ece6acd80de76c0ba0ece704b33f4a63e6276e0e10ac9d40090d |
-| corpus_fixture_metadata | 5a27ffc150822a94847095b765d20e4f0299ec4d9e58f2ea1af05d6ecf470d77 |
+| kubernetes_and_pvc_layout | 1c2938a918c84c354987f3105b6cfc93930953b342cd09468f97fb10315a9ef8 |
+| corpus_fixture_metadata | 466b3b2d681cbeee4ed0d49edf24fff01ad829e5c00c60bf20e2b64c51b1b4cb |
 
 ## Compatibility
 
@@ -221,7 +221,7 @@ Manifest hashes:
 
 | path | size_bytes | sha256 |
 | --- | --- | --- |
-| deploy/k8s/hear-annotate.yaml | 32871 | 3160298b27e45596ad5a46527502a5566185f777045bfa197a67bc2e6e139661 |
+| deploy/k8s/hear-annotate.yaml | 40634 | 7df467571e4e8b8da1942b41875ea7e30bc4859d24a5d975183576af2fa86314 |
 | deploy/k8s/hear-birdnet.yaml | 7474 | 9a4265e78c5c03e10a563b1a178582492e3f0aeef0c47f630f56fe23c06c6aa5 |
 | deploy/k8s/hear-drain.yaml | 13594 | 38e02f09e8b124e5d321a7c51a97e93b898b03e27de6d19a0d38fb9b00cedf4e |
 | deploy/k8s/hear-embed.yaml | 9190 | 1f3e86e8d5d1f57f4bc5d8d4ca6adb958671f5a65c7db7b21e47225916d465ad |
@@ -230,7 +230,7 @@ Manifest hashes:
 | deploy/k8s/hear-score.yaml | 11126 | 03c0713d22b23d3f06177c79ca6d612925768c98d566f012fc01d209de5dcf0d |
 | deploy/k8s/hear-tag.yaml | 15625 | 367ed67528bb15a5dd652bf924db0af409a8f65c1b00128c0a3b14e990be1890 |
 | deploy/k8s/hear-tdoa.yaml | 17920 | 8ff0135e4b56f76d7b0d69ccdc4f9129efd3050047698cc9161b002cfaae2cc8 |
-| deploy/k8s/README.md | 20755 | 0c8bc43156a57555f1c00931d0548795bc9c2bc93b349cfeed16664bf3d2c630 |
+| deploy/k8s/README.md | 24093 | 8bcbcb12c00c025f2d36b2616db1df00b262ffb4c50c6a1bd948d101c24063a4 |
 
 ### PVCs
 
@@ -277,6 +277,7 @@ Representative fixture inventory only: repo paths, top-level schema ids, counts,
 | testdata/hugbot_latency_trials.json | (none) | {"length": 450, "type": "array"} | 143346 | 72f50300ca13d7d4bbf01ff0959dc4512d1d4f96b1a81eb3872e84992ff2b254 |
 | testdata/sketch_golden.json | hear.sketch.golden.v4 | {"cases_count": 9, "schema": "hear.sketch.golden.v4", "top_level_keys": ["cases", "f_hi", "f_lo", "frames", "fs_codes", "fs_mask", "fs_shift", "hop_s", "layout_bit", "layout_equivalent_above_hz", "mel_bands", "nfft", "note", "schema", "wire_size"], "type": "object"} | 109646 | 6c3cfbce52d54f01f9b6e21523d5f2dc426fa0b0562fbe193251a771d67516bd |
 | testdata/window_golden.json | hear.window.golden.v2 | {"cases_count": 4, "schema": "hear.window.golden.v2", "top_level_keys": ["cases", "env_ms", "guard_s", "note", "onset_frac", "retrigger_s", "schema"], "type": "object"} | 52751 | cadf188a841010ea11c969a053b1f57970832f9cb0a8164d3da9e65d32ea4d41 |
+| tests/fixtures/heartbeat-smoke.json | (none) | {"top_level_keys": ["class", "counters", "device_id", "fw_version", "gps", "telemetry_path", "telemetry_schema_version", "time", "ts", "uptime_s", "wifi"], "type": "object"} | 407 | f4bb34386f81e9ba8edf14b8d3b38adcd485bd376ee966d864590996962a29f8 |
 | tests/fixtures/status_mach.json | (none) | {"top_level_keys": ["acq", "audio", "class", "clips", "env", "esp_clock", "gate", "gps", "heap", "i2c", "i2s", "node", "pos", "pps", "psram", "raw", "scene", "sd", "sd_free_mb", "sd_total_mb", "time", "uptime_s", "write_fail"], "type": "object"} | 2111 | 2d822b7f2f640ce6e8f2f987727dbda0458a7959c681862ecce15c61f1b1e881 |
 | tests/fixtures/status_nyquist.json | (none) | {"top_level_keys": ["acq", "audio", "class", "clips", "env", "esp_clock", "gate", "gps", "heap", "i2c", "i2s", "node", "pos", "pps", "psram", "raw", "scene", "sd", "sd_free_mb", "sd_total_mb", "time", "uptime_s", "write_fail"], "type": "object"} | 2113 | fc6caf8751a1438c474a205e816f6b5772fb294e42a17c0c976d8b5e15d3dc57 |
 | tests/fixtures/tdoa-solved-events-2026-09-11.json | (none) | {"events_count": 2, "top_level_keys": ["events", "how_to_read", "provenance", "what"], "type": "object"} | 8191 | 027f8fd72650a8371238fee45cee91aac08f8d16985284bb207b7c20d7432a86 |

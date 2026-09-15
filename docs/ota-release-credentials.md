@@ -95,6 +95,14 @@ if an installer can tell. Both are now declared and enforced at build time:
   and stay installable. Refusing them would strand the fleet on firmware it cannot update; the
   node-side `auth` gate is what protects those installs.
 
+## Token scope
+
+This document describes the *mechanism*; whether `HEAR_ADMIN_TOKEN` is one fleet secret or one
+secret per node — and its custody, rotation, revocation, lost-token recovery and redaction rules —
+is decided in `docs/decisions/0006-admin-token-provisioning-policy.md`. The NVS record is per
+device either way; today's tooling (`gen_secrets.read_push_config()`, `flash.py:admin_token()`)
+reads a single bare key and so implements the fleet-wide shape only.
+
 An unprovisioned image is not a node-ready image. Treat `image_class: unprovisioned` as "this
 image supplies nothing; the node must already hold all four", and provision over USB with
 `enroll.py` -- which is the only place a fleet token is ever written to a node.

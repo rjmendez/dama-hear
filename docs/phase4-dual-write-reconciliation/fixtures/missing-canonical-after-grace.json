@@ -1,0 +1,95 @@
+{
+  "case": "missing-canonical-after-grace",
+  "description": "The same absence once the grace window has closed. Critical, and repairable by replaying the inbox -- never by writing the row by hand.",
+  "expected_classification": "missing_canonical",
+  "expected_repair_action": "replay_inbox",
+  "expected_severity": "critical",
+  "receipt": {
+    "comparator": {
+      "name": "hear-reconcile",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "correlation": {
+      "binding": "legacy_orphan",
+      "correlation_id": "legacy:59fe70a2f50ab28f5141d3334943d2cf45ee49c83586e1606eee5967ffe24fe1",
+      "device_id": "kasami",
+      "event_id": null,
+      "legacy_uid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "site_id": "site-alpha",
+      "source": "node-http",
+      "telemetry_path": "hear/heartbeat"
+    },
+    "credential": {
+      "canonical": {
+        "key_id": null,
+        "principal_id": null,
+        "scope": "unknown"
+      },
+      "legacy": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:kasami",
+        "scope": "device"
+      },
+      "matched": false
+    },
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "replay_inbox",
+      "repairable": true
+    },
+    "emitted_at": "2026-09-15T01:00:30Z",
+    "evidence": {
+      "canonical_raw_ref": null,
+      "legacy_raw_ref": "raw/legacy/2026/09/15/kasami-0007",
+      "redaction_profile": "hear.reconcile.redact.v1"
+    },
+    "receipt_id": "7759703e-26ed-5f24-a5e4-34aca4041ad5",
+    "run_id": "recon-2026-09-15T00",
+    "sampling": {
+      "forced_reason": "mismatches are never sampled",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.reconcile.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "clock_tier": null,
+        "observed_at": null,
+        "outcome": "absent",
+        "reasons": [],
+        "row_count": 0,
+        "state_hash": null,
+        "writer": null,
+        "writer_version": null,
+        "written_at": null
+      },
+      "legacy": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:e48758db15ec5a5d232cda3a3f3c2aee56d492a263d43273189ae8409e0e7765",
+        "writer": "tools/hear_heartbeat_receiver.py",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "missing_canonical",
+      "notes": [],
+      "repair_action": "replay_inbox",
+      "severity": "critical"
+    },
+    "window": {
+      "end": "2026-09-15T01:00:00Z",
+      "start": "2026-09-15T00:00:00Z"
+    }
+  }
+}

@@ -720,6 +720,31 @@ class TestTheEmbeddedConfigMaps:
         assert svc["metadata"]["annotations"]["tailscale.com/expose"] == "true"
         assert svc["spec"]["type"] == "ClusterIP"
 
+    def test_hear_annotate_readiness_is_not_a_user_query_endpoint(self):
+        """⚠️THE PROBE WAS `GET /api/queue?limit=1`, SO READINESS COST A CORPUS PARSE.
+
+        At 1,878 clips that request took 1.19 s median against the API server's default 1 s
+        probe timeout: the pod holding the only human ground truth flapped NotReady and the
+        tailnet UI went down, with no code change involved -- the corpus simply grew. A probe
+        pointed at a user query measures the user query, so it fails for reasons that have
+        nothing to do with whether the process can serve. Readiness must name a dedicated
+        endpoint whose cost does not grow with the data.
+        """
+        web, = [c for c in self._doc("hear-annotate-code", "Deployment", "hear-annotate")[
+            "spec"]["template"]["spec"]["containers"] if c["name"] == "web"]
+        probe = web["readinessProbe"]["httpGet"]
+        assert probe["path"] == "/healthz", (
+            "readiness probes %r; an /api/ path makes availability a function of corpus size"
+            % probe["path"])
+        assert probe["port"] == "http"
+        assert web["readinessProbe"]["timeoutSeconds"] >= 1
+
+        source = (ROOT / "tools" / "hear_annotate" / "server.py").read_text()
+        assert '@app.get("/healthz")' in source, (
+            "the manifest probes a path the shipped server does not serve")
+        assert "build_queue" not in source.split('@app.get("/healthz")')[1].split("@app.get")[0], (
+            "readiness must not invoke the queue work it exists to stop measuring")
+
     @pytest.mark.parametrize("bundle", sorted(_gen()["EMBEDDED_BUNDLES"]))
     def test_the_live_configmap_matches_the_checkout(self, bundle):
         """⚠️READ-ONLY, AND IT MUST STAY READ-ONLY. `kubectl get`. Never `apply`, not even

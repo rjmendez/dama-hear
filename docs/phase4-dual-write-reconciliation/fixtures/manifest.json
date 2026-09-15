@@ -1,0 +1,162 @@
+{
+  "cases": [
+    {
+      "description": "Legacy and canonical wrote the same projection with the same GPS-anchored clock.",
+      "emits_receipt": true,
+      "expected_classification": "match",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "match-both-sides-agree.json"
+    },
+    {
+      "description": "Legacy wrote 30 s ago and canonical has not landed. Below the live grace window this is scheduling, not loss, and no receipt is written.",
+      "emits_receipt": false,
+      "expected_classification": "pending",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "pending-inside-grace-window.json"
+    },
+    {
+      "description": "The same absence once the grace window has closed. Critical, and repairable by replaying the inbox -- never by writing the row by hand.",
+      "emits_receipt": true,
+      "expected_classification": "missing_canonical",
+      "expected_repair_action": "replay_inbox",
+      "expected_severity": "critical",
+      "file": "missing-canonical-after-grace.json"
+    },
+    {
+      "description": "An SD backlog replayed six hours after the legacy row. On the backfill grace window this is expected; using the live window here would page every drain run.",
+      "emits_receipt": false,
+      "expected_classification": "pending",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "backfill-lag-inside-backfill-grace.json"
+    },
+    {
+      "description": "Identity-based dedup failed: two canonical rows mirror one legacy record. Judged before any value comparison, because 'which value differs' has no answer here.",
+      "emits_receipt": true,
+      "expected_classification": "duplicate_canonical",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "duplicate-canonical-rows.json"
+    },
+    {
+      "description": "A monotonic counter disagrees by one row. Counters are compared exactly, so this is critical: a counter that drifts is a write the canonical path did not make.",
+      "emits_receipt": true,
+      "expected_classification": "value_divergence",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "value-divergence-on-a-counter.json"
+    },
+    {
+      "description": "The canonical row is attributed to a different authenticated principal. Judged first and never sampled away: a pair that is not about the same producer is not a pair, and every later comparison would be meaningless.",
+      "emits_receipt": true,
+      "expected_classification": "identity_divergence",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "identity-divergence-forged-device.json"
+    },
+    {
+      "description": "Neither side had a GPS fix. Both wrote a null observation instant and the tier `wall`; comparing the numbers would manufacture a mismatch out of two honest writers, so only the tier is compared.",
+      "emits_receipt": true,
+      "expected_classification": "match",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "unanchored-clock-compared-as-tier.json"
+    },
+    {
+      "description": "Legacy stored the body and canonical wrote a durable refusal. Both records exist, so nothing was dropped -- but one of the two validators is wrong and an operator has to decide which.",
+      "emits_receipt": true,
+      "expected_classification": "outcome_divergence",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "outcome-divergence-canonical-refused.json"
+    },
+    {
+      "description": "A canonical row exists that the authoritative path never wrote. Not data loss -- legacy still has everything it ever had -- but something wrote canonically outside the dual-writer, so the binding is a `canonical_orphan`.",
+      "emits_receipt": true,
+      "expected_classification": "missing_legacy",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "warn",
+      "file": "canonical-orphan-no-legacy-row.json"
+    },
+    {
+      "description": "A `batch_sequence` gap inside one `boot_id` that did not close within the order grace window. Warn, not critical: late arrival is normal and only a gap that persists is evidence.",
+      "emits_receipt": true,
+      "expected_classification": "order_divergence",
+      "expected_repair_action": "none",
+      "expected_severity": "warn",
+      "file": "order-divergence-persistent-sequence-gap.json"
+    },
+    {
+      "description": "One side published no projection digest, so no verdict is derivable. Classified `unclassified` at critical severity rather than quietly counted as a match.",
+      "emits_receipt": true,
+      "expected_classification": "unclassified",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "unclassified-missing-state-hash.json"
+    },
+    {
+      "description": "A survey position and a bearer credential differ between the sides. Both are recorded as digests: the deny list beats the allow list, so a receipt store can never become the place a real-world coordinate or a token was reintroduced.",
+      "emits_receipt": true,
+      "expected_classification": "value_divergence",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "redaction-denies-location-and-credential-paths.json"
+    },
+    {
+      "description": "The canonical writer reported a failed write. Legacy stands and the site is unaffected, which is why this is warn rather than critical -- but it is repairable by replay and must not be left to the grace window to rediscover.",
+      "emits_receipt": true,
+      "expected_classification": "error_canonical",
+      "expected_repair_action": "replay_inbox",
+      "expected_severity": "warn",
+      "file": "error-canonical-write-failed.json"
+    },
+    {
+      "description": "The authoritative writer reported a failed write. Dual-write did not cause it and cannot mask it; the comparator surfaces it because it is the one failure that is already data loss.",
+      "emits_receipt": true,
+      "expected_classification": "error_legacy",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "error-legacy-write-failed.json"
+    },
+    {
+      "description": "Two authoritative rows map to one canonical identity -- the MQTT duplication the bridge already tolerates. Warn, not critical: legacy has always behaved this way and canonical collapsing them is the designed outcome, not a defect.",
+      "emits_receipt": true,
+      "expected_classification": "duplicate_legacy",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "warn",
+      "file": "duplicate-legacy-rows.json"
+    },
+    {
+      "description": "Both rows exist and agree field by field, but the canonical row was written against an earlier revision of the legacy record. Replayable from the outbox; a stale row is not a lost row.",
+      "emits_receipt": true,
+      "expected_classification": "stale_canonical",
+      "expected_repair_action": "replay_outbox",
+      "expected_severity": "warn",
+      "file": "stale-canonical-row.json"
+    },
+    {
+      "description": "An import wrote the canonical row from a newer revision than the legacy row it mirrors. Warn and manual review only: the repair boundary is replay-only, and nothing in this design may rewrite an authoritative row to catch it up.",
+      "emits_receipt": true,
+      "expected_classification": "stale_legacy",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "warn",
+      "file": "stale-legacy-row.json"
+    }
+  ],
+  "contract": "hear.reconcile.receipt.v1",
+  "contract_major": 1,
+  "generator": "tools/gen_reconcile_contracts.py",
+  "source_of_truth": "hear/ingest/reconcile.py",
+  "staged_reason": "Publishing under contracts/ regenerates docs/data/phase0-freeze-contracts.v1.json, which the in-flight HTTPS batch ingest lane owns. Promotion is a move plus a baseline regeneration and no content change; see docs/decisions/0005-phase4-dual-write-observability.md.",
+  "status": "staged",
+  "tolerances": {
+    "backfill_grace_s": 86400,
+    "default_audit_denominator": 1000,
+    "live_grace_s": 300,
+    "max_differences": 32,
+    "max_receipt_bytes": 8192,
+    "order_grace_s": 300
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "case": "backfill-lag-inside-backfill-grace",
+  "description": "An SD backlog replayed six hours after the legacy row. On the backfill grace window this is expected; using the live window here would page every drain run.",
+  "expected_classification": "pending",
+  "expected_repair_action": "none",
+  "expected_severity": "info",
+  "receipt": null
+}

@@ -56,6 +56,13 @@ jobs:
           for v in numeric ml-cpu; do
             python3 deploy/images/gen_pip_lock.py "$v" > "requirements/lock/$v.txt"
           done
+          # Service closures resolve the same way, inside the same pinned base -- hear-runtime
+          # adds no Python package to it. A service lock going stale is exactly as invisible as
+          # a base one, so it is regenerated here too.
+          for s in hear-heartbeat; do
+            python3 deploy/images/gen_pip_lock.py "service:$s" \
+              > "requirements/lock/service-$s.txt"
+          done
 
       - name: nothing changed
         run: |
@@ -148,6 +155,114 @@ jobs:
           cache-from: type=gha,scope=base-ml-cpu
           cache-to: type=gha,mode=max,scope=base-ml-cpu
 
+      # ⚠️THE FIRST IMAGE THAT CARRIES CODE. Everything above is substrate; this is the Phase 1.5
+      # pilot (docs/worker-packaging.md, gate 1). Its parent is the runtime image built in this
+      # same job, named by digest, and its closure is replayed from
+      # requirements/lock/service-hear-heartbeat.txt.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: heartbeat
+        with:
+          context: .
+          file: deploy/images/service/Dockerfile.hear-heartbeat
+          build-args: |
+            RUNTIME_IMAGE=${{ steps.where.outputs.prefix }}/base-runtime@${{ steps.runtime.outputs.digest }}
+            SOURCE_COMMIT=${{ github.sha }}
+          tags: ${{ steps.where.outputs.prefix }}/hear-heartbeat:${{ github.sha }}
+          push: true
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=hear-heartbeat
+          cache-to: type=gha,mode=max,scope=hear-heartbeat
+
+      # ⚠️READ THE IMAGE, NOT THE Dockerfile. tests/test_service_images.py proves what the build
+      # was *asked* for; this proves what it produced -- the same bytes of
+      # tools/hear_heartbeat_receiver.py that the checkout and the rollback ConfigMap carry, the
+      # locked redis, the documented argv, and uid 0 (deliberate: the /state database is
+      # root-owned and local-path ignores fsGroup).
+      - name: hear-heartbeat contains what the repo says
+        run: |
+          ref="${{ steps.where.outputs.prefix }}/hear-heartbeat@${{ steps.heartbeat.outputs.digest }}"
+          docker pull -q "$ref"
+          docker tag "$ref" hear-heartbeat:scan
+
+          want="$(sha256sum tools/hear_heartbeat_receiver.py | cut -d' ' -f1)"
+          got="$(docker run --rm --entrypoint sha256sum hear-heartbeat:scan \
+                   /app/tools/hear_heartbeat_receiver.py | cut -d' ' -f1)"
+          echo "receiver sha256: repo=$want image=$got"
+          [ "$want" = "$got" ] || {
+            echo "::error::the image's receiver is not the checkout's receiver"; exit 1; }
+
+          locked="$(grep -oP '^redis==\K[0-9.]+' requirements/lock/service-hear-heartbeat.txt)"
+          docker run --rm --entrypoint python hear-heartbeat:scan -c "
+          import redis, sys
+          assert redis.__version__ == '$locked', (redis.__version__, '$locked')
+          print('redis', redis.__version__, 'python', sys.version.split()[0])"
+
+          uid="$(docker run --rm --entrypoint id hear-heartbeat:scan -u)"
+          [ "$uid" = "0" ] || { echo "::error::expected uid 0, got $uid"; exit 1; }
+
+          entry="$(docker inspect -f '{{json .Config.Entrypoint}}' hear-heartbeat:scan)"
+          echo "entrypoint: $entry"
+          [ "$entry" = '["python","/app/tools/hear_heartbeat_receiver.py","--port","5051"]' ] || {
+            echo "::error::the image entrypoint is not the documented argv"; exit 1; }
+
+          rev="$(docker inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+                  hear-heartbeat:scan)"
+          [ "$rev" = "${{ github.sha }}" ] || {
+            echo "::error::image revision label is $rev, not ${{ github.sha }}"; exit 1; }
+
+      # ⚠️IT STARTS, ON ITS OWN DURABLE PATH, WITH NO REDIS. The receiver commits to the SQLite
+      # outbox first and reflects into Redis second, so a probe-green pod with an unreachable
+      # cache is the expected behaviour and the one worth proving before a cutover. Nothing here
+      # touches the cluster: the container writes a throwaway volume in the runner.
+      - name: hear-heartbeat serves /healthz from the image, offline
+        run: |
+          ref="hear-heartbeat:scan"
+          docker run -d --name hb-smoke -p 15051:5051 \
+            -e HEAR_DURABLE_STORE=sqlite \
+            -e HEAR_DURABLE_DB=/state/heartbeat-receiver.sqlite3 \
+            -e HEAR_DURABLE_REPLAY_LIMIT=256 \
+            -e HEAR_HEARTBEAT_TTL_S=30 \
+            -e HEAR_HEARTBEAT_SOCKET_TIMEOUT_S=0.5 \
+            -e REDIS_HOST=127.0.0.1 -e REDIS_PORT=6399 \
+            -e HEAR_HEARTBEAT_TOKEN=smoke-token \
+            -v hb-smoke-state:/state "$ref"
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:15051/healthz >/dev/null 2>&1 && break || sleep 1
+          done
+          body="$(curl -fsS http://127.0.0.1:15051/healthz)"
+          echo "$body"
+          python3 - "$body" <<'EOF'
+          import json, sys
+          got = json.loads(sys.argv[1])
+          assert got["status"] == "ok", got
+          assert got["service"] == "hear-heartbeat-receiver", got
+          assert got["durable_store"]["backend"] == "sqlite", got
+          assert got["redis_target"] == "127.0.0.1:6399", got
+          EOF
+          # ⚠️AND IT IS DURABLE BEFORE IT IS CACHED. With the cache unreachable the POST reports
+          # 503 -- the caller is told the Redis write failed -- but the record is committed to
+          # the outbox regardless, with a failed cache attempt recorded against it for the
+          # replay worker. A cutover that lost the state mount or the HEAR_DURABLE_* env would
+          # show a green /healthz and an empty ledger, which is exactly the failure this catches.
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+                    -H 'Content-Type: application/json' -H 'X-Hear-Token: smoke-token' \
+                    --data @tests/fixtures/heartbeat-smoke.json \
+                    http://127.0.0.1:15051/api/hear/heartbeat)"
+          echo "POST /api/hear/heartbeat -> $code"
+          [ "$code" = "503" ] || { echo "::error::expected 503 with Redis down, got $code"; exit 1; }
+          docker exec hb-smoke python -c "
+          import sqlite3
+          con = sqlite3.connect('/state/heartbeat-receiver.sqlite3')
+          rows = con.execute('SELECT telemetry_path, device_id FROM durable_records').fetchall()
+          outcomes = [r[0] for r in con.execute('SELECT outcome FROM cache_attempts')]
+          print('durable', rows, 'cache', outcomes)
+          assert rows == [('hear/heartbeat', 'smoke-node')], rows
+          assert outcomes and all(o != 'success' for o in outcomes), outcomes"
+
+          docker rm -f hb-smoke >/dev/null
+          docker volume rm hb-smoke-state >/dev/null
+
       # The interpreter and the pinned versions, read out of the image that was just built
       # rather than out of the file that asked for them. Also what puts the image into the
       # runner's daemon, which is where the scanner then finds it.
@@ -172,6 +287,11 @@ jobs:
             echo "| base-runtime | \`${{ steps.runtime.outputs.digest }}\` |"
             echo "| base-numeric | \`${{ steps.numeric.outputs.digest }}\` |"
             echo "| base-ml-cpu  | \`${{ steps.ml_cpu.outputs.digest }}\` |"
+            echo "| hear-heartbeat | \`${{ steps.heartbeat.outputs.digest }}\` |"
+            echo ""
+            echo "⚠️Record a **published** service digest in \`deploy/images/service/digests.txt\`"
+            echo "and in \`deploy/k8s/hear-heartbeat.proposed.yaml\`. A pull-request build is"
+            echo "discarded with its registry; only the \`main\` run publishes."
           } >> "$GITHUB_STEP_SUMMARY"
 
       # ⚠️A SCAN THAT NEVER FAILS IS A BADGE. This exits non-zero on a fixable HIGH/CRITICAL;
@@ -187,4 +307,17 @@ jobs:
           exit-code: "1"
           format: table
           # dated, reviewed exceptions -- each one expires
+          trivyignores: deploy/images/trivyignore.yaml
+
+      # ⚠️THE SERVICE IMAGE IS SCANNED TOO, AND SEPARATELY. It is a different layer stack from
+      # base-ml-cpu -- a different base variant and its own closure -- so a clean scan of the
+      # base chain says nothing about it. Same gate: fixable HIGH/CRITICAL fails the build.
+      - name: scan the pilot service image
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: hear-heartbeat:scan
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
           trivyignores: deploy/images/trivyignore.yaml

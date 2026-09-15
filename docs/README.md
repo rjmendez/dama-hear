@@ -38,6 +38,8 @@ what was chosen, the in-tree evidence it rests on, and what was deliberately lef
 | [0002 - contract repository layout](decisions/0002-contract-repository-layout.md) | The canonical home for a published contract: schema, fixtures, generator, and the decision record that names it. |
 | [0003 - Phase 2 durable outbox Postgres cut-over](decisions/0003-phase2-durable-outbox-postgres-cutover.md) | The dual-write, backfill and reversal plan for moving the heartbeat outbox from SQLite to Postgres. |
 | [0004 - Phase 4 HTTPS batch ingest adapter](decisions/0004-phase4-https-batch-ingest-adapter.md) | An additive HTTPS batch ingest path: frame versioned separately from items, receipt-based contiguous acknowledgement, identity-based replay safety, and no broker or queue at this scale. |
+| [0005 - Phase 4 dual-write observability and reconciliation](decisions/0005-phase4-dual-write-observability.md) | How a future legacy + HTTPS dual-write is observed: recorded join key, a closed classification vocabulary, grace-window `pending`, and redacted mismatch receipts. |
+| [0006 - `HEAR_ADMIN_TOKEN` scope, custody and lifecycle](decisions/0006-admin-token-provisioning-policy.md) | Per-node versus fleet-wide admin tokens, authority of record, enrollment injection, rotation/revocation, lost-token recovery, redaction rules, and the tooling changes each option implies. Generates no credential. |
 | [phase4-https-batch-ingest.md](phase4-https-batch-ingest.md) | The operational specification behind 0004: API and auth, sizing and limits, retry/offline durability, timestamp and version semantics, refusal visibility, TLS/key lifecycle, observability, dual-write comparison and rollback. |
 
 ## System and subsystem references

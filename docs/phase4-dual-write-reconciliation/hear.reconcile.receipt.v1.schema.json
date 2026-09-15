@@ -1,0 +1,568 @@
+{
+  "$id": "https://schemas.dama.example/hear/reconcile/v1/receipt.schema.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": true,
+  "description": "Durable record of one legacy/HTTPS dual-write comparison. Carries hashes, field paths and reason codes; never payload bodies, credentials or locations.",
+  "properties": {
+    "comparator": {
+      "additionalProperties": true,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "receipt_major": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "correlation": {
+      "additionalProperties": true,
+      "properties": {
+        "binding": {
+          "description": "how the two sides were joined",
+          "enum": [
+            "bound",
+            "legacy_orphan",
+            "canonical_orphan"
+          ],
+          "type": "string"
+        },
+        "correlation_id": {
+          "type": "string"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "event_id": {
+          "description": "canonical envelope identity",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "legacy_uid": {
+          "description": "authoritative record identity",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site_id": {
+          "type": "string"
+        },
+        "source": {
+          "description": "ingress family",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "telemetry_path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "correlation_id",
+        "binding",
+        "legacy_uid",
+        "event_id",
+        "site_id",
+        "device_id",
+        "telemetry_path"
+      ],
+      "type": "object"
+    },
+    "credential": {
+      "additionalProperties": true,
+      "properties": {
+        "canonical": {
+          "additionalProperties": true,
+          "properties": {
+            "key_id": {
+              "description": "opaque rotation label; never key material",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "principal_id": {
+              "description": "enrolled identity; never a token",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "scope": {
+              "description": "device-scoped or site-scoped credential",
+              "enum": [
+                "device",
+                "site",
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "principal_id",
+            "scope",
+            "key_id"
+          ],
+          "type": "object"
+        },
+        "legacy": {
+          "additionalProperties": true,
+          "properties": {
+            "key_id": {
+              "description": "opaque rotation label; never key material",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "principal_id": {
+              "description": "enrolled identity; never a token",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "scope": {
+              "description": "device-scoped or site-scoped credential",
+              "enum": [
+                "device",
+                "site",
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "principal_id",
+            "scope",
+            "key_id"
+          ],
+          "type": "object"
+        },
+        "matched": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "legacy",
+        "canonical",
+        "matched"
+      ],
+      "type": "object"
+    },
+    "differences": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "canonical": {},
+          "comparator": {
+            "description": "how the field was compared",
+            "enum": [
+              "exact",
+              "hash",
+              "tier",
+              "numeric",
+              "count"
+            ],
+            "type": "string"
+          },
+          "legacy": {},
+          "path": {
+            "type": "string"
+          },
+          "quoted": {
+            "description": "false means both values are redacted digests, not literals",
+            "type": "boolean"
+          },
+          "tolerance": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "legacy",
+          "canonical",
+          "comparator",
+          "tolerance",
+          "quoted"
+        ],
+        "type": "object"
+      },
+      "maxItems": 32,
+      "type": "array"
+    },
+    "differences_dropped": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "disposition": {
+      "additionalProperties": true,
+      "properties": {
+        "queue_ref": {
+          "description": "advisory work-list reference",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "queued": {
+          "type": "boolean"
+        },
+        "repair_action": {
+          "description": "replay-only repair boundary",
+          "enum": [
+            "none",
+            "replay_inbox",
+            "replay_outbox",
+            "manual_review"
+          ],
+          "type": "string"
+        },
+        "repairable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "repairable",
+        "repair_action",
+        "queued",
+        "queue_ref"
+      ],
+      "type": "object"
+    },
+    "emitted_at": {
+      "type": "string"
+    },
+    "evidence": {
+      "additionalProperties": true,
+      "properties": {
+        "canonical_raw_ref": {
+          "description": "object key of retained bytes",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "legacy_raw_ref": {
+          "description": "object key of retained bytes",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "redaction_profile": {
+          "const": "hear.reconcile.redact.v1",
+          "type": "string"
+        }
+      },
+      "required": [
+        "redaction_profile",
+        "legacy_raw_ref",
+        "canonical_raw_ref"
+      ],
+      "type": "object"
+    },
+    "receipt_id": {
+      "description": "uuid5 over (contract, run_id, correlation_id); a re-run converges instead of duplicating.",
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "sampling": {
+      "additionalProperties": true,
+      "properties": {
+        "forced_reason": {
+          "description": "why sampling was bypassed",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rate_denominator": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "sampled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "sampled",
+        "rate_denominator",
+        "forced_reason"
+      ],
+      "type": "object"
+    },
+    "schema": {
+      "const": "hear.reconcile.receipt.v1",
+      "type": "string"
+    },
+    "schema_version": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "sides": {
+      "additionalProperties": true,
+      "properties": {
+        "canonical": {
+          "additionalProperties": true,
+          "properties": {
+            "clock_tier": {
+              "description": "clock evidence tier for observed_at",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "observed_at": {
+              "description": "producer instant, null when unanchored",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "outcome": {
+              "description": "what this writer did with the observation",
+              "enum": [
+                "written",
+                "refused",
+                "errored",
+                "absent"
+              ],
+              "type": "string"
+            },
+            "reasons": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "row_count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "state_hash": {
+              "description": "digest of the compared projection",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "writer": {
+              "description": "writing component",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "writer_version": {
+              "description": "writing build",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "written_at": {
+              "description": "when this writer committed",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "outcome",
+            "row_count",
+            "state_hash"
+          ],
+          "type": "object"
+        },
+        "legacy": {
+          "additionalProperties": true,
+          "properties": {
+            "clock_tier": {
+              "description": "clock evidence tier for observed_at",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "observed_at": {
+              "description": "producer instant, null when unanchored",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "outcome": {
+              "description": "what this writer did with the observation",
+              "enum": [
+                "written",
+                "refused",
+                "errored",
+                "absent"
+              ],
+              "type": "string"
+            },
+            "reasons": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "row_count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "state_hash": {
+              "description": "digest of the compared projection",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "writer": {
+              "description": "writing component",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "writer_version": {
+              "description": "writing build",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "written_at": {
+              "description": "when this writer committed",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "outcome",
+            "row_count",
+            "state_hash"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "legacy",
+        "canonical"
+      ],
+      "type": "object"
+    },
+    "verdict": {
+      "additionalProperties": true,
+      "properties": {
+        "actionable": {
+          "type": "boolean"
+        },
+        "classification": {
+          "description": "closed verdict vocabulary",
+          "enum": [
+            "match",
+            "pending",
+            "missing_canonical",
+            "missing_legacy",
+            "duplicate_canonical",
+            "duplicate_legacy",
+            "stale_canonical",
+            "stale_legacy",
+            "outcome_divergence",
+            "value_divergence",
+            "order_divergence",
+            "identity_divergence",
+            "error_legacy",
+            "error_canonical",
+            "unclassified"
+          ],
+          "type": "string"
+        },
+        "notes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "repair_action": {
+          "description": "replay-only repair boundary",
+          "enum": [
+            "none",
+            "replay_inbox",
+            "replay_outbox",
+            "manual_review"
+          ],
+          "type": "string"
+        },
+        "severity": {
+          "description": "operator routing",
+          "enum": [
+            "info",
+            "warn",
+            "critical"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "classification",
+        "severity",
+        "repair_action",
+        "actionable"
+      ],
+      "type": "object"
+    },
+    "window": {
+      "additionalProperties": true,
+      "properties": {
+        "end": {
+          "type": "string"
+        },
+        "start": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "receipt_id",
+    "run_id",
+    "emitted_at",
+    "window",
+    "correlation",
+    "credential",
+    "sides",
+    "verdict",
+    "differences",
+    "differences_dropped",
+    "disposition",
+    "sampling",
+    "evidence",
+    "comparator"
+  ],
+  "title": "hear.reconcile.receipt.v1",
+  "type": "object"
+}
