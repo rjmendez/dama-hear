@@ -23,6 +23,27 @@ WHAT IS PROVEN HERE, AND WHY EACH ONE IS HERE:
   conflict, model pin mismatch, gate failure).
 * **The source is opened read-only and is never written**, including no `fsync`, no `utimes`, no
   rename, no `.tmp` sweep. Tests census the source tree before and after.
+* **No payload is ever held whole** (`streaming.py`). A payload is a *factory of chunk
+  iterators*; digests accumulate as the chunks go past and nothing but a digest and a byte count
+  survives a stream. The largest object in scope is the 392 MB perch model and the importer is a
+  guest on a pod near its memory limit, so a `body = fh.read()` is a correctness bug here, not a
+  performance one -- `tests/test_objectstore_streaming.py` holds it to a measured memory ceiling.
+* **A restricted class is encrypted or it is not imported** (`crypto.py`). The default key provider
+  refuses every question, so an importer nobody deliberately handed key material to quarantines
+  `clip`/`raw` as `key_provider_unavailable` and keeps going. Nothing in this package creates,
+  derives or stores a key, and the one cipher here declares itself not production ready. With a
+  provider injected, the blob id is `HMAC-SHA256(K_tenant_index, plaintext digest)` -- a plaintext
+  digest in a key, an index, a ledger row or a log line is a confirmation oracle for guessable
+  content, so it exists in exactly one place: inside the sealed metadata sub-document.
+* **A lease is won atomically, or it is not won.** Acquisition is an exclusive create on an
+  epoch-named record, so two racers cannot both be handed the same epoch -- an epoch two writers
+  share fences neither of them. `LocalDirBackend(conditional_put=False)` models the store that has
+  no conditional put, including the update it really loses, so the fallback primitive is tested
+  rather than assumed.
+* **Exactly one object is written twice**: the open tail of a live stream, republished as a new
+  pointer generation under an if-generation-matches commit, at most once per (class, partition)
+  per run. Generations are immutable records; `superseded_by` is derived from the existence of the
+  next one, never written back onto a published object.
 
 The rules come from `files/phase3-key-design/PHASE3-OBJECT-KEY-DESIGN.md` and
 `files/phase3-import-plan/PHASE3-OBJECT-IMPORT-PLAN.md`. Nothing here imports `hear.pool`,
