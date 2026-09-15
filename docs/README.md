@@ -42,6 +42,7 @@ current code disagree, the design states the intended end state.
 | [faketec-pin-budget.md](faketec-pin-budget.md) | Board pin budget. |
 | [l86-reference.md](l86-reference.md) | L86 GNSS module reference. |
 | [hear-latency-calibration-runbook.md](hear-latency-calibration-runbook.md) | Latency calibration procedure. |
+| [pool-backup-restore.md](pool-backup-restore.md) | The backup and restore design for PVC `dama/hear-pool` and its explicit G0 acceptance test: measured storage facts (including that the node's ext4 root is a VHDX on a 95 %-full Windows disk), why no snapshot primitive exists here, generational encrypted archives to a second physical disk, per-class consistency rules for append-only JSONL and a live-WAL SQLite database, key custody, retention, and the restore-isolation boundary. Phase 3 import is blocked until its G0 passes. |
 | [bridge-durable-soak.md](bridge-durable-soak.md) | Durable-outbox soak runbook for `hear-mqtt-bridge`: what `tools/bridge_soak_evidence.py` records, the T+24h/7d/14d pass/fail criteria, and the read-only boundary it enforces. |
 
 ## Operations, policy, and cross-cutting design
