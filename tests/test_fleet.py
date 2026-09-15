@@ -88,6 +88,13 @@ class TestDriftReport:
         }}, monkeypatch)
         assert "PMTK:1/6" in out
 
+    def test_the_row_shows_an_explicit_clock_state_when_the_firmware_reports_one(self, capsys,
+                                                                                  monkeypatch):
+        out = self._run(capsys, {"a=1": self._status("8b9d5b1", "a") | {
+            "time": {"valid": True, "state": "HOLDOVER", "label_rejects": 0}
+        }}, monkeypatch)
+        assert "HOLDOVER" in out
+
 
 class TestTheSplitGate(TestDriftReport):
     """`--require-one-build` — opt-in, and ONLY for the split.

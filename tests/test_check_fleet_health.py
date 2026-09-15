@@ -159,6 +159,11 @@ class TestStatusParsing:
         assert not H.parse_status(
             self._status(time={"valid": False, "label_rejects": 9}))["time_valid"]
 
+    def test_explicit_clock_state_is_read_when_present(self):
+        s = H.parse_status(self._status(time={"valid": True, "state": "HOLDOVER",
+                                             "label_rejects": 0}))
+        assert s["clock_state"] == "HOLDOVER"
+
     def test_rssi_is_read_when_associated(self):
         assert H.parse_status(self._status(net={"rssi": -62, "disc": 1}))["rssi"] == -62
 
@@ -269,6 +274,18 @@ class TestHealthEvaluation:
         r = H.evaluate_health("n", self._status(time={"valid": False, "label_rejects": 4}))
         assert r["state"] == "degraded"
         assert "no UTC anchor" in r["reasons"]
+
+    def test_holdover_clock_is_degraded_by_state(self):
+        r = H.evaluate_health("n", self._status(time={"valid": True, "state": "HOLDOVER",
+                                                      "label_rejects": 0}))
+        assert r["state"] == "degraded"
+        assert "clock=HOLDOVER" in r["reasons"]
+
+    def test_fault_clock_state_is_reported_directly(self):
+        r = H.evaluate_health("n", self._status(time={"valid": False, "state": "FAULT",
+                                                      "label_rejects": 4}))
+        assert r["state"] == "degraded"
+        assert "clock=FAULT" in r["reasons"]
 
     def test_zero_pps_edges_is_degraded(self):
         r = H.evaluate_health("n", self._status(pps={"edges": 0, "spread_us": 0, "glitches": 0}))

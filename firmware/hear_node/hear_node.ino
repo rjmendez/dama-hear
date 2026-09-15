@@ -402,12 +402,28 @@ static volatile uint32_t time_glitch   = 0;    // labellings rejected as inconsi
 static volatile uint32_t pmtk_glitch = 0; // same check, PMTK RMC branch -- its own name, not shared
 static int64_t  prev_unix_s = 0;               // last accepted label, for the +1s/edge check
 static uint32_t prev_edge_n = 0;
+enum { CLOCK_STATE_FAULT = 0, CLOCK_STATE_DEGRADED, CLOCK_STATE_HOLDOVER, CLOCK_STATE_LOCKED };
+enum {
+  CLOCK_DISC_BOOT = 1u << 0,
+  CLOCK_DISC_PROBE_RESYNC = 1u << 1,
+  CLOCK_DISC_PPS_GAP = 1u << 2,
+  CLOCK_DISC_LABEL_REJECT = 1u << 3,
+  CLOCK_DISC_GPS_SILENT = 1u << 4,
+  CLOCK_DISC_NO_FIX = 1u << 5,
+};
+#define CLOCK_SETTLE_EDGES 8u
+static uint32_t clock_settle_until_edge = 0;
+static uint32_t clock_recent_flags = CLOCK_DISC_BOOT;
 // millis() at the end of setup's first statement. It lived below, in the `state` block, and is
 // here now because the UBX parser above needs it to stamp first_label_s.
 static uint32_t boot_ms = 0;
+static char boot_id[17] = "";
 
 static portMUX_TYPE time_mux = portMUX_INITIALIZER_UNLOCKED;
 static void pending_pps_label(uint64_t *local_us, uint32_t *edge_n) {
+  // The PPS ISR can advance between any two volatile reads here. Snapshot the pair once so the
+  // consistency check and the commit talk about the SAME edge rather than whichever one happened
+  // to be current at each read.
   portENTER_CRITICAL(&time_mux);
   *local_us = pend_local_us;
   *edge_n = pend_edge_n;
@@ -450,6 +466,12 @@ static volatile uint32_t first_label_s   = 0;  // uptime at the first accepted l
 static volatile uint32_t ubx_silent_s    = 0;  // seconds with PPS advancing and no NAV-PVT
 static volatile uint32_t ubx_silent_run  = 0;  // the run in progress; 0 once a NAV-PVT lands
 static volatile uint32_t ubx_silent_max  = 0;  // longest such run this boot -- reporting only
+
+static void clock_mark_settle(uint32_t edge_n, uint32_t flags) {
+  uint32_t until = edge_n + CLOCK_SETTLE_EDGES;
+  if (until > clock_settle_until_edge) clock_settle_until_edge = until;
+  clock_recent_flags |= flags;
+}
 
 static void IRAM_ATTR pps_isr() {
   uint64_t now = (uint64_t)esp_timer_get_time();
@@ -504,6 +526,44 @@ static volatile int gps_fix = 0, gps_sats = 0;
 // so one threshold reads every PMTK fix as no-fix.
 static bool gps_has_fix() {
   return GPS_PROTO == GPS_PMTK ? gps_fix >= 1 : gps_fix >= 3;
+}
+
+static const char *clock_state_name(uint8_t st) {
+  switch (st) {
+    case CLOCK_STATE_LOCKED:   return "LOCKED";
+    case CLOCK_STATE_HOLDOVER: return "HOLDOVER";
+    case CLOCK_STATE_DEGRADED: return "DEGRADED";
+    default:                   return "FAULT";
+  }
+}
+
+static uint8_t clock_state_at(uint64_t local_us) {
+  (void)local_us;
+  if (!time_valid || !edge_unix_us || !pps_count) return CLOCK_STATE_FAULT;
+  if (ubx_silent_run > 0) return CLOCK_STATE_HOLDOVER;
+  if (!gps_has_fix() || pps_count < clock_settle_until_edge) return CLOCK_STATE_DEGRADED;
+  return CLOCK_STATE_LOCKED;
+}
+
+static uint64_t clock_anchor_age_us(uint64_t local_us) {
+  if (!time_valid || !edge_unix_us) return 0;
+  uint64_t anchor = (uint64_t)edge_local_us;
+  return local_us >= anchor ? local_us - anchor : anchor - local_us;
+}
+
+static int64_t clock_boot_epoch_us() {
+  if (!time_valid || !edge_unix_us) return 0;
+  return edge_unix_us - (int64_t)edge_local_us;
+}
+
+static uint32_t clock_discontinuity_flags_at(uint64_t local_us) {
+  (void)local_us;
+  uint32_t flags = 0;
+  if (!time_valid || !edge_unix_us || !pps_count) flags |= CLOCK_DISC_BOOT;
+  if (ubx_silent_run > 0) flags |= CLOCK_DISC_GPS_SILENT;
+  if (!gps_has_fix() && (ubx_pvt > 0 || gps_link_ok)) flags |= CLOCK_DISC_NO_FIX;
+  if (pps_count < clock_settle_until_edge) flags |= clock_recent_flags;
+  return flags;
 }
 
 static const char *selftest_gps_now() {
@@ -658,9 +718,12 @@ static void pmtk_parse_rmc(const char *s) {
       time_valid = true;
       portEXIT_CRITICAL(&time_mux);
       if (!first_label_s) {
+        clock_mark_settle(pend_edge, CLOCK_DISC_BOOT);
         uint32_t up = (millis() - boot_ms) / 1000;
         first_label_s = up ? up : 1;
       }
+    } else {
+      clock_mark_settle(pend_edge, CLOCK_DISC_LABEL_REJECT);
     }
     prev_unix_s = unix_s; prev_edge_n = pend_edge;
   }
@@ -1214,9 +1277,12 @@ static void ubx_msg() {
             // and until now the only way to bound it was to notice that a detection had no
             // stamp -- which needs a detection to have happened.
             if (!first_label_s) {
+              clock_mark_settle(pend_edge, CLOCK_DISC_BOOT);
               uint32_t up = (millis() - boot_ms) / 1000;
               first_label_s = up ? up : 1;            // 0 stays reserved for "never"
             }
+          } else {
+            clock_mark_settle(pend_edge, CLOCK_DISC_LABEL_REJECT);
           }
           prev_unix_s = unix_s; prev_edge_n = pend_edge;   // re-sync either way
         }
@@ -1515,6 +1581,10 @@ struct Det { uint32_t sample; uint32_t pps_n; int32_t us_since_pps; int64_t utc_
               // What utc_us is worth, 1-sigma, nanoseconds -- see stamp_sigma_ns(). 0 = no
               // stamp, and dets.csv then carries an EMPTY column rather than a zero.
               uint64_t sync_sigma_ns;
+              uint32_t anchor_age_us;
+              int64_t boot_epoch_us;
+              uint32_t clock_discontinuity_flags;
+              uint8_t clock_state;
               int16_t trigger; uint16_t flags; uint32_t uptime_s; double fs_at;
               uint8_t clip_st;
               uint32_t cseq;          // clip_seq the clip was named with, valid when clip_st == CLIP_OK
@@ -2402,8 +2472,9 @@ static bool push_now_utc(int64_t *utc_us) {
 }
 
 static void push_fill_heartbeat(hear_push_heartbeat_t *hb) {
+  uint64_t nowl = (uint64_t)esp_timer_get_time();
   int64_t utc_us = 0;
-  bool have_utc = push_now_utc(&utc_us);
+  bool have_utc = local_to_utc(nowl, &utc_us);
   hb->device_id = node_id;
   hb->node_class = node_class;
   hb->fw_version = FW_BUILD;
@@ -2411,6 +2482,12 @@ static void push_fill_heartbeat(hear_push_heartbeat_t *hb) {
   hb->gps_fix = gps_fix;
   hb->time_valid = have_utc ? 1 : 0;
   hb->utc_us = have_utc ? utc_us : 0;
+  hb->clock_state = clock_state_name(clock_state_at(nowl));
+  hb->sync_sigma_ns = have_utc ? stamp_sigma_ns(nowl) : 0;
+  hb->anchor_age_us = have_utc ? clock_anchor_age_us(nowl) : 0;
+  hb->boot_epoch_us = have_utc ? clock_boot_epoch_us() : 0;
+  hb->boot_id = boot_id;
+  hb->discontinuity_flags = clock_discontinuity_flags_at(nowl);
   hb->wifi_has_rssi = WiFi.isConnected() ? 1 : 0;
   hb->wifi_rssi_dbm = hb->wifi_has_rssi ? WiFi.RSSI() : 0;
   hb->scene_rows_written = scene_written;
@@ -2420,8 +2497,9 @@ static void push_fill_heartbeat(hear_push_heartbeat_t *hb) {
 }
 
 static void push_fill_event(const struct HearPushEvent *src, hear_push_event_t *ev) {
+  uint64_t nowl = (uint64_t)esp_timer_get_time();
   int64_t utc_us = 0;
-  bool have_utc = push_now_utc(&utc_us);
+  bool have_utc = local_to_utc(nowl, &utc_us);
   memset(ev, 0, sizeof *ev);
   ev->device_id = node_id;
   ev->node_class = node_class;
@@ -2430,6 +2508,12 @@ static void push_fill_event(const struct HearPushEvent *src, hear_push_event_t *
   ev->event_seq = src->seq;
   ev->time_valid = have_utc ? 1 : 0;
   ev->utc_us = have_utc ? utc_us : 0;
+  ev->clock_state = clock_state_name(clock_state_at(nowl));
+  ev->sync_sigma_ns = have_utc ? stamp_sigma_ns(nowl) : 0;
+  ev->anchor_age_us = have_utc ? clock_anchor_age_us(nowl) : 0;
+  ev->boot_epoch_us = have_utc ? clock_boot_epoch_us() : 0;
+  ev->boot_id = boot_id;
+  ev->discontinuity_flags = clock_discontinuity_flags_at(nowl);
   if (src->type == HEAR_PUSH_EVENT_CLIP) {
     ev->event_type = "clip_written";
     ev->clip_basename = src->clip_basename;
@@ -2557,7 +2641,7 @@ static void push_mark_dets_ready(uint32_t batch_rows) {
 
 static bool push_send_heartbeat() {
   hear_push_heartbeat_t hb = {};
-  char body[384];
+  char body[768];
   push_fill_heartbeat(&hb);
   if (!hear_push_heartbeat_json(&hb, body, sizeof body)) {
     push_note_failure("heartbeat encode", -5);
@@ -2579,7 +2663,7 @@ static bool push_send_heartbeat() {
 
 static bool push_send_event(const struct HearPushEvent *src) {
   hear_push_event_t ev = {};
-  char body[384];
+  char body[768];
   push_fill_event(src, &ev);
   if (!hear_push_event_json(&ev, body, sizeof body)) {
     push_note_failure("event encode", -6);
@@ -2898,13 +2982,9 @@ static String status_json() {
   // from the loop task (h_status), so there is no second caller to race it.
   // SIZED FROM THE FORMAT, not from a sample. snprintf truncates silently, and a truncated
   // /status is not a short answer -- it is invalid JSON, which every consumer reads as an
-  // unreachable node. tests/test_firmware_csv_schema.py bounds it: the literal text plus every
-  // conversion at the widest value it can carry (a %s at i2c_found's 256, a %.Nf at 24) is 4303
-  // bytes, so 5632 cannot truncate. Live output measured 2113 chars, which is exactly the sample
-  // a buffer must not be sized from -- the old 3072 was already inside the bound. (The 5463 this
-  // comment used to state no longer reproduces from the test that computes it; recomputed
-  // 2026-09-10 at 129 conversions.)
-  static char b[6144];
+  // unreachable node. tests/test_firmware_csv_schema.py bounds it from the format and the buffer
+  // stays comfortably above that bound after the explicit clock-state fields were added.
+  static char b[7168];
   // JSON has no NaN. A node that does not know its temperature emits null, which every parser
   // reads as absent -- printing nan would be invalid JSON, and a downstream coercion of it to 0.0
   // would look like a freezing reading rather than a missing sensor.
@@ -2916,6 +2996,9 @@ static String status_json() {
   char floor_saved[16];
   if (g_floor_saved == g_floor_saved) snprintf(floor_saved, sizeof floor_saved, "%.1f", g_floor_saved);
   else                                snprintf(floor_saved, sizeof floor_saved, "null");
+  char boot_epoch_json[24];
+  if (tv) snprintf(boot_epoch_json, sizeof boot_epoch_json, "%lld", (long long)clock_boot_epoch_us());
+  else    snprintf(boot_epoch_json, sizeof boot_epoch_json, "null");
   snprintf(b, sizeof b,
     // fw is FIRST after the identity, because the question it answers -- is this node running
     // the same binary as its neighbours -- is asked of the whole fleet at once.
@@ -2959,8 +3042,9 @@ static String status_json() {
     // sync_sigma_ns is what a stamp taken RIGHT NOW would carry, the same number dets.csv writes
     // per detection, so "is this node lying about its clock" is answerable from /status alone --
     // it is `valid` that never goes false, and this that grows.
-    "\"time\":{\"valid\":%s,\"utc_us\":%lld,\"since_edge_us\":%llu,\"sync_sigma_ns\":%llu,"
-      "\"navpvt_nano\":%ld,\"label_rejects\":%lu,"
+    "\"time\":{\"valid\":%s,\"state\":\"%s\",\"utc_us\":%lld,\"since_edge_us\":%llu,"
+      "\"sync_sigma_ns\":%llu,\"anchor_age_us\":%llu,\"boot_epoch_us\":%s,\"boot_id\":\"%s\","
+      "\"discontinuity_flags\":%u,\"navpvt_nano\":%ld,\"label_rejects\":%lu,"
       "\"dets_unlabelled\":%lu,\"first_label_s\":%lu,\"ubx_silent_s\":%lu,\"ubx_silent_max_s\":%lu},"
     // acq_slip: g_acq (what pass 1 really wrote to the sketch ring) minus the g_samples*DECIM rule
     // praw and clip_pump address by. It is 0 unless an I2S read was not a multiple of DECIM, and it
@@ -3029,8 +3113,11 @@ static String status_json() {
     fs_timebase(), (unsigned long)drop_seconds,
     (unsigned long)drop_samples, (unsigned long)over_seconds, (unsigned long)samp_sec_last,
     esp_ppm, (unsigned long)esp_n,
-    anchor_valid ? "true" : "false", (long long)utc_now, (unsigned long long)since_edge,
+    anchor_valid ? "true" : "false", clock_state_name(clock_state_at(nowl)),
+    (long long)utc_now, (unsigned long long)since_edge,
     (unsigned long long)stamp_sigma_ns(nowl),
+    (unsigned long long)clock_anchor_age_us(nowl), boot_epoch_json, boot_id,
+    (unsigned)clock_discontinuity_flags_at(nowl),
     (long)last_nano, (unsigned long)time_glitch,
     (unsigned long)dets_unlabelled, (unsigned long)first_label_s,
     (unsigned long)ubx_silent_s, (unsigned long)ubx_silent_max,
@@ -3087,7 +3174,7 @@ static void h_root() {
              "`<tr><td>uptime<td><b>${s.uptime_s} s</b>`+"
              "`<tr><td>GPS<td><b>fix ${s.gps.fix}, ${s.gps.sats} sats, ${s.gps.utc} UTC</b> @ ${s.gps.baud} baud, ${nm}`+`<tr><td>time accuracy<td><b>${s.gps.tacc_ns} ns</b> &middot; pulse qErr ${s.gps.qerr_ps} ps`+`<tr><td>UBX<td>pvt ${s.gps.ubx_pvt}, tim-tp ${s.gps.ubx_timtp}, ack ${s.gps.ubx_ack}, nak ${s.gps.ubx_nak}`+`<tr><td>config<td><b>${s.gps.config_acked?'accepted':'NOT acked - node TX to module RX unwired?'}</b>`+"
              "`<tr><td>PPS edges<td><b>${s.pps.edges}</b> spread ${s.pps.spread_us} us, ${s.pps.glitches} rejected`+"
-             "`<tr><td>I2S measured<td><b>${f}</b>`+`<tr><td>timebase<td><b>${s.acq.fs_used_hz.toFixed(4)} Hz</b> in use &middot; estimate ${q} &middot; dropped ${s.acq.drop_s} s / over ${s.acq.over_s} s`+`<tr><td>UTC now<td><b>${s.time.valid?new Date(s.time.utc_us/1000).toISOString():'anchor not valid'}</b> &middot; ${(s.time.since_edge_us/1000).toFixed(0)} ms since edge, ${s.time.label_rejects} rejected`+`<tr><td>ESP clock vs GPS<td><b>${s.esp_clock.pps_intervals>2?s.esp_clock.ppm_vs_gps.toFixed(3)+' ppm':'need 3 PPS edges'}</b> over ${s.esp_clock.pps_intervals} s`+"
+             "`<tr><td>I2S measured<td><b>${f}</b>`+`<tr><td>timebase<td><b>${s.acq.fs_used_hz.toFixed(4)} Hz</b> in use &middot; estimate ${q} &middot; dropped ${s.acq.drop_s} s / over ${s.acq.over_s} s`+`<tr><td>UTC now<td><b>${s.time.valid?new Date(s.time.utc_us/1000).toISOString():'anchor not valid'}</b> &middot; ${s.time.state} &middot; ${(s.time.anchor_age_us/1000).toFixed(0)} ms from anchor &middot; ${(s.time.since_edge_us/1000).toFixed(0)} ms since edge`+`<tr><td>clock<td><b>${s.time.sync_sigma_ns} ns</b> UTC uncertainty &middot; boot ${s.time.boot_id} @ ${s.time.boot_epoch_us===null?'unknown':new Date(s.time.boot_epoch_us/1000).toISOString()} &middot; flags 0x${(s.time.discontinuity_flags||0).toString(16)}`+`<tr><td>ESP clock vs GPS<td><b>${s.esp_clock.pps_intervals>2?s.esp_clock.ppm_vs_gps.toFixed(3)+' ppm':'need 3 PPS edges'}</b> over ${s.esp_clock.pps_intervals} s`+"
              "`<tr><td>samples<td>${s.i2s.samples}`+"
              "`<tr><td>detections<td><b>${s.audio.detections}</b> (env peak ${s.audio.env_peak})`+"
              "`<tr><td>raw ring<td>${s.raw.span_s?s.raw.span_s.toFixed(0)+' s, '+s.raw.fill_pct.toFixed(0)+'% written, '+(s.raw.bytes/1048576).toFixed(2)+' MB PSRAM':'<b>not allocated</b>'}`+"
@@ -3149,13 +3236,26 @@ static void det_bad_request(const char *detail) {
 }
 static void det_send_row(uint32_t k, const char *prefix) {
   const Det &d = dets[k % det_cap];
-  char b[240];
+  char b[400];
+  char sync_json[24];
+  if (d.sync_sigma_ns) snprintf(sync_json, sizeof sync_json, "%llu",
+                                (unsigned long long)d.sync_sigma_ns);
+  else                 snprintf(sync_json, sizeof sync_json, "null");
+  char boot_epoch_json[24];
+  if (d.boot_epoch_us) snprintf(boot_epoch_json, sizeof boot_epoch_json, "%lld",
+                                (long long)d.boot_epoch_us);
+  else                 snprintf(boot_epoch_json, sizeof boot_epoch_json, "null");
   snprintf(b, sizeof b, "%s{\"i\":%lu,\"utc_us\":%lld,\"uptime_s\":%lu,\"sample\":%lu,\"pps_n\":%lu,"
                         "\"us_since_pps\":%ld,\"trigger\":%d,\"flags\":%u,\"fs_hz\":%.3f,"
+                        "\"sync_sigma_ns\":%s,"
+                        "\"clock_state\":\"%s\",\"anchor_age_us\":%lu,\"boot_epoch_us\":%s,"
+                        "\"boot_id\":\"%s\",\"clock_discontinuity_flags\":%u,"
                         "\"frame_len\":%d,\"frame\":\"",
            prefix, (unsigned long)k, (long long)d.utc_us,
            (unsigned long)d.uptime_s, (unsigned long)d.sample,
            (unsigned long)d.pps_n, (long)d.us_since_pps, d.trigger, (unsigned)d.flags, d.fs_at,
+           sync_json, clock_state_name(d.clock_state), (unsigned long)d.anchor_age_us, boot_epoch_json,
+           boot_id, (unsigned)d.clock_discontinuity_flags,
            MELIMP_FRAME_BYTES);
   http.sendContent(b);
   static const char hx[] = "0123456789abcdef";
@@ -3683,6 +3783,9 @@ void setup() {
   if (sd_ok && !SD.exists(CLIP_DIR)) SD.mkdir(CLIP_DIR);
   clip_rescan();
   snprintf(clip_rand, sizeof clip_rand, "%06lx", (unsigned long)(esp_random() & 0xFFFFFFu));
+  uint32_t boot_nonce_a = esp_random(), boot_nonce_b = esp_random();
+  snprintf(boot_id, sizeof boot_id, "%08lx%08lx", (unsigned long)boot_nonce_a,
+           (unsigned long)boot_nonce_b);
   if (sd_ok) {
     sd_free_mb_last = (uint32_t)((SD.totalBytes() - SD.usedBytes()) / 1048576UL);
     gate_floor_load();
@@ -3979,7 +4082,7 @@ void setup() {
       }
     }
     pinMode(PPS_PIN, INPUT_PULLDOWN);
-    pps_resync = true; pps_resyncs++; fs_clean_secs = 0;
+    pps_resync = true; pps_resyncs++; fs_clean_secs = 0; clock_mark_settle(pps_count, CLOCK_DISC_PROBE_RESYNC);
     attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
     (void)watching;
     http.send(200, "text/plain", o);
@@ -4021,7 +4124,7 @@ void setup() {
     // f_mkfs blocks loop() for seconds, so PPS edges pass uncounted and the interval spanning the
     // format lands in pps_int_max. Same discard the pin probes needed: mach came back from its
     // format reading a 46 us spread against the 3-4 us it actually holds.
-    pps_resync = true; pps_resyncs++; fs_clean_secs = 0;
+    pps_resync = true; pps_resyncs++; fs_clean_secs = 0; clock_mark_settle(pps_count, CLOCK_DISC_PROBE_RESYNC);
 
     BYTE *work = (BYTE *)malloc(FF_MAX_SS);
     if (!work) { http.send(500, "text/plain", "no memory for the mkfs work buffer\n"); return; }
@@ -4100,7 +4203,7 @@ void setup() {
       o += b;
     }
     pinMode(PPS_PIN, INPUT_PULLDOWN);
-    pps_resync = true; pps_resyncs++; fs_clean_secs = 0;
+    pps_resync = true; pps_resyncs++; fs_clean_secs = 0; clock_mark_settle(pps_count, CLOCK_DISC_PROBE_RESYNC);
     if (pin == PPS_PIN) attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
     o += "\n";
     o += best_swing < 0.25
@@ -4157,7 +4260,7 @@ void setup() {
     int high = 0, n = 0, edges = 0, last = digitalRead(PPS_PIN);
     uint32_t t0 = millis();
     while (millis() - t0 < 2500) { int v = digitalRead(PPS_PIN); if (v) high++; n++; if (v != last) { edges++; last = v; } }
-    pps_resync = true; pps_resyncs++; fs_clean_secs = 0;
+    pps_resync = true; pps_resyncs++; fs_clean_secs = 0; clock_mark_settle(pps_count, CLOCK_DISC_PROBE_RESYNC);
     attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
     char b[300];
     snprintf(b, sizeof b,
@@ -4214,7 +4317,7 @@ void setup() {
     // Re-running bring-up drops the timepulse while it sweeps, and an interval spanning that gap
     // is not a real one. Declare it, exactly as the watchdog path does, or a diagnostic shows up
     // as a multi-second PPS interval that the high-water mark then keeps for the whole run.
-    pps_resync = true; pps_resyncs++; fs_clean_secs = 0;
+    pps_resync = true; pps_resyncs++; fs_clean_secs = 0; clock_mark_settle(pps_count, CLOCK_DISC_PROBE_RESYNC);
     pps_int_min = 0xFFFFFFFF; pps_int_max = 0;
 
     if (http.hasArg("auto")) {
@@ -4514,18 +4617,20 @@ void setup() {
 // the ambiguity csv_open's roll exists to prevent, and a changed header string is what triggers
 // it. Recording the value rather than bumping a version number also makes the NEXT window change
 // visible in the data instead of only in the firmware.
-// ⚠️`sync_sigma_ns` IS APPENDED, AND IT IS THE PHONE'S KEY AND THE PHONE'S UNIT. dama-gotchi
-// publishes the uncertainty of its own clock-to-UTC anchor as `sync_sigma_ns` and hear/pool.py
-// already reads that name off the MQTT payload into the pool record; a node inventing a second
-// name (or stating microseconds) for the same quantity would give one measurement two spellings.
-// Appended AFTER clip_why for the reason the clip columns were: tools/hear_bridge.py treats
-// trailing columns as the supported way to grow this header, and hear/detsfile.py's identify()
-// says in as many words that an APPENDED column is the safe direction and an inserted one is not.
-// A changed header string is also what rolls the file aside, which is what stops G6 rows landing
-// under a G5 header.
+// ⚠️`sync_sigma_ns` AND THE EXPLICIT CLOCK METADATA ARE APPENDED, AND `sync_sigma_ns` KEEPS THE
+// PHONE'S KEY AND UNIT. dama-gotchi publishes the uncertainty of its own clock-to-UTC anchor as
+// `sync_sigma_ns` and hear/pool.py already reads that name off the MQTT payload into the pool
+// record; a node inventing a second name (or stating microseconds) for the same quantity would
+// give one measurement two spellings. The clock-state / anchor-age / boot-id columns are appended
+// after it for the same reason the clip columns were: tools/hear_bridge.py treats trailing
+// columns as the supported way to grow this header, and hear/detsfile.py's identify() says in as
+// many words that an APPENDED column is the safe direction and an inserted one is not. A changed
+// header string is also what rolls the file aside, which is what stops G7 rows landing under a G6
+// header.
 static const char DETS_HDR[] =
   "node_id,utc_us,uptime_s,sample,pps_n,us_since_pps,trigger,flags,fs_hz,sketch_back,frame_hex,"
-  "clip,clip_why,sync_sigma_ns";
+  "clip,clip_why,sync_sigma_ns,clock_state,anchor_age_us,boot_epoch_us,boot_id,"
+  "clock_discontinuity_flags";
 
 // ⚠️THE SKETCH IS TAKEN HERE, NOT AT THE GATE EDGE, BECAUSE THE AUDIO DOES NOT EXIST YET.
 // The window runs forward from one hop before the trigger, so it needs SKETCH_SPAN - SKETCH_BACK
@@ -4610,7 +4715,7 @@ static void det_flush() {
     // that a power cut inside that window loses the row, and det_n vs det_written in health.csv
     // is where that would show. Break, not continue: the file is append-only and in-order.
     if (d.clip_st == CLIP_PENDING || !d.sk_st) break;
-    char line[MELIMP_FRAME_BYTES * 2 + 224];
+    char line[MELIMP_FRAME_BYTES * 2 + 320];
     int m = snprintf(line, sizeof line, "%s,%lld,%lu,%lu,%lu,%ld,%d,%u,%.3f,%lu,",
                      node_id,
                      (long long)d.utc_us, (unsigned long)d.uptime_s, (unsigned long)d.sample,
@@ -4624,7 +4729,17 @@ static void det_flush() {
     // EMPTY, not 0, when the row has no stamp: 0 ns would read as a perfect clock.
     char sg[24] = "";
     if (d.sync_sigma_ns) snprintf(sg, sizeof sg, "%llu", (unsigned long long)d.sync_sigma_ns);
-    int add = snprintf(line + m, sizeof line - m, ",%s,%s,%s", cp, clip_why(d.clip_st), sg);
+    char age[24] = "";
+    if (d.anchor_age_us || d.clock_state != CLOCK_STATE_FAULT)
+      snprintf(age, sizeof age, "%lu", (unsigned long)d.anchor_age_us);
+    char boot_epoch[24] = "";
+    if (d.boot_epoch_us) snprintf(boot_epoch, sizeof boot_epoch, "%lld", (long long)d.boot_epoch_us);
+    char disc[16] = "";
+    if (d.clock_discontinuity_flags)
+      snprintf(disc, sizeof disc, "%u", (unsigned)d.clock_discontinuity_flags);
+    int add = snprintf(line + m, sizeof line - m, ",%s,%s,%s,%s,%s,%s,%s,%s", cp,
+                       clip_why(d.clip_st), sg, clock_state_name(d.clock_state), age,
+                       boot_epoch, boot_id, disc);
     if (add > 0) m += (add < (int)sizeof line - m) ? add : ((int)sizeof line - m - 1);
     line[m++] = '\n';
     if (detf.write((const uint8_t *)line, m) != (size_t)m) {
@@ -4798,6 +4913,10 @@ static void audio_pump() {
           // clip and sketch, and the anchor can be refreshed in that window -- a sigma read then
           // would describe a different instant than the stamp beside it.
           dets[idx].sync_sigma_ns = tok ? stamp_sigma_ns(cap_us) : 0;
+          dets[idx].anchor_age_us = tok ? (uint32_t)clock_anchor_age_us(cap_us) : 0;
+          dets[idx].boot_epoch_us = tok ? (t - (int64_t)cap_us) : 0;
+          dets[idx].clock_discontinuity_flags = clock_discontinuity_flags_at(cap_us);
+          dets[idx].clock_state = clock_state_at(cap_us);
           if (!tok) dets_unlabelled++;          // the loss itself, counted where it happens
           dets[idx].trigger = sac;
           dets[idx].fs_at = fsu;
@@ -4951,7 +5070,7 @@ void loop() {
       // reporting a 3.95 SECOND spread and two glitches, which is a health metric reading as
       // catastrophic failure because of a diagnostic. Every probe route already declares its own
       // disturbance this way; this path is a probe too.
-      pps_resync = true; pps_resyncs++; fs_clean_secs = 0;
+      pps_resync = true; pps_resyncs++; fs_clean_secs = 0; clock_mark_settle(pps_count, CLOCK_DISC_PROBE_RESYNC);
       pps_int_min = 0xFFFFFFFF; pps_int_max = 0;
       gps_bringup();
       logf("gps   bring-up retry done: %s, RX=GPIO%d, %lu baud\n",
@@ -5027,8 +5146,8 @@ void loop() {
             // it and the interval that spans a timepulse probe are counted and excluded, never
             // averaged: that exclusion IS the fix to esp_clock_ppm.
             uint32_t iv = (uint32_t)(cap_last_us - cap_prev_us);
-            if (probed)                     { /* the probe moved the clock: measures nothing */ }
-            else if (iv > 1500000u)         { pps_gaps++; }
+            if (probed)                     { clock_mark_settle(e, CLOCK_DISC_PROBE_RESYNC); }
+            else if (iv > 1500000u)         { pps_gaps++; clock_mark_settle(e, CLOCK_DISC_PPS_GAP); }
             else                            { esp_iv_sum_us += iv; esp_iv_n++; }
             int64_t mu;
             if (local_to_utc(cap_prev_us, &mu)) {

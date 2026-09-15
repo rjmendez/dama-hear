@@ -378,6 +378,7 @@ def parse_status(d: Mapping[str, Any]) -> Dict[str, Any]:
     spread_us = _first(d, (("pps", "spread_us"), ("pps_spread_us",)))
     glitches = _first(d, (("pps", "glitches"), ("pps_glitches",)))
     utc = _first(d, (("time", "valid"), ("time", "synced"), ("time_sync",), ("utc_valid",)))
+    clock_state = _first(d, (("time", "state"), ("clock_state",)))
     rssi = _first(d, (("net", "rssi"), ("wifi", "rssi"), ("rssi",)))
     sd = _first(d, (("sd",),))
     sd_free_mb = _first(d, (("sd_free_mb",),))
@@ -390,6 +391,7 @@ def parse_status(d: Mapping[str, Any]) -> Dict[str, Any]:
         "pps_spread_us": spread_us,
         "pps_glitches": glitches,
         "time_valid": utc,
+        "clock_state": clock_state,
         "rssi": rssi,
         "sd": sd,
         "sd_free_mb": sd_free_mb,
@@ -450,7 +452,9 @@ def evaluate_health(target_name: str, status_data: Optional[Mapping[str, Any]],
 
     if _gps_expected(p) and not _gps_fix_ok(p):
         reasons.append("fix=%s" % p["fix"])
-    if p["time_valid"] is not True:
+    if p.get("clock_state") not in (None, "", "LOCKED"):
+        reasons.append("clock=%s" % p["clock_state"])
+    elif p["time_valid"] is not True:
         reasons.append("no UTC anchor")
     if _pps_expected(p) and (p["pps_edges"] is None or p["pps_edges"] == 0):
         reasons.append("timebase never locked")

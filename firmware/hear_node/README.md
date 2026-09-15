@@ -97,12 +97,18 @@ drain asks for cursor paging and falls back to the legacy array automatically wh
 the query args. **Roll back:** either side can be reverted independently, because the legacy bare
 endpoint is unchanged and the new drain still accepts old and new `/detections` bodies.
 
+`/status time` now makes the node's clock contract explicit instead of leaving operators to infer
+it from one latched boolean and a growing sigma: `state` is one of `LOCKED`, `HOLDOVER`,
+`DEGRADED`, `FAULT`; `sync_sigma_ns` is still the UTC-anchor uncertainty only; `anchor_age_us`,
+`boot_epoch_us`, `boot_id`, and `discontinuity_flags` say how old the anchor is, which boot wrote
+the row, and whether the node is still settling from boot or another discontinuity.
+
 The SD card is the actual record. WiFi is a convenience and a run must not depend on
 it. Everything below is fetchable over the same link with `/sd?file=/dets.csv&tail=20000`:
 
 | file | written | holds |
 |---|---|---|
-| `dets.csv` | as detections fire, batched once a second | one row per detection: `utc_us`, `sample`, `pps_n`, signed `us_since_pps`, `trigger`, `flags`, the rate it was timed at, the log-mel sketch as hex, and `clip` / `clip_why` |
+| `dets.csv` | as detections fire, batched once a second | one row per detection: `utc_us`, `sample`, `pps_n`, signed `us_since_pps`, `trigger`, `flags`, the rate it was timed at, the log-mel sketch as hex, `clip` / `clip_why`, `sync_sigma_ns`, and (G7) the explicit clock-state / anchor / boot metadata |
 | `health.csv` | every 30 s | GPS and PPS quality, the acquisition audit, gate state and `gate_floor`, detection counters, the clip counters, card space |
 | `scene.csv` | every 1.024 s, ungated | the scene descriptor — 20 bands × 4 quarter-second slices of log-mel, hex, the microseconds its FFTs cost, and the band edges that produced it |
 | `clips/*.wav` | one per detection, budgeted | 4 s of raw PCM around the trigger |

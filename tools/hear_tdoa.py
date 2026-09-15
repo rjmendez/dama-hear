@@ -202,6 +202,7 @@ D_UNSURVEYED = "unsurveyed_node"
 D_NOT_ARRIVAL = "not_arrival_class"
 D_CLOCK_UNSTATED = "clock_unstated"
 D_CLOCK_UNTRUSTED = "clock_untrusted"
+D_CLOCK_STATE = "clock_state_inadmissible"
 D_SYNC_SIGMA = "sync_sigma_exceeds"
 D_STAMP_SIGMA = "stamp_sigma_over_class_budget"
 #: ⚠️A SECOND, DIFFERENT REFUSAL ON THE SAME RECEIVER, AND IT MUST NOT BE FOLDED INTO THE FIRST.
@@ -220,9 +221,12 @@ D_ADMITTED = "admitted"
 
 DROP_REASONS = (D_UNANCHORED, D_OUTSIDE_WINDOW, D_OUTSIDE_LOOKBACK_EMITTED,
                 D_OUTSIDE_LOOKBACK_UNASSOC, D_PENDING_SETTLE, D_UNSURVEYED, D_NOT_ARRIVAL,
-                D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_SYNC_SIGMA, D_STAMP_SIGMA,
+                D_CLOCK_UNSTATED, D_CLOCK_UNTRUSTED, D_CLOCK_STATE, D_SYNC_SIGMA, D_STAMP_SIGMA,
                 D_PATH_BIAS, D_ONSET, D_ONSET_UNSTATED, D_LATENCY, D_HETEROGENEOUS_CLASS,
                 D_UNPARSEABLE)
+
+CLOCK_STATES = frozenset({"LOCKED", "HOLDOVER", "DEGRADED", "FAULT"})
+TDOA_CLOCK_STATES = frozenset({"LOCKED", "HOLDOVER"})
 
 # ---------------------------------------------------------------- heterogeneous receivers
 # WEIGHTING HANDLES VARIANCE. IT DOES NOT HANDLE BIAS, AND THIS DOOR IS THE ONE THE WEIGHTS DO
@@ -846,6 +850,25 @@ def admit(root: str, sv: SV.Survey, arr_sv: SV.Survey, policy: Dict[str, Any],
                   _detail(row, "clock_tier %r is not a UTC measurement (trusted tiers %s)"
                           % (row.get("clock_tier"), sorted(C.TRUSTED_CLOCK_TIERS))))
             continue
+        cstate = row.get("clock_state")
+        if cstate not in (None, ""):
+            cstate = str(cstate).strip().upper()
+            if cstate not in CLOCK_STATES:
+                _drop(day, row, D_CLOCK_STATE,
+                      _detail(row, "clock_state %r is not one of %s"
+                                   % (row.get("clock_state"), sorted(CLOCK_STATES))))
+                continue
+            if cstate not in TDOA_CLOCK_STATES:
+                detail = "clock_state %s is not TDoA-admissible; wait for LOCKED/HOLDOVER" % cstate
+                boot_id = row.get("boot_id")
+                if boot_id not in (None, ""):
+                    detail += " (boot %s" % boot_id
+                    disc = row.get("clock_discontinuity_flags")
+                    if disc not in (None, ""):
+                        detail += ", discontinuity_flags %s" % disc
+                    detail += ")"
+                _drop(day, row, D_CLOCK_STATE, _detail(row, detail))
+                continue
         ssig = row.get("sync_sigma_ns")
         # ⚠️TWO GATES ON ONE QUANTITY, AND THEY ASK DIFFERENT QUESTIONS. --max-sync-sigma-ns is
         # APERTURE-relative (DEFAULT_SYNC_SIGMA_FRAC of the tightest pair bound: "is this

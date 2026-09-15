@@ -34,12 +34,15 @@ def _q(bands=20, frames=8, seed=3):
     return np.clip(r.normal(-30, 12, (bands, frames)), -128, 0).round().astype(np.int8)
 
 
-def _row(utc_us=UTC_US, q=None, ref_db=52.5, peak=818, flags=0, sample=2222, fs_hz=16000.169):
+def _row(utc_us=UTC_US, q=None, ref_db=52.5, peak=818, flags=0, sample=2222, fs_hz=16000.169,
+         **extra):
     q = _q() if q is None else q
-    return {"utc_us": utc_us, "uptime_s": 12, "sample": sample, "pps_n": 11,
-            "us_since_pps": 189911, "trigger": peak, "flags": flags, "fs_hz": fs_hz,
-            "frame_hex": SK.pack(189911, ref_db, peak, q, flags=flags).hex(),
-            "src": "dets.csv"}
+    row = {"utc_us": utc_us, "uptime_s": 12, "sample": sample, "pps_n": 11,
+           "us_since_pps": 189911, "trigger": peak, "flags": flags, "fs_hz": fs_hz,
+           "frame_hex": SK.pack(189911, ref_db, peak, q, flags=flags).hex(),
+           "src": "dets.csv"}
+    row.update(extra)
+    return row
 
 
 # A /scene.csv row in the firmware's own format: 20 bands x 4 slices of BARE int8 half-dB steps,
@@ -114,6 +117,9 @@ class TestDetsCsv:
             values = {
                 "node_id": "3", "sketch_back": "192", "clip": "", "clip_why": "",
                 "sync_sigma_ns": "35000",
+                "clock_state": "LOCKED", "anchor_age_us": "250000",
+                "boot_epoch_us": "1788763940000000", "boot_id": "0011223344556677",
+                "clock_discontinuity_flags": "0",
             }
             values.update({k: str(r[k]) for k in
                           ("utc_us", "uptime_s", "sample", "pps_n", "us_since_pps",
@@ -256,10 +262,17 @@ class TestDetectionsJson:
 
     def test_the_live_ring_and_the_card_produce_the_same_record(self):
         # /detections and dets.csv are two views of one Det struct; they must not disagree.
-        r = _row()
+        r = _row(clock_state="HOLDOVER", anchor_age_us="30000000",
+                 boot_epoch_us="1788763940000000", boot_id="0011223344556677",
+                 clock_discontinuity_flags="16", sync_sigma_ns="625000")
         j = {"i": 1, "utc_us": r["utc_us"], "uptime_s": r["uptime_s"], "sample": r["sample"],
              "pps_n": r["pps_n"], "us_since_pps": r["us_since_pps"], "trigger": r["trigger"],
-             "flags": r["flags"], "fs_hz": r["fs_hz"], "frame_len": 172, "frame": r["frame_hex"]}
+             "flags": r["flags"], "fs_hz": r["fs_hz"], "clock_state": r["clock_state"],
+             "anchor_age_us": int(r["anchor_age_us"]),
+             "boot_epoch_us": int(r["boot_epoch_us"]), "boot_id": r["boot_id"],
+             "clock_discontinuity_flags": int(r["clock_discontinuity_flags"]),
+             "sync_sigma_ns": int(r["sync_sigma_ns"]),
+             "frame_len": 172, "frame": r["frame_hex"]}
         a = BR.to_record(r, NODE)
         b = BR.to_record(BR.rows_from_detections([j])[0], NODE)
         a.pop("src"), b.pop("src")
@@ -276,6 +289,15 @@ class TestDetectionsJson:
                           "frame": r["frame_hex"]}]}
         b = BR.to_record(BR.rows_from_detections(page)[0], NODE)
         assert b["utc_us"] == r["utc_us"]
+
+    def test_clock_metadata_reaches_the_record_clock_block(self):
+        rec = BR.to_record(_row(clock_state="degraded", anchor_age_us="1234",
+                                boot_epoch_us="1788763940000000", boot_id="0011223344556677",
+                                clock_discontinuity_flags="9", sync_sigma_ns="41000"), NODE)
+        assert rec["clock"]["state"] == "DEGRADED"
+        assert rec["clock"]["anchor_age_us"] == 1234
+        assert rec["clock"]["boot_id"] == "0011223344556677"
+        assert rec["clock"]["discontinuity_flags"] == 9
 
 
 class TestTimestamp:

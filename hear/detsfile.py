@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read a node's `dets.csv` at any of the five column layouts the firmware has written.
+"""Read a node's `dets.csv` at any of the seven column layouts the firmware has written.
 
 WHY THIS IS NOT `csv.DictReader`. Five generations of `dets.csv` exist on the cards and in the
 drains, and one of them writes a header that does not describe its own rows:
@@ -10,6 +10,7 @@ drains, and one of them writes a header that does not describe its own rows:
     G4  12 cols   node_id, ...                               fs/layout build, node_id populated
     G5  13 cols   + sketch_back before frame_hex             the window fix
     G6  14 cols   + sync_sigma_ns appended                    the declared-uncertainty stamp
+    G7  19 cols   + explicit clock state / anchor / boot metadata appended
 
 ⚠️G3 IS THE WHOLE REASON THIS MODULE EXISTS. `csv.DictReader` on a G3 file silently shifts every
 value one column left of its name: `utc_us` gets the node name, `uptime_s` gets the timestamp,
@@ -75,9 +76,12 @@ G5 = Generation("G5", ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip"
 # as a perfect clock -- which hear/nodeclass.py refuses as a claim no hardware supports.
 _G6 = ("node_id",) + _BASE + ("sketch_back", "frame_hex", "clip", "clip_why", "sync_sigma_ns")
 G6 = Generation("G6", _G6, _G6)
+_G7 = _G6 + ("clock_state", "anchor_age_us", "boot_epoch_us", "boot_id",
+             "clock_discontinuity_flags")
+G7 = Generation("G7", _G7, _G7)
 
-GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5, G6)
-LATEST = G6
+GENERATIONS: Tuple[Generation, ...] = (G1, G2, G3, G4, G5, G6, G7)
+LATEST = G7
 
 # One packed v1 sketch is 172 bytes (344 hex); v2 is 173 bytes (346 hex).
 FRAME_HEX_LEN = 344
@@ -206,6 +210,13 @@ def read_text(text: str, default_node: Optional[str] = None) -> DetsRead:
         # are None -- "not stated" -- and neither is 0. See hear/pool.py's record builder and
         # hear/backend/associate.py, where absent means usable and a number is a claim.
         d["sync_sigma_ns"] = stated_sigma_ns(d.get("sync_sigma_ns"))
+        for key in ("clock_state", "anchor_age_us", "boot_epoch_us", "boot_id",
+                    "clock_discontinuity_flags"):
+            d.setdefault(key, None)
+            if isinstance(d.get(key), str):
+                d[key] = d[key].strip() or None
+        if isinstance(d.get("clock_state"), str):
+            d["clock_state"] = d["clock_state"].upper()
         out.rows.append(d)
     return out
 

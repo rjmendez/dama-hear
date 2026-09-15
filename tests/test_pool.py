@@ -162,14 +162,18 @@ class TestOneDataset:
         pl = P.Pool(str(tmp_path / "pool"))
         frame = binascii.hexlify(_frame(fs=48000.0, seed=41, node_us=123456)).decode()
         csv = tmp_path / "mach.csv"
-        csv.write_text(",".join(DF.G6.declared) + "\n"
+        csv.write_text(",".join(DF.G7.declared) + "\n"
                        + "mach,1788763952189911,1234,5000000,42,597174,-1140,5889,16000.000,192,"
-                         f"{frame},,dedupe,40705\n")
+                         f"{frame},,dedupe,40705,LOCKED,250000,1788763951000000,"
+                         "0011223344556677,0\n")
         live = tmp_path / "gold.json"
         live.write_text(json.dumps([{
             "i": 7, "utc_us": 1788763952189912, "uptime_s": 1235, "sample": 5000001,
             "pps_n": 43, "us_since_pps": 597175, "trigger": -1141, "flags": 5888,
-            "fs_hz": 16000.0, "frame_len": len(frame) // 2, "frame": frame,
+            "fs_hz": 16000.0, "sync_sigma_ns": 625000, "clock_state": "HOLDOVER",
+            "anchor_age_us": 30000000, "boot_epoch_us": 1788763951000000,
+            "boot_id": "8899aabbccddeeff", "clock_discontinuity_flags": 16,
+            "frame_len": len(frame) // 2, "frame": frame,
             "clip": "", "clip_why": "nocard"}]))
         assert pl.ingest_dets(str(csv))["added"] == 1
         assert pl.ingest_detections_json(str(live), default_node="gold")["added"] == 1
@@ -179,10 +183,14 @@ class TestOneDataset:
             assert got["fs_hz"] == 48000.0
             assert got["fs_csv_hz"] == 16000.0
             assert got["fs_stated_by"] == "frame"
-            for key in ("sample", "uptime_s", "pps_n", "us_since_pps", "trigger"):
+            for key in ("sample", "uptime_s", "pps_n", "us_since_pps", "trigger",
+                        "anchor_age_us", "boot_epoch_us", "boot_id",
+                        "clock_discontinuity_flags"):
                 assert isinstance(got[key], str), (node, key, got[key], type(got[key]))
         assert rows["mach"]["trigger"] == "-1140"
         assert rows["gold"]["trigger"] == "-1141"
+        assert rows["mach"]["clock_state"] == "LOCKED"
+        assert rows["gold"]["clock_state"] == "HOLDOVER"
 
     def test_cursor_paged_detections_json_is_ingested_like_the_legacy_array(self, tmp_path):
         pl = P.Pool(str(tmp_path / "pool"))

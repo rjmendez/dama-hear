@@ -251,6 +251,13 @@ def _raw_det_cell(v: Any) -> Optional[str]:
     return None if v in (None, "") else str(v)
 
 
+def _clock_state(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s.upper() if s else None
+
+
 def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """One `hear.detsfile` row -> one pool record. Raises ValueError on an undecodable frame."""
     fh = (row.get("frame_hex") or "").strip()
@@ -311,6 +318,11 @@ def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
         # would claim a perfect clock, and `hear.corpus.Record.sync_sigma_ns` is read by gates
         # that treat absent and stated differently.
         "sync_sigma_ns": _sync_sigma_ns(row.get("sync_sigma_ns")),
+        "clock_state": _clock_state(row.get("clock_state")),
+        "anchor_age_us": _raw_det_cell(row.get("anchor_age_us")),
+        "boot_epoch_us": _raw_det_cell(row.get("boot_epoch_us")),
+        "boot_id": _raw_det_cell(row.get("boot_id")),
+        "clock_discontinuity_flags": _raw_det_cell(row.get("clock_discontinuity_flags")),
         "sample": _raw_det_cell(row.get("sample")),
         "uptime_s": _raw_det_cell(row.get("uptime_s")),
         # ⚠️THE INGEST USED TO DROP THESE TWO, WHICH IS WHY AN UNANCHORED ROW WAS UNRECOVERABLE
@@ -338,7 +350,8 @@ def _record_from_node_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
 #: The /detections (hear_node.ino: h_dets) fields that map straight onto a dets.csv row.
 LIVE_RING_COLUMNS = ("utc_us", "uptime_s", "sample", "pps_n", "us_since_pps", "trigger",
-                     "flags", "fs_hz")
+                     "flags", "fs_hz", "sync_sigma_ns", "clock_state", "anchor_age_us",
+                     "boot_epoch_us", "boot_id", "clock_discontinuity_flags")
 
 
 class Pool:

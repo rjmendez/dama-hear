@@ -46,9 +46,10 @@ one second old; with the anchor an hour old it is the same term times 3600. See 
 
 ## Free run: what a stamp is worth when the anchor stops moving
 
-The firmware now states it per detection, as `dets.csv` `sync_sigma_ns` (G6) and in `/status`
-under `time.sync_sigma_ns` -- the same key and the same unit dama-gotchi publishes for the same
-quantity, the 1-sigma uncertainty of a producer's clock-to-UTC anchor:
+The firmware now states it per detection, as `dets.csv` `sync_sigma_ns` (G6, and G7 when the
+explicit clock-state fields were appended) and in `/status` under `time.sync_sigma_ns` -- the
+same key and the same unit dama-gotchi publishes for the same quantity, the 1-sigma uncertainty
+of a producer's clock-to-UTC anchor:
 
     sync_sigma_ns = STAMP_ANCHOR_SIGMA_US * 1000 + anchor_age_us * STAMP_DRIFT_PPM_MAX / 1000
 
@@ -63,6 +64,35 @@ nothing by `gps_bringup()`.
 ⚠️It is the **clock anchor only**. The 62.47 us I2S block quantisation and the `fs_clean`
 back-date differential are CAPTURE-path terms; they live in `nodeclass`'s `t_sigma_s` and
 `path_bias_s`, and `sync_sigma_ns` means the clock on the phone side too. One column, one meaning.
+
+## Explicit clock states: what they mean, and what the gate does with them
+
+The node now reports four additive states beside the same `sync_sigma_ns` number:
+
+* `LOCKED` — PPS + UTC labels are current and the post-boot/post-discontinuity settle window has
+  cleared.
+* `HOLDOVER` — the node is still extrapolating from its last good anchor. This is the stale-anchor
+  case `sync_sigma_ns` was introduced to make visible.
+* `DEGRADED` — the node has a UTC mapping but is still inside the boot/discontinuity settle window
+  or is receiving time traffic without a live fix.
+* `FAULT` — there is no trusted UTC mapping for this instant.
+
+`/status time`, heartbeat/event telemetry, `/detections`, and `dets.csv` G7 all carry the same
+additive metadata: `clock_state`, `anchor_age_us`, `boot_epoch_us`, `boot_id`, and a compact
+`clock_discontinuity_flags` bitmask. The counters already in `/status` (`label_rejects`,
+`ubx_silent_s`, `probe_resyncs`, `pps_gaps`) stay the detailed evidence; the new fields are the
+short contract the downstream readers can key on.
+
+TDoA admission stays conservative on purpose:
+
+* `LOCKED` and `HOLDOVER` may still contribute arrivals, but only if the stated `sync_sigma_ns`
+  clears the existing per-class budget.
+* `DEGRADED` and `FAULT` are refused as arrivals when a row states them.
+* Rows with no `clock_state` stay on the old path, so mixed old/new firmware is safe.
+
+That is deliberate: the clock-state rollout is observability first, not a weakening of the
+existing `sync_sigma_ns` / `path_bias_s` split, and not a path to making an uncalibrated class
+arrival-eligible.
 
 `STAMP_DRIFT_PPM_MAX = 20`. MEASURED 2026-09-10/11 by differentiating the cumulative `esp_ppm`
 column of `health.csv` and `health-prev.csv` from all three nodes -- `esp_ppm` is a running mean

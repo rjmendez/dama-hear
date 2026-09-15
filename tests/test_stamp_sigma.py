@@ -349,7 +349,7 @@ class TestTheUncertaintyReachesTheWire:
     def test_g6_is_recognised_and_g5_is_still_readable(self):
         assert DF.identify(DF.G6.declared) is DF.G6
         assert DF.identify(DF.G5.declared) is DF.G5
-        assert DF.LATEST is DF.G6
+        assert DF.LATEST is DF.G7
 
     def test_a_stated_sigma_survives_the_reader(self):
         got = DF.read_text(self._row())
