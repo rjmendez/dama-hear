@@ -1550,10 +1550,10 @@ class TestDurableRefusals(TestValidation):
     def test_the_rate_window_reopens(self, tmp_path):
         store = self._store(tmp_path / "hb.sqlite3")
         store.refusal_rate_limit = 1
-        store.refusal_rate_window_s = 0.05
+        store.refusal_rate_window_s = 0.5
         assert store.record_refusal("hear/event", "mach", "mqtt_bridge", "a", b"{}") is not None
         assert store.record_refusal("hear/event", "mach", "mqtt_bridge", "b", b"{}") is None
-        time.sleep(0.06)
+        time.sleep(0.6)
         assert store.record_refusal("hear/event", "mach", "mqtt_bridge", "c", b"{}") is not None
 
     # -- retention ----------------------------------------------------------------------------
