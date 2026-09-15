@@ -42,6 +42,20 @@ kubectl apply -f deploy/k8s/hear-mqtt-bridge-code.yaml -f deploy/k8s/hear-mqtt-b
 #                so the generator rewrites that one document and leaves the rest alone.
 #                Redirecting stdout into the file would truncate the other two documents,
 #                which is why this command has no `>`.
+#
+#                ⚠️`/app/server.py` IS A subPath MOUNT, so the kubelet never propagates a
+#                ConfigMap update into the running pod: an apply with no restart is a no-op to
+#                the process. Restart by SCALING, never by rolling: one RWO PVC, one SQLite
+#                writer, and `maxSurge: 25%` would start the new pod before the old one exits.
+#
+#                  kubectl scale deploy -n dama hear-annotate --replicas=0   # wait for deletion
+#                  kubectl apply -f deploy/k8s/hear-annotate.yaml
+#                  kubectl scale deploy -n dama hear-annotate --replicas=1
+#
+#                This apply also carries the Deployment document, so it resets any live
+#                readiness patch. Readiness is `GET /healthz` -- a bounded check of the
+#                annotation store -- because the old `GET /api/queue?limit=1` probe measured a
+#                full corpus parse and took the pod NotReady as the corpus grew.
 python3 deploy/k8s/gen_configmap.py hear-annotate-code
 kubectl apply -f deploy/k8s/hear-annotate.yaml
 

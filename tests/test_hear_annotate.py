@@ -8,6 +8,7 @@ import os
 import sqlite3
 import struct
 import sys
+import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
 
@@ -250,3 +251,268 @@ def test_reused_submission_id_with_different_payload_is_conflict(tmp_path):
     assert first.status_code == 200
     assert second.status_code == 409
     assert client.get("/api/export").json()["count"] == 1
+
+
+# --------------------------------------------------------------------------- queue cost
+
+def _big_pool(tmp_path, n, annotated=()):
+    """A corpus the size the live one actually reached, with both tag lanes populated."""
+    rows = [_row("k%05d" % i, ts_utc_s=1788987605.0 + i) for i in range(n)]
+    tags = [{"clip_key": r["clip_key"], "model": {"name": "yamnet", "version": "1"},
+             "scores": [{"label": "Dog", "score": 0.5}, {"label": "Bird", "score": 0.45},
+                        {"label": "Cat", "score": 0.3}]} for r in rows]
+    birdnet = [{"clip_key": r["clip_key"],
+                "scores": [{"label": "Great Horned Owl", "score": 0.6}]} for r in rows]
+    pool = _pool(tmp_path, rows, tags=tags, birdnet=birdnet)
+    return pool, rows
+
+
+def _count_parses(monkeypatch):
+    """Count JSONL parses -- the O(corpus) work `/api/queue` used to repeat on every request."""
+    calls = []
+    real = HA._read_jsonl
+
+    def counting(path):
+        calls.append(path)
+        return real(path)
+
+    monkeypatch.setattr(HA, "_read_jsonl", counting)
+    return calls
+
+
+def _reference_queue(pool, db, limit):
+    """The queue recomputed from scratch, by a client that has never cached anything."""
+    fresh = HA.create_app(str(pool), str(db))
+    return TestClient(fresh).get("/api/queue?limit=%d" % limit).json()
+
+
+def test_queue_parses_the_corpus_once_across_repeated_requests(tmp_path, monkeypatch):
+    """⚠️THE DEFECT: every `/api/queue` re-parsed index.jsonl and both tag JSONLs. At 1,878
+    clips that was a 1.19 s median against a 1 s readiness timeout, and the corpus only grows."""
+    pool, _rows = _big_pool(tmp_path, 50)
+    client = TestClient(HA.create_app(str(pool), str(tmp_path / "ann.sqlite3")))
+    calls = _count_parses(monkeypatch)
+
+    first = client.get("/api/queue?limit=5").json()
+    after_first = len(calls)
+    for _ in range(9):
+        assert client.get("/api/queue?limit=5").json() == first
+
+    assert after_first <= 4, "one cold queue must not parse more than the corpus sources once"
+    assert len(calls) == after_first, (
+        "nine further queue requests re-parsed %d JSONL files; the corpus parse must be cached "
+        "and invalidated by its sources, not repeated per request" % (len(calls) - after_first))
+
+
+def test_repeat_queue_requests_stay_far_inside_the_readiness_budget(tmp_path):
+    """A warm request must not carry the corpus parse -- that is what took the pod NotReady."""
+    pool, _rows = _big_pool(tmp_path, 1500)
+    client = TestClient(HA.create_app(str(pool), str(tmp_path / "ann.sqlite3")))
+
+    start = time.perf_counter()
+    client.get("/api/queue?limit=25")
+    cold = time.perf_counter() - start
+
+    warm = []
+    for _ in range(10):
+        start = time.perf_counter()
+        client.get("/api/queue?limit=25")
+        warm.append(time.perf_counter() - start)
+    median = sorted(warm)[len(warm) // 2]
+
+    assert median < 0.05, "warm queue median %.3f s still pays the corpus parse" % median
+    assert median < cold / 3.0, (
+        "warm queue median %.3f s is not meaningfully cheaper than the cold %.3f s"
+        % (median, cold))
+
+
+def test_queue_cost_does_not_grow_with_the_corpus_once_warm(tmp_path):
+    """The live failure mode was growth: a fix that is merely faster crosses the same cliff."""
+    small_pool, _ = _big_pool(tmp_path / "small", 400)
+    big_pool, _ = _big_pool(tmp_path / "big", 3200)
+
+    def warm_median(pool, db):
+        client = TestClient(HA.create_app(str(pool), str(db)))
+        client.get("/api/queue?limit=25")
+        times = []
+        for _ in range(10):
+            start = time.perf_counter()
+            client.get("/api/queue?limit=25")
+            times.append(time.perf_counter() - start)
+        return sorted(times)[len(times) // 2]
+
+    small = warm_median(small_pool, tmp_path / "small.sqlite3")
+    big = warm_median(big_pool, tmp_path / "big.sqlite3")
+    assert big < max(4.0 * small, 0.05), (
+        "an 8x corpus made the warm queue %.4f s against %.4f s -- still O(corpus) per request"
+        % (big, small))
+
+
+def test_cached_queue_is_identical_to_a_freshly_computed_one(tmp_path):
+    pool, rows = _big_pool(tmp_path, 60)
+    db = tmp_path / "ann.sqlite3"
+    client = TestClient(HA.create_app(str(pool), str(db)))
+
+    for _ in range(3):
+        assert client.get("/api/queue?limit=25").json() == _reference_queue(pool, db, 25)
+
+
+def test_annotating_a_clip_drops_it_from_the_very_next_queue(tmp_path):
+    """⚠️NO FILE CHANGES WHEN A LABEL IS WRITTEN. A cache keyed only on the corpus files would
+    keep serving an already-annotated clip, and two annotators would label the same clip."""
+    pool, rows = _big_pool(tmp_path, 40)
+    db = tmp_path / "ann.sqlite3"
+    client = TestClient(HA.create_app(str(pool), str(db)))
+
+    first = client.get("/api/queue?limit=5").json()["clips"][0]["clip_key"]
+    assert client.post("/api/annotations", json={"clip_key": first, "label": "dog"}).status_code == 200
+
+    after = client.get("/api/queue?limit=5").json()
+    assert first not in [c["clip_key"] for c in after["clips"]]
+    assert after == _reference_queue(pool, db, 5)
+
+
+def test_a_clip_appended_to_the_index_appears_in_the_next_queue(tmp_path):
+    pool, rows = _big_pool(tmp_path, 20)
+    db = tmp_path / "ann.sqlite3"
+    client = TestClient(HA.create_app(str(pool), str(db)))
+    client.get("/api/queue?limit=50")
+
+    fresh = _row("arrived-late", ts_utc_s=1788999999.0)
+    with open(pool / "corpus" / "clips" / "index.jsonl", "a") as fh:
+        fh.write(json.dumps(fresh) + "\n")
+
+    keys = [c["clip_key"] for c in client.get("/api/queue?limit=50").json()["clips"]]
+    assert "arrived-late" in keys
+    assert client.get("/api/queue?limit=50").json() == _reference_queue(pool, db, 50)
+
+
+def test_an_atomically_replaced_tags_file_invalidates_the_cache(tmp_path):
+    """The tagger writes tmp-then-rename, and a replacement can land with the byte count and
+    even the mtime of the file it replaced. Identity, not size, is what must be compared."""
+    pool, rows = _big_pool(tmp_path, 12)
+    db = tmp_path / "ann.sqlite3"
+    client = TestClient(HA.create_app(str(pool), str(db)))
+    before = client.get("/api/queue?limit=12").json()
+
+    tags = pool / "corpus" / "clips" / "tags.jsonl"
+    stat = os.stat(tags)
+    replacement = [{"clip_key": r["clip_key"], "model": {"name": "yamnet", "version": "1"},
+                    "scores": [{"label": "Dog", "score": 0.5}, {"label": "Bird", "score": 0.45},
+                               {"label": "Cat", "score": 0.3}]} for r in rows]
+    replacement[0]["scores"] = [{"label": "Gunshot", "score": 0.51},
+                                {"label": "Silence", "score": 0.50},
+                                {"label": "Cat", "score": 0.3}]
+    tmp = tags.with_suffix(".jsonl.tmp")
+    tmp.write_text("".join(json.dumps(r) + "\n" for r in replacement))
+    os.replace(tmp, tags)
+    os.utime(tags, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    after = client.get("/api/queue?limit=12").json()
+    assert after != before, "a replaced tags file was not noticed"
+    assert after == _reference_queue(pool, db, 12)
+
+
+def test_a_truncated_index_empties_the_queue_rather_than_serving_the_old_one(tmp_path):
+    pool, _rows = _big_pool(tmp_path, 15)
+    db = tmp_path / "ann.sqlite3"
+    client = TestClient(HA.create_app(str(pool), str(db)))
+    assert client.get("/api/queue?limit=15").json()["count"] == 15
+
+    open(pool / "corpus" / "clips" / "index.jsonl", "w").close()
+    assert client.get("/api/queue?limit=15").json() == {"clips": [], "count": 0}
+
+
+def test_a_missing_corpus_index_is_an_empty_queue_and_a_ready_service(tmp_path):
+    pool = tmp_path / "pool"
+    (pool / "corpus" / "clips").mkdir(parents=True)
+    client = TestClient(HA.create_app(str(pool), str(tmp_path / "ann.sqlite3")))
+    assert client.get("/api/queue?limit=5").json() == {"clips": [], "count": 0}
+    health = client.get("/healthz")
+    assert health.status_code == 200
+    assert health.json()["corpus_index"] is False
+
+
+def test_cached_index_still_refuses_traversal_and_unlisted_clips(tmp_path):
+    rows = [_row("ok"), dict(_row("escape"), path="../../etc/passwd"),
+            dict(_row("absolute"), path="/etc/passwd")]
+    pool = _pool(tmp_path, rows, audios={"ok": _tone(1000, 45)})
+    client = TestClient(HA.create_app(str(pool), str(tmp_path / "ann.sqlite3")))
+
+    assert client.get("/api/audio/ok").status_code == 200
+    for key in ("escape", "absolute"):
+        assert client.get("/api/audio/%s" % key).status_code == 404
+        assert client.post("/api/annotations", json={"clip_key": key, "label": "dog"}).status_code == 404
+    assert client.get("/api/audio/../../etc/passwd").status_code == 404
+    assert [c["clip_key"] for c in client.get("/api/queue?limit=9").json()["clips"]] == ["ok"]
+    # repeat: a cached index must not become more permissive on the second request
+    assert client.get("/api/audio/escape").status_code == 404
+
+
+def test_concurrent_queue_reads_and_annotations_stay_consistent(tmp_path):
+    """A shared cache is shared state: concurrent readers and writers must not see a torn
+    queue, lose an annotation, or hand the same clip to two annotators twice."""
+    pool, rows = _big_pool(tmp_path, 300)
+    db = tmp_path / "ann.sqlite3"
+    client = TestClient(HA.create_app(str(pool), str(db)))
+    targets = [c["clip_key"] for c in client.get("/api/queue?limit=40").json()["clips"]]
+
+    def annotate(key):
+        return client.post("/api/annotations",
+                           json={"clip_key": key, "label": "dog", "submission_id": "sub-%s" % key})
+
+    def read(_i):
+        body = client.get("/api/queue?limit=40").json()
+        assert body["count"] == len(body["clips"])
+        assert len(set(c["clip_key"] for c in body["clips"])) == len(body["clips"])
+        return body
+
+    with ThreadPoolExecutor(max_workers=8) as pool_exec:
+        writes = [pool_exec.submit(annotate, key) for key in targets]
+        writes += [pool_exec.submit(annotate, key) for key in targets]  # duplicate submissions
+        reads = [pool_exec.submit(read, i) for i in range(20)]
+        assert all(f.result().status_code == 200 for f in writes)
+        for f in reads:
+            f.result()
+
+    export = client.get("/api/export").json()
+    assert export["count"] == len(targets), "idempotent submissions must not duplicate rows"
+    assert sorted(r["clip_key"] for r in export["annotations"]) == sorted(targets)
+    final = client.get("/api/queue?limit=40").json()
+    assert not set(c["clip_key"] for c in final["clips"]) & set(targets)
+    assert final == _reference_queue(pool, db, 40)
+
+
+def test_readiness_endpoint_reports_the_dependencies_without_building_a_queue(tmp_path, monkeypatch):
+    """⚠️THE PROBE MUST NOT BE A USER QUERY. `GET /api/queue?limit=1` made readiness cost a
+    corpus parse; this endpoint must prove the database and nothing expensive."""
+    pool, _rows = _big_pool(tmp_path, 200)
+    client = TestClient(HA.create_app(str(pool), str(tmp_path / "ann.sqlite3")))
+
+    calls = _count_parses(monkeypatch)
+    monkeypatch.setattr(HA, "build_queue", lambda *a, **k: pytest.fail("readiness built a queue"))
+
+    start = time.perf_counter()
+    response = client.get("/healthz")
+    elapsed = time.perf_counter() - start
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "database": "ok", "corpus_index": True}
+    assert response.headers["cache-control"] == "no-store"
+    assert calls == [], "readiness parsed %r" % calls
+    assert elapsed < 0.25, "readiness took %.3f s" % elapsed
+
+
+def test_readiness_fails_when_the_annotation_store_is_unusable(tmp_path):
+    """Availability must not be faked: the failure the old probe surfaced still surfaces."""
+    pool, _rows = _big_pool(tmp_path, 5)
+    db = tmp_path / "ann.sqlite3"
+    client = TestClient(HA.create_app(str(pool), str(db)))
+    assert client.get("/healthz").status_code == 200
+
+    for suffix in ("-wal", "-shm"):
+        (tmp_path / ("ann.sqlite3" + suffix)).unlink(missing_ok=True)
+    db.write_bytes(b"this is not a database")
+    response = client.get("/healthz")
+    assert response.status_code == 503
+    assert response.json()["status"] == "unready"
