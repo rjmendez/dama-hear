@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 347777 B serialised; 348042 B of annotations against a 262144 B cap.
+# apply-mode server: 348466 B serialised; 348731 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'c2ca757'
-    dama-hear/source-sha256: '4b4a8f32b94bf0b18bf883fa8ba153ef92612287683b9d56c26753d301e01fe4'
+    dama-hear/commit: 'cec80c5'
+    dama-hear/source-sha256: '9ed1047941ba7546e2e6ea5e52b7ead898c8c68ee042c25c9f5ed223a3451913'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '347777'
+    dama-hear/serialised-bytes: '348466'
 data:
   hear__init__.py: |
     
@@ -3655,6 +3655,13 @@ data:
             return r.read()
     
     
+    def _get_bounded(url: str, timeout: float, max_bytes: int) -> Tuple[bytes, bool]:
+        """Read at most max_bytes + 1 so callers can prove a response crossed their byte cap."""
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            body = r.read(max_bytes + 1)
+        return body, len(body) > max_bytes
+    
+    
     def fetch_status(ip: str, timeout: float = DEFAULT_TIMEOUT_S) -> Dict[str, Any]:
         return json.loads(_get("http://%s/status" % ip, timeout).decode("utf-8"))
     
@@ -4471,7 +4478,8 @@ data:
     # ---------------------------------------------------------------- the clip lane
     
     
-    def fetch_clip(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S
+    def fetch_clip(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S,
+                   max_bytes: Optional[int] = None
                    ) -> Tuple[Optional[bytes], Optional[str]]:
         """One clip WAV off the card: `(body, None)` on a real clip, `(None, reason)` otherwise.
     
@@ -4488,11 +4496,19 @@ data:
         """
         url = "http://%s/sd?file=%s" % (ip, name)
         try:
-            body = _get(url, timeout)
+            if max_bytes is None:
+                body = _get(url, timeout)
+                over_cap = False
+            else:
+                if max_bytes < 0:
+                    raise ValueError("max_bytes must be >= 0")
+                body, over_cap = _get_bounded(url, timeout, max_bytes)
         except urllib.error.HTTPError as e:
             return None, ("http_404" if e.code == 404 else "http_%d" % e.code)
         except Exception:
             return None, "transport"
+        if over_cap:
+            return None, "byte_cap"
         if not body:
             return None, "empty"
         if body[:4] != b"RIFF":
