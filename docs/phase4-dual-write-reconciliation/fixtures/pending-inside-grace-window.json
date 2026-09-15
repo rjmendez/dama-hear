@@ -1,0 +1,8 @@
+{
+  "case": "pending-inside-grace-window",
+  "description": "Legacy wrote 30 s ago and canonical has not landed. Below the live grace window this is scheduling, not loss, and no receipt is written.",
+  "expected_classification": "pending",
+  "expected_repair_action": "none",
+  "expected_severity": "info",
+  "receipt": null
+}

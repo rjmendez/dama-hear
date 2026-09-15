@@ -1,0 +1,99 @@
+{
+  "case": "outcome-divergence-canonical-refused",
+  "description": "Legacy stored the body and canonical wrote a durable refusal. Both records exist, so nothing was dropped -- but one of the two validators is wrong and an operator has to decide which.",
+  "expected_classification": "outcome_divergence",
+  "expected_repair_action": "manual_review",
+  "expected_severity": "critical",
+  "receipt": {
+    "comparator": {
+      "name": "hear-reconcile",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "correlation": {
+      "binding": "bound",
+      "correlation_id": "legacy:239673674ee2d598838cc3ddb97530c0b35960129a79d3295189001443e39a7b",
+      "device_id": "kasami",
+      "event_id": "66666666-6666-5666-8666-666666666666",
+      "legacy_uid": "1111111111111111111111111111111111111111111111111111111111111111",
+      "site_id": "site-alpha",
+      "source": "node-http",
+      "telemetry_path": "hear/heartbeat"
+    },
+    "credential": {
+      "canonical": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:kasami",
+        "scope": "device"
+      },
+      "legacy": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:kasami",
+        "scope": "device"
+      },
+      "matched": true
+    },
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "manual_review",
+      "repairable": false
+    },
+    "emitted_at": "2026-09-15T01:00:30Z",
+    "evidence": {
+      "canonical_raw_ref": "quarantine/2026/09/15/kasami-0031",
+      "legacy_raw_ref": null,
+      "redaction_profile": "hear.reconcile.redact.v1"
+    },
+    "receipt_id": "ef976c2a-78ab-5cd8-bd4d-5237fb64afc2",
+    "run_id": "recon-2026-09-15T00",
+    "sampling": {
+      "forced_reason": "mismatches are never sampled",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.reconcile.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "refused",
+        "reasons": [
+          "item_unrecognized"
+        ],
+        "row_count": 1,
+        "state_hash": null,
+        "writer": "hear.ingest.batch",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      },
+      "legacy": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:e48758db15ec5a5d232cda3a3f3c2aee56d492a263d43273189ae8409e0e7765",
+        "writer": "tools/hear_heartbeat_receiver.py",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "outcome_divergence",
+      "notes": [
+        "legacy=written canonical=refused"
+      ],
+      "repair_action": "manual_review",
+      "severity": "critical"
+    },
+    "window": {
+      "end": "2026-09-15T01:00:00Z",
+      "start": "2026-09-15T00:00:00Z"
+    }
+  }
+}

@@ -1,0 +1,95 @@
+{
+  "case": "unanchored-clock-compared-as-tier",
+  "description": "Neither side had a GPS fix. Both wrote a null observation instant and the tier `wall`; comparing the numbers would manufacture a mismatch out of two honest writers, so only the tier is compared.",
+  "expected_classification": "match",
+  "expected_repair_action": "none",
+  "expected_severity": "info",
+  "receipt": {
+    "comparator": {
+      "name": "hear-reconcile",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "correlation": {
+      "binding": "bound",
+      "correlation_id": "legacy:41b36c3f29665e41990b8698f62150463157435167ae769355db15fca48f032c",
+      "device_id": "gold",
+      "event_id": "55555555-5555-5555-8555-555555555555",
+      "legacy_uid": "0000000000000000000000000000000000000000000000000000000000000000",
+      "site_id": "site-alpha",
+      "source": "node-http",
+      "telemetry_path": "hear/heartbeat"
+    },
+    "credential": {
+      "canonical": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:gold",
+        "scope": "device"
+      },
+      "legacy": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:gold",
+        "scope": "device"
+      },
+      "matched": true
+    },
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "none",
+      "repairable": false
+    },
+    "emitted_at": "2026-09-15T01:00:30Z",
+    "evidence": {
+      "canonical_raw_ref": null,
+      "legacy_raw_ref": null,
+      "redaction_profile": "hear.reconcile.redact.v1"
+    },
+    "receipt_id": "f130f58d-484f-5907-a374-fe52d42cb63f",
+    "run_id": "recon-2026-09-15T00",
+    "sampling": {
+      "forced_reason": null,
+      "rate_denominator": 1000,
+      "sampled": false
+    },
+    "schema": "hear.reconcile.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "clock_tier": "wall",
+        "observed_at": null,
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:9412fb80397a78d6347b005c68863ba17dbe371d0ab5155850cb44815599e13d",
+        "writer": "hear.ingest.batch",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      },
+      "legacy": {
+        "clock_tier": "wall",
+        "observed_at": null,
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:9412fb80397a78d6347b005c68863ba17dbe371d0ab5155850cb44815599e13d",
+        "writer": "tools/hear_heartbeat_receiver.py",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "match",
+      "notes": [],
+      "repair_action": "none",
+      "severity": "info"
+    },
+    "window": {
+      "end": "2026-09-15T01:00:00Z",
+      "start": "2026-09-15T00:00:00Z"
+    }
+  }
+}

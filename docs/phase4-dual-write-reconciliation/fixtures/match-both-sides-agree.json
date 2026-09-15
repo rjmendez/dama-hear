@@ -1,0 +1,95 @@
+{
+  "case": "match-both-sides-agree",
+  "description": "Legacy and canonical wrote the same projection with the same GPS-anchored clock.",
+  "expected_classification": "match",
+  "expected_repair_action": "none",
+  "expected_severity": "info",
+  "receipt": {
+    "comparator": {
+      "name": "hear-reconcile",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "correlation": {
+      "binding": "bound",
+      "correlation_id": "legacy:5e9d3f4ef21803bd7a00bb85022ae59b4b5a1ae78d3ea8891a6784c23c9b6b6b",
+      "device_id": "gold",
+      "event_id": "11111111-1111-5111-8111-111111111111",
+      "legacy_uid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "site_id": "site-alpha",
+      "source": "node-http",
+      "telemetry_path": "hear/heartbeat"
+    },
+    "credential": {
+      "canonical": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:gold",
+        "scope": "device"
+      },
+      "legacy": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:gold",
+        "scope": "device"
+      },
+      "matched": true
+    },
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "none",
+      "repairable": false
+    },
+    "emitted_at": "2026-09-15T01:00:30Z",
+    "evidence": {
+      "canonical_raw_ref": "raw/canonical/2026/09/15/gold-0001",
+      "legacy_raw_ref": "raw/legacy/2026/09/15/gold-0001",
+      "redaction_profile": "hear.reconcile.redact.v1"
+    },
+    "receipt_id": "7597d414-382d-584a-8eac-b0bd358ef43b",
+    "run_id": "recon-2026-09-15T00",
+    "sampling": {
+      "forced_reason": "first hour after enabling this source",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.reconcile.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:73bff649e59db87a6404e8c7a35d49a36d7d39aeeaa0a772c40f0d9ba78c9e39",
+        "writer": "hear.ingest.batch",
+        "writer_version": "0.0.0-design",
+        "written_at": "2026-09-15T00:30:00Z"
+      },
+      "legacy": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:73bff649e59db87a6404e8c7a35d49a36d7d39aeeaa0a772c40f0d9ba78c9e39",
+        "writer": "tools/hear_heartbeat_receiver.py",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "match",
+      "notes": [],
+      "repair_action": "none",
+      "severity": "info"
+    },
+    "window": {
+      "end": "2026-09-15T01:00:00Z",
+      "start": "2026-09-15T00:00:00Z"
+    }
+  }
+}

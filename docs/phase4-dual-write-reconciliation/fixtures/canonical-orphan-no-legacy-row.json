@@ -1,0 +1,97 @@
+{
+  "case": "canonical-orphan-no-legacy-row",
+  "description": "A canonical row exists that the authoritative path never wrote. Not data loss -- legacy still has everything it ever had -- but something wrote canonically outside the dual-writer, so the binding is a `canonical_orphan`.",
+  "expected_classification": "missing_legacy",
+  "expected_repair_action": "manual_review",
+  "expected_severity": "warn",
+  "receipt": {
+    "comparator": {
+      "name": "hear-reconcile",
+      "receipt_major": 1,
+      "version": "0.0.0-design"
+    },
+    "correlation": {
+      "binding": "canonical_orphan",
+      "correlation_id": "canonical:5e54c238eee2483fb08bfdb7329cba353e89328475417471a8d8d93faa723510",
+      "device_id": "ageev",
+      "event_id": "77777777-7777-5777-8777-777777777777",
+      "legacy_uid": null,
+      "site_id": "site-alpha",
+      "source": "node-http",
+      "telemetry_path": "hear/heartbeat"
+    },
+    "credential": {
+      "canonical": {
+        "key_id": "k-2026-09",
+        "principal_id": "node:ageev",
+        "scope": "device"
+      },
+      "legacy": {
+        "key_id": null,
+        "principal_id": null,
+        "scope": "unknown"
+      },
+      "matched": false
+    },
+    "differences": [],
+    "differences_dropped": 0,
+    "disposition": {
+      "queue_ref": null,
+      "queued": false,
+      "repair_action": "manual_review",
+      "repairable": false
+    },
+    "emitted_at": "2026-09-15T01:00:30Z",
+    "evidence": {
+      "canonical_raw_ref": null,
+      "legacy_raw_ref": null,
+      "redaction_profile": "hear.reconcile.redact.v1"
+    },
+    "receipt_id": "99265aeb-8d78-5161-8811-cac54ea3319b",
+    "run_id": "recon-2026-09-15T00",
+    "sampling": {
+      "forced_reason": "mismatches are never sampled",
+      "rate_denominator": 1,
+      "sampled": true
+    },
+    "schema": "hear.reconcile.receipt.v1",
+    "schema_version": 1,
+    "sides": {
+      "canonical": {
+        "clock_tier": "gps_pps",
+        "observed_at": "2026-09-15T00:29:58Z",
+        "outcome": "written",
+        "reasons": [],
+        "row_count": 1,
+        "state_hash": "sha256:22b98a903c281293ec7f30879af8a7041f8156a415f2fb59b0d43c4bea8f983c",
+        "writer": "hear.ingest.batch",
+        "writer_version": "0.1.6",
+        "written_at": "2026-09-15T00:30:00Z"
+      },
+      "legacy": {
+        "clock_tier": null,
+        "observed_at": null,
+        "outcome": "absent",
+        "reasons": [],
+        "row_count": 0,
+        "state_hash": null,
+        "writer": null,
+        "writer_version": null,
+        "written_at": null
+      }
+    },
+    "verdict": {
+      "actionable": true,
+      "classification": "missing_legacy",
+      "notes": [
+        "a canonical row exists with no authoritative counterpart"
+      ],
+      "repair_action": "manual_review",
+      "severity": "warn"
+    },
+    "window": {
+      "end": "2026-09-15T01:00:00Z",
+      "start": "2026-09-15T00:00:00Z"
+    }
+  }
+}
