@@ -1,0 +1,18 @@
+{
+  "telemetry_path": "hear/heartbeat",
+  "telemetry_schema_version": 1,
+  "device_id": "smoke-node",
+  "ts": "2026-09-15T12:00:00Z",
+  "class": "xiao-s3-pps",
+  "fw_version": "0000000",
+  "uptime_s": 1,
+  "gps": {"fix": 3},
+  "time": {"valid": true},
+  "wifi": {"rssi_dbm": -67},
+  "counters": {
+    "scene_rows_written": 1,
+    "dets_rows_written": 2,
+    "clips_written": 3,
+    "clips_evicted": 0
+  }
+}

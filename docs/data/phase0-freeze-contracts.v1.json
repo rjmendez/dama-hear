@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "68bb14208259d80df1503ac9d08f2abc971bbde2128b759c1f2bc874e7a284db",
+  "baseline_hash": "01d473eefbd0c132b32c0095e08831503b0715202a9cd9a80215d5a9a099cfc3",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -95,6 +95,27 @@
         }
       },
       {
+        "path": "tests/fixtures/heartbeat-smoke.json",
+        "sha256": "f4bb34386f81e9ba8edf14b8d3b38adcd485bd376ee966d864590996962a29f8",
+        "size_bytes": 407,
+        "summary": {
+          "top_level_keys": [
+            "class",
+            "counters",
+            "device_id",
+            "fw_version",
+            "gps",
+            "telemetry_path",
+            "telemetry_schema_version",
+            "time",
+            "ts",
+            "uptime_s",
+            "wifi"
+          ],
+          "type": "object"
+        }
+      },
+      {
         "path": "tests/fixtures/status_mach.json",
         "sha256": "2d822b7f2f640ce6e8f2f987727dbda0458a7959c681862ecce15c61f1b1e881",
         "size_bytes": 2111,
@@ -178,7 +199,7 @@
     ],
     "metadata_only": true,
     "privacy_note": "Representative fixture inventory only: repo paths, top-level schema ids, counts, sizes, and sha256 digests. No live corpus pulls and no payload bodies are copied.",
-    "section_hash": "5a27ffc150822a94847095b765d20e4f0299ec4d9e58f2ea1af05d6ecf470d77"
+    "section_hash": "466b3b2d681cbeee4ed0d49edf24fff01ad829e5c00c60bf20e2b64c51b1b4cb"
   },
   "firmware_build_metadata": {
     "board_profiles": [
@@ -477,8 +498,8 @@
       },
       {
         "path": "deploy/k8s/README.md",
-        "sha256": "0c8bc43156a57555f1c00931d0548795bc9c2bc93b349cfeed16664bf3d2c630",
-        "size_bytes": 20755
+        "sha256": "1d94babbd294e02cd2b235ac55ff0bd96a99623942a68fd3a64531b160cd3c99",
+        "size_bytes": 23121
       }
     ],
     "objects": [
@@ -2123,7 +2144,7 @@
         "storage_request": "5Gi"
       }
     ],
-    "section_hash": "c95e3ae220c4ece6acd80de76c0ba0ece704b33f4a63e6276e0e10ac9d40090d"
+    "section_hash": "7b050db86fd4b86d3ffba4cd660f49126a6df9ec0cfcd311bd0e569417fc956f"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",

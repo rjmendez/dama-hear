@@ -1,0 +1,18 @@
+# Published service images, by digest. One row per migrated workload.
+#
+# ⚠️THIS FILE IS THE ANSWER TO "WHAT RAN THAT DAY". A tag is an alias and can be republished; a
+# digest is the image. The row is written by the commit that follows the `main` build which
+# published it, and the workload's manifest carries the same digest -- tests/test_service_images.py
+# fails if the two disagree, so a manifest cannot point at an image nobody recorded.
+#
+# ⚠️`pending` IS A BLOCKER, NOT A DEFAULT. While a workload's digest is `pending`, its proposed
+# manifest must carry the all-zero digest sentinel and must not be applied: nothing has been
+# published, because a pull request publishes nothing (.github/workflows/images.yml). Recording
+# the digest is step 1 of the cutover in deploy/images/service/README.md.
+#
+# Read a published digest without pulling the image:
+#
+#     docker buildx imagetools inspect ghcr.io/rjmendez/dama-hear/hear-heartbeat:<commit-sha>
+#
+# workload        repository                                   tag (commit)  digest
+hear-heartbeat    ghcr.io/rjmendez/dama-hear/hear-heartbeat    pending       pending

@@ -1,0 +1,13 @@
+# hear-heartbeat service image -- what tools/hear_heartbeat_receiver.py imports that is not
+# the standard library. Everything else it uses (http.server, sqlite3, json, hashlib) ships
+# with the interpreter, which is why this file is one line long.
+#
+# ⚠️THIS IS THE SAME PIN deploy/k8s/hear-heartbeat.yaml INSTALLS AT POD START, and
+# requirements/ci-pods.txt is what CI tests against. tests/test_image_pins.py fails if the three
+# disagree, so the image cannot be a version CI never ran.
+#
+# Regenerate the lock after editing:
+#
+#     python3 deploy/images/gen_pip_lock.py service:hear-heartbeat \
+#         > requirements/lock/service-hear-heartbeat.txt
+redis==7.4.0

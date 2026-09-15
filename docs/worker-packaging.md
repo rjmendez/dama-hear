@@ -199,6 +199,14 @@ volumes and mounts. Keep `hostNetwork`, `dnsPolicy`, `hostPort` 5051, the Servic
 vars including both `secretKeyRef`s, both probes, resources, the `state` PVC mount, the sqlite
 path, and root uid (the `/state` database is root-owned; see the identity boundary).
 
+*Implementation:* `deploy/images/service/Dockerfile.hear-heartbeat`,
+`requirements/image-service-hear-heartbeat.txt` + `requirements/lock/service-hear-heartbeat.txt`,
+the proposed cutover manifest `deploy/k8s/hear-heartbeat.proposed.yaml` (unappliable until its
+digest is recorded in `deploy/images/service/digests.txt`), the guard `tests/test_service_images.py`,
+the offline entrypoint smoke test `tests/test_hear_heartbeat_image_smoke.py`, and the build,
+content check and scan in `.github/workflows/images.yml`. The procedure and the evidence table
+live in `deploy/images/service/README.md`.
+
 Exits when: the pod is `Ready` on the digest; `/healthz` returns the same shape as before; all six
 devices appear in the durable ledger after cutover with continuous `received_at` across the
 restart and zero failed cache attempts; the Redis compatibility keys are still armed; a rollback

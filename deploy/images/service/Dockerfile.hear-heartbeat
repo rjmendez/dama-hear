@@ -1,0 +1,63 @@
+# hear-heartbeat -- the Phase 1.5 pilot service image.
+#
+# The receiver that deploy/k8s/hear-heartbeat.yaml runs today from a ConfigMap `subPath` mount,
+# with `redis` pip-installed into an emptyDir at every pod start. Here both are layers: the code
+# is copied from the checkout at build time and the dependency is replayed from a hash lock.
+#
+# ⚠️THIS BUILDS ON hear-runtime, NOT ON AN UPSTREAM TAG. The parent arrives as a digest from
+# .github/workflows/images.yml, which builds the chain in one job and hands each child the exact
+# image the previous step produced. Building it by hand:
+#
+#     docker build -f deploy/images/Dockerfile.runtime -t hear-runtime:dev .
+#     docker build -f deploy/images/service/Dockerfile.hear-heartbeat \
+#         --build-arg RUNTIME_IMAGE=hear-runtime:dev \
+#         --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" -t hear-heartbeat:dev .
+#
+# ⚠️ONE FILE AND ONE DEPENDENCY IS THE POINT. This is the pilot because its whole closure is
+# `redis`, so what is being proven is the mechanism -- build, provenance, cutover, rollback --
+# and not somebody's ability to containerise numpy. See docs/worker-packaging.md, gate 1.
+ARG RUNTIME_IMAGE
+FROM ${RUNTIME_IMAGE}
+
+# The commit this image's code was copied from. Recorded as a label so a running container can be
+# traced to a source tree without trusting the tag; the images workflow passes it, and
+# tests/test_service_images.py requires the ARG to exist.
+ARG SOURCE_COMMIT=unknown
+
+LABEL org.opencontainers.image.source="https://github.com/rjmendez/dama-hear"
+LABEL org.opencontainers.image.title="hear-heartbeat"
+LABEL org.opencontainers.image.description="hear_node heartbeat/event receiver: durable SQLite outbox, then the Redis compatibility keys."
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.revision="${SOURCE_COMMIT}"
+LABEL dama-hear.entrypoint="python /app/tools/hear_heartbeat_receiver.py --port 5051"
+LABEL dama-hear.lock="requirements/lock/service-hear-heartbeat.txt"
+
+# ⚠️ROOT, DELIBERATELY, AND NOT AS AN OVERSIGHT. hear-runtime ends as uid 65532 and the base-image
+# guard test enforces that. This workload writes /state/heartbeat-receiver.sqlite3 on a
+# `local-path` PVC whose existing database, WAL and shm files were created by a root pod, and
+# `local-path` volumes get no `fsGroup` ownership management -- so a container that started as
+# 65532 would fail to open its own ledger for writing, at runtime, after cutover, with the
+# rollback being the only way back. Re-owning /state is a separate, per-volume change with its
+# own proof of write; it is the identity boundary in docs/worker-packaging.md and it is not part
+# of a packaging change. tests/test_service_images.py holds this file to that rule *and* requires
+# this justification to be present.
+USER root:root
+
+# The resolver already ran, inside this image's base, and recorded a sha256 per artifact:
+# --require-hashes rejects a substituted or re-uploaded wheel and --no-deps forbids the build
+# from resolving anything of its own. PIP_ONLY_BINARY=:all: comes from the base.
+COPY requirements/lock/service-hear-heartbeat.txt /tmp/lock.txt
+RUN pip install --require-hashes --no-deps -r /tmp/lock.txt && rm -f /tmp/lock.txt
+
+# ⚠️THE ONE FILE THE ConfigMap SHIPS, AT THE PATH THE ConfigMap MOUNTS IT TO. Same path means the
+# entrypoint, the probes and any operator's muscle memory are unchanged across the cutover, and
+# tests/test_service_images.py compares this COPY against the `hear-heartbeat-code` bundle so the
+# image and its own rollback artifact cannot come to contain different code.
+COPY tools/hear_heartbeat_receiver.py /app/tools/hear_heartbeat_receiver.py
+
+# The port the fleet POSTs to, and the one deploy/k8s/hear-heartbeat.yaml binds on the host.
+EXPOSE 5051
+
+# ⚠️NO SHELL. The manifest carries no `command`/`args` after cutover, so what runs is this line;
+# there is no `pip install`-then-`exec` preamble left to drift from the checked-in file.
+ENTRYPOINT ["python", "/app/tools/hear_heartbeat_receiver.py", "--port", "5051"]
