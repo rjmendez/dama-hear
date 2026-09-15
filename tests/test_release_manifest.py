@@ -105,25 +105,84 @@ def test_verify_fails_when_an_artifact_is_tampered(monkeypatch, tmp_path):
         release_manifest.verify_release_directory(dist / release_manifest.MANIFEST_NAME, dist, expected_tag=TAG)
 
 
-def test_verify_fails_when_a_release_profile_does_not_match_the_asset():
+def _generated_manifest(monkeypatch, tmp_path):
+    """A real, schema-valid manifest plus the dist dir it describes."""
+    dist, build_info = _write_dist(tmp_path)
+    monkeypatch.setattr(release_manifest, "git_source_state", lambda *args, **kwargs: _source_state())
+    manifest = release_manifest.write_manifest(ROOT, dist, build_info)
+    return manifest, dist
+
+
+def test_verify_fails_when_a_release_profile_does_not_match_the_asset(monkeypatch, tmp_path):
+    manifest, dist = _generated_manifest(monkeypatch, tmp_path)
     name = board_profiles.release_asset_name(TAG, "esp32s3-i2s-gps", "app")
-    data = b"gps-app\n"
-    manifest = {
-        "schema_version": release_manifest.SCHEMA_VERSION,
-        "manifest_type": release_manifest.MANIFEST_TYPE,
-        "tag": TAG,
-        "source": {"commit": COMMIT, "describe": TAG, "dirty": False, "verifiable": True, "refusals": []},
-        "variants": [{
-            "board_class": "xiao-s3-pps",
-            "artifacts": [{
-                "name": board_profiles.release_asset_name(TAG, "xiao-s3-pps", "app"),
-                "sha256": release_manifest._sha256_bytes(b"xiao-app\n"),
-            }],
-        }],
-    }
+    data = (dist / name).read_bytes()
     with pytest.raises(ValueError, match="does not declare"):
         release_manifest.verify_downloaded_release_assets(
             json.dumps(manifest), TAG, "xiao-s3-pps", {name: data})
+
+
+def test_downloaded_assets_verify_against_a_well_formed_manifest(monkeypatch, tmp_path):
+    manifest, dist = _generated_manifest(monkeypatch, tmp_path)
+    assert not release_manifest.manifest_schema_problems(manifest)
+    names = [board_profiles.release_asset_name(TAG, "xiao-s3-pps", kind)
+             for kind in ("app", "bootloader")]
+    assets = {name: (dist / name).read_bytes() for name in names}
+    summary = release_manifest.verify_downloaded_release_assets(
+        json.dumps(manifest), TAG, "xiao-s3-pps", assets)
+    assert summary["tag"] == TAG
+    assert summary["commit"] == COMMIT
+    assert summary["verified_assets"] == sorted(names)
+
+
+@pytest.mark.parametrize("section", ["build", "inputs", "variants", "source"])
+def test_manifest_missing_a_required_section_is_refused(monkeypatch, tmp_path, section):
+    manifest, dist = _generated_manifest(monkeypatch, tmp_path)
+    name = board_profiles.release_asset_name(TAG, "xiao-s3-pps", "app")
+    assets = {name: (dist / name).read_bytes()}
+    manifest.pop(section)
+    with pytest.raises(ValueError, match="does not match release-manifest.schema.json"):
+        release_manifest.verify_downloaded_release_assets(
+            json.dumps(manifest), TAG, "xiao-s3-pps", assets)
+
+
+def test_manifest_artifact_without_a_name_is_refused(monkeypatch, tmp_path):
+    manifest, dist = _generated_manifest(monkeypatch, tmp_path)
+    name = board_profiles.release_asset_name(TAG, "xiao-s3-pps", "app")
+    assets = {name: (dist / name).read_bytes()}
+    variant = next(v for v in manifest["variants"] if v["board_class"] == "xiao-s3-pps")
+    variant["artifacts"][0].pop("name")
+    with pytest.raises(ValueError) as excinfo:
+        release_manifest.verify_downloaded_release_assets(
+            json.dumps(manifest), TAG, "xiao-s3-pps", assets)
+    assert "name" in str(excinfo.value)
+
+
+def test_manifest_artifact_with_a_malformed_hash_is_refused(monkeypatch, tmp_path):
+    manifest, dist = _generated_manifest(monkeypatch, tmp_path)
+    name = board_profiles.release_asset_name(TAG, "xiao-s3-pps", "app")
+    assets = {name: (dist / name).read_bytes()}
+    variant = next(v for v in manifest["variants"] if v["board_class"] == "xiao-s3-pps")
+    variant["artifacts"][0]["sha256"] = "not-a-hash"
+    with pytest.raises(ValueError, match="sha256|schema"):
+        release_manifest.verify_downloaded_release_assets(
+            json.dumps(manifest), TAG, "xiao-s3-pps", assets)
+
+
+def test_malformed_manifest_json_is_refused_as_valueerror():
+    with pytest.raises(ValueError, match="not valid JSON"):
+        release_manifest.verify_downloaded_release_assets(
+            "{not json", TAG, "xiao-s3-pps", {})
+
+
+def test_release_directory_verify_refuses_a_schema_incomplete_manifest(monkeypatch, tmp_path):
+    manifest, dist = _generated_manifest(monkeypatch, tmp_path)
+    manifest.pop("build")
+    (dist / release_manifest.MANIFEST_NAME).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match release-manifest.schema.json"):
+        release_manifest.verify_release_directory(
+            dist / release_manifest.MANIFEST_NAME, dist, expected_tag=TAG)
 
 
 def test_verify_fails_when_an_expected_artifact_is_missing(monkeypatch, tmp_path):
