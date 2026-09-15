@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-mqtt-bridge-code.yaml
-# apply-mode client: 49032 B serialised; 49296 B of annotations against a 262144 B cap.
+# apply-mode client: 55890 B serialised; 56154 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-mqtt-bridge
   annotations:
-    dama-hear/commit: '07e3589'
-    dama-hear/source-sha256: 'e924776bac321c8063a18ec4758f7e7675bd7f2545c7771a42b2a52ae854ac46'
+    dama-hear/commit: 'e63d980'
+    dama-hear/source-sha256: '87813f5d8789eeb2f706354898e26b2798ae3b6d868b1620589d8c769c410ba0'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '49032'
+    dama-hear/serialised-bytes: '55890'
 data:
   tools_hear_heartbeat_receiver.py: |
     #!/usr/bin/env python3
@@ -943,6 +943,7 @@ data:
     import json
     import logging
     import os
+    import ssl
     import sys
     from datetime import datetime, timezone
     from typing import Any, Callable, Dict, Optional, Tuple
@@ -973,10 +974,91 @@ data:
     REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
     REDIS_PASS = os.environ.get("REDIS_PASS")
     
+    # TLS/mTLS material. In Kubernetes these are populated by mounting a Secret (see
+    # deploy/k8s/hear-mqtt-bridge.yaml) with the broker's CA bundle plus this client's own
+    # certificate/key pair, so the broker can also authenticate *us* (mutual TLS), not just
+    # the other way around.
+    MQTT_CA_CERTS = os.environ.get("MQTT_CA_CERTS")
+    MQTT_CERTFILE = os.environ.get("MQTT_CERTFILE")
+    MQTT_KEYFILE = os.environ.get("MQTT_KEYFILE")
+    MQTT_TLS_INSECURE = os.environ.get("MQTT_TLS_INSECURE", "false").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    MQTT_TLS_VERSION = os.environ.get("MQTT_TLS_VERSION", "tlsv1_2")
+    
+    _TLS_VERSIONS: Dict[str, int] = {
+        "tlsv1_2": ssl.PROTOCOL_TLS_CLIENT if hasattr(ssl, "PROTOCOL_TLS_CLIENT") else ssl.PROTOCOL_TLSv1_2,
+        "tlsv1.2": ssl.PROTOCOL_TLS_CLIENT if hasattr(ssl, "PROTOCOL_TLS_CLIENT") else ssl.PROTOCOL_TLSv1_2,
+        # Modern OpenSSL negotiates the highest mutually supported protocol under
+        # PROTOCOL_TLS_CLIENT (which itself enforces a >=TLSv1.2 floor), so "tlsv1_3" is
+        # accepted as a floor label too rather than requiring a dedicated (and, in current
+        # Python/OpenSSL, non-existent) PROTOCOL_TLSv1_3 constant.
+        "tlsv1_3": ssl.PROTOCOL_TLS_CLIENT if hasattr(ssl, "PROTOCOL_TLS_CLIENT") else ssl.PROTOCOL_TLSv1_2,
+        "tlsv1.3": ssl.PROTOCOL_TLS_CLIENT if hasattr(ssl, "PROTOCOL_TLS_CLIENT") else ssl.PROTOCOL_TLSv1_2,
+    }
+    
     _ROUTES: Dict[str, Tuple[Callable[[Any], Dict[str, Any]], str]] = {
         "hear/heartbeat": (validate_heartbeat_payload, "write_heartbeat"),
         "hear/event": (validate_event_payload, "write_event"),
     }
+    
+    
+    class TlsConfigError(ValueError):
+        """Raised when TLS/mTLS flags are inconsistent or unsafe."""
+    
+    
+    def resolve_tls_version(name: str) -> int:
+        """Map a --tls-version flag value to an ssl.PROTOCOL_* constant."""
+        key = name.strip().lower()
+        try:
+            return _TLS_VERSIONS[key]
+        except KeyError as exc:
+            raise TlsConfigError(
+                f"unsupported --tls-version {name!r}; choose one of {sorted(_TLS_VERSIONS)}"
+            ) from exc
+    
+    
+    def configure_tls(client: mqtt.Client, *, ca_certs: Optional[str] = None,
+                       certfile: Optional[str] = None, keyfile: Optional[str] = None,
+                       tls_insecure: bool = False, tls_version: str = MQTT_TLS_VERSION) -> bool:
+        """Configure TLS (and mTLS, if a client cert/key pair is supplied) on ``client``.
+    
+        Returns True if TLS was enabled, False if no CA bundle was supplied (plaintext).
+        Raises TlsConfigError if only one of certfile/keyfile is given, since a half-configured
+        client certificate is never valid for mTLS.
+        """
+        if (certfile is None) != (keyfile is None):
+            raise TlsConfigError(
+                "--certfile and --keyfile must both be supplied together for mTLS, or both omitted"
+            )
+        if not ca_certs:
+            if certfile or keyfile:
+                raise TlsConfigError("--ca-certs is required when --certfile/--keyfile are set")
+            return False
+    
+        client.tls_set(
+            ca_certs=ca_certs,
+            certfile=certfile,
+            keyfile=keyfile,
+            tls_version=resolve_tls_version(tls_version),
+        )
+        # tls_insecure_set(True) disables hostname verification against the broker's cert,
+        # defeating the point of TLS; only ever set it from an explicit, logged opt-in.
+        if tls_insecure:
+            logger.warning(
+                "TLS hostname/certificate verification DISABLED (--tls-insecure); "
+                "this bridge is vulnerable to MITM while this flag is set"
+            )
+        client.tls_insecure_set(tls_insecure)
+        return True
+    
+    
+    def device_id_from_topic(topic: str) -> Optional[str]:
+        """Extract the device_id segment from a ``dama/<device_id>/telemetry`` topic."""
+        parts = topic.split("/")
+        if len(parts) == 3 and parts[0] == "dama" and parts[2] == "telemetry" and parts[1]:
+            return parts[1]
+        return None
     
     
     class BridgeStats:
@@ -987,6 +1069,7 @@ data:
             self.ignored = 0
             self.rejected = 0
             self.malformed = 0
+            self.impersonation = 0
     
     
     def dispatch_message(store: HeartbeatReceiverStore, raw: bytes, topic: str,
@@ -1027,6 +1110,21 @@ data:
                            payload.get("telemetry_path"), topic, exc)
             return None
     
+        # The broker's topic is the only thing this bridge can trust to belong to the
+        # publishing connection; a device (or an on-path attacker with an MQTT credential
+        # but no TLS client cert for another device) could otherwise claim any device_id it
+        # likes in the JSON body. Reject any mismatch instead of trusting the payload alone.
+        topic_device_id = device_id_from_topic(topic)
+        payload_device_id = body.get("device_id")
+        if topic_device_id is not None and topic_device_id != payload_device_id:
+            stats.impersonation += 1
+            logger.warning(
+                "rejected %s message: topic device_id %r does not match payload device_id %r "
+                "(possible impersonation) on %s",
+                payload.get("telemetry_path"), topic_device_id, payload_device_id, topic,
+            )
+            return None
+    
         writer: Callable[[Dict[str, Any]], Dict[str, Any]] = getattr(store, writer_name)
         record = writer(body)
         stats.accepted += 1
@@ -1035,9 +1133,27 @@ data:
     
     def make_client(store: HeartbeatReceiverStore, topic: str = MQTT_TOPIC,
                     client_id: str = MQTT_CLIENT_ID,
-                    stats: Optional[BridgeStats] = None) -> mqtt.Client:
+                    stats: Optional[BridgeStats] = None,
+                    ca_certs: Optional[str] = MQTT_CA_CERTS,
+                    certfile: Optional[str] = MQTT_CERTFILE,
+                    keyfile: Optional[str] = MQTT_KEYFILE,
+                    tls_insecure: bool = MQTT_TLS_INSECURE,
+                    tls_version: str = MQTT_TLS_VERSION) -> mqtt.Client:
         stats = stats if stats is not None else BridgeStats()
         client = mqtt.Client(client_id=client_id, clean_session=True)
+        tls_enabled = configure_tls(
+            client,
+            ca_certs=ca_certs,
+            certfile=certfile,
+            keyfile=keyfile,
+            tls_insecure=tls_insecure,
+            tls_version=tls_version,
+        )
+        client.tls_enabled = tls_enabled
+        if not tls_enabled:
+            logger.warning(
+                "MQTT TLS is DISABLED (no --ca-certs configured); connecting in plaintext"
+            )
     
         def _on_connect(c, userdata, flags, rc, *args):
             if rc != 0:
@@ -1070,6 +1186,21 @@ data:
         ap.add_argument("--redis-host", default=REDIS_HOST)
         ap.add_argument("--redis-port", type=int, default=REDIS_PORT)
         ap.add_argument("--redis-pass", default=REDIS_PASS)
+        ap.add_argument("--ca-certs", default=MQTT_CA_CERTS,
+                        help="Path to the CA bundle (PEM) used to verify the broker's certificate. "
+                             "Enables TLS. Typically a mounted Kubernetes Secret path.")
+        ap.add_argument("--certfile", default=MQTT_CERTFILE,
+                        help="Path to this client's TLS certificate (PEM) for mTLS. "
+                             "Requires --keyfile and --ca-certs.")
+        ap.add_argument("--keyfile", default=MQTT_KEYFILE,
+                        help="Path to this client's TLS private key (PEM) for mTLS. "
+                             "Requires --certfile and --ca-certs.")
+        ap.add_argument("--tls-insecure", action="store_true", default=MQTT_TLS_INSECURE,
+                        help="DANGEROUS: disable broker hostname/certificate verification. "
+                             "Never use outside of local testing.")
+        ap.add_argument("--tls-version", default=MQTT_TLS_VERSION,
+                        choices=sorted(_TLS_VERSIONS),
+                        help="Minimum TLS protocol version to negotiate with the broker.")
         add_durable_store_args(ap)
         return ap.parse_args(argv)
     
@@ -1097,7 +1228,15 @@ data:
             store, args.durable_replay_interval_s, args.durable_replay_limit,
             name="hear-mqtt-bridge-replay")
         logger.info("MQTT broker -> %s:%s topic=%s", args.mqtt_host, args.mqtt_port, args.mqtt_topic)
-        client = make_client(store, topic=args.mqtt_topic, client_id=args.mqtt_client_id)
+        try:
+            client = make_client(
+                store, topic=args.mqtt_topic, client_id=args.mqtt_client_id,
+                ca_certs=args.ca_certs, certfile=args.certfile, keyfile=args.keyfile,
+                tls_insecure=args.tls_insecure, tls_version=args.tls_version,
+            )
+        except TlsConfigError as exc:
+            logger.error("invalid TLS configuration: %s", exc)
+            return 2
         client.connect(args.mqtt_host, args.mqtt_port, keepalive=args.mqtt_keepalive_s)
         try:
             client.loop_forever()
