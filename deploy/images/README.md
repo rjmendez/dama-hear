@@ -133,14 +133,16 @@ The images workflow (`.github/workflows/images.yml`) attaches, for every variant
 - a **vulnerability scan** (Trivy, `--exit-code 1` on HIGH/CRITICAL with a dated, reviewed
   ignore file — not a permanent allowlist).
 
-⚠️**On a pull request the workflow builds but does not push.** Nothing reaches a registry from a
-branch, so a fork cannot publish an image. Publishing is a `main`-only job, which is where the
-digest that manifests will reference is recorded.
+⚠️**On a pull request nothing is published.** The same chain is built, with the same SBOM and
+provenance, into a registry service that lives and dies with the job — so a fork cannot push an
+image anywhere that outlives it, and the review still sees a real build, a real attestation and
+a real scan. Publishing to `ghcr.io` is a `main`-only path, which is where the digest that
+manifests will reference is recorded.
 
-⚠️**A pull request gets no SBOM, and that is a buildx constraint, not a choice.** An attestation
-makes the build emit a manifest list, and the docker exporter that `load: true` uses cannot
-export one — `docker exporter does not currently support exporting manifest lists`. So a PR
-proves the image *builds, runs and scans clean*, and `main` proves its *provenance*.
+⚠️**The chain needs a registry to exist at all.** buildx runs in a container and cannot see an
+image loaded into the runner's daemon, and an attestation makes the build emit a manifest list,
+which the docker exporter cannot export (`docker exporter does not currently support exporting
+manifest lists`). That is why the PR path pushes to `localhost:5000` rather than `--load`ing.
 
 ## Rollout and rollback compatibility
 
