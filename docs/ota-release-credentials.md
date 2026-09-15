@@ -68,3 +68,33 @@ to create that state on purpose; this valve exists for manual mistakes, old asse
 
 `flash.py --release` refuses nodes that cannot prove NVS Wi-Fi, NVS push/admin credentials, and
 post-flash backend push success. `/status` health without the `auth` block is not sufficient.
+
+## Release asset provenance
+
+The node-side gate above is only trustworthy if a published asset really is credential-free, and
+if an installer can tell. Both are now declared and enforced at build time:
+
+* `release.yml` fails if `firmware/hear_node/secrets.h` or `firmware/puc_node/secrets.h` exists in
+  the release checkout, and `firmware.yml` fails on any `secrets.h` anywhere in the tree it
+  compiles. CI has never had one; the failure mode is a published fleet token and a fleet-wide
+  rotation, so it is asserted rather than assumed.
+* `dist/build-info.json` and `release-manifest.json` carry the claim as fields:
+
+  ```json
+  "image_class": "unprovisioned",
+  "compiled_in_credentials": false,
+  "provisioning_required": ["node_id", "wifi", "admin_token", "push_token"]
+  ```
+
+* `release_manifest.py` refuses to generate a manifest from build info declaring anything else, or
+  from a tree that still holds `secrets.h`, and refuses to verify a downloaded release or an
+  offline release directory whose manifest claims compiled-in credentials or a different image
+  class. `flash.py` and `enroll.py` verify every downloaded asset through that function, so such a
+  release stops before it is written to a node.
+* Manifests published before these fields existed (`v0.1.5` and earlier) make no claim either way
+  and stay installable. Refusing them would strand the fleet on firmware it cannot update; the
+  node-side `auth` gate is what protects those installs.
+
+An unprovisioned image is not a node-ready image. Treat `image_class: unprovisioned` as "this
+image supplies nothing; the node must already hold all four", and provision over USB with
+`enroll.py` -- which is the only place a fleet token is ever written to a node.

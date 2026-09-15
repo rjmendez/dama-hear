@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "a998dcc02ea9b8a8123af0498e0e8bd3a70456a73725f36366ea01934a8c5d2e",
+  "baseline_hash": "04c2e744bafc21a74e3d302b3bef06a9f392a15ad00dada18f39c389b9a03e57",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -251,17 +251,17 @@
     ],
     "default_board_class": "xiao-s3-pps",
     "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
-    "section_hash": "21eb4634f76c21d07e2dfcdde4ff77dfb2eebd17bff0ae75c5ee8c9ed8e84b9e",
+    "section_hash": "3fcf5bbb46bfba120bab6a1acab3a35521710b4fcc857000ff1abff8c193d875",
     "source_files": [
       {
         "path": ".github/workflows/firmware.yml",
-        "sha256": "9c731260907c33f0dec1ab85010479116fc83feb7054eedfb1dc33a5234d7945",
-        "size_bytes": 6116
+        "sha256": "6319a70f342d9da03f07df15d04a2c2c323170953ca5089ef9b22fde724589b7",
+        "size_bytes": 6679
       },
       {
         "path": ".github/workflows/release.yml",
-        "sha256": "69282f27adc65c5e7f8129753d4932b85b8315e77dc42e1fdba19f07b3b604da",
-        "size_bytes": 6696
+        "sha256": "d438c736b44a079580c5ee721f3dd1ab85b6c8a823de36dc924ea63c3e0a05c2",
+        "size_bytes": 8858
       },
       {
         "path": "firmware/README.md",
@@ -270,8 +270,8 @@
       },
       {
         "path": "firmware/hear_node/README.md",
-        "sha256": "18af9d76aaa5fdf420d2311fe28429a1741ed52c779c8a4f97f740dae141c8c2",
-        "size_bytes": 53135
+        "sha256": "808840256488bf4e46abc230c7cf41c761faf907b216d653086bb952469798c2",
+        "size_bytes": 53621
       },
       {
         "path": "firmware/hear_node/board_profiles.py",
