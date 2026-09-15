@@ -29,6 +29,8 @@ class MicDiag(ctypes.Structure):
         ("unique", ctypes.c_uint32),
         ("sat_pct", ctypes.c_uint32),
         ("rail_hits", ctypes.c_uint32),
+        ("attempts", ctypes.c_uint32),
+        ("settle_ms", ctypes.c_uint32),
     ]
 
 
@@ -132,7 +134,9 @@ def test_real_variation_is_normal(micdiag):
 def test_status_contract_carries_legacy_and_explicit_mic_fields():
     code = re.sub(r"/\*.*?\*/", "", INO.read_text(), flags=re.S)
     code = re.sub(r"//[^\n]*", "", code)
-    assert "selftest_mic_set_diag(mic_diag_classify" in code
+    # The probe now classifies through the bounded settle window (test_firmware_mic_settle.py),
+    # which is still mic_diag_classify per read.
+    assert "selftest_mic_set_diag(mic_probe_settle(&cfg))" in code
     for token in (r'\"mic\":\"%s\"', r'\"mic_state\":\"%s\"', r'\"mic_reason\":\"%s\"',
                   r'\"mic_stats\":{\"samples\":%lu', r'\"zero_cross_pct\":%lu',
                   r'\"same_adj_pct\":%lu', r'\"unique\":%lu', r'\"sat_pct\":%lu',
