@@ -74,6 +74,31 @@ class TestTheCompiledPin:
     def test_the_compiled_pin_is_one_measured_as_free(self):
         assert _define(INO, "PPS_PIN") in FREE_PINS
 
+    def test_the_diagnostic_does_not_enable_source_or_drive_the_pad(self):
+        with open(INO) as fh:
+            src = fh.read()
+        assert _define(INO, "PPS_SOURCE_CONFIRMED") == 0
+        assert "pinMode(PPS_PIN, INPUT);" in src
+        assert "pinMode(PPS_PIN, INPUT_PULLDOWN);" not in src
+        assert 'NODE_CLASS "puc-ntp"' in src
+
+    def test_the_diagnostic_measures_frequency_width_and_jitter(self):
+        with open(INO) as fh:
+            src = fh.read()
+        for token in (
+            "PPS_MIN_INTERVAL_US",
+            "PPS_MAX_INTERVAL_US",
+            "PPS_MIN_WIDTH_US",
+            "PPS_MAX_WIDTH_US",
+            "PPS_MAX_JITTER_US",
+            "pulse_width_min_us",
+            "pulse_width_max_us",
+            "jitter_us",
+            "waveform_valid",
+            "discipline_enabled",
+        ):
+            assert token in src, "missing PPS diagnostic token %s" % token
+
     @pytest.mark.parametrize("pin", sorted(DRIVEN_PINS))
     def test_the_driven_pins_are_named_so_a_future_choice_is_informed(self, pin):
         # the point is not that 18 is bad, it is that 8/18/39 are all bad and only 15/16/17 are

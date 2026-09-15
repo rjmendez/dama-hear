@@ -13,10 +13,10 @@
 //   DS3231 RTC and an environmental suite on I2C. Pins NOT yet known.
 //   microSD slot. Pins NOT yet known.
 //
-// ⚠️1PPS IS NOT ROUTED. The L86 exposes it on pin 11 and it was forced on with $PMTK285,4,100;
-// no GPIO saw a 1 Hz edge across repeated whole-bank scans. Until a wire is added, this board
-// CANNOT contribute a TDoA arrival -- it is hear/nodeclass.py's `puc-ntp`, not `puc-pps`.
-// PPS_PIN below is where that wire should land when it exists.
+// ⚠️1PPS IS NOT ROUTED ON STOCK HARDWARE. The L86 exposes it on module pin 11 and it was forced
+// on with $PMTK285,4,100; no GPIO saw a 1 Hz edge across repeated whole-bank scans. GPIO17 is
+// the measured safe landing pad for a future wire, but this build only observes it. It cannot
+// contribute a TDoA arrival -- it is hear/nodeclass.py's `puc-ntp`, not `puc-pps`.
 //
 // ⚠️GPIO 19 and 20 ARE USB D-/D+. Reconfiguring them kills the console; it happened once already
 // and cost a replug caught inside a four-second window. They are excluded everywhere, alongside
@@ -83,7 +83,8 @@ struct NtpResult {
 // side effect of a 125-line refactor from a branch carrying an older copy of this file. Neither
 // revert was noticed, because nothing compares the compiled pin against the measurement.
 // puc.h now points HERE as the file that builds. Do not let a stale branch quietly undo it again.
-#define PPS_PIN    17               // L86 pin 6 (1PPS) lands here. Wired 2026-09-09.
+#define PPS_PIN    17               // measured safe pad; L86 module pin 11 is not stock-routed
+#define PPS_SOURCE_CONFIRMED 0      // frequency alone cannot identify GNSS versus RTC
 
 static char node_id[24];
 static WebServer http(80);
@@ -251,18 +252,52 @@ static void gps_pump() {
   }
 }
 
-// ---------------------------------------------------------------- PPS
-static volatile uint32_t pps_count = 0, pps_int_min = 0xFFFFFFFF, pps_int_max = 0;
-static volatile uint64_t pps_us_last = 0;
+// ---------------------------------------------------------------- PPS diagnostic
+// This input is observation-only. Do not add a pull-up/down: an unknown external driver must
+// never be put in contention by the firmware. A timing-shaped signal is not enough to identify its
+// source, so this build never enables PPS discipline or the puc-pps node class.
+static const uint32_t PPS_MIN_INTERVAL_US = 950000;
+static const uint32_t PPS_MAX_INTERVAL_US = 1050000;
+static const uint32_t PPS_MIN_WIDTH_US = 2000;
+static const uint32_t PPS_MAX_WIDTH_US = 998000;
+static const uint32_t PPS_MAX_JITTER_US = 5000;
+static const uint32_t PPS_REQUIRED_RISES = 9;
+static volatile uint32_t pps_rising = 0, pps_falling = 0;
+static volatile uint64_t pps_last_rise_us = 0;
+static volatile uint32_t pps_interval_min = 0xFFFFFFFF, pps_interval_max = 0;
+static volatile uint32_t pps_width_min = 0xFFFFFFFF, pps_width_max = 0;
+static volatile uint32_t pps_jitter_us = 0;
 static void IRAM_ATTR pps_isr() {
   uint64_t now = (uint64_t)esp_timer_get_time();
-  if (pps_count) {
-    uint32_t d = (uint32_t)(now - pps_us_last);
-    if (d < 500000) return;                   // a 1 Hz pulse cannot have edges this close
-    if (d < pps_int_min) pps_int_min = d;
-    if (d > pps_int_max) pps_int_max = d;
+  bool high = gpio_get_level((gpio_num_t)PPS_PIN);
+  if (high) {
+    if (pps_last_rise_us) {
+      uint32_t interval = (uint32_t)(now - pps_last_rise_us);
+      if (interval < pps_interval_min) pps_interval_min = interval;
+      if (interval > pps_interval_max) pps_interval_max = interval;
+      pps_jitter_us = pps_interval_max - pps_interval_min;
+    }
+    pps_last_rise_us = now;
+    pps_rising++;
+  } else if (pps_last_rise_us) {
+    uint32_t width = (uint32_t)(now - pps_last_rise_us);
+    if (width < pps_width_min) pps_width_min = width;
+    if (width > pps_width_max) pps_width_max = width;
+    pps_falling++;
   }
-  pps_us_last = now; pps_count++;
+}
+
+static bool pps_waveform_valid() {
+  return pps_rising >= PPS_REQUIRED_RISES &&
+         pps_interval_min >= PPS_MIN_INTERVAL_US &&
+         pps_interval_max <= PPS_MAX_INTERVAL_US &&
+         pps_width_min >= PPS_MIN_WIDTH_US &&
+         pps_width_max <= PPS_MAX_WIDTH_US &&
+         pps_jitter_us <= PPS_MAX_JITTER_US;
+}
+
+static bool pps_discipline_enabled() {
+  return PPS_SOURCE_CONFIRMED && pps_waveform_valid();
 }
 
 // ---------------------------------------------------------------- whole-bank pin scan
@@ -762,26 +797,30 @@ static void routes() {
       "<pre>dama-hear PUC node %s (%s)\n\n"
       "uptime  %lus\nheap    %lu min %lu max_alloc %lu stack_low_words %lu psram %lu\n"
       "gps     fix %d, %d sats, %s   sentences %lu (%lu valid)\n"
-      "pps     %lu edges on GPIO%d\n\n"
+      "pps     %lu rising edges on GPIO%d, waveform %s, source %s\n\n"
       "/status /pins /i2c /i2creg /rtc /time /timesync /sqw /pdmscan /mic /scan /scanpd /scanpu /gps /pmtk?cmd= /pps /ota /update /reboot\n</pre>",
       node_id, NODE_CLASS, (unsigned long)(millis() / 1000),
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(),
       (unsigned long)ESP.getMaxAllocHeap(), (unsigned long)uxTaskGetStackHighWaterMark(NULL),
       (unsigned long)ESP.getFreePsram(),
       gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences, (unsigned long)gps_valid,
-      (unsigned long)pps_count, PPS_PIN);
+      (unsigned long)pps_rising, PPS_PIN, pps_waveform_valid() ? "valid" : "unproven",
+      PPS_SOURCE_CONFIRMED ? "confirmed" : "unconfirmed");
     http.send(200, "text/html", b);
   });
 
   http.on("/status", []() {
-    char b[1100];
+    char b[1400];
     snprintf(b, sizeof b,
       "{\"node\":\"%s\",\"class\":\"%s\",\"uptime_s\":%lu,"
       "\"reset\":\"%s\",\"power_cycled\":%s,\"heap\":%lu,\"heap_min\":%lu,\"heap_max_alloc\":%lu,\"stack_high_watermark_words\":%lu,\"psram\":%lu,"
       "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid\":%lu,"
       "\"baud\":%d,\"rx_pin\":%d,\"tx_pin\":%d,\"last\":\"%s\"},"
-      "\"pps\":{\"pin\":%d,\"edges\":%lu,\"interval_min_us\":%lu,\"interval_max_us\":%lu,"
-      "\"wired\":%s},"
+      "\"pps\":{\"pin\":%d,\"source\":\"gnss_1pps_unconfirmed\",\"source_confirmed\":%s,"
+      "\"rising_edges\":%lu,\"falling_edges\":%lu,\"frequency_hz\":%.6f,"
+      "\"interval_min_us\":%lu,\"interval_max_us\":%lu,\"jitter_us\":%lu,"
+      "\"pulse_width_min_us\":%lu,\"pulse_width_max_us\":%lu,"
+      "\"waveform_valid\":%s,\"discipline_enabled\":%s},"
       // configured is a BUILD fact (were there credentials at all); sta is the link state.
       "\"wifi\":{\"configured\":%s,\"sta\":%s,\"rssi\":%d,\"ip\":\"%s\"}}",
       node_id, NODE_CLASS, (unsigned long)(millis() / 1000),
@@ -791,12 +830,17 @@ static void routes() {
       (unsigned long)ESP.getFreePsram(),
       gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences, (unsigned long)gps_valid,
       GPS_BAUD, GPS_RX_PIN, GPS_TX_PIN, gps_last,
-      PPS_PIN, (unsigned long)pps_count,
-      (unsigned long)(pps_count > 1 ? pps_int_min : 0),
-      (unsigned long)(pps_count > 1 ? pps_int_max : 0),
-      // Not a configuration flag: it reports whether edges have ACTUALLY arrived. The wire either
-      // exists and pulses or it does not, and nothing else should be allowed to claim otherwise.
-      pps_count > 2 ? "true" : "false",
+      PPS_PIN, PPS_SOURCE_CONFIRMED ? "true" : "false",
+      (unsigned long)pps_rising, (unsigned long)pps_falling,
+      pps_interval_min != 0xFFFFFFFF
+        ? 1000000.0 / (((double)pps_interval_min + pps_interval_max) / 2.0) : 0.0,
+      (unsigned long)(pps_rising > 1 ? pps_interval_min : 0),
+      (unsigned long)(pps_rising > 1 ? pps_interval_max : 0),
+      (unsigned long)(pps_rising > 1 ? pps_jitter_us : 0),
+      (unsigned long)(pps_falling ? pps_width_min : 0),
+      (unsigned long)(pps_falling ? pps_width_max : 0),
+      pps_waveform_valid() ? "true" : "false",
+      pps_discipline_enabled() ? "true" : "false",
       HEAR_WIFI_CONFIGURED ? "true" : "false", sta_ok ? "true" : "false", WiFi.RSSI(),
       sta_ok ? WiFi.localIP().toString().c_str() : "0.0.0.0");
     http.send(200, "application/json", b);
@@ -808,7 +852,7 @@ static void routes() {
       "gpio  role                                    how we know\n"
       "%4d  GPS RX  <- L86 TX, %d baud PMTK        measured: 9600-baud traffic, PMTK705 reply\n"
       "%4d  GPS TX  -> L86 RX                      measured: the module answers PMTK605\n"
-      "%4d  PPS in  <-- THE WIRE GOES HERE         NOT ROUTED on stock hardware; add it\n"
+      "%4d  PPS diagnostic input                    measured safe pad; GNSS wire not stock-routed\n"
       "  19  USB D-                                 do not touch\n"
       "  20  USB D+                                 do not touch\n"
       "26-32 SPI flash                              do not touch\n"
@@ -1169,14 +1213,23 @@ static void routes() {
   });
 
   http.on("/pps", []() {
-    uint32_t e0 = pps_count; delay(2500); uint32_t e1 = pps_count;
-    char b[420];
+    uint32_t e0 = pps_rising; delay(2500); uint32_t e1 = pps_rising;
+    char b[760];
     snprintf(b, sizeof b,
-      "GPIO%d over 2.5 s: %lu edges (total %lu)\n\n%s\n",
+      "GPIO%d over 2.5 s: %lu rising edges (total %lu)\n"
+      "interval %lu..%lu us, jitter %lu us, pulse width %lu..%lu us\n"
+      "waveform_valid=%s source_confirmed=%s discipline_enabled=%s\n\n%s\n",
       PPS_PIN, (unsigned long)(e1 - e0), (unsigned long)e1,
-      (e1 - e0) >= 2 ? "PULSING."
-        : "No edges. Either the wire from L86 pin 11 is not there yet, or the module has no fix\n"
-          "and its timepulse is off -- force it with /pmtk?cmd=PMTK285,4,100 and try again.");
+      (unsigned long)(pps_rising > 1 ? pps_interval_min : 0),
+      (unsigned long)(pps_rising > 1 ? pps_interval_max : 0),
+      (unsigned long)(pps_rising > 1 ? pps_jitter_us : 0),
+      (unsigned long)(pps_falling ? pps_width_min : 0),
+      (unsigned long)(pps_falling ? pps_width_max : 0),
+      pps_waveform_valid() ? "true" : "false",
+      PPS_SOURCE_CONFIRMED ? "true" : "false",
+      pps_discipline_enabled() ? "true" : "false",
+      (e1 - e0) ? "Signal observed; identify its source before enabling PPS."
+                 : "No edges. Stock hardware has no GNSS PPS route; do not probe GPIO18 or GPIO38.");
     http.send(200, "text/plain", b);
   });
 
@@ -1231,9 +1284,9 @@ void setup() {
   Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   Serial.printf("gps   L86 on RX=GPIO%d TX=GPIO%d @ %d\n", GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD);
 
-  pinMode(PPS_PIN, INPUT_PULLDOWN);
-  attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
-  Serial.printf("pps   watching GPIO%d (nothing is wired to it yet)\n", PPS_PIN);
+  pinMode(PPS_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, CHANGE);
+  Serial.printf("pps   diagnostic-only GPIO%d; source unconfirmed, discipline disabled\n", PPS_PIN);
 
   for (int k = 0; k < WIFI_N && !sta_ok; k++) {
     WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSIDS[k], WIFI_PASSES[k]);
@@ -1282,6 +1335,6 @@ void loop() {
     Serial.printf("[%6lus] fix %d/%d sats  nmea %lu/%lu valid  pps %lu\n",
                   (unsigned long)(millis() / 1000), gps_fix, gps_sats,
                   (unsigned long)gps_valid, (unsigned long)gps_sentences,
-                  (unsigned long)pps_count);
+                  (unsigned long)pps_rising);
   }
 }
