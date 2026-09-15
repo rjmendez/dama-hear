@@ -211,6 +211,103 @@ class TestStatusParsing:
         assert H._gps_summary(ubx) == "UBX:3/12"
 
 
+# ---------------------------------------------------------------- data-state report
+
+class TestFleetDataReport:
+    NOW = 2_000_000.0
+
+    @staticmethod
+    def _status(node="nyquist", **overrides):
+        base = {
+            "node": node,
+            "fw": "abc1234",
+            "class": "xiao-s3-pps",
+            "time": {"valid": True, "state": "LOCKED", "anchor_age_us": 1_500_000},
+            "selftest": {"mic": "ok", "mic_state": "normal"},
+            "gps": {"fix": 3, "sats": 12},
+            "pps": {"edges": 99, "glitches": 0},
+        }
+        base.update(overrides)
+        return base
+
+    def test_builds_node_data_state_from_bounded_heartbeats(self):
+        drain = {"sensors": {
+            "nyquist": {
+                "kind": "node",
+                "last_success_s": self.NOW - 60,
+                "last_added": 7,
+                "unfetched_recent": [{"at": self.NOW - 50, "bytes": 0}],
+                "clips_recent": [{
+                    "at": self.NOW - 40, "seen": 3, "fetched": 2, "gone": 1,
+                    "deferred": 0, "probed_404": 0, "unknown": False,
+                }],
+            }
+        }}
+        score = {"last_run_s": self.NOW - 30, "runs": [{
+            "at": self.NOW - 30,
+            "records_seen": 10,
+            "newly_scored": 4,
+            "scored": 6,
+            "refused": 2,
+            "unparseable": 1,
+            "by_source": {"node": 8, "phone": 2},
+            "by_node": {"nyquist": {"scored": 6, "refused": 2}},
+            "by_reason": {"legacy_layout": 2},
+        }]}
+        tag = {"last_run_s": self.NOW - 20, "runs": [{
+            "at": self.NOW - 20,
+            "index_keys": 5,
+            "tagged": 3,
+            "refused": 1,
+            "deferred": 1,
+            "by_node": {"nyquist": {"tagged": 3, "refused": 1}},
+            "by_reason": {"audio_missing": 1},
+        }]}
+        durable = {"durable_store": {"backend": "sqlite", "enabled": True,
+                                     "pending_records": 9}}
+        report = H.build_data_report(["nyquist"], {"nyquist": self._status()}, drain, score, tag,
+                                     durable, now=self.NOW, window_s=7200)
+
+        node = report["nodes"]["nyquist"]
+        assert node["firmware"] == "abc1234"
+        assert node["class"] == "xiao-s3-pps"
+        assert node["clock"] == {"state": "healthy", "value": "LOCKED"}
+        assert node["anchor_age_s"] == {"state": "healthy", "value": 1.5}
+        assert node["mic_state"] == {"state": "healthy", "value": "normal"}
+        assert node["heartbeat"]["last_success_age_s"] == 60
+        assert node["heartbeat"]["clips"]["named_window"] == 3
+        assert node["heartbeat"]["scene"]["unfetched_bytes_window"] == 0
+        assert report["workflows"]["score"]["by_source_window"] == {"node": 8, "phone": 2}
+        assert report["ingest_reject_counts"] == {
+            "score": {"legacy_layout": 2},
+            "tag": {"audio_missing": 1},
+        }
+        assert report["durable_store"]["backend"] == "sqlite"
+        assert report["durable_store"]["pending_records"] == 9
+        assert report["coverage_gaps"] == []
+
+    def test_missing_status_and_heartbeat_are_unknown_not_healthy(self):
+        report = H.build_data_report(["rankine"], {}, None, None, None, None,
+                                     now=self.NOW, window_s=7200)
+        node = report["nodes"]["rankine"]
+        assert node["firmware"] is None
+        assert node["clock"]["state"] == "unknown"
+        assert node["mic_state"]["state"] == "unknown"
+        assert node["heartbeat"]["state"] == "unknown"
+        assert "rankine: status unknown" in report["coverage_gaps"]
+        assert "hear-drain heartbeat missing" in report["coverage_gaps"]
+        assert report["durable_store"]["state"] == "unknown"
+
+    def test_human_table_names_unknowns_and_durable_pending(self):
+        report = H.build_data_report(["rankine"], {}, None, None, None,
+                                     {"backend": "none", "pending_records": 0},
+                                     now=self.NOW, window_s=7200)
+        text = H.format_data_report(report)
+        assert "rankine" in text
+        assert "UNKNOWN" in text
+        assert "durable backend=none pending=0" in text
+
+
 # ---------------------------------------------------------------- layered health evaluation
 
 class TestHealthEvaluation:

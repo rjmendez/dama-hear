@@ -51,6 +51,14 @@ DEFAULT_TIMEOUT_S = 15.0
 DEFAULT_RETRIES = 2
 DEFAULT_BACKOFF_S = 1.5
 DEFAULT_SINCE = "2h"
+DEFAULT_POOL = "~/hear-pool"
+DEFAULT_DATA_WINDOW_S = 7200.0
+KUBECTL_HEARTBEAT_READ_LIMIT_B = 1_048_576
+POOL_HEARTBEATS = {
+    "drain": "heartbeat.json",
+    "score": "state/score_heartbeat.json",
+    "tag": "state/tag_heartbeat.json",
+}
 PMTK_STATUS_CLASSES: Tuple[str, ...] = (
     "esp32s3-i2s-gps",
     "esp32s3-speaker",
@@ -173,6 +181,120 @@ def _as_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _fmt_age(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "UNKNOWN"
+    if seconds < 0:
+        seconds = 0.0
+    if seconds < 90:
+        return "%.0fs" % seconds
+    if seconds < 36 * 3600:
+        return "%.1fh" % (seconds / 3600.0)
+    return "%.1fd" % (seconds / 86400.0)
+
+
+def _age(now: float, epoch_s: Any) -> Optional[float]:
+    v = _as_float(epoch_s)
+    return None if v is None or v <= 0 else max(0.0, now - v)
+
+
+def _health(value: Any, *, healthy: bool = False, reason: Optional[str] = None,
+            not_applicable: bool = False) -> Dict[str, Any]:
+    if not_applicable:
+        state = "not_applicable"
+    elif value is None:
+        state = "unknown"
+    else:
+        state = "healthy" if healthy else "unhealthy"
+    out = {"state": state, "value": value}
+    if reason:
+        out["reason"] = reason
+    return out
+
+
+def _load_json_file(path: Optional[str], warnings: WarningSink) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    p = Path(os.path.expanduser(path))
+    if not p.exists():
+        warnings.add("data source not found: %s" % p)
+        return None
+    try:
+        payload = json.loads(p.read_text())
+    except Exception as exc:
+        warnings.add("could not read JSON data source %s: %s" % (p, exc))
+        return None
+    if not isinstance(payload, dict):
+        warnings.add("JSON data source %s is %s, not an object" % (p, type(payload).__name__))
+        return None
+    return payload
+
+
+def _read_pool_heartbeat(pool: str, rel: str, warnings: WarningSink) -> Optional[Dict[str, Any]]:
+    return _load_json_file(str(Path(os.path.expanduser(pool)) / rel), warnings)
+
+
+def _kubectl_exec_json(namespace: str, target: str, path: str, warnings: WarningSink,
+                       timeout: float, limit_b: int = KUBECTL_HEARTBEAT_READ_LIMIT_B
+                       ) -> Optional[Dict[str, Any]]:
+    """Read one bounded JSON file through an existing pod/deployment; never scans the PVC."""
+    if not shutil.which("kubectl"):
+        warnings.add("kubectl is unavailable; cannot read %s from %s" % (path, target))
+        return None
+    cmd = ["kubectl", "-n", namespace, "exec", target, "--",
+           "head", "-c", str(int(limit_b)), path]
+    try:
+        proc = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=timeout)
+    except Exception as exc:
+        warnings.add("kubectl exec failed for %s:%s: %s" % (target, path, exc))
+        return None
+    if proc.returncode != 0:
+        warnings.add("kubectl exec failed for %s:%s: %s"
+                     % (target, path, (proc.stderr or proc.stdout).strip()))
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except Exception as exc:
+        warnings.add("kubectl exec returned invalid JSON for %s:%s: %s" % (target, path, exc))
+        return None
+    if not isinstance(payload, dict):
+        warnings.add("kubectl exec JSON for %s:%s is %s, not an object"
+                     % (target, path, type(payload).__name__))
+        return None
+    return payload
+
+
+def _kubectl_http_json(namespace: str, target: str, url: str, warnings: WarningSink,
+                       timeout: float, limit_b: int = KUBECTL_HEARTBEAT_READ_LIMIT_B
+                       ) -> Optional[Dict[str, Any]]:
+    if not shutil.which("kubectl"):
+        warnings.add("kubectl is unavailable; cannot read %s from %s" % (url, target))
+        return None
+    code = (
+        "import json,sys,urllib.request;"
+        "r=urllib.request.urlopen(sys.argv[1],timeout=%r);"
+        "sys.stdout.write(r.read(%d).decode('utf-8'))" % (float(timeout), int(limit_b))
+    )
+    cmd = ["kubectl", "-n", namespace, "exec", target, "--", "python3", "-c", code, url]
+    try:
+        proc = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=timeout)
+    except Exception as exc:
+        warnings.add("kubectl exec HTTP read failed for %s %s: %s" % (target, url, exc))
+        return None
+    if proc.returncode != 0:
+        warnings.add("kubectl exec HTTP read failed for %s %s: %s"
+                     % (target, url, (proc.stderr or proc.stdout).strip()))
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except Exception as exc:
+        warnings.add("kubectl exec HTTP returned invalid JSON for %s %s: %s" % (target, url, exc))
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +824,49 @@ def find_hear_drain_pods(namespace: str, warnings: WarningSink, limit: int,
     return names
 
 
+def find_pool_reader_pod(namespace: str, warnings: WarningSink,
+                         timeout: float = 20.0) -> Optional[str]:
+    """Find one running pod that already mounts the hear-pool PVC for bounded JSON reads."""
+    if not shutil.which("kubectl"):
+        warnings.add("kubectl is unavailable; cannot read pool heartbeats")
+        return None
+    labels = ("hear-annotate", "hear-tdoa", "hear-score", "hear-tag", "hear-drain")
+    selector = "app in (%s)" % ",".join(labels)
+    try:
+        proc = _run_kubectl(["-n", namespace, "get", "pods", "-l", selector, "-o", "json"],
+                            timeout)
+    except Exception as exc:
+        warnings.add("kubectl pool-reader lookup failed: %s" % exc)
+        return None
+    if proc.returncode != 0:
+        warnings.add("kubectl could not list pool-reader pods in %s: %s"
+                     % (namespace, (proc.stderr or proc.stdout).strip()))
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        warnings.add("kubectl pool-reader list returned invalid JSON: %s" % exc)
+        return None
+    items = payload.get("items") if isinstance(payload, Mapping) else None
+    if not isinstance(items, list):
+        return None
+    running = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        status = item.get("status") if isinstance(item.get("status"), Mapping) else {}
+        meta = item.get("metadata") if isinstance(item.get("metadata"), Mapping) else {}
+        name = meta.get("name")
+        if name and status.get("phase") == "Running":
+            running.append(item)
+    if not running:
+        warnings.add("no running hear-pool reader pod found")
+        return None
+    running.sort(key=_pod_sort_key, reverse=True)
+    meta = running[0].get("metadata") if isinstance(running[0].get("metadata"), Mapping) else {}
+    return str(meta.get("name"))
+
+
 def read_hear_drain_logs(namespace: str, since: str, pods: Sequence[str], warnings: WarningSink,
                          timeout: float = 45.0) -> str:
     chunks: List[str] = []
@@ -846,6 +1011,353 @@ def apply_ingestion(results: Dict[str, NodeResult], logs: str, warnings: Warning
 
 
 # ---------------------------------------------------------------------------
+# Data-state report
+
+
+def _status_clock(status: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    if not status:
+        return _health(None, reason="no /status document")
+    t = status.get("time") if isinstance(status.get("time"), Mapping) else {}
+    state = _first(status, (("time", "state"), ("clock_state",)))
+    if state is None:
+        valid = _first(status, (("time", "valid"), ("time", "synced"), ("utc_valid",)))
+        state = "LOCKED" if valid is True else ("FAULT" if valid is False else None)
+    return _health(state, healthy=str(state).upper() == "LOCKED",
+                   reason=None if state is not None else "missing time.state/time.valid")
+
+
+def _status_anchor_age(status: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    if not status:
+        return _health(None, reason="no /status document")
+    raw = _first(status, (("time", "anchor_age_us"), ("anchor_age_us",)))
+    us = _as_float(raw)
+    if us is None:
+        return _health(None, reason="status does not expose anchor_age_us")
+    return _health(us / 1_000_000.0, healthy=us >= 0)
+
+
+def _status_mic(status: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    if not status:
+        return _health(None, reason="no /status document")
+    parsed = parse_status(status)
+    value = parsed.get("mic_state") or parsed.get("mic")
+    issue = _mic_issue(parsed)
+    return _health(value, healthy=issue is None and value is not None, reason=issue)
+
+
+def _sum_recent(ring: Any, now: float, window_s: float, fields: Sequence[str]) -> Dict[str, Any]:
+    out = {f: 0 for f in fields}
+    out["runs"] = 0
+    out["unknown_runs"] = 0
+    if not isinstance(ring, list):
+        out["state"] = "unknown"
+        return out
+    for e in ring:
+        if not isinstance(e, Mapping):
+            continue
+        at = _as_float(e.get("at"))
+        if at is None or at < now - window_s:
+            continue
+        out["runs"] += 1
+        if e.get("unknown"):
+            out["unknown_runs"] += 1
+        for f in fields:
+            if e.get(f) is not None:
+                out[f] += int(e.get(f) or 0)
+    out["state"] = "healthy" if out["runs"] else "unknown"
+    return out
+
+
+def _drain_node_report(node: str, sensor: Mapping[str, Any], now: float,
+                       window_s: float) -> Dict[str, Any]:
+    age = _age(now, sensor.get("last_success_s"))
+    clips = _sum_recent(sensor.get("clips_recent"), now, window_s,
+                        ("seen", "fetched", "gone", "deferred", "probed_404"))
+    live = _sum_recent(sensor.get("live_recent"), now, window_s,
+                       ("rows", "added", "lost"))
+    unfetched = _sum_recent(sensor.get("unfetched_recent"), now, window_s, ("bytes",))
+    return {
+        "node": node,
+        "kind": sensor.get("kind"),
+        "last_success_age_s": age,
+        "last_error": sensor.get("last_error"),
+        "last_detection_added": sensor.get("last_added"),
+        "scene": {
+            "unfetched_bytes_window": unfetched.get("bytes"),
+            "unknown_runs": unfetched.get("unknown_runs"),
+            "last_reason": sensor.get("last_unfetched_reason"),
+            "state": unfetched.get("state"),
+        },
+        "clips": {
+            "named_window": clips.get("seen"),
+            "fetched_window": clips.get("fetched"),
+            "destroyed_window": clips.get("gone"),
+            "deferred_window": clips.get("deferred"),
+            "unknown_runs": clips.get("unknown_runs"),
+            "state": clips.get("state"),
+        },
+        "live_ring": {
+            "rows_window": live.get("rows"),
+            "added_window": live.get("added"),
+            "lost_window": live.get("lost"),
+            "pending": None,
+            "state": live.get("state"),
+        },
+    }
+
+
+def _workflow_report(hb: Optional[Mapping[str, Any]], now: float, window_s: float,
+                     count_fields: Sequence[str]) -> Dict[str, Any]:
+    if not hb:
+        return {"state": "unknown", "reason": "heartbeat missing", "last_run_age_s": None,
+                "window_runs": 0}
+    runs = hb.get("runs") or []
+    if not isinstance(runs, list) or not runs:
+        return {"state": "unknown", "reason": "heartbeat records no runs",
+                "last_run_age_s": _age(now, hb.get("last_run_s")), "window_runs": 0}
+    last = runs[-1] if isinstance(runs[-1], Mapping) else {}
+    window = [r for r in runs if isinstance(r, Mapping)
+              and (_as_float(r.get("at")) or 0.0) >= now - window_s] or [last]
+    totals = {f: sum(int(r.get(f) or 0) for r in window) for f in count_fields}
+    refused: Dict[str, int] = {}
+    by_node: Dict[str, Dict[str, int]] = {}
+    by_source: Dict[str, int] = {}
+    for r in window:
+        for k, v in (r.get("by_reason") or {}).items():
+            refused[k] = refused.get(k, 0) + int(v)
+        for k, v in (r.get("by_source") or {}).items():
+            by_source[k] = by_source.get(k, 0) + int(v)
+        for n, vals in (r.get("by_node") or {}).items():
+            bucket = by_node.setdefault(n, {})
+            if isinstance(vals, Mapping):
+                for k, v in vals.items():
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        bucket[k] = bucket.get(k, 0) + int(v)
+    return {
+        "state": "healthy",
+        "last_run_age_s": _age(now, hb.get("last_run_s") or last.get("at")),
+        "window_runs": len(window),
+        "latest": dict(last),
+        "window_totals": totals,
+        "reject_counts": refused,
+        "by_node_window": by_node,
+        "by_source_window": by_source,
+    }
+
+
+def _source_report(drain: Dict[str, Any], score: Dict[str, Any],
+                   tag: Dict[str, Any]) -> Dict[str, Any]:
+    sources: Dict[str, Dict[str, Any]] = {}
+    for node, n in (drain.get("nodes") or {}).items():
+        sources.setdefault(node, {})["detections_last_added"] = n.get("last_detection_added")
+        sources[node]["detection_freshness_age_s"] = n.get("last_success_age_s")
+        sources[node]["clips_named_window"] = (n.get("clips") or {}).get("named_window")
+    for node, vals in (score.get("by_node_window") or {}).items():
+        sources.setdefault(node, {})["score_window"] = vals
+    for node, vals in (tag.get("by_node_window") or {}).items():
+        sources.setdefault(node, {})["tag_window"] = vals
+    return sources
+
+
+def build_data_report(nodes: Sequence[str], statuses: Mapping[str, Mapping[str, Any]],
+                      drain_hb: Optional[Mapping[str, Any]],
+                      score_hb: Optional[Mapping[str, Any]],
+                      tag_hb: Optional[Mapping[str, Any]],
+                      durable_health: Optional[Mapping[str, Any]],
+                      now: Optional[float] = None,
+                      window_s: float = DEFAULT_DATA_WINDOW_S) -> Dict[str, Any]:
+    now = time.time() if now is None else now
+    gaps: List[str] = []
+    node_reports: Dict[str, Any] = {}
+    sensors = (drain_hb or {}).get("sensors") if isinstance(drain_hb, Mapping) else {}
+    sensors = sensors if isinstance(sensors, Mapping) else {}
+    for node in nodes:
+        st = statuses.get(node)
+        if st is None:
+            gaps.append("%s: status unknown" % node)
+        sensor = sensors.get(node) if isinstance(sensors.get(node), Mapping) else {}
+        if not sensor:
+            gaps.append("%s: drain heartbeat unknown" % node)
+        parsed = parse_status(st or {})
+        clock = _status_clock(st)
+        anchor_age = _status_anchor_age(st)
+        mic_state = _status_mic(st)
+        if clock["state"] == "unknown":
+            gaps.append("%s: clock state unknown" % node)
+        if anchor_age["state"] == "unknown":
+            gaps.append("%s: anchor age unknown" % node)
+        if mic_state["state"] == "unknown":
+            gaps.append("%s: mic state unknown" % node)
+        node_reports[node] = {
+            "firmware": None if st is None else st.get("fw"),
+            "class": parsed.get("class") if st is not None else None,
+            "clock": clock,
+            "anchor_age_s": anchor_age,
+            "mic_state": mic_state,
+            "heartbeat": _drain_node_report(node, sensor, now, window_s) if sensor else {
+                "state": "unknown", "last_success_age_s": None,
+            },
+        }
+    if drain_hb is None:
+        gaps.append("hear-drain heartbeat missing")
+    drain = {"state": "healthy" if drain_hb else "unknown", "nodes": {
+        n: _drain_node_report(n, s, now, window_s)
+        for n, s in sensors.items() if isinstance(s, Mapping)
+    }}
+    score = _workflow_report(score_hb, now, window_s,
+                             ("newly_scored", "scored", "refused", "unparseable", "silent"))
+    tag = _workflow_report(tag_hb, now, window_s,
+                           ("tagged", "refused", "already_tagged", "deferred", "unparseable"))
+    if score.get("state") == "unknown":
+        gaps.append("hear-score heartbeat missing or empty")
+    if tag.get("state") == "unknown":
+        gaps.append("hear-tag heartbeat missing or empty")
+    durable = durable_health.get("durable_store") if isinstance(durable_health, Mapping) else None
+    if durable is None and isinstance(durable_health, Mapping):
+        durable = durable_health
+    if not isinstance(durable, Mapping):
+        durable = {"state": "unknown", "backend": None, "pending_records": None}
+        gaps.append("durable heartbeat receiver health missing")
+    else:
+        durable = {
+            "state": "healthy",
+            "backend": durable.get("backend"),
+            "enabled": durable.get("enabled"),
+            "path": durable.get("path"),
+            "pending_records": durable.get("pending_records"),
+            "cache_failures": durable.get("cache_failures"),
+            "last_cache_failure_at": durable.get("last_cache_failure_at"),
+        }
+    return {
+        "schema": "dama-fleet-data-report/v1",
+        "generated_at_s": now,
+        "window_s": window_s,
+        "nodes": node_reports,
+        "sources": _source_report(drain, score, tag),
+        "workflows": {"drain": drain, "score": score, "tag": tag},
+        "ingest_reject_counts": {
+            "score": score.get("reject_counts") or {},
+            "tag": tag.get("reject_counts") or {},
+        },
+        "durable_store": durable,
+        "coverage_gaps": sorted(set(gaps)),
+    }
+
+
+def format_data_report(report: Mapping[str, Any]) -> str:
+    lines = []
+    lines.append("node                 fw           class              clock      anchor   mic        hb_age   det+  clips(named/fetch/defer/lost) scene_gap")
+    lines.append("-------------------- ------------ ------------------ ---------- -------- ---------- -------- ----- ----------------------------- ---------")
+    for node in sorted((report.get("nodes") or {})):
+        n = report["nodes"][node]
+        hb = n.get("heartbeat") or {}
+        clips = hb.get("clips") or {}
+        scene = hb.get("scene") or {}
+        clock = (n.get("clock") or {}).get("value")
+        anchor = (n.get("anchor_age_s") or {}).get("value")
+        mic = (n.get("mic_state") or {}).get("value")
+        lines.append("%-20s %-12s %-18s %-10s %-8s %-10s %-8s %-5s %5s/%-5s/%-5s/%-5s %-9s" % (
+            node,
+            str(n.get("firmware") or "UNKNOWN")[:12],
+            str(n.get("class") or "UNKNOWN")[:18],
+            str(clock or "UNKNOWN")[:10],
+            "UNKNOWN" if anchor is None else _fmt_age(float(anchor)),
+            str(mic or "UNKNOWN")[:10],
+            _fmt_age(hb.get("last_success_age_s")),
+            str(hb.get("last_detection_added") if hb.get("last_detection_added") is not None else "?"),
+            str(clips.get("named_window") if clips.get("named_window") is not None else "?"),
+            str(clips.get("fetched_window") if clips.get("fetched_window") is not None else "?"),
+            str(clips.get("deferred_window") if clips.get("deferred_window") is not None else "?"),
+            str(clips.get("destroyed_window") if clips.get("destroyed_window") is not None else "?"),
+            str((scene.get("unfetched_bytes_window")
+                 if scene.get("unfetched_bytes_window") is not None else "UNKNOWN")),
+        ))
+    wf = report.get("workflows") or {}
+    for name in ("score", "tag"):
+        w = wf.get(name) or {}
+        total = (w.get("latest") or {}).get("records_seen" if name == "score" else "index_keys")
+        lines.append("%-8s %-8s age=%s window_runs=%s total=%s window=%s rejects=%s" % (
+            name, w.get("state", "unknown"), _fmt_age(w.get("last_run_age_s")),
+            w.get("window_runs"), "UNKNOWN" if total is None else total,
+            json.dumps(w.get("window_totals") or {}, sort_keys=True),
+            json.dumps(w.get("reject_counts") or {}, sort_keys=True)))
+    durable = report.get("durable_store") or {}
+    lines.append("durable backend=%s pending=%s state=%s" % (
+        durable.get("backend") or "UNKNOWN",
+        "UNKNOWN" if durable.get("pending_records") is None else durable.get("pending_records"),
+        durable.get("state", "unknown")))
+    gaps = report.get("coverage_gaps") or []
+    lines.append("coverage gaps: %s" % ("none" if not gaps else "; ".join(gaps)))
+    return "\n".join(lines)
+
+
+def _load_status_dir(path: Optional[str], warnings: WarningSink) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    if not path:
+        return out
+    base = Path(os.path.expanduser(path))
+    if not base.exists():
+        warnings.add("status JSON directory not found: %s" % base)
+        return out
+    for p in sorted(base.glob("*.json")):
+        d = _load_json_file(str(p), warnings)
+        if d is not None:
+            out[_norm_name(str(d.get("node") or p.stem))] = d
+    return out
+
+
+def run_data_report(args: argparse.Namespace, warnings: WarningSink) -> int:
+    nodes = parse_nodes(args)
+    statuses = _load_status_dir(args.status_json_dir, warnings)
+    if not args.no_status_probe:
+        for spec in (args.node or []) + (args.nodes or []):
+            name, url = split_target(spec)
+            if name in statuses:
+                continue
+            res = fetch_status(url, args.timeout, args.retries, args.retry_backoff)
+            if res.data:
+                statuses[name] = res.data
+    pool = os.path.expanduser(args.pool)
+    drain_hb = _load_json_file(args.drain_heartbeat, warnings)
+    score_hb = _load_json_file(args.score_heartbeat, warnings)
+    tag_hb = _load_json_file(args.tag_heartbeat, warnings)
+    durable = _load_json_file(args.durable_health, warnings)
+    if args.from_kubectl:
+        pod = find_pool_reader_pod(args.namespace, warnings, args.timeout)
+        if pod:
+            remote_pool = args.pool if str(args.pool).startswith("/") else "/pool/corpus"
+            drain_hb = drain_hb or _kubectl_exec_json(
+                args.namespace, pod, str(Path(remote_pool) / POOL_HEARTBEATS["drain"]),
+                warnings, args.timeout)
+            score_hb = score_hb or _kubectl_exec_json(args.namespace, pod,
+                                                      str(Path(remote_pool)
+                                                          / POOL_HEARTBEATS["score"]),
+                                                      warnings, args.timeout)
+            tag_hb = tag_hb or _kubectl_exec_json(args.namespace, pod,
+                                                  str(Path(remote_pool) / POOL_HEARTBEATS["tag"]),
+                                                  warnings, args.timeout)
+        durable = durable or _kubectl_http_json(args.namespace, "deploy/hear-heartbeat",
+                                                "http://127.0.0.1:5051/healthz",
+                                                warnings, args.timeout)
+    else:
+        drain_hb = drain_hb or _read_pool_heartbeat(pool, POOL_HEARTBEATS["drain"], warnings)
+        score_hb = score_hb or _read_pool_heartbeat(pool, POOL_HEARTBEATS["score"], warnings)
+        tag_hb = tag_hb or _read_pool_heartbeat(pool, POOL_HEARTBEATS["tag"], warnings)
+
+    report = build_data_report(nodes, statuses, drain_hb, score_hb, tag_hb, durable,
+                               window_s=args.window_s)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(format_data_report(report))
+    if warnings.items:
+        print("\nwarnings:", file=sys.stderr)
+        for item in warnings.items:
+            print("- " + item, file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI/report
 
 
@@ -874,6 +1386,30 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("nodes", nargs="*", help="optional node names; defaults to the expected fleet")
     ap.add_argument("--node", action="append", default=[], help="node to check; repeatable")
+    ap.add_argument("--data-report", action="store_true",
+                    help="summarize fleet DATA state from bounded live/fixture sources instead "
+                         "of running the legacy three-layer online check")
+    ap.add_argument("--json", action="store_true",
+                    help="with --data-report, emit machine-readable JSON instead of the human table")
+    ap.add_argument("--pool", default=DEFAULT_POOL,
+                    help="pool root for local heartbeat files read by --data-report")
+    ap.add_argument("--window-s", type=float, default=DEFAULT_DATA_WINDOW_S,
+                    help="window for --data-report heartbeat ring totals")
+    ap.add_argument("--status-json-dir",
+                    help="fixture/source directory of per-node /status JSON files for --data-report")
+    ap.add_argument("--no-status-probe", action="store_true",
+                    help="with --data-report, do not probe node /status endpoints")
+    ap.add_argument("--drain-heartbeat",
+                    help="explicit hear-drain heartbeat.json for --data-report fixtures")
+    ap.add_argument("--score-heartbeat",
+                    help="explicit score_heartbeat.json for --data-report fixtures")
+    ap.add_argument("--tag-heartbeat",
+                    help="explicit tag_heartbeat.json for --data-report fixtures")
+    ap.add_argument("--durable-health",
+                    help="explicit hear-heartbeat /healthz JSON or durable_store object")
+    ap.add_argument("--from-kubectl", action="store_true",
+                    help="with --data-report, read bounded heartbeat JSON files from existing "
+                         "cluster pods (head -c 1MiB only; no PVC scans and no cluster writes)")
     ap.add_argument("--opnsense", default=DEFAULT_OPNSENSE, help="OPNsense base URL")
     ap.add_argument("--dhcp-endpoint", default=DEFAULT_DHCP_ENDPOINT,
                     help="OPNsense DHCP leases endpoint, relative or absolute")
@@ -896,6 +1432,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     warnings = WarningSink()
+    if args.data_report:
+        return run_data_report(args, warnings)
 
     nodes = parse_nodes(args)
     dhcp: Dict[str, str] = {}
