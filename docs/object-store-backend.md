@@ -117,20 +117,22 @@ versioning.
 
 ## Gaps that belong to the importer, not to any backend
 
-Reading the merged scaffold surfaced three things that block a live run whichever backend is
-chosen, and one of them should be fixed while the Protocol still has a single implementation.
+Reading the merged scaffold surfaced four things that block a live run whichever backend is
+chosen. All four were fixed while the Protocol still had a single implementation, which was the
+point of fixing them then: each one changes the Protocol, and changing it once is cheaper than
+changing it after an adapter exists. None of this selects, provisions or configures a backend.
 
-* **Bodies are whole objects in memory.** The staging call takes `bytes`, and the source read is a
-  single `read()`. The perch model is 392 MB. This is a correctness problem under a pod memory
-  limit, not a tuning one, and fixing it changes the Protocol.
-* **No encryption exists.** The envelope, the per-tenant-per-class KEK and the HMAC blob ids are
-  design only. Importing ambient audio and precise coordinates into a second unencrypted location,
-  on a host with no volume encryption, widens the exposure the design was written to close.
-* **`head()` carries no digest, and there is no republish path.** Verification therefore costs a
-  second full read, and the rollback ladder's "republish the previous generation" rung has no
-  mechanism yet; the two cheaper rungs do.
-* **`acquire_lease` is read-then-write.** Adequate while the importer is single-process — the
-  conditional put is the real safety property — and not to be mistaken for a distributed lock.
+| Gap | What it was | What closed it |
+| --- | --- | --- |
+| Bodies were whole objects in memory | `put_staged(bytes)` and a single `read()`; the perch model is 392 MB | `hear/objectstore/streaming.py`: a payload is a `ChunkSource` (a factory of chunk iterators), digests accumulate in flight, and `put_staged_stream`/`put_immutable_stream`/`iter_range` are the payload calls. `tests/test_objectstore_streaming.py` imports a 64 MiB object under an 8 MiB `tracemalloc` ceiling. |
+| No encryption existed | envelope, per-(tenant, class) KEK and HMAC blob ids were design only | `hear/objectstore/crypto.py`: an injected `KeyProvider`/`Cipher` boundary. The **default refuses**, so a restricted class is quarantined `key_provider_unavailable` rather than published in the clear; with a provider, the blob id is `HMAC-SHA256(K_tenant_index, plaintext digest)` and the plaintext digest exists only inside the sealed metadata. |
+| No republish path | the rollback ladder's "republish the previous generation" rung had no mechanism | `commit_pointer(..., expect_generation=...)` plus immutable per-generation records under `hear/v1/ptrgen/`. The open tail is the only object written twice, at most once per (class, partition) per run, and `superseded_by` is *derived* from the next generation rather than written back onto an immutable record. |
+| `acquire_lease` was read-then-write | two racers could be handed the same epoch, which fences neither | acquisition is now an `O_CREAT|O_EXCL` claim on an epoch-named record: one winner, and the loser is told `None`. `LocalDirBackend(conditional_put=False)` models the store that has no conditional put — its writes really do lose an update, and a commit without a live fencing lease is refused outright. |
+
+What is still **not** closed, and is not this lane's to close: `head()` still carries no digest, so
+verification costs a second read (it is a streamed read now, not a buffered one); there is no
+capability probe against a real store, because there is no store; and nothing here has been run
+against anything but synthetic fixtures.
 
 ## Where an S3 adapter may live
 
@@ -149,8 +151,12 @@ backend is ever chosen, that is a decision to take deliberately, not a lint resu
 
 1. The pool has a restore-tested backup. Unchanged, and still the hard blocker; nothing below
    matters until it passes.
-2. Staging streams instead of buffering, proven with a fixture larger than the chunk size.
-3. The encryption boundary exists in code.
+2. ~~Staging streams instead of buffering~~ — done: proven against a fixture 1,024 chunks long,
+   under a memory ceiling a buffered body cannot pass.
+3. ~~The encryption boundary exists in code~~ — the *boundary* does, and it refuses by default. A
+   **key provider and a reviewed AEAD still have to be chosen and wired**: the only cipher in the
+   repository is `HmacCtrCipher`, which declares `production_ready = False`, and the only provider
+   is `InMemoryTestKeyProvider`, whose material is a test seed that never reaches disk.
 4. The capacity reservation is renegotiated against the 52 GB figure rather than the 240 G one.
 
 ## The open questions, stated as choices

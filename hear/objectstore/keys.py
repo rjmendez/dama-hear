@@ -37,6 +37,24 @@ CLASSES = frozenset({
 #: digest of guessable content is a confirmation oracle (key design §8).
 RESTRICTED_CLASSES = frozenset({"clip", "raw"})
 
+#: The governance labels that travel with an object in the CLEAR part of its metadata. The label
+#: is clear precisely so a reader can refuse an object without opening it; the thing the label
+#: describes -- a 7-decimal coordinate, an ambient recording -- is inside the sealed sub-document
+#: and appears in no key, index or log line (key design §8, `docs/data-governance.md`).
+SENSITIVITY = {
+    "clip": ("ambient_audio",),
+    "raw": ("ambient_audio", "precise_location"),
+    "tdoa-arrival-seg": ("precise_location",),
+    "tdoa-run": ("precise_location",),
+}
+
+
+def pointer_generation_prefix(object_key: str) -> str:
+    """Where the immutable per-generation records of one pointer live, beside it and not under it."""
+    if "/obj/" not in object_key:
+        raise ValueError("not an object pointer key: %r" % (object_key,))
+    return object_key.replace("/obj/", "/ptrgen/", 1) + "/"
+
 
 def canonical_json(doc: Dict[str, Any]) -> bytes:
     """The one canonical serialisation: sorted keys, compact separators, UTF-8."""
