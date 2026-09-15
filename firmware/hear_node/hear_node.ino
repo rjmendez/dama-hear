@@ -101,7 +101,8 @@ static bool prov_loaded = false;    // ...and it was read back from NVS, not onl
 
 #include <hear_net.h>
 static hear_net_join_t net_join;
-static uint32_t loop_max_us = 0, loop_max_boot_us = 0;   // longest loop() pass: this health row, and boot
+static uint32_t loop_max_us = 0, loop_max_boot_us = 0;   // longest loop() pass: this health row, and since boot
+static uint32_t loop_max_boot_at_s = 0;                   // uptime at which the since-boot longest pass ended
 static uint32_t stream_stall_n = 0, stream_gone_n = 0;    // sends that gave up: stalled, client gone
 static const char *selftest_mic = "untested";
 static const char *selftest_gps = "untested";
@@ -406,46 +407,31 @@ static uint32_t prev_edge_n = 0;
 static uint32_t boot_ms = 0;
 
 static portMUX_TYPE time_mux = portMUX_INITIALIZER_UNLOCKED;
-struct PendingEdgeSnapshot { uint64_t local_us; uint32_t edge_n; };
-struct TimeAnchorSnapshot { uint64_t local_us; int64_t unix_us; bool valid; };
-struct PpsCaptureSnapshot { uint32_t count; uint64_t prev_us; uint64_t last_us; uint32_t prev_sample; };
-
-static PendingEdgeSnapshot pending_edge_snapshot() {
-  PendingEdgeSnapshot s;
+static void pending_pps_label(uint64_t *local_us, uint32_t *edge_n) {
   portENTER_CRITICAL(&time_mux);
-  s.local_us = pend_local_us;
-  s.edge_n = pend_edge_n;
-  portEXIT_CRITICAL(&time_mux);
-  return s;
-}
-
-static PpsCaptureSnapshot pps_capture_snapshot() {
-  PpsCaptureSnapshot s;
-  portENTER_CRITICAL(&time_mux);
-  s.count = pps_count;
-  s.prev_us = pps_us_prev;
-  s.last_us = pps_us_last;
-  s.prev_sample = pps_samp_prev_exact;
-  portEXIT_CRITICAL(&time_mux);
-  return s;
-}
-
-static void time_anchor_commit(uint64_t local_us, int64_t unix_us) {
-  portENTER_CRITICAL(&time_mux);
-  edge_local_us = local_us;
-  edge_unix_us = unix_us;
-  time_valid = true;
+  *local_us = pend_local_us;
+  *edge_n = pend_edge_n;
   portEXIT_CRITICAL(&time_mux);
 }
 
-static TimeAnchorSnapshot time_anchor_snapshot() {
-  TimeAnchorSnapshot s;
+static void pps_capture_snapshot(uint32_t *count, uint64_t *prev_us,
+                                 uint64_t *last_us, uint32_t *prev_sample) {
   portENTER_CRITICAL(&time_mux);
-  s.local_us = edge_local_us;
-  s.unix_us = edge_unix_us;
-  s.valid = time_valid && edge_unix_us != 0;
+  *count = pps_count;
+  *prev_us = pps_us_prev;
+  *last_us = pps_us_last;
+  *prev_sample = pps_samp_prev_exact;
   portEXIT_CRITICAL(&time_mux);
-  return s;
+}
+
+static bool time_anchor_snapshot(uint64_t *local_us, int64_t *unix_us) {
+  bool valid;
+  portENTER_CRITICAL(&time_mux);
+  *local_us = edge_local_us;
+  *unix_us = edge_unix_us;
+  valid = time_valid && edge_unix_us != 0;
+  portEXIT_CRITICAL(&time_mux);
+  return valid;
 }
 
 // ⚠️time_glitch (published as `label_rejects`) IS NOT THE LOSS COUNTER, AND IT WAS READ AS ONE.
@@ -655,23 +641,28 @@ static void pmtk_parse_rmc(const char *s) {
   int dy = nmea_dec2(dt), mo = nmea_dec2(dt + 2), yy = nmea_dec2(dt + 4);
   if (hh < 0 || mi < 0 || ss < 0 || dy < 1 || mo < 1 || mo > 12 || yy < 0) return;
   long long unix_s = civil_to_unix_s(2000 + yy, mo, dy, hh, mi, ss);
+  uint64_t pend_local = 0; uint32_t pend_edge = 0;
+  pending_pps_label(&pend_local, &pend_edge);
   uint64_t now_us = (uint64_t)esp_timer_get_time();
-  PendingEdgeSnapshot pend = pending_edge_snapshot();
-  if (pend.edge_n && (now_us - pend.local_us) < 900000ULL) {
+  if (pend_edge && (now_us - pend_local) < 900000ULL) {
     bool ok = true;
     if (prev_edge_n && prev_unix_s) {
       long long d_sec = unix_s - prev_unix_s;
-      long long d_edge = (long long)pend.edge_n - (long long)prev_edge_n;
+      long long d_edge = (long long)pend_edge - (long long)prev_edge_n;
       if (d_sec != d_edge) { ok = false; pmtk_glitch++; }
     }
     if (ok) {
-      time_anchor_commit(pend.local_us, (int64_t)unix_s * 1000000LL);
+      portENTER_CRITICAL(&time_mux);
+      edge_local_us = pend_local;
+      edge_unix_us = (int64_t)unix_s * 1000000LL;
+      time_valid = true;
+      portEXIT_CRITICAL(&time_mux);
       if (!first_label_s) {
         uint32_t up = (millis() - boot_ms) / 1000;
         first_label_s = up ? up : 1;
       }
     }
-    prev_unix_s = unix_s; prev_edge_n = pend.edge_n;
+    prev_unix_s = unix_s; prev_edge_n = pend_edge;
   }
 }
 
@@ -1200,8 +1191,9 @@ static void ubx_msg() {
         // Only label an edge we actually saw, and only if this solution is for THAT second: the
         // report follows its own epoch by well under a second. Outside that window we do not
         // guess -- an unlabelled edge is honest, a mislabelled one is 343 m of lie.
-        PendingEdgeSnapshot pend = pending_edge_snapshot();
-        if (pend.edge_n && (now_us - pend.local_us) < 900000ULL) {
+        uint64_t pend_local = 0; uint32_t pend_edge = 0;
+        pending_pps_label(&pend_local, &pend_edge);
+        if (pend_edge && (now_us - pend_local) < 900000ULL) {
           // The time window alone is not enough. NAV-PVT's own epoch sits ~200 ms past the second
           // here, so a LATE report can arrive just after the NEXT edge and land inside the window
           // -- labelling that edge with the previous second. That is the 343 m error, and it looks
@@ -1209,11 +1201,15 @@ static void ubx_msg() {
           bool ok = true;
           if (prev_edge_n && prev_unix_s) {
             long long d_sec = (long long)unix_s - prev_unix_s;
-            long long d_edge = (long long)pend.edge_n - (long long)prev_edge_n;
+            long long d_edge = (long long)pend_edge - (long long)prev_edge_n;
             if (d_sec != d_edge) { ok = false; time_glitch++; }
           }
           if (ok) {                                   // commit local+utc as one matched pair
-            time_anchor_commit(pend.local_us, (int64_t)unix_s * 1000000LL);
+            portENTER_CRITICAL(&time_mux);
+            edge_local_us = pend_local;
+            edge_unix_us = (int64_t)unix_s * 1000000LL;
+            time_valid = true;
+            portEXIT_CRITICAL(&time_mux);
             // Latched once. The gap between this and 0 is the node's real time-to-first-label,
             // and until now the only way to bound it was to notice that a detection had no
             // stamp -- which needs a detection to have happened.
@@ -1222,7 +1218,7 @@ static void ubx_msg() {
               first_label_s = up ? up : 1;            // 0 stays reserved for "never"
             }
           }
-          prev_unix_s = unix_s; prev_edge_n = pend.edge_n;     // re-sync either way
+          prev_unix_s = unix_s; prev_edge_n = pend_edge;   // re-sync either way
         }
       }
     }
@@ -1620,9 +1616,9 @@ static float env_peak_seen = 0;
 // silence visible instead of invisible.
 static bool local_to_utc(uint64_t local_us, int64_t *utc_us) {
   if (!utc_us) return false;
-  TimeAnchorSnapshot a = time_anchor_snapshot();
-  if (!a.valid) return false;
-  *utc_us = a.unix_us + (int64_t)(local_us - a.local_us);
+  uint64_t edge_local = 0; int64_t edge_unix = 0;
+  if (!time_anchor_snapshot(&edge_local, &edge_unix)) return false;
+  *utc_us = edge_unix + (int64_t)(local_us - edge_local);
   return true;
 }
 
@@ -1685,9 +1681,8 @@ static bool local_to_utc(uint64_t local_us, int64_t *utc_us) {
 // 0 means NO STAMP: the caller writes an empty column rather than a number, because 0 ns of
 // uncertainty is a claim no hardware supports and hear/nodeclass.py refuses it as one.
 static uint64_t stamp_sigma_ns(uint64_t local_us) {
-  TimeAnchorSnapshot a = time_anchor_snapshot();
-  if (!a.valid) return 0;
-  uint64_t edge_local_us = a.local_us;
+  uint64_t edge_local_us = 0; int64_t edge_unix_us = 0;
+  if (!time_anchor_snapshot(&edge_local_us, &edge_unix_us)) return 0;
   // A back-dated capture can precede the anchor edge; the magnitude of the interpolation is what
   // carries the drift either way.
   uint64_t age_us = local_us >= edge_local_us ? local_us - edge_local_us : edge_local_us - local_us;
@@ -2889,8 +2884,9 @@ static String status_json() {
   uint32_t esp_n = 0; double esp_ppm = esp_clock_ppm(&esp_n);
   int64_t utc_now = 0; uint64_t nowl = (uint64_t)esp_timer_get_time();
   bool tv = local_to_utc(nowl, &utc_now);
-  TimeAnchorSnapshot anchor = time_anchor_snapshot();
-  uint64_t since_edge = (pps_count && anchor.valid) ? (nowl - anchor.local_us) : 0;
+  uint64_t anchor_local_us = 0; int64_t anchor_unix_us = 0;
+  bool anchor_valid = time_anchor_snapshot(&anchor_local_us, &anchor_unix_us);
+  uint64_t since_edge = (pps_count && anchor_valid) ? (nowl - anchor_local_us) : 0;
   (void)tv;
   uint32_t r_new = g_samples, r_old = praw_oldest();
   uint32_t r_held = praw_cap ? r_new - r_old : 0;
@@ -2930,7 +2926,7 @@ static String status_json() {
     "\"net\":{\"connected\":%s,\"rssi\":%s,\"rssi_join\":%d,\"ch\":%d,\"bssid\":\"%s\",\"joined\":%d,"
       "\"seen\":%d,\"join_ms\":%lu,\"disc\":%lu,\"reconn\":%lu,\"reason\":%d,\"disc_age_s\":%s},"
     "\"sys\":{\"reset\":\"%s\",\"heap_min\":%lu,\"psram_min\":%lu,\"loop_max_ms\":%lu,"
-      "\"loop_max_boot_ms\":%lu,\"chip_c\":%.1f,\"stream_stalls\":%lu,\"stream_gone\":%lu},"
+      "\"loop_max_boot_ms\":%lu,\"loop_max_boot_at_s\":%lu,\"chip_c\":%.1f,\"stream_stalls\":%lu,\"stream_gone\":%lu},"
     "\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"pmtk_ack\":%lu,\"pmtk_nak\":%lu,\"pmtk_glitch\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
@@ -3005,7 +3001,8 @@ static String status_json() {
     (unsigned long)hear_net_disconnects(), (unsigned long)hear_net_reconnects(),
     hear_net_last_reason(), disc_age_json(),
     reset_reason_name(), (unsigned long)ESP.getMinFreeHeap(), (unsigned long)ESP.getMinFreePsram(),
-    (unsigned long)(loop_max_us / 1000), (unsigned long)(loop_max_boot_us / 1000), temperatureRead(),
+    (unsigned long)(loop_max_us / 1000), (unsigned long)(loop_max_boot_us / 1000),
+    (unsigned long)loop_max_boot_at_s, temperatureRead(),
     (unsigned long)stream_stall_n, (unsigned long)stream_gone_n,
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
@@ -3031,7 +3028,7 @@ static String status_json() {
     fs_timebase(), (unsigned long)drop_seconds,
     (unsigned long)drop_samples, (unsigned long)over_seconds, (unsigned long)samp_sec_last,
     esp_ppm, (unsigned long)esp_n,
-    anchor.valid ? "true" : "false", (long long)utc_now, (unsigned long long)since_edge,
+    anchor_valid ? "true" : "false", (long long)utc_now, (unsigned long long)since_edge,
     (unsigned long long)stamp_sigma_ns(nowl),
     (long)last_nano, (unsigned long)time_glitch,
     (unsigned long)dets_unlabelled, (unsigned long)first_label_s,
@@ -3106,8 +3103,8 @@ static void h_dets() {
   uint32_t n = total < det_cap ? total : det_cap;
   if (n > DETS_HTTP_MAX) n = DETS_HTTP_MAX;
   uint32_t first = total - n;                 // ring: the newest n, oldest first
-  String o = "[";
-  o.reserve(n * (MELIMP_FRAME_BYTES * 2 + 280) + 64);
+  http.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  http.send(200, "application/json", "[");
   for (uint32_t k = first; k < total; k++) {
     const Det &d = dets[k % det_cap];
     char b[240];
@@ -3118,10 +3115,12 @@ static void h_dets() {
              (unsigned long)d.uptime_s, (unsigned long)d.sample,
              (unsigned long)d.pps_n, (long)d.us_since_pps, d.trigger, (unsigned)d.flags, d.fs_at,
              MELIMP_FRAME_BYTES);
-    o += b;
+    http.sendContent(b);
     static const char hx[] = "0123456789abcdef";
+    String frame;
+    frame.reserve(MELIMP_FRAME_BYTES * 2);
     for (int j = 0; j < MELIMP_FRAME_BYTES; j++) {
-      o += hx[d.frame[j] >> 4]; o += hx[d.frame[j] & 0xF];
+      frame += hx[d.frame[j] >> 4]; frame += hx[d.frame[j] & 0xF];
     }
     // ⚠️tools/hear_bridge.py's rows_from_detections() selects DETS_COLUMNS[:-1], so these two keys
     // are dropped on that path until that list grows. They are here anyway: /detections is also
@@ -3130,10 +3129,10 @@ static void h_dets() {
     char cp[80] = "";
     if (d.clip_st == CLIP_OK) clip_name(cp, sizeof cp, d.cseq, d.sample);
     snprintf(t, sizeof t, "\",\"clip\":\"%s\",\"clip_why\":\"%s\"}", cp, clip_why(d.clip_st));
-    o += t;
+    http.sendContent(frame + t);
   }
-  o += "]";
-  http.send(200, "application/json", o);
+  http.sendContent("]");
+  http.sendContent("");
 }
 
 // Hoisted above setup(): /format must close this before it unmounts, and the section that
@@ -3236,24 +3235,41 @@ static bool gps_autobaud() {
       logf("gps   measured %lu us/bit -> %lu baud (%.1f%% off standard), trying it first\n",
            (unsigned long)bit_us, (unsigned long)measured, (double)snap_err);
     uint32_t best_b = 0; int best_score = 0; bool best_ubx = false;
-    for (unsigned k = 0; k < nc; k++) {
+    int cnm = 0, cub = 0;
+    bool confirmed = false;
+    for (unsigned k = 0; k < nc && !confirmed; k++) {
       Serial1.begin(cand[k], SERIAL_8N1, gps_rx_pin, gps_tx_pin);
       int nm = 0, ub = 0;
       gps_listen(1200, &nm, &ub);
       logf("gps   %6lu baud -> %d NMEA, %d UBX\n", (unsigned long)cand[k], nm, ub);
       int score = nm + ub;
       if (score > best_score) { best_score = score; best_b = cand[k]; best_ubx = (ub > nm); }
-      Serial1.end();
+      // A rate that already reaches the quorum is confirmed here, and a confirmed rate ends the
+      // sweep: the remaining dwells cannot beat a link that has decoded twice.
+      if (score >= GPS_DECODE_QUORUM) {
+        cnm = 0; cub = 0;
+        gps_listen(GPS_CONFIRM_MS, &cnm, &cub);
+        confirmed = (cnm + cub) >= GPS_DECODE_QUORUM;
+        if (confirmed) {
+          best_b = cand[k]; best_ubx = (cub > cnm); gps_baud = cand[k];
+          logf("gps   %lu baud confirmed after %u of %u rates\n",
+               (unsigned long)cand[k], k + 1, nc);
+        }
+      }
+      if (!confirmed) Serial1.end();
       boot_wdt_service();
     }
-    gps_baud = best_b ? best_b : 9600;
-    Serial1.begin(gps_baud, SERIAL_8N1, gps_rx_pin, gps_tx_pin);
-    // Confirm the winner rather than trusting its sweep score. A rate that only ever scored
-    // once has not been distinguished from noise, and reporting it as a decoded link is what
-    // stops the caller trying the other pin order.
-    int cnm = 0, cub = 0;
-    gps_listen(GPS_CONFIRM_MS, &cnm, &cub);
-    bool confirmed = best_b && (cnm + cub) >= GPS_DECODE_QUORUM;
+    if (!confirmed) {
+      gps_baud = best_b ? best_b : 9600;
+      Serial1.begin(gps_baud, SERIAL_8N1, gps_rx_pin, gps_tx_pin);
+      // Confirm the winner rather than trusting its sweep score. A rate that only ever scored
+      // once has not been distinguished from noise, and reporting it as a decoded link is what
+      // stops the caller trying the other pin order.
+      cnm = 0; cub = 0;
+      gps_listen(GPS_CONFIRM_MS, &cnm, &cub);
+      confirmed = best_b && (cnm + cub) >= GPS_DECODE_QUORUM;
+      if (cnm + cub) best_ubx = (cub > cnm);
+    }
     logf("gps   using %lu baud (%s) -- confirm %d NMEA, %d UBX in %d ms: %s\n",
                   (unsigned long)gps_baud, best_ubx ? "UBX binary" : "NMEA",
                   cnm, cub, GPS_CONFIRM_MS,
@@ -4732,7 +4748,7 @@ void loop() {
     if (last_us) {
       uint32_t d = now - last_us;
       if (d > loop_max_us) loop_max_us = d;
-      if (d > loop_max_boot_us) loop_max_boot_us = d;
+      if (d > loop_max_boot_us) { loop_max_boot_us = d; loop_max_boot_at_s = (millis() - boot_ms) / 1000; }
     }
     last_us = now; }
   http.handleClient();
@@ -4843,20 +4859,22 @@ void loop() {
         // or refuses.) Only when exactly one edge has passed, because a blocking handler can
         // straddle two, and then the timestamp and the sample count describe different seconds.
         if (span == 1) {
-          PpsCaptureSnapshot cap = pps_capture_snapshot();
-          if (cap.count == e) {
+          uint32_t cap_count = 0, cap_prev_sample = 0;
+          uint64_t cap_prev_us = 0, cap_last_us = 0;
+          pps_capture_snapshot(&cap_count, &cap_prev_us, &cap_last_us, &cap_prev_sample);
+          if (cap_count == e) {
             // The crystal figure, accumulated where the pair can be validated rather than in the
             // ISR. An interval that is not about a second means an EDGE WENT MISSING -- pps_count
             // did not advance for it, so anything computed per counted edge is short by one. Both
             // it and the interval that spans a timepulse probe are counted and excluded, never
             // averaged: that exclusion IS the fix to esp_clock_ppm.
-            uint32_t iv = (uint32_t)(cap.last_us - cap.prev_us);
+            uint32_t iv = (uint32_t)(cap_last_us - cap_prev_us);
             if (probed)                     { /* the probe moved the clock: measures nothing */ }
             else if (iv > 1500000u)         { pps_gaps++; }
             else                            { esp_iv_sum_us += iv; esp_iv_n++; }
             int64_t mu;
-            if (local_to_utc(cap.prev_us, &mu)) {
-              praw_mark_push(mu, cap.prev_sample);
+            if (local_to_utc(cap_prev_us, &mu)) {
+              praw_mark_push(mu, cap_prev_sample);
             }
           }
         }

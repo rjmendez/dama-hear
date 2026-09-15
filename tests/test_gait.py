@@ -1,5 +1,6 @@
 import json
 import math
+from types import SimpleNamespace
 import numpy as np
 import pytest
 
@@ -22,7 +23,6 @@ from hear.gait import (
     detect_footstep_impacts,
     estimate_cadence_and_cv,
 )
-from hear.live_runner_solver import PhoneTelemetry
 
 
 def test_crest_factor_computation():
@@ -257,7 +257,7 @@ def test_phone_telemetry_and_mqtt_ingestion():
     classifier = GaitBiomechanicalClassifier(imu_fs=100.0)
 
     # PhoneTelemetry compatibility
-    phone = PhoneTelemetry(phone_id="phone-test", ip="192.168.1.50")
+    phone = SimpleNamespace(phone_id="phone-test", ip="192.168.1.50")
     phone.imu_z = list(np.ones(300) * 9.81)
     phone.audio = list(np.zeros(3000))
 
