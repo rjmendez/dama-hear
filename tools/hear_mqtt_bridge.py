@@ -28,6 +28,7 @@ import paho.mqtt.client as mqtt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools.hear_heartbeat_receiver import (  # noqa: E402
+    DurablePruneWorker,
     DurableReplayWorker,
     HeartbeatReceiverStore,
     RequestError,
@@ -303,6 +304,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     replay_worker = DurableReplayWorker(
         store, args.durable_replay_interval_s, args.durable_replay_limit,
         name="hear-mqtt-bridge-replay")
+    prune_worker = DurablePruneWorker(
+        store, args.durable_prune_interval_s, args.durable_retention_days,
+        name="hear-mqtt-bridge-prune")
     logger.info("MQTT broker -> %s:%s topic=%s", args.mqtt_host, args.mqtt_port, args.mqtt_topic)
     try:
         client = make_client(
@@ -318,6 +322,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         client.loop_forever()
     finally:
         replay_worker.stop()
+        prune_worker.stop()
     return 0
 
 
