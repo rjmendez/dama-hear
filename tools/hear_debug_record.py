@@ -168,10 +168,10 @@ def extract_and_delete(workspace: str, body: bytes, basename: str) -> Tuple[Dict
 
 
 def _candidate_rows(node: str, ip: str, start_s: float, end_s: float,
-                    timeout: float) -> List[Dict[str, Any]]:
+                    deadline: float, timeout: float) -> List[Dict[str, Any]]:
     bodies = []
     for name in HD.DETS_FILES:
-        body = HD.fetch_sd(ip, name, timeout)
+        body = HD.fetch_sd(ip, name, _remaining(deadline, timeout))
         if body:
             bodies.append((name, body))
     candidates = [
@@ -223,7 +223,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     "allowlisted target %s reported node identity %r" % (node, reported))
             candidates = _candidate_rows(
                 node, ip, args.window_start.timestamp(), args.window_end.timestamp(),
-                _remaining(deadline, args.timeout))
+                deadline, args.timeout)
             audit["candidates_in_window"] = len(candidates)
             for candidate in candidates[:args.clip_count]:
                 if time.time() >= deadline:

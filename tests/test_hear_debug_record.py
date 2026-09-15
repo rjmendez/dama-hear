@@ -74,6 +74,17 @@ class TestRequestGate:
 
 
 class TestEphemeralCapture:
+    def test_candidate_fetches_recompute_the_remaining_ttl(self, monkeypatch):
+        remaining = iter((9.0, 4.0))
+        seen = []
+        monkeypatch.setattr(DR, "_remaining", lambda deadline, timeout: next(remaining))
+        monkeypatch.setattr(
+            DR.HD, "fetch_sd",
+            lambda ip, name, timeout: seen.append((name, timeout)))
+
+        assert DR._candidate_rows("nyquist", "10.0.0.1", 0, 1, 10, 10) == []
+        assert seen == [("dets.csv", 9.0), ("dets-prev.csv", 4.0)]
+
     def test_extracts_derived_output_and_proves_raw_deletion(self, tmp_path, monkeypatch):
         when = dt.datetime(2026, 9, 15, 18, 2, tzinfo=dt.timezone.utc).timestamp()
         candidates = [_candidate(100, when), _candidate(200, when + 1)]
@@ -82,7 +93,7 @@ class TestEphemeralCapture:
         monkeypatch.setattr(DR.HD, "fetch_status",
                             lambda ip, timeout: {"node": "nyquist"})
         monkeypatch.setattr(DR, "_candidate_rows",
-                            lambda node, ip, start, end, timeout: candidates)
+                            lambda node, ip, start, end, deadline, timeout: candidates)
         monkeypatch.setattr(DR.HD, "fetch_clip",
                             lambda ip, name, timeout, max_bytes=None: (_wav(), None))
         real_tempdir = DR.tempfile.TemporaryDirectory
@@ -113,7 +124,7 @@ class TestEphemeralCapture:
         monkeypatch.setattr(DR.HD, "fetch_status",
                             lambda ip, timeout: {"node": "nyquist"})
         monkeypatch.setattr(DR, "_candidate_rows",
-                            lambda node, ip, start, end, timeout: candidates)
+                            lambda node, ip, start, end, deadline, timeout: candidates)
         def bounded(ip, name, timeout, max_bytes=None):
             return ((None, "byte_cap") if len(body) > max_bytes else (body, None))
 
@@ -148,7 +159,7 @@ class TestEphemeralCapture:
         monkeypatch.setattr(DR.HD, "fetch_status",
                             lambda ip, timeout: {"node": "nyquist"})
         monkeypatch.setattr(DR, "_candidate_rows",
-                            lambda node, ip, start, end, timeout: [candidate])
+                            lambda node, ip, start, end, deadline, timeout: [candidate])
         monkeypatch.setattr(DR.HD, "fetch_clip",
                             lambda *args, **kwargs: called.append(args))
 

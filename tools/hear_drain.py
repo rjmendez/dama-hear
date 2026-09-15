@@ -1941,6 +1941,12 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
                            "clips_unknown": True,
                            "clips_reason": "the run ended before the clip lane ran",
                            "prune": None}
+    if clip_max_per_node <= 0:
+        try:
+            out["prune"] = CL.prune(pl.root, clip_store_max_bytes, stamp)
+        except Exception as e:
+            out["errors"].append("clips prune: %r" % (e,))
+            out["clips_reason"] = "privacy-mode pruning failed: %r" % (e,)
     try:
         st = fetch_status(ip, timeout)
     except Exception as e:
@@ -2146,11 +2152,6 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
     # clips/<day>/<node>/.
     if clip_max_per_node <= 0:
         out["clips_reason"] = "the clip lane is disabled (--clip-max-per-node 0)"
-        try:
-            out["prune"] = CL.prune(pl.root, clip_store_max_bytes, stamp)
-        except Exception as e:
-            out["errors"].append("clips prune: %r" % (e,))
-            out["clips_reason"] += "; pruning failed: %r" % (e,)
     elif DETS_FILES[0] in dets_failed:
         # No live dets file means no discoverable names. That is an UNMEASURED run for the clip
         # lane, not a clean one: the clips are still on the card and nothing here looked.
