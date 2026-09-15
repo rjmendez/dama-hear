@@ -51,4 +51,46 @@ HEAR_PG_TEST_DSN=postgresql://postgres@127.0.0.1:5432/hear_scratch python3 -m py
 
 It drops the `hear` schema at the end. Do not point it at anything you care about.
 
+## The ephemeral suite
+
+`tests/test_hear_durable_pg_store_parity.py` is the behavioural half: it checks that the schema
+behaves like the SQLite store the receiver ships today wherever the two must agree, and
+deliberately differently only where the audit says it must. It does not need a scratch database
+that someone prepared -- `tools/hear_durable_pg_testdb.py` creates one per test, applies the
+migrations, and drops it afterwards. `HEAR_PG_TEST_DSN` therefore points at the *server*, and
+only databases named `hear_test_<random>` are ever created, written to, or dropped.
+
+```bash
+# any throwaway server; a container is the usual one
+docker run --rm -d --name pg -e POSTGRES_PASSWORD=scratch postgres:16
+export HEAR_PG_TEST_DSN=postgresql://postgres:scratch@127.0.0.1:5432/postgres
+
+python3 tools/hear_durable_pg_testdb.py --self-test    # apply, re-apply, exercise, roll back
+python3 -m pytest tests/test_hear_durable_pg_store_parity.py -q
+```
+
+Without `HEAR_PG_TEST_DSN` the live tests skip and the file-level ones still run. CI runs the
+whole thing against a `postgres:16` service container in the `durable outbox on an ephemeral
+postgres` job, with `HEAR_PG_REQUIRE_LIVE=1` so a missing server fails the job instead of
+skipping it green.
+
+What it asserts, beyond the DDL-shape checks in `test_hear_durable_pg_schema.py`:
+
+| | invariant |
+| --- | --- |
+| `PAR01` | the replayed bytes are the arrived bytes; `jsonb` is a projection, never the replay source |
+| `PAR02` | identity is device-scoped: four devices sharing one uid keep four records and four bodies |
+| `PAR03` | claim order is (due, arrival) order, which is what makes replay monotonic |
+| `PAR04` | claim → publish is atomic, and a second publish is a reported no-op |
+| `PAR05` | a lease expires on time and only then; an abandoned record is re-drainable, not retried-against |
+| `PAR06` | attempts count up, backoff grows and is capped, the cap quarantines instead of dropping |
+| `PAR07` | health is counter reads and partial-index reads: its cost tracks the backlog, not the ledger |
+| `PAR08` | backfill imports already-cached history as published and never republishes it |
+| `PAR09` | the default partition is never dropped, unpublished history is never dropped, dry run drops nothing |
+| `PAR10` | the store seam is complete: every `DurableRecordStore` method has exactly one counterpart |
+
+The concurrency rules (`SKIP LOCKED` disjoint claims, one publish under a race, a rolled-back
+claim) are asserted from two simultaneous `psql` sessions, because a single connection cannot
+demonstrate them.
+
 Requires PostgreSQL 15 or newer; validated on 16.
