@@ -5,6 +5,7 @@ import socket
 import sqlite3
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -15,63 +16,81 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools import hear_heartbeat_receiver as HR  # noqa: E402
 
 
+class _FakeDedupeScript:
+    """Stands in for the redis-py Script object returned by ``client.register_script``."""
+
+    def __init__(self, client: "FakeRedis"):
+        self._client = client
+
+    def __call__(self, keys=None, args=None):
+        return self._client._eval_dedupe_write(keys or [], args or [])
+
+
 class FakeRedis:
-    def __init__(self, failures_before_success: int = 0):
+    """A minimal in-memory double for the one Redis surface RedisHeartbeatCache uses: a single
+    atomic dedupe-and-write Lua script (``register_script`` + a callable ``Script``-like object).
+
+    ``failures_before_success`` simulates a clean outage: the script never reaches Redis (or
+    Redis rejects it outright), so nothing is mutated before the exception is raised.
+    ``ambiguous_failures_before_success`` simulates the crash/ambiguous-ACK window this receiver
+    must tolerate: Redis fully applies the script (including the dedupe marker) but the caller
+    never learns of the success (e.g. the connection drops before the reply arrives), so the
+    caller retries. Because the dedupe marker is already recorded, the retry must no-op instead
+    of duplicating the stream/event write.
+    """
+
+    def __init__(self, failures_before_success: int = 0,
+                ambiguous_failures_before_success: int = 0):
         self.values = {}
         self.ttls = {}
         self.sets = {}
         self.streams = {}
         self.failures_before_success = failures_before_success
+        self.ambiguous_failures_before_success = ambiguous_failures_before_success
         self.execute_calls = 0
-        self._ops = []
+        self.dedupe = {}
+        self._dedupe_seq = 0
 
-    def pipeline(self, transaction=False):
-        assert transaction is False
-        self._ops = []
-        return self
+    def register_script(self, script: str) -> _FakeDedupeScript:
+        return _FakeDedupeScript(self)
 
-    def setex(self, key, ttl, value):
-        self._ops.append(("setex", key, ttl, value))
-        return self
-
-    def sadd(self, key, *members):
-        self._ops.append(("sadd", key, members))
-        return self
-
-    def set(self, key, value):
-        self._ops.append(("set", key, value))
-        return self
-
-    def xadd(self, key, fields, maxlen=None, approximate=True):
-        self._ops.append(("xadd", key, dict(fields), maxlen, approximate))
-        return str(len(self.streams.get(key, [])) + 1)
-
-    def execute(self):
+    def _eval_dedupe_write(self, keys, args):
         self.execute_calls += 1
-        ops, self._ops = self._ops, []
         if self.failures_before_success > 0:
             self.failures_before_success -= 1
             raise RuntimeError("simulated redis outage")
-        for op in ops:
-            kind = op[0]
-            if kind == "setex":
-                _, key, ttl, value = op
-                self.values[key] = value
-                self.ttls[key] = ttl
-            elif kind == "sadd":
-                _, key, members = op
-                self.sets.setdefault(key, set()).update(members)
-            elif kind == "set":
-                _, key, value = op
-                self.values[key] = value
-            elif kind == "xadd":
-                _, key, fields, maxlen, approximate = op
-                stream = self.streams.setdefault(key, [])
-                stream.append(fields)
-                if maxlen is not None and len(stream) > maxlen:
-                    del stream[:-maxlen]
-                assert approximate is True
-        return []
+
+        dedupe_key, hb_key, devices_key, latest_key, event_key, stream_key = keys
+        record_uid, telemetry_path, node_id, body_json, ttl_s, maxlen = args
+        ttl_s, maxlen = int(ttl_s), int(maxlen)
+
+        if record_uid in self.dedupe:
+            return 0
+
+        if telemetry_path == "hear/heartbeat":
+            self.values[hb_key] = body_json
+            self.ttls[hb_key] = ttl_s
+            self.sets.setdefault(devices_key, set()).add(node_id)
+            self.values[latest_key] = body_json
+        else:
+            self.sets.setdefault(devices_key, set()).add(node_id)
+            self.values[event_key] = body_json
+            stream = self.streams.setdefault(stream_key, [])
+            stream.append({"device_id": node_id, "payload": body_json})
+            if len(stream) > maxlen:
+                del stream[:-maxlen]
+
+        self._dedupe_seq += 1
+        self.dedupe[record_uid] = self._dedupe_seq
+        if len(self.dedupe) > maxlen:
+            oldest = sorted(self.dedupe.items(), key=lambda kv: kv[1])[:len(self.dedupe) - maxlen]
+            for stale_uid, _ in oldest:
+                del self.dedupe[stale_uid]
+
+        if self.ambiguous_failures_before_success > 0:
+            self.ambiguous_failures_before_success -= 1
+            raise RuntimeError("simulated ambiguous redis ack loss")
+        return 1
 
 
 class TestValidation:
@@ -193,8 +212,9 @@ class TestValidation:
 
 
 @contextmanager
-def running_server(auth_token=None, socket_timeout_s=0.2, durable_store=None):
-    fake = FakeRedis()
+def running_server(auth_token=None, socket_timeout_s=0.2, durable_store=None, fake=None,
+                   durable_replay_interval_s=0.0, durable_replay_limit=HR.DURABLE_REPLAY_LIMIT):
+    fake = fake if fake is not None else FakeRedis()
     store = HR.HeartbeatReceiverStore(
         fake,
         heartbeat_ttl_s=30,
@@ -204,6 +224,8 @@ def running_server(auth_token=None, socket_timeout_s=0.2, durable_store=None):
     server = HR.create_server(
         "127.0.0.1", 0, store, max_body_bytes=2048,
         auth_token=auth_token, socket_timeout_s=socket_timeout_s,
+        durable_replay_interval_s=durable_replay_interval_s,
+        durable_replay_limit=durable_replay_limit,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -417,6 +439,52 @@ class TestDurableSqlite(TestValidation):
         assert counts["successes"] == 1
         assert json.loads(recovered_fake.values["dama:hear:nyquist"])["device_id"] == "nyquist"
 
+    def test_ambiguous_redis_ack_loss_does_not_duplicate_the_stream_on_retry(self, tmp_path):
+        # Simulates the crash/ambiguous-ACK window: Redis fully applies the write (including the
+        # atomic dedupe marker) but the caller never learns of the success, so the durable store
+        # marks the attempt "failed" and a retry is expected. The retry must not duplicate the
+        # event stream entry because Redis-side dedupe recognizes the record_uid was already
+        # applied.
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis(ambiguous_failures_before_success=1)
+        store = HR.HeartbeatReceiverStore(
+            fake,
+            heartbeat_ttl_s=30,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        with pytest.raises(RuntimeError, match="simulated ambiguous redis ack loss"):
+            store.write_event(self._event())
+        counts = self._counts(db)
+        assert counts["records"] == 1
+        assert counts["successes"] == 0
+        assert counts["failures"] == 1
+        # Redis actually applied the write despite the caller seeing an exception.
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+
+        store.write_event(self._event())
+        counts = self._counts(db)
+        assert counts["records"] == 1
+        assert counts["successes"] == 1
+        assert counts["failures"] == 1
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+        assert fake.execute_calls == 2
+
+    def test_dedupe_metadata_is_bounded_by_event_stream_maxlen(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        fake = FakeRedis()
+        store = HR.HeartbeatReceiverStore(
+            fake,
+            heartbeat_ttl_s=30,
+            event_stream_maxlen=3,
+            redis_target="fake:6379",
+            durable_store=HR.make_durable_store("sqlite", str(db)),
+        )
+        for seq in range(10):
+            store.write_event(self._event(event_seq=seq, idempotency_key=f"evt-{seq}"))
+        assert len(fake.dedupe) <= 3
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) <= 3
+
     def test_bad_payload_does_not_append_any_durable_rows(self, tmp_path):
         db = tmp_path / "heartbeats.sqlite3"
         durable = HR.make_durable_store("sqlite", str(db))
@@ -441,6 +509,66 @@ class TestDurableSqlite(TestValidation):
         assert body["durable_store"]["backend"] == "sqlite"
         assert body["durable_store"]["path"].endswith("heartbeats.sqlite3")
         assert body["durable_store"]["pending_records"] == 0
+
+
+class TestBackgroundReplayWorker:
+    @staticmethod
+    def _event(**overrides):
+        return TestValidation._event(**overrides)
+
+    def test_a_failed_live_write_is_replayed_after_redis_recovers_without_a_restart(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        # The first live write hits a clean outage (no restart needed to recover: Redis just
+        # comes back on its own, as it would after a network blip or pod restart).
+        fake = FakeRedis(failures_before_success=1)
+        with running_server(durable_store=durable, fake=fake,
+                            durable_replay_interval_s=0.05) as (base_url, _fake, _addr, server):
+            assert server._replay_thread is not None
+            with pytest.raises(urllib.error.HTTPError) as ei:
+                TestHttpIntegration._post(base_url + "/api/hear/event", self._event())
+            assert ei.value.code == 503
+
+            synced = False
+            for _ in range(50):
+                time.sleep(0.05)
+                with sqlite3.connect(db) as con:
+                    successes = con.execute(
+                        "SELECT COUNT(*) FROM cache_attempts WHERE outcome='succeeded'"
+                    ).fetchone()[0]
+                if successes:
+                    synced = True
+                    break
+            assert synced, "background replay worker did not repair the pending record in time"
+        assert len(fake.streams[HR.EVENT_STREAM_KEY]) == 1
+
+    def test_background_worker_is_disabled_when_durability_is_off(self):
+        with running_server(durable_store=None, durable_replay_interval_s=0.05) as (
+            _base_url, _fake, _addr, server,
+        ):
+            assert server._replay_thread is None
+
+    def test_server_close_stops_the_replay_worker_and_leaves_no_thread_behind(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        store = HR.HeartbeatReceiverStore(
+            FakeRedis(), heartbeat_ttl_s=30, redis_target="fake:6379", durable_store=durable,
+        )
+        server = HR.create_server(
+            "127.0.0.1", 0, store, durable_replay_interval_s=0.02, durable_replay_limit=8,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            replay_thread = server._replay_thread
+            assert replay_thread is not None
+            assert replay_thread.is_alive()
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+        assert not replay_thread.is_alive()
+        assert server._replay_thread is None
 
 
 class TestStartupConfig:

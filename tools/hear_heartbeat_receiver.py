@@ -36,6 +36,7 @@ DURABLE_BACKENDS = ("none", "sqlite", "postgres")
 DURABLE_STORE = (os.environ.get("HEAR_DURABLE_STORE", "none") or "none").strip().lower()
 DURABLE_DB = os.environ.get("HEAR_DURABLE_DB", "/state/heartbeats.sqlite3")
 DURABLE_REPLAY_LIMIT = int(os.environ.get("HEAR_DURABLE_REPLAY_LIMIT", "256"))
+DURABLE_REPLAY_INTERVAL_S = float(os.environ.get("HEAR_DURABLE_REPLAY_INTERVAL_S", "5.0"))
 DURABLE_SCHEMA_VERSION = 1
 
 
@@ -304,31 +305,81 @@ class SqliteDurableRecordStore(DurableRecordStore):
         }
 
 
+# Applies a heartbeat/event write and records a durable-record-uid dedupe marker in a single
+# atomic Redis Lua invocation. Redis executes scripts single-threaded and atomically, so either
+# every write it makes (including the dedupe marker) lands, or none of it does. That closes the
+# ambiguous-ACK window between "Redis accepted the write" and "SQLite recorded cache success": if
+# the process crashes or the response is lost after Redis already applied the script, the retry
+# with the same record_uid finds the dedupe marker already set and no-ops instead of re-appending
+# to the event stream. The dedupe ZSET is trimmed to event_stream_maxlen on every call, using the
+# same bound as EVENT_STREAM_MAXLEN, so it cannot grow unbounded.
+_DEDUPE_WRITE_SCRIPT = """
+local dedupe_key = KEYS[1]
+local hb_key = KEYS[2]
+local devices_key = KEYS[3]
+local latest_key = KEYS[4]
+local event_key = KEYS[5]
+local stream_key = KEYS[6]
+
+local record_uid = ARGV[1]
+local telemetry_path = ARGV[2]
+local node_id = ARGV[3]
+local body_json = ARGV[4]
+local ttl_s = tonumber(ARGV[5])
+local maxlen = tonumber(ARGV[6])
+
+if redis.call('ZSCORE', dedupe_key, record_uid) then
+    return 0
+end
+
+if telemetry_path == 'hear/heartbeat' then
+    redis.call('SETEX', hb_key, ttl_s, body_json)
+    redis.call('SADD', devices_key, node_id)
+    redis.call('SET', latest_key, body_json)
+else
+    redis.call('SADD', devices_key, node_id)
+    redis.call('SET', event_key, body_json)
+    redis.call('XADD', stream_key, 'MAXLEN', '~', maxlen, '*', 'device_id', node_id, 'payload', body_json)
+end
+
+local seq = redis.call('INCR', dedupe_key .. ':seq')
+redis.call('ZADD', dedupe_key, seq, record_uid)
+local count = redis.call('ZCARD', dedupe_key)
+if count > maxlen then
+    redis.call('ZREMRANGEBYRANK', dedupe_key, 0, count - maxlen - 1)
+end
+return 1
+"""
+
+
 class RedisHeartbeatCache:
     def __init__(self, client: Any, heartbeat_ttl_s: int = HEARTBEAT_TTL_S,
                  event_stream_key: str = EVENT_STREAM_KEY,
-                 event_stream_maxlen: int = EVENT_STREAM_MAXLEN):
+                 event_stream_maxlen: int = EVENT_STREAM_MAXLEN,
+                 dedupe_key: str = "dama:hear:dedupe"):
         self.client = client
         self.heartbeat_ttl_s = heartbeat_ttl_s
         self.event_stream_key = event_stream_key
         self.event_stream_maxlen = event_stream_maxlen
+        self.dedupe_key = dedupe_key
+        self._dedupe_script = client.register_script(_DEDUPE_WRITE_SCRIPT)
 
-    def write(self, record: Dict[str, Any], body_json: str) -> None:
+    def write(self, record: Dict[str, Any], body_json: str, record_uid: str) -> None:
         telemetry_path = record["telemetry_path"]
         node_id = record["device_id"]
-        pipe = self.client.pipeline(transaction=False)
         if telemetry_path == "hear/heartbeat":
-            pipe.setex(f"dama:hear:{node_id}", self.heartbeat_ttl_s, body_json)
-            pipe.sadd("dama:hear:devices", node_id)
-            pipe.set("dama:hear:latest", body_json)
+            hb_key, latest_key = f"dama:hear:{node_id}", "dama:hear:latest"
+            event_key, stream_key = "", ""
         elif telemetry_path == "hear/event":
-            pipe.sadd("dama:hear:devices", node_id)
-            pipe.set(f"dama:hear:event:{node_id}", body_json)
-            pipe.xadd(self.event_stream_key, {"device_id": node_id, "payload": body_json},
-                      maxlen=self.event_stream_maxlen, approximate=True)
+            hb_key, latest_key = "", ""
+            event_key, stream_key = f"dama:hear:event:{node_id}", self.event_stream_key
         else:  # pragma: no cover - validators own this in practice.
             raise ValueError(f"unsupported telemetry_path {telemetry_path!r}")
-        pipe.execute()
+        self._dedupe_script(
+            keys=[self.dedupe_key, hb_key, "dama:hear:devices", latest_key, event_key, stream_key],
+            args=[record_uid, telemetry_path, node_id, body_json,
+                  self.heartbeat_ttl_s, self.event_stream_maxlen],
+        )
 
 
 class HeartbeatReceiverStore:
@@ -365,7 +416,7 @@ class HeartbeatReceiverStore:
         if stored.cached:
             return stored.record
         try:
-            self.cache.write(stored.record, stored.body_json)
+            self.cache.write(stored.record, stored.body_json, stored.record_uid)
         except Exception as exc:
             self.durable_store.note_cache_failure(stored.record_uid, self.redis_target, exc)
             raise
@@ -386,7 +437,7 @@ class HeartbeatReceiverStore:
         summary["attempted"] = len(pending)
         for entry in pending:
             try:
-                self.cache.write(entry.record, entry.body_json)
+                self.cache.write(entry.record, entry.body_json, entry.record_uid)
             except Exception as exc:
                 self.durable_store.note_cache_failure(entry.record_uid, self.redis_target, exc)
                 summary["failed"] += 1
@@ -407,9 +458,36 @@ class ReceiverServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 16
 
-    def __init__(self, server_address, handler_cls, store: HeartbeatReceiverStore):
+    def __init__(self, server_address, handler_cls, store: HeartbeatReceiverStore,
+                 durable_replay_interval_s: float = 0.0,
+                 durable_replay_limit: int = DURABLE_REPLAY_LIMIT):
         super().__init__(server_address, handler_cls)
         self.store = store
+        self._replay_interval_s = durable_replay_interval_s
+        self._replay_limit = durable_replay_limit
+        self._replay_stop = threading.Event()
+        self._replay_thread: Optional[threading.Thread] = None
+        if durable_replay_interval_s > 0 and store.durable_store.enabled:
+            self._replay_thread = threading.Thread(
+                target=self._replay_loop, name="hear-heartbeat-replay", daemon=True)
+            self._replay_thread.start()
+
+    def _replay_loop(self) -> None:
+        # Runs for the life of the server so pending durable records left behind by a Redis
+        # outage get replayed while the process stays up, not only at the next startup. Woken
+        # early (instead of a plain sleep) so server_close() can stop it promptly.
+        while not self._replay_stop.wait(self._replay_interval_s):
+            try:
+                self.store.replay_pending(limit=self._replay_limit)
+            except Exception:
+                logger.exception("background durable replay attempt failed")
+
+    def server_close(self) -> None:
+        self._replay_stop.set()
+        if self._replay_thread is not None:
+            self._replay_thread.join(timeout=5)
+            self._replay_thread = None
+        super().server_close()
 
 
 def utc_now() -> str:
@@ -443,6 +521,9 @@ def add_durable_store_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--durable-store", default=DURABLE_STORE, choices=DURABLE_BACKENDS)
     ap.add_argument("--durable-db", default=DURABLE_DB)
     ap.add_argument("--durable-replay-limit", type=int, default=DURABLE_REPLAY_LIMIT)
+    ap.add_argument("--durable-replay-interval-s", type=float, default=DURABLE_REPLAY_INTERVAL_S,
+                    help="seconds between background replays of pending durable records while "
+                         "the server is up; <= 0 disables the background worker")
 
 
 def make_durable_store(kind: str = DURABLE_STORE,
@@ -687,12 +768,16 @@ def make_redis_client(redis_host: str = REDIS_HOST, redis_port: int = REDIS_PORT
 def create_server(bind: str, port: int, store: HeartbeatReceiverStore,
                   max_body_bytes: int = MAX_BODY_BYTES,
                   auth_token: Optional[str] = AUTH_TOKEN,
-                  socket_timeout_s: float = SOCKET_TIMEOUT_S) -> ReceiverServer:
+                  socket_timeout_s: float = SOCKET_TIMEOUT_S,
+                  durable_replay_interval_s: float = 0.0,
+                  durable_replay_limit: int = DURABLE_REPLAY_LIMIT) -> ReceiverServer:
     return ReceiverServer(
         (bind, port),
         make_handler(store, max_body_bytes=max_body_bytes,
                      auth_token=auth_token, socket_timeout_s=socket_timeout_s),
         store,
+        durable_replay_interval_s=durable_replay_interval_s,
+        durable_replay_limit=durable_replay_limit,
     )
 
 
@@ -733,8 +818,16 @@ def main(argv: Optional[list[str]] = None) -> int:
               % (replay["attempted"], replay["synced"], replay["failed"],
                  replay["remaining_pending"]))
     print(f"[hear-heartbeat] Listening on http://{args.bind}:{args.port}")
-    create_server(args.bind, args.port, store, max_body_bytes=args.max_body_bytes,
-                  auth_token=auth_token, socket_timeout_s=args.socket_timeout_s).serve_forever()
+    server = create_server(
+        args.bind, args.port, store, max_body_bytes=args.max_body_bytes,
+        auth_token=auth_token, socket_timeout_s=args.socket_timeout_s,
+        durable_replay_interval_s=args.durable_replay_interval_s,
+        durable_replay_limit=args.durable_replay_limit,
+    )
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
     return 0
 
 
