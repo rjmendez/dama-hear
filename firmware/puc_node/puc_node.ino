@@ -621,6 +621,295 @@ static String mic_capture(int clk, int din, int fs, bool stereo) {
   return o;
 }
 
+// ---- LIS3DH seismic capture -------------------------------------------------------------------
+// The phone-compatible vibration lane is 400 Hz, and the LIS3DH supports 400 Hz exactly in normal
+// high-resolution mode. That gives a 200 Hz Nyquist rate, enough for the existing
+// InfrasoundSeismicTagger's 0.1--100 Hz feature band without inventing an interpolated rate.
+#define LIS3DH_ADDR              0x18
+#define LIS3DH_WHO_AM_I          0x0F
+#define LIS3DH_WHO_AM_I_EXPECTED 0x33
+#define LIS3DH_CTRL_REG1         0x20
+#define LIS3DH_CTRL_REG4         0x23
+#define LIS3DH_CTRL_REG5         0x24
+#define LIS3DH_OUT_X_L           0x28
+#define LIS3DH_FIFO_CTRL_REG     0x2E
+#define LIS3DH_FIFO_SRC_REG      0x2F
+#define IMU_I2C_SDA              47
+#define IMU_I2C_SCL              48
+#define IMU_I2C_HZ               400000
+#define IMU_ODR_HZ               400
+#define IMU_DT_US                2500
+#define IMU_RING_N               512
+#define IMU_FIFO_CAPACITY        32
+#define IMU_FIFO_WATERMARK       24
+#define IMU_BURST_MAX            32
+#define IMU_MAX_CONSEC_I2C_ERRORS 3
+#define IMU_STALE_US             1000000ULL
+#define IMU_FIFO_LEVEL_UNKNOWN   255
+#define LIS3DH_MPS2_PER_LSB      (9.80665f * 0.001f / 16.0f)
+
+struct ImuSample {
+  uint32_t seq;
+  uint64_t mono_us;
+  int16_t x;
+  int16_t y;
+  int16_t z;
+};
+
+static ImuSample imu_ring[IMU_RING_N];
+static uint32_t imu_seq = 0, imu_seen = 0, imu_bursts = 0, imu_fifo_overruns = 0;
+static uint32_t imu_fifo_lost_min = 0, imu_ring_drops = 0, imu_i2c_errors = 0, imu_short_reads = 0;
+static uint32_t imu_consecutive_i2c_errors = 0, imu_last_read_latency_us = 0;
+static uint64_t imu_last_us = 0, imu_init_us = 0;
+static uint8_t imu_who = 0, imu_fifo_level = 0, imu_ctrl1 = 0, imu_ctrl4 = 0, imu_ctrl5 = 0, imu_fifo_ctrl = 0;
+static bool imu_ok = false;
+static const char *imu_fault = "not initialised";
+
+static bool imu_bus_begin() {
+  if (!Wire.begin(IMU_I2C_SDA, IMU_I2C_SCL, IMU_I2C_HZ)) return false;
+  Wire.setTimeOut(10);
+  return true;
+}
+
+static bool lis3dh_read_reg(uint8_t reg, uint8_t *v) {
+  if (!imu_bus_begin()) return false;
+  Wire.beginTransmission(LIS3DH_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)LIS3DH_ADDR, 1) != 1) return false;
+  *v = Wire.read();
+  return true;
+}
+
+static bool lis3dh_write_checked(uint8_t reg, uint8_t value, uint8_t mask, uint8_t *readback) {
+  if (!imu_bus_begin()) return false;
+  Wire.beginTransmission(LIS3DH_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  if (Wire.endTransmission() != 0) return false;
+  uint8_t got = 0;
+  if (!lis3dh_read_reg(reg, &got)) return false;
+  if (readback) *readback = got;
+  return (got & mask) == (value & mask);
+}
+
+static bool lis3dh_read_sample(int16_t *x, int16_t *y, int16_t *z) {
+  if (!imu_bus_begin()) return false;
+  Wire.beginTransmission(LIS3DH_ADDR);
+  Wire.write((uint8_t)(LIS3DH_OUT_X_L | 0x80));        // address auto-increment
+  if (Wire.endTransmission(false) != 0) return false;
+  int got = Wire.requestFrom((int)LIS3DH_ADDR, 6);
+  if (got != 6) { imu_short_reads++; while (Wire.available()) Wire.read(); return false; }
+  uint8_t xl = Wire.read(), xh = Wire.read(), yl = Wire.read(), yh = Wire.read(), zl = Wire.read(), zh = Wire.read();
+  *x = (int16_t)((uint16_t)xh << 8 | xl);
+  *y = (int16_t)((uint16_t)yh << 8 | yl);
+  *z = (int16_t)((uint16_t)zh << 8 | zl);
+  return true;
+}
+
+static void imu_note_sample(uint64_t mono_us, int16_t x, int16_t y, int16_t z) {
+  uint32_t pos = imu_seq % IMU_RING_N;
+  if (imu_seen >= IMU_RING_N) imu_ring_drops++;
+  imu_ring[pos] = {imu_seq++, mono_us, x, y, z};
+  imu_seen++;
+  imu_last_us = mono_us;
+}
+
+static void imu_note_i2c_error() {
+  imu_i2c_errors++;
+  if (imu_consecutive_i2c_errors < 0xFFFFFFFF) imu_consecutive_i2c_errors++;
+}
+
+static bool imu_fresh(uint64_t now_us) {
+  if (!imu_last_us) return imu_init_us && (now_us - imu_init_us) <= IMU_STALE_US;
+  return (now_us - imu_last_us) <= IMU_STALE_US;
+}
+
+static bool imu_runtime_ok(uint64_t now_us) {
+  return imu_ok && imu_consecutive_i2c_errors < IMU_MAX_CONSEC_I2C_ERRORS && imu_fresh(now_us);
+}
+
+static const char *imu_state(uint64_t now_us) {
+  if (!imu_ok) return "disabled";
+  if (imu_consecutive_i2c_errors >= IMU_MAX_CONSEC_I2C_ERRORS) return "i2c_fault";
+  if (!imu_fresh(now_us)) return "stale";
+  return "ok";
+}
+
+static uint8_t lis3dh_fifo_count(uint8_t src) {
+  if (src & 0x20) return 0;                         // EMPTY
+  uint8_t fss = src & 0x1F;
+  return fss == 0x1F ? IMU_FIFO_CAPACITY : fss;      // FSS=31 is the full 32-sample FIFO
+}
+
+static bool imu_init() {
+  imu_ok = false;
+  imu_fault = "bus begin failed";
+  imu_init_us = (uint64_t)esp_timer_get_time();
+  if (!imu_bus_begin()) return false;
+  if (!lis3dh_read_reg(LIS3DH_WHO_AM_I, &imu_who)) { imu_fault = "WHO_AM_I read failed"; return false; }
+  if (imu_who != LIS3DH_WHO_AM_I_EXPECTED) { imu_fault = "WHO_AM_I mismatch"; return false; }
+
+  // CTRL_REG1: ODR=400 Hz (0111), normal power, XYZ enabled. CTRL_REG4: BDU + high-resolution,
+  // +/-2 g raw output. CTRL_REG5/FIFO_CTRL: FIFO enabled in stream mode with a bounded watermark.
+  if (!lis3dh_write_checked(LIS3DH_CTRL_REG1, 0x77, 0xFF, &imu_ctrl1)) { imu_fault = "CTRL_REG1 readback failed"; return false; }
+  if (!lis3dh_write_checked(LIS3DH_CTRL_REG4, 0x88, 0xFF, &imu_ctrl4)) { imu_fault = "CTRL_REG4 readback failed"; return false; }
+  if (!lis3dh_write_checked(LIS3DH_CTRL_REG5, 0x40, 0x40, &imu_ctrl5)) { imu_fault = "CTRL_REG5 readback failed"; return false; }
+  if (!lis3dh_write_checked(LIS3DH_FIFO_CTRL_REG, 0x80 | IMU_FIFO_WATERMARK, 0xDF, &imu_fifo_ctrl)) {
+    imu_fault = "FIFO_CTRL readback failed"; return false;
+  }
+  imu_ok = true;
+  imu_fault = "";
+  return true;
+}
+
+static void imu_poll() {
+  if (!imu_ok) return;
+  uint8_t src = 0;
+  if (!lis3dh_read_reg(LIS3DH_FIFO_SRC_REG, &src)) { imu_note_i2c_error(); return; }
+  bool overrun = src & 0x40;
+  uint8_t n = lis3dh_fifo_count(src);
+  if (overrun) { imu_fifo_overruns++; imu_fifo_lost_min++; }
+  if (n > IMU_BURST_MAX) n = IMU_BURST_MAX;
+  if (!n) { imu_fifo_level = 0; return; }
+  int16_t xs[IMU_BURST_MAX], ys[IMU_BURST_MAX], zs[IMU_BURST_MAX];
+  uint8_t got = 0;
+  uint64_t read_start_us = (uint64_t)esp_timer_get_time();
+  for (uint8_t i = 0; i < n; i++) {
+    if (!lis3dh_read_sample(&xs[got], &ys[got], &zs[got])) { imu_note_i2c_error(); break; }
+    got++;
+  }
+  if (!got) { imu_fifo_level = IMU_FIFO_LEVEL_UNKNOWN; return; }
+  uint64_t drain_done_us = (uint64_t)esp_timer_get_time();
+  uint64_t read_latency_us = drain_done_us - read_start_us;
+  imu_last_read_latency_us = read_latency_us > 0xFFFFFFFFULL ? 0xFFFFFFFF : (uint32_t)read_latency_us;
+  for (uint8_t i = 0; i < got; i++) {
+    uint64_t sample_us = drain_done_us - (uint64_t)(got - 1 - i) * IMU_DT_US;
+    imu_note_sample(sample_us, xs[i], ys[i], zs[i]);
+  }
+  bool post_level_ok = lis3dh_read_reg(LIS3DH_FIFO_SRC_REG, &src);
+  if (post_level_ok)
+    imu_fifo_level = lis3dh_fifo_count(src);
+  else {
+    imu_note_i2c_error();
+    imu_fifo_level = IMU_FIFO_LEVEL_UNKNOWN;
+  }
+  if (got == n && post_level_ok) imu_consecutive_i2c_errors = 0;
+  imu_bursts++;
+}
+
+static uint32_t imu_available() {
+  return imu_seen < IMU_RING_N ? imu_seen : IMU_RING_N;
+}
+
+static String imu_health_json() {
+  uint64_t now_us = (uint64_t)esp_timer_get_time();
+  double age_s = imu_last_us ? (now_us - imu_last_us) / 1e6 : -1.0;
+  char b[720];
+  snprintf(b, sizeof b,
+    "{\"ok\":%s,\"state\":\"%s\",\"fault\":\"%s\",\"sensor\":\"lis3dh\",\"addr\":\"0x18\","
+    "\"who_am_i\":\"0x%02X\","
+    "\"bus\":{\"sda\":%d,\"scl\":%d,\"hz\":%d},\"odr_hz\":%d,\"dt_us\":%d,"
+    "\"mode\":\"high_resolution_fifo_stream_poll\",\"fifo_watermark\":%d,\"fifo_level\":%u,"
+    "\"samples\":%lu,\"ring_samples\":%lu,\"burst_reads\":%lu,\"drops\":%lu,"
+    "\"fifo_overruns\":%lu,\"fifo_lost_min\":%lu,\"i2c_errors\":%lu,"
+    "\"consecutive_i2c_errors\":%lu,\"max_consecutive_i2c_errors\":%d,"
+    "\"short_reads\":%lu,\"last_age_s\":%.3f,\"stale_after_s\":%.3f,"
+    "\"last_read_latency_us\":%lu,\"timestamp_basis\":\"last_sample_estimate_post_drain_us\","
+    "\"ctrl\":{\"reg1\":\"0x%02X\",\"reg4\":\"0x%02X\",\"reg5\":\"0x%02X\",\"fifo\":\"0x%02X\"}}",
+    imu_runtime_ok(now_us) ? "true" : "false", imu_state(now_us), imu_fault, imu_who,
+    IMU_I2C_SDA, IMU_I2C_SCL, IMU_I2C_HZ, IMU_ODR_HZ, IMU_DT_US, IMU_FIFO_WATERMARK, imu_fifo_level,
+    (unsigned long)imu_seen, (unsigned long)imu_available(), (unsigned long)imu_bursts,
+    (unsigned long)imu_ring_drops, (unsigned long)imu_fifo_overruns, (unsigned long)imu_fifo_lost_min,
+    (unsigned long)imu_i2c_errors, (unsigned long)imu_consecutive_i2c_errors, IMU_MAX_CONSEC_I2C_ERRORS,
+    (unsigned long)imu_short_reads, age_s, IMU_STALE_US / 1000000.0,
+    (unsigned long)imu_last_read_latency_us, imu_ctrl1, imu_ctrl4, imu_ctrl5, imu_fifo_ctrl);
+  return String(b);
+}
+
+static String imu_features_json() {
+  uint32_t n = imu_available();
+  if (!imu_ok || n < 8) {
+    return "{\"schema\":\"phone-vibration-features-v1\",\"source\":\"imu\",\"sensor\":\"lis3dh\","
+           "\"fs_hz\":400,\"feature_metrics\":{\"source\":\"imu\",\"source_fs_hz\":400,"
+           "\"analysis_fs_hz\":400,\"duration_s\":0,\"rms\":0,\"crest_factor\":0},"
+           "\"vibration_onset\":null,\"scores\":{},\"claim\":{\"is_microphone\":false,"
+           "\"is_seismic\":true,\"provenance\":\"sensor\"}}";
+  }
+  double sum = 0, peak_abs = 0, zsum = 0;
+  int peak_i = 0;
+  uint32_t start = imu_seq - n;
+  for (uint32_t i = 0; i < n; i++) {
+    ImuSample &s = imu_ring[(start + i) % IMU_RING_N];
+    double ax = s.x * (double)LIS3DH_MPS2_PER_LSB;
+    double ay = s.y * (double)LIS3DH_MPS2_PER_LSB;
+    double az = s.z * (double)LIS3DH_MPS2_PER_LSB;
+    double accel_mag = sqrt(ax * ax + ay * ay + az * az);
+    sum += accel_mag; zsum += az;
+  }
+  double mean = sum / n, zmean = zsum / n, var = 0, zvar = 0, z4 = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    ImuSample &s = imu_ring[(start + i) % IMU_RING_N];
+    double ax = s.x * (double)LIS3DH_MPS2_PER_LSB;
+    double ay = s.y * (double)LIS3DH_MPS2_PER_LSB;
+    double az = s.z * (double)LIS3DH_MPS2_PER_LSB;
+    double accel_mag = sqrt(ax * ax + ay * ay + az * az);
+    double c = accel_mag - mean, zc = az - zmean;
+    var += c * c; zvar += zc * zc; z4 += zc * zc * zc * zc;
+    double a = fabs(c);
+    if (a > peak_abs) { peak_abs = a; peak_i = i; }
+  }
+  double rms = sqrt(var / n);
+  double crest = rms > 1e-9 ? peak_abs / rms : 0;
+  double zkurt = zvar > 1e-9 ? (z4 / n) / ((zvar / n) * (zvar / n)) : 0;
+  ImuSample &pk = imu_ring[(start + peak_i) % IMU_RING_N];
+  bool onset = n >= 40 && crest >= 5.0 && peak_abs >= rms * 5.0;
+  char onset_buf[120];
+  if (onset)
+    snprintf(onset_buf, sizeof onset_buf, "{\"mono_us\":%llu,\"seq\":%lu,\"peak_mag_mps2\":%.3f}",
+             (unsigned long long)pk.mono_us, (unsigned long)pk.seq, peak_abs);
+  else
+    snprintf(onset_buf, sizeof onset_buf, "null");
+  char b[760];
+  snprintf(b, sizeof b,
+    "{\"schema\":\"phone-vibration-features-v1\",\"source\":\"imu\",\"sensor\":\"lis3dh\","
+    "\"fs_hz\":%d,\"feature_metrics\":{\"source\":\"imu\",\"source_fs_hz\":%d,"
+    "\"input\":\"accel_mag\",\"units\":\"m/s2\","
+    "\"analysis_fs_hz\":%d,\"duration_s\":%.4f,\"rms\":%.3f,\"crest_factor\":%.3f,"
+    "\"dc_offset\":%.3f,\"z_kurtosis\":%.3f},"
+    "\"vibration_onset\":%s,"
+    "\"scores\":{\"seismic.rayleigh_wave\":0.0},\"claim\":{\"is_microphone\":false,"
+    "\"is_seismic\":true,\"provenance\":\"sensor\"}}",
+    IMU_ODR_HZ, IMU_ODR_HZ, IMU_ODR_HZ, n / (double)IMU_ODR_HZ, rms, crest, mean, zkurt,
+    onset_buf);
+  return String(b);
+}
+
+static String imu_samples_json(int limit) {
+  if (limit < 1) limit = 1;
+  if (limit > (int)IMU_RING_N) limit = IMU_RING_N;
+  uint32_t have = imu_available();
+  uint32_t n = have < (uint32_t)limit ? have : (uint32_t)limit;
+  uint32_t start = imu_seq - n;
+  String o = "{\"schema\":\"puc-lis3dh-raw-v1\",\"source\":\"imu\",\"sensor\":\"lis3dh\",";
+  o += "\"fs_hz\":";
+  o += String(IMU_ODR_HZ);
+  o += ",\"dt_us\":";
+  o += String(IMU_DT_US);
+  o += ",\"clock\":\"sample-clock-reconstructed-from-burst-end-monotonic-us\"";
+  o += ",\"health\":" + imu_health_json() + ",\"features\":" + imu_features_json() + ",\"samples\":[";
+  for (uint32_t i = 0; i < n; i++) {
+    ImuSample &s = imu_ring[(start + i) % IMU_RING_N];
+    if (i) o += ",";
+    char row[130];
+    snprintf(row, sizeof row, "{\"seq\":%lu,\"mono_us\":%llu,\"x\":%d,\"y\":%d,\"z\":%d}",
+             (unsigned long)s.seq, (unsigned long long)s.mono_us, s.x, s.y, s.z);
+    o += row;
+  }
+  o += "]}";
+  return o;
+}
+
 // ---- time ------------------------------------------------------------------------------------
 // This board is called puc-ntp and until now had NO time client of any kind: no NTP, no RTC read,
 // no `time` in /status. hear/nodeclass.py credits the class with t_sigma 3 ms = 1.03 m, which was
@@ -792,28 +1081,32 @@ static String pin_scan(uint32_t window_ms, int mode) {
 // ---------------------------------------------------------------- HTTP
 static void routes() {
   http.on("/", []() {
-    char b[700];
+    char b[1000];
     snprintf(b, sizeof b,
       "<pre>dama-hear PUC node %s (%s)\n\n"
       "uptime  %lus\nheap    %lu min %lu max_alloc %lu stack_low_words %lu psram %lu\n"
       "gps     fix %d, %d sats, %s   sentences %lu (%lu valid)\n"
-      "pps     %lu rising edges on GPIO%d, waveform %s, source %s\n\n"
-      "/status /pins /i2c /i2creg /rtc /time /timesync /sqw /pdmscan /mic /scan /scanpd /scanpu /gps /pmtk?cmd= /pps /ota /update /reboot\n</pre>",
+      "pps     %lu rising edges on GPIO%d, waveform %s, source %s\n"
+      "imu     %s, %lu samples, %lu FIFO overruns\n\n"
+      "/status /imu /imu/status /imu/features /pins /i2c /i2creg /rtc /time /timesync /sqw /pdmscan /mic /scan /scanpd /scanpu /gps /pmtk?cmd= /pps /ota /update /reboot\n</pre>",
       node_id, NODE_CLASS, (unsigned long)(millis() / 1000),
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(),
       (unsigned long)ESP.getMaxAllocHeap(), (unsigned long)uxTaskGetStackHighWaterMark(NULL),
       (unsigned long)ESP.getFreePsram(),
       gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences, (unsigned long)gps_valid,
       (unsigned long)pps_rising, PPS_PIN, pps_waveform_valid() ? "valid" : "unproven",
-      PPS_SOURCE_CONFIRMED ? "confirmed" : "unconfirmed");
+      PPS_SOURCE_CONFIRMED ? "confirmed" : "unconfirmed",
+      imu_ok ? "ok" : imu_fault, (unsigned long)imu_seen, (unsigned long)imu_fifo_overruns);
     http.send(200, "text/html", b);
   });
 
   http.on("/status", []() {
-    char b[1400];
+    String imu = imu_health_json();
+    char b[1800];
     snprintf(b, sizeof b,
       "{\"node\":\"%s\",\"class\":\"%s\",\"uptime_s\":%lu,"
       "\"reset\":\"%s\",\"power_cycled\":%s,\"heap\":%lu,\"heap_min\":%lu,\"heap_max_alloc\":%lu,\"stack_high_watermark_words\":%lu,\"psram\":%lu,"
+      "\"imu\":%s,"
       "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid\":%lu,"
       "\"baud\":%d,\"rx_pin\":%d,\"tx_pin\":%d,\"last\":\"%s\"},"
       "\"pps\":{\"pin\":%d,\"source\":\"gnss_1pps_unconfirmed\",\"source_confirmed\":%s,"
@@ -827,7 +1120,7 @@ static void routes() {
       reset_name(), esp_reset_reason() == ESP_RST_POWERON ? "true" : "false",
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(),
       (unsigned long)ESP.getMaxAllocHeap(), (unsigned long)uxTaskGetStackHighWaterMark(NULL),
-      (unsigned long)ESP.getFreePsram(),
+      (unsigned long)ESP.getFreePsram(), imu.c_str(),
       gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences, (unsigned long)gps_valid,
       GPS_BAUD, GPS_RX_PIN, GPS_TX_PIN, gps_last,
       PPS_PIN, PPS_SOURCE_CONFIRMED ? "true" : "false",
@@ -846,6 +1139,13 @@ static void routes() {
     http.send(200, "application/json", b);
   });
 
+  http.on("/imu/status", []() { http.send(200, "application/json", imu_health_json()); });
+  http.on("/imu/features", []() { http.send(200, "application/json", imu_features_json()); });
+  http.on("/imu", []() {
+    int limit = http.hasArg("limit") ? http.arg("limit").toInt() : 128;
+    http.send(200, "application/json", imu_samples_json(limit));
+  });
+
   http.on("/pins", []() {
     char b[760];
     snprintf(b, sizeof b,
@@ -862,6 +1162,7 @@ static void routes() {
       "  38  DS3231 SQW <- 1 Hz, open-drain        measured: /sqw then /scanpu; off/on is causal\n"
       "  47  I2C SDA                               measured: /i2c, 6 devices answered\n"
       "  48  I2C SCL                               measured: /i2c\n\n"
+      " 0x18 LIS3DH seismic capture at 400 Hz      WHO_AM_I 0x33; /imu exposes raw XYZ + features\n"
       "On the bus: 0x18 LIS3DH, 0x1C LIS3MDL, 0x39 AS7341(likely), 0x50 blank EEPROM,\n"
       "0x68 DS3231 (confirmed, OSF=0), 0x76 BME680 (confirmed). The microSD pins are still\n"
       "unknown -- the nine remaining pulled-up pins are where its CMD and D0-D3 should be.\n",
@@ -1287,6 +1588,10 @@ void setup() {
   pinMode(PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, CHANGE);
   Serial.printf("pps   diagnostic-only GPIO%d; source unconfirmed, discipline disabled\n", PPS_PIN);
+  if (imu_init())
+    Serial.printf("imu   LIS3DH 0x18 WHO_AM_I 0x%02X, 400 Hz FIFO stream on SDA=47 SCL=48\n", imu_who);
+  else
+    Serial.printf("imu   disabled: %s (WHO_AM_I 0x%02X)\n", imu_fault, imu_who);
 
   for (int k = 0; k < WIFI_N && !sta_ok; k++) {
     WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSIDS[k], WIFI_PASSES[k]);
@@ -1328,13 +1633,15 @@ void loop() {
     wifi_failures = 0;
   }
   gps_pump();
+  imu_poll();
   hear_boot_tick(sta_ok);   // ⚠️the argument this node used to ignore
   static uint32_t last = 0;
   if (millis() - last > 30000) {
     last = millis();
-    Serial.printf("[%6lus] fix %d/%d sats  nmea %lu/%lu valid  pps %lu\n",
+    Serial.printf("[%6lus] fix %d/%d sats  nmea %lu/%lu valid  pps %lu  imu %lu samples ovf %lu err %lu\n",
                   (unsigned long)(millis() / 1000), gps_fix, gps_sats,
                   (unsigned long)gps_valid, (unsigned long)gps_sentences,
-                  (unsigned long)pps_rising);
+                  (unsigned long)pps_rising, (unsigned long)imu_seen,
+                  (unsigned long)imu_fifo_overruns, (unsigned long)imu_i2c_errors);
   }
 }
