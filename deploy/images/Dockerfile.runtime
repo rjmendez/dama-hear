@@ -28,6 +28,20 @@ ENV OPENBLAS_NUM_THREADS=1 \
     OMP_NUM_THREADS=1 \
     MKL_NUM_THREADS=1
 
+# The base is pinned, and this snapshot keeps the security refresh pinned too. Move the timestamp
+# deliberately when refreshing the base; snapshot.debian.org archives are immutable.
+RUN set -eux; \
+    rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; \
+    printf '%s\n' \
+      'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260915T000000Z trixie main' \
+      'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260915T000000Z trixie-updates main' \
+      'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20260915T000000Z trixie-security main' \
+      > /etc/apt/sources.list.d/debian-snapshot.list; \
+    apt-get -o Acquire::Check-Valid-Until=false update; \
+    apt-get upgrade -y --no-install-recommends; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
 # uid 65532 is nonroot by the distroless convention, and it is a FIXED number on purpose: the
 # hear-pool PVC already has files on it owned by the uid the current pods write as, so the
 # migration has one number to reconcile rather than one per rebuild.

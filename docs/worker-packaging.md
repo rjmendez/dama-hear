@@ -128,9 +128,9 @@ Required for every worker image, enforced in CI:
 
 Not claimed, and deliberately: images are not bit-reproducible (timestamps and layer ordering
 vary), the locks are `linux/amd64` only, and the GPU variant inherits TensorFlow's interpreter
-rather than Python 3.13. The pinned base supplies the OS packages; the build does not resolve
-Debian APT metadata. These limits are recorded so a later reviewer does not assume a stronger
-guarantee than exists.
+rather than Python 3.13. The runtime's OS refresh uses the immutable Debian snapshot recorded in
+its Dockerfile; moving that snapshot is a deliberate image refresh. These limits are recorded so
+a later reviewer does not assume a stronger guarantee than exists.
 
 ## ConfigMap-to-image cutover
 

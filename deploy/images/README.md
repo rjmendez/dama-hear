@@ -71,10 +71,11 @@ Claimed:
 
 Not claimed:
 
-- **The OS layer is frozen by the base digest.** `hear-runtime` does not contact Debian APT or
-  perform an unpinned upgrade during the build, so two builds from this checkout start with the
-  same Debian package bytes. Security updates require a deliberate base-image digest refresh,
-  which keeps the OS change reviewable and reproducible alongside the locked Python closure.
+- **The OS layer is frozen by the base digest and a dated Debian snapshot.** `hear-runtime`
+  refreshes security packages only from the immutable `20260915T000000Z` snapshot, so two builds
+  from this checkout resolve the same Debian package bytes. Security updates require a deliberate
+  snapshot and base-image refresh, which keeps the OS change reviewable and reproducible alongside
+  the locked Python closure.
 - ⚠️**One platform.** The locks are `linux/amd64`, which is what the k3s nodes are. A second
   architecture is a second lock file, not a re-resolve of these.
 - ⚠️**`ml-gpu` is not Python 3.13.** It inherits TensorFlow's interpreter, so its lock is not
@@ -90,12 +91,11 @@ indexes, or telemetry endpoints". The pieces that makes possible are here:
   verifiable rather than trusted.
 - The base digests are exact, so `docker save` of those two images plus the built variants is a
   complete build input set.
-- No APT command runs in any variant: nothing enters the image from a distro mirror, so the set
-  of OS packages to mirror is fixed and known from the base image alone.
+- `hear-runtime` is the only APT consumer, and it names an immutable snapshot; the set of OS
+  packages to mirror is fixed and known from the Dockerfile and base image.
 
-The image chain itself has no Debian mirror dependency: all OS packages arrive in the pinned
-base image. An air-gapped site still needs its configured registry or an exported copy of the
-base and derived images.
+An air-gapped site needs an exported copy of the pinned base and derived images, or an internal
+mirror populated from the dated Debian snapshot.
 
 ## The model boundary
 
