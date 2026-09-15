@@ -230,6 +230,11 @@ a compromised or buggy writer cannot erase the ledger it writes to.
 
 ## 9. Migration, backfill, mixed deployment, rollback
 
+The stage table below is the spine. Its executable form — flags, write ordering, dual-write error
+semantics, backfill watermarks, reconciliation, rollback drills and the per-stage gates — is
+[phase2-postgres-migration-plan.md](phase2-postgres-migration-plan.md), which adds no DDL and
+defers to this document wherever the two appear to disagree.
+
 Additive at every step. The SQLite ledgers are never written to by any of this.
 
 | Step | Action | Reversal |
