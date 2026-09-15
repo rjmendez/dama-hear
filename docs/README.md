@@ -52,6 +52,8 @@ current code disagree, the design states the intended end state.
 | [data-governance.md](data-governance.md) | Self-hosted acoustic data governance: data classes, recording indicators, retention, access, export, and audit controls for captured and derived data. |
 | [resilience.md](resilience.md) | Failure-mode design: the invariants that must survive, degraded-mode behaviour per dependency, and how operators learn about failure without reading a stack trace. |
 | [durable-outbox-failure-drill-runbook.md](durable-outbox-failure-drill-runbook.md) | Maintenance-window procedure for the `hear-mqtt-bridge` durable-outbox induced-failure drill: gate, prechecks, backup, scoped fault injection, expected observations, abort triggers, recovery order, evidence receipt, and pass criteria. |
+| [ota-release-credentials.md](ota-release-credentials.md) | The tokenless-release incident, the firmware secret audit, and the NVS credential contract that keeps published images secret-free without making a node OTA-unrecoverable. |
+| [release-v0.1.6-readiness.md](release-v0.1.6-readiness.md) | The pre-cut gate for v0.1.6: required merged prerequisites, artifact variants and the `fs_acquisition_hz: 48000` manifest check, the unprovisioned-vs-fleet-ready public asset contract, operator-selected admin-token provisioning, pre-cut checks, per-node rollout order and no-go gates, the deliberate `nyquist` rollback receipt, and failure/rollback procedures. Not executed. |
 
 ## Field findings and calibration records
 
