@@ -79,14 +79,25 @@ class TestBuildVariants:
 
 
 class TestReleaseImagesAreRefusedWhenTheBusDiffers:
-    def test_gold_is_refused_the_class_release(self):
-        why = bp.release_variant_refusal("esp32s3-i2s-gps", "gold")
-        assert why and "quad" in why
+    def test_gold_is_refused_the_octal_release_variant(self):
+        why = bp.release_variant_refusal("esp32s3-i2s-gps", "gold", "octal")
+        assert why and "quad" in why and "octal" in why
+
+    def test_gold_accepts_the_qspi_release_variant(self):
+        assert bp.release_variant_refusal("esp32s3-i2s-gps", "gold", "quad") is None
 
     def test_default_nodes_still_take_the_class_release(self):
-        assert bp.release_variant_refusal("esp32s3-i2s-gps", "ageev") is None
-        assert bp.release_variant_refusal("esp32s3-i2s-gps", "kasami") is None
-        assert bp.release_variant_refusal("xiao-s3-pps", "nyquist") is None
+        assert bp.release_variant_refusal("esp32s3-i2s-gps", "ageev", "octal") is None
+        assert bp.release_variant_refusal("esp32s3-i2s-gps", "kasami", "octal") is None
+        assert bp.release_variant_refusal("xiao-s3-pps", "nyquist", "octal") is None
+
+    def test_default_nodes_are_refused_the_qspi_release_variant(self):
+        why = bp.release_variant_refusal("esp32s3-i2s-gps", "ageev", "quad")
+        assert why and "octal" in why and "quad" in why
+
+    def test_qspi_release_assets_are_variant_qualified(self):
+        assert bp.release_asset_name("v0.1.3", "esp32s3-i2s-gps", "app", "quad") \
+            == "hear_node-esp32s3-i2s-gps-qspi-v0.1.3.bin"
 
 
 class TestCiBuildsEveryModeItCanFlash:
@@ -100,10 +111,11 @@ class TestCiBuildsEveryModeItCanFlash:
         for node, rec in bp.NODE_PSRAM_MODES.items():
             assert bp.fqbn(rec["board_class"], node) in built, node
 
-    def test_the_published_class_images_are_still_the_default_mode(self):
+    def test_published_variants_name_their_psram_mode(self):
         for entry in self._matrix():
             if entry["sketch"] == "hear_node" and entry["release_stem"]:
-                assert entry["fqbn"] == bp.FQBN
+                assert entry["release_stem"] == bp.release_stem(entry["board_class"], entry["psram_mode"])
+                assert entry["fqbn"] == bp.PSRAM_MODES[entry["psram_mode"]]["fqbn"]
 
 
 class TestFirmwareRefusesToDegradeSilently:
@@ -113,3 +125,4 @@ class TestFirmwareRefusesToDegradeSilently:
         assert "BOARD_HAS_PSRAM" in ino
         assert "psramFound()" in ino
         assert '\\"psram_fault\\":%s' in ino
+        assert '\\"psram_bus\\":\\"%s\\"' in ino

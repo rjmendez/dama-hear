@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "03616aec0552ec788e225706abdf6278a01cfa6c107e1b06fe1f87309bebb882",
+  "baseline_hash": "9f7d47b1224e0cfa5ebd40f7e3ad00fbdc5d30a2f014a784d46c1d76d23d3ab5",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -251,17 +251,17 @@
     ],
     "default_board_class": "xiao-s3-pps",
     "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
-    "section_hash": "127af3f4fa499dbceba49a4225f46919c6567284e329c3511bb7460b63aa651d",
+    "section_hash": "51968c026a8f7c8ed479650bcccd59784d022c771954858afccd9e4790c0367c",
     "source_files": [
       {
         "path": ".github/workflows/firmware.yml",
-        "sha256": "3700ce1d3b1a8e7802e353d91428d8f846faf379eb03557bd864bf5d5049df10",
-        "size_bytes": 6254
+        "sha256": "9c731260907c33f0dec1ab85010479116fc83feb7054eedfb1dc33a5234d7945",
+        "size_bytes": 6116
       },
       {
         "path": ".github/workflows/release.yml",
-        "sha256": "2f28bd279d85565f83992b52c099f1111111df8daf2fa467e7b243381f84dd82",
-        "size_bytes": 5017
+        "sha256": "69282f27adc65c5e7f8129753d4932b85b8315e77dc42e1fdba19f07b3b604da",
+        "size_bytes": 6696
       },
       {
         "path": "firmware/README.md",
@@ -275,8 +275,8 @@
       },
       {
         "path": "firmware/hear_node/board_profiles.py",
-        "sha256": "7bacb23e11938ec0762beb43b6001b8e63b32191f0111ff7cf4f3c46e049b3e3",
-        "size_bytes": 7813
+        "sha256": "261a300c7bc1a9ab214fb2d539fd74aead5e75516f4c5321a0404524ff61b463",
+        "size_bytes": 7903
       },
       {
         "path": "firmware/hear_node/gen_secrets.py",
@@ -285,8 +285,8 @@
       },
       {
         "path": "firmware/hear_node/hear_node.ino",
-        "sha256": "7f562253b40227566704297c079fb217240742d3bec540cb2c07ec9e46271928",
-        "size_bytes": 322334
+        "sha256": "fe8f2a6e2b44f731d126e6d1dc7432a9c63b4878497fab320b5164a555811343",
+        "size_bytes": 322548
       },
       {
         "path": "firmware/hear_node/hear_push_payload.h",
@@ -364,7 +364,7 @@
           "-DHEAR_BOARD_ESP32S3_I2S_GPS"
         ],
         "guarded": true,
-        "release_stem": null,
+        "release_stem": "hear_node-esp32s3-i2s-gps-qspi",
         "sketch": "hear_node"
       },
       {

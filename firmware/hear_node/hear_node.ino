@@ -3175,6 +3175,15 @@ static String status_json() {
   char boot_epoch_json[24];
   if (tv) snprintf(boot_epoch_json, sizeof boot_epoch_json, "%lld", (long long)clock_boot_epoch_us());
   else    snprintf(boot_epoch_json, sizeof boot_epoch_json, "null");
+#ifdef BOARD_HAS_PSRAM
+#ifdef CONFIG_SPIRAM_MODE_OCT
+  const char *psram_bus = "octal";
+#else
+  const char *psram_bus = "quad";
+#endif
+#else
+  const char *psram_bus = "none";
+#endif
   snprintf(b, sizeof b,
     // fw is FIRST after the identity, because the question it answers -- is this node running
     // the same binary as its neighbours -- is asked of the whole fleet at once.
@@ -3193,7 +3202,7 @@ static String status_json() {
       // psram_fault: the image was built expecting PSRAM and the chip has none it can talk to,
       // i.e. the binary's PSRAM bus mode does not match this board. Everything that wanted PSRAM
       // is now on the internal heap and this node is on its way to an allocation failure.
-      "\"loop_max_boot_ms\":%lu,\"loop_max_boot_at_s\":%lu,\"chip_c\":%.1f,\"stream_stalls\":%lu,\"stream_gone\":%lu,\"psram_fault\":%s},"
+      "\"loop_max_boot_ms\":%lu,\"loop_max_boot_at_s\":%lu,\"chip_c\":%.1f,\"stream_stalls\":%lu,\"stream_gone\":%lu,\"psram_fault\":%s,\"psram_bus\":\"%s\"},"
     "\"uptime_s\":%lu,\"heap\":%lu,\"psram\":%lu,"
     "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid_nmea\":%lu,\"baud\":%lu,"
     "\"tacc_ns\":%lu,\"qerr_ps\":%ld,\"ubx_pvt\":%lu,\"ubx_timtp\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"pmtk_ack\":%lu,\"pmtk_nak\":%lu,\"pmtk_glitch\":%lu,\"config_acked\":%s,\"timtp_flags\":%u,\"qerr_valid\":%s},"
@@ -3279,7 +3288,7 @@ static String status_json() {
     (unsigned long)(loop_max_us / 1000), (unsigned long)(loop_max_boot_us / 1000),
     (unsigned long)loop_max_boot_at_s, temperatureRead(),
     (unsigned long)stream_stall_n, (unsigned long)stream_gone_n,
-    psram_fault ? "true" : "false",
+    psram_fault ? "true" : "false", psram_bus,
     (unsigned long)((millis() - boot_ms) / 1000), (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getFreePsram(),
     gps_fix, gps_sats, gps_utc, (unsigned long)gps_sentences,

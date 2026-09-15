@@ -112,8 +112,9 @@ def check_sums(sums_text, name, data):
         raise ValueError("%s sha256 %s, SHA256SUMS says %s" % (name, got, want))
 
 
-def release_files(tag, dest, board_class, repo=REPO_SLUG):
+def release_files(tag, dest, board_class, psram_mode=None, repo=REPO_SLUG):
     board_profiles.require_board_class(board_class)
+    psram_mode = board_profiles.require_psram_mode(psram_mode or board_profiles.psram_mode(board_class))
     base = "https://github.com/%s/releases/download/%s/" % (repo, tag)
     manifest_text = None
     try:
@@ -123,7 +124,7 @@ def release_files(tag, dest, board_class, repo=REPO_SLUG):
     sums = None if manifest_text is not None else fetch(base + "SHA256SUMS").decode()
     fetched = {}
     for kind in ("app", "bootloader", "partitions"):
-        name = board_profiles.release_asset_name(tag, board_class, kind)
+        name = board_profiles.release_asset_name(tag, board_class, kind, psram_mode)
         data = fetch(base + name)
         if manifest_text is None:
             check_sums(sums, name, data)
@@ -131,7 +132,8 @@ def release_files(tag, dest, board_class, repo=REPO_SLUG):
         with open(os.path.join(dest, board_profiles.upload_filename(kind)), "wb") as f:
             f.write(data)
     if manifest_text is not None:
-        release_manifest.verify_downloaded_release_assets(manifest_text, tag, board_class, fetched)
+        release_manifest.verify_downloaded_release_assets(
+            manifest_text, tag, board_class, fetched, psram_mode=psram_mode)
         print("enroll: %s %s assets verified against %s"
               % (tag, board_class, release_manifest.MANIFEST_NAME))
     else:
@@ -279,15 +281,17 @@ def main(argv=None):
 
     if a.release:
         try:
-            refusal = board_profiles.release_variant_refusal(a.cls, a.node)
+            mode = board_profiles.psram_mode(a.cls, a.node)
+            refusal = board_profiles.release_variant_refusal(a.cls, a.node, mode)
         except ValueError as e:
             die(str(e))
         if refusal:
             die("refusing release %s: %s" % (a.release, refusal))
-        d = os.path.join(REPO, ".otabuild", "release-%s-%s-usb" % (a.release, a.cls))
+        variant = board_profiles.build_variant(a.cls, a.node)
+        d = os.path.join(REPO, ".otabuild", "release-%s-%s-usb" % (a.release, variant))
         os.makedirs(d, exist_ok=True)
         try:
-            release_files(a.release, d, a.cls)
+            release_files(a.release, d, a.cls, mode)
         except (OSError, ValueError) as e:
             die("release %s (%s): %s" % (a.release, a.cls, e))
         upload(a.port, d, node_fqbn())

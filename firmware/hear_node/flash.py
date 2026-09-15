@@ -111,6 +111,35 @@ def release_refusal(st, node, board_class=None):
     return None
 
 
+def _live_psram_mode(st):
+    """The PSRAM bus mode reported by /status, if this firmware is new enough to expose it."""
+    for holder, key in ((st.get("sys"), "psram_bus"), (st.get("hardware"), "psram_mode"),
+                        (st, "psram_mode")):
+        if isinstance(holder, dict) and holder.get(key):
+            return board_profiles.require_psram_mode(str(holder[key]).strip().lower())
+    return None
+
+
+def release_psram_mode(st, board_class, node):
+    """Choose the release asset's PSRAM variant without relaxing the mismatch guard."""
+    recorded = board_profiles.psram_mode(board_class, node)
+    try:
+        live = _live_psram_mode(st)
+    except ValueError as e:
+        die(str(e))
+    if live is not None:
+        why = board_profiles.release_variant_refusal(board_class, node, live)
+        if why:
+            die("refusing to install release on %s: live /status reports %s PSRAM but %s"
+                % (st.get("node"), live, why))
+        return live
+    sys_block = st.get("sys") if isinstance(st.get("sys"), dict) else {}
+    if sys_block.get("psram_fault") and recorded == board_profiles.psram_mode(board_class):
+        die("refusing to guess a PSRAM release variant for %s: /status reports psram_fault but no "
+            "live psram_bus; record this node in NODE_PSRAM_MODES first" % node)
+    return recorded
+
+
 def resolve_board_class(requested, live_status=None, require_live=False):
     if requested is not None:
         board_profiles.require_board_class(requested)
@@ -126,11 +155,12 @@ def resolve_board_class(requested, live_status=None, require_live=False):
         raise
 
 
-def release_image(tag, board_class, repo=REPO_SLUG):
-    """Download the board-class app image, refuse it unless SHA256SUMS vouches for it."""
+def release_image(tag, board_class, psram_mode=None, repo=REPO_SLUG):
+    """Download the board-class/PSRAM app image, refuse it unless release metadata vouches for it."""
     import enroll
     base = "https://github.com/%s/releases/download/%s/" % (repo, tag)
-    name = board_profiles.release_asset_name(tag, board_class, "app")
+    psram_mode = board_profiles.require_psram_mode(psram_mode or board_profiles.psram_mode(board_class))
+    name = board_profiles.release_asset_name(tag, board_class, "app", psram_mode)
     try:
         manifest_text = None
         try:
@@ -140,13 +170,15 @@ def release_image(tag, board_class, repo=REPO_SLUG):
         data = enroll.fetch(base + name)
         if manifest_text is not None:
             release_manifest.verify_downloaded_release_assets(
-                manifest_text, tag, board_class, {name: data})
+                manifest_text, tag, board_class, {name: data}, psram_mode=psram_mode)
         else:
             sums = enroll.fetch(base + "SHA256SUMS").decode()
             enroll.check_sums(sums, name, data)
     except (OSError, ValueError) as e:
         die("release %s: %s" % (tag, e))
-    d = os.path.join(REPO, ".otabuild", "release-%s-%s" % (tag, board_class))
+    variant = board_profiles.build_variant(board_class) if psram_mode == board_profiles.psram_mode(board_class) \
+        else board_class + board_profiles.PSRAM_MODES[psram_mode]["variant_suffix"]
+    d = os.path.join(REPO, ".otabuild", "release-%s-%s" % (tag, variant))
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, name)
     with open(path, "wb") as f:
@@ -197,13 +229,11 @@ def main(argv):
         why = release_refusal(was, node, board_class)
         if why:
             die("refusing to install %s on %s: %s" % (release, target, why))
-        try:
-            why = board_profiles.release_variant_refusal(board_class, node)
-        except ValueError as e:
-            die(str(e))
+        mode = release_psram_mode(was, board_class, node)
+        why = board_profiles.release_variant_refusal(board_class, node, mode)
         if why:
             die("refusing to install %s on %s: %s" % (release, target, why))
-        bin_path = release_image(release, board_class)
+        bin_path = release_image(release, board_class, mode)
     else:
         # 1. identity, for THIS node, immediately before the build that carries it
         if not is_serial:

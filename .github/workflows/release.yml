@@ -38,6 +38,11 @@ jobs:
           name: fw-hear_node-esp32s3-i2s-gps
           path: ${{ runner.temp }}/hear-node-release/esp32s3-i2s-gps
 
+      - uses: actions/download-artifact@v8
+        with:
+          name: fw-hear_node-esp32s3-i2s-gps-qspi
+          path: ${{ runner.temp }}/hear-node-release/esp32s3-i2s-gps-qspi
+
       - name: assemble
         run: |
           mkdir dist
@@ -51,6 +56,11 @@ jobs:
           cp "$RUNNER_TEMP/hear-node-release/esp32s3-i2s-gps/hear_node.ino.partitions.bin" "dist/hear_node-esp32s3-i2s-gps-$TAG-partitions.bin"
           cp "$RUNNER_TEMP/hear-node-release/esp32s3-i2s-gps/hear_node.ino.merged.bin"     "dist/hear_node-esp32s3-i2s-gps-$TAG-merged.bin"
           cp "$RUNNER_TEMP/hear-node-release/esp32s3-i2s-gps/hear_node.ino.elf"            "dist/hear_node-esp32s3-i2s-gps-$TAG.elf"
+          cp "$RUNNER_TEMP/hear-node-release/esp32s3-i2s-gps-qspi/hear_node.ino.bin"            "dist/hear_node-esp32s3-i2s-gps-qspi-$TAG.bin"
+          cp "$RUNNER_TEMP/hear-node-release/esp32s3-i2s-gps-qspi/hear_node.ino.bootloader.bin" "dist/hear_node-esp32s3-i2s-gps-qspi-$TAG-bootloader.bin"
+          cp "$RUNNER_TEMP/hear-node-release/esp32s3-i2s-gps-qspi/hear_node.ino.partitions.bin" "dist/hear_node-esp32s3-i2s-gps-qspi-$TAG-partitions.bin"
+          cp "$RUNNER_TEMP/hear-node-release/esp32s3-i2s-gps-qspi/hear_node.ino.merged.bin"     "dist/hear_node-esp32s3-i2s-gps-qspi-$TAG-merged.bin"
+          cp "$RUNNER_TEMP/hear-node-release/esp32s3-i2s-gps-qspi/hear_node.ino.elf"            "dist/hear_node-esp32s3-i2s-gps-qspi-$TAG.elf"
           python3 - <<'PY'
           import json, os
           tag = os.environ["TAG"]
@@ -64,9 +74,18 @@ jobs:
               "variants": [
                   {"board_class": "xiao-s3-pps",
                    "release_stem": "hear_node-xiao-s3-pps",
+                   "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
+                   "psram_mode": "octal",
                    "build_flags": ["-DHEAR_ALLOW_NO_WIFI"]},
                   {"board_class": "esp32s3-i2s-gps",
                    "release_stem": "hear_node-esp32s3-i2s-gps",
+                   "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
+                   "psram_mode": "octal",
+                   "build_flags": ["-DHEAR_ALLOW_NO_WIFI", "-DHEAR_BOARD_ESP32S3_I2S_GPS"]},
+                  {"board_class": "esp32s3-i2s-gps",
+                   "release_stem": "hear_node-esp32s3-i2s-gps-qspi",
+                   "fqbn": "esp32:esp32:esp32s3:PSRAM=enabled,FlashSize=8M,PartitionScheme=default_8MB,USBMode=default,CDCOnBoot=cdc",
+                   "psram_mode": "quad",
                    "build_flags": ["-DHEAR_ALLOW_NO_WIFI", "-DHEAR_BOARD_ESP32S3_I2S_GPS"]},
               ],
               "credentials": "none compiled in; read from the node's NVS (enroll.py)",
@@ -83,7 +102,7 @@ jobs:
           cat > notes.md <<EOF
           Firmware for \`firmware/hear_node\` at \`$GITHUB_SHA\`. \`/status\` reports it as \`fw: $TAG\`.
 
-          These images carry **no Wi-Fi credentials and no node name**. Each node keeps its own in NVS, which OTA does not touch, so the release publishes one image per board class and \`flash.py --release\` chooses the one that matches the node's live \`/status\`.
+          These images carry **no Wi-Fi credentials and no node name**. Each node keeps its own in NVS, which OTA does not touch, so the release publishes one image per board class/PSRAM-bus variant and \`flash.py --release\` chooses the one that matches the node's live \`/status\`.
 
           An enrolled node, over the air:
 
@@ -98,7 +117,8 @@ jobs:
           | file | what it is |
           |---|---|
           | \`hear_node-xiao-s3-pps-$TAG.*\` | Seeed XIAO ESP32-S3 Sense release set |
-          | \`hear_node-esp32s3-i2s-gps-$TAG.*\` | ESP32-S3 + I2S mic + PMTK GPS release set |
+          | \`hear_node-esp32s3-i2s-gps-$TAG.*\` | ESP32-S3 + I2S mic + PMTK GPS octal-PSRAM release set |
+          | \`hear_node-esp32s3-i2s-gps-qspi-$TAG.*\` | ESP32-S3 + I2S mic + PMTK GPS quad-PSRAM (QSPI) release set |
           | \`build-info.json\` | toolchain and flags |
           | \`release-manifest.json\` | immutable offline-verifiable release manifest |
           | \`release-manifest.schema.json\` | manifest JSON schema |

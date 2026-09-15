@@ -137,7 +137,7 @@ def _file_record(path, data):
     return {"path": path, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
-def _release_manifest_text(tag, board_class, assets, dirty=False):
+def _release_manifest_text(tag, board_class, assets, dirty=False, psram_mode="octal"):
     """A schema-valid manifest; verification refuses anything less."""
     stub = b"stub\n"
     return json.dumps({
@@ -168,7 +168,9 @@ def _release_manifest_text(tag, board_class, assets, dirty=False):
         "schema_guards": [_file_record("tests/test_firmware_csv_schema.py", stub)],
         "variants": [{
             "board_class": board_class,
-            "release_stem": board_profiles.release_stem(board_class),
+            "psram_mode": psram_mode,
+            "release_stem": board_profiles.release_stem(board_class, psram_mode),
+            "fqbn": board_profiles.PSRAM_MODES[psram_mode]["fqbn"],
             "build_flags": ["-DHEAR_ALLOW_NO_WIFI"],
             "board_header": _file_record(board_profiles.board_header(board_class), stub),
             "capture_profile": {
@@ -314,7 +316,7 @@ class TestPostFlashVersionCheck:
         states = iter([good] + [dict(good, fw="v0.1.4-122-g794e3f5", uptime_s=90)] * 200)
         monkeypatch.setattr(flash, "status", lambda host: next(states))
         monkeypatch.setattr(flash.time, "sleep", lambda _: None)
-        monkeypatch.setattr(flash, "release_image", lambda tag, board_class: "/x/app.bin")
+        monkeypatch.setattr(flash, "release_image", lambda tag, board_class, psram_mode=None: "/x/app.bin")
         monkeypatch.setattr(flash.subprocess, "run", lambda cmd, **kw: type(
             "R", (), {"stdout": "OK", "stderr": "", "returncode": 0})())
         with pytest.raises(SystemExit):
@@ -331,6 +333,8 @@ class TestBoardClassSelection:
         assert board_profiles.build_extra_flags("esp32s3-i2s-gps") == "-DHEAR_BOARD_ESP32S3_I2S_GPS"
         assert board_profiles.release_asset_name("v0.1.3", "esp32s3-i2s-gps", "app") \
             == "hear_node-esp32s3-i2s-gps-v0.1.3.bin"
+        assert board_profiles.release_asset_name("v0.1.3", "esp32s3-i2s-gps", "app", "quad") \
+            == "hear_node-esp32s3-i2s-gps-qspi-v0.1.3.bin"
 
     def test_release_path_refuses_a_wrong_requested_board_class(self, monkeypatch):
         monkeypatch.setattr(flash, "status",
@@ -338,6 +342,33 @@ class TestBoardClassSelection:
                                           "prov": {"src": "nvs", "nets": 1, "nvs": True}})
         with pytest.raises(SystemExit):
             flash.main(["flash.py", "gold", "172.16.100.50", "--release", "v0.1.3", "--class", "xiao-s3-pps"])
+
+    def test_release_path_uses_live_reported_qspi_variant_for_gold(self, monkeypatch):
+        called = []
+        good = {"node": "gold", "class": "esp32s3-i2s-gps",
+                "sys": {"psram_bus": "quad"},
+                "prov": {"src": "nvs", "nets": 1, "nvs": True}}
+        states = iter([good, dict(good, fw="v0.1.3", uptime_s=3)])
+        monkeypatch.setattr(flash, "status", lambda host: next(states))
+        monkeypatch.setattr(flash.time, "sleep", lambda _: None)
+        monkeypatch.setattr(flash.subprocess, "run", lambda cmd, **kw: type(
+            "R", (), {"stdout": "OK", "stderr": "", "returncode": 0})())
+
+        def fake_release_image(tag, board_class, psram_mode=None):
+            called.append((tag, board_class, psram_mode))
+            return "/x/app.bin"
+
+        monkeypatch.setattr(flash, "release_image", fake_release_image)
+        assert flash.main(["flash.py", "gold", "172.16.100.50", "--release", "v0.1.3"]) == 0
+        assert called == [("v0.1.3", "esp32s3-i2s-gps", "quad")]
+
+    def test_release_path_refuses_live_psram_mode_that_contradicts_the_node_record(self, monkeypatch):
+        monkeypatch.setattr(flash, "status",
+                            lambda host: {"node": "gold", "class": "esp32s3-i2s-gps",
+                                          "sys": {"psram_bus": "octal"},
+                                          "prov": {"src": "nvs", "nets": 1, "nvs": True}})
+        with pytest.raises(SystemExit):
+            flash.main(["flash.py", "gold", "172.16.100.50", "--release", "v0.1.3"])
 
     def test_live_gps_node_build_adds_the_board_define(self, monkeypatch):
         cmds = []
@@ -389,6 +420,32 @@ class TestBoardClassSelection:
             "hear_node-esp32s3-i2s-gps-v0.1.3-partitions.bin",
         ]
 
+    def test_enroll_release_files_download_the_qspi_variant(self, monkeypatch, tmp_path):
+        fetched = []
+        payloads = {
+            "hear_node-esp32s3-i2s-gps-qspi-v0.1.3.bin": b"app",
+            "hear_node-esp32s3-i2s-gps-qspi-v0.1.3-bootloader.bin": b"boot",
+            "hear_node-esp32s3-i2s-gps-qspi-v0.1.3-partitions.bin": b"parts",
+        }
+        manifest = _release_manifest_text("v0.1.3", "esp32s3-i2s-gps", payloads,
+                                          psram_mode="quad")
+
+        def fake_fetch(url, timeout=60):
+            name = url.rsplit("/", 1)[-1]
+            fetched.append(name)
+            if name == release_manifest.MANIFEST_NAME:
+                return manifest.encode()
+            return payloads[name]
+
+        monkeypatch.setattr(enroll, "fetch", fake_fetch)
+        enroll.release_files("v0.1.3", str(tmp_path), "esp32s3-i2s-gps", "quad")
+        assert fetched == [
+            release_manifest.MANIFEST_NAME,
+            "hear_node-esp32s3-i2s-gps-qspi-v0.1.3.bin",
+            "hear_node-esp32s3-i2s-gps-qspi-v0.1.3-bootloader.bin",
+            "hear_node-esp32s3-i2s-gps-qspi-v0.1.3-partitions.bin",
+        ]
+
     def test_enroll_release_files_falls_back_to_sha256sums_for_legacy_releases(self, monkeypatch, tmp_path):
         fetched = []
 
@@ -417,9 +474,10 @@ class TestBoardClassSelection:
         ]
 
     def test_flash_release_image_uses_the_manifest_when_present(self, monkeypatch, tmp_path):
-        name = "hear_node-esp32s3-i2s-gps-v0.1.3.bin"
+        name = "hear_node-esp32s3-i2s-gps-qspi-v0.1.3.bin"
         payload = b"app"
-        manifest = _release_manifest_text("v0.1.3", "esp32s3-i2s-gps", {name: payload})
+        manifest = _release_manifest_text("v0.1.3", "esp32s3-i2s-gps", {name: payload},
+                                          psram_mode="quad")
         fetched = []
 
         def fake_fetch(url, timeout=60):
@@ -433,6 +491,6 @@ class TestBoardClassSelection:
 
         monkeypatch.setattr(flash, "REPO", str(tmp_path))
         monkeypatch.setattr(enroll, "fetch", fake_fetch)
-        path = flash.release_image("v0.1.3", "esp32s3-i2s-gps")
+        path = flash.release_image("v0.1.3", "esp32s3-i2s-gps", "quad")
         assert pathlib.Path(path).read_bytes() == payload
         assert fetched == [release_manifest.MANIFEST_NAME, name]
