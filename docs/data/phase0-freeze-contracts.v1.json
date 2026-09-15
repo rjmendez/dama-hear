@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "59e85a2eb21876ef16ce507fca8349ea06a0e096ee50adaec235aea8249e5fb0",
+  "baseline_hash": "b4682b2fb5a5dcfed04f9e9d26258d82b6be277edd306b00a54d9819a97d12eb",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -432,8 +432,8 @@
     "manifest_files": [
       {
         "path": "deploy/k8s/hear-annotate.yaml",
-        "sha256": "626e06637419460bc35de39328e1a75e072946d0c192a12ce9f1c8ea079a4061",
-        "size_bytes": 27683
+        "sha256": "07444be208e7d6e8b96b82f8ebd363f2b62eb197955f4b272d6de3f926cf2a8d",
+        "size_bytes": 32877
       },
       {
         "path": "deploy/k8s/hear-birdnet.yaml",
@@ -477,8 +477,8 @@
       },
       {
         "path": "deploy/k8s/README.md",
-        "sha256": "a7f7487543e350ef79649f441e0b3c7439cadcdf5d073b9072babbfd99a5bc18",
-        "size_bytes": 15104
+        "sha256": "157e2eed4140bfe331e0d8c39b45a1ca934b20f536c95a5a5dcf0f10f86b9ea7",
+        "size_bytes": 16983
       }
     ],
     "objects": [
@@ -2123,7 +2123,7 @@
         "storage_request": "5Gi"
       }
     ],
-    "section_hash": "849be220cbf001054dd939e25a023e245a0f01638b1f97a3c05659238bdd8edc"
+    "section_hash": "63890192afc8d4fd368a1e8887152977cd245769df9a4675f84ea373762a6f15"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",

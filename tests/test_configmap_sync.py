@@ -544,3 +544,200 @@ class TestTheProvenanceSurvivesHistoryRewrites:
         second_ann = second["metadata"]["annotations"]
         assert first_ann["dama-hear/commit"] != second_ann["dama-hear/commit"]
         assert first_ann["dama-hear/source-sha256"] == second_ann["dama-hear/source-sha256"]
+
+
+# ------------------------------------- ConfigMaps embedded inside a workload manifest
+
+class TestTheEmbeddedConfigMaps:
+    """⚠️A HAND-EMBEDDED ConfigMap IS THE SAME SECOND COPY WITH NO GUARD ON IT.
+
+    `deploy/k8s/hear-annotate.yaml` carries `server.py` inline next to the Deployment that
+    mounts it, so none of the tests above could see it: they walk `BUNDLES`, and it was not in
+    `BUNDLES`. It drifted at commit fa5a589 -- `tools/hear_annotate/server.py` gained path
+    traversal, proxy-trust, idempotency and WAV-frame hardening and the embedded copy did not,
+    so the pod holding the only human-labelled ground truth in the system ran the pre-hardening
+    code while the checkout, the tests and the reviewer all read the hardened one.
+
+    These tests walk `EMBEDDED_BUNDLES` for the same reason the content guard above walks
+    `BUNDLES`: a second embedded ConfigMap must not be able to arrive unguarded. The fix for a
+    failure here is never an edit to the YAML:
+
+        python3 deploy/k8s/gen_configmap.py <bundle>
+    """
+
+    @staticmethod
+    def _manifest(bundle):
+        return ROOT / _gen()["EMBEDDED_BUNDLES"][bundle][0]
+
+    @staticmethod
+    def _doc(bundle, kind, name):
+        manifest = TestTheEmbeddedConfigMaps._manifest(bundle)
+        for doc in yaml.safe_load_all(manifest.read_text()):
+            if doc and doc.get("kind") == kind and doc["metadata"]["name"] == name:
+                return doc
+        raise AssertionError("no %s/%s in %s" % (kind, name, manifest.name))
+
+    @pytest.mark.parametrize("bundle", sorted(_gen()["EMBEDDED_BUNDLES"]))
+    def test_the_embedded_copy_matches_the_checkout(self, bundle):
+        """The code the pod runs must be the code in the checkout. This is the whole guard."""
+        gen = _gen()
+        _manifest, _app, code, data = gen["EMBEDDED_BUNDLES"][bundle]
+        embedded = self._doc(bundle, "ConfigMap", bundle)["data"]
+        for key, rel in list(code) + list(data):
+            assert key in embedded, "%s is not in %s at all" % (key, bundle)
+            assert embedded[key] == gen["_block"](str(ROOT / rel)), (
+                "%s has drifted from %s -- the cluster is running the old one. Regenerate:\n"
+                "    python3 deploy/k8s/gen_configmap.py %s" % (key, rel, bundle))
+        assert set(embedded) == {k for k, _rel in list(code) + list(data)}, (
+            "%s ships keys that are in no bundle list, so nothing generates or checks them"
+            % bundle)
+
+    @pytest.mark.parametrize("bundle", sorted(_gen()["EMBEDDED_BUNDLES"]))
+    def test_the_sources_regenerate_the_checked_in_manifest_byte_for_byte(self, bundle):
+        """⚠️THE STRONGER STATEMENT, AND THE ONE THAT MAKES THE FILE GENERATED RATHER THAN
+        MERELY CHECKED. Equal `data` would still pass with hand-maintained indentation, key
+        order or annotations that the generator would never emit -- and the next regeneration
+        would then produce a diff nobody asked for, which is how an operator learns to distrust
+        the tool and hand-edit the YAML again. The generator's output IS the committed file.
+        """
+        gen = _gen()
+        text = self._manifest(bundle).read_text()
+        stamp = self._doc(bundle, "ConfigMap", bundle)["metadata"]["annotations"][
+            "dama-hear/commit"]
+        assert gen["render_embedded"](bundle, stamp, text) == text, (
+            "%s is not what gen_configmap.py emits for %s. Regenerate:\n"
+            "    python3 deploy/k8s/gen_configmap.py %s"
+            % (self._manifest(bundle).name, bundle, bundle))
+
+    @pytest.mark.parametrize("bundle", sorted(_gen()["EMBEDDED_BUNDLES"]))
+    def test_regeneration_rewrites_the_configmap_and_nothing_else(self, bundle):
+        """⚠️COMPATIBILITY IS THE POINT: the Deployment and the Service in the same file are
+        hand-maintained, and a generator that reformatted them would be a packaging change
+        smuggled in behind a sync guard. Regenerating from a CHANGED source must move the
+        ConfigMap document and leave every other byte of the manifest where it was.
+        """
+        gen = _gen()
+        _m, _app, code, data = gen["EMBEDDED_BUNDLES"][bundle]
+        text = self._manifest(bundle).read_text()
+        key, rel = (list(code) + list(data))[0]
+        real = gen["_block"]
+        try:
+            gen["_block"] = lambda p, _r=real: (_r(p) + "# regeneration probe\n"
+                                                if p.endswith(rel) else _r(p))
+            changed = gen["render_embedded"](bundle, "0000000", text)
+        finally:
+            gen["_block"] = real
+        assert changed != text, "a changed source must change the manifest"
+        regenerated, = [d for d in yaml.safe_load_all(changed)
+                        if d and d.get("kind") == "ConfigMap"]
+        assert regenerated["data"][key].endswith("# regeneration probe\n")
+        marker = "\n---\n"
+        assert changed.split(marker, 1)[1] == text.split(marker, 1)[1], (
+            "regenerating %s rewrote a document it does not own" % bundle)
+
+    @pytest.mark.parametrize("bundle", sorted(_gen()["EMBEDDED_BUNDLES"]))
+    def test_the_provenance_identifies_the_embedded_content(self, bundle):
+        gen = _gen()
+        manifest, _app, code, data = gen["EMBEDDED_BUNDLES"][bundle]
+        ann = self._doc(bundle, "ConfigMap", bundle)["metadata"]["annotations"]
+        stamp = ann.get("dama-hear/commit", "")
+        assert stamp and not stamp.endswith("-dirty"), (
+            "%s has an unusable provenance stamp %r; regenerate from a clean commit"
+            % (bundle, stamp))
+        assert ann.get("dama-hear/generated-by") == "deploy/k8s/gen_configmap.py", (
+            "a generated object must say so, or the next editor hand-edits it")
+        assert ann.get("dama-hear/embedded-in") == manifest
+        assert ann.get("dama-hear/source-sha256") == gen["source_digest"](code, data)
+
+    @pytest.mark.parametrize("bundle", sorted(_gen()["EMBEDDED_BUNDLES"]))
+    def test_the_import_closure_check_still_runs(self, bundle):
+        gen = _gen()
+        _m, _app, code, data = gen["EMBEDDED_BUNDLES"][bundle]
+        gen["check"](code, data)      # raises SystemExit if the closure is incomplete
+
+    @pytest.mark.parametrize("bundle", sorted(_gen()["EMBEDDED_BUNDLES"]))
+    def test_every_key_is_mounted_where_the_bundle_says(self, bundle):
+        """The seam that breaks only in the cluster, for the block-style mounts this manifest
+        uses: a key the pod does not mount is a file the pod does not have."""
+        gen = _gen()
+        _m, app, code, data = gen["EMBEDDED_BUNDLES"][bundle]
+        keys = {k: rel for k, rel in list(code) + list(data)}
+        dep = self._doc(bundle, "Deployment", app)
+        spec = dep["spec"]["template"]["spec"]
+        volumes = {v["name"]: v for v in spec["volumes"]}
+        code_volumes = [n for n, v in volumes.items()
+                        if (v.get("configMap") or {}).get("name") == bundle]
+        assert code_volumes, "no volume in %s serves ConfigMap %s" % (app, bundle)
+        for container in spec["containers"]:
+            mounted = {m["subPath"]: m["mountPath"] for m in container["volumeMounts"]
+                       if m["name"] in code_volumes and "subPath" in m}
+            assert set(mounted) == set(keys), (
+                "container %r mounts %r but %s ships %r"
+                % (container["name"], sorted(mounted), bundle, sorted(keys)))
+            for key, path in sorted(mounted.items()):
+                assert path == "/app/" + key, (
+                    "%s is mounted at %s; a key mounted at the wrong path is a different module,"
+                    " or none" % (key, path))
+
+    def test_hear_annotate_keeps_the_runtime_contract_the_guard_must_not_change(self):
+        """⚠️PINNED BECAUSE THIS POD OWNS annotations.sqlite3 -- irreplaceable human ground
+        truth on an unbacked `local-path` PVC. Bringing the ConfigMap under the generator is a
+        packaging change and must be nothing else: same object name, same key, same mount path,
+        same image, same database path, same claim, same tailnet exposure. If a later change to
+        the generator moves any of these, it is that change that is wrong.
+        """
+        bundle = "hear-annotate-code"
+        cm = self._doc(bundle, "ConfigMap", bundle)
+        assert cm["metadata"]["namespace"] == "dama"
+        assert cm["metadata"]["labels"] == {"app": "hear-annotate"}
+        assert set(cm["data"]) == {"server.py"}
+
+        spec = self._doc(bundle, "Deployment", "hear-annotate")["spec"]["template"]["spec"]
+        web, = [c for c in spec["containers"] if c["name"] == "web"]
+        assert web["image"] == "python:3.13-slim"
+        assert {e["name"]: e["value"] for e in web["env"]} == {
+            "HEAR_ANNOTATE_DB": "/pool/corpus/annotations.sqlite3"}
+        assert {"name": "code", "mountPath": "/app/server.py",
+                "subPath": "server.py"} in web["volumeMounts"]
+        assert {"name": "pool", "mountPath": "/pool"} in web["volumeMounts"]
+        assert "--pool /pool" in " ".join(web["args"])
+        claims = [v["persistentVolumeClaim"]["claimName"] for v in spec["volumes"]
+                  if "persistentVolumeClaim" in v]
+        assert claims == ["hear-pool"]
+
+        svc = self._doc(bundle, "Service", "hear-annotate")
+        assert svc["metadata"]["annotations"]["tailscale.com/expose"] == "true"
+        assert svc["spec"]["type"] == "ClusterIP"
+
+    @pytest.mark.parametrize("bundle", sorted(_gen()["EMBEDDED_BUNDLES"]))
+    def test_the_live_configmap_matches_the_checkout(self, bundle):
+        """⚠️READ-ONLY, AND IT MUST STAY READ-ONLY. `kubectl get`. Never `apply`, not even
+        `--dry-run`: a test that can reach the cluster must not be one edit away from writing
+        to it.
+
+        A live object OLDER than the checkout is reported as a skip rather than a failure --
+        the same rule the bundle size guard above follows, because an un-applied regeneration
+        is an operator's decision and not a defect in this tree. What fails is a live object
+        that CLAIMS this checkout's content, by source-sha256, and does not have it.
+        """
+        gen = _gen()
+        _m, _app, code, data = gen["EMBEDDED_BUNDLES"][bundle]
+        obj = _live(bundle)
+        live_data = obj.get("data") or {}
+        want = {key: gen["_block"](str(ROOT / rel)) for key, rel in list(code) + list(data)}
+        ann = obj.get("metadata", {}).get("annotations", {}) or {}
+        here = gen["source_digest"](code, data)
+        if live_data == want:
+            return
+        drifted = sorted(set(want) | set(live_data)) and [
+            k for k in sorted(set(want) | set(live_data)) if want.get(k) != live_data.get(k)]
+        if ann.get("dama-hear/source-sha256") != here:
+            pytest.skip(
+                "live %s is stamped %r against this checkout's %r and differs in %s -- the "
+                "cluster is running code that is not in this tree. Apply it deliberately:\n"
+                "    kubectl apply -f %s"
+                % (bundle, ann.get("dama-hear/source-sha256") or ann.get("dama-hear/commit"),
+                   here, drifted, gen["EMBEDDED_BUNDLES"][bundle][0]))
+        assert live_data == want, (
+            "live %s is stamped with this checkout's source digest but %s differ, so the object "
+            "in the cluster was edited outside the generator" % (bundle, drifted))

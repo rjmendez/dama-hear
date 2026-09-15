@@ -169,6 +169,14 @@ MQTT_BRIDGE_CODE = [
     ("tools_hear_mqtt_bridge.py", "tools/hear_mqtt_bridge.py"),
 ]
 
+#: ⚠️ONE FILE, AND IT IS THE ONE THAT OWNS annotations.sqlite3. tools/hear_annotate/server.py
+#: imports fastapi and pydantic and nothing from this repo, so its closure is itself -- but
+#: check() still runs over it, so the day someone imports `hear.clips` to read a WAV header the
+#: generation fails here instead of the pod failing in the cluster.
+ANNOTATE_CODE = [
+    ("server.py", "tools/hear_annotate/server.py"),
+]
+
 #: name -> (app label, code files, data files). The first entry is the default, so the command
 #: documented in deploy/k8s/README.md keeps working with no argument.
 BUNDLES = {
@@ -180,6 +188,24 @@ BUNDLES = {
     "hear-mqtt-bridge-code": ("hear-mqtt-bridge", MQTT_BRIDGE_CODE, []),
 }
 DEFAULT_BUNDLE = "hear-drain-code"
+
+#: name -> (manifest, app label, code files, data files) for a ConfigMap that lives INSIDE a
+#: workload manifest rather than in its own generated file.
+#:
+#: ⚠️IT IS A SEPARATE TABLE BECAUSE THE UNIT OF APPLY IS DIFFERENT, not because the guard is
+#: weaker. A BUNDLES entry is one file that is applied by itself; hear-annotate.yaml is one file
+#: carrying ConfigMap + Deployment + Service that an operator applies whole, and splitting it
+#: would change the documented deploy command and the rollback artifact. So the generator
+#: REWRITES THE ConfigMap DOCUMENT IN PLACE and leaves every other byte of the manifest alone:
+#: same object name, same key, same mount path, same image, env, PVC and Service.
+#:
+#: ⚠️THE DATA IS STILL GENERATED WHOLE, which is the property that matters. server.py was
+#: hand-embedded and drifted from tools/hear_annotate/server.py at commit fa5a589 (#151) --
+#: hardening that never reached the pod, invisible from the cluster and invisible from a diff of
+#: the source file that was changed, because nothing generated the copy and no test compared it.
+EMBEDDED_BUNDLES = {
+    "hear-annotate-code": ("deploy/k8s/hear-annotate.yaml", "hear-annotate", ANNOTATE_CODE, []),
+}
 
 
 def _imported_paths(tree):
@@ -509,12 +535,72 @@ def render(name, app, code, data, sha):
     return "\n".join(out)
 
 
+def _split_manifest(text, name):
+    """(before, preamble, after) around the `name` ConfigMap document of a multi-document file.
+
+    `preamble` is the document's own leading comment lines, which are prose about the manifest
+    and not generated from anything -- they are carried across a regeneration unchanged. `before`
+    and `after` are every other byte of the file, and the generator must not touch them: the
+    Deployment's image, env, probes, volume mounts and the PVC claim are in `after`, and a
+    generator that rewrote them would be a packaging change wearing a sync guard's clothes.
+    """
+    lines = text.split("\n")
+    starts = [i + 1 for i, l in enumerate(lines) if l == "---"]
+    if not text.startswith("---"):
+        starts.insert(0, 0)
+    for n, start in enumerate(starts):
+        end = starts[n + 1] - 1 if n + 1 < len(starts) else len(lines)
+        doc = lines[start:end]
+        if "kind: ConfigMap" not in doc or ("  name: %s" % name) not in doc:
+            continue
+        head = 0
+        while head < len(doc) and (doc[head].startswith("#") or not doc[head].strip()):
+            head += 1
+        return lines[:start], doc[:head], lines[end:]
+    sys.exit("no ConfigMap named %r in the manifest" % name)
+
+
+def render_embedded(name, sha, text):
+    """`text` with the `name` ConfigMap document regenerated from the checkout, nothing else.
+
+    ⚠️NO apply-mode / serialised-bytes ANNOTATION HERE, ON PURPOSE. Those two describe how ONE
+    object is applied, and this object is never applied alone -- `kubectl apply -f
+    deploy/k8s/hear-annotate.yaml` submits three documents, so a per-object mode stamped into
+    this one would be advice for a command nobody runs. The identity annotations are the ones
+    that make a running pod traceable, and those are here.
+    """
+    manifest, app, code, data = EMBEDDED_BUNDLES[name]
+    before, preamble, after = _split_manifest(text, name)
+    out = list(before) + list(preamble) + [
+        "apiVersion: v1", "kind: ConfigMap", "metadata:",
+        "  name: %s" % name, "  namespace: dama",
+        "  labels:", "    app: %s" % app,
+        "  annotations:",
+        "    dama-hear/commit: %r" % sha,
+        "    dama-hear/source-sha256: %r" % source_digest(code, data),
+        "    dama-hear/generated-by: deploy/k8s/gen_configmap.py",
+        "    dama-hear/embedded-in: %s" % manifest,
+        "data:"]
+    for key, rel in code + data:
+        out.append("  %s: |" % key)
+        # `_block` clips to exactly one trailing newline, which is what `|` round-trips; the
+        # final empty element is that newline and would otherwise render as a whitespace line
+        # between this block and the next document's `---`.
+        out += ["    " + l for l in _block(os.path.join(ROOT, rel)).split("\n")[:-1]]
+    return "\n".join(out + after)
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     name = argv[0] if argv else DEFAULT_BUNDLE
-    if name not in BUNDLES:
-        sys.exit("unknown bundle %r; known: %s" % (name, ", ".join(sorted(BUNDLES))))
-    app, code, data = BUNDLES[name]
+    if name not in BUNDLES and name not in EMBEDDED_BUNDLES:
+        sys.exit("unknown bundle %r; known: %s" % (
+            name, ", ".join(sorted(set(BUNDLES) | set(EMBEDDED_BUNDLES)))))
+    embedded = name in EMBEDDED_BUNDLES
+    if embedded:
+        manifest, app, code, data = EMBEDDED_BUNDLES[name]
+    else:
+        app, code, data = BUNDLES[name]
     check(code, data)
     sha = subprocess.check_output(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"]).decode().strip()
     # ⚠️THE GENERATED BUNDLES ARE EXCLUDED FROM THE DIRTY TEST, AND THEY HAVE TO BE.
@@ -526,8 +612,24 @@ def main(argv=None):
     porcelain = subprocess.check_output(
         ["git", "-C", ROOT, "status", "--porcelain"]).decode().splitlines()
     generated = {"deploy/k8s/%s.yaml" % b for b in BUNDLES}
+    # ⚠️AND SO IS THE MANIFEST AN EMBEDDED BUNDLE IS REWRITTEN INTO, for the same reason: the
+    # write dirties the tree it stamps. Only its OTHER documents are hand-maintained, and an
+    # edit to those is not evidence about the source this ConfigMap ships.
+    generated |= {m for m, _a, _c, _d in EMBEDDED_BUNDLES.values()}
     dirty = [ln for ln in porcelain if ln[3:].strip().strip('"') not in generated]
     stamp = sha + ("-dirty" if dirty else "")
+    if embedded:
+        # ⚠️WRITTEN IN PLACE, NEVER PRINTED. The documented command for a standalone bundle
+        # redirects stdout into the file it generates; doing that with a manifest that carries a
+        # Deployment and a Service would truncate the two documents this does not generate.
+        path = os.path.join(ROOT, manifest)
+        text = render_embedded(name, stamp, open(path).read())
+        with open(path, "w") as fh:
+            fh.write(text)
+        sys.stderr.write(
+            "%s: regenerated in place inside %s from %s\n  kubectl apply -f %s\n"
+            % (name, manifest, ", ".join(rel for _k, rel in code + data), manifest))
+        return
     text = render(name, app, code, data, stamp)
     mode, n_bytes, n_ann = apply_mode(code, data, name=name, sha=stamp, app=app)
     # stderr, because stdout is redirected into the .yaml by the documented command and an
