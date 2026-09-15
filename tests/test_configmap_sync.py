@@ -107,7 +107,7 @@ def test_every_bundle_provenance_matches_embedded_content(bundle):
     want = _gen()["source_digest"](code, data)
     assert annotations.get("dama-hear/source-sha256") == want
     canonical = json.dumps(
-        embedded, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        doc["data"], ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
     import hashlib
     assert hashlib.sha256(canonical).hexdigest() == want
 
