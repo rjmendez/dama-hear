@@ -174,8 +174,9 @@ and the solvers read the pool with no adapter.
   CronJob whose pods the namespace then refused (`minimum cpu usage per Container is 100m`),
   because the limit applies at POD creation. Create one job from the CronJob and watch it run.
 - **The ConfigMap is written whole.** Regenerate it with `gen_configmap.py`; never edit a key in
-  the cluster. The generator refuses to ship an incomplete closure and stamps the commit it was
-  built from into the object's annotations.
+  the cluster. The generator refuses to ship an incomplete closure and stamps both the source
+  commit and a content digest into the object's annotations. The digest is the authoritative
+  bundle identity because it remains valid when GitHub squash-merges a branch.
 - **The import audit did not audit imports.** It resolved only `hear/<name>.py`, from three
   `ImportFrom` shapes, with no `ast.Import` branch at all — so `from modules.supersonic import
   classify` passed it silently and a workload importing the classifier would have generated

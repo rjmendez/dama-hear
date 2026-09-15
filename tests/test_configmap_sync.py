@@ -92,34 +92,24 @@ def test_every_bundle_has_a_checked_in_configmap():
 
 
 @pytest.mark.parametrize("bundle", sorted(_gen()["BUNDLES"]))
-def test_every_bundle_stamp_is_clean_and_matches_embedded_content(bundle):
-    """The provenance annotation must identify the exact committed source copied into the map."""
+def test_every_bundle_provenance_matches_embedded_content(bundle):
+    """Provenance must identify the exact data and remain valid across squash merges."""
     path = ROOT / "deploy" / "k8s" / (bundle + ".yaml")
     doc = yaml.safe_load(path.read_text())
-    stamp = doc["metadata"]["annotations"].get("dama-hear/commit", "")
+    annotations = doc["metadata"]["annotations"]
+    stamp = annotations.get("dama-hear/commit", "")
     assert stamp and not stamp.endswith("-dirty"), (
         "%s has an unusable provenance stamp %r; regenerate from a clean commit" %
         (path.name, stamp))
-    try:
-        subprocess.check_call(
-            ["git", "-C", str(ROOT), "cat-file", "-e", "%s^{commit}" % stamp],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except subprocess.CalledProcessError:
-        pytest.fail("%s provenance stamp %r is not a commit in this checkout" %
-                    (path.name, stamp))
 
     embedded = _embedded(path)
     _app, code, data = _gen()["BUNDLES"][bundle]
-    for key, rel in list(code) + list(data):
-        want = subprocess.check_output(
-            ["git", "-C", str(ROOT), "show", "%s:%s" % (stamp, rel)],
-            text=True,
-        )
-        assert embedded[key] == want, (
-            "%s key %s does not match %s at %s; regenerate from that commit" %
-            (path.name, key, rel, stamp))
+    want = _gen()["source_digest"](code, data)
+    assert annotations.get("dama-hear/source-sha256") == want
+    canonical = json.dumps(
+        doc["data"], ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    import hashlib
+    assert hashlib.sha256(canonical).hexdigest() == want
 
 
 @pytest.mark.parametrize("bundle", sorted(_gen()["BUNDLES"]))
@@ -405,12 +395,14 @@ def test_the_declared_size_matches_what_the_api_server_stored(bundle):
     path = ROOT / "deploy" / "k8s" / (bundle + ".yaml")
     here = None
     if path.exists():
-        here = (yaml.safe_load(path.read_text()).get("metadata", {})
-                .get("annotations", {}) or {}).get("dama-hear/commit")
-    if int(declared) != stored and ann.get("dama-hear/commit") != here:
+        here_ann = (yaml.safe_load(path.read_text()).get("metadata", {})
+                    .get("annotations", {}) or {})
+        here = here_ann.get("dama-hear/source-sha256") or here_ann.get("dama-hear/commit")
+    live_identity = ann.get("dama-hear/source-sha256") or ann.get("dama-hear/commit")
+    if int(declared) != stored and live_identity != here:
         pytest.skip("live %s is stamped %r against the checkout's %r, and declares %s B where "
                     "the server stored %d B (%+d). Regenerated bundles have not been applied."
-                    % (bundle, ann.get("dama-hear/commit"), here, declared, stored,
+                    % (bundle, live_identity, here, declared, stored,
                        stored - int(declared)))
     assert int(declared) == stored, (
         "live %s declares %s B but the API server stored %d B of last-applied-configuration "
@@ -541,43 +533,14 @@ class TestTheCommitStampCanActuallySayClean:
         assert ".py" not in clause.split("]")[0], "a .py path must never be excluded"
 
 
-class TestTheStampNamesACommitThatExists:
-    """⚠️A STAMP NAMING AN UNREACHABLE COMMIT IS WORSE THAN ONE SAYING "-dirty".
-
-    A file cannot contain the hash of the commit that contains it, so the stamp always names the
-    PARENT state. That is fine until someone regenerates the bundles and then `git commit
-    --amend`: the amend rewrites the SHA the bundles just recorded, and the stamp is left
-    pointing at a commit that is no longer in history. Observed exactly that way on 2026-09-11 --
-    stamp d7b2a0f, HEAD 79e0813, and `git merge-base --is-ancestor` said no.
-
-    The fix is two commits, not one amended commit: land the source, then regenerate. This test
-    is what says so out loud.
-
-    Skipped, not failed, when the tree is dirty -- mid-edit the stamp is expected to be stale,
-    and a test that fails during ordinary work is a test people learn to ignore.
-    """
-
-    def test_every_bundle_stamp_is_an_ancestor_of_head(self):
-        import subprocess
-        root = str(ROOT)
-        if subprocess.run(["git", "-C", root, "rev-parse", "--git-dir"],
-                          capture_output=True).returncode != 0:
-            pytest.skip("not a git checkout")
-        porcelain = subprocess.check_output(
-            ["git", "-C", root, "status", "--porcelain"]).decode().splitlines()
-        generated = {"deploy/k8s/%s.yaml" % b for b in _gen()["BUNDLES"]}
-        if [ln for ln in porcelain if ln[3:].strip().strip('"') not in generated]:
-            pytest.skip("working tree has source changes; the stamp is expected to be stale")
-        for bundle in sorted(_gen()["BUNDLES"]):
-            path = ROOT / "deploy" / "k8s" / (bundle + ".yaml")
-            if not path.exists():
-                continue
-            stamp = (yaml.safe_load(path.read_text())["metadata"]["annotations"]
-                     .get("dama-hear/commit") or "")
-            if not stamp or stamp.endswith("-dirty"):
-                continue
-            assert subprocess.run(["git", "-C", root, "merge-base", "--is-ancestor", stamp, "HEAD"],
-                                  capture_output=True).returncode == 0, (
-                "%s stamps %s, which is not an ancestor of HEAD. An --amend after regenerating "
-                "does this: the amend rewrites the SHA the bundle just recorded. Land the source "
-                "first, then regenerate in a second commit." % (path.name, stamp))
+class TestTheProvenanceSurvivesHistoryRewrites:
+    def test_source_digest_does_not_depend_on_commit_stamp(self):
+        ns = _gen()
+        bundle = "hear-heartbeat-code"
+        app, code, data = ns["BUNDLES"][bundle]
+        first = yaml.safe_load(ns["render"](bundle, app, code, data, "1111111"))
+        second = yaml.safe_load(ns["render"](bundle, app, code, data, "2222222"))
+        first_ann = first["metadata"]["annotations"]
+        second_ann = second["metadata"]["annotations"]
+        assert first_ann["dama-hear/commit"] != second_ann["dama-hear/commit"]
+        assert first_ann["dama-hear/source-sha256"] == second_ann["dama-hear/source-sha256"]

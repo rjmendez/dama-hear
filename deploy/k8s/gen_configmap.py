@@ -23,6 +23,7 @@ cluster, which is the failure this script exists to make impossible -- and the d
 half it did not have. Adding an import or a model file without adding it here fails generation.
 """
 import ast
+import hashlib
 import json
 import os
 import subprocess
@@ -292,6 +293,14 @@ OBJECT_CAP = 1048576
 CLIENT_APPLY_MARGIN = 8192
 
 
+def source_digest(code, data):
+    """Stable identity for the exact ConfigMap data, independent of Git merge strategy."""
+    payload = {key: _block(os.path.join(ROOT, rel)) for key, rel in code + data}
+    canonical = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _object(name, app, code, data, sha, mode, n_bytes):
     """The ConfigMap exactly as kubectl will serialise it -- the thing the cap applies to.
 
@@ -303,6 +312,7 @@ def _object(name, app, code, data, sha, mode, n_bytes):
             "metadata": {"name": name, "namespace": "dama",
                          "labels": {"app": app},
                          "annotations": {"dama-hear/commit": sha,
+                                         "dama-hear/source-sha256": source_digest(code, data),
                                          "dama-hear/generated-by": "deploy/k8s/gen_configmap.py",
                                          "dama-hear/apply-mode": mode,
                                          "dama-hear/serialised-bytes": str(n_bytes)}},
@@ -483,6 +493,7 @@ def render(name, app, code, data, sha):
            "  labels:", "    app: %s" % app,
            "  annotations:",
            "    dama-hear/commit: %r" % sha,
+           "    dama-hear/source-sha256: %r" % source_digest(code, data),
            "    dama-hear/generated-by: deploy/k8s/gen_configmap.py",
            # ⚠️STRUCTURED, NOT PROSE. The test that checks a bundle over the cap is marked
            # server-side reads THIS field. A test that grepped the document for the string

@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-mqtt-bridge-code.yaml
-# apply-mode client: 39914 B serialised; 40091 B of annotations against a 262144 B cap.
+# apply-mode client: 40007 B serialised; 40271 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,11 @@ metadata:
   labels:
     app: hear-mqtt-bridge
   annotations:
-    dama-hear/commit: 'a8b9e3a'
+    dama-hear/commit: 'b54798f'
+    dama-hear/source-sha256: '20903bd8e2a1e4f1befd9f0d85bff0f2eb3d0c137d7e87300ff92dd550036162'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '39914'
+    dama-hear/serialised-bytes: '40007'
 data:
   tools_hear_heartbeat_receiver.py: |
     #!/usr/bin/env python3
