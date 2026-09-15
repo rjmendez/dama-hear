@@ -126,11 +126,11 @@ Required for every worker image, enforced in CI:
    recorded in the change that migrates it, so "what ran on that day" is answerable from git
    alone.
 
-Not claimed, and deliberately: images are not bit-reproducible (apt metadata, timestamps and
-layer ordering vary), the locks are `linux/amd64` only, and the GPU variant inherits TensorFlow's
-interpreter rather than Python 3.13. A true air-gapped build still needs a mirrored Debian
-snapshot. These limits are recorded so a later reviewer does not assume a stronger guarantee than
-exists.
+Not claimed, and deliberately: images are not bit-reproducible (timestamps and layer ordering
+vary), the locks are `linux/amd64` only, and the GPU variant inherits TensorFlow's interpreter
+rather than Python 3.13. The pinned base supplies the OS packages; the build does not resolve
+Debian APT metadata. These limits are recorded so a later reviewer does not assume a stronger
+guarantee than exists.
 
 ## ConfigMap-to-image cutover
 

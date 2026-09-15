@@ -28,18 +28,6 @@ ENV OPENBLAS_NUM_THREADS=1 \
     OMP_NUM_THREADS=1 \
     MKL_NUM_THREADS=1
 
-# ⚠️SECURITY UPGRADES ONLY, AND NEVER AN INSTALL. The pinned base carries whatever Debian
-# packages it was built with, and it is republished on its own schedule -- the first scan of
-# this chain found 12 fixable HIGH/CRITICAL CVEs (perl, gzip, pcre2, sqlite3) that Debian had
-# already fixed and the base had not yet picked up. A digest pin freezes the fix out as
-# effectively as it freezes the bug in, so the OS layer tracks security while the Python closure
-# stays locked. `upgrade`, not `install`: nothing new enters the image here.
-RUN set -eux; \
-    apt-get update; \
-    apt-get upgrade -y --no-install-recommends; \
-    apt-get clean; \
-    rm -rf /var/lib/apt/lists/*
-
 # uid 65532 is nonroot by the distroless convention, and it is a FIXED number on purpose: the
 # hear-pool PVC already has files on it owned by the uid the current pods write as, so the
 # migration has one number to reconcile rather than one per rebuild.

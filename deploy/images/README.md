@@ -71,13 +71,10 @@ Claimed:
 
 Not claimed:
 
-- ⚠️**Not bit-identical images, and the OS layer is deliberately not frozen.** `hear-runtime`
-  runs `apt-get upgrade` — *upgrade*, never *install* — so two builds a month apart can carry
-  different Debian package versions. That is the intended trade: the first scan of this chain
-  found 12 fixable HIGH/CRITICAL CVEs (perl, gzip, pcre2, sqlite3) that Debian had already fixed
-  and the pinned base had not yet picked up, and a digest pin freezes the fix out exactly as
-  well as it freezes the bug in. **The Python closure is locked; the OS tracks security.**
-  Bit-identical layers would additionally need a snapshot Debian mirror and `SOURCE_DATE_EPOCH`.
+- **The OS layer is frozen by the base digest.** `hear-runtime` does not contact Debian APT or
+  perform an unpinned upgrade during the build, so two builds from this checkout start with the
+  same Debian package bytes. Security updates require a deliberate base-image digest refresh,
+  which keeps the OS change reviewable and reproducible alongside the locked Python closure.
 - ⚠️**One platform.** The locks are `linux/amd64`, which is what the k3s nodes are. A second
   architecture is a second lock file, not a re-resolve of these.
 - ⚠️**`ml-gpu` is not Python 3.13.** It inherits TensorFlow's interpreter, so its lock is not
@@ -93,14 +90,12 @@ indexes, or telemetry endpoints". The pieces that makes possible are here:
   verifiable rather than trusted.
 - The base digests are exact, so `docker save` of those two images plus the built variants is a
   complete build input set.
-- No `apt-get install` in any variant: nothing new enters the image from a distro mirror, so the
-  set of OS packages to mirror is fixed and known from the base image alone.
+- No APT command runs in any variant: nothing enters the image from a distro mirror, so the set
+  of OS packages to mirror is fixed and known from the base image alone.
 
-⚠️What is still missing for a true air-gapped build is a Debian security mirror, which the
-`apt-get upgrade` in `hear-runtime` does need. An air-gapped site either points `apt` at its own
-mirror or drops that layer and accepts the base image's patch level — and then has to say so,
-because the choice is between an unpatched OS and a mirrored one, not between a mirror and
-nothing.
+The image chain itself has no Debian mirror dependency: all OS packages arrive in the pinned
+base image. An air-gapped site still needs its configured registry or an exported copy of the
+base and derived images.
 
 ## The model boundary
 
