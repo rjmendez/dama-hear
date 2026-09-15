@@ -36,6 +36,15 @@ current code disagree, the design states the intended end state.
 | [l86-reference.md](l86-reference.md) | L86 GNSS module reference. |
 | [hear-latency-calibration-runbook.md](hear-latency-calibration-runbook.md) | Latency calibration procedure. |
 
+## Operations, policy, and cross-cutting design
+
+| Document | What it defines |
+|---|---|
+| [analytics.md](analytics.md) | The analytics layer above geometry and detectors: event model, modality naming rules, correlation, tracks, geofences, and alerts with provenance back to raw evidence. |
+| [cost-capacity.md](cost-capacity.md) | The fleet sizing model: uplink, storage, and clip/audio cost formulas with stated default variables, to be recalculated per deployment. |
+| [data-governance.md](data-governance.md) | Self-hosted acoustic data governance: data classes, recording indicators, retention, access, export, and audit controls for captured and derived data. |
+| [resilience.md](resilience.md) | Failure-mode design: the invariants that must survive, degraded-mode behaviour per dependency, and how operators learn about failure without reading a stack trace. |
+
 ## Field findings and calibration records
 
 Dated, point-in-time evidence; superseded only by a later dated record.
