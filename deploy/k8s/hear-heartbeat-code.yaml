@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-heartbeat-code.yaml
-# apply-mode client: 30714 B serialised; 30891 B of annotations against a 262144 B cap.
+# apply-mode client: 41779 B serialised; 41956 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,10 +8,10 @@ metadata:
   labels:
     app: hear-heartbeat
   annotations:
-    dama-hear/commit: '5ed1dfc'
+    dama-hear/commit: 'dbf5fb7'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '30714'
+    dama-hear/serialised-bytes: '41779'
 data:
   tools_hear_heartbeat_receiver.py: |
     #!/usr/bin/env python3
@@ -24,6 +24,7 @@ data:
     from __future__ import annotations
     
     import argparse
+    import contextlib
     import hashlib
     import json
     import logging
@@ -52,6 +53,11 @@ data:
     DURABLE_STORE = (os.environ.get("HEAR_DURABLE_STORE", "none") or "none").strip().lower()
     DURABLE_DB = os.environ.get("HEAR_DURABLE_DB", "/state/heartbeats.sqlite3")
     DURABLE_REPLAY_LIMIT = int(os.environ.get("HEAR_DURABLE_REPLAY_LIMIT", "256"))
+    # A single bounded replay pass cannot clear a backlog bigger than its limit, so replay drains in
+    # batches and a background pass keeps resuming: an outage longer than the limit must not need a
+    # process restart per 256 rows.
+    DURABLE_REPLAY_MAX_BATCHES = int(os.environ.get("HEAR_DURABLE_REPLAY_MAX_BATCHES", "1024"))
+    DURABLE_REPLAY_INTERVAL_S = float(os.environ.get("HEAR_DURABLE_REPLAY_INTERVAL_S", "60"))
     DURABLE_SCHEMA_VERSION = 1
     
     
@@ -81,6 +87,8 @@ data:
     SOCKET_TIMEOUT_S = float(os.environ.get("HEAR_HEARTBEAT_SOCKET_TIMEOUT_S", "0.5"))
     EVENT_STREAM_KEY = os.environ.get("HEAR_EVENT_STREAM_KEY", "dama:hear:events")
     EVENT_STREAM_MAXLEN = int(os.environ.get("HEAR_EVENT_STREAM_MAXLEN", "1024"))
+    EVENT_PUBLISH_GUARD_PREFIX = os.environ.get("HEAR_EVENT_PUBLISH_GUARD_PREFIX", "dama:hear:published:")
+    EVENT_PUBLISH_GUARD_TTL_S = int(os.environ.get("HEAR_EVENT_PUBLISH_GUARD_TTL_S", "86400"))
     RECEIVER_SCHEMA_VERSION = 1
     _DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
     _CLASS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
@@ -120,6 +128,9 @@ data:
     
         def note_cache_failure(self, record_uid: str, cache_target: str, exc: BaseException) -> None:
             return
+    
+        def is_cached(self, record_uid: str) -> bool:
+            return False
     
         def pending_records(self, limit: int) -> list[DurableEntry]:
             return []
@@ -254,6 +265,14 @@ data:
                     (record_uid, cache_target, outcome, error_text, utc_now()),
                 )
     
+        def is_cached(self, record_uid: str) -> bool:
+            with self._lock, self._connect() as con:
+                row = con.execute(
+                    "SELECT 1 FROM cache_attempts WHERE record_uid = ? AND outcome = 'succeeded' LIMIT 1",
+                    (record_uid,),
+                ).fetchone()
+            return row is not None
+    
         def pending_records(self, limit: int) -> list[DurableEntry]:
             if limit <= 0:
                 return []
@@ -319,15 +338,37 @@ data:
     
     
     class RedisHeartbeatCache:
+        # ⚠️XADD IS THE ONE NON-IDEMPOTENT CACHE WRITE. Every other key write here is a plain
+        # SET/SETEX/SADD that can be replayed as often as the outbox needs, but an event XADD appends
+        # a new stream entry every time it runs. A crash between the publish and the durable success
+        # marker -- or two concurrent requests carrying the same record_uid -- would otherwise put the
+        # same hear/event on dama:hear:events twice behind a single durable row. SET NX on a
+        # per-record_uid guard key makes the append happen at most once, and the guard is taken and
+        # used inside one Lua script so the reservation and the append cannot be split by a crash.
+        _PUBLISH_ONCE_LUA = """
+        if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', tonumber(ARGV[2])) then
+          redis.call('XADD', KEYS[2], 'MAXLEN', '~', tonumber(ARGV[3]), '*',
+                     'device_id', ARGV[4], 'payload', ARGV[5])
+          return 1
+        end
+        return 0
+        """
+    
         def __init__(self, client: Any, heartbeat_ttl_s: int = HEARTBEAT_TTL_S,
                      event_stream_key: str = EVENT_STREAM_KEY,
-                     event_stream_maxlen: int = EVENT_STREAM_MAXLEN):
+                     event_stream_maxlen: int = EVENT_STREAM_MAXLEN,
+                     publish_guard_prefix: str = EVENT_PUBLISH_GUARD_PREFIX,
+                     publish_guard_ttl_s: int = EVENT_PUBLISH_GUARD_TTL_S):
             self.client = client
             self.heartbeat_ttl_s = heartbeat_ttl_s
             self.event_stream_key = event_stream_key
             self.event_stream_maxlen = event_stream_maxlen
+            self.publish_guard_prefix = publish_guard_prefix
+            self.publish_guard_ttl_s = publish_guard_ttl_s
+            self._eval_supported = True
     
-        def write(self, record: Dict[str, Any], body_json: str) -> None:
+        def write(self, record: Dict[str, Any], body_json: str,
+                  record_uid: Optional[str] = None) -> None:
             telemetry_path = record["telemetry_path"]
             node_id = record["device_id"]
             pipe = self.client.pipeline(transaction=False)
@@ -335,14 +376,64 @@ data:
                 pipe.setex(f"dama:hear:{node_id}", self.heartbeat_ttl_s, body_json)
                 pipe.sadd("dama:hear:devices", node_id)
                 pipe.set("dama:hear:latest", body_json)
+                pipe.execute()
             elif telemetry_path == "hear/event":
                 pipe.sadd("dama:hear:devices", node_id)
                 pipe.set(f"dama:hear:event:{node_id}", body_json)
-                pipe.xadd(self.event_stream_key, {"device_id": node_id, "payload": body_json},
-                          maxlen=self.event_stream_maxlen, approximate=True)
+                pipe.execute()
+                self.publish_event_once(node_id, body_json, record_uid)
             else:  # pragma: no cover - validators own this in practice.
                 raise ValueError(f"unsupported telemetry_path {telemetry_path!r}")
-            pipe.execute()
+    
+        def publish_event_once(self, node_id: str, body_json: str,
+                               record_uid: Optional[str]) -> None:
+            fields = {"device_id": node_id, "payload": body_json}
+            if not record_uid:  # pragma: no cover - callers always pass one.
+                pipe = self.client.pipeline(transaction=False)
+                pipe.xadd(self.event_stream_key, fields,
+                          maxlen=self.event_stream_maxlen, approximate=True)
+                pipe.execute()
+                return
+            guard_key = f"{self.publish_guard_prefix}{record_uid}"
+            if self._eval_publish_once(guard_key, node_id, body_json) is not None:
+                return
+            self._guarded_publish_once(guard_key, fields)
+    
+        def _eval_publish_once(self, guard_key: str, node_id: str,
+                               body_json: str) -> Optional[int]:
+            """Atomic guard+append; ``None`` means this client cannot run scripts at all."""
+            if not self._eval_supported:
+                return None
+            try:
+                return int(self.client.eval(
+                    self._PUBLISH_ONCE_LUA, 2, guard_key, self.event_stream_key,
+                    utc_now(), self.publish_guard_ttl_s, self.event_stream_maxlen,
+                    node_id, body_json,
+                ) or 0)
+            except (AttributeError, NotImplementedError, redis.exceptions.ResponseError) as exc:
+                # Scripting off (or a stub client): fall back to the two-step guard below. Connection
+                # and timeout errors deliberately propagate so a cache outage stays retryable.
+                self._eval_supported = False
+                logger.warning("redis eval unavailable (%s); using non-atomic publish guard",
+                               _error_text(exc))
+                return None
+    
+        def _guarded_publish_once(self, guard_key: str, fields: Dict[str, str]) -> None:
+            if not self.client.set(guard_key, utc_now(), nx=True, ex=self.publish_guard_ttl_s):
+                return
+            try:
+                pipe = self.client.pipeline(transaction=False)
+                pipe.xadd(self.event_stream_key, fields,
+                          maxlen=self.event_stream_maxlen, approximate=True)
+                pipe.execute()
+            except Exception:
+                # Release the reservation so the outbox replay can publish this record later.
+                try:
+                    self.client.delete(guard_key)
+                except Exception as release_exc:  # pragma: no cover - best effort only.
+                    logger.warning("could not release publish guard %s: %s",
+                                   guard_key, _error_text(release_exc))
+                raise
     
     
     class HeartbeatReceiverStore:
@@ -363,6 +454,31 @@ data:
                 event_stream_key=event_stream_key,
                 event_stream_maxlen=event_stream_maxlen,
             )
+            self._uid_locks_guard = threading.Lock()
+            self._uid_locks: Dict[str, list] = {}
+    
+        @contextlib.contextmanager
+        def _record_lock(self, record_uid: str):
+            """Serialise the whole persist -> publish -> mark-success path for one record_uid.
+    
+            The sqlite statements were already serialised, but two concurrent requests carrying the
+            same record_uid could still interleave between the "already cached?" check and the cache
+            publish and publish the same record twice.
+            """
+            with self._uid_locks_guard:
+                entry = self._uid_locks.get(record_uid)
+                if entry is None:
+                    entry = [threading.Lock(), 0]
+                    self._uid_locks[record_uid] = entry
+                entry[1] += 1
+            try:
+                with entry[0]:
+                    yield
+            finally:
+                with self._uid_locks_guard:
+                    entry[1] -= 1
+                    if entry[1] <= 0:
+                        self._uid_locks.pop(record_uid, None)
     
         def write_heartbeat(self, payload: Dict[str, Any]) -> Dict[str, Any]:
             return self._write(payload)
@@ -371,20 +487,26 @@ data:
             return self._write(payload)
     
         def _write(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-            record = dict(payload)
-            record["received_at"] = utc_now()
-            record["receiver_schema_version"] = RECEIVER_SCHEMA_VERSION
-            body_json = encode_json(record)
-            stored = self.durable_store.persist(_record_uid(payload), record, body_json)
-            if stored.cached:
+            record_uid = _record_uid(payload)
+            with self._record_lock(record_uid):
+                record = dict(payload)
+                record["received_at"] = utc_now()
+                record["receiver_schema_version"] = RECEIVER_SCHEMA_VERSION
+                body_json = encode_json(record)
+                stored = self.durable_store.persist(record_uid, record, body_json)
+                if stored.cached:
+                    return stored.record
+                self._publish(stored)
                 return stored.record
+    
+        def _publish(self, stored: DurableEntry) -> None:
+            """Cache-publish one already-durable record, then append its success marker."""
             try:
-                self.cache.write(stored.record, stored.body_json)
+                self.cache.write(stored.record, stored.body_json, record_uid=stored.record_uid)
             except Exception as exc:
                 self.durable_store.note_cache_failure(stored.record_uid, self.redis_target, exc)
                 raise
             self.durable_store.note_cache_success(stored.record_uid, self.redis_target)
-            return stored.record
     
         def replay_pending(self, limit: int = DURABLE_REPLAY_LIMIT) -> Dict[str, Any]:
             summary = {
@@ -399,15 +521,52 @@ data:
             pending = self.durable_store.pending_records(limit)
             summary["attempted"] = len(pending)
             for entry in pending:
-                try:
-                    self.cache.write(entry.record, entry.body_json)
-                except Exception as exc:
-                    self.durable_store.note_cache_failure(entry.record_uid, self.redis_target, exc)
-                    summary["failed"] += 1
-                    continue
-                self.durable_store.note_cache_success(entry.record_uid, self.redis_target)
-                summary["synced"] += 1
+                with self._record_lock(entry.record_uid):
+                    if self.durable_store.is_cached(entry.record_uid):
+                        # A concurrent request published it between the pending scan and here.
+                        summary["synced"] += 1
+                        continue
+                    try:
+                        self._publish(entry)
+                    except Exception:
+                        summary["failed"] += 1
+                        continue
+                    summary["synced"] += 1
             summary["remaining_pending"] = int(self.durable_store.health()["pending_records"])
+            return summary
+    
+        def drain_pending(self, limit: int = DURABLE_REPLAY_LIMIT,
+                          max_batches: int = DURABLE_REPLAY_MAX_BATCHES) -> Dict[str, Any]:
+            """Replay in bounded batches until nothing is pending (or the cache stops accepting).
+    
+            One ``replay_pending(limit=N)`` pass can only clear N rows, so an outage that left more
+            than N pending records used to strand the remainder until the next process restart.
+            """
+            summary = {
+                "backend": self.durable_store.backend,
+                "attempted": 0,
+                "synced": 0,
+                "failed": 0,
+                "batches": 0,
+                "remaining_pending": 0,
+                "drained": True,
+            }
+            if not self.durable_store.enabled or limit <= 0:
+                return summary
+            while max_batches <= 0 or summary["batches"] < max_batches:
+                batch = self.replay_pending(limit=limit)
+                summary["batches"] += 1
+                summary["attempted"] += batch["attempted"]
+                summary["synced"] += batch["synced"]
+                summary["failed"] += batch["failed"]
+                summary["remaining_pending"] = batch["remaining_pending"]
+                if batch["attempted"] == 0 or batch["synced"] == 0:
+                    # Nothing pending, or the cache is refusing every write: stop and let the
+                    # background pass retry rather than spin against an outage.
+                    break
+                if batch["remaining_pending"] == 0:
+                    break
+            summary["drained"] = summary["remaining_pending"] == 0
             return summary
     
         def health_snapshot(self) -> Dict[str, Any]:
@@ -424,6 +583,54 @@ data:
         def __init__(self, server_address, handler_cls, store: HeartbeatReceiverStore):
             super().__init__(server_address, handler_cls)
             self.store = store
+    
+    
+    class ReplayWorker(threading.Thread):
+        """Recurring bounded drain pass so a backlog never waits for the next process restart."""
+    
+        def __init__(self, store: "HeartbeatReceiverStore", interval_s: float = DURABLE_REPLAY_INTERVAL_S,
+                     limit: int = DURABLE_REPLAY_LIMIT,
+                     max_batches: int = DURABLE_REPLAY_MAX_BATCHES,
+                     on_summary: Optional[Callable[[Dict[str, Any]], None]] = None):
+            super().__init__(name="hear-durable-replay", daemon=True)
+            self.store = store
+            self.interval_s = float(interval_s)
+            self.limit = limit
+            self.max_batches = max_batches
+            self.on_summary = on_summary
+            self._stop_event = threading.Event()
+    
+        def run_once(self) -> Dict[str, Any]:
+            summary = self.store.drain_pending(limit=self.limit, max_batches=self.max_batches)
+            if self.on_summary is not None and (summary["attempted"] or summary["failed"]):
+                self.on_summary(summary)
+            return summary
+    
+        def run(self) -> None:
+            while not self._stop_event.wait(self.interval_s):
+                try:
+                    self.run_once()
+                except Exception as exc:  # pragma: no cover - a replay pass must never kill the loop.
+                    logger.warning("durable replay pass failed: %s", _error_text(exc))
+    
+        def stop(self, timeout: Optional[float] = None) -> None:
+            self._stop_event.set()
+            if self.is_alive():
+                self.join(timeout=timeout)
+    
+    
+    def start_replay_worker(store: "HeartbeatReceiverStore",
+                            interval_s: float = DURABLE_REPLAY_INTERVAL_S,
+                            limit: int = DURABLE_REPLAY_LIMIT,
+                            max_batches: int = DURABLE_REPLAY_MAX_BATCHES,
+                            on_summary: Optional[Callable[[Dict[str, Any]], None]] = None
+                            ) -> Optional[ReplayWorker]:
+        if not store.durable_store.enabled or interval_s <= 0 or limit <= 0:
+            return None
+        worker = ReplayWorker(store, interval_s=interval_s, limit=limit,
+                              max_batches=max_batches, on_summary=on_summary)
+        worker.start()
+        return worker
     
     
     def utc_now() -> str:
@@ -457,6 +664,8 @@ data:
         ap.add_argument("--durable-store", default=DURABLE_STORE, choices=DURABLE_BACKENDS)
         ap.add_argument("--durable-db", default=DURABLE_DB)
         ap.add_argument("--durable-replay-limit", type=int, default=DURABLE_REPLAY_LIMIT)
+        ap.add_argument("--durable-replay-max-batches", type=int, default=DURABLE_REPLAY_MAX_BATCHES)
+        ap.add_argument("--durable-replay-interval-s", type=float, default=DURABLE_REPLAY_INTERVAL_S)
     
     
     def make_durable_store(kind: str = DURABLE_STORE,
@@ -712,13 +921,23 @@ data:
             redis_target=target,
             durable_store=make_durable_store(args.durable_store, args.durable_db),
         )
-        replay = store.replay_pending(limit=args.durable_replay_limit)
+        replay = store.drain_pending(limit=args.durable_replay_limit,
+                                     max_batches=args.durable_replay_max_batches)
         print(f"[hear-heartbeat] Redis target configured -> {target}")
         print(f"[hear-heartbeat] durable backend={store.durable_store.backend} path={store.durable_store.path}")
         if replay["attempted"] or replay["failed"]:
             print("[hear-heartbeat] replay pending attempted=%d synced=%d failed=%d remaining=%d"
                   % (replay["attempted"], replay["synced"], replay["failed"],
                      replay["remaining_pending"]))
+        start_replay_worker(
+            store,
+            interval_s=args.durable_replay_interval_s,
+            limit=args.durable_replay_limit,
+            max_batches=args.durable_replay_max_batches,
+            on_summary=lambda s: print(
+                "[hear-heartbeat] replay pass attempted=%d synced=%d failed=%d remaining=%d"
+                % (s["attempted"], s["synced"], s["failed"], s["remaining_pending"])),
+        )
         print(f"[hear-heartbeat] Listening on http://{args.bind}:{args.port}")
         create_server(args.bind, args.port, store, max_body_bytes=args.max_body_bytes,
                       auth_token=auth_token, socket_timeout_s=args.socket_timeout_s).serve_forever()
