@@ -1,0 +1,130 @@
+# ⚠️PROPOSED, NOT APPLIED. This is the Phase 1.5 pilot cutover for hear-heartbeat: the same
+# workload, delivered as an immutable image instead of a ConfigMap mount plus a pip install at
+# pod start. `deploy/k8s/hear-heartbeat.yaml` remains the applied manifest and the rollback
+# artifact until the gate-1 evidence in deploy/images/service/README.md exists.
+#
+# ⚠️IT CANNOT BE APPLIED YET, BY CONSTRUCTION. The `image:` below is the all-zero digest
+# sentinel, because a pull request publishes nothing: the digest is recorded in
+# deploy/images/service/digests.txt by the commit that follows the `main` build, and
+# tests/test_service_images.py requires this file and that record to agree. An accidental apply
+# fails on ImagePullBackOff with a digest that cannot exist -- it does not pull "something".
+#
+# ⚠️THE DIFF AGAINST hear-heartbeat.yaml IS THE REVIEW. It is exactly five things:
+#   image:            the digest instead of the moving `python:3.13-slim` tag
+#   command:/args:    deleted -- the image's ENTRYPOINT is the same argv the shell preamble ended
+#                     with, so there is no `pip install` left to run against the live index
+#   volumeMounts:     the `code` and `deps` mounts deleted
+#   volumes:          the `code` ConfigMap volume and the `deps` emptyDir deleted
+# and nothing else. hostNetwork, dnsPolicy, hostPort 5051, the Service, all nine env vars
+# including both secretKeyRefs, both probes, resources, replicas, `strategy: Recreate`, the
+# `state` mount, the PVC and the root uid are byte-identical;
+# tests/test_service_images.py::test_the_proposed_manifest_changes_only_packaging proves it by
+# parsing both files rather than by trusting this comment.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hear-heartbeat-state
+  namespace: dama
+  labels:
+    app: hear-heartbeat
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hear-heartbeat
+  namespace: dama
+  labels:
+    app: hear-heartbeat
+  annotations:
+    dama-hear/what: >-
+      Receives hear_node heartbeat and event POSTs, commits each accepted record to the
+      phase-0 durable outbox, and then reflects it into the existing short-TTL dama:hear:*
+      Redis compatibility keys.
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: this pod holds hostPort 5051 AND a ReadWriteOnce state PVC, so a
+  # surge pod can never become ready alongside the outgoing one -- it stays Pending forever and
+  # the rollout hangs. Tear the old pod down first.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: hear-heartbeat
+  template:
+    metadata:
+      labels:
+        app: hear-heartbeat
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: receiver
+          # Recorded in deploy/images/service/digests.txt; built by
+          # deploy/images/service/Dockerfile.hear-heartbeat from this commit's
+          # tools/hear_heartbeat_receiver.py and requirements/lock/service-hear-heartbeat.txt.
+          # The zero digest is the "not published yet" sentinel -- see the header.
+          image: ghcr.io/rjmendez/dama-hear/hear-heartbeat@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          # No command/args: the image ENTRYPOINT is
+          # `python /app/tools/hear_heartbeat_receiver.py --port 5051`, which is what the deleted
+          # shell preamble exec'd. The container still runs as root -- the /state database is
+          # root-owned and local-path ignores fsGroup (docs/worker-packaging.md, identity boundary).
+          ports:
+            - { name: http, containerPort: 5051, hostPort: 5051 }
+          env:
+            - { name: HEAR_HEARTBEAT_TTL_S, value: "30" }
+            - { name: HEAR_HEARTBEAT_SOCKET_TIMEOUT_S, value: "0.5" }
+            - { name: HEAR_DURABLE_STORE, value: "sqlite" }
+            - { name: HEAR_DURABLE_DB, value: "/state/heartbeat-receiver.sqlite3" }
+            - { name: HEAR_DURABLE_REPLAY_LIMIT, value: "256" }
+            - { name: REDIS_HOST, value: "audit-redis.infra.svc.cluster.local" }
+            - { name: REDIS_PORT, value: "6379" }
+            - name: REDIS_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: dama-redis-secret
+                  key: REDIS_PASS
+                  optional: true
+            - name: HEAR_HEARTBEAT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hear-heartbeat-token
+                  key: token
+          volumeMounts:
+            # `code` and `deps` are gone: both are in the image. `state` is untouched -- a
+            # packaging change may not create, move, reformat or re-own durable state.
+            - { name: state, mountPath: /state }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: "1",  memory: 256Mi }
+      volumes:
+        # ⚠️ConfigMap hear-heartbeat-code STAYS APPLIED AND UNREFERENCED. It is the rollback
+        # artifact, it keeps its BUNDLES entry and its sync test, and it is deleted in the
+        # retirement step (9), never in a cutover.
+        - name: state
+          persistentVolumeClaim:
+            claimName: hear-heartbeat-state
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hear-heartbeat
+  namespace: dama
+  labels:
+    app: hear-heartbeat
+spec:
+  selector:
+    app: hear-heartbeat
+  ports:
+    - { name: http, port: 5051, targetPort: http }

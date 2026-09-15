@@ -26,8 +26,14 @@ import gen_pip_lock  # noqa: E402
 PIN = re.compile(r"^([A-Za-z0-9._-]+)==([^\s\\]+)", re.M)
 FROM = re.compile(r"^FROM\s+(\S+)", re.M)
 DOCKERFILES = sorted(IMAGES.glob("Dockerfile.*"))
+# ⚠️`*.proposed.yaml` IS EXCLUDED ON PURPOSE, AND IT IS NOT EXCLUDED FROM SCRUTINY. These are the
+# Phase 1.5 cutover manifests: not applied, and referencing an image this repository *builds*
+# rather than an upstream one, so `base-images.txt` -- which pins the upstream tags the cluster
+# still runs -- is not the file that covers them. `tests/test_service_images.py` is: it requires
+# every one of them to carry a digest that `deploy/images/service/digests.txt` records.
 MANIFESTS = [p for p in sorted((ROOT / "deploy" / "k8s").glob("hear-*.yaml"))
-             if not p.name.endswith("-code.yaml")]
+             if not p.name.endswith("-code.yaml")
+             and not p.name.endswith(".proposed.yaml")]
 
 
 def pins(path):

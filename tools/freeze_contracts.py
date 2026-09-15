@@ -453,6 +453,15 @@ def k8s_layout() -> Dict[str, Any]:
     for path in sorted((ROOT / "deploy" / "k8s").glob("*.yaml")):
         if path.name.endswith("-code.yaml"):
             continue
+        # ⚠️A `*.proposed.yaml` IS NOT PART OF THE LAYOUT. The Phase 1.5 cutover manifests
+        # describe an object that is not applied and that duplicates the name of one that is;
+        # recording both here would freeze a baseline saying the namespace holds two Deployments
+        # called hear-heartbeat. They are guarded by tests/test_service_images.py, which proves
+        # each one differs from its applied manifest by packaging alone -- and the moment one is
+        # applied it *replaces* deploy/k8s/<workload>.yaml, at which point the baseline moves
+        # because that file changed.
+        if path.name.endswith(".proposed.yaml"):
+            continue
         manifests.append(file_record(relpath(path)))
         text = path.read_text()
         path_refs = sorted(
