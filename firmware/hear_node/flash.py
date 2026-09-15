@@ -30,11 +30,10 @@ by enroll.py or by any build of this tree flashed in the default mode, which cop
 credentials into NVS at boot. A node that does not report an NVS record is refused.
 
 /update IS A PRIVILEGED ENDPOINT. The firmware endpoint-auth change made /update, /reboot, /format
-and /gate require `X-Hear-Auth: <HEAR_ADMIN_TOKEN>`, and it fails CLOSED: a build with no token
-compiled in refuses every request from everyone, permanently, for that image. This script is the
-only OTA client there is, so it sends the token (from ~/.hear_push, never a tracked file) and it
-refuses to put a tokenless image on a node it can only reach over the air -- that flash would be
-the last one that does not need a USB cable.
+and /gate require `X-Hear-Auth: <HEAR_ADMIN_TOKEN>`. This script is the only OTA client there is,
+so it sends the token (from ~/.hear_push, never a tracked file). A release-mode flash is refused
+unless live /status proves the node has admin and push credentials in NVS before any byte is
+written.
 """
 import json
 import os
@@ -75,11 +74,9 @@ def admin_token(path=None):
 def admin_lockout_refusal(token, argv, node, target):
     """Why an over-the-air build-mode flash must not proceed with no admin token, or None.
 
-    HEAR_ADMIN_TOKEN is compile-time -- NVS carries the node id and its Wi-Fi, not this -- and
-    hear_auth_ok() returns false outright when the compiled-in token is empty. So an image built
-    with no token answers /status forever and refuses /update, /reboot, /format and /gate from
-    everyone, including this script. Over the air that is unrecoverable without physically
-    reaching the board, which is precisely the condition an OTA flash is chosen to avoid.
+    A tokenless image answers /status forever but cannot protect /update with any credential.
+    The firmware keeps /update recoverable in that state, but this script still refuses to create
+    the state accidentally: a field node should keep admin in NVS before any release OTA.
     """
     if token or LOCKOUT_OPT_OUT in argv:
         return None

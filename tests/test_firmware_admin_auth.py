@@ -84,6 +84,11 @@ class TestHearAuthOkFailsClosed:
         # unconfigured build fail closed instead of open.
         assert "if (!wn) return false;" in body
 
+    def test_update_has_a_tokenless_recovery_valve_but_other_routes_do_not(self):
+        body = _fn("hear_ota_auth_ok")
+        assert "if (!admin_token_runtime()[0]) return true;" in body
+        assert "return hear_auth_ok();" in body
+
     def test_the_token_can_arrive_as_a_header_or_a_query_argument(self):
         body = _fn("hear_auth_ok")
         assert 'http.hasHeader("X-Hear-Auth")' in body
@@ -146,8 +151,8 @@ class TestPrivilegedHandlersCallTheGuardFirst:
         # The completion handler alone would be too late: bytes already reached Update.write()
         # by the time it runs. ota_authorized must be decided at UPLOAD_FILE_START, before
         # Update.begin(), and every later stage of the upload must check it.
-        assert "ota_authorized = hear_auth_ok();" in b
-        assert b.index("ota_authorized = hear_auth_ok();") < b.index("Update.begin(")
+        assert "ota_authorized = hear_ota_auth_ok();" in b
+        assert b.index("ota_authorized = hear_ota_auth_ok();") < b.index("Update.begin(")
         assert b.count("if (!ota_authorized) return;") >= 2
         assert "if (!ota_authorized) { hear_auth_reject(); return; }" in b
 
