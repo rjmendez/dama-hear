@@ -92,6 +92,13 @@ static bool sta_ok = false;
 static uint32_t wifi_retry_at = 0;
 static uint32_t wifi_failures = 0;
 static bool task_wdt_live = false;
+RTC_NOINIT_ATTR static uint32_t rtc_last_reset_reason = 0;
+RTC_NOINIT_ATTR static uint32_t rtc_last_panic_code = 0;
+RTC_NOINIT_ATTR static uint32_t rtc_last_boot_try = 0;
+static uint32_t rtc_prev_reset_reason = 0;
+static uint32_t rtc_prev_panic_code = 0;
+static uint32_t rtc_prev_boot_try = 0;
+static bool rtc_prev_valid = false;
 static void task_wdt_arm(uint32_t ms) {
   esp_task_wdt_config_t c = { .timeout_ms = ms, .idle_core_mask = 0, .trigger_panic = true };
   if (esp_task_wdt_reconfigure(&c) != ESP_OK) esp_task_wdt_init(&c);
@@ -99,9 +106,16 @@ static void task_wdt_arm(uint32_t ms) {
   esp_task_wdt_reset();
   task_wdt_live = true;
 }
-static void task_wdt_service() {
+static void task_wdt_kick() {
   if (task_wdt_live) esp_task_wdt_reset();
+}
+static void task_wdt_service() {
+  task_wdt_kick();
   yield();
+}
+static void task_wdt_wait_ms(uint32_t ms) {
+  uint32_t t0 = millis();
+  while ((uint32_t)(millis() - t0) < ms) { task_wdt_service(); delay(1); }
 }
 
 static uint32_t wifi_backoff_ms() {
@@ -174,6 +188,36 @@ static const char *reset_name() {
     default:                return "OTHER";
   }
 }
+static const char *reset_name_for(uint32_t reason) {
+  switch ((esp_reset_reason_t)reason) {
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_SW:        return "SW";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_EXT:       return "EXT";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    default:                return "OTHER";
+  }
+}
+static uint32_t panic_code_for(uint32_t reason) {
+  switch ((esp_reset_reason_t)reason) {
+    case ESP_RST_PANIC: return 0x0001u;
+    case ESP_RST_INT_WDT:
+    case ESP_RST_WDT: return 0x0002u;
+    case ESP_RST_TASK_WDT: return 0x0003u;
+    default: return 0;
+  }
+}
+static const char *rtc_postmortem_json() {
+  static char pm[160];
+  snprintf(pm, sizeof pm,
+           "{\"available\":%s,\"prev_reset\":\"%s\",\"prev_boot_try\":%lu,\"prev_panic_code\":%lu}",
+           rtc_prev_valid ? "true" : "false", reset_name_for(rtc_prev_reset_reason),
+           (unsigned long)rtc_prev_boot_try, (unsigned long)rtc_prev_panic_code);
+  return pm;
+}
 
 static void node_identity() {
 #ifdef NODE_ID
@@ -187,20 +231,18 @@ static void node_identity() {
 }
 
 static void rtc_postmortem_boot_log() {
-  RTC_NOINIT_ATTR static uint32_t last_reset_reason = 0;
-  RTC_NOINIT_ATTR static uint32_t last_panic_code = 0;
-  RTC_NOINIT_ATTR static uint32_t last_boot_try = 0;
   uint32_t reason = (uint32_t)esp_reset_reason();
-  last_reset_reason = reason;
-  last_boot_try = (uint32_t)hear_boot_try();
-  switch (reason) {
-    case ESP_RST_PANIC: last_panic_code = 0x0001u; break;
-    case ESP_RST_INT_WDT: case ESP_RST_WDT: last_panic_code = 0x0002u; break;
-    case ESP_RST_TASK_WDT: last_panic_code = 0x0003u; break;
-    default: last_panic_code = 0; break;
-  }
-  Serial.printf("boot  rtc reset=%s boot_try=%lu panic_code=0x%08lx\n",
-                reset_name(), (unsigned long)last_boot_try, (unsigned long)last_panic_code);
+  rtc_prev_reset_reason = rtc_last_reset_reason;
+  rtc_prev_panic_code = rtc_last_panic_code;
+  rtc_prev_boot_try = rtc_last_boot_try;
+  rtc_prev_valid = rtc_prev_reset_reason || rtc_prev_panic_code || rtc_prev_boot_try;
+  rtc_last_reset_reason = reason;
+  rtc_last_panic_code = panic_code_for(reason);
+  rtc_last_boot_try = (uint32_t)hear_boot_try();
+  Serial.printf("boot  rtc prev_reset=%s prev_boot_try=%lu prev_panic_code=0x%08lx current_reset=%s current_boot_try=%lu current_panic_code=0x%08lx\n",
+                reset_name_for(rtc_prev_reset_reason), (unsigned long)rtc_prev_boot_try,
+                (unsigned long)rtc_prev_panic_code, reset_name_for(rtc_last_reset_reason),
+                (unsigned long)rtc_last_boot_try, (unsigned long)rtc_last_panic_code);
 }
 
 // ---------------------------------------------------------------- GPS (PMTK, not UBX)
@@ -934,13 +976,14 @@ static NtpResult ntp_query(const char *host, int want) {
   if (!udp.begin(0)) { r.err = "no local UDP port"; return r; }
   double best_off = 0, best_rtt = 1e9, mn = 1e9, mx = 0;
   for (int i = 0; i < want; i++) {
+    task_wdt_kick();
     uint8_t pkt[48] = {0}; pkt[0] = 0x1B;               // LI 0, VN 3, mode 3 (client)
     uint64_t t1 = (uint64_t)esp_timer_get_time();
     struct timeval tv1; gettimeofday(&tv1, nullptr);
     udp.beginPacket(host, 123); udp.write(pkt, 48); udp.endPacket();
     uint32_t deadline = millis() + 400;
     int len = 0;
-    while (millis() < deadline && !(len = udp.parsePacket())) delay(1);
+    while (millis() < deadline && !(len = udp.parsePacket())) { task_wdt_service(); delay(1); }
     if (len < 48) continue;
     udp.read(pkt, 48);
     uint64_t t4 = (uint64_t)esp_timer_get_time();
@@ -957,7 +1000,7 @@ static NtpResult ntp_query(const char *host, int want) {
     if (rtt < mn) mn = rtt;
     if (rtt > mx) mx = rtt;
     r.n++;
-    delay(60);
+    task_wdt_wait_ms(60);
   }
   udp.stop();
   if (!r.n) { r.err = "no reply"; return r; }
@@ -1106,7 +1149,7 @@ static void routes() {
     snprintf(b, sizeof b,
       "{\"node\":\"%s\",\"class\":\"%s\",\"uptime_s\":%lu,"
       "\"auth\":{\"admin\":{\"configured\":%s,\"src\":\"%s\"}},"
-      "\"reset\":\"%s\",\"power_cycled\":%s,\"heap\":%lu,\"heap_min\":%lu,\"heap_max_alloc\":%lu,\"stack_high_watermark_words\":%lu,\"psram\":%lu,"
+      "\"reset\":\"%s\",\"power_cycled\":%s,\"postmortem\":%s,\"heap\":%lu,\"heap_min\":%lu,\"heap_max_alloc\":%lu,\"stack_high_watermark_words\":%lu,\"psram\":%lu,"
       "\"imu\":%s,"
       "\"gps\":{\"fix\":%d,\"sats\":%d,\"utc\":\"%s\",\"sentences\":%lu,\"valid\":%lu,"
       "\"baud\":%d,\"rx_pin\":%d,\"tx_pin\":%d,\"last\":\"%s\"},"
@@ -1119,7 +1162,7 @@ static void routes() {
       "\"wifi\":{\"configured\":%s,\"sta\":%s,\"rssi\":%d,\"ip\":\"%s\"}}",
       node_id, NODE_CLASS, (unsigned long)(millis() / 1000),
       HEAR_ADMIN_TOKEN[0] ? "true" : "false", HEAR_ADMIN_TOKEN[0] ? "compiled" : "missing",
-      reset_name(), esp_reset_reason() == ESP_RST_POWERON ? "true" : "false",
+      reset_name(), esp_reset_reason() == ESP_RST_POWERON ? "true" : "false", rtc_postmortem_json(),
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(),
       (unsigned long)ESP.getMaxAllocHeap(), (unsigned long)uxTaskGetStackHighWaterMark(NULL),
       (unsigned long)ESP.getFreePsram(), imu.c_str(),
@@ -1348,23 +1391,24 @@ static void routes() {
     String o = "holding each vendor output HIGH in turn, watching GPIO44 for the L86 waking\n\n";
     int found = -1;
     for (int pin : CAND) {
-      Serial1.end(); delay(10);
+      Serial1.end(); task_wdt_wait_ms(10);
       pinMode(pin, OUTPUT);
       digitalWrite(pin, HIGH);
-      delay(3000);                       // held, not pulsed
+      task_wdt_wait_ms(3000);            // held, not pulsed
       pinMode(GPS_RX_PIN, INPUT);
       uint32_t ed = 0, n = 0, hi = 0; int last = digitalRead(GPS_RX_PIN);
       uint64_t t0 = esp_timer_get_time();
       while ((uint64_t)esp_timer_get_time() - t0 < 2000000ULL) {
         int v = digitalRead(GPS_RX_PIN); n++; if (v) hi++;
         if (v != last) { ed++; last = v; }
+        if ((n & 1023u) == 0) task_wdt_kick();
       }
       char b[130];
       snprintf(b, sizeof b, "GPIO%-3d held HIGH 3 s -> RX edges %-7lu high %5.1f%%  %s\n",
                pin, (unsigned long)ed, 100.0 * hi / n, ed > 100 ? "<== AWAKE" : "");
       o += b;
       if (ed > 100) { found = pin; break; }
-      digitalWrite(pin, LOW); delay(50); pinMode(pin, INPUT);   // release before the next one
+      digitalWrite(pin, LOW); task_wdt_wait_ms(50); pinMode(pin, INPUT);   // release before the next one
       Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
     }
     Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
@@ -1391,19 +1435,20 @@ static void routes() {
     static const int CAND[] = {2, 10, 21, 40, 41, 42};
     String o = "pulsing the vendor's output pins, watching GPIO44 for the L86 waking up\n\n";
     for (int pin : CAND) {
-      Serial1.end(); delay(10);
+      Serial1.end(); task_wdt_wait_ms(10);
       pinMode(pin, OUTPUT);
-      digitalWrite(pin, LOW);  delay(200);      // assert (most resets/enables are active low)
-      digitalWrite(pin, HIGH); delay(200);
+      digitalWrite(pin, LOW);  task_wdt_wait_ms(200);      // assert (most resets/enables are active low)
+      digitalWrite(pin, HIGH); task_wdt_wait_ms(200);
       pinMode(pin, INPUT);                      // leave nothing asserted
       // give it time to boot and start talking, then look at the copper rather than the UART
-      delay(1500);
+      task_wdt_wait_ms(1500);
       pinMode(GPS_RX_PIN, INPUT);
       uint32_t ed = 0, n = 0, hi = 0; int last = digitalRead(GPS_RX_PIN);
       uint64_t t0 = esp_timer_get_time();
       while ((uint64_t)esp_timer_get_time() - t0 < 1500000ULL) {
         int v = digitalRead(GPS_RX_PIN); n++; if (v) hi++;
         if (v != last) { ed++; last = v; }
+        if ((n & 1023u) == 0) task_wdt_kick();
       }
       char b[120];
       snprintf(b, sizeof b, "GPIO%-3d pulsed -> RX edges %-7lu high %5.1f%%  %s\n",
@@ -1423,7 +1468,7 @@ static void routes() {
     // are excluded from it precisely BECAUSE they are the UART. So drop the driver and look at
     // the copper.
     Serial1.end();
-    delay(20);
+    task_wdt_wait_ms(20);
     String o = "";
     // Three pull modes on the module's TX. Plain INPUT cannot tell a line DRIVEN low from one
     // that is simply not driven at all -- both read 0. Against a pullup they differ: a driving
@@ -1435,7 +1480,7 @@ static void routes() {
       const char *pmode = (pin == GPS_TX_PIN) ? "float" : (pass == 0 ? "float" : pass == 1 ? "PULLUP" : "plldn");
       if (pin == GPS_RX_PIN) pass++;
       pinMode(pin, mode);
-      delay(30);
+      task_wdt_wait_ms(30);
       uint32_t hi = 0, n = 0, ed = 0, mn = 0xFFFFFFFF;
       int last = digitalRead(pin);
       uint64_t t0 = esp_timer_get_time(), lastch = t0;
@@ -1448,6 +1493,7 @@ static void routes() {
           if (r && r < mn) mn = r;
           ed++; lastch = now; last = v;
         }
+        if ((n & 1023u) == 0) task_wdt_kick();
       }
       char b[200];
       snprintf(b, sizeof b, "GPIO%-3d %-3s %-6s edges %-7lu high %5.1f%%  shortest run %lu us  %s\n",
@@ -1469,6 +1515,7 @@ static void routes() {
     uint32_t t0 = millis();
     while (millis() - t0 < 3000 && o.length() < 3000) {
       while (Serial1.available()) { char c = Serial1.read(); if (c != '\r') o += c; }
+      task_wdt_service();
     }
     http.send(200, "text/plain", o.length() ? o : "(nothing at 9600 on GPIO44)\n");
   });
@@ -1511,12 +1558,13 @@ static void routes() {
     uint32_t t0 = millis();
     while (millis() - t0 < 2000) {
       while (Serial1.available()) { char ch = Serial1.read(); if (ch != '\r') o += ch; }
+      task_wdt_service();
     }
     http.send(200, "text/plain", o);
   });
 
   http.on("/pps", []() {
-    uint32_t e0 = pps_rising; delay(2500); uint32_t e1 = pps_rising;
+    uint32_t e0 = pps_rising; task_wdt_wait_ms(2500); uint32_t e1 = pps_rising;
     char b[760];
     snprintf(b, sizeof b,
       "GPIO%d over 2.5 s: %lu rising edges (total %lu)\n"
@@ -1568,9 +1616,12 @@ static void routes() {
       if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
     } else if (u.status == UPLOAD_FILE_WRITE) {
       if (!ota_authorized) return;
+      task_wdt_service();
       if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
+      task_wdt_service();
     } else if (u.status == UPLOAD_FILE_END) {
       if (!ota_authorized) return;
+      task_wdt_service();
       if (Update.end(true)) Serial.printf("ota   %u bytes ok\n", u.totalSize);
       else Update.printError(Serial);
     }
