@@ -625,11 +625,21 @@ spec:
             - name: HEAR_ANNOTATE_DB
               value: /pool/corpus/annotations.sqlite3
           readinessProbe:
+            # ⚠️NOT `/api/queue?limit=1`, WHICH IS WHAT THIS WAS. That made readiness cost a
+            # full parse of clips/index.jsonl plus both tag JSONLs every probe period: 1.19 s
+            # median at 1,878 clips against the API server's default 1 s probe timeout, so the
+            # pod holding the only human ground truth went NotReady and the tailnet UI went
+            # down as the corpus grew. /healthz opens the annotation database and stats the
+            # corpus sources -- O(1) in the corpus -- and never builds a queue.
             httpGet:
-              path: "/api/queue?limit=1"
+              path: "/healthz"
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+            # Explicit rather than inherited: the old default-1 s was never a decision, and a
+            # bounded check deserves a stated bound. 2 s is headroom for a busy node, not for
+            # corpus growth -- nothing behind this path grows with the corpus.
+            timeoutSeconds: 2
           resources:
             requests:
               cpu: 100m
