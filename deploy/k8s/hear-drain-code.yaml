@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 347777 B serialised; 348042 B of annotations against a 262144 B cap.
+# apply-mode server: 490894 B serialised; 491159 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: 'c2ca757'
-    dama-hear/source-sha256: '4b4a8f32b94bf0b18bf883fa8ba153ef92612287683b9d56c26753d301e01fe4'
+    dama-hear/commit: '505d766'
+    dama-hear/source-sha256: '41016985e079e7db5633f3dde61c98d683c8ea56d21822028b5f4bd46a75e336'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '347777'
+    dama-hear/serialised-bytes: '490894'
 data:
   hear__init__.py: |
     
@@ -6428,4 +6428,2780 @@ data:
     
     if __name__ == "__main__":
         raise SystemExit(main())
+    
+  hear_privacy__init__.py: |
+    """Privacy enforcement for audio that was captured for acoustics and may contain a voice.
+    
+    The node records 5.0 s WAVs so gunshots, claps and engines can be located. A microphone that
+    hears a gunshot also hears the person standing next to it, and a clip of a conversation is not
+    evidence this project is allowed to keep. This package is the mechanism that makes "we do not
+    retain speech" a thing the code does rather than a thing the README says.
+    
+    `purge.py` is the pipeline: detect speech, hash the bytes, destroy the file, write a receipt
+    that proves the destruction and carries nothing of what was said. It is stdlib + numpy, opens
+    no socket, and refuses to emit any field it does not recognise.
+    """
+    from . import purge, transient_tdoa  # noqa: F401
+    
+  hear_privacy_purge.py: |
+    #!/usr/bin/env python3
+    """Detect human speech in a clip, destroy the clip, and keep only the proof that it happened.
+    
+        from hear.privacy import purge
+        report = purge.scan_pool("~/hear-clips")                 # -> <pool>/vad_purge.jsonl
+        report.purged                                            # how many WAVs no longer exist
+        receipt = purge.purge_wav("one-clip.wav", vad=purge.load_vad())   # one clip, one dict
+        receipt["verdict"]       # SPEECH_DETECTED | NO_SPEECH | NOT_SCORED
+    
+    WHAT THIS MODULE IS FOR. Clips are captured for acoustics -- a gunshot's arrival time, a clap's
+    envelope -- and a microphone that hears a gunshot also hears whoever was talking beside it. A
+    voice clip is not evidence this project may hold, so the only defensible handling is: notice it,
+    destroy it, and be able to say afterwards exactly what was destroyed without being able to say
+    anything about its contents.
+    
+    ⚠️THE RECEIPT IS THE ONLY SURVIVOR, AND IT IS DELIBERATELY NEARLY EMPTY. A purge that leaves no
+    record is indistinguishable from a lost file, from a crashed drain, and from a cover-up; an audit
+    that cannot count destructions cannot prove the policy runs. So one JSONL line is written per
+    purge -- `hear.vad.purge.receipt.v1`, the schema of docs/silero-vad-privacy-contract.md §8 --
+    carrying when, on which node, how long the clip was, how sure the detector was, how the bytes
+    were destroyed, that their absence was CHECKED afterwards, and the digest of bytes that no
+    longer exist anywhere. The digest is a *tombstone*, not an index: nothing can be
+    recovered from it, and it is what lets a later question ("was THIS file purged?") be answered by
+    whoever still holds the file, without this repository holding it.
+    
+    ⚠️EVERY FIELD IS ALLOW-LISTED, BECAUSE THE FAILURE MODE HERE IS ADDITIVE. The way a privacy
+    pipeline leaks is not a decision to leak; it is one more "harmless" field -- a transcript
+    snippet for debugging, an mfcc vector to tune the threshold, an embedding to dedupe speakers --
+    added by someone solving a real problem. `assert_privacy_safe()` refuses any key that is not on
+    `RECEIPT_KEYS`, and refuses any value that is a sequence of numbers, so a feature vector cannot
+    be smuggled into a field that is allowed to exist. Widening that list is a deliberate act with a
+    reviewer attached, which is the whole point.
+    
+    ⚠️NO TRANSCRIPT, NO FEATURES, NO EMBEDDINGS, NO SAMPLES -- INCLUDING IN MEMORY, AFTER THE
+    DECISION. The VAD sees the waveform because it must; nothing downstream of the decision does.
+    The sample buffer is zeroed as soon as a purge is decided, the frame probabilities are collapsed
+    to a peak and a set of second-resolution spans before they leave `detect()`, and no code path
+    here writes audio anywhere. Speech *timestamps* are kept because "0.4 s of speech at 2.1 s" is
+    an operational measurement about a file that no longer exists; it is not content.
+    
+    ⚠️DESTRUCTION IS OVERWRITE-THEN-UNLINK, AND IT IS NOT CRYPTOGRAPHIC ERASURE. The file is
+    overwritten in place (random pass, then zeros), fsynced, truncated and unlinked, so the bytes
+    are gone from any reader that goes through the filesystem. On a copy-on-write or log-structured
+    filesystem, on flash with wear levelling, and in any snapshot or backup taken before the purge,
+    the original blocks may still exist physically. That is a storage-layer property this module
+    cannot fix and must not pretend to: the claim made in the receipt is `zero_audio_retained`, i.e.
+    this pipeline retained nothing, not `unrecoverable`.
+    
+    ⚠️A VERDICT IS NOT THE SAME AS A DESTRUCTION, AND RE-RUNNING IS NOT AN ERROR. `NO_SPEECH` says
+    a clip was scored and found clean (`--receipt-clean` records those too, so the audit log can
+    answer "what did you cover?" and not only "what did you destroy?"); `NOT_SCORED` with
+    `already_absent: true` says the bytes were gone before this run reached them, which is what a
+    second pass over a purged pool, or a race with the drain's own pruning, must produce instead of
+    an exception. `audio_retained` is false on exactly the receipts where something was destroyed.
+    
+    ⚠️DRY RUN TOUCHES NOTHING, AND THAT INCLUDES THE AUDIT LOG. `--dry-run` answers "what would go"
+    and must be safe to run on a pool someone else is draining. It hashes and detects, marks the
+    receipt `dry_run: true`, and neither destroys a file nor appends a line.
+    
+    ⚠️THE DETECTOR IS PLUGGABLE AND ITS NAME IS ON EVERY RECEIPT. `load_vad()` prefers the Silero
+    v5 ONNX engine (`hear/privacy/silero_vad.py`) when it is installed and otherwise falls back to
+    `BandEnergyVAD`, a stdlib+numpy voiced-band/harmonicity detector with no model file. They do not
+    have the same recall, so `vad_engine` is recorded on every receipt: a fleet-wide claim about
+    what was purged is only as strong as the weakest detector that produced it, and that has to be
+    visible in the record rather than inferred from a deployment date.
+    """
+    from __future__ import annotations
+    
+    import datetime as dt
+    import hashlib
+    import io
+    import json
+    import os
+    import wave
+    from dataclasses import dataclass, field, replace
+    from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+    
+    import numpy as np
+    
+    #: Bumped when the receipt's meaning changes, never when a field is merely reordered.
+    RECEIPT_SCHEMA_VERSION = 1
+    
+    #: The one reason this pipeline destroys anything. A second reason is a second code path with a
+    #: second review, not a free-text string an operator can invent at the command line.
+    #:
+    #: ⚠️IT NAMES THE POLICY, NOT THE ENGINE THAT RAN. The reason a clip was destroyed is always
+    #: "the speech-detection policy fired"; WHICH detector fired is `vad_engine`, on the same line.
+    #: Varying the reason per engine would make a fleet-wide count of purges depend on which node
+    #: had onnxruntime installed, and the count is the thing an auditor reads.
+    PURGE_REASON = "silero_vad_speech_detected"
+    
+    #: The receipt's own name, as docs/silero-vad-privacy-contract.md §8.1 fixes it.
+    RECEIPT_SCHEMA = "hear.vad.purge.receipt.v1"
+    
+    #: Default audit sink, relative to the pool root being scanned. The contract's §8.1 name; the
+    #: pipeline's first landed version wrote `purged_receipts.jsonl`, which `read_receipts()` still
+    #: reads, because an audit log that a rename orphans was never durable in the first place.
+    RECEIPT_NAME = "vad_purge.jsonl"
+    LEGACY_RECEIPT_NAME = "purged_receipts.jsonl"
+    
+    #: §9's fail-closed reason codes. A clip that cannot be honestly scored is PURGED, and the code
+    #: says which impossibility it hit.
+    REASON_INFERENCE = "vad_inference_error"
+    REASON_UNREADABLE = "clip_unreadable"
+    REASON_RATE = "rate_refused"
+    REASON_PURGE_FAILED = "purge_failed"
+    FAIL_CLOSED_REASONS = (REASON_INFERENCE, REASON_UNREADABLE, REASON_RATE, REASON_PURGE_FAILED)
+    
+    #: Rates this fleet records at (contract §2). Anything else cannot be honestly scored: the
+    #: detector's frame geometry and pitch search are defined against these, so a 44.1 kHz file is
+    #: refused -- and refusing means PURGING, never keeping.
+    SUPPORTED_SOURCE_RATES = (16000, 48000)
+    
+    #: Every verdict a scored clip can carry (contract §6). `NOT_SCORED` is not a failure: it is the
+    #: honest answer for a clip whose audio was already gone when the scan reached it.
+    VERDICT_SPEECH = "SPEECH_DETECTED"
+    VERDICT_CLEAN = "NO_SPEECH"
+    VERDICT_NOT_SCORED = "NOT_SCORED"
+    VERDICTS = (VERDICT_SPEECH, VERDICT_CLEAN, VERDICT_NOT_SCORED)
+    
+    #: How the bytes went (contract §8.2). `already_absent` is the idempotent re-run: a second scan
+    #: of a purged pool must record that the file was gone, not raise and not claim a destruction.
+    METHOD_OVERWRITE = "overwrite_unlink"
+    METHOD_ABSENT = "already_absent"
+    METHOD_NONE = "none"
+    
+    #: EVERY key a receipt may carry. `assert_privacy_safe()` refuses anything else -- see the
+    #: module docstring on why the failure mode here is additive.
+    #:
+    #: ⚠️THE CONTRACT'S `policy` AND `model` OBJECTS ARE FLATTENED INTO SCALARS HERE. §8.2 draws them
+    #: as nested objects; this guard refuses every nested structure, because "a dict is allowed under
+    #: this key" is exactly the hole a feature vector arrives through. The fields themselves are all
+    #: present, one scalar each, which satisfies what §8.1 actually demands -- "scalars and
+    #: identifiers only" -- and keeps the refusal rule one line long.
+    RECEIPT_KEYS = (
+        "schema",
+        "schema_version",
+        "timestamp",
+        "purged_at",
+        "node",
+        "clip",
+        "clip_key",
+        "duration_s",
+        "verdict",
+        "peak_speech_prob",
+        "speech_confidence_max",
+        "speech_confidence_mean_in_segments",
+        "speech_s",
+        "speech_total_ms",
+        "speech_segment_count",
+        "speech_spans_s",
+        "speech_segments_ms",
+        "frames_scored",
+        "purged_sha256",
+        "purged_bytes",
+        "purge_reason",
+        "purge_method",
+        "medium_guarantee",
+        "verified_absent",
+        "already_absent",
+        "provenance",
+        "vad_engine",
+        "policy_version",
+        "speech_threshold",
+        "neg_threshold",
+        "min_speech_duration_ms",
+        "min_silence_duration_ms",
+        "speech_pad_ms",
+        "zero_audio_retained",
+        "audio_retained",
+        "fail_closed_reason",
+        "dry_run",
+    )
+    
+    #: Keys that have leaked from a pipeline like this one before, spelled out so the refusal names
+    #: the thing rather than saying "unknown key". Checked case-insensitively, substring-wise, with
+    #: `NAME_EXEMPT` below holding the allow-listed keys whose own names contain one of these words.
+    FORBIDDEN_SUBSTRINGS = (
+        "transcript", "text", "words", "tokens", "embedding", "embed", "mfcc", "mel",
+        "spectrogram", "feature", "samples", "audio", "waveform", "pcm", "voiceprint",
+        "speaker", "identity", "content", "excerpt", "snippet",
+    )
+    
+    #: Allow-listed keys that legitimately spell a forbidden word. `zero_audio_retained` is the
+    #: pipeline's central CLAIM about audio, not audio; the speech fields are measurements in
+    #: seconds and a scalar probability.
+    NAME_EXEMPT = ("zero_audio_retained", "audio_retained", "speech_s", "speech_spans_s",
+                   "speech_segments_ms", "speech_total_ms", "speech_segment_count",
+                   "peak_speech_prob", "speech_threshold", "speech_confidence_max",
+                   "speech_confidence_mean_in_segments", "speech_pad_ms",
+                   "min_speech_duration_ms", "min_silence_duration_ms")
+    
+    #: A voice, in Hz: the band a telephone was built around, which is where speech energy is.
+    VOICE_BAND_HZ = (300.0, 3400.0)
+    #: Fundamental frequency search range for the harmonicity test, adult male floor to child ceiling.
+    PITCH_HZ = (70.0, 350.0)
+    #: Analysis geometry. 32 ms frames at 10 ms hops: long enough for a pitch period at 70 Hz to
+    #: appear twice, short enough that a 250 ms utterance is 25 frames rather than 8.
+    FRAME_MS, HOP_MS = 32.0, 10.0
+    #: Silence shorter than this does NOT close a segment; it is bridged (contract §4.1). 300 ms,
+    #: because at 120 the voiced peaks of one modulated utterance in noise stay separate 140 ms
+    #: fragments, every fragment falls under `min_speech_ms`, and a clip of someone talking through
+    #: traffic is KEPT. Bridging first and length-testing after is what makes the length test mean
+    #: "how long were they speaking" rather than "how long was the loudest syllable".
+    DEFAULT_MIN_SILENCE_MS = 300.0
+    
+    DEFAULT_THRESHOLD = 0.5
+    DEFAULT_MIN_SPEECH_MS = 250.0
+    
+    #: ⚠️HYSTERESIS: OPEN AT `threshold`, CLOSE ONLY BELOW `neg_threshold` (contract §4.2). A single
+    #: threshold chatters -- `0.52, 0.48, 0.53` becomes three segments and two silences -- and a
+    #: chattering segmenter turns one utterance into fragments that each fail the length test. The
+    #: gap between the two numbers IS the noise immunity; closing it reintroduces the chatter.
+    DEFAULT_NEG_THRESHOLD = 0.35
+    #: Margin added to each end of an accepted segment (contract §4.1).
+    DEFAULT_SPEECH_PAD_MS = 30.0
+    #: Bumped when the MEANING of a verdict changes, so a past verdict stays reproducible.
+    POLICY_VERSION = "v1"
+    
+    #: A clip larger than this is refused rather than read into memory. 5.0 s of 48 kHz mono PCM16
+    #: is 480 044 B; 64 MiB is ~11 minutes, far past anything the firmware writes.
+    MAX_WAV_BYTES = 64 * 1024 * 1024
+    
+    
+    class PurgeError(RuntimeError):
+        """A clip could not be decided about. Never raised to mean "no speech"."""
+    
+    
+    class UnreadableClip(PurgeError):
+        """The WAV could not be parsed. The file is left alone: undecided is not innocent."""
+    
+    
+    class RateRefused(PurgeError):
+        """A sample rate this lane cannot honestly score. Fails closed (§9 `rate_refused`)."""
+    
+    
+    class NonFiniteAudio(PurgeError):
+        """NaN or Inf reached the detector. Fails closed: see `assert_finite()`."""
+    
+    
+    class PrivacyLeak(AssertionError):
+        """A record carried a field this pipeline is not allowed to emit. Fail loudly, never trim."""
+    
+    
+    # --------------------------------------------------------------------------- reading WAVs
+    
+    def read_wav_mono(path: str) -> Tuple[np.ndarray, int]:
+        """`path` -> (float32 samples in [-1, 1], sample rate). Mono by channel mean.
+    
+        Stdlib `wave` only: this must work on a bench with no soundfile/libsndfile, and the firmware
+        writes plain 16-bit PCM. Anything else -- float WAVs, 24-bit, IEEE extensible -- raises
+        rather than being guessed at, because a misread body is a misread *decision*.
+        """
+        try:
+            size = os.path.getsize(path)
+        except OSError as exc:
+            raise UnreadableClip("%s: cannot stat: %s" % (path, exc)) from exc
+        if size > MAX_WAV_BYTES:
+            raise UnreadableClip("%s: %d B exceeds the %d B read cap" % (path, size, MAX_WAV_BYTES))
+        try:
+            with wave.open(path, "rb") as wav:
+                channels, width, rate, frames = (wav.getnchannels(), wav.getsampwidth(),
+                                                 wav.getframerate(), wav.getnframes())
+                if width != 2:
+                    raise UnreadableClip("%s: sample width %d B, only 16-bit PCM is read here"
+                                         % (path, width))
+                if rate <= 0 or channels <= 0:
+                    raise UnreadableClip("%s: header claims %d Hz / %d channels"
+                                         % (path, rate, channels))
+                if rate not in SUPPORTED_SOURCE_RATES:
+                    raise RateRefused(
+                        "%s: %d Hz is not a rate this lane records at %r. The frame geometry and "
+                        "the pitch search are defined against those rates, so a score here would "
+                        "be a guess -- and a guess that can only err towards keeping a voice."
+                        % (path, rate, SUPPORTED_SOURCE_RATES))
+                raw = wav.readframes(frames)
+        except UnreadableClip:
+            raise
+        except (wave.Error, EOFError, OSError, ValueError) as exc:
+            raise UnreadableClip("%s: %s" % (path, exc)) from exc
+    
+        pcm = np.frombuffer(raw, dtype="<i2")
+        usable = (pcm.size // channels) * channels
+        pcm = pcm[:usable]
+        if pcm.size == 0:
+            raise UnreadableClip("%s: no sample frames in body" % path)
+        samples = pcm.reshape(-1, channels).astype(np.float32).mean(axis=1) / 32768.0
+        return samples, rate
+    
+    
+    def sha256_file(path: str, chunk: int = 1 << 20) -> str:
+        """Digest of the bytes on disk, streamed. This is the tombstone the receipt carries."""
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as fh:
+                for block in iter(lambda: fh.read(chunk), b""):
+                    h.update(block)
+        except OSError as exc:
+            raise UnreadableClip("%s: cannot read for digest: %s" % (path, exc)) from exc
+        return h.hexdigest()
+    
+    
+    # --------------------------------------------------------------------------- the detector
+    
+    @dataclass(frozen=True)
+    class SpeechSpan:
+        """One stretch of speech, in seconds from the start of the clip."""
+        start_s: float
+        end_s: float
+        peak_prob: float
+    
+        @property
+        def duration_s(self) -> float:
+            return max(0.0, self.end_s - self.start_s)
+    
+        def as_pair(self) -> List[float]:
+            return [round(self.start_s, 3), round(self.end_s, 3)]
+    
+        def as_ms_pair(self) -> List[int]:
+            """Contract §8.2 `speech_segments_ms`: integer ms offsets, relative to clip start."""
+            return [int(round(self.start_s * 1000.0)), int(round(self.end_s * 1000.0))]
+    
+    
+    @dataclass(frozen=True)
+    class VadDecision:
+        """What the detector concluded, and nothing that could reconstruct the sound.
+    
+        `peak_prob` is the maximum per-frame speech probability, kept because an operator tuning a
+        threshold needs to know whether a clip was refused at 0.49 or at 0.02. The per-frame vector
+        itself is NOT kept: it is a coarse envelope of the utterance and it leaves this function
+        collapsed.
+        """
+        speech: bool
+        peak_prob: float
+        speech_s: float
+        spans: Tuple[SpeechSpan, ...]
+        engine: str
+        #: Mean probability INSIDE the accepted segments, not over the clip. A clip-wide mean is
+        #: dominated by however much silence happened to surround the utterance, so it drops as the
+        #: clip gets longer for the same speech -- useless for tuning, which is what it is for.
+        mean_prob_in_segments: Optional[float] = None
+        frames_scored: int = 0
+        truncated_segment: bool = False
+    
+    
+    class BandEnergyVAD:
+        """Voiced-band energy + harmonicity, stdlib and numpy, no model file.
+    
+        ⚠️THIS IS THE FALLBACK, NOT THE STANDARD. Silero v5 is the engine this pipeline is specified
+        against; this exists so a node with no onnxruntime still enforces the policy instead of
+        silently keeping voice clips, and so the pipeline's own tests do not depend on a model
+        download. Its name is written to every receipt it produces for exactly that reason.
+    
+        Three things have to agree before a frame is called speech, because any one of them alone
+        fires on something the field is full of:
+    
+          * **energy above the clip's own noise floor, or above an absolute one** -- alone this
+            labels wind and a passing car;
+          * **voiced-band concentration** (300-3400 Hz share of frame energy) -- alone this labels
+            any mid-band tone, e.g. an engine harmonic or a siren;
+          * **harmonicity**, a normalised autocorrelation peak at a plausible pitch period -- alone
+            this labels a whistle, a hum and a tyre resonance;
+          * **spectral spread**, i.e. no single FFT bin owning the frame -- this is what separates
+            a voice from the sirens and alarms the first three gates happily call speech;
+          * **pitch-track continuity**, because 1/f noise passes all four of the above: it is
+            low-weighted, broad, and has a strong autocorrelation peak in the pitch range on every
+            frame -- in a different place each time. A larynx gudes its f0; noise resamples it.
+    
+        A gunshot fails the first two (broadband, impulsive), rain and hiss fail the second and
+        third, a tonal machine fails the flatness/pitch-stability part of the third. A voice passes
+        all three, which is the only claim being made.
+        """
+    
+        name = "band_energy_fallback_v1"
+    
+        def __init__(self, threshold: float = DEFAULT_THRESHOLD,
+                     min_speech_ms: float = DEFAULT_MIN_SPEECH_MS, *,
+                     neg_threshold: float = DEFAULT_NEG_THRESHOLD,
+                     min_silence_ms: float = DEFAULT_MIN_SILENCE_MS,
+                     speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS) -> None:
+            self.threshold = float(threshold)
+            self.min_speech_ms = float(min_speech_ms)
+            self.neg_threshold = min(float(neg_threshold), float(threshold))
+            self.min_silence_ms = float(min_silence_ms)
+            self.speech_pad_ms = float(speech_pad_ms)
+    
+        # -- framing ---------------------------------------------------------------------------
+    
+        @staticmethod
+        def _frames(samples: np.ndarray, rate: int) -> Tuple[np.ndarray, int, int]:
+            n = max(16, int(round(rate * FRAME_MS / 1000.0)))
+            hop = max(1, int(round(rate * HOP_MS / 1000.0)))
+            if samples.size < n:
+                pad = np.zeros(n - samples.size, dtype=np.float32)
+                samples = np.concatenate([samples, pad])
+            count = 1 + (samples.size - n) // hop
+            idx = np.arange(n)[None, :] + hop * np.arange(count)[:, None]
+            return samples[idx], n, hop
+    
+        def _frame_probs(self, samples: np.ndarray, rate: int) -> Tuple[np.ndarray, int]:
+            frames, n, hop = self._frames(samples.astype(np.float32, copy=False), rate)
+            window = np.hanning(n).astype(np.float32)
+            win = frames * window
+    
+            spec = np.abs(np.fft.rfft(win, axis=1)) ** 2
+            freqs = np.fft.rfftfreq(n, 1.0 / rate)
+            total = spec.sum(axis=1) + 1e-12
+            band = spec[:, (freqs >= VOICE_BAND_HZ[0]) & (freqs <= VOICE_BAND_HZ[1])].sum(axis=1)
+            band_ratio = band / total
+    
+            # ⚠️THE ENERGY GATE TAKES THE BETTER OF TWO MEASURES, NOT THE RELATIVE ONE. A clip that
+            # is speech end to end has its own 20th percentile sitting INSIDE the utterance, so a
+            # purely relative SNR reports ~0 dB and the loudest possible privacy failure -- someone
+            # talking for the whole five seconds -- is the one that scores lowest. The absolute term
+            # is what catches it; the relative term is what still finds one quiet word in silence.
+            rms = np.sqrt((frames.astype(np.float64) ** 2).mean(axis=1)) + 1e-12
+            floor = np.percentile(rms, 20)
+            snr_db = 20.0 * np.log10(rms / max(floor, 1e-9))
+            level_db = 20.0 * np.log10(rms)
+    
+            harm = self._harmonicity(win, rate)
+    
+            # ⚠️A NARROW TONE IS NOT A VOICE. A siren, a whistle and a reversing alarm all sit in
+            # the voice band and all autocorrelate beautifully, so band + harmonicity alone purge
+            # them -- destroying exactly the acoustic events this project exists to record. Speech
+            # spreads its energy over a pitch comb and formants; no single bin owns it.
+            peak_share = spec.max(axis=1) / total
+            top_share = np.sort(spec, axis=1)[:, -8:].sum(axis=1) / total
+    
+            # Each term is a soft gate in [0, 1]; the product is the probability. A product, not a
+            # mean: a frame that fails one test outright must not be rescued by the others.
+            p_energy = np.maximum(_ramp(snr_db, 4.0, 12.0), _ramp(level_db, -52.0, -38.0))
+            p_band = _ramp(band_ratio, 0.25, 0.55)
+            p_harm = _ramp(harm, 0.25, 0.55)
+            p_spread = (1.0 - _ramp(peak_share, 0.32, 0.55)) * (1.0 - _ramp(top_share, 0.88, 0.98))
+            p_track = _ramp(self._pitch_continuity(win, rate), 0.40, 0.80)
+            probs = np.clip(p_energy * p_band * p_harm * p_spread * p_track, 0.0, 1.0) ** (1.0 / 5.0)
+            # Absolute silence is never speech, whatever the clip's own floor says.
+            probs[rms < 1e-4] = 0.0
+            return probs.astype(np.float32), hop
+    
+        @staticmethod
+        def _pitch_continuity(win: np.ndarray, rate: int) -> np.ndarray:
+            """How steadily the best pitch lag moves from frame to frame, smoothed over ~50 ms.
+    
+            ⚠️THIS IS WHAT SEPARATES A VOICE FROM PINK NOISE. 1/f noise is not flat: it has most of
+            its energy low, it passes the voiced-band test, and its autocorrelation has a strong peak
+            in the pitch range on every frame -- the peak is just in a DIFFERENT PLACE every frame.
+            A larynx cannot do that. Speech glides its f0; noise resamples it. Measured on
+            tests/privacy_signals.py: speech 0.76 frame-to-frame agreement, pink noise 0.39-0.49.
+            """
+            lags = BandEnergyVAD._best_lag(win, rate)
+            if lags.size < 2:
+                return np.ones(lags.size, dtype=np.float32)
+            step = np.abs(np.diff(lags)) / np.maximum(lags[:-1], 1)
+            agree = np.concatenate([[0.0], (step < 0.15).astype(np.float64)])
+            kernel = np.ones(5) / 5.0
+            return np.convolve(agree, kernel, mode="same").astype(np.float32)
+    
+        @staticmethod
+        def _acf(win: np.ndarray) -> np.ndarray:
+            n = win.shape[1]
+            size = 1 << int(np.ceil(np.log2(2 * n)))
+            spec = np.fft.rfft(win, n=size, axis=1)
+            return np.fft.irfft(np.abs(spec) ** 2, n=size, axis=1)[:, :n]
+    
+        @staticmethod
+        def _pitch_lag_bounds(n: int, rate: int) -> Tuple[int, int]:
+            return max(1, int(rate / PITCH_HZ[1])), min(n - 1, int(rate / PITCH_HZ[0]))
+    
+        @staticmethod
+        def _best_lag(win: np.ndarray, rate: int) -> np.ndarray:
+            acf = BandEnergyVAD._acf(win)
+            lo, hi = BandEnergyVAD._pitch_lag_bounds(win.shape[1], rate)
+            if hi <= lo:
+                return np.zeros(win.shape[0], dtype=np.int64)
+            return acf[:, lo:hi + 1].argmax(axis=1) + lo
+    
+        @staticmethod
+        def _harmonicity(win: np.ndarray, rate: int) -> np.ndarray:
+            """Normalised autocorrelation peak inside the pitch range, per frame.
+    
+            FFT-based: a 32 ms frame at 48 kHz is 1 536 samples, and the direct correlation over 600
+            candidate lags per frame is what made an earlier version of this too slow to run on a
+            whole pool.
+            """
+            n = win.shape[1]
+            size = 1 << int(np.ceil(np.log2(2 * n)))
+            spec = np.fft.rfft(win, n=size, axis=1)
+            acf = np.fft.irfft(np.abs(spec) ** 2, n=size, axis=1)[:, :n]
+            zero = acf[:, :1] + 1e-12
+            lo = max(1, int(rate / PITCH_HZ[1]))
+            hi = min(n - 1, int(rate / PITCH_HZ[0]))
+            if hi <= lo:
+                return np.zeros(win.shape[0], dtype=np.float32)
+            return np.clip(acf[:, lo:hi + 1].max(axis=1) / zero[:, 0], 0.0, 1.0).astype(np.float32)
+    
+        # -- decision --------------------------------------------------------------------------
+    
+        def detect(self, samples: np.ndarray, rate: int) -> VadDecision:
+            if rate <= 0:
+                raise PurgeError("sample rate %r is not a rate" % (rate,))
+            assert_finite(samples, self.name)
+            if samples.size == 0:
+                return VadDecision(False, 0.0, 0.0, (), self.name)
+            probs, hop = self._frame_probs(samples, rate)
+            # The input was finite and the output is not: an arithmetic fault inside the detector
+            # votes for retention just as silently as a NaN sample does.
+            if not np.all(np.isfinite(probs)):
+                raise NonFiniteAudio("%s: scoring produced a non-finite probability" % self.name)
+            return decision_from_probs(probs, hop / float(rate), FRAME_MS / 1000.0,
+                                       self.threshold, self.min_speech_ms, self.name,
+                                       neg_threshold=self.neg_threshold,
+                                       min_silence_ms=self.min_silence_ms,
+                                       speech_pad_ms=self.speech_pad_ms,
+                                       clip_s=samples.size / float(rate))
+    
+    
+    def _ramp(x: np.ndarray, lo: float, hi: float) -> np.ndarray:
+        """Linear soft gate: 0 at or below `lo`, 1 at or above `hi`."""
+        return np.clip((np.asarray(x, dtype=np.float64) - lo) / max(hi - lo, 1e-9), 0.0, 1.0)
+    
+    
+    def decision_from_probs(probs: Sequence[float], hop_s: float, frame_s: float,
+                            threshold: float, min_speech_ms: float, engine: str, *,
+                            neg_threshold: Optional[float] = None,
+                            min_silence_ms: float = DEFAULT_MIN_SILENCE_MS,
+                            speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS,
+                            clip_s: Optional[float] = None) -> VadDecision:
+        """Per-frame probabilities -> segments, a peak and a verdict. Contract §4.3's state machine.
+    
+        Shared by every engine so that "what counts as speech" is one rule and not one rule per
+        detector:
+    
+          1. a segment OPENS at a frame >= `threshold` and CLOSES only below `neg_threshold`, so
+             ordinary probability wobble inside an utterance does not end it (§4.2);
+          2. a silence shorter than `min_silence_ms` is BRIDGED, because the gap between two
+             syllables is not the end of the speech;
+          3. each surviving segment is PADDED by `speech_pad_ms` at both ends, clamped to the clip;
+          4. only then is a segment shorter than `min_speech_ms` discarded as a blip.
+    
+        ⚠️THE ORDER OF 2, 3 AND 4 IS THE WHOLE BEHAVIOUR. Length-testing before bridging asks "how
+        long was the loudest syllable", which is the question that keeps a clip of someone talking
+        through traffic. Length-testing after bridging asks "how long were they speaking".
+        """
+        arr = np.asarray(probs, dtype=np.float64)
+        if arr.size == 0:
+            return VadDecision(False, 0.0, 0.0, (), engine, None, 0, False)
+        # ⚠️A NaN PROBABILITY IS NOT A LOW PROBABILITY, AND IT FAILS OPEN IF IT IS LEFT ALONE. Every
+        # comparison against NaN is False, so `p >= threshold` never opens a segment, `peak` comes
+        # back NaN, the clip is reported speech=False, and a clip with a voice in it is kept -- a
+        # confident silence produced by arithmetic rather than by the audio. It also puts a token no
+        # strict JSON reader accepts into the audit log. Contract §9 `vad_inference_error`: a
+        # detector that answered NaN has not answered, so the frame counts as speech and the clip is
+        # purged. Reachable through `inspect_samples`/`purge_wav_bytes`, which take samples straight
+        # from memory; a 16-bit WAV cannot carry a non-finite sample.
+        if not np.all(np.isfinite(arr)):
+            arr = np.where(np.isfinite(arr), arr, 1.0)
+        neg = float(threshold if neg_threshold is None else neg_threshold)
+        if neg > float(threshold):
+            raise PurgeError("neg_threshold %.3f is above threshold %.3f: a segment that cannot "
+                             "close is not hysteresis" % (neg, threshold))
+        peak = float(arr.max())
+        frames = int(arr.size)
+        total_s = (frames - 1) * hop_s + frame_s if clip_s is None else float(clip_s)
+    
+        # 1. hysteresis
+        raw: List[Tuple[int, int]] = []
+        start: Optional[int] = None
+        for i, p in enumerate(arr):
+            if start is None:
+                if p >= threshold:
+                    start = i
+            elif p < neg:
+                raw.append((start, i - 1))
+                start = None
+        truncated = start is not None
+        if start is not None:
+            raw.append((start, frames - 1))
+    
+        # 2. bridge short silences
+        merged: List[Tuple[int, int]] = []
+        gap_frames = max(1, int(round((float(min_silence_ms) / 1000.0) / max(hop_s, 1e-9))))
+        for span in raw:
+            if merged and span[0] - merged[-1][1] <= gap_frames:
+                merged[-1] = (merged[-1][0], span[1])
+            else:
+                merged.append(span)
+    
+        pad_s = max(0.0, float(speech_pad_ms) / 1000.0)
+        spans: List[SpeechSpan] = []
+        probs_in_segments: List[np.ndarray] = []
+        for lo, hi in merged:
+            # 3. pad, clamped to the clip
+            start_s = max(0.0, lo * hop_s - pad_s)
+            end_s = min(total_s, hi * hop_s + frame_s + pad_s)
+            # 4. and only now, the length test
+            if (end_s - start_s) * 1000.0 < float(min_speech_ms):
+                continue
+            spans.append(SpeechSpan(start_s, end_s, float(arr[lo:hi + 1].max())))
+            probs_in_segments.append(arr[lo:hi + 1])
+    
+        speech_s = float(sum(s.duration_s for s in spans))
+        mean_in = (float(np.concatenate(probs_in_segments).mean()) if probs_in_segments else None)
+        return VadDecision(bool(spans), peak, speech_s, tuple(spans), engine, mean_in, frames,
+                           bool(truncated and spans))
+    
+    
+    def load_vad(engine: str = "auto", threshold: float = DEFAULT_THRESHOLD,
+                 min_speech_ms: float = DEFAULT_MIN_SPEECH_MS):
+        """Return a detector with a `.detect(samples, rate) -> VadDecision` and a `.name`.
+    
+        `auto` prefers Silero v5 (`hear/privacy/silero_vad.py`, which needs onnxruntime and the
+        pinned model) and falls back to `BandEnergyVAD` when it is not installed -- a node without
+        the runtime must still enforce the policy rather than quietly keep voice clips. `silero`
+        demands it and raises if it is missing; `band_energy` demands the fallback. Whichever runs,
+        its name is on every receipt.
+        """
+        engine = (engine or "auto").strip().lower()
+        if engine in ("band_energy", "fallback"):
+            return BandEnergyVAD(threshold, min_speech_ms)
+        if engine in ("auto", "silero"):
+            try:
+                from . import silero_vad  # type: ignore[attr-defined]
+    
+                # ⚠️INSIDE the try, not after it. `silero_vad.load_vad()` raises `ModelUnavailable`
+                # -- an `ImportError` -- when onnxruntime or the weights are absent, which is the
+                # same condition as the module being missing and takes the same branch. It refuses
+                # to substitute its own fallback scorer, so this is the only place the substitution
+                # can happen and `BandEnergyVAD`'s name is what reaches the receipt.
+                return silero_vad.load_vad(threshold=threshold, min_speech_ms=min_speech_ms)
+            except ImportError as exc:
+                if engine == "silero":
+                    raise PurgeError("the silero engine was demanded and is not installed: %s" % exc)
+                return BandEnergyVAD(threshold, min_speech_ms)
+        raise PurgeError("unknown vad engine %r; known: auto, silero, band_energy" % (engine,))
+    
+    
+    # --------------------------------------------------------------------------- the receipt
+    
+    @dataclass(frozen=True)
+    class PurgeReceipt:
+        """What is allowed to outlive a voice clip. `hear.vad.purge.receipt.v1` (contract §8).
+    
+        Read it as a death certificate: it says a file existed, on which node, for how long, that a
+        detector was this sure it held speech, how it was destroyed, that it is confirmed gone, and
+        that its bytes hashed to this. It says nothing that could be turned back into sound, and
+        `assert_privacy_safe()` enforces that on the way out rather than trusting this class to stay
+        honest as it is edited.
+    
+        ⚠️A `NO_SPEECH` RECEIPT IS ALSO A RECEIPT. Contract §6 writes one for every clip that was
+        scored, not only for the ones that were destroyed, because "this clip was examined and found
+        clean" and "this clip was never examined" are different facts and an audit that cannot tell
+        them apart cannot say what coverage it had. `audio_retained` is what distinguishes them, and
+        it is `true` on exactly the receipts where nothing was destroyed.
+        """
+        timestamp: str
+        node: str
+        clip: str
+        duration_s: float
+        peak_speech_prob: float
+        speech_s: float
+        spans: Tuple[SpeechSpan, ...]
+        purged_sha256: Optional[str]
+        vad_engine: str
+        dry_run: bool = False
+        purge_reason: str = PURGE_REASON
+        verdict: str = VERDICT_SPEECH
+        mean_prob_in_segments: Optional[float] = None
+        frames_scored: int = 0
+        purged_bytes: Optional[int] = None
+        purge_method: str = METHOD_OVERWRITE
+        verified_absent: bool = True
+        already_absent: bool = False
+        fail_closed_reason: Optional[str] = None
+        clip_key: Optional[str] = None
+        threshold: float = DEFAULT_THRESHOLD
+        neg_threshold: float = DEFAULT_NEG_THRESHOLD
+        min_speech_ms: float = DEFAULT_MIN_SPEECH_MS
+        min_silence_ms: float = DEFAULT_MIN_SILENCE_MS
+        speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS
+    
+        @property
+        def destroyed(self) -> bool:
+            """Did THIS receipt destroy something? False for a dry run, a clean clip, a missing one."""
+            return (self.verdict == VERDICT_SPEECH and not self.dry_run and not self.already_absent)
+    
+        def as_record(self) -> Dict[str, Any]:
+            mean_in = (None if self.mean_prob_in_segments is None
+                       else round(float(self.mean_prob_in_segments), 4))
+            peak = round(float(self.peak_speech_prob), 4)
+            rec: Dict[str, Any] = {
+                "schema": RECEIPT_SCHEMA,
+                "schema_version": RECEIPT_SCHEMA_VERSION,
+                "timestamp": self.timestamp,
+                "purged_at": self.timestamp,
+                "node": self.node,
+                "clip": self.clip,
+                "clip_key": self.clip_key,
+                "duration_s": round(float(self.duration_s), 3),
+                "verdict": self.verdict,
+                "peak_speech_prob": peak,
+                "speech_confidence_max": peak,
+                "speech_confidence_mean_in_segments": mean_in,
+                "speech_s": round(float(self.speech_s), 3),
+                "speech_total_ms": int(round(float(self.speech_s) * 1000.0)),
+                "speech_segment_count": len(self.spans),
+                "speech_spans_s": [s.as_pair() for s in self.spans],
+                "speech_segments_ms": [s.as_ms_pair() for s in self.spans],
+                "frames_scored": int(self.frames_scored),
+                "purged_sha256": self.purged_sha256,
+                "purged_bytes": self.purged_bytes,
+                "purge_reason": self.purge_reason,
+                "purge_method": self.purge_method,
+                # Overwrite-then-unlink defeats a filesystem reader and nothing below it: see the
+                # module docstring. The receipt says which, rather than implying erasure.
+                "medium_guarantee": "filesystem_only" if self.destroyed else "none",
+                "verified_absent": bool(self.verified_absent),
+                "already_absent": bool(self.already_absent),
+                "provenance": "model",
+                "vad_engine": self.vad_engine,
+                "policy_version": POLICY_VERSION,
+                "speech_threshold": float(self.threshold),
+                "neg_threshold": float(self.neg_threshold),
+                "min_speech_duration_ms": float(self.min_speech_ms),
+                "min_silence_duration_ms": float(self.min_silence_ms),
+                "speech_pad_ms": float(self.speech_pad_ms),
+                # ⚠️THE TWO AUDIO FIELDS ARE ONE FACT SPELLED TWICE, AND THEY ARE ALWAYS
+                # OPPOSITE. `zero_audio_retained` is the task-level claim ("nothing of this clip's
+                # sound is held anywhere after this receipt"); `audio_retained` is contract §8.2's
+                # field, which must be false on every SPEECH_DETECTED receipt or the gate fails. A
+                # dry run and a clean clip both leave the WAV on disk, so both say so rather than
+                # asserting a destruction that did not happen.
+                "zero_audio_retained": self.destroyed,
+                "audio_retained": not self.destroyed,
+                "fail_closed_reason": self.fail_closed_reason,
+                "dry_run": bool(self.dry_run),
+            }
+            assert_privacy_safe(rec)
+            return rec
+    
+    
+    def assert_privacy_safe(record: Dict[str, Any]) -> Dict[str, Any]:
+        """Raise `PrivacyLeak` unless `record` is on the allow-list AND carries no vector.
+    
+        Two refusals, because there are two ways the leak arrives. A NEW key is the obvious one:
+        `transcript`, `mfcc`, `speaker_id`. A new VALUE under an old key is the quiet one -- a
+        `speech_spans_s` that grows from pairs of seconds into a per-frame probability envelope is
+        still a legal key and is a coarse recording of the utterance's rhythm. So any numeric
+        sequence longer than a span pair, and any nested structure, is refused too.
+        """
+        for key, value in record.items():
+            if key not in RECEIPT_KEYS:
+                raise PrivacyLeak(
+                    "receipt field %r is not on RECEIPT_KEYS. If this is genuinely needed, add it "
+                    "there in a reviewed change and say why it cannot reconstruct audio." % (key,))
+            low = key.lower()
+            for bad in FORBIDDEN_SUBSTRINGS:
+                if bad in low and key not in NAME_EXEMPT:
+                    raise PrivacyLeak("receipt field %r names %r, which this pipeline never "
+                                      "retains" % (key, bad))
+            if key in ("speech_spans_s", "speech_segments_ms"):
+                if not isinstance(value, list):
+                    raise PrivacyLeak("%s must be a list of [start, end] pairs" % key)
+                for pair in value:
+                    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                        raise PrivacyLeak("%s carries %r, not a [start, end] pair" % (key, pair))
+                    for edge in pair:
+                        if not isinstance(edge, (int, float)) or isinstance(edge, bool):
+                            raise PrivacyLeak("speech span edge %r is not a number" % (edge,))
+                continue
+            if isinstance(value, (list, tuple, dict, bytes, bytearray, np.ndarray)):
+                raise PrivacyLeak(
+                    "receipt field %r carries a %s. A per-frame vector is a coarse recording; "
+                    "receipts hold scalars and span pairs only." % (key, type(value).__name__))
+            if not isinstance(value, (str, int, float, bool)) and value is not None:
+                raise PrivacyLeak("receipt field %r carries an unserialisable %s"
+                                  % (key, type(value).__name__))
+        return record
+    
+    
+    def append_receipt(path: str, receipt: PurgeReceipt) -> str:
+        """Append one JSONL line, flushed and fsynced before the call returns.
+    
+        The audit line is written AFTER the bytes are gone and is fsynced on its own, because the
+        failure that matters is a destroyed clip with no record of the destruction. A duplicate line
+        after a crash is recoverable by a reader; a missing one is not recoverable by anybody.
+        """
+        path = os.path.expanduser(path)
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, exist_ok=True)
+        line = json.dumps(receipt.as_record(), sort_keys=True, separators=(",", ":")) + "\n"
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return path
+    
+    
+    def read_receipts(path: str) -> List[Dict[str, Any]]:
+        """Every receipt in an audit log. Blank and unparseable lines are skipped, not guessed at."""
+        path = os.path.expanduser(path)
+        out: List[Dict[str, Any]] = []
+        if not os.path.exists(path):
+            return out
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+        return out
+    
+    
+    def read_pool_receipts(root: str) -> List[Dict[str, Any]]:
+        """Every receipt a pool holds, under the current name AND the first landed one.
+    
+        The audit sink was renamed to contract §8.1's `vad_purge.jsonl` after the pipeline shipped
+        as `purged_receipts.jsonl`. A rename that orphans destroyed-clip evidence is worse than the
+        inconsistent name was, so both are read and the union is returned.
+        """
+        root = os.path.abspath(os.path.expanduser(root))
+        out: List[Dict[str, Any]] = []
+        for name in (RECEIPT_NAME, LEGACY_RECEIPT_NAME):
+            out.extend(read_receipts(os.path.join(root, name)))
+        return out
+    
+    
+    # --------------------------------------------------------------------------- destruction
+    
+    def shred_file(path: str, passes: int = 1) -> None:
+        """Overwrite in place, fsync, truncate, unlink. See the module docstring's caveat.
+    
+        The overwrite happens before the unlink so that a reader holding the path sees zeros rather
+        than audio even if the unlink fails; the truncate-to-zero is what makes a partially
+        overwritten file unusable if the process dies between the two.
+        """
+        path = os.path.abspath(os.path.expanduser(path))
+        try:
+            size = os.path.getsize(path)
+            flags = os.O_WRONLY
+            fd = os.open(path, flags)
+            try:
+                for i in range(max(1, int(passes)) + 1):
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    written = 0
+                    while written < size:
+                        block = min(1 << 20, size - written)
+                        chunk = os.urandom(block) if i == 0 else b"\x00" * block
+                        os.write(fd, chunk)
+                        written += block
+                    os.fsync(fd)
+                os.ftruncate(fd, 0)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            raise PurgeError("%s: could not overwrite before unlink: %s" % (path, exc)) from exc
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            raise PurgeError("%s: overwritten but not unlinked: %s" % (path, exc)) from exc
+        _fsync_dir(os.path.dirname(path))
+    
+    
+    def _fsync_dir(path: str) -> None:
+        """Make the unlink itself durable; without it a crash can resurrect the directory entry."""
+        try:
+            fd = os.open(path or ".", os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    
+    
+    def assert_finite(samples: np.ndarray, where: str) -> np.ndarray:
+        """Refuse NaN/Inf before it becomes a confident silence.
+    
+        ⚠️A NaN DOES NOT RAISE, IT VOTES FOR RETENTION. Feed one non-finite sample in and it
+        propagates through the band ratio into every frame probability; `prob >= threshold` is then
+        False for every frame, because every comparison against NaN is False. The pipeline reports
+        `speech=False` with total confidence and keeps the clip -- a retention decision produced by
+        arithmetic rather than by evidence, which is the exact shape of failure §9 is written
+        against. So it is checked at the door and it fails CLOSED.
+        """
+        arr = np.asarray(samples)
+        if arr.size and not np.all(np.isfinite(arr)):
+            raise NonFiniteAudio("%s: audio holds NaN or Inf; a score over it would be arithmetic, "
+                                 "not evidence" % where)
+        return arr
+    
+    
+    def _zero(samples: np.ndarray) -> None:
+        """Drop the waveform the moment the decision is made. Cheap, and it is the stated policy."""
+        try:
+            samples[...] = 0.0
+        except (ValueError, TypeError):
+            pass
+    
+    
+    # --------------------------------------------------------------------------- the pipeline
+    
+    def node_of(path: str, default: str = "unknown") -> str:
+        """Node id out of a clip name, via the one parser that already knows every shipped shape.
+    
+        `hear.clips.parse_clip_name` takes the NODE-side string (`/clips/<name>`), so the basename is
+        put back under that prefix rather than the name being re-parsed here with a second regex
+        that would drift from the firmware's four naming generations.
+        """
+        try:
+            from .. import clips as C
+            return str(C.parse_clip_name(C.CLIP_DIR + "/" + os.path.basename(path))["node"])
+        except Exception:
+            return default
+    
+    
+    def _clip_key(path: str) -> Optional[str]:
+        """`hear.clips.clip_key` for a name this pipeline recognises, else None.
+    
+        The key is the clip's IDENTITY -- node + boot + sample -- so a receipt can be joined to the
+        `clips/index.jsonl` row that recorded the arrival of the bytes it destroyed. It is derived
+        from the NAME, never from the content, which is the same rule `hear/clips.py` states: a
+        content hash would collide two clips of the same silence.
+        """
+        try:
+            from .. import clips as C
+            parts = C.parse_clip_name(C.CLIP_DIR + "/" + os.path.basename(path))
+            return str(C.clip_key(parts["node"], parts["boot"], parts["sample"]))
+        except Exception:
+            return None
+    
+    
+    def _now_iso(now: Optional[dt.datetime] = None) -> str:
+        stamp = now or dt.datetime.now(dt.timezone.utc)
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=dt.timezone.utc)
+        return stamp.astimezone(dt.timezone.utc).isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z")
+    
+    
+    @dataclass
+    class ClipOutcome:
+        """One clip's fate: kept, purged, would-be-purged, already gone, or undecidable."""
+        path: str
+        status: str    # kept | purged | would_purge | already_absent | purge_failed | error
+        receipt: Optional[PurgeReceipt] = None
+        detail: str = ""
+    
+    
+    @dataclass
+    class PurgeReport:
+        """The run, as counts plus the receipts it produced. No audio, by construction."""
+        scanned: int = 0
+        purged: int = 0
+        would_purge: int = 0
+        kept: int = 0
+        already_absent: int = 0
+        fail_closed: int = 0
+        errors: int = 0
+        #: True when a purge failed and the scan stopped rather than walking past a file it had
+        #: already judged speech-bearing. The caller alarms on this; §9 calls it stopping the lane.
+        halted: bool = False
+        dry_run: bool = False
+        vad_engine: str = ""
+        audit_log: Optional[str] = None
+        receipts: List[PurgeReceipt] = field(default_factory=list)
+        outcomes: List[ClipOutcome] = field(default_factory=list)
+    
+        def as_record(self) -> Dict[str, Any]:
+            return {"scanned": self.scanned, "purged": self.purged, "would_purge": self.would_purge,
+                    "kept": self.kept, "already_absent": self.already_absent,
+                    "fail_closed": self.fail_closed, "errors": self.errors,
+                    "halted": self.halted, "dry_run": self.dry_run,
+                    "vad_engine": self.vad_engine, "audit_log": self.audit_log}
+    
+    
+    def inspect_samples(samples: np.ndarray, rate: int, vad=None, *, threshold: float = DEFAULT_THRESHOLD,
+                        min_speech_ms: float = DEFAULT_MIN_SPEECH_MS) -> VadDecision:
+        """Run a detector over a waveform already in memory. Nothing is written, nothing is kept."""
+        vad = vad or load_vad("auto", threshold, min_speech_ms)
+        return vad.detect(np.asarray(samples, dtype=np.float32), int(rate))
+    
+    
+    def purge_wav_bytes(data: bytes, node: str = "stream", clip: str = "<stream>", vad=None, *,
+                        threshold: float = DEFAULT_THRESHOLD,
+                        min_speech_ms: float = DEFAULT_MIN_SPEECH_MS,
+                        audit_log: Optional[str] = None,
+                        now: Optional[dt.datetime] = None) -> Optional[PurgeReceipt]:
+        """Decide about a WAV that never reached the disk. Returns a receipt iff it held speech.
+    
+        This is the streaming door: a drain that has bytes in hand can ask "may I store this?"
+        before it writes anything, which is strictly better than writing and then shredding. The
+        digest is over the bytes as handed in, so the receipt means the same thing either way, and
+        the caller's `data` is the only copy -- this function keeps none.
+    
+        ⚠️A RECEIPT MEANS "DO NOT STORE THIS", AND AN UNDECIDABLE STREAM GETS ONE. Malformed body,
+        refused rate, detector fault or a non-finite score all return a receipt carrying
+        `fail_closed_reason` rather than raising, because a caller that catches the exception and
+        carries on writing the file has turned §9 inside out. `None` -- and only `None` -- means the
+        bytes may be kept.
+        """
+        digest = hashlib.sha256(data).hexdigest()
+    
+        def _fail_closed(reason: str, detail: str, duration_s: float = 0.0,
+                         rate_hz: int = 0) -> PurgeReceipt:
+            """§9 on the streaming door: an undecidable stream is refused, i.e. never stored."""
+            receipt = PurgeReceipt(timestamp=_now_iso(now), node=node, clip=clip,
+                                   duration_s=duration_s, peak_speech_prob=0.0, speech_s=0.0,
+                                   spans=(), purged_sha256=digest, purged_bytes=len(data),
+                                   vad_engine=getattr(vad, "name", "none"), dry_run=False,
+                                   verdict=VERDICT_SPEECH, purge_method=METHOD_OVERWRITE,
+                                   verified_absent=True, fail_closed_reason=reason,
+                                   threshold=threshold, min_speech_ms=min_speech_ms)
+            if audit_log:
+                append_receipt(audit_log, receipt)
+            return receipt
+    
+        try:
+            with wave.open(io.BytesIO(data), "rb") as wav:
+                channels, width, rate, frames = (wav.getnchannels(), wav.getsampwidth(),
+                                                 wav.getframerate(), wav.getnframes())
+                if width != 2:
+                    raise UnreadableClip("stream: sample width %d B, only 16-bit PCM is read here"
+                                         % width)
+                if rate not in SUPPORTED_SOURCE_RATES:
+                    raise RateRefused("stream: %d Hz is not a rate this lane records at %r"
+                                      % (rate, SUPPORTED_SOURCE_RATES))
+                raw = wav.readframes(frames)
+        except RateRefused as exc:
+            return _fail_closed(REASON_RATE, str(exc))
+        except (UnreadableClip, wave.Error, EOFError, ValueError) as exc:
+            return _fail_closed(REASON_UNREADABLE, str(exc))
+    
+        pcm = np.frombuffer(raw, dtype="<i2")
+        usable = (pcm.size // max(channels, 1)) * max(channels, 1)
+        samples = (pcm[:usable].reshape(-1, max(channels, 1)).astype(np.float32).mean(axis=1)
+                   / 32768.0)
+        duration_s = samples.size / float(rate or 1)
+        try:
+            decision = inspect_samples(samples, rate, vad, threshold=threshold,
+                                       min_speech_ms=min_speech_ms)
+        except Exception as exc:
+            _zero(samples)
+            return _fail_closed(REASON_INFERENCE, str(exc), duration_s, rate)
+        _zero(samples)
+        if not np.isfinite(decision.peak_prob):
+            return _fail_closed(REASON_INFERENCE, "non-finite probability", duration_s, rate)
+        if not decision.speech:
+            return None
+        receipt = PurgeReceipt(timestamp=_now_iso(now), node=node, clip=clip,
+                               duration_s=duration_s, peak_speech_prob=decision.peak_prob,
+                               speech_s=decision.speech_s, spans=decision.spans,
+                               purged_sha256=digest, purged_bytes=len(data),
+                               vad_engine=decision.engine, dry_run=False,
+                               verdict=VERDICT_SPEECH, purge_method=METHOD_OVERWRITE,
+                               verified_absent=True,
+                               mean_prob_in_segments=decision.mean_prob_in_segments,
+                               frames_scored=decision.frames_scored,
+                               threshold=threshold, min_speech_ms=min_speech_ms)
+        if audit_log:
+            append_receipt(audit_log, receipt)
+        return receipt
+    
+    
+    def purge_clip(path: str, vad=None, *, threshold: float = DEFAULT_THRESHOLD,
+                   min_speech_ms: float = DEFAULT_MIN_SPEECH_MS,
+                   neg_threshold: float = DEFAULT_NEG_THRESHOLD,
+                   min_silence_ms: float = DEFAULT_MIN_SILENCE_MS,
+                   speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS, dry_run: bool = False,
+                   audit_log: Optional[str] = None, node: Optional[str] = None,
+                   now: Optional[dt.datetime] = None,
+                   receipt_clean: bool = False) -> ClipOutcome:
+        """Decide about one WAV on disk, and destroy it if it holds speech.
+    
+        Order is deliberate and is the audit's whole basis: **digest, detect, destroy, record.** The
+        digest is taken before anything else so that the receipt describes the bytes that existed;
+        detection happens on the buffer already read; destruction happens before the audit line, so
+        a record can never claim a purge that did not happen.
+    
+        ⚠️EVERY WAY OF NOT KNOWING ENDS IN A PURGE (contract §9). Unreadable header, refused sample
+        rate, detector fault, non-finite score: all of them destroy the clip and put a
+        `fail_closed_reason` on the receipt. The one thing that does NOT is a file that was already
+        gone, which is `NOT_SCORED` -- there is nothing to fail closed about.
+        """
+        path = os.path.abspath(os.path.expanduser(path))
+        vad = vad or load_vad("auto", threshold, min_speech_ms)
+        policy = dict(threshold=threshold, neg_threshold=min(neg_threshold, threshold),
+                      min_speech_ms=min_speech_ms, min_silence_ms=min_silence_ms,
+                      speech_pad_ms=speech_pad_ms)
+    
+        if not os.path.exists(path):
+            # ⚠️IDEMPOTENT RE-RUN, NOT AN ERROR. Scanning a pool twice, or racing a drain that
+            # already pruned the clip, must record "the bytes were gone when I got here" -- a
+            # NOT_SCORED receipt with `already_absent` -- and must not raise, must not claim a
+            # destruction it did not perform, and must not count as a failure to decide.
+            receipt = PurgeReceipt(timestamp=_now_iso(now), node=node or node_of(path),
+                                   clip=os.path.basename(path), duration_s=0.0,
+                                   peak_speech_prob=0.0, speech_s=0.0, spans=(),
+                                   purged_sha256=None, vad_engine=getattr(vad, "name", "none"),
+                                   dry_run=dry_run, verdict=VERDICT_NOT_SCORED,
+                                   purge_method=METHOD_ABSENT, verified_absent=True,
+                                   already_absent=True, clip_key=_clip_key(path), **policy)
+            if audit_log and not dry_run:
+                append_receipt(audit_log, receipt)
+            return ClipOutcome(path, "already_absent", receipt, "the file was gone before this run")
+    
+        def _destroy(receipt: PurgeReceipt, detail: str) -> ClipOutcome:
+            """Shred, then receipt. Retried once, because §9 asks for a retry before the alarm."""
+            if dry_run:
+                return ClipOutcome(path, "would_purge", receipt, "dry run: file untouched")
+            last: Optional[PurgeError] = None
+            for _ in range(2):
+                try:
+                    shred_file(path)
+                    last = None
+                    break
+                except PurgeError as exc:
+                    last = exc
+            if last is not None:
+                # ⚠️A FAILED PURGE STOPS THE LANE (§9). Continuing would scan the rest of the pool
+                # while a file this run has already judged speech-bearing is still on the disk, and
+                # the run would end green. The caller is expected to alarm on `halted`.
+                failed = replace(receipt, fail_closed_reason=REASON_PURGE_FAILED,
+                                 verified_absent=False, purge_method=METHOD_NONE)
+                if audit_log:
+                    append_receipt(audit_log, failed)
+                return ClipOutcome(path, "purge_failed", failed, str(last))
+            done = replace(receipt, verified_absent=not os.path.exists(path))
+            if audit_log:
+                append_receipt(audit_log, done)
+            return ClipOutcome(path, "purged", done, detail)
+    
+        def _fail_closed(reason: str, detail: str, digest: Optional[str] = None,
+                         size: Optional[int] = None, duration_s: float = 0.0) -> ClipOutcome:
+            """§9: a clip that cannot be honestly scored is destroyed, not kept and warned about.
+    
+            ⚠️THE ASYMMETRY IS THE POLICY, NOT A BUG. The cost of destroying a clip of wind because
+            its header was truncated is one clip of wind. The cost of keeping a clip because the
+            detector crashed is a recording of a conversation, retained on the strength of an error
+            message nobody read. So every impossibility here resolves to SPEECH_DETECTED, with the
+            reason on the receipt so the alarm can say which one fired.
+            """
+            receipt = PurgeReceipt(timestamp=_now_iso(now), node=node or node_of(path),
+                                   clip=os.path.basename(path), clip_key=_clip_key(path),
+                                   duration_s=duration_s, peak_speech_prob=0.0, speech_s=0.0,
+                                   spans=(), purged_sha256=digest, purged_bytes=size,
+                                   vad_engine=getattr(vad, "name", "none"), dry_run=dry_run,
+                                   verdict=VERDICT_SPEECH, purge_method=METHOD_OVERWRITE,
+                                   verified_absent=False, fail_closed_reason=reason, **policy)
+            return _destroy(receipt, "fail-closed (%s): %s" % (reason, detail))
+    
+        try:
+            purged_bytes = os.path.getsize(path)
+            digest = sha256_file(path)
+            samples, rate = read_wav_mono(path)
+        except RateRefused as exc:
+            return _fail_closed(REASON_RATE, str(exc))
+        except PurgeError as exc:
+            return _fail_closed(REASON_UNREADABLE, str(exc))
+    
+        duration_s = samples.size / float(rate or 1)
+        try:
+            decision = vad.detect(samples, rate)
+        except Exception as exc:
+            _zero(samples)
+            return _fail_closed(REASON_INFERENCE, "vad failed: %s" % exc, digest, purged_bytes,
+                                duration_s)
+        _zero(samples)
+        del samples
+    
+        if not np.isfinite(decision.peak_prob):
+            return _fail_closed(REASON_INFERENCE, "the detector returned a non-finite probability",
+                                digest, purged_bytes, duration_s)
+    
+        common = dict(timestamp=_now_iso(now), node=node or node_of(path),
+                      clip=os.path.basename(path), clip_key=_clip_key(path),
+                      duration_s=duration_s, peak_speech_prob=decision.peak_prob,
+                      speech_s=decision.speech_s, spans=decision.spans,
+                      purged_sha256=digest, purged_bytes=purged_bytes,
+                      vad_engine=decision.engine,
+                      mean_prob_in_segments=decision.mean_prob_in_segments,
+                      frames_scored=decision.frames_scored, **policy)
+    
+        if not decision.speech:
+            receipt = PurgeReceipt(dry_run=dry_run, verdict=VERDICT_CLEAN,
+                                   purge_method=METHOD_NONE, verified_absent=False, **common)
+            if audit_log and not dry_run and receipt_clean:
+                append_receipt(audit_log, receipt)
+            return ClipOutcome(path, "kept", receipt if receipt_clean else None,
+                               "no speech (peak %.3f < %.3f)" % (decision.peak_prob, threshold))
+    
+        receipt = PurgeReceipt(dry_run=dry_run, verdict=VERDICT_SPEECH,
+                               purge_method=METHOD_OVERWRITE, verified_absent=False, **common)
+        return _destroy(receipt, "shredded and unlinked")
+    
+    
+    def purge_wav(path: str, *, vad=None, dry_run: bool = False,
+                  threshold: float = DEFAULT_THRESHOLD,
+                  min_speech_ms: float = DEFAULT_MIN_SPEECH_MS,
+                  neg_threshold: float = DEFAULT_NEG_THRESHOLD,
+                  min_silence_ms: float = DEFAULT_MIN_SILENCE_MS,
+                  speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS,
+                  audit_log: Optional[str] = None, node: Optional[str] = None,
+                  now: Optional[dt.datetime] = None) -> Dict[str, Any]:
+        """One clip in, one receipt dict out -- for every outcome, including the ones that keep it.
+    
+        `purge_clip()` returns a `ClipOutcome` because a pool scan needs to count statuses;
+        this returns the receipt record itself, which is what a caller holding a single path
+        wants. The verdict is on the record (`SPEECH_DETECTED` / `NO_SPEECH` / `NOT_SCORED`), so a
+        kept clip and a destroyed one are told apart by a field rather than by a None.
+    
+        ⚠️IT DOES NOT RAISE FOR AN UNDECIDABLE CLIP ANY MORE. An unreadable header, a refused rate
+        or a detector fault returns a `SPEECH_DETECTED` receipt carrying `fail_closed_reason`,
+        because §9 resolves every impossibility towards destruction -- and a caller that only has to
+        catch an exception to keep the file has an accidental opt-out of the whole policy. A clip
+        that is simply gone is `NOT_SCORED` with `already_absent: true`.
+        """
+        outcome = purge_clip(path, vad, threshold=threshold, min_speech_ms=min_speech_ms,
+                             neg_threshold=neg_threshold, min_silence_ms=min_silence_ms,
+                             speech_pad_ms=speech_pad_ms, dry_run=dry_run, audit_log=audit_log,
+                             node=node, now=now, receipt_clean=True)
+        if outcome.receipt is None:                      # unreachable today; kept as a hard floor
+            raise PurgeError(outcome.detail or "%s: undecidable and unreceipted" % path)
+        return outcome.receipt.as_record()
+    
+    
+    def iter_clips(root: str) -> Iterator[str]:
+        """Every `.wav` under `root`, depth-first and sorted, so two runs report in one order."""
+        root = os.path.abspath(os.path.expanduser(root))
+        if os.path.isfile(root):
+            yield root
+            return
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            for name in sorted(filenames):
+                if name.lower().endswith(".wav"):
+                    yield os.path.join(dirpath, name)
+    
+    
+    def scan_pool(root: str, *, engine: str = "auto", threshold: float = DEFAULT_THRESHOLD,
+                  min_speech_ms: float = DEFAULT_MIN_SPEECH_MS,
+                  neg_threshold: float = DEFAULT_NEG_THRESHOLD,
+                  min_silence_ms: float = DEFAULT_MIN_SILENCE_MS,
+                  speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS, dry_run: bool = False,
+                  audit_log: Optional[str] = None, vad=None,
+                  now: Optional[dt.datetime] = None, receipt_clean: bool = False,
+                  on_outcome=None) -> PurgeReport:
+        """Walk a clip pool, purging every WAV that holds speech.
+    
+        `audit_log` defaults to `<root>/vad_purge.jsonl` for a live run and is never written
+        in a dry run. The audit log itself is never a scan target -- it is JSONL, not a WAV -- so a
+        run cannot purge its own evidence.
+    
+        ⚠️THE WALK STOPS ON A FAILED PURGE, AND ONLY ON THAT. Everything else -- an unreadable
+        clip, a refused rate, a detector fault -- is destroyed and scanning continues (§9). But a
+        file this run has judged speech-bearing and could NOT destroy is still on the disk, and a
+        scan that walks past it finishes green while the thing it exists to prevent is true. So the
+        report comes back `halted`, and the caller is expected to alarm rather than reschedule.
+        """
+        root = os.path.abspath(os.path.expanduser(root))
+        vad = vad or load_vad(engine, threshold, min_speech_ms)
+        if audit_log is None and not dry_run:
+            audit_log = os.path.join(root, RECEIPT_NAME)
+        report = PurgeReport(dry_run=dry_run, vad_engine=getattr(vad, "name", engine),
+                             audit_log=None if dry_run else audit_log)
+        for path in iter_clips(root):
+            outcome = purge_clip(path, vad, threshold=threshold, min_speech_ms=min_speech_ms,
+                                 neg_threshold=neg_threshold, min_silence_ms=min_silence_ms,
+                                 speech_pad_ms=speech_pad_ms, dry_run=dry_run,
+                                 audit_log=None if dry_run else audit_log, now=now,
+                                 receipt_clean=receipt_clean)
+            report.scanned += 1
+            report.outcomes.append(outcome)
+            if outcome.receipt is not None:
+                report.receipts.append(outcome.receipt)
+                if outcome.receipt.fail_closed_reason:
+                    report.fail_closed += 1
+            if outcome.status == "purged":
+                report.purged += 1
+            elif outcome.status == "would_purge":
+                report.would_purge += 1
+            elif outcome.status == "kept":
+                report.kept += 1
+            elif outcome.status == "already_absent":
+                report.already_absent += 1
+            else:
+                report.errors += 1
+            if on_outcome is not None:
+                on_outcome(outcome)
+            if outcome.status == "purge_failed":
+                report.halted = True
+                break
+        return report
+    
+  hear_privacy_silero_vad.py: |
+    #!/usr/bin/env python3
+    """Silero VAD v5 over onnxruntime: does this buffer contain a human voice, yes or no.
+    
+    The nodes listen at 48 kHz for gunshots and insects, and a microphone good enough for a
+    shockwave is good enough for a conversation two gardens away. `hear/privacy/purge.py` destroys
+    anything that contains speech; this module is the detector that decides, and it implements
+    `docs/silero-vad-privacy-contract.md` rather than a reading of the upstream README.
+    
+    ⚠️THE MODEL INPUT IS 576 SAMPLES, NOT 512, AND FEEDING IT 512 FAILS SILENTLY TOWARDS RETENTION.
+    512 is the *hop*; the tensor is that hop prefixed with the 64-sample context tail of the previous
+    hop (contract §2.3). A bare 512-sample call does not raise -- it returns ~0.001 for unambiguous
+    speech, so a lane built on it writes confident `NO_SPEECH` receipts over every conversation it is
+    handed. `verify_window_contract()` is the startup canary that proves this wiring is right, and it
+    is required (§2.4) precisely because the failure has no symptom.
+    
+    ⚠️STREAM STATE IS TWO OBJECTS. The recurrent `state` `(2, 1, 128)` AND the 64-sample context
+    tail, reset together, carried together, never persisted or logged -- the context tail is literally
+    4 ms of PCM (§3.2). A partial reset costs most of the detector (mean 0.75 -> 0.25, measured) and
+    throws nothing. `score_chunk()` and `score_stream()` carry both objects forward, `score_clip()`
+    resets first and proves it did, `score_chunk_isolated()` is the stateless form for a caller that
+    owns the memory itself, and the memory has no public accessor at all -- a `state` attribute is
+    one `getattr` loop away from a receipt, and the context tail is PCM.
+    
+    ⚠️SAMPLE RATE IS VALIDATED, NEVER ASSUMED. Silero reads 16 kHz or 8 kHz. Raw 48 kHz acquisition
+    audio is decimated through `hear.resample`'s anti-aliased L=1 M=3 path (§2.1) and any other rate
+    is refused rather than stretched to the nearest.
+    
+    ⚠️A MISSING WEIGHT FILE DOES NOT SILENTLY DISABLE THE GATE. The `.onnx` artifact is not
+    redistributable through this repository and is absent in CI, so the wrapper falls back to a
+    deterministic band-energy / harmonicity / flatness scorer, says so in `.engine` and
+    `uses_real_model`, and `load_vad()` -- the entry point `purge.py` calls -- raises
+    `ModelUnavailable` instead of impersonating Silero, so the purge pipeline records the engine that
+    actually ran on the receipt.
+    
+        from hear.privacy.silero_vad import SileroVAD
+        vad = SileroVAD()                              # $HEAR_SILERO_VAD_MODEL, else the fallback
+        vad.is_speech(hop_16k)                         # or score_chunk() / score_stream() by frame
+        vad.get_speech_timestamps(clip_48k, sample_rate=48000)
+    """
+    
+    from __future__ import annotations
+    
+    import math
+    import os
+    from dataclasses import dataclass
+    from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+    
+    import numpy as np
+    
+    #: The rate the model is trained for, and the rate every score in this module is taken at.
+    MODEL_RATE_HZ = 16000
+    #: The same number under the name the contract and the fleet's other lanes use.
+    MODEL_SAMPLE_RATE = MODEL_RATE_HZ
+    #: Rates Silero v5 accepts.
+    SUPPORTED_RATES: Tuple[int, ...] = (8000, 16000)
+    #: Rates this module accepts as *input*: the two model rates and the acquisition rate.
+    SUPPORTED_INPUT_RATES: Tuple[int, ...] = (8000, 16000, 48000)
+    #: The advance between frames at 16 kHz, in samples. 32 ms. Contract §2.3.
+    CHUNK_SAMPLES = 512
+    #: The context tail prefixed to each hop at 16 kHz. Contract §2.3.
+    CONTEXT_SAMPLES = 64
+    #: What the graph actually reads at 16 kHz: context + hop.
+    WINDOW_SAMPLES = CONTEXT_SAMPLES + CHUNK_SAMPLES
+    #: The same three numbers per rate. The 8 kHz figures are arithmetic, not measured (§2.3).
+    CHUNK_SAMPLES_BY_RATE: Dict[int, int] = {8000: 256, 16000: CHUNK_SAMPLES}
+    CONTEXT_SAMPLES_BY_RATE: Dict[int, int] = {8000: 32, 16000: CONTEXT_SAMPLES}
+    WINDOW_SAMPLES_BY_RATE: Dict[int, int] = {
+        rate: CONTEXT_SAMPLES_BY_RATE[rate] + CHUNK_SAMPLES_BY_RATE[rate]
+        for rate in CHUNK_SAMPLES_BY_RATE}
+    #: The node acquisition rate, decimated to MODEL_RATE_HZ before scoring.
+    ACQ_RATE_HZ = 48000
+    #: Shape of the v5 recurrent context: (2 layers, batch, hidden). v4 carries h and c at half.
+    STATE_SHAPE: Tuple[int, int, int] = (2, 1, 128)
+    V4_STATE_SHAPE: Tuple[int, int, int] = (2, 1, 64)
+    #: Where the weights live when nobody says otherwise.
+    MODEL_ENV = "HEAR_SILERO_VAD_MODEL"
+    DEFAULT_MODEL_PATH = "models/silero_vad.onnx"
+    #: Below this RMS a window is digital silence and is scored zero without further analysis.
+    SILENCE_RMS = 1e-5
+    
+    #: Contract §4.1. Proposed defaults, not measured on this fleet's clips.
+    DEFAULT_THRESHOLD = 0.50
+    NEG_THRESHOLD_MARGIN = 0.15
+    DEFAULT_MIN_SPEECH_MS = 250.0
+    DEFAULT_MIN_SILENCE_MS = 300.0
+    DEFAULT_SPEECH_PAD_MS = 30.0
+    
+    #: Canary bounds, contract §2.4: the normal path must find the synthetic voice, and the bare-hop
+    #: path must reproduce the degenerate mode it is there to detect.
+    #:
+    #: ⚠️0.30, NOT DEFAULT_THRESHOLD. Measured against the real snakers4/silero-vad v5 weights
+    #: (2026-09-16, the first time this repo ran them): the synthetic formant stack peaks at 0.386
+    #: on the real graph, comfortably above the 0.0006 the bare-hop control gets on the SAME signal
+    #: -- a 640x margin that is what actually proves the window is wired, not whether a trained net
+    #: is fooled into calling a synthesised buzz a human voice. Chasing 0.50 here means cranking the
+    #: signal to near-clipping amplitude, which passes by distortion rather than by the window being
+    #: right, and would silently re-break if this file's canary formula ever changed. This constant
+    #: gates `verify_window_contract()` only; `DEFAULT_THRESHOLD` (0.50), the number field clips are
+    #: actually judged against, is untouched and was proven separately against real speech.
+    CANARY_MIN_PROB = 0.30
+    CANARY_DEGENERATE_MAX_PROB = 0.1
+    
+    _VOICE_BAND_HZ: Tuple[float, float] = (300.0, 3400.0)
+    _PITCH_HZ: Tuple[float, float] = (75.0, 320.0)
+    
+    
+    class SileroVADError(Exception):
+        """The VAD cannot answer for this input or in this configuration."""
+    
+    
+    class UnsupportedSampleRate(SileroVADError):
+        """A rate the model is not trained for, and that this module will not silently stretch."""
+    
+    
+    class ModelUnavailable(SileroVADError, ImportError):
+        """The real weights were required and are not present.
+    
+        An `ImportError` as well, because `purge.load_vad()` treats "Silero is not installed here"
+        as a fall-back-to-the-band-energy-engine condition rather than an outage.
+        """
+    
+    
+    class WindowContractViolated(SileroVADError):
+        """The graph does not read the window this module feeds it, or the canary did not fire.
+    
+        Contract §9's `vad_window_contract_violated`: fail closed. A caller that purges on a score
+        must stop, not carry on scoring through a shape it has not verified.
+        """
+    
+    
+    @dataclass(frozen=True)
+    class SpeechSegment:
+        """One run of speech, in seconds against the *input* clip's own timebase."""
+    
+        start: float
+        end: float
+        confidence: float
+    
+        def as_dict(self) -> Dict[str, float]:
+            return {"start": self.start, "end": self.end, "confidence": self.confidence}
+    
+    
+    @dataclass
+    class StreamState:
+        """The two objects that are one stream's memory: the RNN state and the context tail.
+    
+        ⚠️Neither is persisted, logged or exported. `context` is 4 ms of PCM from the clip being
+        scored and inherits its classification (contract §3.2).
+        """
+    
+        rnn: np.ndarray
+        context: np.ndarray
+    
+        @classmethod
+        def zeros(cls, sample_rate: int, state_shape: Tuple[int, ...] = STATE_SHAPE) -> "StreamState":
+            return cls(rnn=np.zeros(state_shape, dtype=np.float32),
+                       context=np.zeros(CONTEXT_SAMPLES_BY_RATE[sample_rate], dtype=np.float32))
+    
+        def copy(self) -> "StreamState":
+            return StreamState(rnn=np.array(self.rnn, dtype=np.float32, copy=True),
+                               context=np.array(self.context, dtype=np.float32, copy=True))
+    
+        def is_zero(self) -> bool:
+            """Frame-0 assertion: a clip starts from nothing, or the verdict is another clip's."""
+            return not bool(np.any(self.rnn)) and not bool(np.any(self.context))
+    
+    
+    @dataclass(frozen=True)
+    class ClipScores:
+        """Per-frame probabilities for one clip, with the two numbers a receipt needs about them."""
+    
+        probabilities: Tuple[float, ...]
+        tail_samples_dropped: int
+        state_reset_confirmed: bool
+    
+        @property
+        def frames(self) -> int:
+            return len(self.probabilities)
+    
+        def __iter__(self) -> Iterator[float]:
+            """Iterating a clip's scores gives its per-frame probabilities, in sample order."""
+            return iter(self.probabilities)
+    
+        def __len__(self) -> int:
+            return len(self.probabilities)
+    
+    
+    def validate_rate(sample_rate: int) -> int:
+        """-> a rate the model reads. 48 kHz is accepted here and decimated on the way in."""
+        try:
+            rate = int(sample_rate)
+        except (TypeError, ValueError) as exc:
+            raise UnsupportedSampleRate("%r is not a sample rate" % (sample_rate,)) from exc
+        if rate in SUPPORTED_RATES or rate == ACQ_RATE_HZ:
+            return rate
+        raise UnsupportedSampleRate(
+            "%d Hz is neither a Silero rate %s nor the %d Hz acquisition rate; refused rather than "
+            "resampled by guess" % (rate, SUPPORTED_RATES, ACQ_RATE_HZ)
+        )
+    
+    
+    def as_mono_float32(audio: Any) -> np.ndarray:
+        """Any *mono* buffer -> 1-D float32. int PCM is scaled to +/-1; multi-channel is refused.
+    
+        ⚠️Interleaved channels are not averaged here. Mixing down is a judgement about the recording
+        -- which microphone heard the voice, whether one channel is a dead short, whether the two are
+        out of phase and cancel a talker to nothing -- and a VAD that makes that judgement silently
+        can answer "no speech" about a clip that has a voice in one channel. The fleet's clips are
+        mono (contract §1); anything else is the caller's to mix down deliberately.
+        """
+        array = np.asarray(audio)
+        if array.dtype == np.bool_ or array.dtype.kind in "USOV":
+            raise SileroVADError("audio of dtype %s is not a waveform" % (array.dtype,))
+        if array.ndim > 2:
+            raise SileroVADError("audio with %d dimensions is not a waveform" % (array.ndim,))
+        if array.ndim == 2:
+            if min(array.shape) != 1:
+                raise SileroVADError(
+                    "audio of shape %s is %d-channel; refused rather than mixed down, because a "
+                    "mixdown can cancel the one channel that holds the voice"
+                    % (array.shape, min(array.shape)))
+            array = array.reshape(-1)
+        if array.dtype.kind in "iu":
+            scale = float(max(abs(np.iinfo(array.dtype).min), np.iinfo(array.dtype).max))
+            array = array.astype(np.float64) / scale
+        array = np.asarray(array, dtype=np.float32).reshape(-1)
+        if not np.all(np.isfinite(array)):
+            raise SileroVADError("audio contains NaN or infinity; refused rather than scored")
+        return array
+    
+    
+    def decimate_48k_to_16k(audio: Any) -> np.ndarray:
+        """48 kHz -> 16 kHz through the platform's anti-aliased polyphase path (L=1, M=3).
+    
+        `hear.resample`, not a bare `[::3]`: plain decimation folds everything above 8 kHz back onto
+        the voice band, which both hides speech and invents it.
+        """
+        from hear import resample as _resample
+    
+        pcm = as_mono_float32(audio)
+        if pcm.size == 0:
+            return pcm
+        out = _resample.resample(pcm, float(ACQ_RATE_HZ), float(MODEL_RATE_HZ))
+        return np.asarray(out["pcm"], dtype=np.float32).reshape(-1)
+    
+    
+    def model_rate_for(sample_rate: int) -> int:
+        """-> the rate `to_model_rate()` will hand the model for audio at `sample_rate`."""
+        rate = validate_rate(sample_rate)
+        return MODEL_RATE_HZ if rate == ACQ_RATE_HZ else rate
+    
+    
+    def to_model_rate(audio: Any, sample_rate: int) -> np.ndarray:
+        """-> mono float32 at a rate the model reads, decimating 48 kHz input on the way.
+    
+        The rate that came out is `model_rate_for(sample_rate)`, asked separately so that this
+        returns a waveform and nothing else: a function that returns a pair is one a caller can feed
+        to the model whole by accident.
+        """
+        if model_rate_for(sample_rate) != int(sample_rate):
+            return decimate_48k_to_16k(audio)
+        return as_mono_float32(audio)
+    
+    
+    def hops(pcm: np.ndarray, hop: int) -> Iterator[np.ndarray]:
+        """Whole hops only, in sample order. A partial final hop is dropped, never zero-padded.
+    
+        Contract §2.3: a zero-padded frame is scored as near-silence by construction, and the end of
+        a clip is exactly where a truncated word sits. Discarding under 32 ms is honest; padding
+        invents a low score. What was dropped is counted by `tail_samples_dropped()`.
+        """
+        whole = (pcm.size // hop) * hop
+        for start in range(0, whole, hop):
+            yield pcm[start:start + hop]
+    
+    
+    def tail_samples_dropped(n_samples: int, hop: int) -> int:
+        """How many trailing samples `hops()` did not score. A number, not a silence."""
+        return int(n_samples) - (int(n_samples) // hop) * hop
+    
+    
+    class SyntheticVADEngine:
+        """Deterministic stand-in for the real weights: band energy, harmonicity, flatness.
+    
+        It exists so the privacy tests are hermetic, not so the fleet can ship without the model:
+        `load_vad()` refuses to hand this to the purge pipeline under Silero's name. It reads the
+        same 576-sample window and carries the same state shape as the real engine, so streaming
+        code exercised against it exercises the discipline it will use against Silero.
+        """
+    
+        name = "synthetic_band_harmonicity"
+        is_real = False
+        state_shape = STATE_SHAPE
+    
+        def new_state(self) -> np.ndarray:
+            return np.zeros(self.state_shape, dtype=np.float32)
+    
+        def run(self, window: np.ndarray, state: np.ndarray, sample_rate: int
+                ) -> Tuple[float, np.ndarray]:
+            raw = self._score(window, sample_rate)
+            previous = float(state[0, 0, 0])
+            smoothed = 0.65 * raw + 0.35 * previous if previous > 0.0 else raw
+            nxt = np.zeros(self.state_shape, dtype=np.float32)
+            nxt[0, 0, 0] = np.float32(smoothed)
+            nxt[1, 0, 0] = np.float32(raw)
+            return float(min(max(smoothed, 0.0), 1.0)), nxt
+    
+        @staticmethod
+        def _score(window: np.ndarray, sample_rate: int) -> float:
+            x = np.asarray(window, dtype=np.float64)
+            x = x - x.mean()
+            rms = float(np.sqrt(np.mean(x * x))) if x.size else 0.0
+            if rms < SILENCE_RMS:
+                return 0.0
+    
+            taper = np.hanning(x.size) if x.size > 1 else np.ones(1)
+            spectrum = np.abs(np.fft.rfft(x * taper)) + 1e-12
+            freqs = np.fft.rfftfreq(x.size, 1.0 / float(sample_rate))
+            power = spectrum * spectrum
+            total = float(power.sum())
+    
+            band = (freqs >= _VOICE_BAND_HZ[0]) & (freqs <= _VOICE_BAND_HZ[1])
+            band_ratio = float(power[band].sum() / total)
+    
+            # Flatness separates broadband hiss (near 1) from anything structured (near 0).
+            flatness = float(np.exp(np.mean(np.log(power))) / (total / power.size))
+    
+            # Peak concentration separates a single tone or a stridulating insect, which put most of
+            # their power in one bin, from a voice, which spreads it over a harmonic stack.
+            peak_ratio = float(power.max() / total)
+    
+            # Harmonicity: a voiced window autocorrelates at its pitch period, noise does not.
+            norm = float(np.dot(x, x))
+            lo = max(int(sample_rate / _PITCH_HZ[1]), 1)
+            hi = min(int(sample_rate / _PITCH_HZ[0]), x.size - 1)
+            if hi > lo and norm > 0.0:
+                corr = np.correlate(x, x, mode="full")[x.size - 1:]
+                harmonic = float(np.max(corr[lo:hi]) / norm)
+            else:
+                harmonic = 0.0
+            harmonic = min(max(harmonic, 0.0), 1.0)
+    
+            logit = (4.5 * (band_ratio - 0.35)
+                     + 5.0 * (harmonic - 0.35)
+                     - 10.0 * max(0.0, peak_ratio - 0.30) / 0.30
+                     - 6.0 * max(0.0, flatness - 0.30) / 0.30
+                     - 0.4)
+            return 1.0 / (1.0 + math.exp(-max(min(logit, 30.0), -30.0)))
+    
+    
+    class OnnxVADEngine:
+        """The real thing: a Silero v5 (`state`) or v4 (`h`, `c`) graph under onnxruntime.
+    
+        The generation is read off the loaded file's declared inputs, never assumed, and the
+        declared input length -- where the graph fixes it rather than leaving it dynamic -- is
+        checked against the window this module feeds (contract §2.3, §3.1).
+        """
+    
+        name = "silero_vad_v5_onnx"
+        is_real = True
+    
+        def __init__(self, model_path: Optional[str] = None, sample_rate: int = MODEL_RATE_HZ,
+                     providers: Optional[Sequence[str]] = None, session: Any = None) -> None:
+            if session is None:
+                session = self._open_session(model_path, providers)
+                self.injected = False
+            else:
+                # ⚠️AN INJECTED SESSION SKIPS THE WEIGHT-FILE CHECK, SO IT IS NOT PROOF OF SILERO.
+                # It exists so a test, or a service that already holds a warm session, can drive the
+                # ONNX path with no onnxruntime import and no 2 MB blob in the repository. The
+                # signature and window checks below still run against whatever was handed in, and
+                # `name` says an injected session produced the score so a receipt cannot imply the
+                # shipped weights did.
+                self.injected = True
+                self.name = "silero_vad_onnx_injected_session"
+            self.model_path = model_path or "<injected session>"
+            self.session = session
+            inputs = {i.name: i for i in self.session.get_inputs()}
+            if "h" in inputs and "c" in inputs:
+                self.split_state, self.state_shape = True, V4_STATE_SHAPE
+                self.name = ("silero_vad_v4_onnx_injected_session" if self.injected
+                             else "silero_vad_v4_onnx")
+            elif "state" in inputs:
+                self.split_state, self.state_shape = False, STATE_SHAPE
+            else:
+                raise WindowContractViolated(
+                    "%s declares inputs %s, which is neither the v5 {input, sr, state} nor the v4 "
+                    "{input, sr, h, c} signature; refused rather than guessed"
+                    % (self.model_path, sorted(inputs)))
+            self.wants_rate = "sr" in inputs
+            self.input_name = "input" if "input" in inputs else self.session.get_inputs()[0].name
+            self.declared_window = self._declared_window(inputs[self.input_name])
+            expected = WINDOW_SAMPLES_BY_RATE[validate_rate(sample_rate)]
+            if self.declared_window is not None and self.declared_window != expected:
+                raise WindowContractViolated(
+                    "%s declares an input of %d samples and this module feeds %d (%d context + %d "
+                    "hop); a constant that disagrees with the graph is the defect, not the graph"
+                    % (self.model_path, self.declared_window, expected,
+                       CONTEXT_SAMPLES_BY_RATE[sample_rate], CHUNK_SAMPLES_BY_RATE[sample_rate]))
+    
+        @staticmethod
+        def _open_session(model_path: Optional[str], providers: Optional[Sequence[str]]) -> Any:
+            """Load the weights, or say why they cannot be. Never a silent substitution."""
+            try:
+                import onnxruntime
+            except ImportError as exc:  # pragma: no cover - exercised only without onnxruntime
+                raise ModelUnavailable(
+                    "onnxruntime is not installed, so %s cannot be scored" % (model_path,)
+                ) from exc
+            if not model_path or not os.path.isfile(model_path):
+                raise ModelUnavailable("no Silero weights at %s" % (model_path,))
+            options = onnxruntime.SessionOptions()
+            options.inter_op_num_threads = 1
+            options.intra_op_num_threads = 1
+            return onnxruntime.InferenceSession(
+                model_path, sess_options=options,
+                providers=list(providers) if providers else ["CPUExecutionProvider"])
+    
+        @staticmethod
+        def _declared_window(spec: Any) -> Optional[int]:
+            """The graph's own input length, or None where it leaves the dimension dynamic."""
+            shape = list(getattr(spec, "shape", []) or [])
+            if not shape:
+                return None
+            last = shape[-1]
+            return int(last) if isinstance(last, int) else None
+    
+        def new_state(self) -> np.ndarray:
+            return np.zeros(self.state_shape, dtype=np.float32)
+    
+        def run(self, window: np.ndarray, state: np.ndarray, sample_rate: int
+                ) -> Tuple[float, np.ndarray]:
+            feed: Dict[str, Any] = {
+                self.input_name: np.asarray(window, dtype=np.float32).reshape(1, -1),
+            }
+            if self.wants_rate:
+                feed["sr"] = np.array(int(sample_rate), dtype=np.int64)
+            if self.split_state:
+                feed["h"] = np.ascontiguousarray(state, dtype=np.float32)
+                feed["c"] = np.ascontiguousarray(state, dtype=np.float32)
+            else:
+                feed["state"] = np.ascontiguousarray(state, dtype=np.float32)
+    
+            outputs = self.session.run(None, feed)
+            probability = float(np.asarray(outputs[0]).reshape(-1)[0])
+            # ⚠️A NaN IS NOT A LOW PROBABILITY. Every comparison against NaN is False, so a NaN that
+            # is clamped to 0.0 -- or carried into `p >= threshold` -- reads as confident silence and
+            # the clip is kept. Contract §9 `vad_inference_error`: raise, and let the caller purge.
+            if not math.isfinite(probability):
+                raise SileroVADError(
+                    "%s returned a non-finite probability (%r); a NaN is not a low score"
+                    % (self.name, probability))
+            if not -0.01 <= probability <= 1.01:
+                raise SileroVADError(
+                    "%s returned %r, which is not a probability" % (self.name, probability))
+            nxt = (np.asarray(outputs[1], dtype=np.float32).reshape(self.state_shape)
+                   if len(outputs) >= 2 else state)
+            if not np.all(np.isfinite(nxt)):
+                raise SileroVADError("%s returned a non-finite recurrent state" % (self.name,))
+            return min(max(probability, 0.0), 1.0), np.asarray(nxt, dtype=np.float32)
+    
+    
+    class SileroVAD:
+        """Silero VAD v5, stateless per hop or stateful across a stream.
+    
+        `model_path=None` looks at `$HEAR_SILERO_VAD_MODEL`, then `models/silero_vad.onnx`, and
+        falls back to `SyntheticVADEngine` when neither the weights nor onnxruntime are there. Pass
+        `require_model=True` where a fallback answer would be a privacy failure rather than a
+        convenience.
+    
+        `session=` drives the ONNX path with an already-built session -- a warm one held by a
+        service, or a stub in a test -- without importing onnxruntime and without a weight file. An
+        injected session is checked against the same signature and window rules as a loaded one, is
+        never silently replaced by the fallback, and names itself on every receipt as injected.
+        """
+    
+        def __init__(self, model_path: Optional[str] = None, *, sample_rate: int = MODEL_RATE_HZ,
+                     require_model: bool = False,
+                     threshold: float = DEFAULT_THRESHOLD,
+                     providers: Optional[Sequence[str]] = None,
+                     session: Any = None) -> None:
+            self.sample_rate = model_rate_for(sample_rate)
+            self.hop = CHUNK_SAMPLES_BY_RATE[self.sample_rate]
+            self.context_samples = CONTEXT_SAMPLES_BY_RATE[self.sample_rate]
+            self.window = WINDOW_SAMPLES_BY_RATE[self.sample_rate]
+            _check_threshold(threshold)
+            self.threshold = float(threshold)
+            self.model_path = self._resolve_path(model_path)
+            # ⚠️A PATH THE CALLER NAMED IS A REQUIREMENT, NOT A HINT. Falling back to the synthetic
+            # engine after being pointed at a specific file would answer a question about Silero's
+            # weights with something else's arithmetic.
+            self.engine = self._open_engine(self.model_path, self.sample_rate,
+                                            require_model or model_path is not None,
+                                            providers, session)
+            self._state = self._zero_state()
+    
+        @staticmethod
+        def _resolve_path(model_path: Optional[str]) -> str:
+            if model_path:
+                return str(model_path)
+            return os.environ.get(MODEL_ENV) or DEFAULT_MODEL_PATH
+    
+        @staticmethod
+        def _open_engine(model_path: str, sample_rate: int, require_model: bool,
+                         providers: Optional[Sequence[str]], session: Any = None) -> Any:
+            """The graph if it loads, else the fallback -- unless a caller said it must be the graph.
+    
+            An injected `session` is never swapped for the fallback: a caller that handed over a
+            session asked for that session, and quietly scoring with something else would make the
+            engine name on a receipt a guess.
+            """
+            try:
+                return OnnxVADEngine(model_path, sample_rate=sample_rate, providers=providers,
+                                     session=session)
+            except ModelUnavailable:
+                if require_model or session is not None:
+                    raise
+                return SyntheticVADEngine()
+    
+        @property
+        def uses_real_model(self) -> bool:
+            """True only when the scores came out of the Silero graph."""
+            return bool(getattr(self.engine, "is_real", False))
+    
+        def assert_real_model(self) -> None:
+            """Raise unless the real weights are loaded. For callers that destroy data on a score."""
+            if not self.uses_real_model:
+                raise ModelUnavailable(
+                    "scoring is running on the %s fallback engine, not Silero weights; set %s"
+                    % (self.engine.name, MODEL_ENV))
+    
+        # -- state -------------------------------------------------------------------------------
+    
+        def _zero_state(self) -> StreamState:
+            """A zeroed stream memory: RNN state and context tail together, never one of the two."""
+            return StreamState.zeros(self.sample_rate, getattr(self.engine, "state_shape",
+                                                               STATE_SHAPE))
+    
+        def reset(self) -> None:
+            """Clear both objects. Called between clips, unconditionally, and after any failure."""
+            self._state = self._zero_state()
+    
+        # ⚠️THE STREAM MEMORY HAS NO PUBLIC ACCESSOR, ON PURPOSE. Contract §3.2 rule 6: the recurrent
+        # state and the 64-sample context tail are functions of the audio and inherit its
+        # classification -- the tail is literally 4 ms of PCM. A public `state` attribute is one
+        # `{name: getattr(vad, name) for name in dir(vad)}` away from a receipt, a log line or a
+        # crash dump, so callers get `reset()` and nothing else. Tests that need to checkpoint a
+        # stream use `_state` and say in their name that they are reaching inside.
+    
+        def _restore_state(self, value: Any) -> None:
+            """Put a checkpointed stream memory back. Both halves, validated, or neither."""
+            self._state = self._checked_state(value).copy()
+    
+        def _checked_state(self, value: Any) -> StreamState:
+            if not isinstance(value, StreamState):
+                raise SileroVADError(
+                    "stream state must be a StreamState carrying both the RNN state and the context "
+                    "tail; a bare array is half a reset")
+            shape = getattr(self.engine, "state_shape", STATE_SHAPE)
+            if tuple(np.shape(value.rnn)) != tuple(shape):
+                raise SileroVADError(
+                    "state shape %s is not the model's %s" % (np.shape(value.rnn), shape))
+            if int(np.size(value.context)) != self.context_samples:
+                raise SileroVADError(
+                    "context tail of %d samples is not the model's %d"
+                    % (np.size(value.context), self.context_samples))
+            return value
+    
+        # -- scoring -----------------------------------------------------------------------------
+    
+        def _prepare(self, audio: Any, sample_rate: Optional[int]) -> np.ndarray:
+            """-> mono float32 at the engine's own rate, or a refusal."""
+            given = self.sample_rate if sample_rate is None else sample_rate
+            rate = model_rate_for(given)
+            if rate != self.sample_rate:
+                raise UnsupportedSampleRate(
+                    "this VAD is configured for %d Hz and was handed %d Hz audio"
+                    % (self.sample_rate, rate))
+            return to_model_rate(audio, given)
+    
+        def _run_hop(self, hop: np.ndarray, state: StreamState) -> Tuple[float, StreamState]:
+            """One hop, prefixed with the carried context, -> (probability, the state after it)."""
+            if hop.size != self.hop:
+                raise SileroVADError(
+                    "a frame is exactly %d samples at %d Hz and this one is %d; whole hops only, "
+                    "and a partial tail is dropped rather than padded"
+                    % (self.hop, self.sample_rate, hop.size))
+            window = np.concatenate([state.context, hop]).astype(np.float32)
+            if window.size != self.window:
+                raise WindowContractViolated(
+                    "built a %d-sample window where the contract is %d (%d context + %d hop)"
+                    % (window.size, self.window, self.context_samples, self.hop))
+            probability, rnn = self.engine.run(window, state.rnn, self.sample_rate)
+            return probability, StreamState(rnn=np.asarray(rnn, dtype=np.float32),
+                                            context=np.array(hop[-self.context_samples:],
+                                                             dtype=np.float32))
+    
+        def score_chunk_isolated(self, chunk: Any, *, sample_rate: Optional[int] = None,
+                                 carry: Optional[StreamState] = None) -> Tuple[float, StreamState]:
+            """Stateless: -> (probability, next state). The instance's own state is untouched.
+    
+            For a caller that owns the stream memory itself -- one state per node in a fan-in, say.
+            Anything else wants `score_chunk()`, which carries the state for you and is the only
+            form that reproduces the measured probabilities (§2.5: dropping the hand-off costs
+            speech mean 0.75 -> 0.25).
+            """
+            pcm = self._prepare(chunk, sample_rate)
+            carried = self._zero_state() if carry is None else self._checked_state(carry)
+            return self._run_hop(pcm, carried)
+    
+        def score_chunk(self, chunk: Any, *, sample_rate: Optional[int] = None) -> float:
+            """Stateful: score one hop and carry both halves of the stream memory forward.
+    
+            The state is reset on any failure rather than left holding a state produced by one
+            (contract §3.2 rule 4).
+            """
+            try:
+                probability, self._state = self._run_hop(self._prepare(chunk, sample_rate),
+                                                         self._state)
+            except Exception:
+                self.reset()
+                raise
+            return probability
+    
+        #: Names this had before `score_chunk` became the stateful one. Same calls.
+        push = score_chunk
+    
+        def score_stream(self, audio: Any, *, sample_rate: Optional[int] = None,
+                         reset: bool = False) -> Iterator[float]:
+            """Score a buffer hop by hop, carrying state across the whole of it.
+    
+            ⚠️THIS DOES NOT RESET FIRST. It is the entry point for audio that arrives in pieces, so
+            the second call continues the first one's stream -- which is what makes it useful and
+            what makes it wrong for a whole clip. A clip is `score_clip()`, which resets and proves
+            it did (contract §3.2 rule 3).
+            """
+            if reset:
+                self.reset()
+            pcm = self._prepare(audio, sample_rate)
+            for hop in hops(pcm, self.hop):
+                probability, self._state = self._run_hop(hop, self._state)
+                yield probability
+    
+        def score_clip(self, audio: Any, *, sample_rate: Optional[int] = None) -> ClipScores:
+            """A whole clip from a guaranteed-zero state: probabilities, dropped tail, and proof.
+    
+            `state_reset_confirmed` is the receipt field of contract §3.2: frame 0 of a clip ran
+            against a state and a context that were both zero, so this verdict is about this clip.
+            """
+            self.reset()
+            confirmed = self._state.is_zero()
+            pcm = self._prepare(audio, sample_rate)
+            try:
+                scores = tuple(self._run_hop_stream(pcm))
+            except Exception:
+                self.reset()
+                raise
+            return ClipScores(probabilities=scores,
+                              tail_samples_dropped=tail_samples_dropped(pcm.size, self.hop),
+                              state_reset_confirmed=confirmed)
+    
+        def _run_hop_stream(self, pcm: np.ndarray) -> Iterator[float]:
+            for hop in hops(pcm, self.hop):
+                probability, self._state = self._run_hop(hop, self._state)
+                yield probability
+    
+        def probabilities(self, audio: Any, *, sample_rate: Optional[int] = None) -> List[float]:
+            """Every frame's probability for a whole clip, from a fresh state."""
+            return list(self.score_clip(audio, sample_rate=sample_rate).probabilities)
+    
+        #: `stream()` was the name of the carrying-on scorer before `score_stream()`. Same call.
+        stream = score_stream
+    
+        def has_speech(self, audio: Any, *, sample_rate: Optional[int] = None,
+                       threshold: Optional[float] = None) -> bool:
+            """`is_speech()` under the name the purge lane calls it by."""
+            return self.is_speech(audio, threshold, sample_rate=sample_rate)
+    
+        def is_speech(self, audio_chunk: Any, threshold: Optional[float] = None, *,
+                      sample_rate: Optional[int] = None) -> bool:
+            """True when any frame of `audio_chunk` scores at or above `threshold`.
+    
+            `threshold=None` uses the one this VAD was built with. A clip is judged on its own: the
+            stream memory is reset first, and asking twice gives the same answer.
+            """
+            threshold = self.threshold if threshold is None else threshold
+            _check_threshold(threshold)
+            return any(p >= float(threshold)
+                       for p in self.score_clip(audio_chunk, sample_rate=sample_rate).probabilities)
+    
+        def get_speech_timestamps(self, audio: Any, *, threshold: Optional[float] = None,
+                                  sample_rate: Optional[int] = None,
+                                  min_speech_duration_ms: float = DEFAULT_MIN_SPEECH_MS,
+                                  min_silence_duration_ms: float = DEFAULT_MIN_SILENCE_MS,
+                                  speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS,
+                                  max_speech_duration_s: float = math.inf,
+                                  ) -> List[Dict[str, float]]:
+            """-> `[{'start': s, 'end': s, 'confidence': p}, ...]` in the input clip's own seconds.
+    
+            The hysteresis of contract §4.2/§4.3: a segment opens at `threshold` and closes only
+            after `min_silence_duration_ms` below `threshold - 0.15`, so one quiet frame between two
+            words does not cut a sentence in half. `threshold=None` uses the instance's own.
+            """
+            threshold = self.threshold if threshold is None else threshold
+            _check_threshold(threshold)
+            rate_in = validate_rate(sample_rate if sample_rate is not None else self.sample_rate)
+            scores = self.score_clip(audio, sample_rate=rate_in).probabilities
+            if not scores:
+                return []
+    
+            hop_s = self.hop / float(self.sample_rate)
+            neg_threshold = max(float(threshold) - NEG_THRESHOLD_MARGIN, 0.01)
+            min_speech_s = max(float(min_speech_duration_ms), 0.0) / 1000.0
+            min_silence_s = max(float(min_silence_duration_ms), 0.0) / 1000.0
+            pad_s = max(float(speech_pad_ms), 0.0) / 1000.0
+            duration_s = len(scores) * hop_s
+    
+            segments: List[SpeechSegment] = []
+            start_idx: Optional[int] = None
+            silence_run = 0
+            run_scores: List[float] = []
+    
+            def close(end_idx: int) -> None:
+                assert start_idx is not None
+                start_s = start_idx * hop_s
+                end_s = min(end_idx * hop_s, duration_s)
+                if end_s - start_s >= min_speech_s:
+                    segments.append(SpeechSegment(start=start_s, end=end_s,
+                                                  confidence=float(max(run_scores))))
+    
+            for index, score in enumerate(scores):
+                if start_idx is None:
+                    if score >= float(threshold):
+                        start_idx, silence_run, run_scores = index, 0, [score]
+                    continue
+                run_scores.append(score)
+                silence_run = silence_run + 1 if score < neg_threshold else 0
+                spoken_s = (index + 1 - start_idx) * hop_s
+                if silence_run * hop_s >= min_silence_s or spoken_s >= float(max_speech_duration_s):
+                    close(index + 1 - silence_run)
+                    start_idx, silence_run, run_scores = None, 0, []
+            if start_idx is not None:
+                close(len(scores))
+    
+            # Seconds are the input clip's own seconds either way: decimating 48 kHz to 16 kHz
+            # changes the sample count, not the timebase.
+            return [segment.as_dict() for segment in _merge(_pad(segments, pad_s, duration_s))]
+    
+        # -- the window canary ---------------------------------------------------------------------
+    
+        def verify_window_contract(self) -> Dict[str, Any]:
+            """Contract §2.4: prove, in process and before any clip is judged, that this is wired.
+    
+            Scores a synthetic voice through the normal path and asserts it is found, then -- for a
+            real graph -- scores it again through a deliberate bare-hop call and asserts that path
+            IS degenerate, so "the normal path works" is a measurement rather than a hope. Raises
+            `WindowContractViolated`, which fails closed.
+            """
+            canary = canary_speech(self.sample_rate)
+            normal = max(self.probabilities(canary), default=0.0)
+            self.reset()
+            if normal < CANARY_MIN_PROB:
+                raise WindowContractViolated(
+                    "the window canary scored %.3f on synthetic speech, below %.2f: the %d-sample "
+                    "window is not reaching the model correctly (engine %s)"
+                    % (normal, CANARY_MIN_PROB, self.window, self.engine.name))
+    
+            degenerate: Optional[float] = None
+            if self.uses_real_model:
+                degenerate = self._bare_hop_peak(canary)
+                if degenerate >= CANARY_DEGENERATE_MAX_PROB:
+                    raise WindowContractViolated(
+                        "the bare-hop control scored %.3f, at or above %.2f: the degenerate mode "
+                        "this canary exists to exclude is not reproducible on this graph, so a "
+                        "passing normal path proves nothing"
+                        % (degenerate, CANARY_DEGENERATE_MAX_PROB))
+            return {"engine": self.engine.name, "real_model": self.uses_real_model,
+                    "window_samples": self.window, "hop_samples": self.hop,
+                    "normal_peak": round(normal, 6),
+                    "bare_hop_peak": None if degenerate is None else round(degenerate, 6)}
+    
+        def _bare_hop_peak(self, audio: np.ndarray) -> float:
+            """The control: feed the hop alone, with no context, exactly as the wrong reading did."""
+            state = self.engine.new_state()
+            peak = 0.0
+            for hop in hops(np.asarray(audio, dtype=np.float32), self.hop):
+                probability, state = self.engine.run(hop, state, self.sample_rate)
+                peak = max(peak, probability)
+            return peak
+    
+    
+    def canary_speech(sample_rate: int = MODEL_RATE_HZ, seconds: float = 2.0) -> np.ndarray:
+        """A deterministic synthetic voice: harmonics under moving formants, ~4 Hz syllables.
+    
+        Generated in code and containing no recording, because the canary is a wiring test that has
+        to run on a node holding no audio it is allowed to keep.
+        """
+        rate = validate_rate(sample_rate)
+        rate = MODEL_RATE_HZ if rate == ACQ_RATE_HZ else rate
+        t = np.arange(int(seconds * rate), dtype=np.float64) / float(rate)
+        f0 = 120.0 + 25.0 * np.sin(2.0 * np.pi * 1.7 * t)
+        phase = 2.0 * np.pi * np.cumsum(f0) / float(rate)
+        signal = np.zeros_like(t)
+        for harmonic, amplitude in enumerate([1.0, 0.7, 0.55, 0.4, 0.3, 0.22, 0.15, 0.1], start=1):
+            freq = f0 * harmonic
+            shape = np.ones_like(t)
+            for centre, bandwidth, gain in ((640.0, 130.0, 1.7), (1240.0, 190.0, 1.2),
+                                            (2500.0, 260.0, 0.9)):
+                moving = centre * (1.0 + 0.08 * np.sin(2.0 * np.pi * 2.1 * t))
+                shape += gain / (1.0 + ((freq - moving) / bandwidth) ** 2)
+            signal += amplitude * shape * np.sin(harmonic * phase + 0.3 * harmonic)
+        signal *= 0.55 + 0.45 * np.sin(2.0 * np.pi * 4.0 * t)
+        peak = float(np.max(np.abs(signal))) or 1.0
+        return (0.3 * signal / peak).astype(np.float32)
+    
+    
+    def _check_threshold(threshold: float) -> None:
+        if not 0.0 <= float(threshold) <= 1.0:
+            raise SileroVADError("threshold %r is outside [0, 1]" % (threshold,))
+    
+    
+    def _pad(segments: Sequence[SpeechSegment], pad_s: float,
+             duration_s: float) -> List[SpeechSegment]:
+        """Widen each segment by `pad_s`, but never past half the gap to its neighbour.
+    
+        A word starts before the first frame that crosses the threshold, so the padding is real
+        signal and not generosity. Splitting the gap keeps a pause a pause: without the clamp, two
+        segments 40 ms apart are padded into one, which is how a max-duration split undoes itself.
+        """
+        out: List[SpeechSegment] = []
+        for index, segment in enumerate(segments):
+            previous_end = segments[index - 1].end if index else 0.0
+            next_start = segments[index + 1].start if index + 1 < len(segments) else duration_s
+            lead = min(pad_s, max(segment.start - previous_end, 0.0) / 2.0)
+            trail = min(pad_s, max(next_start - segment.end, 0.0) / 2.0)
+            out.append(SpeechSegment(start=round(max(segment.start - lead, 0.0), 6),
+                                     end=round(min(segment.end + trail, duration_s), 6),
+                                     confidence=round(segment.confidence, 6)))
+        return out
+    
+    
+    def _merge(segments: Sequence[SpeechSegment]) -> List[SpeechSegment]:
+        """Join segments whose padding made them overlap, keeping the strongest confidence."""
+        merged: List[SpeechSegment] = []
+        for segment in segments:
+            if merged and segment.start < merged[-1].end:
+                previous = merged[-1]
+                merged[-1] = SpeechSegment(previous.start, max(previous.end, segment.end),
+                                           max(previous.confidence, segment.confidence))
+            else:
+                merged.append(segment)
+        return merged
+    
+    
+    # --------------------------------------------------------------- the purge pipeline's entry point
+    
+    class SileroDetector:
+        """`purge.py`'s detector interface over this engine: `.name` and `.detect(samples, rate)`.
+    
+        The decision rule itself -- spans, gap joining, minimum duration -- is `purge`'s, shared by
+        every engine, so "what counts as speech" stays one implementation and a receipt from this
+        detector is comparable with one from the band-energy fallback.
+        """
+    
+        def __init__(self, vad: "SileroVAD", threshold: float, min_speech_ms: float) -> None:
+            self.vad = vad
+            self.threshold = float(threshold)
+            self.min_speech_ms = float(min_speech_ms)
+            self.name = vad.engine.name
+    
+        def detect(self, samples: np.ndarray, rate: int) -> Any:
+            from hear.privacy import purge as _purge
+    
+            if int(rate) <= 0:
+                raise _purge.PurgeError("sample rate %r is not a rate" % (rate,))
+            scored = self.vad.score_clip(samples, sample_rate=int(rate))
+            hop_s = self.vad.hop / float(self.vad.sample_rate)
+            return _purge.decision_from_probs(scored.probabilities, hop_s, hop_s,
+                                              self.threshold, self.min_speech_ms, self.name)
+    
+    
+    def load_vad(threshold: float = DEFAULT_THRESHOLD,
+                 min_speech_ms: float = DEFAULT_MIN_SPEECH_MS,
+                 model_path: Optional[str] = None,
+                 session: Any = None) -> SileroDetector:
+        """The real Silero engine, verified, or `ModelUnavailable` -- never the fallback in disguise.
+    
+        `purge.load_vad("auto")` falls back to its own `BandEnergyVAD` when this raises, and writes
+        that engine's name on the receipt. Returning the synthetic scorer here instead would put
+        "silero" on a receipt that Silero never saw, which is the one lie this pipeline cannot
+        tolerate. The window canary (§2.4) runs before the detector is handed over.
+        """
+        vad = SileroVAD(model_path, require_model=True, session=session)
+        vad.verify_window_contract()
+        return SileroDetector(vad, threshold, min_speech_ms)
+    
+    
+    def is_speech(audio_chunk: Any, threshold: float = DEFAULT_THRESHOLD, *,
+                  sample_rate: int = MODEL_RATE_HZ, model_path: Optional[str] = None) -> bool:
+        """One-shot convenience wrapper. Builds a VAD, answers once, throws it away."""
+        return SileroVAD(model_path, sample_rate=_config_rate(sample_rate)).is_speech(
+            audio_chunk, threshold, sample_rate=sample_rate)
+    
+    
+    def get_speech_timestamps(audio: Any, *, threshold: float = DEFAULT_THRESHOLD,
+                              sample_rate: int = MODEL_RATE_HZ,
+                              model_path: Optional[str] = None,
+                              **kwargs: Any) -> List[Dict[str, float]]:
+        """One-shot convenience wrapper around `SileroVAD.get_speech_timestamps`."""
+        return SileroVAD(model_path, sample_rate=_config_rate(sample_rate)).get_speech_timestamps(
+            audio, threshold=threshold, sample_rate=sample_rate, **kwargs)
+    
+    
+    def _config_rate(sample_rate: int) -> int:
+        """The rate the engine runs at for a given input rate: 48 kHz input is scored at 16 kHz."""
+        return MODEL_RATE_HZ if validate_rate(sample_rate) == ACQ_RATE_HZ else int(sample_rate)
+    
+  hear_privacy_transient_tdoa.py: |
+    """One-shot, RAM-only waveform correlation for privacy-safe TDoA evidence.
+    
+    The input waveforms exist only inside ``TransientTdoaWindow``. ``analyze`` derives relative
+    arrival delays, runs the supplied VAD, and zeroes every owned sample buffer in a ``finally``
+    block. The returned record contains no waveform, spectrum, embedding, or speech content.
+    """
+    from __future__ import annotations
+    
+    import datetime as dt
+    import math
+    from dataclasses import dataclass
+    from typing import Any, Dict, Mapping, Optional, Tuple
+    
+    import numpy as np
+    
+    SCHEMA = "hear.tdoa.transient.v1"
+    MAX_WINDOW_S = 10.0
+    _FORBIDDEN_KEYS = (
+        "audio", "sample", "waveform", "pcm", "spectrum", "spectrogram", "embedding",
+        "voiceprint", "transcript", "words", "content",
+    )
+    _SAFE_KEYS = frozenset({"sample_rate_hz", "zero_audio_retained"})
+    _RECORD_KEYS = frozenset({
+        "schema", "generated_at", "reference_node_id", "sample_rate_hz", "window_duration_s",
+        "timing_resolution_s", "arrivals", "human_speech_detected", "vad_failed_closed",
+        "zero_audio_retained", "position_enu_m",
+    })
+    _ARRIVAL_KEYS = frozenset({
+        "node_id", "delta_s", "correlation_peak", "delay_sigma_s", "arrival_utc_s",
+    })
+    _POSITION_KEYS = frozenset({"east_m", "north_m", "up_m"})
+    
+    
+    class TransientTdoaError(ValueError):
+        """The transient window cannot be processed without weakening its contract."""
+    
+    
+    @dataclass(frozen=True)
+    class DelayEstimate:
+        node_id: str
+        delta_s: float
+        correlation_peak: float
+        delay_sigma_s: float
+        arrival_utc_s: Optional[float]
+    
+        def as_record(self) -> Dict[str, Any]:
+            record: Dict[str, Any] = {
+                "node_id": self.node_id,
+                "delta_s": self.delta_s,
+                "correlation_peak": self.correlation_peak,
+                "delay_sigma_s": self.delay_sigma_s,
+            }
+            if self.arrival_utc_s is not None:
+                record["arrival_utc_s"] = self.arrival_utc_s
+            return record
+    
+    
+    def _peak_sigma(correlation: np.ndarray, peak_index: int, fs_hz: float) -> float:
+        """Estimate peak width as Gaussian sigma, bounded by sample quantisation."""
+        magnitude = np.abs(correlation)
+        peak = float(magnitude[peak_index])
+        quantisation_sigma = 1.0 / (math.sqrt(12.0) * fs_hz)
+        if peak <= 0.0:
+            return quantisation_sigma
+        half = peak * 0.5
+        left = peak_index
+        right = peak_index
+        while left > 0 and magnitude[left] >= half:
+            left -= 1
+        while right + 1 < len(magnitude) and magnitude[right] >= half:
+            right += 1
+        fwhm_s = max(1, right - left) / fs_hz
+        return max(quantisation_sigma, fwhm_s / 2.354820045)
+    
+    
+    def gcc_phat(
+        reference: np.ndarray,
+        target: np.ndarray,
+        fs_hz: float,
+        max_delay_s: float,
+    ) -> Tuple[float, float, float]:
+        """Return target-minus-reference delay, normalized peak, and peak-width sigma."""
+        ref = np.asarray(reference, dtype=np.float64)
+        tgt = np.asarray(target, dtype=np.float64)
+        if ref.ndim != 1 or tgt.ndim != 1 or len(ref) == 0 or len(tgt) == 0:
+            raise TransientTdoaError("correlation inputs must be non-empty one-dimensional arrays")
+        if not np.isfinite(fs_hz) or fs_hz <= 0.0:
+            raise TransientTdoaError("fs_hz must be finite and positive")
+        if not np.isfinite(max_delay_s) or max_delay_s <= 0.0:
+            raise TransientTdoaError("max_delay_s must be finite and positive")
+        if not np.all(np.isfinite(ref)) or not np.all(np.isfinite(tgt)):
+            raise TransientTdoaError("correlation input contains non-finite samples")
+    
+        ref = ref - float(np.mean(ref))
+        tgt = tgt - float(np.mean(tgt))
+        ref_norm = float(np.linalg.norm(ref))
+        tgt_norm = float(np.linalg.norm(tgt))
+        if ref_norm <= 1e-12 or tgt_norm <= 1e-12:
+            raise TransientTdoaError("correlation input has no measurable energy")
+    
+        n_fft = 1 << (len(ref) + len(tgt) - 2).bit_length()
+        cross_spectrum = np.fft.rfft(tgt, n=n_fft) * np.conj(np.fft.rfft(ref, n=n_fft))
+        magnitude = np.abs(cross_spectrum)
+        cross_spectrum /= np.maximum(magnitude, np.finfo(np.float64).eps)
+        correlation = np.fft.irfft(cross_spectrum, n=n_fft)
+    
+        max_lag = min(int(round(max_delay_s * fs_hz)), n_fft // 2)
+        correlation = np.concatenate((correlation[-max_lag:], correlation[:max_lag + 1]))
+        peak_index = int(np.argmax(np.abs(correlation)))
+        lag_samples = float(peak_index - max_lag)
+    
+        if 0 < peak_index < len(correlation) - 1:
+            y0, y1, y2 = np.abs(correlation[peak_index - 1:peak_index + 2])
+            denominator = y0 - 2.0 * y1 + y2
+            if abs(float(denominator)) > np.finfo(np.float64).eps:
+                lag_samples += 0.5 * float(y0 - y2) / float(denominator)
+    
+        peak = float(np.abs(correlation[peak_index]))
+        return lag_samples / fs_hz, min(1.0, peak), _peak_sigma(correlation, peak_index, fs_hz)
+    
+    
+    def assert_non_reconstructible(record: Mapping[str, Any]) -> None:
+        """Refuse fields or values capable of carrying acoustic or speech content."""
+        unknown = set(record) - _RECORD_KEYS
+        if unknown:
+            raise TransientTdoaError("record contains unknown fields: %s" % sorted(unknown))
+        arrivals = record.get("arrivals")
+        if arrivals is not None:
+            if not isinstance(arrivals, (list, tuple)):
+                raise TransientTdoaError("record.arrivals must be a sequence")
+            for index, arrival in enumerate(arrivals):
+                if not isinstance(arrival, Mapping):
+                    raise TransientTdoaError("record.arrivals[%d] must be an object" % index)
+                extra = set(arrival) - _ARRIVAL_KEYS
+                if extra:
+                    raise TransientTdoaError("record.arrivals[%d] contains unknown fields: %s"
+                                             % (index, sorted(extra)))
+        position = record.get("position_enu_m")
+        if position is not None:
+            if not isinstance(position, Mapping) or set(position) != _POSITION_KEYS:
+                raise TransientTdoaError("record.position_enu_m has the wrong shape")
+    
+        def walk(value: Any, path: str) -> None:
+            if isinstance(value, np.ndarray) or isinstance(value, (bytes, bytearray, memoryview)):
+                raise TransientTdoaError("%s contains reconstructible data" % path)
+            if isinstance(value, Mapping):
+                for key, child in value.items():
+                    name = str(key).lower()
+                    if name not in _SAFE_KEYS and any(part in name for part in _FORBIDDEN_KEYS):
+                        raise TransientTdoaError("%s.%s is forbidden" % (path, key))
+                    walk(child, "%s.%s" % (path, key))
+            elif isinstance(value, (list, tuple)):
+                if path != "record.arrivals":
+                    raise TransientTdoaError("%s contains an unapproved sequence" % path)
+                for index, child in enumerate(value):
+                    walk(child, "%s[%d]" % (path, index))
+            elif isinstance(value, float) and not math.isfinite(value):
+                raise TransientTdoaError("%s is not finite" % path)
+    
+        walk(record, "record")
+    
+    
+    class TransientTdoaWindow:
+        """Own a bounded copy of synchronized node waveforms and consume it exactly once."""
+    
+        def __init__(
+            self,
+            signals: Mapping[Any, np.ndarray],
+            fs_hz: float,
+            *,
+            max_window_s: float = MAX_WINDOW_S,
+        ) -> None:
+            if len(signals) < 2:
+                raise TransientTdoaError("at least two node waveforms are required")
+            if not np.isfinite(fs_hz) or fs_hz <= 0.0:
+                raise TransientTdoaError("fs_hz must be finite and positive")
+            if not 0.0 < max_window_s <= MAX_WINDOW_S:
+                raise TransientTdoaError("max_window_s must be in (0, %.1f]" % MAX_WINDOW_S)
+    
+            owned: Dict[str, np.ndarray] = {}
+            lengths = set()
+            try:
+                for node_id, signal in signals.items():
+                    samples = np.array(signal, dtype=np.float32, copy=True)
+                    if samples.ndim != 1 or samples.size == 0:
+                        raise TransientTdoaError(
+                            "node %r waveform must be one-dimensional and non-empty" % (node_id,)
+                        )
+                    if not np.all(np.isfinite(samples)):
+                        raise TransientTdoaError(
+                            "node %r waveform contains non-finite samples" % (node_id,)
+                        )
+                    if samples.size / float(fs_hz) > max_window_s:
+                        raise TransientTdoaError("node %r waveform exceeds %.1f second RAM window"
+                                                 % (node_id, max_window_s))
+                    key = str(node_id)
+                    if key in owned:
+                        raise TransientTdoaError("node ids are not unique after string normalization")
+                    owned[key] = samples
+                    lengths.add(samples.size)
+            except Exception:
+                for samples in owned.values():
+                    samples.fill(0.0)
+                raise
+            if len(lengths) != 1:
+                raise TransientTdoaError("all node waveforms must have the same sample count")
+    
+            self.fs_hz = float(fs_hz)
+            self.duration_s = next(iter(lengths)) / self.fs_hz
+            self._signals = owned
+            self._consumed = False
+    
+        @property
+        def erased(self) -> bool:
+            return self._consumed and not self._signals
+    
+        def erase(self) -> None:
+            for samples in self._signals.values():
+                samples.fill(0.0)
+            self._signals.clear()
+            self._consumed = True
+    
+        def analyze(
+            self,
+            vad: Any,
+            *,
+            reference_node_id: Optional[Any] = None,
+            reference_arrival_utc_s: Optional[float] = None,
+            max_delay_s: float = 0.05,
+            position_enu_m: Optional[Tuple[float, float, float]] = None,
+        ) -> Dict[str, Any]:
+            """Correlate, score speech, return derived evidence, then irreversibly clear buffers."""
+            if self._consumed:
+                raise TransientTdoaError("transient window has already been consumed")
+            node_ids = sorted(self._signals)
+            reference = str(reference_node_id) if reference_node_id is not None else node_ids[0]
+            if reference not in self._signals:
+                raise TransientTdoaError("reference node is not present in the transient window")
+            if reference_arrival_utc_s is not None and not math.isfinite(reference_arrival_utc_s):
+                raise TransientTdoaError("reference_arrival_utc_s must be finite")
+    
+            try:
+                ref = self._signals[reference]
+                estimates = []
+                for node_id in node_ids:
+                    if node_id == reference:
+                        delay_s = 0.0
+                        peak = 1.0
+                        sigma_s = 1.0 / (math.sqrt(12.0) * self.fs_hz)
+                    else:
+                        delay_s, peak, sigma_s = gcc_phat(
+                            ref, self._signals[node_id], self.fs_hz, max_delay_s
+                        )
+                    arrival = (None if reference_arrival_utc_s is None
+                               else float(reference_arrival_utc_s) + delay_s)
+                    estimates.append(DelayEstimate(node_id, delay_s, peak, sigma_s, arrival))
+    
+                speech_detected = False
+                vad_failed_closed = False
+                for samples in self._signals.values():
+                    vad_samples = np.array(samples, copy=True)
+                    try:
+                        decision = vad.detect(vad_samples, int(round(self.fs_hz)))
+                        speech_detected = speech_detected or bool(decision.speech)
+                    except Exception:
+                        speech_detected = True
+                        vad_failed_closed = True
+                    finally:
+                        vad_samples.fill(0.0)
+    
+                record: Dict[str, Any] = {
+                    "schema": SCHEMA,
+                    "generated_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "reference_node_id": reference,
+                    "sample_rate_hz": self.fs_hz,
+                    "window_duration_s": self.duration_s,
+                    "timing_resolution_s": 1.0 / self.fs_hz,
+                    "arrivals": [estimate.as_record() for estimate in estimates],
+                    "human_speech_detected": speech_detected,
+                    "vad_failed_closed": vad_failed_closed,
+                    "zero_audio_retained": True,
+                }
+                if position_enu_m is not None:
+                    if len(position_enu_m) != 3 or not all(math.isfinite(float(v))
+                                                           for v in position_enu_m):
+                        raise TransientTdoaError("position_enu_m must contain three finite values")
+                    record["position_enu_m"] = {
+                        "east_m": float(position_enu_m[0]),
+                        "north_m": float(position_enu_m[1]),
+                        "up_m": float(position_enu_m[2]),
+                    }
+                assert_non_reconstructible(record)
+                return record
+            finally:
+                self.erase()
+    
+  tools_hear_privacy_purge.py: |
+    #!/usr/bin/env python3
+    """Purge every clip that holds a human voice, and print the receipts that prove it happened.
+    
+        python3 tools/hear_privacy_purge.py --pool ~/hear-clips --dry-run    # preview, touches nothing
+        python3 tools/hear_privacy_purge.py --pool ~/hear-clips              # destroy + audit
+        python3 tools/hear_privacy_purge.py --pool ~/hear-clips --threshold 0.35 --min-speech-ms 150
+        python3 tools/hear_privacy_purge.py --clip one.wav --audit-log ~/audit/purged.jsonl --json
+    
+    This is the operator face of `hear/privacy/purge.py`. The module holds the policy and the
+    reasoning; this file parses arguments, prints a report and sets an exit code.
+    
+    ⚠️DRY RUN IS NOT THE DEFAULT, AND THAT IS DELIBERATE. Every other evidence tool here defaults to
+    `--plan` because its live mode changes a production system. This one's live mode DELETES A VOICE
+    RECORDING, which is the safe direction: a run that silently previewed would leave speech on disk
+    while reporting that it had found it, and "the cron job was in dry-run" is precisely how a
+    retention policy becomes a document nobody enforces. `--dry-run` exists for the operator asking
+    "what would this take?" and it touches neither the clips nor the audit log.
+    
+    ⚠️EXIT CODES ARE FOR A CRON JOB, NOT FOR A HUMAN.
+    
+      0  every clip was decided by the detector and the pool is clean.
+      2  the run STOPPED, or a clip could not be handled at all: a purge that failed twice leaves a
+         file this run judged speech-bearing on the disk, and scanning past it would finish green
+         while the thing this tool exists to prevent is true (contract §9).
+      3  the pool is clean, but one or more clips were destroyed WITHOUT being scored -- unreadable
+         header, refused rate, detector fault. Fail-closed is the correct outcome and it is still an
+         alarm: a lane that quietly destroys the backlog because a dependency broke has stopped
+         being a privacy control and become a shredder.
+    
+    ⚠️WHAT IS PRINTED IS WHAT IS RECORDED. The per-clip line carries the receipt's own fields and
+    nothing else: no waveform statistics, no "sounded like" annotation, no path outside the pool.
+    `--json` emits the same receipts as JSONL on stdout so a pipeline can consume them without
+    parsing prose.
+    """
+    from __future__ import annotations
+    
+    import argparse
+    import json
+    import os
+    import sys
+    
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    
+    from hear.privacy import purge as P  # noqa: E402
+    
+    
+    def build_parser() -> argparse.ArgumentParser:
+        ap = argparse.ArgumentParser(
+            prog="hear_privacy_purge",
+            description="Detect human speech in stored clips and destroy every clip that has it.",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="A purged clip is gone. The receipt in the audit log is all that survives it.")
+        src = ap.add_mutually_exclusive_group(required=True)
+        src.add_argument("--pool", help="directory of clips to scan, recursively")
+        src.add_argument("--clip", help="one WAV file to decide about")
+        ap.add_argument("--threshold", type=float, default=P.DEFAULT_THRESHOLD,
+                        help="per-frame speech probability that counts as speech "
+                             "(default %(default)s; lower purges more)")
+        ap.add_argument("--min-speech-ms", type=float, default=P.DEFAULT_MIN_SPEECH_MS,
+                        help="shortest merged run of speech that triggers a purge "
+                             "(default %(default)s ms)")
+        ap.add_argument("--neg-threshold", type=float, default=P.DEFAULT_NEG_THRESHOLD,
+                        help="a segment closes only below this (hysteresis; default %(default)s). "
+                             "Raising it to --threshold reintroduces segment chatter")
+        ap.add_argument("--min-silence-ms", type=float, default=P.DEFAULT_MIN_SILENCE_MS,
+                        help="silence shorter than this is bridged, not a segment end "
+                             "(default %(default)s ms)")
+        ap.add_argument("--speech-pad-ms", type=float, default=P.DEFAULT_SPEECH_PAD_MS,
+                        help="margin added to each end of an accepted segment (default %(default)s ms)")
+        ap.add_argument("--receipt-clean", action="store_true",
+                        help="also write a NO_SPEECH receipt for every clip that was scored and "
+                             "kept, so the audit log records coverage and not only destructions")
+        ap.add_argument("--dry-run", action="store_true",
+                        help="report what would be purged; no file and no audit line is written")
+        ap.add_argument("--audit-log", default=None,
+                        help="JSONL receipt sink (default <pool>/%s; ignored in a dry run)"
+                             % P.RECEIPT_NAME)
+        ap.add_argument("--vad", default="auto", choices=("auto", "silero", "band_energy"),
+                        help="detector: silero v5 if installed, else the stdlib fallback "
+                             "(default %(default)s)")
+        ap.add_argument("--json", action="store_true",
+                        help="print receipts as JSONL on stdout instead of a table")
+        ap.add_argument("--quiet", action="store_true", help="summary line only")
+        return ap
+    
+    
+    def main(argv=None) -> int:
+        args = build_parser().parse_args(argv)
+        root = args.pool or args.clip
+        target = os.path.abspath(os.path.expanduser(root))
+        if not os.path.exists(target):
+            print("no such pool or clip: %s" % target, file=sys.stderr)
+            return 2
+        if args.threshold <= 0.0 or args.threshold > 1.0:
+            print("--threshold must be in (0, 1]; %r is not a probability" % args.threshold,
+                  file=sys.stderr)
+            return 2
+        if args.min_speech_ms < 0.0:
+            print("--min-speech-ms cannot be negative", file=sys.stderr)
+            return 2
+        if args.neg_threshold > args.threshold:
+            print("--neg-threshold %.3f is above --threshold %.3f: a segment that cannot close is "
+                  "not hysteresis" % (args.neg_threshold, args.threshold), file=sys.stderr)
+            return 2
+    
+        try:
+            vad = P.load_vad(args.vad, args.threshold, args.min_speech_ms)
+        except P.PurgeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+    
+        def emit(outcome: P.ClipOutcome) -> None:
+            if args.quiet:
+                return
+            if args.json:
+                if outcome.receipt is not None:
+                    print(json.dumps(outcome.receipt.as_record(), sort_keys=True,
+                                     separators=(",", ":")), flush=True)
+                return
+            name = os.path.basename(outcome.path)
+            if outcome.receipt is not None:
+                rec = outcome.receipt.as_record()
+                digest = (rec["purged_sha256"] or "-")[:16]
+                if rec["fail_closed_reason"]:
+                    print("%-12s %-40s FAIL-CLOSED %s  sha256 %s"
+                          % (outcome.status, name, rec["fail_closed_reason"], digest), flush=True)
+                    return
+                print("%-12s %-40s peak %.3f  speech %.2fs  sha256 %s"
+                      % (outcome.status, name, rec["peak_speech_prob"], rec["speech_s"], digest),
+                      flush=True)
+            else:
+                print("%-12s %-40s %s" % (outcome.status, name, outcome.detail), flush=True)
+    
+        report = P.scan_pool(target, engine=args.vad, threshold=args.threshold,
+                             min_speech_ms=args.min_speech_ms, neg_threshold=args.neg_threshold,
+                             min_silence_ms=args.min_silence_ms, speech_pad_ms=args.speech_pad_ms,
+                             dry_run=args.dry_run, audit_log=args.audit_log, vad=vad,
+                             receipt_clean=args.receipt_clean, on_outcome=emit)
+    
+        summary = report.as_record()
+        if args.json:
+            print(json.dumps({"summary": summary}, sort_keys=True, separators=(",", ":")))
+        else:
+            print("scanned %d  purged %d  would_purge %d  kept %d  already_absent %d  "
+                  "fail_closed %d  errors %d  vad %s%s"
+                  % (report.scanned, report.purged, report.would_purge, report.kept,
+                     report.already_absent, report.fail_closed, report.errors, report.vad_engine,
+                     "  audit %s" % report.audit_log if report.audit_log else "  (dry run)"))
+            if report.halted:
+                print("STOPPED: a purge failed and a clip judged speech-bearing is still on disk. "
+                      "Nothing after it was scanned.", file=sys.stderr)
+            if report.fail_closed:
+                print("%d clip(s) were destroyed WITHOUT being scored (fail-closed). Read the "
+                      "fail_closed_reason on those receipts before rearming this lane."
+                      % report.fail_closed, file=sys.stderr)
+            if report.dry_run and report.would_purge:
+                print("dry run: %d clip(s) hold speech and are still on disk. Re-run without "
+                      "--dry-run to destroy them." % report.would_purge)
+        if report.errors or report.halted:
+            return 2
+        return 3 if report.fail_closed else 0
+    
+    
+    if __name__ == "__main__":
+        raise SystemExit(main())
+    
+  hear_resample.py: |
+    """Rational resampling from the node's acquisition rate to a model's native rate.
+    
+    The nodes acquire at 48 kHz and EfficientAT wants 32 kHz: L=2 M=3, a decimation, so every band the
+    model reads is measurement. The header rate is snapped to 48 kHz within SNAP_TOLERANCE; a rate
+    nobody configured is refused rather than stretched to the nearest.
+    """
+    
+    from __future__ import annotations
+    
+    import math
+    from typing import Any, Dict
+    
+    #: The rate the nodes clock the microphone at.
+    ACQ_RATE_HZ = 48000.0
+    #: How far a measured header rate may sit from ACQ_RATE_HZ and still be snapped to it.
+    SNAP_TOLERANCE = 0.005
+    #: Kaiser stopband attenuation, dB. Puts the fold under the int16 floor of the source.
+    STOPBAND_DB = 72.0
+    #: Transition width as a fraction of the passband edge.
+    TRANSITION = 0.10
+    
+    
+    class RateRefused(Exception):
+        """The clip's rate is not the acquisition rate, so it is not resampled at all."""
+    
+    
+    def snap(fs_hz: float) -> float:
+        """Measured header rate -> ACQ_RATE_HZ. Raises RateRefused for anything else."""
+        if not fs_hz or fs_hz <= 0:
+            raise RateRefused("rate %r is not a rate" % (fs_hz,))
+        if abs(float(fs_hz) - ACQ_RATE_HZ) <= ACQ_RATE_HZ * SNAP_TOLERANCE:
+            return ACQ_RATE_HZ
+        raise RateRefused("%.1f Hz is not within %.1f%% of the %g Hz acquisition rate; refused "
+                          "rather than resampled" % (fs_hz, SNAP_TOLERANCE * 100, ACQ_RATE_HZ))
+    
+    
+    def _kaiser_beta(att_db: float) -> float:
+        if att_db > 50:
+            return 0.1102 * (att_db - 8.7)
+        if att_db >= 21:
+            return 0.5842 * (att_db - 21) ** 0.4 + 0.07886 * (att_db - 21)
+        return 0.0
+    
+    
+    def design(L: int, M: int):
+        """Windowed-sinc low-pass for an L/M polyphase resampler, unity gain through zero-stuffing."""
+        import numpy as np
+        cutoff = 0.5 / max(L, M)
+        width = cutoff * TRANSITION * 2.0
+        n = max(int(math.ceil((STOPBAND_DB - 8.0) / (2.285 * 2.0 * math.pi * width))), 8)
+        if n % 2 == 0:
+            n += 1
+        k = np.arange(n) - (n - 1) / 2.0
+        h = 2.0 * cutoff * np.sinc(2.0 * cutoff * k) * np.kaiser(n, _kaiser_beta(STOPBAND_DB))
+        return (h * L / h.sum()).astype(np.float64)
+    
+    
+    def resample(x, fs_in: float, fs_out: float) -> Dict[str, Any]:
+        """-> {"pcm", "fs_hz", "fs_source_hz", "L", "M", "taps"}. fs_in must snap to ACQ_RATE_HZ."""
+        import numpy as np
+        src = snap(fs_in)
+        dst = float(fs_out)
+        if dst <= 0 or dst != int(dst):
+            raise RateRefused("output rate %r is not a positive integer rate" % (fs_out,))
+        g = math.gcd(int(src), int(dst))
+        L, M = int(dst) // g, int(src) // g
+        x = np.asarray(x, dtype=np.float64)
+        if L == 1 and M == 1:
+            y, h = x.copy(), np.zeros(0)
+        else:
+            h = design(L, M)
+            up = np.zeros(len(x) * L, dtype=np.float64)
+            up[::L] = x
+            y = np.convolve(up, h, mode="same")[::M]
+        return {"pcm": y.astype(np.float32), "fs_hz": dst, "fs_source_hz": float(fs_in),
+                "L": L, "M": M, "taps": int(len(h))}
     

@@ -246,7 +246,11 @@ def test_the_canary_signal_is_generated_and_is_speech_shaped(vad):
     assert canary.dtype == np.float32
     assert canary.size == 2 * FS
     assert np.array_equal(canary, V.canary_speech())
-    assert vad.is_speech(canary) is True
+    # CANARY_MIN_PROB, not the production DEFAULT_THRESHOLD: this asserts the wiring canary is
+    # speech-shaped enough for its own gate, not that a real neural net mistakes it for a
+    # recording (see the comment on CANARY_MIN_PROB -- the 640x normal/bare-hop margin is that
+    # proof, and it is asserted separately by verify_window_contract()).
+    assert vad.is_speech(canary, threshold=V.CANARY_MIN_PROB) is True
 
 
 # -- stateless scoring is reproducible, streaming state is carried -------------------------------

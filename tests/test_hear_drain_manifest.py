@@ -238,11 +238,19 @@ class TestTheClipLaneIsBounded:
             "a run from eating the next tick" % m.group(1))
 
     def test_the_clip_retention_policy_is_declared_rather_than_defaulted(self, blocks):
-        # Live policy intentionally retains no voice WAVs. A full manifest apply must not revive
-        # the old default by omitting either explicit zero.
-        assert re.search(r"--clip-max-per-node\s+0\b", blocks["drain"]), blocks["drain"]
-        assert re.search(r"--clip-store-max-b\s+0\b", blocks["drain"]), blocks["drain"]
+        # Live policy retains voice WAVs only long enough to score and purge them: retention is
+        # explicit and non-zero, but it must never appear WITHOUT the same-run purge gate that
+        # bounds exposure to one drain cycle. A manifest that fetches clips and drops the purge
+        # call would be a silent policy regression back to indefinite retention.
+        assert re.search(r"--clip-max-per-node\s+(?!0\b)\d+", blocks["drain"]), blocks["drain"]
+        assert re.search(r"--clip-store-max-b\s+(?!0\b)\d+", blocks["drain"]), blocks["drain"]
         assert "--clip-deadline-s" in blocks["drain"], blocks["drain"]
+        assert "hear_privacy_purge.py" in blocks["drain"], (
+            "clip retention is enabled but the drain block never calls the purge tool -- every "
+            "fetched clip would sit on the PVC unscored, indefinitely" )
+        assert "HEAR_SILERO_VAD_MODEL" in blocks["drain"], (
+            "the purge call runs with no model pinned, so it would silently score with "
+            "BandEnergyVAD instead of the real Silero engine every single run")
 
     def test_the_gate_fails_on_a_binding_cap(self, blocks):
         assert "--max-clips-deferred" in blocks["check"], (

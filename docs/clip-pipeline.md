@@ -139,6 +139,13 @@ The CronJob carries `activeDeadlineSeconds: 840`. Runs already take 218–307 s 
 under `concurrencyPolicy: Forbid`, so an overrun silently *skips* the next tick; the deadline keeps
 that failure bounded and visible before the next 15-minute slot.
 
+⚠️**Retention is gated by the same-run purge, not by policy alone.** Every clip this fetch writes
+is scored by `tools/hear_privacy_purge.py` (Silero VAD v5, `HEAR_SILERO_VAD_MODEL` pinned by
+sha256) before the run exits, and anything holding confirmed speech is destroyed then — see
+`docs/silero-vad-privacy-contract.md`. A voice recording can exist on the pool for at most one
+drain cycle (~15 minutes), never indefinitely. `set -e` makes a purge failure a red CronJob, not a
+silent skip: the alternative is unscored speech sitting on the PVC with a green history.
+
 ⚠️`deploy/k8s/hear-drain.yaml` is applied **whole** and must be a superset of the live object.
 `--phone-corpus /pool/sketch_corpus` was added to the live CronJob by hand once already. Check
 before every apply:

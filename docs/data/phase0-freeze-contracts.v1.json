@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "0a43fd69aa28d4ac3145da4eec732f05456273db46de82cdb61297f9cf39aa90",
+  "baseline_hash": "a03e3b8b33cae606dd479241fb4c67ca2d7107b9fc3698a0563a508f415f5df1",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -480,8 +480,8 @@
       },
       {
         "path": "deploy/k8s/hear-drain.yaml",
-        "sha256": "162286454c4ba763d46485da96239a52a419982ee2a52e197aca4164bcb7db8d",
-        "size_bytes": 13424
+        "sha256": "a74407ca0a69a6ea0c3e0e8eb96c1da6338b649067c6706bec5ec01ccfa38d72",
+        "size_bytes": 18271
       },
       {
         "path": "deploy/k8s/hear-embed.yaml",
@@ -758,6 +758,10 @@
         "path_references": [
           "/pool",
           "/pool/corpus",
+          "/pool/corpus/clips",
+          "/pool/corpus/clips/vad_purge.jsonl",
+          "/pool/models",
+          "/pool/models/silero_vad.onnx",
           "/pool/pylib",
           "/pool/sketch_corpus"
         ],
@@ -836,6 +840,42 @@
                 "volume_name": "code"
               },
               {
+                "claim_name": null,
+                "mount_path": "/app/hear/privacy/__init__.py",
+                "sub_path": "hear_privacy__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/privacy/purge.py",
+                "sub_path": "hear_privacy_purge.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/privacy/silero_vad.py",
+                "sub_path": "hear_privacy_silero_vad.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/privacy/transient_tdoa.py",
+                "sub_path": "hear_privacy_transient_tdoa.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_privacy_purge.py",
+                "sub_path": "tools_hear_privacy_purge.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/resample.py",
+                "sub_path": "hear_resample.py",
+                "volume_name": "code"
+              },
+              {
                 "claim_name": "hear-pool",
                 "mount_path": "/pool",
                 "sub_path": null,
@@ -853,6 +893,10 @@
         "path_references": [
           "/pool",
           "/pool/corpus",
+          "/pool/corpus/clips",
+          "/pool/corpus/clips/vad_purge.jsonl",
+          "/pool/models",
+          "/pool/models/silero_vad.onnx",
           "/pool/pylib",
           "/pool/sketch_corpus"
         ],
@@ -931,6 +975,42 @@
                 "volume_name": "code"
               },
               {
+                "claim_name": null,
+                "mount_path": "/app/hear/privacy/__init__.py",
+                "sub_path": "hear_privacy__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/privacy/purge.py",
+                "sub_path": "hear_privacy_purge.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/privacy/silero_vad.py",
+                "sub_path": "hear_privacy_silero_vad.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/privacy/transient_tdoa.py",
+                "sub_path": "hear_privacy_transient_tdoa.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/tools/hear_privacy_purge.py",
+                "sub_path": "tools_hear_privacy_purge.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/resample.py",
+                "sub_path": "hear_resample.py",
+                "volume_name": "code"
+              },
+              {
                 "claim_name": "hear-pool",
                 "mount_path": "/pool",
                 "sub_path": null,
@@ -948,6 +1028,10 @@
         "path_references": [
           "/pool",
           "/pool/corpus",
+          "/pool/corpus/clips",
+          "/pool/corpus/clips/vad_purge.jsonl",
+          "/pool/models",
+          "/pool/models/silero_vad.onnx",
           "/pool/pylib",
           "/pool/sketch_corpus"
         ],
@@ -2370,14 +2454,18 @@
         "path_references": [
           "/pool",
           "/pool/corpus",
+          "/pool/corpus/clips",
           "/pool/corpus/clips/tags.jsonl",
+          "/pool/corpus/clips/vad_purge.jsonl",
           "/pool/corpus/scores",
           "/pool/corpus/tdoa",
           "/pool/corpus/tdoa/arrivals",
           "/pool/corpus/tdoa/model_card.json",
           "/pool/corpus/tdoa/runs",
+          "/pool/models",
           "/pool/models/mn10_as",
           "/pool/models/perch_v2",
+          "/pool/models/silero_vad.onnx",
           "/pool/pylib",
           "/pool/pylib-perch",
           "/pool/pylib-tag",
@@ -2396,7 +2484,7 @@
         "storage_request": "20Gi"
       }
     ],
-    "section_hash": "0069b973796b11b1ce7d5e143bb2e2e8ef458e14d257f76f517c09ad4f974ee5"
+    "section_hash": "eb9a90dd5f2d8fc66b04bc26c683396c2d046b9ae0943f3bbe67764026fb195c"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",

@@ -14,14 +14,14 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | 0a43fd69aa28d4ac3145da4eec732f05456273db46de82cdb61297f9cf39aa90 |
+| baseline | a03e3b8b33cae606dd479241fb4c67ca2d7107b9fc3698a0563a508f415f5df1 |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
 | firmware_build_metadata | 354438a194e485711ece94ccefe668543ac63a20eb2e288bc5d4a6455e6e5f6f |
 | schemas | 94b4918a473b1622dc555228ba2b6b6359873dd5b12e4f498fb12f3b81087221 |
 | published_contracts | a87c434d400f4f31ec4cc252761fff18ee14355a8170cf80133ef72315c082f3 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |
 | redis_keys | d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03 |
-| kubernetes_and_pvc_layout | 0069b973796b11b1ce7d5e143bb2e2e8ef458e14d257f76f517c09ad4f974ee5 |
+| kubernetes_and_pvc_layout | eb9a90dd5f2d8fc66b04bc26c683396c2d046b9ae0943f3bbe67764026fb195c |
 | corpus_fixture_metadata | 52ddc9da76e76e5b920512c82bb9529b9075fea44faa6ce526d9347b35550af0 |
 
 ## Compatibility
@@ -226,7 +226,7 @@ Manifest hashes:
 | --- | --- | --- |
 | deploy/k8s/hear-annotate.yaml | 40926 | 43537c445a510b443e4d28e1c0bb592347c58da5713f38bba1c8b4a4c74e118e |
 | deploy/k8s/hear-birdnet.yaml | 7474 | 9a4265e78c5c03e10a563b1a178582492e3f0aeef0c47f630f56fe23c06c6aa5 |
-| deploy/k8s/hear-drain.yaml | 13424 | 162286454c4ba763d46485da96239a52a419982ee2a52e197aca4164bcb7db8d |
+| deploy/k8s/hear-drain.yaml | 18271 | a74407ca0a69a6ea0c3e0e8eb96c1da6338b649067c6706bec5ec01ccfa38d72 |
 | deploy/k8s/hear-embed.yaml | 9190 | 1f3e86e8d5d1f57f4bc5d8d4ca6adb958671f5a65c7db7b21e47225916d465ad |
 | deploy/k8s/hear-heartbeat.yaml | 4023 | c4cb18d1a5a9a72637b88611ddd2909f93c635b4de54194c7f02fafd378f2d9e |
 | deploy/k8s/hear-mqtt-bridge.yaml | 5560 | 43f53a0ec58056e08a5104dd8fdb5ed51f6ea4f700363777a94468e050ca8538 |
@@ -242,7 +242,7 @@ Manifest hashes:
 | --- | --- | --- | --- | --- |
 | hear-heartbeat-state | 5Gi | ReadWriteOnce | Deployment hear-heartbeat receiver:/state | (none) |
 | hear-mqtt-bridge-state | 5Gi | ReadWriteOnce | Deployment hear-mqtt-bridge bridge:/state | (none) |
-| hear-pool | 5Gi | ReadWriteOnce | CronJob hear-drain drain:/pool<br>CronJob hear-drain-check check:/pool<br>CronJob hear-embed embed:/pool<br>CronJob hear-embed-check check:/pool<br>CronJob hear-pool-backup-l0 backup:/pool<br>CronJob hear-pool-backup-l1 backup:/pool<br>CronJob hear-score score:/pool<br>CronJob hear-score-check check:/pool<br>CronJob hear-tag tag:/pool<br>CronJob hear-tag-check check:/pool<br>CronJob hear-tdoa tdoa:/pool<br>CronJob hear-tdoa-check check:/pool | /pool<br>/pool/corpus<br>/pool/corpus/clips/tags.jsonl<br>/pool/corpus/scores<br>/pool/corpus/tdoa<br>/pool/corpus/tdoa/arrivals<br>/pool/corpus/tdoa/model_card.json<br>/pool/corpus/tdoa/runs<br>/pool/models/mn10_as<br>/pool/models/perch_v2<br>/pool/pylib<br>/pool/pylib-perch<br>/pool/pylib-tag<br>/pool/sketch_corpus |
+| hear-pool | 5Gi | ReadWriteOnce | CronJob hear-drain drain:/pool<br>CronJob hear-drain-check check:/pool<br>CronJob hear-embed embed:/pool<br>CronJob hear-embed-check check:/pool<br>CronJob hear-pool-backup-l0 backup:/pool<br>CronJob hear-pool-backup-l1 backup:/pool<br>CronJob hear-score score:/pool<br>CronJob hear-score-check check:/pool<br>CronJob hear-tag tag:/pool<br>CronJob hear-tag-check check:/pool<br>CronJob hear-tdoa tdoa:/pool<br>CronJob hear-tdoa-check check:/pool | /pool<br>/pool/corpus<br>/pool/corpus/clips<br>/pool/corpus/clips/tags.jsonl<br>/pool/corpus/clips/vad_purge.jsonl<br>/pool/corpus/scores<br>/pool/corpus/tdoa<br>/pool/corpus/tdoa/arrivals<br>/pool/corpus/tdoa/model_card.json<br>/pool/corpus/tdoa/runs<br>/pool/models<br>/pool/models/mn10_as<br>/pool/models/perch_v2<br>/pool/models/silero_vad.onnx<br>/pool/pylib<br>/pool/pylib-perch<br>/pool/pylib-tag<br>/pool/sketch_corpus |
 | hear-pool-restore | 20Gi | ReadWriteOnce | (none) | (none) |
 
 ### Objects
