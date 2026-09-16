@@ -1,0 +1,101 @@
+{
+  "case_set": "the-never-retained-field-list",
+  "source_of_truth": [
+    "hear/ingest/reconcile.py",
+    "hear/verify/shadow_read.py",
+    "hear/verify/list_read.py"
+  ],
+  "docs": [
+    "docs/phase6-read-audit-retention.md",
+    "docs/legacy-operator-read-boundaries.md",
+    "docs/data-governance.md",
+    "docs/phase5-shadow-read-comparator.md"
+  ],
+  "position": "Section 4.2 of the retention design is a deny list of things no audit record, receipt, quarantine row or aggregate may ever retain. It is enforced by pattern with unknown paths defaulting to hidden, so the next field added upstream defaults to redacted rather than to leaked. Each row below is that table rendered as a field path with the enforcement that actually holds it.",
+  "rules": {
+    "blind": "No durable representation may exist at all -- not the value, not a digest. A stable digest of a coordinate is still a stable identifier for that coordinate.",
+    "hidden": "The value may never appear literally. A comparator may keep an opaque digest of it to say two sides differ."
+  },
+  "enforcement": {
+    "deny_pattern": "hear/ingest/reconcile.py VALUE_DENY_PATTERN -- deny beats allow, in one place, for all three modules",
+    "unknown_default_hidden": "not in any allow list, so quoting it is impossible without a contract change and a test"
+  },
+  "never_retained": [
+    {"path": "clip.audio.samples", "family": "audio_bytes", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Clip or raw audio bytes, any transform of them"},
+    {"path": "clip.pcm", "family": "audio_bytes", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Clip or raw audio bytes, any transform of them"},
+    {"path": "clip_bytes", "family": "audio_bytes", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Clip or raw audio bytes, any transform of them"},
+    {"path": "clip.raw", "family": "audio_bytes", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Clip or raw audio bytes, any transform of them"},
+    {"path": "clip.spectrogram", "family": "audio_bytes", "rule": "blind", "enforced_by": "unknown_default_hidden", "doc_row": "any transform of them (spectrogram, embedding, hash of the bytes as an index key)"},
+    {"path": "clip.embedding", "family": "audio_bytes", "rule": "blind", "enforced_by": "unknown_default_hidden", "doc_row": "any transform of them (spectrogram, embedding, hash of the bytes as an index key)"},
+
+    {"path": "location.lat", "family": "coordinate", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Coordinates in any form -- value, rounded value, geohash, or digest"},
+    {"path": "device.lon", "family": "coordinate", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Coordinates in any form -- value, rounded value, geohash, or digest"},
+    {"path": "gps_fix_lat", "family": "coordinate", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Coordinates in any form -- value, rounded value, geohash, or digest"},
+    {"path": "node.position", "family": "coordinate", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Coordinates in any form -- value, rounded value, geohash, or digest"},
+    {"path": "site.coords", "family": "coordinate", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Coordinates in any form -- value, rounded value, geohash, or digest"},
+    {"path": "site.geohash", "family": "coordinate", "rule": "blind", "enforced_by": "unknown_default_hidden", "doc_row": "Coordinates in any form -- value, rounded value, geohash, or digest"},
+    {"path": "solution.coordinate.digest", "family": "coordinate", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "not even a hash -- a stable digest of a coordinate is still a stable identifier for that coordinate"},
+
+    {"path": "annotation.notes", "family": "free_text", "rule": "hidden", "enforced_by": "unknown_default_hidden", "doc_row": "Free-text annotation notes: never logged, never in an audit record, never in an error body"},
+    {"path": "annotation.notes.payload", "family": "free_text", "rule": "hidden", "enforced_by": "deny_pattern", "doc_row": "Free-text annotation notes"},
+    {"path": "review.comment", "family": "free_text", "rule": "hidden", "enforced_by": "unknown_default_hidden", "doc_row": "Operator-entered free text is unclassifiable by construction"},
+    {"path": "label.text", "family": "label", "rule": "hidden", "enforced_by": "unknown_default_hidden", "doc_row": "Label text and label rows: the audit record indexes a read; it is not a second copy of the labels"},
+    {"path": "labels.rows", "family": "label", "rule": "hidden", "enforced_by": "unknown_default_hidden", "doc_row": "Label text and label rows"},
+
+    {"path": "auth.token", "family": "credential", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Tokens, bearer credentials, secrets, DSNs, path"},
+    {"path": "authorization", "family": "credential", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Tokens, bearer credentials, secrets, DSNs, path"},
+    {"path": "x_hear_token", "family": "credential", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Tokens, bearer credentials, secrets, DSNs, path"},
+    {"path": "admin.password", "family": "credential", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Tokens, bearer credentials, secrets, DSNs, path"},
+    {"path": "node.secret", "family": "credential", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Tokens, bearer credentials, secrets, DSNs, path"},
+    {"path": "tls.private.pem", "family": "credential", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Tokens, bearer credentials, secrets, DSNs, path"},
+    {"path": "postgres.dsn", "family": "credential", "rule": "blind", "enforced_by": "unknown_default_hidden", "doc_row": "the DSN carries a password and must never reach /healthz or a log line"},
+
+    {"path": "filter.near_latitude", "family": "filter_value", "rule": "blind", "enforced_by": "deny_pattern", "doc_row": "Raw filter values from the query string: a query is user input"},
+    {"path": "filter.q", "family": "filter_value", "rule": "hidden", "enforced_by": "unknown_default_hidden", "doc_row": "Raw filter values from the query string"},
+    {"path": "filter.actor", "family": "filter_value", "rule": "hidden", "enforced_by": "unknown_default_hidden", "doc_row": "Raw filter values from the query string"},
+    {"path": "filter.notes", "family": "filter_value", "rule": "hidden", "enforced_by": "unknown_default_hidden", "doc_row": "Raw filter values from the query string"},
+
+    {"path": "response.body", "family": "response_body", "rule": "hidden", "enforced_by": "deny_pattern", "doc_row": "Result bodies, row payloads, or any payload/body/raw path"},
+    {"path": "result.payload", "family": "response_body", "rule": "hidden", "enforced_by": "deny_pattern", "doc_row": "Result bodies, row payloads, or any payload/body/raw path"},
+    {"path": "row.raw", "family": "response_body", "rule": "hidden", "enforced_by": "deny_pattern", "doc_row": "Result bodies, row payloads, or any payload/body/raw path"},
+    {"path": "export.body", "family": "response_body", "rule": "hidden", "enforced_by": "deny_pattern", "doc_row": "Result bodies, row payloads, or any payload/body/raw path"},
+
+    {"path": "some.future.field", "family": "unknown_path", "rule": "hidden", "enforced_by": "unknown_default_hidden", "doc_row": "An unrecognised field path is not writable to an audit record"},
+    {"path": "annotation.reviewer_note_v2", "family": "unknown_path", "rule": "hidden", "enforced_by": "unknown_default_hidden", "doc_row": "An unrecognised field path is not writable to an audit record"},
+    {"path": "sides.legacy.actor_name", "family": "unknown_path", "rule": "hidden", "enforced_by": "unknown_default_hidden", "doc_row": "the only field that can name a person; it is the first thing to go"}
+  ],
+  "still_quotable": [
+    {"path": "filter.kind", "why": "A declared facet is part of the question both sides were asked, and a question nobody can read is a comparison nobody can reproduce."},
+    {"path": "filter.bound", "why": "Inclusive versus half-open is the usual way one request becomes two questions."},
+    {"path": "row_count", "why": "A count is the finding."},
+    {"path": "retention_class", "why": "A record that cannot state its own horizon cannot be reconciled."},
+    {"path": "aggregate.value.c:0123456789abcdef", "why": "A cell above the k floor carries its numbers; its identity is an opaque handle."}
+  ],
+  "filter_redaction_cases": [
+    {
+      "name": "a-coordinate-smuggled-in-through-a-query-parameter",
+      "filters": {"near_latitude": "48.1", "kind": "gunshot"},
+      "quoted_keys": ["kind"],
+      "redacted_keys": ["near_latitude"],
+      "why": "`?near_latitude=...` is the obvious way to reintroduce a coordinate through the one field nobody classified."
+    },
+    {
+      "name": "free-text-search-terms-are-user-input-too",
+      "filters": {"q": "shots near the north fence", "kind": "gunshot"},
+      "quoted_keys": ["kind"],
+      "redacted_keys": ["q"]
+    },
+    {
+      "name": "an-actor-filter-never-quotes-the-actor",
+      "filters": {"actor": "reviewer-7", "kind": "gunshot"},
+      "quoted_keys": ["kind"],
+      "redacted_keys": ["actor"]
+    }
+  ],
+  "blind_rendering_cases": [
+    {"name": "a-coordinate-difference-carries-no-values", "path": "node.position", "comparator": "blind"},
+    {"name": "a-clip-body-difference-carries-no-values", "path": "clip.pcm", "comparator": "blind"},
+    {"name": "a-credential-difference-carries-no-values", "path": "auth.token", "comparator": "blind"},
+    {"name": "presence-is-also-blind", "path": "location.lat", "comparator": "presence"}
+  ]
+}

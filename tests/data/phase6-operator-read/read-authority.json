@@ -1,0 +1,68 @@
+{
+  "case_set": "legacy-is-the-sole-read-authority-and-nothing-live-is-enabled",
+  "source_of_truth": [
+    "hear/verify/shadow_read.py",
+    "hear/verify/list_read.py"
+  ],
+  "docs": [
+    "docs/phase6-operator-read-audit.md",
+    "docs/phase6-operator-api-contract.md",
+    "docs/phase6-read-audit-retention.md",
+    "docs/legacy-operator-read-boundaries.md"
+  ],
+  "position": "Every fixture in this directory describes a comparator that does not run, against an API that does not exist, over an audit store nobody has created. These cases keep that true: the authority constant is imported rather than restated, the design modules are unreachable from the runtime tree, the lane vocabulary refuses any mode where a reader has already moved, and no route, credential, auth check or audit table has appeared anywhere.",
+  "authority": {
+    "read_authority": "legacy",
+    "read_modes": ["off", "shadow", "compare", "prefer", "only"],
+    "shadow_modes": ["shadow", "compare"],
+    "refused_modes": ["off", "prefer", "only"],
+    "why": "`prefer` and `only` are modes in which a reader has already moved; `off` is not a comparison at all. The comparator refuses all three rather than producing evidence that describes a lane it is not in."
+  },
+  "design_modules": [
+    {
+      "module": "hear/verify/list_read.py",
+      "importable_by": ["hear/verify/__init__.py", "tools/gen_list_read_contracts.py", "tests"],
+      "runtime_importers_allowed": 0
+    },
+    {
+      "module": "hear/verify/shadow_read.py",
+      "importable_by": ["hear/verify/__init__.py", "hear/verify/list_read.py", "tools/gen_shadow_read_contracts.py", "tests"],
+      "runtime_importers_allowed": 0
+    }
+  ],
+  "forbidden_in_runtime_trees": {
+    "searched_trees": ["hear", "tools", "modules"],
+    "endpoint_literals": ["/api/v1/detections", "/api/v1/clips", "/api/v1/annotations", "/api/v1/audit", "/api/readcompare"],
+    "why": "A canonical operator read route is the one thing Phase 6 must not grow by accident. The check is over string literals in the trees that run, not over prose in a design document."
+  },
+  "no_auth_enforcement": {
+    "must_not_appear_in": ["hear/verify/list_read.py", "hear/verify/shadow_read.py"],
+    "tokens": ["password", "api_key =", "bearer ", "secret =", "Authorization:", "verify_token", "check_scope", "require_role"],
+    "why": "These fixtures pin a contract; they do not authorise, authenticate or enforce anything. A comparator with a credential of its own is a reader."
+  },
+  "no_live_read_path": {
+    "network_modules_forbidden": ["socket", "http", "urllib", "requests", "asyncio", "psycopg", "psycopg2", "redis", "kubernetes"],
+    "io_builtins_forbidden": ["open", "input", "exec", "eval", "compile", "__import__"],
+    "node_endpoints_forbidden": ["/status", "/ls", "/sd", "/audio", "/api/queue", "/api/export"],
+    "why": "P6-R5: the node HTTP client is single-threaded and shared, so a comparator that polled a node would be a competing fetcher against live capture. The rule is asserted over imports and string literals so the modules may still explain in prose that they open no socket."
+  },
+  "schema_constants": [
+    {"schema": "docs/phase6-list-read/hear.readcompare.receipt.v1.schema.json", "pointer": ["properties", "read_authority", "const"], "value": "legacy"},
+    {"schema": "docs/phase5-shadow-read/hear.shadowread.receipt.v1.schema.json", "pointer": ["properties", "read_authority", "const"], "value": "legacy"},
+    {"schema": "docs/phase6-list-read/hear.readcompare.receipt.v1.schema.json", "pointer": ["properties", "disposition", "properties", "queued", "const"], "value": false}
+  ],
+  "manifest_claims": [
+    {"manifest": "docs/phase6-list-read/fixtures/manifest.json", "key": "read_authority", "value": "legacy"},
+    {"manifest": "docs/phase6-list-read/fixtures/manifest.json", "key": "status", "value": "staged"},
+    {"manifest": "docs/phase5-shadow-read/fixtures/manifest.json", "key": "read_authority", "value": "legacy"}
+  ],
+  "every_emitted_receipt_declares": {
+    "read_authority": "legacy",
+    "read_mode_in": ["shadow", "compare"],
+    "disposition.queued": false,
+    "scanned_fixture_dirs": [
+      "docs/phase6-list-read/fixtures",
+      "docs/phase5-shadow-read/fixtures"
+    ]
+  }
+}
