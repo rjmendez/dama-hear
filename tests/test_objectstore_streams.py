@@ -41,7 +41,6 @@ def test_an_append_after_the_freeze_is_invisible_to_this_run(pool):
     frozen = S.freeze_range(pool["records_path"])
     with open(pool["records_path"], "ab") as fh:
         fh.write(json.dumps({"key": "late"}, sort_keys=True).encode("utf-8") + b"\n")
-    seg = S.segment(frozen, "record-seg", ("2026-09-12", "node"), 1)
     assert "late" not in frozen.body.decode("utf-8")
     # ...and the next run picks it up from where this one stopped, with no overlap and no gap.
     nxt = S.freeze_range(pool["records_path"], start=frozen.end)
