@@ -1,0 +1,422 @@
+{
+  "aggregate_functions": [
+    "count",
+    "distinct",
+    "sum",
+    "min",
+    "max",
+    "p50",
+    "p95",
+    "p99"
+  ],
+  "blocking_classifications": [
+    "cursor_divergence",
+    "tie_break_divergence",
+    "count_divergence",
+    "membership_divergence",
+    "aggregate_divergence",
+    "export_divergence",
+    "filter_divergence",
+    "projection_divergence",
+    "tombstone_divergence",
+    "threshold_divergence",
+    "scope_divergence",
+    "comparator_fault",
+    "unclassified"
+  ],
+  "bounds": {
+    "backfill_settle_s": 86400,
+    "cost_ceiling_s_per_10k_rows": 60.0,
+    "default_page_denominator": 10,
+    "default_query_denominator": 50,
+    "export_slice_rows": 1000,
+    "late_arrival_s": 3600,
+    "max_aggregate_cells": 500,
+    "max_differences": 32,
+    "max_export_rows_compared": 50000,
+    "max_pages_compared": 20,
+    "max_receipt_bytes": 8192,
+    "max_rows_compared": 10000,
+    "min_cell_count": 5,
+    "order_grace_s": 300,
+    "pin_ttl_s": 86400,
+    "retention_edge_s": 3600,
+    "settle_s": 900,
+    "snapshot_skew_s": 5
+  },
+  "cases": [
+    {
+      "description": "Both sides pinned, same page, same rows, same order.",
+      "emits_receipt": true,
+      "expected_classification": "match",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "match-two-pinned-pages-agree.json"
+    },
+    {
+      "description": "The canonical list has not caught up with rows minutes old; no receipt is written.",
+      "emits_receipt": false,
+      "expected_classification": "pending",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "pending-inside-the-settle-horizon.json"
+    },
+    {
+      "description": "The canonical list returned the page 300 s after the settle horizon.",
+      "emits_receipt": true,
+      "expected_classification": "late_arrival",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "warn",
+      "file": "late-arrival-after-the-settle-horizon.json"
+    },
+    {
+      "description": "A pinned legacy re-read returned a different page. Expected on a surface with no snapshot isolation; row-level verdicts for the page are withheld.",
+      "emits_receipt": true,
+      "expected_classification": "snapshot_drift",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "warn",
+      "file": "snapshot-drift-legacy-list-has-no-isolation.json"
+    },
+    {
+      "description": "A row landed at the page boundary while the window was open. The page shifted; the data did not.",
+      "emits_receipt": true,
+      "expected_classification": "boundary_drift",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "warn",
+      "file": "boundary-drift-insert-at-a-page-edge.json"
+    },
+    {
+      "description": "Re-reading with the same canonical cursor returned different rows.",
+      "emits_receipt": true,
+      "expected_classification": "cursor_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "reindex_request",
+      "expected_severity": "critical",
+      "file": "cursor-divergence-unstable-round-trip.json"
+    },
+    {
+      "description": "Paging dropped a row between two pages; contiguity is judged before content.",
+      "emits_receipt": true,
+      "expected_classification": "cursor_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "reindex_request",
+      "expected_severity": "critical",
+      "file": "cursor-divergence-row-skipped-across-a-page-boundary.json"
+    },
+    {
+      "description": "Two rows share a `captured_at` and the two sides ordered them differently; the sort key is not a total order on at least one side.",
+      "emits_receipt": true,
+      "expected_classification": "tie_break_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "reindex_request",
+      "expected_severity": "critical",
+      "file": "tie-break-divergence-equal-sort-keys-ordered-differently.json"
+    },
+    {
+      "description": "Ordering inversions outlived the order grace window.",
+      "emits_receipt": true,
+      "expected_classification": "order_divergence",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "warn",
+      "file": "order-divergence-past-the-order-grace-window.json"
+    },
+    {
+      "description": "The same inversions, inside the grace window: a gap that closes itself was never a defect. Proves the comparator does not fire on correct behaviour.",
+      "emits_receipt": true,
+      "expected_classification": "match",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "match-inversions-inside-the-order-grace-window.json"
+    },
+    {
+      "description": "One side stopped at the page cap and the other did not; the two answers cover different extents.",
+      "emits_receipt": true,
+      "expected_classification": "pagination_divergence",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "reindex_request",
+      "expected_severity": "warn",
+      "file": "pagination-divergence-one-side-truncated.json"
+    },
+    {
+      "description": "Same settled question, different row counts.",
+      "emits_receipt": true,
+      "expected_classification": "count_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "count-divergence-on-a-settled-window.json"
+    },
+    {
+      "description": "Identical row counts over the same pinned window, but not the same rows.",
+      "emits_receipt": true,
+      "expected_classification": "membership_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "replay_inbox",
+      "expected_severity": "critical",
+      "file": "membership-divergence-same-count-different-rows.json"
+    },
+    {
+      "description": "A per-device daily count differs. Counts are compared with zero tolerance, always.",
+      "emits_receipt": true,
+      "expected_classification": "aggregate_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "aggregate-divergence-one-cell-differs.json"
+    },
+    {
+      "description": "Two aggregates agree, and the below-k cell is still counted with its key redacted; the verdict is never suppressed, only the identity.",
+      "emits_receipt": true,
+      "expected_classification": "match",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "aggregate-small-cell-key-suppressed.json"
+    },
+    {
+      "description": "A below-k cell diverges: the finding is reported in full, and both numbers are redacted because a cell of three is a person or a node, not a population.",
+      "emits_receipt": true,
+      "expected_classification": "aggregate_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "aggregate-divergence-small-cell-values-redacted.json"
+    },
+    {
+      "description": "Page exhaustion over a recorded (since_id, max_id) range is digest-identical to the bounded export of the same range.",
+      "emits_receipt": true,
+      "expected_classification": "match",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "export-equivalence-bounded-range-matches.json"
+    },
+    {
+      "description": "Same bounded range, same row count, different ordered content digest.",
+      "emits_receipt": true,
+      "expected_classification": "export_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "export-divergence-same-rows-different-content.json"
+    },
+    {
+      "description": "The legacy export offers no range bound, so the comparison is refused and the coverage loss recorded. The comparator never issues the unbounded read.",
+      "emits_receipt": true,
+      "expected_classification": "export_bound_exceeded",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "warn",
+      "file": "export-bound-exceeded-comparator-refuses-the-unbounded-dump.json"
+    },
+    {
+      "description": "The same request became two questions; every row verdict downstream would be an artefact.",
+      "emits_receipt": true,
+      "expected_classification": "filter_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "filter-divergence-inclusive-versus-half-open-bound.json"
+    },
+    {
+      "description": "The two surfaces expose different field sets; one shape difference is one finding, not one per row.",
+      "emits_receipt": true,
+      "expected_classification": "projection_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "projection-divergence-different-compared-field-sets.json"
+    },
+    {
+      "description": "One surface has pruned rows the other still lists, nowhere near either declared horizon.",
+      "emits_receipt": true,
+      "expected_classification": "retention_divergence",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "warn",
+      "file": "retention-divergence-pruned-away-from-any-horizon.json"
+    },
+    {
+      "description": "Rows aged past the legacy 7-day raw horizon are excluded as a retention edge, not reported as loss. Proves the comparator does not fire on correct behaviour.",
+      "emits_receipt": true,
+      "expected_classification": "match",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "none",
+      "expected_severity": "info",
+      "file": "match-rows-past-the-legacy-retention-horizon.json"
+    },
+    {
+      "description": "A deletion did not propagate: the row is tombstoned on one side and still listed on the other.",
+      "emits_receipt": true,
+      "expected_classification": "tombstone_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "tombstone-divergence-deleted-row-still-listed.json"
+    },
+    {
+      "description": "The two sides used different operator thresholds (P6-R3). The run is void, not a mismatch.",
+      "emits_receipt": true,
+      "expected_classification": "threshold_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "threshold-divergence-two-sides-invoked-differently.json"
+    },
+    {
+      "description": "The two answers cover different sites or device sets; a pair about two scopes is not a pair.",
+      "emits_receipt": true,
+      "expected_classification": "scope_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "scope-divergence-two-sides-answered-for-different-scopes.json"
+    },
+    {
+      "description": "A staged rollout is a mixed-version deployment; comparison continues over the intersection.",
+      "emits_receipt": true,
+      "expected_classification": "version_divergence",
+      "expected_gate_impact": "none",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "warn",
+      "file": "version-divergence-mixed-read-majors.json"
+    },
+    {
+      "description": "The legacy list could not be pinned, so there is no snapshot to compare against.",
+      "emits_receipt": true,
+      "expected_classification": "comparator_fault",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "comparator-fault-unpinned-legacy-list.json"
+    },
+    {
+      "description": "The comparator presented a pin older than its 24 h lifetime; the auditor's own scheduling defect, never a store's.",
+      "emits_receipt": true,
+      "expected_classification": "comparator_fault",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "comparator-fault-expired-pin.json"
+    },
+    {
+      "description": "The two reads are 45 s apart and describe different moments.",
+      "emits_receipt": true,
+      "expected_classification": "comparator_fault",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "comparator-fault-snapshot-skew.json"
+    },
+    {
+      "description": "The legacy list surface did not answer; absence of an answer is not an answer about absence.",
+      "emits_receipt": true,
+      "expected_classification": "comparator_fault",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "comparator-fault-legacy-surface-unavailable.json"
+    },
+    {
+      "description": "One surface published no result digest, so no verdict is derivable.",
+      "emits_receipt": true,
+      "expected_classification": "unclassified",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_repair_action": "manual_review",
+      "expected_severity": "critical",
+      "file": "unclassified-missing-result-digest.json"
+    }
+  ],
+  "classifications": [
+    "match",
+    "pending",
+    "late_arrival",
+    "snapshot_drift",
+    "boundary_drift",
+    "cursor_divergence",
+    "tie_break_divergence",
+    "order_divergence",
+    "pagination_divergence",
+    "count_divergence",
+    "membership_divergence",
+    "aggregate_divergence",
+    "export_divergence",
+    "export_bound_exceeded",
+    "filter_divergence",
+    "projection_divergence",
+    "retention_divergence",
+    "tombstone_divergence",
+    "threshold_divergence",
+    "scope_divergence",
+    "version_divergence",
+    "comparator_fault",
+    "unclassified"
+  ],
+  "contract": "hear.readcompare.receipt.v1",
+  "contract_major": 1,
+  "drift_kinds": [
+    "none",
+    "insert_drift",
+    "delete_drift",
+    "update_drift",
+    "reorder_drift",
+    "snapshot_drift",
+    "pin_absent"
+  ],
+  "exhaustive_surfaces": [
+    "health_snapshot",
+    "ledger_stat",
+    "audit_list",
+    "annotation_export"
+  ],
+  "generator": "tools/gen_list_read_contracts.py",
+  "grains": [
+    "page",
+    "window",
+    "aggregate",
+    "export"
+  ],
+  "group_key_dimensions": [
+    "site_id",
+    "device_id",
+    "day",
+    "hour",
+    "evidence_class",
+    "kind",
+    "state",
+    "retention_class",
+    "lane_mode"
+  ],
+  "media_type": "application/vnd.dama.hear.readcompare.receipt.v1+json",
+  "pin_kinds": [
+    "cursor_pin",
+    "range_pin",
+    "snapshot_id",
+    "none"
+  ],
+  "read_authority": "legacy",
+  "source_of_truth": "hear/verify/list_read.py",
+  "staged_reason": "the artifacts live under docs/ rather than contracts/ until the Phase 4 and Phase 5 receipts ahead of them are promoted, because publishing a contract id regenerates the Phase 0 freeze baseline and two lanes regenerating one hashed file is a conflict with no meaning. Promotion is a git mv plus a baseline regeneration and no content change; see docs/decisions/0009-phase6-list-read-comparison.md.",
+  "status": "staged",
+  "surfaces": [
+    "annotation_queue",
+    "annotation_export",
+    "fleet_health_table",
+    "health_snapshot",
+    "clip_index",
+    "detection_list",
+    "scene_list",
+    "tag_list",
+    "score_list",
+    "localization_list",
+    "audit_list",
+    "ledger_stat"
+  ]
+}

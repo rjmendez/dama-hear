@@ -1,0 +1,1016 @@
+{
+  "$id": "https://schemas.dama.example/hear/readcompare/v1/receipt.schema.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": true,
+  "description": "Durable record of one legacy/canonical list, aggregate or bounded-export read comparison. Carries pins, digests, counts, cell keys above a k-anonymity floor and reason codes; never result bodies, cursor tokens, credentials, coordinates, reviewer identities, free text or clip audio.",
+  "properties": {
+    "aggregate": {
+      "additionalProperties": true,
+      "properties": {
+        "cells_compared": {
+          "description": "cells in the comparison",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cells_suppressed": {
+          "description": "cells whose key was redacted for being below the k-anonymity floor; their verdicts are still counted",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "dimensions": {
+          "items": {
+            "description": "closed dimension list",
+            "enum": [
+              "site_id",
+              "device_id",
+              "day",
+              "hour",
+              "evidence_class",
+              "kind",
+              "state",
+              "retention_class",
+              "lane_mode"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "function": {
+          "description": "how the cells were computed",
+          "enum": [
+            "count",
+            "distinct",
+            "sum",
+            "min",
+            "max",
+            "p50",
+            "p95",
+            "p99"
+          ],
+          "type": "string"
+        },
+        "tolerance": {
+          "description": "0 for count and distinct, always",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "comparator": {
+      "additionalProperties": true,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "receipt_major": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "coverage": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "differences": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "blind": {
+            "description": "equality decided in memory; no value is durable, not even a hash",
+            "type": "boolean"
+          },
+          "canonical": {
+            "description": "redacted, or null for a blind comparator"
+          },
+          "comparator": {
+            "description": "how the value was compared",
+            "enum": [
+              "exact",
+              "hash",
+              "tier",
+              "numeric",
+              "count",
+              "set",
+              "order",
+              "presence",
+              "blind"
+            ],
+            "type": "string"
+          },
+          "legacy": {
+            "description": "redacted, or null for a blind comparator"
+          },
+          "path": {
+            "type": "string"
+          },
+          "quoted": {
+            "type": "boolean"
+          },
+          "tolerance": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "legacy",
+          "canonical",
+          "comparator",
+          "tolerance",
+          "quoted",
+          "blind"
+        ],
+        "type": "object"
+      },
+      "maxItems": 32,
+      "type": "array"
+    },
+    "differences_dropped": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "disposition": {
+      "additionalProperties": true,
+      "properties": {
+        "gate_impact": {
+          "description": "cutover consequence",
+          "enum": [
+            "none",
+            "blocks_cutover"
+          ],
+          "type": "string"
+        },
+        "queue_ref": {
+          "description": "set by a human, never by this tool",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "queued": {
+          "const": false,
+          "description": "the comparator never queues repair; a human dequeues from an advisory work list",
+          "type": "boolean"
+        },
+        "repair_action": {
+          "description": "advisory only",
+          "enum": [
+            "none",
+            "replay_inbox",
+            "replay_outbox",
+            "reindex_request",
+            "manual_review"
+          ],
+          "type": "string"
+        },
+        "repairable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "repairable",
+        "repair_action",
+        "gate_impact",
+        "queued"
+      ],
+      "type": "object"
+    },
+    "drift": {
+      "additionalProperties": true,
+      "properties": {
+        "kind": {
+          "description": "what changed underneath the paged read",
+          "enum": [
+            "none",
+            "insert_drift",
+            "delete_drift",
+            "update_drift",
+            "reorder_drift",
+            "snapshot_drift",
+            "pin_absent"
+          ],
+          "type": "string"
+        },
+        "rows_deleted": {
+          "description": "",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rows_inserted": {
+          "description": "",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rows_updated": {
+          "description": "",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "emitted_at": {
+      "type": "string"
+    },
+    "evidence": {
+      "additionalProperties": true,
+      "properties": {
+        "canonical_result_ref": {
+          "description": "object key of the retained canonical answer",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "legacy_result_ref": {
+          "description": "object key of the retained legacy answer",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "redaction_profile": {
+          "const": "hear.readcompare.redact.v1",
+          "type": "string"
+        }
+      },
+      "required": [
+        "redaction_profile"
+      ],
+      "type": "object"
+    },
+    "export": {
+      "additionalProperties": true,
+      "properties": {
+        "bounded": {
+          "description": "false means the comparator refused the read",
+          "type": "boolean"
+        },
+        "manifest_digest_equal": {
+          "description": "paged concatenation equals the bounded export",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "max_id_present": {
+          "type": "boolean"
+        },
+        "reason": {
+          "description": "why, when it is not equal",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rows_compared": {
+          "description": "rows actually compared",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rows_declared": {
+          "description": "rows the manifest claims",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "since_id_present": {
+          "type": "boolean"
+        },
+        "slices": {
+          "description": "ordered digest slices compared",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "grain": {
+      "description": "one page, one settled window, one aggregate, one bounded export",
+      "enum": [
+        "page",
+        "window",
+        "aggregate",
+        "export"
+      ],
+      "type": "string"
+    },
+    "page": {
+      "additionalProperties": true,
+      "properties": {
+        "boundary_first_row_key": {
+          "description": "hashed identity only",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "boundary_last_row_key": {
+          "description": "hashed identity only",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "count": {
+          "description": "pages in the pinned answer",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "fingerprint": {
+          "description": "identity of this page in this pin",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "first": {
+          "type": "boolean"
+        },
+        "index": {
+          "description": "0-based page index within the pin",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "last": {
+          "type": "boolean"
+        },
+        "size": {
+          "description": "rows requested",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "query": {
+      "additionalProperties": true,
+      "properties": {
+        "bound_kind": {
+          "description": "inclusivity of the bounds, folded into the fingerprint because it is how one request becomes two questions",
+          "enum": [
+            "half_open",
+            "closed"
+          ],
+          "type": "string"
+        },
+        "device_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "expected_difference_list": {
+          "description": "version of the dated list of known legacy defects whose differences are expected rather than findings",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filters": {
+          "additionalProperties": true,
+          "description": "redacted filter values; a query is user input and an unknown filter path defaults to hidden",
+          "type": "object"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "page_size": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "projection_version": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "site_id": {
+          "type": "string"
+        },
+        "sort": {
+          "additionalProperties": true,
+          "properties": {
+            "direction": {
+              "description": "sort direction",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "type": "string"
+            },
+            "field": {
+              "type": "string"
+            },
+            "tie_break": {
+              "description": "unique column making the sort a total order",
+              "type": "string"
+            }
+          },
+          "required": [
+            "field",
+            "direction",
+            "tie_break"
+          ],
+          "type": "object"
+        },
+        "surface": {
+          "description": "which list/aggregate/export surface",
+          "enum": [
+            "annotation_queue",
+            "annotation_export",
+            "fleet_health_table",
+            "health_snapshot",
+            "clip_index",
+            "detection_list",
+            "scene_list",
+            "tag_list",
+            "score_list",
+            "localization_list",
+            "audit_list",
+            "ledger_stat"
+          ],
+          "type": "string"
+        },
+        "threshold_fingerprint": {
+          "description": "digest of the operator threshold set both sides were invoked with; two different sets void the run",
+          "type": "string"
+        },
+        "time_from": {
+          "description": "lower bound",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_to": {
+          "description": "upper bound",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "fingerprint",
+        "surface",
+        "site_id",
+        "sort",
+        "page_size",
+        "projection_version",
+        "threshold_fingerprint"
+      ],
+      "type": "object"
+    },
+    "read_authority": {
+      "const": "legacy",
+      "description": "legacy remains authoritative; this comparator serves nobody",
+      "type": "string"
+    },
+    "read_mode": {
+      "description": "the lane mode this comparison ran under",
+      "enum": [
+        "shadow",
+        "compare"
+      ],
+      "type": "string"
+    },
+    "receipt_id": {
+      "description": "uuid5 over (contract, run_id, query fingerprint, page or aggregate key); a re-run converges instead of duplicating.",
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "sampling": {
+      "additionalProperties": true,
+      "properties": {
+        "forced_reason": {
+          "description": "why sampling was overridden",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rate_denominator": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "sampled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "sampled",
+        "rate_denominator"
+      ],
+      "type": "object"
+    },
+    "schema": {
+      "const": "hear.readcompare.receipt.v1",
+      "type": "string"
+    },
+    "schema_version": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "sides": {
+      "additionalProperties": true,
+      "properties": {
+        "canonical": {
+          "additionalProperties": true,
+          "properties": {
+            "cursor_stable": {
+              "description": "the cursor round-tripped to the same rows",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "membership_digest": {
+              "description": "which rows, order ignored",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "order_digest": {
+              "description": "the sequence of row keys",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "outcome": {
+              "description": "what the read surface did",
+              "enum": [
+                "answered",
+                "refused",
+                "errored",
+                "unavailable"
+              ],
+              "type": "string"
+            },
+            "page_count": {
+              "description": "pages consumed for this answer",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pin_age_s": {
+              "description": "age of the pin when the read was issued",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "pin_id": {
+              "description": "non-secret handle for the pin; never the cursor token, which is opaque and side-local",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pin_kind": {
+              "description": "how this side was pinned to a snapshot",
+              "enum": [
+                "cursor_pin",
+                "range_pin",
+                "snapshot_id",
+                "none"
+              ],
+              "type": "string"
+            },
+            "projection_fields_digest": {
+              "description": "the compared field set",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "projection_version": {
+              "description": "compared projection version",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "read_contract_major": {
+              "description": "read API/contract major",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "reader": {
+              "description": "which reader answered",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reader_version": {
+              "description": "its build",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reasons": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "result_hash": {
+              "description": "order-independent digest of the settled set",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "retention_class": {
+              "description": "governance retention class",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "retention_horizon_s": {
+              "description": "declared retention horizon",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "row_count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "row_state": {
+              "description": "what this surface says about the listed rows",
+              "enum": [
+                "present",
+                "absent",
+                "tombstoned",
+                "retention_expired"
+              ],
+              "type": "string"
+            },
+            "snapshot_at": {
+              "description": "when this surface answered",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "truncated": {
+              "description": "a page or row cap was reached",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "outcome",
+            "row_state",
+            "row_count",
+            "pin_kind"
+          ],
+          "type": "object"
+        },
+        "legacy": {
+          "additionalProperties": true,
+          "properties": {
+            "cursor_stable": {
+              "description": "the cursor round-tripped to the same rows",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "membership_digest": {
+              "description": "which rows, order ignored",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "order_digest": {
+              "description": "the sequence of row keys",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "outcome": {
+              "description": "what the read surface did",
+              "enum": [
+                "answered",
+                "refused",
+                "errored",
+                "unavailable"
+              ],
+              "type": "string"
+            },
+            "page_count": {
+              "description": "pages consumed for this answer",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pin_age_s": {
+              "description": "age of the pin when the read was issued",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "pin_id": {
+              "description": "non-secret handle for the pin; never the cursor token, which is opaque and side-local",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pin_kind": {
+              "description": "how this side was pinned to a snapshot",
+              "enum": [
+                "cursor_pin",
+                "range_pin",
+                "snapshot_id",
+                "none"
+              ],
+              "type": "string"
+            },
+            "projection_fields_digest": {
+              "description": "the compared field set",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "projection_version": {
+              "description": "compared projection version",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "read_contract_major": {
+              "description": "read API/contract major",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "reader": {
+              "description": "which reader answered",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reader_version": {
+              "description": "its build",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reasons": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "result_hash": {
+              "description": "order-independent digest of the settled set",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "retention_class": {
+              "description": "governance retention class",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "retention_horizon_s": {
+              "description": "declared retention horizon",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "row_count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "row_state": {
+              "description": "what this surface says about the listed rows",
+              "enum": [
+                "present",
+                "absent",
+                "tombstoned",
+                "retention_expired"
+              ],
+              "type": "string"
+            },
+            "snapshot_at": {
+              "description": "when this surface answered",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "truncated": {
+              "description": "a page or row cap was reached",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "outcome",
+            "row_state",
+            "row_count",
+            "pin_kind"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "legacy",
+        "canonical"
+      ],
+      "type": "object"
+    },
+    "verdict": {
+      "additionalProperties": true,
+      "properties": {
+        "actionable": {
+          "type": "boolean"
+        },
+        "classification": {
+          "description": "closed verdict vocabulary",
+          "enum": [
+            "match",
+            "pending",
+            "late_arrival",
+            "snapshot_drift",
+            "boundary_drift",
+            "cursor_divergence",
+            "tie_break_divergence",
+            "order_divergence",
+            "pagination_divergence",
+            "count_divergence",
+            "membership_divergence",
+            "aggregate_divergence",
+            "export_divergence",
+            "export_bound_exceeded",
+            "filter_divergence",
+            "projection_divergence",
+            "retention_divergence",
+            "tombstone_divergence",
+            "threshold_divergence",
+            "scope_divergence",
+            "version_divergence",
+            "comparator_fault",
+            "unclassified"
+          ],
+          "type": "string"
+        },
+        "gate_impact": {
+          "description": "whether this stops a read cutover",
+          "enum": [
+            "none",
+            "blocks_cutover"
+          ],
+          "type": "string"
+        },
+        "notes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "repair_action": {
+          "description": "advisory, replay-only boundary",
+          "enum": [
+            "none",
+            "replay_inbox",
+            "replay_outbox",
+            "reindex_request",
+            "manual_review"
+          ],
+          "type": "string"
+        },
+        "severity": {
+          "description": "operator routing",
+          "enum": [
+            "info",
+            "warn",
+            "critical"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "classification",
+        "severity",
+        "repair_action",
+        "gate_impact",
+        "actionable"
+      ],
+      "type": "object"
+    },
+    "window": {
+      "additionalProperties": true,
+      "properties": {
+        "as_of": {
+          "type": "string"
+        },
+        "end": {
+          "type": "string"
+        },
+        "settle_s": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "start": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "start",
+        "end",
+        "as_of",
+        "settle_s"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "receipt_id",
+    "run_id",
+    "emitted_at",
+    "read_authority",
+    "read_mode",
+    "grain",
+    "window",
+    "query",
+    "drift",
+    "sides",
+    "verdict",
+    "differences",
+    "differences_dropped",
+    "disposition",
+    "sampling",
+    "coverage",
+    "evidence",
+    "comparator"
+  ],
+  "title": "hear.readcompare.receipt.v1",
+  "type": "object"
+}
