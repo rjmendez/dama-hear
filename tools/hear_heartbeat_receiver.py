@@ -2291,7 +2291,10 @@ def make_handler(store: HeartbeatReceiverStore,
                  auth_token: Optional[str] = AUTH_TOKEN,
                  socket_timeout_s: float = SOCKET_TIMEOUT_S,
                  ingest_metrics: Optional[IO.IngestMetrics] = None,
-                 batch_adapter: Optional[BatchIngestAdapter] = None) -> type[BaseHTTPRequestHandler]:
+                 batch_adapter: Optional[BatchIngestAdapter] = None,
+                 before_batch_response: Optional[
+                     Callable[[int, str, Dict[str, str], str], None]
+                 ] = None) -> type[BaseHTTPRequestHandler]:
     ingest_metrics = ingest_metrics or IO.IngestMetrics()
 
     class ReceiverHandler(BaseHTTPRequestHandler):
@@ -2358,6 +2361,8 @@ def make_handler(store: HeartbeatReceiverStore,
                     logger.exception("batch ingest request crashed: %s", exc)
                     return
                 encoded = body.encode("utf-8")
+                if before_batch_response is not None:
+                    before_batch_response(status, body, headers, request_id)
                 self.send_response(status)
                 for key, value in headers.items():
                     self.send_header(key, value)
@@ -2521,6 +2526,9 @@ def create_server(bind: str, port: int, store: HeartbeatReceiverStore,
                   socket_timeout_s: float = SOCKET_TIMEOUT_S,
                   ingest_metrics: Optional[IO.IngestMetrics] = None,
                   batch_adapter: Optional[BatchIngestAdapter] = None,
+                  before_batch_response: Optional[
+                      Callable[[int, str, Dict[str, str], str], None]
+                  ] = None,
                   durable_replay_interval_s: float = 0.0,
                   durable_replay_limit: int = DURABLE_REPLAY_LIMIT,
                   durable_prune_interval_s: float = 0.0,
@@ -2533,7 +2541,8 @@ def create_server(bind: str, port: int, store: HeartbeatReceiverStore,
         (bind, port),
         make_handler(store, max_body_bytes=max_body_bytes,
                      auth_token=auth_token, socket_timeout_s=socket_timeout_s,
-                     ingest_metrics=ingest_metrics, batch_adapter=batch_adapter),
+                     ingest_metrics=ingest_metrics, batch_adapter=batch_adapter,
+                     before_batch_response=before_batch_response),
         store,
         durable_replay_interval_s=durable_replay_interval_s,
         durable_replay_limit=durable_replay_limit,
