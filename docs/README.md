@@ -60,6 +60,7 @@ what was chosen, the in-tree evidence it rests on, and what was deliberately lef
 |---|---|
 | [architecture.md](architecture.md) | Current system overview. |
 | [acoustic-stack.md](acoustic-stack.md) | The acoustic processing stack end to end. |
+| [survey-bioacoustic-foundation-models.md](survey-bioacoustic-foundation-models.md) | Survey of the bioacoustic backbone candidates behind the acoustic stack's Stage 1: Perch 2.0's measured architecture, provenance, objectives and documented non-avian failures; BioLingual, animal2vec, SurfPerch and the marine/infrasound models; AudioMAE and CAV-MAE against the shipped `mn10_as` and PaSST on parameters, GMACs and licence; and neural audio codecs (EnCodec, DAC, SoundStream, SemantiCodec) as an event-selected edge spool, with the airtime, satellite and storage arithmetic computed against this fleet's own measured radio and disk. Survey only; nothing selected or procured. |
 | [acoustic-models-bleeding-edge.md](acoustic-models-bleeding-edge.md) | The 5-Tier Acoustic Architecture: node micro-DSP, ingest privacy purge, coarse triage, bioacoustic foundation, spatial and replay — with block diagrams, per-tier latency/memory budgets, the licence compatibility matrix and gates G0–G4. |
 | [clip-pipeline.md](clip-pipeline.md) | Clip capture, drain, indexing, and retention. |
 | [timing.md](timing.md) | Clocking, boot-relative time, and trusted UTC. |

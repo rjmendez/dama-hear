@@ -306,6 +306,10 @@ path is designed, the GPU is contended, and the pull trigger is not yet inside t
 
 ### 5.1 Perch 2.0 — the backbone, chosen on licence
 
+> The measured survey behind this table — architecture, dataset provenance, training objectives,
+> the documented non-avian failures, the alternatives that were refused and the codec question
+> for spooling audio to it: **`docs/survey-bioacoustic-foundation-models.md`**.
+
 | property | value |
 |---|---|
 | licence | **Apache-2.0** ✅ |
