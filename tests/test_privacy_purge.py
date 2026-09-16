@@ -749,7 +749,7 @@ SHARED_FIXTURES = (
     ("gaussian_noise",      False,        False,              0.030),
     ("gaussian_noise_loud", False,        False,              0.041),
     ("pink_noise",          False,        False,              0.028),
-    ("pink_noise_loud",     False,        False,              0.028),
+    ("pink_noise_loud",     False,        False,              0.021),
     ("bird_chirps",         False,        False,              0.018),
     ("tone_1k",             False,        False,              0.006),
 )
@@ -761,6 +761,22 @@ def band_energy():
 
 def clip_at(tmp_path, name, samples, rate=16000):
     return write_wav(tmp_path / name, np.asarray(samples, dtype=np.float32), rate=rate)
+
+
+@pytest.mark.parametrize("name,_holds,_purges,silero_peak", SHARED_FIXTURES,
+                         ids=[f[0] for f in SHARED_FIXTURES])
+def test_the_silero_column_is_the_golden_and_not_a_memory_of_it(name, _holds, _purges,
+                                                                silero_peak):
+    """The column says it was measured, so it is compared to the measurement.
+
+    A number copied into a comment is a number that drifts the first time the fixtures are
+    regenerated, and this one is the only reason to believe the fallback agrees with anything.
+    """
+    with open(os.path.join(ROOT, "testdata", "silero_vad_golden.json"), encoding="utf-8") as fh:
+        golden = json.load(fh)
+    recorded = max(golden["fixtures"][name]["probs"])
+    assert abs(recorded - silero_peak) < 0.0015, \
+        "%s: the table says %.3f, the golden says %.3f" % (name, silero_peak, recorded)
 
 
 @pytest.mark.parametrize("name,holds_speech,purges,_silero", SHARED_FIXTURES,
