@@ -197,17 +197,60 @@ def test_unreadable_clips_raise_rather_than_returning_silence(tmp_path):
         P.read_wav_mono(str(missing))
 
 
-def test_a_clip_that_cannot_be_read_is_an_error_and_survives(tmp_path):
-    """Undecided is not innocent, and it is not guilty either: the file is left where it is."""
+def test_a_clip_that_cannot_be_read_is_destroyed_not_kept(tmp_path):
+    """Contract §9: undecided is treated as guilty. Keeping it is the unbounded-cost mistake."""
     bad = tmp_path / "bad.wav"
     bad.write_bytes(b"not a wav at all")
     outcome = P.purge_clip(str(bad), P.BandEnergyVAD())
-    assert outcome.status == "error"
-    assert outcome.receipt is None
-    assert bad.exists()
+    assert outcome.status == "purged"
+    assert not bad.exists()
+    rec = outcome.receipt.as_record()
+    assert rec["verdict"] == P.VERDICT_SPEECH
+    assert rec["fail_closed_reason"] == P.REASON_UNREADABLE
+    assert rec["peak_speech_prob"] == 0.0, "a fail-closed purge claims no measurement"
 
 
-def test_a_detector_fault_is_an_error_not_a_keep(tmp_path):
+def test_a_refused_sample_rate_fails_closed(tmp_path):
+    """44.1 kHz is not a rate this lane records at, so it cannot be honestly scored."""
+    path = write_wav(tmp_path / "odd.wav", voice(1.0, rate=44100), rate=44100)
+    outcome = P.purge_clip(path, P.BandEnergyVAD())
+    assert outcome.status == "purged" and not os.path.exists(path)
+    assert outcome.receipt.as_record()["fail_closed_reason"] == P.REASON_RATE
+
+
+def test_non_finite_audio_fails_closed_rather_than_scoring_as_silence():
+    """A NaN makes every `p >= threshold` False: a confident silence produced by arithmetic."""
+    sig = voice(1.0)
+    sig[1000] = np.nan
+    with pytest.raises(P.NonFiniteAudio):
+        P.BandEnergyVAD().detect(sig, RATE)
+    sig[1000] = np.inf
+    with pytest.raises(P.NonFiniteAudio):
+        P.inspect_samples(sig, RATE, P.BandEnergyVAD())
+
+
+def test_a_non_finite_stream_is_refused_not_stored(tmp_path):
+    """The streaming door returns a receipt -- 'do not store' -- instead of raising."""
+    class NaNVad:
+        name = "nan-vad"
+
+        def detect(self, samples, rate):
+            return P.VadDecision(False, float("nan"), 0.0, (), self.name)
+
+    import io
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(RATE)
+        wav.writeframes((voice() * 32767).astype("<i2").tobytes())
+    receipt = P.purge_wav_bytes(buf.getvalue(), node="n", vad=NaNVad())
+    assert receipt is not None, "a non-finite score must never mean 'safe to keep'"
+    assert receipt.as_record()["fail_closed_reason"] == P.REASON_INFERENCE
+
+
+def test_a_detector_fault_destroys_the_clip_and_says_why(tmp_path):
+    """`vad_unavailable` purging the backlog is the design, not a catastrophe (§9)."""
     class Broken:
         name = "broken"
 
@@ -216,8 +259,33 @@ def test_a_detector_fault_is_an_error_not_a_keep(tmp_path):
 
     path = write_wav(tmp_path / "v.wav", voice())
     outcome = P.purge_clip(path, Broken())
-    assert outcome.status == "error"
-    assert os.path.exists(path)
+    assert outcome.status == "purged" and not os.path.exists(path)
+    rec = outcome.receipt.as_record()
+    assert rec["fail_closed_reason"] == P.REASON_INFERENCE
+    assert rec["purged_sha256"], "the digest was taken before the detector was asked"
+
+
+def test_a_purge_that_fails_twice_stops_the_scan(tmp_path):
+    """Walking past a file this run judged speech-bearing would finish green while it is there."""
+    first = write_wav(tmp_path / "a-voice.wav", voice())
+    second = write_wav(tmp_path / "b-voice.wav", voice(f0=200.0))
+    real_shred = P.shred_file
+
+    def refuse(path, passes=1):
+        if os.path.basename(path).startswith("a-"):
+            raise P.PurgeError("read-only filesystem")
+        return real_shred(path, passes)
+
+    P.shred_file = refuse
+    try:
+        report = P.scan_pool(str(tmp_path), vad=P.BandEnergyVAD())
+    finally:
+        P.shred_file = real_shred
+
+    assert report.halted is True
+    assert report.scanned == 1, "nothing after the failure was scanned"
+    assert os.path.exists(first) and os.path.exists(second)
+    assert report.outcomes[-1].receipt.as_record()["fail_closed_reason"] == P.REASON_PURGE_FAILED
 
 
 # ---------------------------------------------------------------- destruction
@@ -357,9 +425,11 @@ def test_a_clean_stream_yields_no_receipt():
     assert P.purge_wav_bytes(buf.getvalue(), node="n") is None
 
 
-def test_a_malformed_stream_raises(tmp_path):
-    with pytest.raises(P.UnreadableClip):
-        P.purge_wav_bytes(b"RIFFnope", node="n")
+def test_a_malformed_stream_is_refused_rather_than_raising(tmp_path):
+    """A caller that only has to catch an exception to keep the bytes has opted out of §9."""
+    receipt = P.purge_wav_bytes(b"RIFFnope", node="n")
+    assert receipt is not None
+    assert receipt.as_record()["fail_closed_reason"] == P.REASON_UNREADABLE
 
 
 # ---------------------------------------------------------------- the privacy contract
@@ -486,12 +556,22 @@ def test_dry_run_receipt_does_not_claim_a_destruction(tmp_path):
     assert os.path.exists(path)
 
 
-def test_purge_wav_raises_only_when_the_clip_cannot_be_decided(tmp_path):
+def test_purge_wav_reports_a_fail_closed_destruction_instead_of_raising(tmp_path):
     bad = tmp_path / "bad.wav"
     bad.write_bytes(b"not a wav")
-    with pytest.raises(P.UnreadableClip):
-        P.purge_wav(str(bad), vad=P.BandEnergyVAD())
-    assert bad.exists()
+    rec = P.purge_wav(str(bad), vad=P.BandEnergyVAD())
+    assert rec["verdict"] == P.VERDICT_SPEECH
+    assert rec["fail_closed_reason"] == P.REASON_UNREADABLE
+    assert rec["zero_audio_retained"] is True
+    assert not bad.exists()
+
+
+def test_a_dry_run_never_fail_closes_a_file_off_the_disk(tmp_path):
+    bad = tmp_path / "bad.wav"
+    bad.write_bytes(b"not a wav")
+    rec = P.purge_wav(str(bad), vad=P.BandEnergyVAD(), dry_run=True)
+    assert rec["fail_closed_reason"] == P.REASON_UNREADABLE
+    assert rec["dry_run"] is True and bad.exists()
 
 
 # ---------------------------------------------------------------- hysteresis (contract §4)
@@ -604,11 +684,15 @@ def test_cli_json_mode_emits_parseable_receipts(tmp_path):
     assert records[0]["purge_reason"] == P.PURGE_REASON
 
 
-def test_cli_exit_code_2_when_a_clip_cannot_be_decided(tmp_path):
-    (tmp_path / "broken.wav").write_bytes(b"still not a wav")
+def test_cli_exit_code_3_when_a_clip_was_destroyed_without_being_scored(tmp_path):
+    """Fail-closed is correct AND is an alarm: a shredder is not a privacy control."""
+    broken = tmp_path / "broken.wav"
+    broken.write_bytes(b"still not a wav")
     proc = run_tool("--pool", str(tmp_path), "--vad", "band_energy")
-    assert proc.returncode == 2
-    assert "error" in proc.stdout
+    assert proc.returncode == 3, proc.stderr
+    assert "FAIL-CLOSED" in proc.stdout and "clip_unreadable" in proc.stdout
+    assert "fail-closed" in proc.stderr.lower()
+    assert not broken.exists()
 
 
 def test_cli_refuses_a_missing_pool_and_a_silly_threshold(tmp_path):

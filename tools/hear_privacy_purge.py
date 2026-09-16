@@ -16,11 +16,16 @@ while reporting that it had found it, and "the cron job was in dry-run" is preci
 retention policy becomes a document nobody enforces. `--dry-run` exists for the operator asking
 "what would this take?" and it touches neither the clips nor the audit log.
 
-⚠️EXIT CODES ARE FOR A CRON JOB, NOT FOR A HUMAN. 0 means every clip was decided (whether or not
-anything was purged); 2 means at least one clip could NOT be decided -- unreadable header,
-detector fault, a file that survived its own unlink. An undecided clip is the only failure this
-tool has, because it is the only state in which speech may still be on the disk while the run
-reports success.
+⚠️EXIT CODES ARE FOR A CRON JOB, NOT FOR A HUMAN.
+
+  0  every clip was decided by the detector and the pool is clean.
+  2  the run STOPPED, or a clip could not be handled at all: a purge that failed twice leaves a
+     file this run judged speech-bearing on the disk, and scanning past it would finish green
+     while the thing this tool exists to prevent is true (contract §9).
+  3  the pool is clean, but one or more clips were destroyed WITHOUT being scored -- unreadable
+     header, refused rate, detector fault. Fail-closed is the correct outcome and it is still an
+     alarm: a lane that quietly destroys the backlog because a dependency broke has stopped
+     being a privacy control and become a shredder.
 
 ⚠️WHAT IS PRINTED IS WHAT IS RECORDED. The per-clip line carries the receipt's own fields and
 nothing else: no waveform statistics, no "sounded like" annotation, no path outside the pool.
@@ -115,9 +120,14 @@ def main(argv=None) -> int:
         name = os.path.basename(outcome.path)
         if outcome.receipt is not None:
             rec = outcome.receipt.as_record()
+            digest = (rec["purged_sha256"] or "-")[:16]
+            if rec["fail_closed_reason"]:
+                print("%-12s %-40s FAIL-CLOSED %s  sha256 %s"
+                      % (outcome.status, name, rec["fail_closed_reason"], digest), flush=True)
+                return
             print("%-12s %-40s peak %.3f  speech %.2fs  sha256 %s"
-                  % (outcome.status, name, rec["peak_speech_prob"], rec["speech_s"],
-                     rec["purged_sha256"][:16]), flush=True)
+                  % (outcome.status, name, rec["peak_speech_prob"], rec["speech_s"], digest),
+                  flush=True)
         else:
             print("%-12s %-40s %s" % (outcome.status, name, outcome.detail), flush=True)
 
@@ -131,15 +141,24 @@ def main(argv=None) -> int:
     if args.json:
         print(json.dumps({"summary": summary}, sort_keys=True, separators=(",", ":")))
     else:
-        print("scanned %d  purged %d  would_purge %d  kept %d  already_absent %d  errors %d  "
-              "vad %s%s"
+        print("scanned %d  purged %d  would_purge %d  kept %d  already_absent %d  "
+              "fail_closed %d  errors %d  vad %s%s"
               % (report.scanned, report.purged, report.would_purge, report.kept,
-                 report.already_absent, report.errors, report.vad_engine,
+                 report.already_absent, report.fail_closed, report.errors, report.vad_engine,
                  "  audit %s" % report.audit_log if report.audit_log else "  (dry run)"))
+        if report.halted:
+            print("STOPPED: a purge failed and a clip judged speech-bearing is still on disk. "
+                  "Nothing after it was scanned.", file=sys.stderr)
+        if report.fail_closed:
+            print("%d clip(s) were destroyed WITHOUT being scored (fail-closed). Read the "
+                  "fail_closed_reason on those receipts before rearming this lane."
+                  % report.fail_closed, file=sys.stderr)
         if report.dry_run and report.would_purge:
             print("dry run: %d clip(s) hold speech and are still on disk. Re-run without "
                   "--dry-run to destroy them." % report.would_purge)
-    return 2 if report.errors else 0
+    if report.errors or report.halted:
+        return 2
+    return 3 if report.fail_closed else 0
 
 
 if __name__ == "__main__":
