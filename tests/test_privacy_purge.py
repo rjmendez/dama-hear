@@ -748,8 +748,8 @@ SHARED_FIXTURES = (
     ("silence",             False,        False,              0.009),
     ("gaussian_noise",      False,        False,              0.030),
     ("gaussian_noise_loud", False,        False,              0.041),
-    ("pink_noise",          False,        True,               0.028),
-    ("pink_noise_loud",     False,        True,               0.028),
+    ("pink_noise",          False,        False,              0.028),
+    ("pink_noise_loud",     False,        False,              0.028),
     ("bird_chirps",         False,        False,              0.018),
     ("tone_1k",             False,        False,              0.006),
 )
@@ -879,20 +879,39 @@ def test_a_fully_clipped_clip_is_still_judged(tmp_path):
 
 @pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
 def test_a_non_finite_sample_never_produces_a_confident_silence(bad):
-    """⚠️OPEN DEFECT, xfailing until the engine owner closes it (docs §9, `vad_inference_error`).
+    """CLOSED (docs §9, `vad_inference_error`): the refusal is louder than a fail-closed verdict.
 
-    A NaN propagates through the fallback's band ratio, `peak_prob` comes back NaN, every
-    comparison against the threshold is False, and the clip is reported as `speech=False` --
-    a confident silence produced by arithmetic rather than by the audio. Docs §9 requires the
-    opposite: a detector that answered NaN has not answered, and the clip is purged.
+    A NaN used to propagate through the fallback's band ratio, `peak_prob` came back NaN, every
+    comparison against the threshold was False, and the clip was reported `speech=False` -- a
+    confident silence produced by arithmetic rather than by the audio. The detector now refuses
+    the buffer outright, which `purge_clip` turns into a fail-closed purge with a stated reason
+    rather than a verdict that looks measured.
     """
     samples = np.asarray(SIG.speech_like(), dtype=np.float32).copy()
     samples[100] = bad
     with np.errstate(all="ignore"):
-        decision = P.inspect_samples(samples, 16000, band_energy())
-    if decision.peak_prob != decision.peak_prob:
-        pytest.xfail("peak_prob is NaN; docs §9 asks for a fail-closed purge, not a score")
-    assert decision.speech, "a clip with a voice and a corrupt sample was called silent"
+        with pytest.raises(P.NonFiniteAudio):
+            P.inspect_samples(samples, 16000, band_energy())
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_a_non_finite_sample_is_purged_rather_than_kept(tmp_path, bad):
+    """The refusal above, seen from the only place it matters: what happened to the audio."""
+    path = clip_at(tmp_path, "corrupt.wav", SIG.speech_like())
+    samples = np.asarray(SIG.speech_like(), dtype=np.float32).copy()
+    samples[100] = bad
+
+    class Corrupting:
+        name = "corrupting_stub"
+
+        def detect(self, _samples, rate):
+            with np.errstate(all="ignore"):
+                return P.inspect_samples(samples, rate, band_energy())
+
+    outcome = P.purge_clip(path, Corrupting())
+    assert outcome.status == "purged"
+    assert not os.path.exists(path)
+    assert outcome.receipt.fail_closed_reason
 
 
 def test_the_audit_log_stays_strict_json(tmp_path):

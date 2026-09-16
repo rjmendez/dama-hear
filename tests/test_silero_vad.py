@@ -767,10 +767,11 @@ def test_the_geometry_the_golden_was_measured_under_is_the_geometry_the_module_u
     frame = GOLDEN["frame"]
     rate = frame["rate_hz"]
     assert rate == V.MODEL_RATE_HZ
-    assert frame["chunk_samples"] == V.CHUNK_SAMPLES[rate]
-    assert frame["context_samples"] == V.CONTEXT_SAMPLES[rate]
+    assert frame["chunk_samples"] == V.CHUNK_SAMPLES == V.CHUNK_SAMPLES_BY_RATE[rate]
+    assert frame["context_samples"] == V.CONTEXT_SAMPLES == V.CONTEXT_SAMPLES_BY_RATE[rate]
     assert tuple(frame["state_shape"]) == tuple(V.STATE_SHAPE)
-    assert frame["chunk_samples"] + frame["context_samples"] == V.WINDOW_SAMPLES[rate]
+    assert (frame["chunk_samples"] + frame["context_samples"]
+            == V.WINDOW_SAMPLES == V.WINDOW_SAMPLES_BY_RATE[rate])
 
 
 @pytest.mark.parametrize("name", [f[0] for f in SHARED])
