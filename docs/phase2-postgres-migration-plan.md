@@ -517,6 +517,30 @@ harness and the schema/store parity suite are in the tree and green in CI:
 * CI job `durable outbox on an ephemeral postgres` runs it against a `postgres:16` service
   container with `HEAR_PG_REQUIRE_LIVE=1`, so the suite cannot pass by skipping — gate G7.
 
+**What exists now (the cut-over rehearsal, ahead of the store).** §6, §7 and §9.1 are rehearsed,
+not merely written down — against a synthetic corpus, never against a pool ledger:
+
+* `tools/hear_durable_ledger_fixture.py` builds the legacy corpus with the shipping
+  `SqliteDurableRecordStore` (cached and uncached rows, a failed-only attempt, a mach-era body, a
+  cross-ledger uid collision, poison rows, repeated refusals) — so no live data is exported to
+  rehearse an import;
+* `tools/hear_durable_backfill.py` is the M5 tool in rehearsal form: read-only source proven by a
+  write probe, freeze watermark, batching, checkpoint/resume, poison quarantine with a non-zero
+  exit, and `--reverse` (§9.1) guarded on a stopped, unlocked writer. Its destination must be a
+  `hear_test_<random>` scratch database;
+* `tools/hear_durable_reconcile.py` is M5v: per-`(device, path, day)` counts, bucket hash
+  digests, state and acknowledgement-time checks, the row-conservation statement, exit 2 on any
+  mismatch;
+* `tools/hear_durable_cutover_rehearsal.py` runs gates `R01`–`R11` and prints the receipt §15
+  asks for; `tests/test_hear_durable_cutover_rehearsal.py` runs the whole thing in CI, offline
+  against a model of `hear.backfill_record()` and — with a server — against the real function,
+  requiring the two to agree field for field.
+
+Correction to the §6 table above, from that rehearsal: a duplicate arrival does **not** increment
+`backfill_watermarks.rows_skipped`. `hear.backfill_record()` only writes that table when it
+inserts; the duplicate is counted as `durable_record_ids.duplicate_arrivals` and by the run
+report, which is where the reconciliation takes its skip count from.
+
 What it deliberately does not contain: anything that needs the Postgres `DurableRecordStore`
 itself (seam conformance parametrised over three backends, dual-write, reconciliation, reverse
 backfill, the performance smoke). Those land with the store, and the list below is their spec.
