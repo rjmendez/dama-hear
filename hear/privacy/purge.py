@@ -546,6 +546,16 @@ def decision_from_probs(probs: Sequence[float], hop_s: float, frame_s: float,
     arr = np.asarray(probs, dtype=np.float64)
     if arr.size == 0:
         return VadDecision(False, 0.0, 0.0, (), engine, None, 0, False)
+    # ⚠️A NaN PROBABILITY IS NOT A LOW PROBABILITY, AND IT FAILS OPEN IF IT IS LEFT ALONE. Every
+    # comparison against NaN is False, so `p >= threshold` never opens a segment, `peak` comes
+    # back NaN, the clip is reported speech=False, and a clip with a voice in it is kept -- a
+    # confident silence produced by arithmetic rather than by the audio. It also puts a token no
+    # strict JSON reader accepts into the audit log. Contract §9 `vad_inference_error`: a
+    # detector that answered NaN has not answered, so the frame counts as speech and the clip is
+    # purged. Reachable through `inspect_samples`/`purge_wav_bytes`, which take samples straight
+    # from memory; a 16-bit WAV cannot carry a non-finite sample.
+    if not np.all(np.isfinite(arr)):
+        arr = np.where(np.isfinite(arr), arr, 1.0)
     neg = float(threshold if neg_threshold is None else neg_threshold)
     if neg > float(threshold):
         raise PurgeError("neg_threshold %.3f is above threshold %.3f: a segment that cannot "
