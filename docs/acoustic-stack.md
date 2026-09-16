@@ -805,6 +805,10 @@ never downloads a model it cannot hash.
 
 ### 6.3 Stage 1 — Perch 2.0, chosen on licence
 
+> The backbone survey behind this choice — measured parameters, GMACs, licences, dataset
+> provenance and the documented non-avian failures, plus the codec options for spooling a remote
+> node's audio to it: **`docs/survey-bioacoustic-foundation-models.md`**.
+
 32 kHz, 5 s window, EfficientNet-B3, ~12M params, **1536-d** embeddings, Apache-2.0. BirdNET
 V2.4 is comparable in the few-shot benchmark ("Perch and BirdNET 2.3 obtain similar
 performance"), but its **models** are CC BY-NC-SA 4.0 and ShareAlike plausibly follows every
