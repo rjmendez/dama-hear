@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "fabfc37f3b1daa2198296b49dd0b560ef43cab3cb33045df6a507d84425a2b4b",
+  "baseline_hash": "62bcf523904186f5c7ab8f3b8c9e7a0eae21e22d05e2d52c4dd31b19fc0d6714",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -490,12 +490,12 @@
       },
       {
         "path": "deploy/k8s/hear-heartbeat.yaml",
-        "sha256": "607c478b31080cbc5ced8898d520a31aa7c6f965f5f77d35867bbc0fb307445c",
+        "sha256": "5b01c20c4cdd010fdb8e62a94933afddb6190d2f0884135a742b0b3993b4af8e",
         "size_bytes": 4640
       },
       {
         "path": "deploy/k8s/hear-mqtt-bridge.yaml",
-        "sha256": "cd059103b677071149645fadbeecdb8bb879b330fd66bb0f9a387cea548e7196",
+        "sha256": "a45c124e62162116c9228dcdf36d5bafc86a096805f4337d33782a5f823c19e9",
         "size_bytes": 6068
       },
       {
@@ -2544,7 +2544,7 @@
         "storage_request": "20Gi"
       }
     ],
-    "section_hash": "8e54ce9a560c5e690b4b71a63ba7f5e0d8ab8a3ad77b88afee42418d7a0eb6d7"
+    "section_hash": "d61530a4d2b7a9bedcc9024ad5540a1199c887af4019a7d41ad49672238fb715"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",
