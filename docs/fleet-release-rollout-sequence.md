@@ -319,7 +319,9 @@ Dependency chain, strictly ordered:
    the asset it needs does not exist yet.
 3. **`gold` is flashed last** in the §4 order, with the `-qspi` asset only. `board_profiles.
    release_variant_refusal()` refuses the octal asset on it and vice versa; do not force either.
-4. **Acceptance** (`gold-quad-flash-readiness` owns the go/no-go):
+4. **Acceptance** (`gold-quad-flash-readiness` owns the go/no-go; the full non-executing package —
+   release gate, provisioning handoff, ring and heap thresholds, `/audio` validation, rollback — is
+   [gold-release-flash-acceptance.md](gold-release-flash-acceptance.md)):
    * `raw.want_s` > 0 and `raw.span_s` > 0 and stable — expected landing 10 s or 15 s on a 2 MiB
      part; `raw.want_s` names the tier, so **do not assume a number**;
    * `/audio` reports `ring: true` and `addressable: true` with a 48 000 Hz header;
