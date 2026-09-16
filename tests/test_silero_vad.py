@@ -153,7 +153,7 @@ def test_an_unsupported_rate_reaches_the_caller_from_the_helpers(vad):
 
 def test_an_8k_vad_refuses_16k_audio_instead_of_scoring_it_at_the_wrong_rate():
     engine = V.SileroVAD(sample_rate=8000)
-    assert engine.window == V.CHUNK_SAMPLES[8000]
+    assert (engine.hop, engine.context_samples, engine.window) == (256, 32, 288)
     with pytest.raises(V.UnsupportedSampleRate):
         engine.push(np.zeros(256, dtype=np.float32), sample_rate=16000)
 
@@ -188,55 +188,131 @@ def test_a_threshold_outside_zero_to_one_is_refused(vad):
             vad.get_speech_timestamps(voice(0.2), threshold=bad)
 
 
+# -- the window contract: 576 samples, not 512 ---------------------------------------------------
+
+def test_the_window_is_the_hop_prefixed_with_a_context_tail():
+    assert V.CHUNK_SAMPLES == {8000: 256, 16000: 512}
+    assert V.CONTEXT_SAMPLES == {8000: 32, 16000: 64}
+    assert V.WINDOW_SAMPLES == {8000: 288, 16000: 576}
+    engine = V.SileroVAD()
+    assert (engine.hop, engine.context_samples, engine.window) == (512, 64, 576)
+    assert math.isclose(engine.hop / float(FS), 0.032)
+
+
+def test_the_engine_is_fed_576_samples_of_context_plus_hop(vad, monkeypatch):
+    seen = []
+
+    def spy(window, state, rate):
+        seen.append(np.array(window, dtype=np.float32))
+        return 0.0, state
+
+    monkeypatch.setattr(vad.engine, "run", spy)
+    clip = voice(0.2)
+    list(vad.stream(clip, reset=True))
+    assert seen and all(w.size == vad.window for w in seen)
+    # Frame 0 is zero context; frame 1 carries the literal last 64 samples of frame 0's hop.
+    assert not seen[0][: vad.context_samples].any()
+    assert seen[1][: vad.context_samples] == pytest.approx(
+        clip[vad.hop - vad.context_samples:vad.hop], abs=1e-6)
+    assert seen[1][vad.context_samples:] == pytest.approx(clip[vad.hop:2 * vad.hop], abs=1e-6)
+
+
+def test_the_window_canary_passes_and_reports_what_it_measured(vad):
+    report = vad.verify_window_contract()
+    assert report["window_samples"] == 576
+    assert report["hop_samples"] == 512
+    assert report["normal_peak"] >= V.CANARY_MIN_PROB
+
+
+def test_the_canary_fails_closed_when_the_normal_path_stops_finding_speech(vad, monkeypatch):
+    monkeypatch.setattr(vad.engine, "run",
+                        lambda window, state, rate: (0.001, state))
+    with pytest.raises(V.WindowContractViolated):
+        vad.verify_window_contract()
+
+
+def test_the_canary_signal_is_generated_and_is_speech_shaped(vad):
+    canary = V.canary_speech()
+    assert canary.dtype == np.float32
+    assert canary.size == 2 * FS
+    assert np.array_equal(canary, V.canary_speech())
+    assert vad.is_speech(canary) is True
+
+
 # -- stateless scoring is reproducible, streaming state is carried -------------------------------
 
+def test_a_fresh_state_is_zero_in_both_halves(vad):
+    state = vad.new_state()
+    assert state.rnn.shape == V.STATE_SHAPE
+    assert state.context.size == vad.context_samples
+    assert state.is_zero() is True
+
+
 def test_score_chunk_is_stateless_and_repeatable(vad):
-    chunk = voice(0.2)[:vad.window]
+    chunk = voice(0.2)[:vad.hop]
     first, state_a = vad.score_chunk(chunk)
     second, state_b = vad.score_chunk(chunk)
     assert first == second
-    assert np.array_equal(state_a, state_b)
-    assert np.array_equal(vad.state, np.zeros(V.STATE_SHAPE, dtype=np.float32))
+    assert np.array_equal(state_a.rnn, state_b.rnn)
+    assert np.array_equal(state_a.context, state_b.context)
+    assert vad.state.is_zero() is True
 
 
-def test_score_chunk_accepts_a_carried_state_without_touching_the_instance(vad):
-    chunk = voice(0.2)[:vad.window]
+def test_the_next_state_carries_the_hops_own_tail_as_context(vad):
+    chunk = voice(0.2)[:vad.hop]
     _, state = vad.score_chunk(chunk)
-    carried, _ = vad.score_chunk(chunk, state=state)
-    fresh, _ = vad.score_chunk(chunk)
-    assert carried != fresh or state.any()
-    assert np.array_equal(vad.state, np.zeros(V.STATE_SHAPE, dtype=np.float32))
+    assert state.context == pytest.approx(chunk[-vad.context_samples:], abs=1e-6)
 
 
-def test_push_advances_the_streaming_state_and_reset_clears_it(vad):
-    chunk = voice(0.2)[:vad.window]
-    vad.push(chunk)
-    assert vad.state.any()
+def test_push_advances_both_halves_and_reset_clears_both(vad):
+    vad.push(voice(0.2)[:vad.hop])
+    assert vad.state.rnn.any()
+    assert vad.state.context.any()
     vad.reset()
-    assert not vad.state.any()
+    assert vad.state.is_zero() is True
 
 
-def test_streaming_a_clip_chunk_by_chunk_matches_scoring_it_whole(vad):
+def test_streaming_a_clip_hop_by_hop_matches_scoring_it_whole(vad):
     clip = voice(1.0)
     whole = vad.probabilities(clip)
     vad.reset()
-    piecewise = [vad.push(clip[i:i + vad.window])
-                 for i in range(0, (clip.size // vad.window) * vad.window, vad.window)]
+    piecewise = [vad.push(clip[i:i + vad.hop])
+                 for i in range(0, (clip.size // vad.hop) * vad.hop, vad.hop)]
     assert piecewise == pytest.approx(whole[:len(piecewise)])
 
 
+def test_a_dropped_context_changes_the_answer_so_it_is_not_a_buffering_detail(vad):
+    """A partial reset is measured upstream to cost most of the detector; it must not be free."""
+    clip = voice(1.0)
+    carried = vad.probabilities(clip)
+    vad.reset()
+    partial = []
+    for i in range(0, (clip.size // vad.hop) * vad.hop, vad.hop):
+        state = vad.state
+        state.context[:] = 0.0
+        vad.state = state
+        partial.append(vad.push(clip[i:i + vad.hop]))
+    assert partial != pytest.approx(carried[:len(partial)])
+
+
 def test_state_is_a_copy_so_a_caller_cannot_mutate_it_from_underneath(vad):
-    vad.push(voice(0.2)[:vad.window])
+    vad.push(voice(0.2)[:vad.hop])
     snapshot = vad.state
-    snapshot[:] = 0.0
-    assert vad.state.any()
+    snapshot.rnn[:] = 0.0
+    snapshot.context[:] = 0.0
+    assert vad.state.rnn.any()
+    assert vad.state.context.any()
 
 
-def test_a_state_of_the_wrong_shape_is_refused(vad):
+def test_half_a_state_is_refused_because_a_partial_reset_is_the_silent_failure(vad):
     with pytest.raises(V.SileroVADError):
-        vad.state = np.zeros((1, 1, 8), dtype=np.float32)
+        vad.state = np.zeros(V.STATE_SHAPE, dtype=np.float32)
     with pytest.raises(V.SileroVADError):
-        vad.score_chunk(voice(0.2)[:vad.window], state=np.zeros((3, 3), dtype=np.float32))
+        vad.state = V.StreamState(rnn=np.zeros((1, 1, 8), dtype=np.float32),
+                                  context=np.zeros(64, dtype=np.float32))
+    with pytest.raises(V.SileroVADError):
+        vad.state = V.StreamState(rnn=np.zeros(V.STATE_SHAPE, dtype=np.float32),
+                                  context=np.zeros(16, dtype=np.float32))
 
 
 def test_a_restored_state_reproduces_the_stream_that_produced_it(vad):
@@ -250,29 +326,44 @@ def test_a_restored_state_reproduces_the_stream_that_produced_it(vad):
     assert len(first) == len(tail_a)
 
 
-# -- chunk boundaries and malformed buffers ------------------------------------------------------
+def test_a_clip_is_scored_from_a_state_proven_zero(vad):
+    vad.push(voice(0.2)[:vad.hop])
+    scored = vad.score_clip(voice(1.0))
+    assert scored.state_reset_confirmed is True
+    assert scored.frames == len(scored.probabilities)
 
-def test_a_chunk_longer_than_the_window_is_refused_not_truncated(vad):
+
+def test_a_failed_call_resets_the_stream_rather_than_resuming_from_it(vad):
+    vad.push(voice(0.2)[:vad.hop])
     with pytest.raises(V.SileroVADError):
-        vad.score_chunk(np.zeros(vad.window + 1, dtype=np.float32))
+        vad.push(np.zeros(vad.hop + 1, dtype=np.float32))
+    assert vad.state.is_zero() is True
 
 
-def test_a_short_chunk_is_extended_to_the_window_without_a_zero_step(vad):
-    padded = V._fit_chunk(voice(0.05)[:100], vad.window)
-    assert padded.size == vad.window
-    assert padded.dtype == np.float32
-    assert np.count_nonzero(padded) > 100
+# -- frame boundaries and malformed buffers ------------------------------------------------------
+
+def test_a_chunk_that_is_not_a_whole_hop_is_refused_not_padded(vad):
+    for size in (vad.hop + 1, vad.hop - 1, vad.window):
+        with pytest.raises(V.SileroVADError):
+            vad.score_chunk(np.zeros(size, dtype=np.float32))
 
 
-def test_a_clip_that_is_not_a_whole_number_of_windows_still_scores_every_sample(vad):
-    clip = voice(1.0)[: vad.window * 3 + 17]
-    scores = vad.probabilities(clip)
-    assert len(scores) == 4
-    assert all(0.0 <= s <= 1.0 for s in scores)
+def test_a_partial_final_hop_is_dropped_and_counted(vad):
+    clip = voice(1.0)[: vad.hop * 3 + 17]
+    scored = vad.score_clip(clip)
+    assert scored.frames == 3
+    assert scored.tail_samples_dropped == 17
+    assert V.tail_samples_dropped(clip.size, vad.hop) == 17
 
 
-def test_a_tail_window_does_not_invent_speech_out_of_padding(vad):
-    assert max(vad.probabilities(tone(1.0)[: vad.window * 31 + 128])) < 0.5
+def test_a_buffer_shorter_than_one_hop_scores_no_frames_rather_than_a_padded_one(vad):
+    scored = vad.score_clip(voice(1.0)[: vad.hop - 1])
+    assert scored.probabilities == ()
+    assert scored.tail_samples_dropped == vad.hop - 1
+
+
+def test_a_tail_frame_does_not_invent_speech_out_of_padding(vad):
+    assert max(vad.probabilities(tone(1.0)[: vad.hop * 31 + 128])) < 0.5
 
 
 @pytest.mark.parametrize("bad", [np.array(["a", "b"]), np.zeros((2, 2, 2)),
@@ -382,18 +473,20 @@ def test_scoring_is_deterministic_across_instances():
 
 # -- the onnxruntime plumbing, against a graph built here ----------------------------------------
 
-def _tiny_silero_like_model(path: pathlib.Path, split_state: bool) -> pathlib.Path:
+def _tiny_silero_like_model(path: pathlib.Path, split_state: bool = False,
+                            declared_window: object = None) -> pathlib.Path:
     """A graph with Silero's I/O contract and arithmetic simple enough to predict by hand.
 
-    output = mean(|input|) clipped to [0, 1] plus the carried state's first element; the next
-    state is the state plus that mean. Enough to prove the feed, the state round-trip and the
-    v4/v5 input-name split are wired correctly, and nothing about speech.
+    `output = clip(mean(|input|), 0, 1)`, and the next state is the state plus that mean. It
+    proves the feed, the state round-trip, the declared-window check and the v4/v5 signature
+    split are wired correctly, and says nothing about speech.
     """
     onnx = pytest.importorskip("onnx")
     from onnx import TensorProto, helper, numpy_helper
 
-    state_shape = [1, 1, V.STATE_SHAPE[2]] if split_state else list(V.STATE_SHAPE)
-    inputs = [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, None]),
+    state_shape = list(V.V4_STATE_SHAPE if split_state else V.STATE_SHAPE)
+    length = declared_window if declared_window is not None else "n"
+    inputs = [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, length]),
               helper.make_tensor_value_info("sr", TensorProto.INT64, [])]
     names = ["h", "c"] if split_state else ["state"]
     inputs += [helper.make_tensor_value_info(n, TensorProto.FLOAT, state_shape) for n in names]
@@ -425,18 +518,75 @@ def test_the_onnx_engine_feeds_the_graph_and_carries_its_state(tmp_path, split_s
     engine = V.SileroVAD(str(path))
     assert engine.uses_real_model is True
     engine.assert_real_model()
+    assert engine.engine.split_state is split_state
+    assert engine.engine.state_shape == (V.V4_STATE_SHAPE if split_state else V.STATE_SHAPE)
 
-    chunk = np.full(engine.window, 0.25, dtype=np.float32)
-    probability, state = engine.score_chunk(chunk)
-    assert probability == pytest.approx(0.25, abs=1e-5)
-    assert state.shape == V.STATE_SHAPE
-    assert float(state[0, 0, 0]) == pytest.approx(0.25, abs=1e-5)
+    # A quarter-amplitude hop against a zero context: the graph sees 576 samples, 64 of which
+    # are zero, so the mean it returns is the one predicted for that window and not for the hop.
+    hop = np.full(engine.hop, 0.25, dtype=np.float32)
+    expected = 0.25 * engine.hop / float(engine.window)
+    probability, state = engine.score_chunk(hop)
+    assert probability == pytest.approx(expected, abs=1e-6)
+    assert state.rnn.shape == engine.engine.state_shape
+    assert float(state.rnn[0, 0, 0]) == pytest.approx(expected, abs=1e-6)
+    assert state.context == pytest.approx(hop[-engine.context_samples:])
 
-    # The second window sees the state the first one produced, which is the whole point.
-    assert engine.push(chunk) == pytest.approx(0.25, abs=1e-5)
-    assert float(engine.state[0, 0, 0]) == pytest.approx(0.25, abs=1e-5)
+    # The second hop sees the first one's state and context, which is the whole point.
+    assert engine.push(hop) == pytest.approx(expected, abs=1e-6)
+    assert engine.push(hop) == pytest.approx(0.25, abs=1e-6)
     engine.reset()
-    assert not engine.state.any()
+    assert engine.state.is_zero() is True
+
+
+def test_a_graph_that_declares_the_wrong_window_is_refused(tmp_path):
+    pytest.importorskip("onnxruntime")
+    wrong = _tiny_silero_like_model(tmp_path / "w512.onnx", declared_window=512)
+    with pytest.raises(V.WindowContractViolated):
+        V.SileroVAD(str(wrong))
+    right = _tiny_silero_like_model(tmp_path / "w576.onnx", declared_window=576)
+    assert V.SileroVAD(str(right)).uses_real_model is True
+
+
+def test_a_graph_with_neither_signature_is_refused_rather_than_guessed(tmp_path):
+    pytest.importorskip("onnx")
+    pytest.importorskip("onnxruntime")
+    from onnx import TensorProto, helper
+
+    graph = helper.make_graph(
+        [helper.make_node("Abs", ["input"], ["output"])], "not_silero",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, "n"])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, "n"])])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 9
+    path = tmp_path / "not-silero.onnx"
+    path.write_bytes(model.SerializeToString())
+    with pytest.raises(V.WindowContractViolated):
+        V.SileroVAD(str(path))
+
+
+def test_load_vad_refuses_to_hand_the_fallback_to_the_purge_pipeline(tmp_path):
+    with pytest.raises(V.ModelUnavailable):
+        V.load_vad(model_path=str(tmp_path / "absent.onnx"))
+    # purge.load_vad("auto") must see that refusal as "not installed here" and use its own
+    # engine, so a receipt never carries Silero's name for a score Silero did not produce.
+    from hear.privacy import purge
+
+    detector = purge.load_vad("auto", 0.5, 250.0)
+    assert isinstance(detector, purge.BandEnergyVAD)
+
+
+def test_load_vad_runs_the_canary_and_returns_a_purge_detector(tmp_path, monkeypatch):
+    pytest.importorskip("onnxruntime")
+    from hear.privacy import purge
+
+    path = _tiny_silero_like_model(tmp_path / "canary.onnx")
+    monkeypatch.setattr(V.SileroVAD, "verify_window_contract", lambda self: {"ok": True})
+    detector = V.load_vad(model_path=str(path))
+    assert detector.name == "silero_vad_v5_onnx"
+    decision = detector.detect(voice(1.0), FS)
+    assert isinstance(decision, purge.VadDecision)
+    assert decision.engine == "silero_vad_v5_onnx"
+    assert 0.0 <= decision.peak_prob <= 1.0
 
 
 def test_a_corrupt_model_file_is_a_clear_failure_not_a_silent_fallback(tmp_path):
@@ -449,7 +599,3 @@ def test_a_corrupt_model_file_is_a_clear_failure_not_a_silent_fallback(tmp_path)
         caught.value)
 
 
-def test_the_window_size_is_the_one_silero_reads():
-    assert V.CHUNK_SAMPLES == {8000: 256, 16000: 512}
-    assert V.SileroVAD().window == 512
-    assert math.isclose(512 / float(FS), 0.032)

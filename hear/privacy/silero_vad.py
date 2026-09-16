@@ -2,36 +2,37 @@
 """Silero VAD v5 over onnxruntime: does this buffer contain a human voice, yes or no.
 
 The nodes listen at 48 kHz for gunshots and insects, and a microphone good enough for a
-shockwave is good enough for a conversation two gardens away. Everything the fleet keeps has to
-be provably not speech, so the speech decision is a single small module with one scoring path,
-one state discipline and no hidden network access.
+shockwave is good enough for a conversation two gardens away. `hear/privacy/purge.py` destroys
+anything that contains speech; this module is the detector that decides, and it implements
+`docs/silero-vad-privacy-contract.md` rather than a reading of the upstream README.
 
-Three things this file is careful about, because each of them is a way the privacy gate silently
-stops working:
+⚠️THE MODEL INPUT IS 576 SAMPLES, NOT 512, AND FEEDING IT 512 FAILS SILENTLY TOWARDS RETENTION.
+512 is the *hop*; the tensor is that hop prefixed with the 64-sample context tail of the previous
+hop (contract §2.3). A bare 512-sample call does not raise -- it returns ~0.001 for unambiguous
+speech, so a lane built on it writes confident `NO_SPEECH` receipts over every conversation it is
+handed. `verify_window_contract()` is the startup canary that proves this wiring is right, and it
+is required (§2.4) precisely because the failure has no symptom.
 
-⚠️SAMPLE RATE IS VALIDATED, NEVER ASSUMED. Silero v5 is trained on 16 kHz (and 8 kHz) and reads a
-fixed 512-sample (256 at 8 kHz) window. Handing it 48 kHz audio does not fail -- it scores a
-buffer three times too fast, mis-reads every formant, and returns a plausible number. Raw 48 kHz
-is therefore decimated through `hear.resample`'s anti-aliased polyphase path before scoring, and
-any other rate is refused rather than stretched.
+⚠️STREAM STATE IS TWO OBJECTS. The recurrent `state` `(2, 1, 128)` AND the 64-sample context
+tail, reset together, carried together, never persisted or logged -- the context tail is literally
+4 ms of PCM (§3.2). A partial reset costs most of the detector (mean 0.75 -> 0.25, measured) and
+throws nothing. `score_chunk()` is stateless and reproducible, `push()`/`stream()` carry both
+objects, `reset()` clears both, and every clip asserts at frame 0 that both are zero.
 
-⚠️STREAMING STATE IS EXPLICIT. The model is an RNN: its answer for a chunk depends on the chunks
-before it. `score_chunk()` is stateless and reproducible (it never touches the instance state),
-`push()`/`stream()` carry the recurrent context forward, and `reset()` is what you call between
-two unrelated clips. Mixing those up is what makes a VAD look like it works on a test clip and
-leak on a real one.
+⚠️SAMPLE RATE IS VALIDATED, NEVER ASSUMED. Silero reads 16 kHz or 8 kHz. Raw 48 kHz acquisition
+audio is decimated through `hear.resample`'s anti-aliased L=1 M=3 path (§2.1) and any other rate
+is refused rather than stretched to the nearest.
 
-⚠️A MISSING WEIGHT FILE DOES NOT SILENTLY DISABLE THE GATE. The `.onnx` binary is not
-redistributable through this repository and is absent in CI, so this module falls back to a
-deterministic synthetic scorer with the same interface, records that it did in `.engine`, and
-`assert_real_model()` is available to any caller (a purge pipeline, say) that must refuse to run
-on the fallback. The fallback is a real signal-processing scorer -- band energy, harmonicity and
-spectral flatness -- not a random number, so tests are hermetic and meaningful, but it is not
-Silero and never claims to be.
+⚠️A MISSING WEIGHT FILE DOES NOT SILENTLY DISABLE THE GATE. The `.onnx` artifact is not
+redistributable through this repository and is absent in CI, so the wrapper falls back to a
+deterministic band-energy / harmonicity / flatness scorer, says so in `.engine` and
+`uses_real_model`, and `load_vad()` -- the entry point `purge.py` calls -- raises
+`ModelUnavailable` instead of impersonating Silero, so the purge pipeline records the engine that
+actually ran on the receipt.
 
     from hear.privacy.silero_vad import SileroVAD
-    vad = SileroVAD()                                  # env HEAR_SILERO_VAD_MODEL, or fallback
-    vad.is_speech(chunk_16k)                           # one 512-sample window
+    vad = SileroVAD()                              # $HEAR_SILERO_VAD_MODEL, else the fallback
+    vad.is_speech(hop_16k)
     vad.get_speech_timestamps(clip_48k, sample_rate=48000)
 """
 
@@ -40,25 +41,43 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 #: The rate the model is trained for, and the rate every score in this module is taken at.
 MODEL_RATE_HZ = 16000
-#: Rates Silero v5 accepts directly.
+#: Rates Silero v5 accepts.
 SUPPORTED_RATES: Tuple[int, ...] = (8000, 16000)
-#: The window the model reads, per rate. Silero v5 refuses anything else.
+#: The advance between frames, per rate. 32 ms either way. Contract §2.3.
 CHUNK_SAMPLES: Dict[int, int] = {8000: 256, 16000: 512}
+#: The context tail prefixed to each hop. The 8 kHz figure is arithmetic, not measured (§2.3).
+CONTEXT_SAMPLES: Dict[int, int] = {8000: 32, 16000: 64}
+#: What the graph actually reads: context + hop.
+WINDOW_SAMPLES: Dict[int, int] = {rate: CONTEXT_SAMPLES[rate] + CHUNK_SAMPLES[rate]
+                                  for rate in CHUNK_SAMPLES}
 #: The node acquisition rate, decimated to MODEL_RATE_HZ before scoring.
 ACQ_RATE_HZ = 48000
-#: Shape of the v5 recurrent context: (2 layers, batch, hidden).
+#: Shape of the v5 recurrent context: (2 layers, batch, hidden). v4 carries h and c at half.
 STATE_SHAPE: Tuple[int, int, int] = (2, 1, 128)
+V4_STATE_SHAPE: Tuple[int, int, int] = (2, 1, 64)
 #: Where the weights live when nobody says otherwise.
 MODEL_ENV = "HEAR_SILERO_VAD_MODEL"
 DEFAULT_MODEL_PATH = "models/silero_vad.onnx"
 #: Below this RMS a window is digital silence and is scored zero without further analysis.
 SILENCE_RMS = 1e-5
+
+#: Contract §4.1. Proposed defaults, not measured on this fleet's clips.
+DEFAULT_THRESHOLD = 0.50
+NEG_THRESHOLD_MARGIN = 0.15
+DEFAULT_MIN_SPEECH_MS = 250.0
+DEFAULT_MIN_SILENCE_MS = 300.0
+DEFAULT_SPEECH_PAD_MS = 30.0
+
+#: Canary bounds, contract §2.4: the normal path must find the synthetic voice, and the bare-hop
+#: path must reproduce the degenerate mode it is there to detect.
+CANARY_MIN_PROB = 0.5
+CANARY_DEGENERATE_MAX_PROB = 0.1
 
 _VOICE_BAND_HZ: Tuple[float, float] = (300.0, 3400.0)
 _PITCH_HZ: Tuple[float, float] = (75.0, 320.0)
@@ -72,8 +91,20 @@ class UnsupportedSampleRate(SileroVADError):
     """A rate the model is not trained for, and that this module will not silently stretch."""
 
 
-class ModelUnavailable(SileroVADError):
-    """The real weights were required and are not present."""
+class ModelUnavailable(SileroVADError, ImportError):
+    """The real weights were required and are not present.
+
+    An `ImportError` as well, because `purge.load_vad()` treats "Silero is not installed here"
+    as a fall-back-to-the-band-energy-engine condition rather than an outage.
+    """
+
+
+class WindowContractViolated(SileroVADError):
+    """The graph does not read the window this module feeds it, or the canary did not fire.
+
+    Contract §9's `vad_window_contract_violated`: fail closed. A caller that purges on a score
+    must stop, not carry on scoring through a shape it has not verified.
+    """
 
 
 @dataclass(frozen=True)
@@ -88,8 +119,46 @@ class SpeechSegment:
         return {"start": self.start, "end": self.end, "confidence": self.confidence}
 
 
+@dataclass
+class StreamState:
+    """The two objects that are one stream's memory: the RNN state and the context tail.
+
+    ⚠️Neither is persisted, logged or exported. `context` is 4 ms of PCM from the clip being
+    scored and inherits its classification (contract §3.2).
+    """
+
+    rnn: np.ndarray
+    context: np.ndarray
+
+    @classmethod
+    def zeros(cls, sample_rate: int, state_shape: Tuple[int, ...] = STATE_SHAPE) -> "StreamState":
+        return cls(rnn=np.zeros(state_shape, dtype=np.float32),
+                   context=np.zeros(CONTEXT_SAMPLES[sample_rate], dtype=np.float32))
+
+    def copy(self) -> "StreamState":
+        return StreamState(rnn=np.array(self.rnn, dtype=np.float32, copy=True),
+                           context=np.array(self.context, dtype=np.float32, copy=True))
+
+    def is_zero(self) -> bool:
+        """Frame-0 assertion: a clip starts from nothing, or the verdict is another clip's."""
+        return not bool(np.any(self.rnn)) and not bool(np.any(self.context))
+
+
+@dataclass(frozen=True)
+class ClipScores:
+    """Per-frame probabilities for one clip, with the two numbers a receipt needs about them."""
+
+    probabilities: Tuple[float, ...]
+    tail_samples_dropped: int
+    state_reset_confirmed: bool
+
+    @property
+    def frames(self) -> int:
+        return len(self.probabilities)
+
+
 def validate_rate(sample_rate: int) -> int:
-    """-> a rate the model reads. 48 kHz is accepted here and decimated by the caller."""
+    """-> a rate the model reads. 48 kHz is accepted here and decimated on the way in."""
     try:
         rate = int(sample_rate)
     except (TypeError, ValueError) as exc:
@@ -124,8 +193,8 @@ def as_mono_float32(audio: Any) -> np.ndarray:
 def decimate_48k_to_16k(audio: Any) -> np.ndarray:
     """48 kHz -> 16 kHz through the platform's anti-aliased polyphase path (L=1, M=3).
 
-    Uses `hear.resample` rather than a bare `[::3]`: plain decimation folds everything above
-    8 kHz back onto the voice band, which both hides speech and invents it.
+    `hear.resample`, not a bare `[::3]`: plain decimation folds everything above 8 kHz back onto
+    the voice band, which both hides speech and invents it.
     """
     from hear import resample as _resample
 
@@ -144,83 +213,59 @@ def to_model_rate(audio: Any, sample_rate: int) -> Tuple[np.ndarray, int]:
     return as_mono_float32(audio), rate
 
 
-def _fit_chunk(chunk: np.ndarray, window: int) -> np.ndarray:
-    """Extend a short window to the model window; refuse a long one, which would be truncation.
+def hops(pcm: np.ndarray, hop: int) -> Iterator[np.ndarray]:
+    """Whole hops only, in sample order. A partial final hop is dropped, never zero-padded.
 
-    The tail is mirrored, not zero-filled: a zero tail is a step discontinuity that smears the
-    spectrum of whatever preceded it and reads as a broadband onset, which is exactly the shape
-    a voice onset has. Mirroring keeps the window's own spectral character.
+    Contract §2.3: a zero-padded frame is scored as near-silence by construction, and the end of
+    a clip is exactly where a truncated word sits. Discarding under 32 ms is honest; padding
+    invents a low score. What was dropped is counted by `tail_samples_dropped()`.
     """
-    if chunk.size == window:
-        return chunk
-    if chunk.size > window:
-        raise SileroVADError(
-            "chunk of %d samples is longer than the model window of %d; split it rather than "
-            "letting the tail go unscored" % (chunk.size, window)
-        )
-    if chunk.size == 0:
-        return np.zeros(window, dtype=np.float32)
-    padded = np.zeros(window, dtype=np.float32)
-    mirrored = np.concatenate([chunk, chunk[::-1]])
-    repeats = int(math.ceil(window / mirrored.size))
-    filler = np.tile(mirrored, repeats)[:window]
-    padded[:] = filler.astype(np.float32)
-    padded[: chunk.size] = chunk
-    return padded
+    whole = (pcm.size // hop) * hop
+    for start in range(0, whole, hop):
+        yield pcm[start:start + hop]
 
 
-def _windows(pcm: np.ndarray, window: int) -> Iterator[np.ndarray]:
-    """Cut a buffer into model windows, covering the tail without inventing a boundary.
-
-    A remainder shorter than the window is covered by sliding the last window back to the end
-    of the buffer rather than zero-filling it, so every sample is scored inside a window made of
-    real audio. Only a buffer shorter than one window is mirrored out to length.
-    """
-    if pcm.size == 0:
-        return
-    full = (pcm.size // window) * window
-    for start in range(0, full, window):
-        yield pcm[start:start + window]
-    if pcm.size > full:
-        tail = pcm[-window:] if pcm.size >= window else pcm
-        yield _fit_chunk(tail, window)
+def tail_samples_dropped(n_samples: int, hop: int) -> int:
+    """How many trailing samples `hops()` did not score. A number, not a silence."""
+    return int(n_samples) - (int(n_samples) // hop) * hop
 
 
 class SyntheticVADEngine:
     """Deterministic stand-in for the real weights: band energy, harmonicity, flatness.
 
-    It exists so the privacy tests are hermetic, not so the fleet can ship without the model. It
-    is stateful in the same shape as the real engine -- the returned probability is smoothed
-    against the previous window through the carried state -- so streaming code exercised against
-    it exercises the same state discipline it will use against Silero.
+    It exists so the privacy tests are hermetic, not so the fleet can ship without the model:
+    `load_vad()` refuses to hand this to the purge pipeline under Silero's name. It reads the
+    same 576-sample window and carries the same state shape as the real engine, so streaming
+    code exercised against it exercises the discipline it will use against Silero.
     """
 
-    name = "synthetic"
+    name = "synthetic_band_harmonicity"
     is_real = False
+    state_shape = STATE_SHAPE
 
     def new_state(self) -> np.ndarray:
-        return np.zeros(STATE_SHAPE, dtype=np.float32)
+        return np.zeros(self.state_shape, dtype=np.float32)
 
-    def run(self, chunk: np.ndarray, state: np.ndarray, sample_rate: int
+    def run(self, window: np.ndarray, state: np.ndarray, sample_rate: int
             ) -> Tuple[float, np.ndarray]:
-        raw = self._score(chunk, sample_rate)
+        raw = self._score(window, sample_rate)
         previous = float(state[0, 0, 0])
         smoothed = 0.65 * raw + 0.35 * previous if previous > 0.0 else raw
-        nxt = np.zeros(STATE_SHAPE, dtype=np.float32)
+        nxt = np.zeros(self.state_shape, dtype=np.float32)
         nxt[0, 0, 0] = np.float32(smoothed)
         nxt[1, 0, 0] = np.float32(raw)
         return float(min(max(smoothed, 0.0), 1.0)), nxt
 
     @staticmethod
-    def _score(chunk: np.ndarray, sample_rate: int) -> float:
-        x = np.asarray(chunk, dtype=np.float64)
+    def _score(window: np.ndarray, sample_rate: int) -> float:
+        x = np.asarray(window, dtype=np.float64)
         x = x - x.mean()
         rms = float(np.sqrt(np.mean(x * x))) if x.size else 0.0
         if rms < SILENCE_RMS:
             return 0.0
 
-        window = np.hanning(x.size) if x.size > 1 else np.ones(1)
-        spectrum = np.abs(np.fft.rfft(x * window)) + 1e-12
+        taper = np.hanning(x.size) if x.size > 1 else np.ones(1)
+        spectrum = np.abs(np.fft.rfft(x * taper)) + 1e-12
         freqs = np.fft.rfftfreq(x.size, 1.0 / float(sample_rate))
         power = spectrum * spectrum
         total = float(power.sum())
@@ -231,8 +276,8 @@ class SyntheticVADEngine:
         # Flatness separates broadband hiss (near 1) from anything structured (near 0).
         flatness = float(np.exp(np.mean(np.log(power))) / (total / power.size))
 
-        # Peak concentration separates a single tone or a stridulating insect, which put most
-        # of their power in one bin, from a voice, which spreads it over a harmonic stack.
+        # Peak concentration separates a single tone or a stridulating insect, which put most of
+        # their power in one bin, from a voice, which spreads it over a harmonic stack.
         peak_ratio = float(power.max() / total)
 
         # Harmonicity: a voiced window autocorrelates at its pitch period, noise does not.
@@ -255,14 +300,20 @@ class SyntheticVADEngine:
 
 
 class OnnxVADEngine:
-    """The real thing: a Silero v5 (`state`) or v4 (`h`, `c`) graph under onnxruntime."""
+    """The real thing: a Silero v5 (`state`) or v4 (`h`, `c`) graph under onnxruntime.
 
-    name = "onnx"
+    The generation is read off the loaded file's declared inputs, never assumed, and the
+    declared input length -- where the graph fixes it rather than leaving it dynamic -- is
+    checked against the window this module feeds (contract §2.3, §3.1).
+    """
+
+    name = "silero_vad_v5_onnx"
     is_real = True
 
-    def __init__(self, model_path: str, providers: Optional[Sequence[str]] = None) -> None:
+    def __init__(self, model_path: str, sample_rate: int = MODEL_RATE_HZ,
+                 providers: Optional[Sequence[str]] = None) -> None:
         try:
-            import onnxruntime  # noqa: WPS433 -- optional dependency, absent in CI
+            import onnxruntime
         except ImportError as exc:  # pragma: no cover - exercised only without onnxruntime
             raise ModelUnavailable(
                 "onnxruntime is not installed, so %s cannot be scored" % (model_path,)
@@ -278,45 +329,65 @@ class OnnxVADEngine:
             model_path, sess_options=options,
             providers=list(providers) if providers else ["CPUExecutionProvider"],
         )
-        names = {i.name for i in self.session.get_inputs()}
-        self.split_state = "h" in names and "c" in names
-        self.wants_rate = "sr" in names
-        self.input_name = "input" if "input" in names else self.session.get_inputs()[0].name
+        inputs = {i.name: i for i in self.session.get_inputs()}
+        if "h" in inputs and "c" in inputs:
+            self.split_state, self.state_shape = True, V4_STATE_SHAPE
+            self.name = "silero_vad_v4_onnx"
+        elif "state" in inputs:
+            self.split_state, self.state_shape = False, STATE_SHAPE
+        else:
+            raise WindowContractViolated(
+                "%s declares inputs %s, which is neither the v5 {input, sr, state} nor the v4 "
+                "{input, sr, h, c} signature; refused rather than guessed"
+                % (model_path, sorted(inputs)))
+        self.wants_rate = "sr" in inputs
+        self.input_name = "input" if "input" in inputs else self.session.get_inputs()[0].name
+        self.declared_window = self._declared_window(inputs[self.input_name])
+        expected = WINDOW_SAMPLES[validate_rate(sample_rate)]
+        if self.declared_window is not None and self.declared_window != expected:
+            raise WindowContractViolated(
+                "%s declares an input of %d samples and this module feeds %d (%d context + %d "
+                "hop); a constant that disagrees with the graph is the defect, not the graph"
+                % (model_path, self.declared_window, expected,
+                   CONTEXT_SAMPLES[sample_rate], CHUNK_SAMPLES[sample_rate]))
+
+    @staticmethod
+    def _declared_window(spec: Any) -> Optional[int]:
+        """The graph's own input length, or None where it leaves the dimension dynamic."""
+        shape = list(getattr(spec, "shape", []) or [])
+        if not shape:
+            return None
+        last = shape[-1]
+        return int(last) if isinstance(last, int) else None
 
     def new_state(self) -> np.ndarray:
-        return np.zeros(STATE_SHAPE, dtype=np.float32)
+        return np.zeros(self.state_shape, dtype=np.float32)
 
-    def run(self, chunk: np.ndarray, state: np.ndarray, sample_rate: int
+    def run(self, window: np.ndarray, state: np.ndarray, sample_rate: int
             ) -> Tuple[float, np.ndarray]:
         feed: Dict[str, Any] = {
-            self.input_name: np.asarray(chunk, dtype=np.float32).reshape(1, -1),
+            self.input_name: np.asarray(window, dtype=np.float32).reshape(1, -1),
         }
         if self.wants_rate:
             feed["sr"] = np.array(int(sample_rate), dtype=np.int64)
         if self.split_state:
-            feed["h"] = np.ascontiguousarray(state[0:1], dtype=np.float32)
-            feed["c"] = np.ascontiguousarray(state[1:2], dtype=np.float32)
+            feed["h"] = np.ascontiguousarray(state, dtype=np.float32)
+            feed["c"] = np.ascontiguousarray(state, dtype=np.float32)
         else:
             feed["state"] = np.ascontiguousarray(state, dtype=np.float32)
 
         outputs = self.session.run(None, feed)
         probability = float(np.asarray(outputs[0]).reshape(-1)[0])
-        if self.split_state and len(outputs) >= 3:
-            nxt = np.concatenate(
-                [np.asarray(outputs[1], dtype=np.float32).reshape(1, *STATE_SHAPE[1:]),
-                 np.asarray(outputs[2], dtype=np.float32).reshape(1, *STATE_SHAPE[1:])], axis=0)
-        elif len(outputs) >= 2:
-            nxt = np.asarray(outputs[1], dtype=np.float32).reshape(STATE_SHAPE)
-        else:
-            nxt = state
+        nxt = (np.asarray(outputs[1], dtype=np.float32).reshape(self.state_shape)
+               if len(outputs) >= 2 else state)
         return min(max(probability, 0.0), 1.0), np.asarray(nxt, dtype=np.float32)
 
 
 class SileroVAD:
-    """Silero VAD v5, stateless per chunk or stateful across a stream.
+    """Silero VAD v5, stateless per hop or stateful across a stream.
 
-    `model_path=None` looks at `$HEAR_SILERO_VAD_MODEL` then `models/silero_vad.onnx`, and falls
-    back to `SyntheticVADEngine` when neither the weights nor onnxruntime are there. Pass
+    `model_path=None` looks at `$HEAR_SILERO_VAD_MODEL`, then `models/silero_vad.onnx`, and
+    falls back to `SyntheticVADEngine` when neither the weights nor onnxruntime are there. Pass
     `require_model=True` where a fallback answer would be a privacy failure rather than a
     convenience.
     """
@@ -326,10 +397,13 @@ class SileroVAD:
                  providers: Optional[Sequence[str]] = None) -> None:
         rate = validate_rate(sample_rate)
         self.sample_rate = MODEL_RATE_HZ if rate == ACQ_RATE_HZ else rate
-        self.window = CHUNK_SAMPLES[self.sample_rate]
+        self.hop = CHUNK_SAMPLES[self.sample_rate]
+        self.context_samples = CONTEXT_SAMPLES[self.sample_rate]
+        self.window = WINDOW_SAMPLES[self.sample_rate]
         self.model_path = self._resolve_path(model_path)
-        self.engine = self._open_engine(self.model_path, require_model, providers)
-        self._state = self.engine.new_state()
+        self.engine = self._open_engine(self.model_path, self.sample_rate, require_model,
+                                        providers)
+        self._state = self.new_state()
 
     @staticmethod
     def _resolve_path(model_path: Optional[str]) -> str:
@@ -338,10 +412,10 @@ class SileroVAD:
         return os.environ.get(MODEL_ENV) or DEFAULT_MODEL_PATH
 
     @staticmethod
-    def _open_engine(model_path: str, require_model: bool,
+    def _open_engine(model_path: str, sample_rate: int, require_model: bool,
                      providers: Optional[Sequence[str]]) -> Any:
         try:
-            return OnnxVADEngine(model_path, providers=providers)
+            return OnnxVADEngine(model_path, sample_rate=sample_rate, providers=providers)
         except ModelUnavailable:
             if require_model:
                 raise
@@ -357,52 +431,44 @@ class SileroVAD:
         if not self.uses_real_model:
             raise ModelUnavailable(
                 "scoring is running on the %s fallback engine, not Silero weights; set %s"
-                % (self.engine.name, MODEL_ENV)
-            )
+                % (self.engine.name, MODEL_ENV))
 
     # -- state -------------------------------------------------------------------------------
 
+    def new_state(self) -> StreamState:
+        """A zeroed stream memory: RNN state and context tail together, never one of the two."""
+        return StreamState.zeros(self.sample_rate, getattr(self.engine, "state_shape",
+                                                           STATE_SHAPE))
+
     def reset(self) -> None:
-        """Drop the recurrent context. Call between two unrelated clips, never inside one."""
-        self._state = self.engine.new_state()
+        """Clear both objects. Called between clips, unconditionally, and after any failure."""
+        self._state = self.new_state()
 
     @property
-    def state(self) -> np.ndarray:
-        """A copy of the streaming context, so a caller cannot mutate it from underneath."""
-        return np.array(self._state, dtype=np.float32, copy=True)
+    def state(self) -> StreamState:
+        """A copy, so a caller cannot mutate the stream's memory from underneath it."""
+        return self._state.copy()
 
     @state.setter
-    def state(self, value: Any) -> None:
-        array = np.asarray(value, dtype=np.float32)
-        if array.shape != STATE_SHAPE:
+    def state(self, value: StreamState) -> None:
+        self._state = self._checked_state(value).copy()
+
+    def _checked_state(self, value: Any) -> StreamState:
+        if not isinstance(value, StreamState):
             raise SileroVADError(
-                "state shape %s is not the model's %s" % (array.shape, STATE_SHAPE))
-        self._state = np.array(array, dtype=np.float32, copy=True)
+                "stream state must be a StreamState carrying both the RNN state and the context "
+                "tail; a bare array is half a reset")
+        shape = getattr(self.engine, "state_shape", STATE_SHAPE)
+        if tuple(np.shape(value.rnn)) != tuple(shape):
+            raise SileroVADError(
+                "state shape %s is not the model's %s" % (np.shape(value.rnn), shape))
+        if int(np.size(value.context)) != self.context_samples:
+            raise SileroVADError(
+                "context tail of %d samples is not the model's %d"
+                % (np.size(value.context), self.context_samples))
+        return value
 
     # -- scoring -----------------------------------------------------------------------------
-
-    def score_chunk(self, chunk: Any, *, sample_rate: Optional[int] = None,
-                    state: Optional[np.ndarray] = None) -> Tuple[float, np.ndarray]:
-        """Stateless: -> (probability, next_state). The instance's own state is untouched."""
-        pcm, rate = to_model_rate(chunk, sample_rate if sample_rate is not None
-                                  else self.sample_rate)
-        if rate != self.sample_rate:
-            raise UnsupportedSampleRate(
-                "this VAD is configured for %d Hz and was handed %d Hz audio"
-                % (self.sample_rate, rate))
-        window = _fit_chunk(pcm, self.window)
-        carried = self.engine.new_state() if state is None else np.asarray(state,
-                                                                          dtype=np.float32)
-        if carried.shape != STATE_SHAPE:
-            raise SileroVADError(
-                "state shape %s is not the model's %s" % (carried.shape, STATE_SHAPE))
-        return self.engine.run(window, carried, self.sample_rate)
-
-    def push(self, chunk: Any, *, sample_rate: Optional[int] = None) -> float:
-        """Stateful: score one window and carry the recurrent context forward."""
-        probability, self._state = self.score_chunk(chunk, sample_rate=sample_rate,
-                                                    state=self._state)
-        return probability
 
     def _prepare(self, audio: Any, sample_rate: Optional[int]) -> np.ndarray:
         """-> mono float32 at the engine's own rate, or a refusal."""
@@ -414,58 +480,113 @@ class SileroVAD:
                 % (self.sample_rate, rate))
         return pcm
 
+    def _run_hop(self, hop: np.ndarray, state: StreamState) -> Tuple[float, StreamState]:
+        """One hop, prefixed with the carried context, -> (probability, the state after it)."""
+        if hop.size != self.hop:
+            raise SileroVADError(
+                "a frame is exactly %d samples at %d Hz and this one is %d; whole hops only, "
+                "and a partial tail is dropped rather than padded"
+                % (self.hop, self.sample_rate, hop.size))
+        window = np.concatenate([state.context, hop]).astype(np.float32)
+        if window.size != self.window:
+            raise WindowContractViolated(
+                "built a %d-sample window where the contract is %d (%d context + %d hop)"
+                % (window.size, self.window, self.context_samples, self.hop))
+        probability, rnn = self.engine.run(window, state.rnn, self.sample_rate)
+        return probability, StreamState(rnn=np.asarray(rnn, dtype=np.float32),
+                                        context=np.array(hop[-self.context_samples:],
+                                                         dtype=np.float32))
+
+    def score_chunk(self, chunk: Any, *, sample_rate: Optional[int] = None,
+                    state: Optional[StreamState] = None) -> Tuple[float, StreamState]:
+        """Stateless: -> (probability, next state). The instance's own state is untouched."""
+        pcm = self._prepare(chunk, sample_rate)
+        carried = self.new_state() if state is None else self._checked_state(state)
+        return self._run_hop(pcm, carried)
+
+    def push(self, chunk: Any, *, sample_rate: Optional[int] = None) -> float:
+        """Stateful: score one hop and carry both halves of the stream memory forward.
+
+        The state is reset on any failure rather than left holding a state produced by one
+        (contract §3.2 rule 4).
+        """
+        try:
+            probability, self._state = self._run_hop(self._prepare(chunk, sample_rate),
+                                                     self._state)
+        except Exception:
+            self.reset()
+            raise
+        return probability
+
     def stream(self, audio: Any, *, sample_rate: Optional[int] = None,
                reset: bool = False) -> Iterator[float]:
-        """Score a buffer window by window, carrying state across the whole of it."""
+        """Score a buffer hop by hop, carrying state across the whole of it."""
         if reset:
             self.reset()
-        for window in _windows(self._prepare(audio, sample_rate), self.window):
-            probability, self._state = self.engine.run(window, self._state, self.sample_rate)
+        pcm = self._prepare(audio, sample_rate)
+        for hop in hops(pcm, self.hop):
+            probability, self._state = self._run_hop(hop, self._state)
             yield probability
 
-    def probabilities(self, audio: Any, *, sample_rate: Optional[int] = None
-                      ) -> List[float]:
-        """Every window's probability for a whole clip, from a fresh state."""
-        return list(self.stream(audio, sample_rate=sample_rate, reset=True))
+    def score_clip(self, audio: Any, *, sample_rate: Optional[int] = None) -> ClipScores:
+        """A whole clip from a guaranteed-zero state: probabilities, dropped tail, and proof.
 
-    def is_speech(self, audio_chunk: Any, threshold: float = 0.5, *,
-                  sample_rate: Optional[int] = None) -> bool:
-        """True when any window of `audio_chunk` scores at or above `threshold`.
-
-        Stateless with respect to the instance: a clip is judged on its own, and asking twice
-        gives the same answer.
+        `state_reset_confirmed` is the receipt field of contract §3.2: frame 0 of a clip ran
+        against a state and a context that were both zero, so this verdict is about this clip.
         """
-        if not 0.0 <= float(threshold) <= 1.0:
-            raise SileroVADError("threshold %r is outside [0, 1]" % (threshold,))
-        state = self.engine.new_state()
-        for window in _windows(self._prepare(audio_chunk, sample_rate), self.window):
-            probability, state = self.engine.run(window, state, self.sample_rate)
-            if probability >= float(threshold):
-                return True
-        return False
+        self.reset()
+        confirmed = self._state.is_zero()
+        pcm = self._prepare(audio, sample_rate)
+        try:
+            scores = tuple(self._run_hop_stream(pcm))
+        except Exception:
+            self.reset()
+            raise
+        return ClipScores(probabilities=scores,
+                          tail_samples_dropped=tail_samples_dropped(pcm.size, self.hop),
+                          state_reset_confirmed=confirmed)
 
-    def get_speech_timestamps(self, audio: Any, *, threshold: float = 0.5,
+    def _run_hop_stream(self, pcm: np.ndarray) -> Iterator[float]:
+        for hop in hops(pcm, self.hop):
+            probability, self._state = self._run_hop(hop, self._state)
+            yield probability
+
+    def probabilities(self, audio: Any, *, sample_rate: Optional[int] = None) -> List[float]:
+        """Every frame's probability for a whole clip, from a fresh state."""
+        return list(self.score_clip(audio, sample_rate=sample_rate).probabilities)
+
+    def is_speech(self, audio_chunk: Any, threshold: float = DEFAULT_THRESHOLD, *,
+                  sample_rate: Optional[int] = None) -> bool:
+        """True when any frame of `audio_chunk` scores at or above `threshold`.
+
+        A clip is judged on its own: the stream memory is reset first, and asking twice gives
+        the same answer.
+        """
+        _check_threshold(threshold)
+        return any(p >= float(threshold)
+                   for p in self.score_clip(audio_chunk, sample_rate=sample_rate).probabilities)
+
+    def get_speech_timestamps(self, audio: Any, *, threshold: float = DEFAULT_THRESHOLD,
                               sample_rate: Optional[int] = None,
-                              min_speech_duration_ms: float = 250.0,
-                              min_silence_duration_ms: float = 100.0,
-                              speech_pad_ms: float = 30.0,
+                              min_speech_duration_ms: float = DEFAULT_MIN_SPEECH_MS,
+                              min_silence_duration_ms: float = DEFAULT_MIN_SILENCE_MS,
+                              speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS,
                               max_speech_duration_s: float = math.inf,
                               ) -> List[Dict[str, float]]:
         """-> `[{'start': s, 'end': s, 'confidence': p}, ...]` in the input clip's own seconds.
 
-        Hysteresis, as Silero's own helper does it: a segment opens at `threshold` and closes
-        only after `min_silence_duration_ms` below `threshold - 0.15`, so one quiet window
-        between two words does not cut a sentence in half.
+        The hysteresis of contract §4.2/§4.3: a segment opens at `threshold` and closes only
+        after `min_silence_duration_ms` below `threshold - 0.15`, so one quiet frame between two
+        words does not cut a sentence in half.
         """
-        if not 0.0 <= float(threshold) <= 1.0:
-            raise SileroVADError("threshold %r is outside [0, 1]" % (threshold,))
+        _check_threshold(threshold)
         rate_in = validate_rate(sample_rate if sample_rate is not None else self.sample_rate)
-        scores = self.probabilities(audio, sample_rate=rate_in)
+        scores = self.score_clip(audio, sample_rate=rate_in).probabilities
         if not scores:
             return []
 
-        hop_s = self.window / float(self.sample_rate)
-        neg_threshold = max(float(threshold) - 0.15, 0.01)
+        hop_s = self.hop / float(self.sample_rate)
+        neg_threshold = max(float(threshold) - NEG_THRESHOLD_MARGIN, 0.01)
         min_speech_s = max(float(min_speech_duration_ms), 0.0) / 1000.0
         min_silence_s = max(float(min_silence_duration_ms), 0.0) / 1000.0
         pad_s = max(float(speech_pad_ms), 0.0) / 1000.0
@@ -490,10 +611,7 @@ class SileroVAD:
                     start_idx, silence_run, run_scores = index, 0, [score]
                 continue
             run_scores.append(score)
-            if score < neg_threshold:
-                silence_run += 1
-            else:
-                silence_run = 0
+            silence_run = silence_run + 1 if score < neg_threshold else 0
             spoken_s = (index + 1 - start_idx) * hop_s
             if silence_run * hop_s >= min_silence_s or spoken_s >= float(max_speech_duration_s):
                 close(index + 1 - silence_run)
@@ -505,15 +623,86 @@ class SileroVAD:
         # changes the sample count, not the timebase.
         return [segment.as_dict() for segment in _merge(_pad(segments, pad_s, duration_s))]
 
+    # -- the window canary ---------------------------------------------------------------------
+
+    def verify_window_contract(self) -> Dict[str, Any]:
+        """Contract §2.4: prove, in process and before any clip is judged, that this is wired.
+
+        Scores a synthetic voice through the normal path and asserts it is found, then -- for a
+        real graph -- scores it again through a deliberate bare-hop call and asserts that path
+        IS degenerate, so "the normal path works" is a measurement rather than a hope. Raises
+        `WindowContractViolated`, which fails closed.
+        """
+        canary = canary_speech(self.sample_rate)
+        normal = max(self.probabilities(canary), default=0.0)
+        self.reset()
+        if normal < CANARY_MIN_PROB:
+            raise WindowContractViolated(
+                "the window canary scored %.3f on synthetic speech, below %.2f: the %d-sample "
+                "window is not reaching the model correctly (engine %s)"
+                % (normal, CANARY_MIN_PROB, self.window, self.engine.name))
+
+        degenerate: Optional[float] = None
+        if self.uses_real_model:
+            degenerate = self._bare_hop_peak(canary)
+            if degenerate >= CANARY_DEGENERATE_MAX_PROB:
+                raise WindowContractViolated(
+                    "the bare-hop control scored %.3f, at or above %.2f: the degenerate mode "
+                    "this canary exists to exclude is not reproducible on this graph, so a "
+                    "passing normal path proves nothing"
+                    % (degenerate, CANARY_DEGENERATE_MAX_PROB))
+        return {"engine": self.engine.name, "real_model": self.uses_real_model,
+                "window_samples": self.window, "hop_samples": self.hop,
+                "normal_peak": round(normal, 6),
+                "bare_hop_peak": None if degenerate is None else round(degenerate, 6)}
+
+    def _bare_hop_peak(self, audio: np.ndarray) -> float:
+        """The control: feed the hop alone, with no context, exactly as the wrong reading did."""
+        state = self.engine.new_state()
+        peak = 0.0
+        for hop in hops(np.asarray(audio, dtype=np.float32), self.hop):
+            probability, state = self.engine.run(hop, state, self.sample_rate)
+            peak = max(peak, probability)
+        return peak
+
+
+def canary_speech(sample_rate: int = MODEL_RATE_HZ, seconds: float = 2.0) -> np.ndarray:
+    """A deterministic synthetic voice: harmonics under moving formants, ~4 Hz syllables.
+
+    Generated in code and containing no recording, because the canary is a wiring test that has
+    to run on a node holding no audio it is allowed to keep.
+    """
+    rate = validate_rate(sample_rate)
+    rate = MODEL_RATE_HZ if rate == ACQ_RATE_HZ else rate
+    t = np.arange(int(seconds * rate), dtype=np.float64) / float(rate)
+    f0 = 120.0 + 25.0 * np.sin(2.0 * np.pi * 1.7 * t)
+    phase = 2.0 * np.pi * np.cumsum(f0) / float(rate)
+    signal = np.zeros_like(t)
+    for harmonic, amplitude in enumerate([1.0, 0.7, 0.55, 0.4, 0.3, 0.22, 0.15, 0.1], start=1):
+        freq = f0 * harmonic
+        shape = np.ones_like(t)
+        for centre, bandwidth, gain in ((640.0, 130.0, 1.7), (1240.0, 190.0, 1.2),
+                                        (2500.0, 260.0, 0.9)):
+            moving = centre * (1.0 + 0.08 * np.sin(2.0 * np.pi * 2.1 * t))
+            shape += gain / (1.0 + ((freq - moving) / bandwidth) ** 2)
+        signal += amplitude * shape * np.sin(harmonic * phase + 0.3 * harmonic)
+    signal *= 0.55 + 0.45 * np.sin(2.0 * np.pi * 4.0 * t)
+    peak = float(np.max(np.abs(signal))) or 1.0
+    return (0.3 * signal / peak).astype(np.float32)
+
+
+def _check_threshold(threshold: float) -> None:
+    if not 0.0 <= float(threshold) <= 1.0:
+        raise SileroVADError("threshold %r is outside [0, 1]" % (threshold,))
+
 
 def _pad(segments: Sequence[SpeechSegment], pad_s: float,
          duration_s: float) -> List[SpeechSegment]:
     """Widen each segment by `pad_s`, but never past half the gap to its neighbour.
 
-    A word starts before the first window that crosses the threshold, so the padding is real
+    A word starts before the first frame that crosses the threshold, so the padding is real
     signal and not generosity. Splitting the gap keeps a pause a pause: without the clamp, two
-    segments 40 ms apart would be padded into one, which is how a max-duration split quietly
-    undoes itself.
+    segments 40 ms apart are padded into one, which is how a max-duration split undoes itself.
     """
     out: List[SpeechSegment] = []
     for index, segment in enumerate(segments):
@@ -527,7 +716,7 @@ def _pad(segments: Sequence[SpeechSegment], pad_s: float,
     return out
 
 
-def _merge(segments: Iterable[SpeechSegment]) -> List[SpeechSegment]:
+def _merge(segments: Sequence[SpeechSegment]) -> List[SpeechSegment]:
     """Join segments whose padding made them overlap, keeping the strongest confidence."""
     merged: List[SpeechSegment] = []
     for segment in segments:
@@ -540,14 +729,56 @@ def _merge(segments: Iterable[SpeechSegment]) -> List[SpeechSegment]:
     return merged
 
 
-def is_speech(audio_chunk: Any, threshold: float = 0.5, *, sample_rate: int = MODEL_RATE_HZ,
-              model_path: Optional[str] = None) -> bool:
+# --------------------------------------------------------------- the purge pipeline's entry point
+
+class SileroDetector:
+    """`purge.py`'s detector interface over this engine: `.name` and `.detect(samples, rate)`.
+
+    The decision rule itself -- spans, gap joining, minimum duration -- is `purge`'s, shared by
+    every engine, so "what counts as speech" stays one implementation and a receipt from this
+    detector is comparable with one from the band-energy fallback.
+    """
+
+    def __init__(self, vad: "SileroVAD", threshold: float, min_speech_ms: float) -> None:
+        self.vad = vad
+        self.threshold = float(threshold)
+        self.min_speech_ms = float(min_speech_ms)
+        self.name = vad.engine.name
+
+    def detect(self, samples: np.ndarray, rate: int) -> Any:
+        from hear.privacy import purge as _purge
+
+        if int(rate) <= 0:
+            raise _purge.PurgeError("sample rate %r is not a rate" % (rate,))
+        scored = self.vad.score_clip(samples, sample_rate=int(rate))
+        hop_s = self.vad.hop / float(self.vad.sample_rate)
+        return _purge.decision_from_probs(scored.probabilities, hop_s, hop_s,
+                                          self.threshold, self.min_speech_ms, self.name)
+
+
+def load_vad(threshold: float = DEFAULT_THRESHOLD,
+             min_speech_ms: float = DEFAULT_MIN_SPEECH_MS,
+             model_path: Optional[str] = None) -> SileroDetector:
+    """The real Silero engine, verified, or `ModelUnavailable` -- never the fallback in disguise.
+
+    `purge.load_vad("auto")` falls back to its own `BandEnergyVAD` when this raises, and writes
+    that engine's name on the receipt. Returning the synthetic scorer here instead would put
+    "silero" on a receipt that Silero never saw, which is the one lie this pipeline cannot
+    tolerate. The window canary (§2.4) runs before the detector is handed over.
+    """
+    vad = SileroVAD(model_path, require_model=True)
+    vad.verify_window_contract()
+    return SileroDetector(vad, threshold, min_speech_ms)
+
+
+def is_speech(audio_chunk: Any, threshold: float = DEFAULT_THRESHOLD, *,
+              sample_rate: int = MODEL_RATE_HZ, model_path: Optional[str] = None) -> bool:
     """One-shot convenience wrapper. Builds a VAD, answers once, throws it away."""
     return SileroVAD(model_path, sample_rate=_config_rate(sample_rate)).is_speech(
         audio_chunk, threshold, sample_rate=sample_rate)
 
 
-def get_speech_timestamps(audio: Any, *, threshold: float = 0.5,
+def get_speech_timestamps(audio: Any, *, threshold: float = DEFAULT_THRESHOLD,
                           sample_rate: int = MODEL_RATE_HZ,
                           model_path: Optional[str] = None,
                           **kwargs: Any) -> List[Dict[str, float]]:
