@@ -49,7 +49,7 @@ spec:
         # whatever code it started with, indefinitely. Kept in sync by
         # deploy/k8s/gen_configmap.py (DEPLOYMENT_CHECKSUM_TARGETS) whenever the bundle
         # is regenerated; see tests/test_configmap_sync.py for the guard.
-        checksum/hear-mqtt-bridge-code: '2a1d9d91069c79ed0775299b0cb0d73b547943e0cbebbc65acce4f97faa14164'
+        checksum/hear-mqtt-bridge-code: '2d49a113707d7abec99a57bf3375edf32e7cea686c344123c4408f9d107ee6dc'
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -97,6 +97,11 @@ spec:
             - { name: MQTT_TLS_INSECURE, value: "false" }
             - { name: MQTT_TLS_VERSION, value: "tlsv1_2" }
           volumeMounts:
+            - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+            - { name: code, mountPath: /app/hear/ingest/__init__.py, subPath: hear_ingest__init__.py }
+            - { name: code, mountPath: /app/hear/ingest/envelope.py, subPath: hear_ingest_envelope.py }
+            - { name: code, mountPath: /app/hear/ingest/batch.py, subPath: hear_ingest_batch.py }
+            - { name: code, mountPath: /app/hear/ingest/observability.py, subPath: hear_ingest_observability.py }
             - { name: code, mountPath: /app/tools/hear_heartbeat_receiver.py, subPath: tools_hear_heartbeat_receiver.py }
             - { name: code, mountPath: /app/tools/hear_mqtt_bridge.py, subPath: tools_hear_mqtt_bridge.py }
             - { name: deps, mountPath: /deps }

@@ -42,7 +42,10 @@ spec:
         # Forces a new ReplicaSet (Recreate: a full pod restart) whenever
         # hear-heartbeat-code.yaml's content changes. The code file below is mounted
         # with subPath, which kubelet's ConfigMap sync does not live-update.
-        checksum/hear-heartbeat-code: '2a7e1811cdeb995d28a888b48af9eba5739535766b28c4a3b9f0c05f91a0d03e'
+        checksum/hear-heartbeat-code: '825ab427bb565eedf85b95cc00ca6fc351b1325b3f79f5c79d2ea8d2dc4b4b1e'
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "5051"
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -82,6 +85,11 @@ spec:
                   name: hear-heartbeat-token
                   key: token
           volumeMounts:
+            - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+            - { name: code, mountPath: /app/hear/ingest/__init__.py, subPath: hear_ingest__init__.py }
+            - { name: code, mountPath: /app/hear/ingest/envelope.py, subPath: hear_ingest_envelope.py }
+            - { name: code, mountPath: /app/hear/ingest/batch.py, subPath: hear_ingest_batch.py }
+            - { name: code, mountPath: /app/hear/ingest/observability.py, subPath: hear_ingest_observability.py }
             - { name: code, mountPath: /app/tools/hear_heartbeat_receiver.py, subPath: tools_hear_heartbeat_receiver.py }
             - { name: deps, mountPath: /deps }
             - { name: state, mountPath: /state }

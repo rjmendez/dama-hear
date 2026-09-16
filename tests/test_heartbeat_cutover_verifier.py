@@ -298,7 +298,7 @@ def test_an_unrelated_pod_annotation_is_not_covered_by_the_allowance(tmp_path):
     docs = _docs(APPLIED)
     dep = next(d for d in docs if d["kind"] == "Deployment")
     dep["spec"]["template"].setdefault("metadata", {}).setdefault(
-        "annotations", {})["prometheus.io/scrape"] = "true"
+        "annotations", {})["dama-hear/unrelated"] = "true"
     applied = tmp_path / "applied.yaml"
     _write_yaml(applied, docs)
     violations, _notes = V.diff_manifests(applied, PROPOSED)

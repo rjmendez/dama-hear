@@ -391,6 +391,16 @@ class TestHttpIntegration(TestValidation):
         assert body["redis_target"] == "fake:6379"
         assert body["durable_store"]["backend"] == "none"
 
+    def test_metrics_exposes_the_checked_in_ingest_metric_families(self):
+        with running_server() as (base_url, _fake, _addr, _server):
+            with urllib.request.urlopen(base_url + "/metrics", timeout=2) as resp:
+                assert resp.status == 200
+                assert resp.headers["Content-Type"].startswith("text/plain; version=0.0.4")
+                body = resp.read().decode("utf-8")
+        assert "# HELP ingest_producer_spool_backlog " in body
+        assert "# TYPE ingest_ack_gap_items histogram" in body
+        assert "# TYPE ingest_idempotency_conflicts_total counter" in body
+
     def test_slow_client_times_out_instead_of_holding_a_thread_forever(self):
         with running_server(socket_timeout_s=0.2) as (_base_url, _fake, addr, server):
             assert server.daemon_threads is True

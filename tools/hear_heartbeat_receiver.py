@@ -15,6 +15,7 @@ import os
 import re
 import socket
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -25,6 +26,9 @@ from typing import Any, Callable, Dict, Mapping, Optional
 from urllib.parse import urlparse
 
 import redis
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hear.ingest import observability as IO
 
 logger = logging.getLogger("hear-heartbeat")
 
@@ -1474,7 +1478,10 @@ def _refused_device_id(raw_body: Any) -> str:
 def make_handler(store: HeartbeatReceiverStore,
                  max_body_bytes: int = MAX_BODY_BYTES,
                  auth_token: Optional[str] = AUTH_TOKEN,
-                 socket_timeout_s: float = SOCKET_TIMEOUT_S) -> type[BaseHTTPRequestHandler]:
+                 socket_timeout_s: float = SOCKET_TIMEOUT_S,
+                 ingest_metrics: Optional[IO.IngestMetrics] = None) -> type[BaseHTTPRequestHandler]:
+    ingest_metrics = ingest_metrics or IO.IngestMetrics()
+
     class ReceiverHandler(BaseHTTPRequestHandler):
         server_version = "hear-heartbeat-receiver/1"
 
@@ -1483,7 +1490,11 @@ def make_handler(store: HeartbeatReceiverStore,
             self.connection.settimeout(socket_timeout_s)
 
         def do_GET(self) -> None:
-            if urlparse(self.path).path != "/healthz":
+            path = urlparse(self.path).path
+            if path == "/metrics":
+                self.send_prometheus(ingest_metrics.render_prometheus())
+                return
+            if path != "/healthz":
                 self.send_error(404)
                 return
             snapshot = store.health_snapshot()
@@ -1572,6 +1583,13 @@ def make_handler(store: HeartbeatReceiverStore,
             self.end_headers()
             self.wfile.write(body)
 
+        def send_prometheus(self, body: bytes, code: int = 200) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def log_message(self, fmt: str, *args: Any) -> None:
             return
 
@@ -1595,6 +1613,7 @@ def create_server(bind: str, port: int, store: HeartbeatReceiverStore,
                   max_body_bytes: int = MAX_BODY_BYTES,
                   auth_token: Optional[str] = AUTH_TOKEN,
                   socket_timeout_s: float = SOCKET_TIMEOUT_S,
+                  ingest_metrics: Optional[IO.IngestMetrics] = None,
                   durable_replay_interval_s: float = 0.0,
                   durable_replay_limit: int = DURABLE_REPLAY_LIMIT,
                   durable_prune_interval_s: float = 0.0,
@@ -1602,7 +1621,8 @@ def create_server(bind: str, port: int, store: HeartbeatReceiverStore,
     return ReceiverServer(
         (bind, port),
         make_handler(store, max_body_bytes=max_body_bytes,
-                     auth_token=auth_token, socket_timeout_s=socket_timeout_s),
+                     auth_token=auth_token, socket_timeout_s=socket_timeout_s,
+                     ingest_metrics=ingest_metrics),
         store,
         durable_replay_interval_s=durable_replay_interval_s,
         durable_replay_limit=durable_replay_limit,

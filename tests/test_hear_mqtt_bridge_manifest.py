@@ -36,6 +36,11 @@ def test_the_bridge_runs_the_expected_entrypoint_and_mounts_code_and_state():
     assert c["image"] == "python:3.13-slim"
     assert "hear_mqtt_bridge.py" in c["args"][0]
     mounts = {(m["name"], m.get("subPath", m["mountPath"])): m["mountPath"] for m in c["volumeMounts"]}
+    assert mounts[("code", "hear__init__.py")] == "/app/hear/__init__.py"
+    assert mounts[("code", "hear_ingest__init__.py")] == "/app/hear/ingest/__init__.py"
+    assert mounts[("code", "hear_ingest_envelope.py")] == "/app/hear/ingest/envelope.py"
+    assert mounts[("code", "hear_ingest_batch.py")] == "/app/hear/ingest/batch.py"
+    assert mounts[("code", "hear_ingest_observability.py")] == "/app/hear/ingest/observability.py"
     assert mounts[("code", "tools_hear_heartbeat_receiver.py")] == "/app/tools/hear_heartbeat_receiver.py"
     assert mounts[("code", "tools_hear_mqtt_bridge.py")] == "/app/tools/hear_mqtt_bridge.py"
     assert mounts[("state", "/state")] == "/state"

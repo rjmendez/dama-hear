@@ -60,6 +60,10 @@ spec:
     metadata:
       labels:
         app: hear-heartbeat
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "5051"
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet

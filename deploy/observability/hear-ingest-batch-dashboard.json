@@ -1,0 +1,96 @@
+{
+  "title": "Hear HTTPS batch ingest",
+  "uid": "hear-ingest-batch",
+  "schemaVersion": 39,
+  "version": 1,
+  "timezone": "utc",
+  "refresh": "1m",
+  "templating": {
+    "list": [
+      {
+        "name": "site",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(ingest_batches_total, site)",
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      },
+      {
+        "name": "device",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(ingest_batches_total{site=~\"$site\"}, device_id)",
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Producer spool backlog",
+      "type": "timeseries",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (device_id) (ingest_producer_spool_backlog{site=~\"$site\",device_id=~\"$device\"})",
+          "legendFormat": "{{device_id}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Ack gap average (15m)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (device_id) (increase(ingest_ack_gap_items_sum{site=~\"$site\",device_id=~\"$device\"}[15m])) / clamp_min(sum by (device_id) (increase(ingest_ack_gap_items_count{site=~\"$site\",device_id=~\"$device\"}[15m])), 1)",
+          "legendFormat": "{{device_id}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Observed sequence gaps (6h)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (device_id) (increase(ingest_sequence_gaps_total{site=~\"$site\",device_id=~\"$device\"}[6h]))",
+          "legendFormat": "{{device_id}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Batch admission rate by status (15m)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (status) (rate(ingest_batches_total{site=~\"$site\",device_id=~\"$device\"}[15m]))",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    }
+  ]
+}

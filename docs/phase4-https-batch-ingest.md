@@ -430,7 +430,9 @@ counts and latency. Every response and every stored record identifies the answer
 and build (`server.adapter`, `server.version`, `server.envelope_major`), so a bad translation
 or a bad rollout is attributable to a release. Dashboards and mismatch receipts for the
 dual-write comparison are specified by the companion task
-`phase4-dual-write-observability`; this document defines the counters they read.
+`phase4-dual-write-observability`; this document defines the counters they read. The checked-in
+metric extractor and exposition seam live in `hear/ingest/observability.py`, and the staged
+dashboard/alert assets live in `deploy/observability/`.
 
 ## 13. Dual-write, shadow compare and reconciliation
 

@@ -13,9 +13,12 @@
 #         --build-arg RUNTIME_IMAGE=hear-runtime:dev \
 #         --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" -t hear-heartbeat:dev .
 #
-# ⚠️ONE FILE AND ONE DEPENDENCY IS THE POINT. This is the pilot because its whole closure is
-# `redis`, so what is being proven is the mechanism -- build, provenance, cutover, rollback --
-# and not somebody's ability to containerise numpy. See docs/worker-packaging.md, gate 1.
+# ⚠️A SMALL IMPORT CLOSURE AND ONE DEPENDENCY IS THE POINT. This is still the pilot because its
+# only third-party closure is `redis`, so what is being proven is the mechanism -- build,
+# provenance, cutover, rollback -- and not somebody's ability to containerise numpy. The repo
+# modules below are copied one by one so tests/test_service_images.py can prove the image and the
+# rollback ConfigMap ship the exact same code at the exact same paths. See docs/worker-packaging.md,
+# gate 1.
 ARG RUNTIME_IMAGE
 FROM ${RUNTIME_IMAGE}
 
@@ -49,10 +52,16 @@ USER root:root
 COPY requirements/lock/service-hear-heartbeat.txt /tmp/lock.txt
 RUN pip install --require-hashes --no-deps -r /tmp/lock.txt && rm -f /tmp/lock.txt
 
-# ⚠️THE ONE FILE THE ConfigMap SHIPS, AT THE PATH THE ConfigMap MOUNTS IT TO. Same path means the
-# entrypoint, the probes and any operator's muscle memory are unchanged across the cutover, and
-# tests/test_service_images.py compares this COPY against the `hear-heartbeat-code` bundle so the
-# image and its own rollback artifact cannot come to contain different code.
+# ⚠️THE EXACT FILE SET THE ConfigMap SHIPS, AT THE PATHS THE ConfigMap MOUNTS THEM TO. Same paths
+# mean the entrypoint, the probes and any operator's muscle memory are unchanged across the
+# cutover, and tests/test_service_images.py compares these COPY lines against the
+# `hear-heartbeat-code` bundle so the image and its own rollback artifact cannot come to contain
+# different code.
+COPY hear/__init__.py /app/hear/__init__.py
+COPY hear/ingest/__init__.py /app/hear/ingest/__init__.py
+COPY hear/ingest/envelope.py /app/hear/ingest/envelope.py
+COPY hear/ingest/batch.py /app/hear/ingest/batch.py
+COPY hear/ingest/observability.py /app/hear/ingest/observability.py
 COPY tools/hear_heartbeat_receiver.py /app/tools/hear_heartbeat_receiver.py
 
 # The port the fleet POSTs to, and the one deploy/k8s/hear-heartbeat.yaml binds on the host.

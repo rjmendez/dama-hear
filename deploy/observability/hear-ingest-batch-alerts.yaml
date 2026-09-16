@@ -1,0 +1,70 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hear-ingest-batch-observability
+  namespace: dama
+spec:
+  groups:
+    - name: hear-ingest-batch.rules
+      rules:
+        - alert: HearIngestAckGapSustained
+          expr: |
+            (
+              sum by (site, device_id, source, adapter) (
+                increase(ingest_ack_gap_items_sum[15m])
+              ) > 0
+            )
+            and on (site, device_id, source, adapter)
+            (
+              sum by (site, device_id, source, adapter) (
+                increase(ingest_batches_total{status="accepted"}[15m])
+              ) > 0
+            )
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Sustained ingest ack gap
+            description: >
+              A producer is submitting accepted batches, but the durable acknowledgement
+              prefix is still leaving items behind inside the batch.
+        - alert: HearIngestProducerSpoolBacklogGrowing
+          expr: |
+            (
+              max by (site, device_id, source, adapter) (
+                max_over_time(ingest_producer_spool_backlog[30m])
+              ) > 0
+            )
+            and on (site, device_id, source, adapter)
+            (
+              max by (site, device_id, source, adapter) (
+                delta(ingest_producer_spool_backlog[30m])
+              ) > 0
+            )
+            and on (site, device_id, source, adapter)
+            (
+              sum by (site, device_id, source, adapter) (
+                increase(ingest_batches_total{status="accepted"}[30m])
+              ) > 0
+            )
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: Producer spool backlog is growing
+            description: >
+              A producer-reported spool backlog is present and increasing while accepted
+              batches continue to arrive, indicating drain slower than fill.
+        - alert: HearIngestSequenceGapObserved
+          expr: |
+            sum by (site, device_id, source, adapter) (
+              increase(ingest_sequence_gaps_total[30m])
+            ) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Producer batch sequence gap observed
+            description: >
+              One producer reported a gap in producer.batch_sequence within the same
+              boot_id, which is continuity evidence worth investigation.

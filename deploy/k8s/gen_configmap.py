@@ -173,6 +173,11 @@ TDOA_DATA = [
 ]
 
 HEARTBEAT_CODE = [
+    ("hear__init__.py", "hear/__init__.py"),
+    ("hear_ingest__init__.py", "hear/ingest/__init__.py"),
+    ("hear_ingest_envelope.py", "hear/ingest/envelope.py"),
+    ("hear_ingest_batch.py", "hear/ingest/batch.py"),
+    ("hear_ingest_observability.py", "hear/ingest/observability.py"),
     ("tools_hear_heartbeat_receiver.py", "tools/hear_heartbeat_receiver.py"),
 ]
 
@@ -180,6 +185,11 @@ MQTT_BRIDGE_CODE = [
     # hear_mqtt_bridge.py imports validate_*/write_*/RequestError straight from this file so
     # the AWS and LAN ingest paths share one schema instead of two that can drift apart --
     # which means both files have to ship in the same ConfigMap for the import to resolve.
+    ("hear__init__.py", "hear/__init__.py"),
+    ("hear_ingest__init__.py", "hear/ingest/__init__.py"),
+    ("hear_ingest_envelope.py", "hear/ingest/envelope.py"),
+    ("hear_ingest_batch.py", "hear/ingest/batch.py"),
+    ("hear_ingest_observability.py", "hear/ingest/observability.py"),
     ("tools_hear_heartbeat_receiver.py", "tools/hear_heartbeat_receiver.py"),
     ("tools_hear_mqtt_bridge.py", "tools/hear_mqtt_bridge.py"),
 ]
