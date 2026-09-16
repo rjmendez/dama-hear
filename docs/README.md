@@ -69,7 +69,7 @@ what was chosen, the in-tree evidence it rests on, and what was deliberately lef
 | [l86-reference.md](l86-reference.md) | L86 GNSS module reference. |
 | [hear-latency-calibration-runbook.md](hear-latency-calibration-runbook.md) | Latency calibration procedure. |
 | [pool-backup-restore.md](pool-backup-restore.md) | The backup and restore design for PVC `dama/hear-pool` and its explicit G0 acceptance test: measured storage facts (including that the node's ext4 root is a VHDX on a 95 %-full Windows disk), why no snapshot primitive exists here, generational encrypted archives to a second physical disk, per-class consistency rules for append-only JSONL and a live-WAL SQLite database, key custody, retention, and the restore-isolation boundary. Phase 3 import is blocked until its G0 passes. |
-| [bridge-durable-soak.md](bridge-durable-soak.md) | Durable-outbox soak runbook for `hear-mqtt-bridge`: what `tools/bridge_soak_evidence.py` records, the T+24h/7d/14d pass/fail criteria, and the read-only boundary it enforces. |
+| [bridge-durable-soak.md](bridge-durable-soak.md) | Durable-outbox soak runbook for `hear-mqtt-bridge`: the authoritative T0 baseline and five-node coverage with Rankine documented as excluded, what `tools/bridge_soak_evidence.py` records, the T+24h/7d/14d pass/fail criteria, the read-only boundary it enforces, and the offline day-1/day-7/day-14 series review run by `tools/soak_evidence_validate.py`. |
 
 ## Operations, policy, and cross-cutting design
 
