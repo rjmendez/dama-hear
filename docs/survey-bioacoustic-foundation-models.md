@@ -2,7 +2,8 @@
 
 **Status: survey. Nothing here is built, chosen, or procured.** This document exists to put
 numbers under the model names that `docs/acoustic-stack.md` §6.3 and `docs/ml-lifecycle.md`
-already spend: Perch 2.0 as the S1 embedding backbone, `mn10_as` as the shipped coarse tagger,
+already spend: Perch 2.0 as the S1 embedding backbone (Tier 3 in
+`docs/acoustic-models-bleeding-edge.md`), `mn10_as` as the shipped coarse tagger,
 and the still-unwritten question of how a remote node's audio gets to a backbone at all when the
 link is Meshtastic, not WiFi.
 
@@ -737,4 +738,4 @@ this repository's own documents.
 - EnCodec — [arXiv:2210.13438](https://arxiv.org/abs/2210.13438); `facebookresearch/encodec`. DAC — [arXiv:2306.06546](https://arxiv.org/abs/2306.06546); `descriptinc/descript-audio-codec` (MIT). SoundStream — [arXiv:2107.03312](https://arxiv.org/abs/2107.03312). Lyra — `google/lyra`. SemantiCodec — [arXiv:2405.00233](https://arxiv.org/abs/2405.00233). Opus — RFC 6716
 - Compression and bioacoustics — *Bioacoustics* 2023, [doi:10.1080/09524622.2023.2290718](https://doi.org/10.1080/09524622.2023.2290718); *Ecology and Evolution* 2021, [doi:10.1002/ece3.8042](https://doi.org/10.1002/ece3.8042)
 - Link budgets — The Things Network LoRaWAN spreading-factor and duty-cycle documentation; ETSI EN 300 220-2 V3.2.1 §4.3.3; Whytock et al., [doi:10.1101/2021.11.10.468078](https://doi.org/10.1101/2021.11.10.468078) (Iridium SBD 340 B)
-- In-tree — `docs/acoustic-stack.md`, `docs/uplink.md`, `docs/esp32s3-lora-node.md`, `docs/ml-lifecycle.md`, `docs/phase3-storage-capacity-model.md`, `docs/clip-pipeline.md`
+- In-tree — `docs/acoustic-stack.md`, `docs/acoustic-models-bleeding-edge.md`, `docs/uplink.md`, `docs/esp32s3-lora-node.md`, `docs/ml-lifecycle.md`, `docs/phase3-storage-capacity-model.md`, `docs/clip-pipeline.md`

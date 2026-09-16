@@ -10,6 +10,16 @@ ships first, what each stage costs in node hearing and operator hours, what it r
 and which stages cannot start until a phone release, an RTK survey, or a microphone that does
 not exist yet arrives.
 
+> **The model architecture that spans all of this is `docs/acoustic-models-bleeding-edge.md`** —
+> the formal **5-Tier Acoustic Architecture** (Tier 0 node edge / micro-DSP, Tier 1 ingest privacy
+> and compliance, Tier 2 coarse event triage, Tier 3 bioacoustic and ecological foundation, Tier 4
+> multi-sensor spatial and replay), with the block diagrams, the per-tier latency and memory
+> budgets, the licence compatibility matrix and the verification gates G0–G4.
+> **This document is the measurement of record; where the two disagree, that one is wrong.**
+> ⚠️Note the word "tier" is used in two senses here: §2 and §7 below tier the **sensors**, while
+> that document tiers the **models**. They are different axes and neither is a renaming of the
+> other.
+
 ### Node reachability is a three-layer verdict
 
 Never declare a node **offline** from a failed curl or `/status` probe alone. The node's HTTP
@@ -656,6 +666,12 @@ it works **inside hugbot's array and nowhere else on the property**.
 
 ## 6. Models: the cascade, and the numbers it is allowed to quote
 
+> The cascade below is the **model** axis, and its full architecture — five tiers, their block
+> diagrams, budgets, licence matrix and gates — is `docs/acoustic-models-bleeding-edge.md`.
+> Map: §6 Stage 0/0.5 → Tier 0/Tier 2, §6.3 Stage 1 → Tier 3, §5 S4 → Tier 4. The **privacy purge
+> gate between the drain and the pool is Tier 1, and it does not exist**; every clip this fleet
+> collects is landed and tagged unfiltered today.
+
 A cheap always-on triage in front of an expensive identifier. Explicitly, and with two large
 caveats.
 
@@ -845,6 +861,10 @@ retargeted or retired deliberately.)
 
 ## 7. What each tier contributes, and why flattening them destroys it
 
+⚠️**Sensor tiers, not model tiers.** This section tiers the *hardware* that hears. The model
+cascade is tiered separately in `docs/acoustic-models-bleeding-edge.md`, and a node appears in
+both with different obligations.
+
 - **xiao nodes** — GPS-PPS time (tAcc 24–28 ns, 0 glitches, PPS spread 6–9 µs) and the **only
   retrospective ring in the fleet** (60 s measured). They are the fleet's clock and its memory. They are
   single-mic and **structurally cannot bear**.
@@ -908,6 +928,8 @@ retargeted or retired deliberately.)
 | powerline-easement broadband emission in the aircraft band | the false-positive floor on the one easy target | one quiet capture near the easement |
 | hugbot's ESP acoustic→ADC group delay | hugbot arrival times — must be **omitted**, not zeroed | an external reference |
 | whether the 2080 Ti (sm_75) runs the chosen Perch runtime | S1 image sizing | one container run |
+| Silero VAD v5's **weights** licence, artefact size and sha256 | the Tier 1 privacy purge gate — every clip is landed and tagged unfiltered until it closes (`docs/acoustic-models-bleeding-edge.md` G1.1–G1.2) | read the release artefact |
+| BioLingual's weights licence, embedding width and native rate | whether zero-shot text query may write the pool at all (G3.2) | a model-card read and one forward pass |
 
 ---
 
