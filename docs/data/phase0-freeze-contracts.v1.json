@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "a03e3b8b33cae606dd479241fb4c67ca2d7107b9fc3698a0563a508f415f5df1",
+  "baseline_hash": "6ed2f6ae812d1a261ed85fb016ac78dfe1d1687e865130c1cfaf8be2ce69fde2",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -480,8 +480,8 @@
       },
       {
         "path": "deploy/k8s/hear-drain.yaml",
-        "sha256": "a74407ca0a69a6ea0c3e0e8eb96c1da6338b649067c6706bec5ec01ccfa38d72",
-        "size_bytes": 18271
+        "sha256": "af67cf80b27831423574f9f0c1b8d3a06bb14f1ed6e987b295d0289451ed8b12",
+        "size_bytes": 19588
       },
       {
         "path": "deploy/k8s/hear-embed.yaml",
@@ -2484,7 +2484,7 @@
         "storage_request": "20Gi"
       }
     ],
-    "section_hash": "eb9a90dd5f2d8fc66b04bc26c683396c2d046b9ae0943f3bbe67764026fb195c"
+    "section_hash": "5cdb3a5592dd545ef61122f16a4f0df4c40258df8e267b15bb3bd9ea6190ef0f"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",
