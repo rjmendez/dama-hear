@@ -61,3 +61,33 @@ def test_a_stream_digest_does_not_depend_on_row_order():
     rows = [{"key": "a"}, {"key": "b"}, {"key": "c"}]
     digests = [K.record_digest(r) for r in rows]
     assert K.stream_digest(digests) == K.stream_digest(reversed(digests))
+
+
+def test_every_class_labelled_sensitive_is_actually_protected():
+    """⚠️THE LABELLED-BUT-UNPROTECTED REGRESSION: `tdoa-*` was marked and then left in the clear.
+
+    `SENSITIVITY` labelled `tdoa-arrival-seg` and `tdoa-run` `precise_location` while
+    `RESTRICTED_CLASSES` was the literal `{"clip", "raw"}`, so both TDOA classes were addressed by
+    the raw sha256 of their plaintext, imported with no key provider at all, deduped across
+    tenants by content address, and had that digest copied into ledger rows and quarantine
+    records. A TDOA arrival row is short and highly guessable -- a few node ids, a coordinate, a
+    microsecond timestamp -- which makes a published digest of it a confirmation oracle for the
+    exact coordinate the label exists to protect. The set is now derived from the labels, so the
+    two tables cannot drift apart again.
+    """
+    labelled = {cls for cls, labels in K.SENSITIVITY.items()
+                if K.RESTRICTED_SENSITIVITY.intersection(labels)}
+    assert labelled == set(K.RESTRICTED_CLASSES)
+    assert {"tdoa-arrival-seg", "tdoa-run", "clip", "raw"} <= set(K.RESTRICTED_CLASSES)
+    assert set(K.SENSITIVITY) <= set(K.CLASSES)
+
+
+def test_a_precise_location_class_is_addressed_per_tenant_and_never_by_its_plaintext():
+    plaintext = K.sha256_hex(b'{"node":"mach","lat":40.2925221,"lon":-79.1221604}')
+    one = K.restricted_blob_id(b"tenant-a-index-key", plaintext)
+    two = K.restricted_blob_id(b"tenant-b-index-key", plaintext)
+    assert one != plaintext and two != plaintext and one != two
+    # And such a class cannot be keyed with the plain algo, which is what kept the digest public.
+    assert K.blob_key(one, algo="hmac-sha256", tenant="dama").endswith(one)
+    with pytest.raises(ValueError):
+        K.blob_key(one, algo="hmac-sha256")

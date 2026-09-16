@@ -47,13 +47,13 @@ S3-compatible storage first appears at `deployment.md:79`, which begins at three
 | # | Demand | Where it lives |
 | --- | --- | --- |
 | D1 | Conditional create-if-absent on the pointer: absent → committed, present with the same blob → replay, present with a different blob → conflict | `commit_pointer` |
-| D2 | A fencing epoch when D1 is unavailable, so a resurrected writer is refused at commit | `Lease.epoch`, `_lease_is_live` |
+| D2 | A fencing epoch when D1 is unavailable, so a resurrected writer is refused at commit — one per *acquisition*, including a same-holder reacquire | `Lease.epoch`, `Lease.token`, `_lease_is_live` |
 | D3 | Published keys are immutable by mechanism — `put_immutable(if_absent=False)` raises | `backend.py` |
 | D4 | The importer credential has no `delete_object`; staging is the only deletable prefix | module docstring |
 | D5 | Read-after-write for a new key, because verification re-reads what was staged | `stage.py` |
 | D6 | Range GET, so a 392 MB model and a 480 KB clip share one code path and bytes never flow through a worker (`docs/api-boundaries.md:88-90`) | `get_range` |
 | D7 | Prefix listing for GC and audit only — resume replays the local ledger, never a bucket listing | `list_prefix` |
-| D8 | Leases with TTL, holder and a monotonic epoch | `acquire_lease` |
+| D8 | Leases with TTL, holder, a monotonic epoch and a per-acquisition token | `acquire_lease`, `renew_lease` |
 | D9 | Three credentials: importer, reader, custodian | key design; today every job, including the `*-check` verifiers, mounts `/pool` rw |
 | D10 | The digest compared on readback is the one recorded at ingest, never recomputed from the same read | `ledger.jsonl`, `index.jsonl` |
 
@@ -117,20 +117,74 @@ versioning.
 
 ## Gaps that belong to the importer, not to any backend
 
-Reading the merged scaffold surfaced three things that block a live run whichever backend is
-chosen, and one of them should be fixed while the Protocol still has a single implementation.
+Reading the merged scaffold surfaced four things that block a live run whichever backend is
+chosen. All four were fixed while the Protocol still had a single implementation, which was the
+point of fixing them then: each one changes the Protocol, and changing it once is cheaper than
+changing it after an adapter exists. None of this selects, provisions or configures a backend.
 
-* **Bodies are whole objects in memory.** The staging call takes `bytes`, and the source read is a
-  single `read()`. The perch model is 392 MB. This is a correctness problem under a pod memory
-  limit, not a tuning one, and fixing it changes the Protocol.
-* **No encryption exists.** The envelope, the per-tenant-per-class KEK and the HMAC blob ids are
-  design only. Importing ambient audio and precise coordinates into a second unencrypted location,
-  on a host with no volume encryption, widens the exposure the design was written to close.
-* **`head()` carries no digest, and there is no republish path.** Verification therefore costs a
-  second full read, and the rollback ladder's "republish the previous generation" rung has no
-  mechanism yet; the two cheaper rungs do.
-* **`acquire_lease` is read-then-write.** Adequate while the importer is single-process — the
-  conditional put is the real safety property — and not to be mistaken for a distributed lock.
+| Gap | What it was | What closed it |
+| --- | --- | --- |
+| Bodies were whole objects in memory | `put_staged(bytes)` and a single `read()`; the perch model is 392 MB | `hear/objectstore/streaming.py`: a payload is a `ChunkSource` (a factory of chunk iterators), digests accumulate in flight, and `put_staged_stream`/`put_immutable_stream`/`iter_range` are the payload calls. `tests/test_objectstore_streaming.py` imports a 64 MiB object under an 8 MiB `tracemalloc` ceiling. |
+| No encryption existed | envelope, per-(tenant, class) KEK and HMAC blob ids were design only | `hear/objectstore/crypto.py`: an injected `KeyProvider`/`Cipher` boundary. The **default refuses**, so a restricted class is quarantined `key_provider_unavailable` rather than published in the clear; with a provider, the blob id is `HMAC-SHA256(K_tenant_index, plaintext digest)` and the plaintext digest exists only inside the sealed metadata. The restricted set is derived from the sensitivity labels, so `tdoa-arrival-seg`/`tdoa-run` (`precise_location`) are covered by the same refusal as `clip`/`raw`. |
+| No republish path | the rollback ladder's "republish the previous generation" rung had no mechanism | `commit_pointer(..., expect_generation=...)` plus immutable per-generation records under `hear/v1/ptrgen/`. The open tail is the only object written twice, at most once per (class, partition) per run, and `superseded_by` is *derived* from the next generation rather than written back onto an immutable record. |
+| `acquire_lease` was read-then-write | two racers could be handed the same epoch, which fences neither | acquisition is now an `O_CREAT|O_EXCL` claim on an epoch-named record: one winner, and the loser is told `None`. `LocalDirBackend(conditional_put=False)` models the store that has no conditional put — it reports `atomic_cas=False`, takes claims by check → write → confirm with an injectable race window, really does lose an update, and a commit without a live fencing lease is refused outright. |
+
+### The review of that first cut, and what it changed
+
+Review of the scaffold found five defects in the fixes themselves. None of them was reachable from
+a production path — there is still no backend, no KMS and no live data — but three of them
+invalidated security claims the scaffold was making in its own docstrings, so they are recorded
+here rather than only in a commit message.
+
+| Defect | Why it mattered | What it is now |
+| --- | --- | --- |
+| The sealed metadata was encrypted with the body's `(key, nonce)` | In a CTR construction two messages under one keystream publish `P1 XOR P2`, and the metadata plaintext is a schema-shaped document an attacker can write out — so the body came back in the clear | One DEK, four values: `hkdf_expand` (RFC 5869, HMAC-SHA256, with the published test vector asserted) derives an independent key *and* nonce for `body` and for `metadata`, each bound to the tenant, class, key id and cipher name. The attack is executed in `test_xoring_the_body_against_the_sealed_metadata_recovers_nothing` and must fail. |
+| The nonce was `sha256("nonce/" + plaintext digest + wrapped key)`, and both inputs were published | That is a confirmation oracle requiring **no key at all**: guess the plaintext, recompute, compare | Every nonce comes out of the HKDF over the secret DEK and is **not published** — a reader derives it after unwrapping. `test_no_published_field_confirms_a_guessed_plaintext` searches every key and every stored byte for a keyless derivation of the guess, including the old formula, with a key-holding positive control so the negative result means something. |
+| `ObjectCrypto`'s default built `HmacCtrCipher` and passed `allow_test_cipher=True` itself | The guard against a not-production-ready cipher was defeated by the constructor meant to enforce it | The default is `RefusingCipher`: no algorithm, raises on `seal`. A key provider alone no longer makes an importer able to encrypt, and `HmacCtrCipher` must still be named *and* admitted explicitly. `production_ready = False` is unchanged — it was not renamed or relabelled. |
+| A generation claim followed by a failed pointer write wedged the object forever | The retry found generation N claimed, called it someone else's, and could never reach N+1 either because the pointer never advanced | The claim is compared against the document being written on the identity that matters (object, blob, generation, predecessor). A match rolls forward and publishes the claimed record; a different blob is still a real conflict. Injected mid-commit failures cover both, at the backend and end to end. |
+| The re-stage after a bad readback sat outside the per-object handler | A source or key failure on the *second* read aborted the whole import with no report, no `run_close` and no quarantine record | One table maps per-object failures to quarantine reasons and every read goes through it. Two tests kill a source and a key provider mid-retry and require the run to close, the object to be quarantined and the next object to publish. |
+
+One further defect fell out of writing those tests: an interrupted write left a truncated file
+behind — fatal under create-if-absent, because every later run would find it, re-read it, and
+quarantine it as corrupt forever. An interrupted write now removes the key it created, which is
+not the `delete_object` the importer is denied: nothing ever pointed at it.
+
+### The second review, and what it changed
+
+An independent review of the streaming/encrypted importer found six further defects. As before,
+none is reachable from a production path — there is still no backend, no KMS and no live data —
+but four of them contradicted claims this document or the module docstrings were making, so they
+are recorded here with the regression that now holds each one.
+
+| Defect | Why it mattered | What it is now |
+| --- | --- | --- |
+| `InMemoryTestKeyProvider` had a default seed, and `ObjectCrypto` never looked at `is_test_only` | A caller who forgot an argument got working encryption under a secret compiled into the repository, which is indistinguishable at runtime from real encryption and is not encryption at all | The seed is required, must be ≥ 16 bytes, and `ObjectCrypto` refuses any `is_test_only` provider unless constructed with `allow_test_provider=True`. `synthetic_crypto()` takes a seed or samples `os.urandom(32)`; there is no constant left to reach. A signature-level test asserts no default seed, so the guard cannot be re-added by a default argument. |
+| The wrap was `DEK XOR HMAC(KEK, tenant/class)` — one constant mask per class | The mask is recoverable from a single unwrapped DEK, so disclosing one object's key disclosed *every* key in its class, and an edited wrapped key silently opened to a different key rather than failing | Per-object wrapping: `salt ‖ DEK XOR HKDF(KEK, salt ‖ context) ‖ HMAC tag`, with the context bound to tenant, class, key id and blob id, and `open_key` authenticating before it returns. The salt is derived (`HMAC(KEK, "wrap/salt/" + context)`) rather than sampled, because metadata is digest-addressed and a random salt would republish it on every replay. `test_one_disclosed_dek_does_not_unwrap_the_rest_of_its_class` performs the recovery and requires it to fail. |
+| A live same-holder lease was handed back its existing epoch | A crashed importer and its restart share a holder id, so the zombie and the replacement got the *same* fence — which fences neither, and is exactly the case the fence exists for | Every acquisition mints a new epoch *and* a new random token; only `renew_lease` keeps the pair it was given (a renewal that minted a fence would invalidate epochs already written into committed pointers). `_lease_is_live` compares both and re-reads the record, so a zombie holding the old token is refused at commit even though its holder id still matches. |
+| `conditional_put=False` still used `O_CREAT|O_EXCL` for generation claims and lease epochs | The "store with no conditional put" simulation was quietly atomic, so the fallback path nobody could test in production was also untested here | The weak store reports `atomic_cas=False` and uses no atomic primitive anywhere: check → injectable race window → write → read-after-write confirm, returning `taken` when a racer clobbered it. The residual (a racer landing *after* the confirm) is caught by the lease token re-read at commit, and is stated rather than papered over. |
+| Only the staging put retried `BackendTransient`, and store errnos surfaced as bare `OSError` | One flaky blob PUT, metadata PUT or pointer commit ended a run that had already published hundreds of objects; and `ENOSPC`/`EIO` were classified `source_unreadable`, which blames the evidence for a full disk | Blob put, dedupe readback, metadata put and the pointer head/commit each retry with backoff, and quarantine `backend_transient` — after deleting the staged copy — only once the retries are spent. `as_backend_fault` classifies `ENOSPC`, `EIO`, `EDQUOT`, `EROFS` and the network errnos on both the read and write paths; `source_unreadable` is reserved for the bytes we were handed. |
+| `RESTRICTED_CLASSES` was the literal `{"clip", "raw"}` while `SENSITIVITY` labelled `tdoa-arrival-seg`/`tdoa-run` `precise_location` | Both TDOA classes were addressed by the raw sha256 of their plaintext, imported with no key provider, deduped across tenants by content address, and had that digest copied into ledger and quarantine rows. An arrival row is short and guessable, so a published digest of it is a confirmation oracle for the coordinate the label exists to protect | `RESTRICTED_CLASSES` is derived from `SENSITIVITY`, so anything labelled `ambient_audio` or `precise_location` is restricted by construction and the two tables cannot drift. An import-time check requires every labelled class to exist in `CLASSES`. End-to-end tests require the TDOA classes to quarantine without a provider, to publish no plaintext digest and no plaintext coordinate with one, and not to share a blob across tenants. |
+
+#### Two hard gates this review did not close
+
+Both are specified in ADR 0010 (PR #245) and neither is in this branch. They are the reason the
+cipher here still says `production_ready = False` and sealing is still refused by default:
+
+* **AEAD-AAD metadata binding.** Sealed metadata is authenticated, but the envelope's public
+  fields (key id, algorithm, tenant, class, generation) are not bound into an AEAD's associated
+  data, so a real AEAD is required before a swapped envelope can be *detected* rather than argued
+  about.
+* **Streaming authenticated decryption.** There is no chunk-level authenticated read path: a
+  reader cannot verify a 392 MB body incrementally without buffering it, which is the same
+  constraint that made the write path stream in the first place.
+
+Until both land with a reviewed AEAD and a real key provider, nothing in this package should seal
+anything anybody intends to rely on.
+
+What is still **not** closed, and is not this lane's to close: `head()` still carries no digest, so
+verification costs a second read (it is a streamed read now, not a buffered one); there is no
+capability probe against a real store, because there is no store; and nothing here has been run
+against anything but synthetic fixtures.
 
 ## Where an S3 adapter may live
 
@@ -149,8 +203,15 @@ backend is ever chosen, that is a decision to take deliberately, not a lint resu
 
 1. The pool has a restore-tested backup. Unchanged, and still the hard blocker; nothing below
    matters until it passes.
-2. Staging streams instead of buffering, proven with a fixture larger than the chunk size.
-3. The encryption boundary exists in code.
+2. ~~Staging streams instead of buffering~~ — done: proven against a fixture 1,024 chunks long,
+   under a memory ceiling a buffered body cannot pass.
+3. ~~The encryption boundary exists in code~~ — the *boundary* does, and it refuses by default. A
+   **key provider and a reviewed AEAD still have to be chosen and wired**: the only cipher in the
+   repository is `HmacCtrCipher`, which declares `production_ready = False`, and the only provider
+   is `InMemoryTestKeyProvider`, which is refused outright unless a caller passes
+   `allow_test_provider=True` and hands it a seed of its own. Two gates named in ADR 0010
+   (PR #245) are also still open: **AEAD-AAD binding of the envelope metadata** and **streaming
+   authenticated decryption**.
 4. The capacity reservation is renegotiated against the 52 GB figure rather than the 240 G one.
 
 ## The open questions, stated as choices
