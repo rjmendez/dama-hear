@@ -305,7 +305,7 @@ class TestTheNamesComeFromTheDetsColumn:
 
         monkeypatch.setattr(HD, "fetch_sd", flaky)
         r = HD.drain_node(pl, "nyquist", "10.0.0.1")
-        assert dets_calls == [("dets.csv", None, HD.DEFAULT_TIMEOUT_S)] * 2
+        assert dets_calls == [("dets.csv", None, HD.DETS_FETCH_TIMEOUT_S)] * 2
         assert _clip_paths(n) == [_name(501)]
         assert r["clips_seen"] == 1 and r["clips_fetched"] == 1
 
