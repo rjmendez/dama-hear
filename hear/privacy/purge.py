@@ -72,7 +72,7 @@ import io
 import json
 import os
 import wave
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -97,6 +97,19 @@ RECEIPT_SCHEMA = "hear.vad.purge.receipt.v1"
 #: reads, because an audit log that a rename orphans was never durable in the first place.
 RECEIPT_NAME = "vad_purge.jsonl"
 LEGACY_RECEIPT_NAME = "purged_receipts.jsonl"
+
+#: §9's fail-closed reason codes. A clip that cannot be honestly scored is PURGED, and the code
+#: says which impossibility it hit.
+REASON_INFERENCE = "vad_inference_error"
+REASON_UNREADABLE = "clip_unreadable"
+REASON_RATE = "rate_refused"
+REASON_PURGE_FAILED = "purge_failed"
+FAIL_CLOSED_REASONS = (REASON_INFERENCE, REASON_UNREADABLE, REASON_RATE, REASON_PURGE_FAILED)
+
+#: Rates this fleet records at (contract §2). Anything else cannot be honestly scored: the
+#: detector's frame geometry and pitch search are defined against these, so a 44.1 kHz file is
+#: refused -- and refusing means PURGING, never keeping.
+SUPPORTED_SOURCE_RATES = (16000, 48000)
 
 #: Every verdict a scored clip can carry (contract §6). `NOT_SCORED` is not a failure: it is the
 #: honest answer for a clip whose audio was already gone when the scan reached it.
@@ -217,6 +230,14 @@ class UnreadableClip(PurgeError):
     """The WAV could not be parsed. The file is left alone: undecided is not innocent."""
 
 
+class RateRefused(PurgeError):
+    """A sample rate this lane cannot honestly score. Fails closed (§9 `rate_refused`)."""
+
+
+class NonFiniteAudio(PurgeError):
+    """NaN or Inf reached the detector. Fails closed: see `assert_finite()`."""
+
+
 class PrivacyLeak(AssertionError):
     """A record carried a field this pipeline is not allowed to emit. Fail loudly, never trim."""
 
@@ -246,6 +267,12 @@ def read_wav_mono(path: str) -> Tuple[np.ndarray, int]:
             if rate <= 0 or channels <= 0:
                 raise UnreadableClip("%s: header claims %d Hz / %d channels"
                                      % (path, rate, channels))
+            if rate not in SUPPORTED_SOURCE_RATES:
+                raise RateRefused(
+                    "%s: %d Hz is not a rate this lane records at %r. The frame geometry and "
+                    "the pitch search are defined against those rates, so a score here would "
+                    "be a guess -- and a guess that can only err towards keeping a voice."
+                    % (path, rate, SUPPORTED_SOURCE_RATES))
             raw = wav.readframes(frames)
     except UnreadableClip:
         raise
@@ -334,7 +361,10 @@ class BandEnergyVAD:
       * **harmonicity**, a normalised autocorrelation peak at a plausible pitch period -- alone
         this labels a whistle, a hum and a tyre resonance;
       * **spectral spread**, i.e. no single FFT bin owning the frame -- this is what separates
-        a voice from the sirens and alarms the first three gates happily call speech.
+        a voice from the sirens and alarms the first three gates happily call speech;
+      * **pitch-track continuity**, because 1/f noise passes all four of the above: it is
+        low-weighted, broad, and has a strong autocorrelation peak in the pitch range on every
+        frame -- in a different place each time. A larynx gudes its f0; noise resamples it.
 
     A gunshot fails the first two (broadband, impulsive), rain and hiss fail the second and
     third, a tonal machine fails the flatness/pitch-stability part of the third. A voice passes
@@ -403,10 +433,48 @@ class BandEnergyVAD:
         p_band = _ramp(band_ratio, 0.25, 0.55)
         p_harm = _ramp(harm, 0.25, 0.55)
         p_spread = (1.0 - _ramp(peak_share, 0.32, 0.55)) * (1.0 - _ramp(top_share, 0.88, 0.98))
-        probs = np.clip(p_energy * p_band * p_harm * p_spread, 0.0, 1.0) ** (1.0 / 4.0)
+        p_track = _ramp(self._pitch_continuity(win, rate), 0.40, 0.80)
+        probs = np.clip(p_energy * p_band * p_harm * p_spread * p_track, 0.0, 1.0) ** (1.0 / 5.0)
         # Absolute silence is never speech, whatever the clip's own floor says.
         probs[rms < 1e-4] = 0.0
         return probs.astype(np.float32), hop
+
+    @staticmethod
+    def _pitch_continuity(win: np.ndarray, rate: int) -> np.ndarray:
+        """How steadily the best pitch lag moves from frame to frame, smoothed over ~50 ms.
+
+        ⚠️THIS IS WHAT SEPARATES A VOICE FROM PINK NOISE. 1/f noise is not flat: it has most of
+        its energy low, it passes the voiced-band test, and its autocorrelation has a strong peak
+        in the pitch range on every frame -- the peak is just in a DIFFERENT PLACE every frame.
+        A larynx cannot do that. Speech glides its f0; noise resamples it. Measured on
+        tests/privacy_signals.py: speech 0.76 frame-to-frame agreement, pink noise 0.39-0.49.
+        """
+        lags = BandEnergyVAD._best_lag(win, rate)
+        if lags.size < 2:
+            return np.ones(lags.size, dtype=np.float32)
+        step = np.abs(np.diff(lags)) / np.maximum(lags[:-1], 1)
+        agree = np.concatenate([[0.0], (step < 0.15).astype(np.float64)])
+        kernel = np.ones(5) / 5.0
+        return np.convolve(agree, kernel, mode="same").astype(np.float32)
+
+    @staticmethod
+    def _acf(win: np.ndarray) -> np.ndarray:
+        n = win.shape[1]
+        size = 1 << int(np.ceil(np.log2(2 * n)))
+        spec = np.fft.rfft(win, n=size, axis=1)
+        return np.fft.irfft(np.abs(spec) ** 2, n=size, axis=1)[:, :n]
+
+    @staticmethod
+    def _pitch_lag_bounds(n: int, rate: int) -> Tuple[int, int]:
+        return max(1, int(rate / PITCH_HZ[1])), min(n - 1, int(rate / PITCH_HZ[0]))
+
+    @staticmethod
+    def _best_lag(win: np.ndarray, rate: int) -> np.ndarray:
+        acf = BandEnergyVAD._acf(win)
+        lo, hi = BandEnergyVAD._pitch_lag_bounds(win.shape[1], rate)
+        if hi <= lo:
+            return np.zeros(win.shape[0], dtype=np.int64)
+        return acf[:, lo:hi + 1].argmax(axis=1) + lo
 
     @staticmethod
     def _harmonicity(win: np.ndarray, rate: int) -> np.ndarray:
@@ -432,9 +500,14 @@ class BandEnergyVAD:
     def detect(self, samples: np.ndarray, rate: int) -> VadDecision:
         if rate <= 0:
             raise PurgeError("sample rate %r is not a rate" % (rate,))
+        assert_finite(samples, self.name)
         if samples.size == 0:
             return VadDecision(False, 0.0, 0.0, (), self.name)
         probs, hop = self._frame_probs(samples, rate)
+        # The input was finite and the output is not: an arithmetic fault inside the detector
+        # votes for retention just as silently as a NaN sample does.
+        if not np.all(np.isfinite(probs)):
+            raise NonFiniteAudio("%s: scoring produced a non-finite probability" % self.name)
         return decision_from_probs(probs, hop / float(rate), FRAME_MS / 1000.0,
                                    self.threshold, self.min_speech_ms, self.name,
                                    neg_threshold=self.neg_threshold,
@@ -797,6 +870,23 @@ def _fsync_dir(path: str) -> None:
         os.close(fd)
 
 
+def assert_finite(samples: np.ndarray, where: str) -> np.ndarray:
+    """Refuse NaN/Inf before it becomes a confident silence.
+
+    ⚠️A NaN DOES NOT RAISE, IT VOTES FOR RETENTION. Feed one non-finite sample in and it
+    propagates through the band ratio into every frame probability; `prob >= threshold` is then
+    False for every frame, because every comparison against NaN is False. The pipeline reports
+    `speech=False` with total confidence and keeps the clip -- a retention decision produced by
+    arithmetic rather than by evidence, which is the exact shape of failure §9 is written
+    against. So it is checked at the door and it fails CLOSED.
+    """
+    arr = np.asarray(samples)
+    if arr.size and not np.all(np.isfinite(arr)):
+        raise NonFiniteAudio("%s: audio holds NaN or Inf; a score over it would be arithmetic, "
+                             "not evidence" % where)
+    return arr
+
+
 def _zero(samples: np.ndarray) -> None:
     """Drop the waveform the moment the decision is made. Cheap, and it is the stated policy."""
     try:
@@ -849,7 +939,7 @@ def _now_iso(now: Optional[dt.datetime] = None) -> str:
 class ClipOutcome:
     """One clip's fate: kept, purged, would-be-purged, already gone, or undecidable."""
     path: str
-    status: str    # "kept" | "purged" | "would_purge" | "already_absent" | "error"
+    status: str    # kept | purged | would_purge | already_absent | purge_failed | error
     receipt: Optional[PurgeReceipt] = None
     detail: str = ""
 
@@ -862,7 +952,11 @@ class PurgeReport:
     would_purge: int = 0
     kept: int = 0
     already_absent: int = 0
+    fail_closed: int = 0
     errors: int = 0
+    #: True when a purge failed and the scan stopped rather than walking past a file it had
+    #: already judged speech-bearing. The caller alarms on this; §9 calls it stopping the lane.
+    halted: bool = False
     dry_run: bool = False
     vad_engine: str = ""
     audit_log: Optional[str] = None
@@ -872,7 +966,8 @@ class PurgeReport:
     def as_record(self) -> Dict[str, Any]:
         return {"scanned": self.scanned, "purged": self.purged, "would_purge": self.would_purge,
                 "kept": self.kept, "already_absent": self.already_absent,
-                "errors": self.errors, "dry_run": self.dry_run,
+                "fail_closed": self.fail_closed, "errors": self.errors,
+                "halted": self.halted, "dry_run": self.dry_run,
                 "vad_engine": self.vad_engine, "audit_log": self.audit_log}
 
 
@@ -894,8 +989,29 @@ def purge_wav_bytes(data: bytes, node: str = "stream", clip: str = "<stream>", v
     before it writes anything, which is strictly better than writing and then shredding. The
     digest is over the bytes as handed in, so the receipt means the same thing either way, and
     the caller's `data` is the only copy -- this function keeps none.
+
+    ⚠️A RECEIPT MEANS "DO NOT STORE THIS", AND AN UNDECIDABLE STREAM GETS ONE. Malformed body,
+    refused rate, detector fault or a non-finite score all return a receipt carrying
+    `fail_closed_reason` rather than raising, because a caller that catches the exception and
+    carries on writing the file has turned §9 inside out. `None` -- and only `None` -- means the
+    bytes may be kept.
     """
     digest = hashlib.sha256(data).hexdigest()
+
+    def _fail_closed(reason: str, detail: str, duration_s: float = 0.0,
+                     rate_hz: int = 0) -> PurgeReceipt:
+        """§9 on the streaming door: an undecidable stream is refused, i.e. never stored."""
+        receipt = PurgeReceipt(timestamp=_now_iso(now), node=node, clip=clip,
+                               duration_s=duration_s, peak_speech_prob=0.0, speech_s=0.0,
+                               spans=(), purged_sha256=digest, purged_bytes=len(data),
+                               vad_engine=getattr(vad, "name", "none"), dry_run=False,
+                               verdict=VERDICT_SPEECH, purge_method=METHOD_OVERWRITE,
+                               verified_absent=True, fail_closed_reason=reason,
+                               threshold=threshold, min_speech_ms=min_speech_ms)
+        if audit_log:
+            append_receipt(audit_log, receipt)
+        return receipt
+
     try:
         with wave.open(io.BytesIO(data), "rb") as wav:
             channels, width, rate, frames = (wav.getnchannels(), wav.getsampwidth(),
@@ -903,20 +1019,29 @@ def purge_wav_bytes(data: bytes, node: str = "stream", clip: str = "<stream>", v
             if width != 2:
                 raise UnreadableClip("stream: sample width %d B, only 16-bit PCM is read here"
                                      % width)
+            if rate not in SUPPORTED_SOURCE_RATES:
+                raise RateRefused("stream: %d Hz is not a rate this lane records at %r"
+                                  % (rate, SUPPORTED_SOURCE_RATES))
             raw = wav.readframes(frames)
-    except UnreadableClip:
-        raise
-    except (wave.Error, EOFError, ValueError) as exc:
-        raise UnreadableClip("stream: %s" % exc) from exc
+    except RateRefused as exc:
+        return _fail_closed(REASON_RATE, str(exc))
+    except (UnreadableClip, wave.Error, EOFError, ValueError) as exc:
+        return _fail_closed(REASON_UNREADABLE, str(exc))
 
     pcm = np.frombuffer(raw, dtype="<i2")
     usable = (pcm.size // max(channels, 1)) * max(channels, 1)
     samples = (pcm[:usable].reshape(-1, max(channels, 1)).astype(np.float32).mean(axis=1)
                / 32768.0)
     duration_s = samples.size / float(rate or 1)
-    decision = inspect_samples(samples, rate, vad, threshold=threshold,
-                               min_speech_ms=min_speech_ms)
+    try:
+        decision = inspect_samples(samples, rate, vad, threshold=threshold,
+                                   min_speech_ms=min_speech_ms)
+    except Exception as exc:
+        _zero(samples)
+        return _fail_closed(REASON_INFERENCE, str(exc), duration_s, rate)
     _zero(samples)
+    if not np.isfinite(decision.peak_prob):
+        return _fail_closed(REASON_INFERENCE, "non-finite probability", duration_s, rate)
     if not decision.speech:
         return None
     receipt = PurgeReceipt(timestamp=_now_iso(now), node=node, clip=clip,
@@ -948,6 +1073,11 @@ def purge_clip(path: str, vad=None, *, threshold: float = DEFAULT_THRESHOLD,
     digest is taken before anything else so that the receipt describes the bytes that existed;
     detection happens on the buffer already read; destruction happens before the audit line, so
     a record can never claim a purge that did not happen.
+
+    ⚠️EVERY WAY OF NOT KNOWING ENDS IN A PURGE (contract §9). Unreadable header, refused sample
+    rate, detector fault, non-finite score: all of them destroy the clip and put a
+    `fail_closed_reason` on the receipt. The one thing that does NOT is a file that was already
+    gone, which is `NOT_SCORED` -- there is nothing to fail closed about.
     """
     path = os.path.abspath(os.path.expanduser(path))
     vad = vad or load_vad("auto", threshold, min_speech_ms)
@@ -971,21 +1101,73 @@ def purge_clip(path: str, vad=None, *, threshold: float = DEFAULT_THRESHOLD,
             append_receipt(audit_log, receipt)
         return ClipOutcome(path, "already_absent", receipt, "the file was gone before this run")
 
+    def _destroy(receipt: PurgeReceipt, detail: str) -> ClipOutcome:
+        """Shred, then receipt. Retried once, because §9 asks for a retry before the alarm."""
+        if dry_run:
+            return ClipOutcome(path, "would_purge", receipt, "dry run: file untouched")
+        last: Optional[PurgeError] = None
+        for _ in range(2):
+            try:
+                shred_file(path)
+                last = None
+                break
+            except PurgeError as exc:
+                last = exc
+        if last is not None:
+            # ⚠️A FAILED PURGE STOPS THE LANE (§9). Continuing would scan the rest of the pool
+            # while a file this run has already judged speech-bearing is still on the disk, and
+            # the run would end green. The caller is expected to alarm on `halted`.
+            failed = replace(receipt, fail_closed_reason=REASON_PURGE_FAILED,
+                             verified_absent=False, purge_method=METHOD_NONE)
+            if audit_log:
+                append_receipt(audit_log, failed)
+            return ClipOutcome(path, "purge_failed", failed, str(last))
+        done = replace(receipt, verified_absent=not os.path.exists(path))
+        if audit_log:
+            append_receipt(audit_log, done)
+        return ClipOutcome(path, "purged", done, detail)
+
+    def _fail_closed(reason: str, detail: str, digest: Optional[str] = None,
+                     size: Optional[int] = None, duration_s: float = 0.0) -> ClipOutcome:
+        """§9: a clip that cannot be honestly scored is destroyed, not kept and warned about.
+
+        ⚠️THE ASYMMETRY IS THE POLICY, NOT A BUG. The cost of destroying a clip of wind because
+        its header was truncated is one clip of wind. The cost of keeping a clip because the
+        detector crashed is a recording of a conversation, retained on the strength of an error
+        message nobody read. So every impossibility here resolves to SPEECH_DETECTED, with the
+        reason on the receipt so the alarm can say which one fired.
+        """
+        receipt = PurgeReceipt(timestamp=_now_iso(now), node=node or node_of(path),
+                               clip=os.path.basename(path), clip_key=_clip_key(path),
+                               duration_s=duration_s, peak_speech_prob=0.0, speech_s=0.0,
+                               spans=(), purged_sha256=digest, purged_bytes=size,
+                               vad_engine=getattr(vad, "name", "none"), dry_run=dry_run,
+                               verdict=VERDICT_SPEECH, purge_method=METHOD_OVERWRITE,
+                               verified_absent=False, fail_closed_reason=reason, **policy)
+        return _destroy(receipt, "fail-closed (%s): %s" % (reason, detail))
+
     try:
         purged_bytes = os.path.getsize(path)
         digest = sha256_file(path)
         samples, rate = read_wav_mono(path)
+    except RateRefused as exc:
+        return _fail_closed(REASON_RATE, str(exc))
     except PurgeError as exc:
-        return ClipOutcome(path, "error", None, str(exc))
+        return _fail_closed(REASON_UNREADABLE, str(exc))
 
     duration_s = samples.size / float(rate or 1)
     try:
         decision = vad.detect(samples, rate)
-    except Exception as exc:                                  # a detector fault is undecided
+    except Exception as exc:
         _zero(samples)
-        return ClipOutcome(path, "error", None, "vad failed: %s" % exc)
+        return _fail_closed(REASON_INFERENCE, "vad failed: %s" % exc, digest, purged_bytes,
+                            duration_s)
     _zero(samples)
     del samples
+
+    if not np.isfinite(decision.peak_prob):
+        return _fail_closed(REASON_INFERENCE, "the detector returned a non-finite probability",
+                            digest, purged_bytes, duration_s)
 
     common = dict(timestamp=_now_iso(now), node=node or node_of(path),
                   clip=os.path.basename(path), clip_key=_clip_key(path),
@@ -1006,21 +1188,7 @@ def purge_clip(path: str, vad=None, *, threshold: float = DEFAULT_THRESHOLD,
 
     receipt = PurgeReceipt(dry_run=dry_run, verdict=VERDICT_SPEECH,
                            purge_method=METHOD_OVERWRITE, verified_absent=False, **common)
-    if dry_run:
-        return ClipOutcome(path, "would_purge", receipt, "dry run: file untouched")
-    try:
-        shred_file(path)
-    except PurgeError as exc:
-        return ClipOutcome(path, "error", None, str(exc))
-    # ⚠️THE RECEIPT ASSERTS ABSENCE, SO ABSENCE IS CHECKED. A receipt that says a file is gone
-    # because the unlink returned without raising is a claim about an API call, not about the
-    # filesystem; contract §7.2 wants the post-unlink existence check on the record.
-    receipt = PurgeReceipt(dry_run=False, verdict=VERDICT_SPEECH,
-                           purge_method=METHOD_OVERWRITE,
-                           verified_absent=not os.path.exists(path), **common)
-    if audit_log:
-        append_receipt(audit_log, receipt)
-    return ClipOutcome(path, "purged", receipt, "shredded and unlinked")
+    return _destroy(receipt, "shredded and unlinked")
 
 
 def purge_wav(path: str, *, vad=None, dry_run: bool = False,
@@ -1038,16 +1206,18 @@ def purge_wav(path: str, *, vad=None, dry_run: bool = False,
     wants. The verdict is on the record (`SPEECH_DETECTED` / `NO_SPEECH` / `NOT_SCORED`), so a
     kept clip and a destroyed one are told apart by a field rather than by a None.
 
-    Raises only for a clip that could not be DECIDED about -- an unreadable header, a detector
-    fault. A clip that is simply gone is `NOT_SCORED` with `already_absent: true`, which is what
-    makes a re-run over an already-purged pool a no-op instead of an exception.
+    ⚠️IT DOES NOT RAISE FOR AN UNDECIDABLE CLIP ANY MORE. An unreadable header, a refused rate
+    or a detector fault returns a `SPEECH_DETECTED` receipt carrying `fail_closed_reason`,
+    because §9 resolves every impossibility towards destruction -- and a caller that only has to
+    catch an exception to keep the file has an accidental opt-out of the whole policy. A clip
+    that is simply gone is `NOT_SCORED` with `already_absent: true`.
     """
     outcome = purge_clip(path, vad, threshold=threshold, min_speech_ms=min_speech_ms,
                          neg_threshold=neg_threshold, min_silence_ms=min_silence_ms,
                          speech_pad_ms=speech_pad_ms, dry_run=dry_run, audit_log=audit_log,
                          node=node, now=now, receipt_clean=True)
-    if outcome.receipt is None:
-        raise UnreadableClip(outcome.detail or "%s: undecidable" % path)
+    if outcome.receipt is None:                      # unreachable today; kept as a hard floor
+        raise PurgeError(outcome.detail or "%s: undecidable and unreceipted" % path)
     return outcome.receipt.as_record()
 
 
@@ -1077,6 +1247,12 @@ def scan_pool(root: str, *, engine: str = "auto", threshold: float = DEFAULT_THR
     `audit_log` defaults to `<root>/vad_purge.jsonl` for a live run and is never written
     in a dry run. The audit log itself is never a scan target -- it is JSONL, not a WAV -- so a
     run cannot purge its own evidence.
+
+    ⚠️THE WALK STOPS ON A FAILED PURGE, AND ONLY ON THAT. Everything else -- an unreadable
+    clip, a refused rate, a detector fault -- is destroyed and scanning continues (§9). But a
+    file this run has judged speech-bearing and could NOT destroy is still on the disk, and a
+    scan that walks past it finishes green while the thing it exists to prevent is true. So the
+    report comes back `halted`, and the caller is expected to alarm rather than reschedule.
     """
     root = os.path.abspath(os.path.expanduser(root))
     vad = vad or load_vad(engine, threshold, min_speech_ms)
@@ -1094,6 +1270,8 @@ def scan_pool(root: str, *, engine: str = "auto", threshold: float = DEFAULT_THR
         report.outcomes.append(outcome)
         if outcome.receipt is not None:
             report.receipts.append(outcome.receipt)
+            if outcome.receipt.fail_closed_reason:
+                report.fail_closed += 1
         if outcome.status == "purged":
             report.purged += 1
         elif outcome.status == "would_purge":
@@ -1106,4 +1284,7 @@ def scan_pool(root: str, *, engine: str = "auto", threshold: float = DEFAULT_THR
             report.errors += 1
         if on_outcome is not None:
             on_outcome(outcome)
+        if outcome.status == "purge_failed":
+            report.halted = True
+            break
     return report
