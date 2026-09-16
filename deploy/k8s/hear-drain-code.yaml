@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-drain-code.yaml
-# apply-mode server: 499113 B serialised; 499384 B of annotations against a 262144 B cap.
+# apply-mode server: 499107 B serialised; 499372 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-drain
   annotations:
-    dama-hear/commit: '3e1a55e-dirty'
+    dama-hear/commit: '40a4270'
     dama-hear/source-sha256: '92d77d17c101b3f502fe688c2616d835bc33de112d7c552e4b2251c36acfb164'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '499113'
+    dama-hear/serialised-bytes: '499107'
 data:
   hear__init__.py: |
     
