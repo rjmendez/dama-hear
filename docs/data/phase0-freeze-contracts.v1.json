@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "6ed2f6ae812d1a261ed85fb016ac78dfe1d1687e865130c1cfaf8be2ce69fde2",
+  "baseline_hash": "fabfc37f3b1daa2198296b49dd0b560ef43cab3cb33045df6a507d84425a2b4b",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -490,13 +490,13 @@
       },
       {
         "path": "deploy/k8s/hear-heartbeat.yaml",
-        "sha256": "c4cb18d1a5a9a72637b88611ddd2909f93c635b4de54194c7f02fafd378f2d9e",
-        "size_bytes": 4023
+        "sha256": "607c478b31080cbc5ced8898d520a31aa7c6f965f5f77d35867bbc0fb307445c",
+        "size_bytes": 4640
       },
       {
         "path": "deploy/k8s/hear-mqtt-bridge.yaml",
-        "sha256": "43f53a0ec58056e08a5104dd8fdb5ed51f6ea4f700363777a94468e050ca8538",
-        "size_bytes": 5560
+        "sha256": "cd059103b677071149645fadbeecdb8bb879b330fd66bb0f9a387cea548e7196",
+        "size_bytes": 6068
       },
       {
         "path": "deploy/k8s/hear-pool-backup.yaml",
@@ -1260,6 +1260,36 @@
             "mounts": [
               {
                 "claim_name": null,
+                "mount_path": "/app/hear/__init__.py",
+                "sub_path": "hear__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/ingest/__init__.py",
+                "sub_path": "hear_ingest__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/ingest/envelope.py",
+                "sub_path": "hear_ingest_envelope.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/ingest/batch.py",
+                "sub_path": "hear_ingest_batch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/ingest/observability.py",
+                "sub_path": "hear_ingest_observability.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
                 "mount_path": "/app/tools/hear_heartbeat_receiver.py",
                 "sub_path": "tools_hear_heartbeat_receiver.py",
                 "volume_name": "code"
@@ -1382,6 +1412,36 @@
             ],
             "image": "python:3.13-slim",
             "mounts": [
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/__init__.py",
+                "sub_path": "hear__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/ingest/__init__.py",
+                "sub_path": "hear_ingest__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/ingest/envelope.py",
+                "sub_path": "hear_ingest_envelope.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/ingest/batch.py",
+                "sub_path": "hear_ingest_batch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/ingest/observability.py",
+                "sub_path": "hear_ingest_observability.py",
+                "volume_name": "code"
+              },
               {
                 "claim_name": null,
                 "mount_path": "/app/tools/hear_heartbeat_receiver.py",
@@ -2484,7 +2544,7 @@
         "storage_request": "20Gi"
       }
     ],
-    "section_hash": "5cdb3a5592dd545ef61122f16a4f0df4c40258df8e267b15bb3bd9ea6190ef0f"
+    "section_hash": "8e54ce9a560c5e690b4b71a63ba7f5e0d8ab8a3ad77b88afee42418d7a0eb6d7"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",

@@ -14,14 +14,14 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | 6ed2f6ae812d1a261ed85fb016ac78dfe1d1687e865130c1cfaf8be2ce69fde2 |
+| baseline | fabfc37f3b1daa2198296b49dd0b560ef43cab3cb33045df6a507d84425a2b4b |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
 | firmware_build_metadata | 354438a194e485711ece94ccefe668543ac63a20eb2e288bc5d4a6455e6e5f6f |
 | schemas | 94b4918a473b1622dc555228ba2b6b6359873dd5b12e4f498fb12f3b81087221 |
 | published_contracts | a87c434d400f4f31ec4cc252761fff18ee14355a8170cf80133ef72315c082f3 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |
 | redis_keys | d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03 |
-| kubernetes_and_pvc_layout | 5cdb3a5592dd545ef61122f16a4f0df4c40258df8e267b15bb3bd9ea6190ef0f |
+| kubernetes_and_pvc_layout | 8e54ce9a560c5e690b4b71a63ba7f5e0d8ab8a3ad77b88afee42418d7a0eb6d7 |
 | corpus_fixture_metadata | 52ddc9da76e76e5b920512c82bb9529b9075fea44faa6ce526d9347b35550af0 |
 
 ## Compatibility
@@ -228,8 +228,8 @@ Manifest hashes:
 | deploy/k8s/hear-birdnet.yaml | 7474 | 9a4265e78c5c03e10a563b1a178582492e3f0aeef0c47f630f56fe23c06c6aa5 |
 | deploy/k8s/hear-drain.yaml | 19588 | af67cf80b27831423574f9f0c1b8d3a06bb14f1ed6e987b295d0289451ed8b12 |
 | deploy/k8s/hear-embed.yaml | 9190 | 1f3e86e8d5d1f57f4bc5d8d4ca6adb958671f5a65c7db7b21e47225916d465ad |
-| deploy/k8s/hear-heartbeat.yaml | 4023 | c4cb18d1a5a9a72637b88611ddd2909f93c635b4de54194c7f02fafd378f2d9e |
-| deploy/k8s/hear-mqtt-bridge.yaml | 5560 | 43f53a0ec58056e08a5104dd8fdb5ed51f6ea4f700363777a94468e050ca8538 |
+| deploy/k8s/hear-heartbeat.yaml | 4640 | 607c478b31080cbc5ced8898d520a31aa7c6f965f5f77d35867bbc0fb307445c |
+| deploy/k8s/hear-mqtt-bridge.yaml | 6068 | cd059103b677071149645fadbeecdb8bb879b330fd66bb0f9a387cea548e7196 |
 | deploy/k8s/hear-pool-backup.yaml | 15918 | 269a57100ca6078c5b5321cf2d13780fb70d46b440c2b2ecd3db940cb45efb26 |
 | deploy/k8s/hear-score.yaml | 11126 | 03c0713d22b23d3f06177c79ca6d612925768c98d566f012fc01d209de5dcf0d |
 | deploy/k8s/hear-tag.yaml | 15625 | 367ed67528bb15a5dd652bf924db0af409a8f65c1b00128c0a3b14e990be1890 |
