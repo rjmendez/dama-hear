@@ -240,6 +240,11 @@ UNFETCHED_RING = 64
 BOOT_AUDIT_MAX_DAYS = 3
 
 DEFAULT_TIMEOUT_S = 30.0
+# `dets.csv` / `dets-prev.csv` are cheap (tens of KB; see the module docstring), so a healthy
+# transfer is comfortably sub-second even at the 40 KB/s contended floor. Giving them their own
+# timeout lets the drain retry the known "one dropped connection" fault without spending 30 s per
+# attempt on a node that is genuinely down.
+DETS_FETCH_TIMEOUT_S = 10.0
 # ⚠️CLIP BODY FETCHES NEED THEIR OWN, MUCH SHORTER BOUND. A clip is fixed at 5.0 s of 48 kHz
 # mono WAV (480,044 B; see hear/clips.py), and docs/clip-pipeline.md records a measured 168 KB/s
 # clip path on the live fleet: a healthy transfer is ~2.9 s. 6 s leaves roughly 2x margin for a
@@ -703,6 +708,10 @@ LS_RETRY_BACKOFF_S = 1.5
 # under contention is worth retrying, an HTTP status is not" rule applies to dets/scene fetches.
 SD_RETRIES = 3
 SD_RETRY_BACKOFF_S = 1.5
+# A tailed live scene fetch can legitimately take near its 30 s timeout at the 40 KB/s transfer
+# floor, so it gets ONE retry rather than two: enough to clear a single dropped connection without
+# spending a dead node's whole job budget re-asking for the same 2 MB tail.
+SCENE_TAIL_RETRIES = 2
 
 
 def ls_sizes_retrying(ip: str, timeout: float = DEFAULT_TIMEOUT_S, retries: int = LS_RETRIES,
@@ -761,8 +770,10 @@ def fetch_sd_retrying(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S,
     existing absent-file contract (`404 -> None`, CSV/WAV sniffing, test stubs that patch
     `fetch_sd`) stays intact.
 
-    ⚠️THIS IS FOR DETS/SCENE/CONTEXT, NOT FOR CLIP BODIES. A clip lane may have 100+ candidates
-    behind one deadline, so a stalled clip must fail fast and move on rather than being retried.
+    ⚠️CALLERS CHOOSE THE BUDGET. Live scene tails and dets fetches are worth retrying; whole
+    rolled files and clip bodies are not. A multi-minute rolled-file timeout on a dead node is a
+    different failure mode from one dropped connection on a small or bounded fetch, and the job
+    must not burn its whole deadline re-asking for a file that is simply gone.
     """
     if sleep is None:
         sleep = time.sleep
@@ -1158,9 +1169,10 @@ def drain_context_file(pl: "P.Pool", node: str, ip: str, name: str, sizes: Optio
         tail, file_timeout = CONTEXT_BLIND_TAIL_BYTES, timeout
     else:
         tail, file_timeout = int(size_now) - int(prev) + CONTEXT_OVERLAP_BYTES, timeout
-    body, err, _attempts = fetch_sd_retrying(ip, name, file_timeout, tail=tail)
-    if err:
-        out["errors"].append("%s: %s" % (name, err))
+    try:
+        body = fetch_sd(ip, name, file_timeout, tail=tail)
+    except Exception as e:
+        out["errors"].append("%s: %r" % (name, e))
         return False
     if not body:
         return False
@@ -2093,7 +2105,9 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
             file_timeout = rolled_file_timeout(size_now, timeout)
         else:
             file_timeout = timeout
-        body, err, _attempts = fetch_sd_retrying(ip, name, file_timeout, tail=tail)
+        retries = SCENE_TAIL_RETRIES if tail else 1
+        body, err, _attempts = fetch_sd_retrying(ip, name, file_timeout, retries=retries,
+                                                 tail=tail)
         if err:
             out["errors"].append("%s: %s" % (name, err))
             if tail:
@@ -2173,7 +2187,7 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
     dets_bodies: List[Tuple[str, bytes]] = []
     dets_failed: List[str] = []
     for name in DETS_FILES:
-        body, err, _attempts = fetch_sd_retrying(ip, name, timeout)
+        body, err, _attempts = fetch_sd_retrying(ip, name, DETS_FETCH_TIMEOUT_S)
         if err:
             out["errors"].append("%s: %s" % (name, err))
             dets_failed.append(name)
