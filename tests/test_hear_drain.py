@@ -15,6 +15,7 @@ import binascii
 import json
 import os
 import sys
+import time
 
 import numpy as np
 import pytest
@@ -25,6 +26,64 @@ from hear import scenefile as SF                                    # noqa: E402
 from tools import hear_drain as HD                                  # noqa: E402
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+
+class TestGetEnforcesAHardWallClockBound:
+    """⚠️2026-09-16 INCIDENT: `urlopen(timeout=...)` alone only bounds ONE recv() call. A node
+    that trickles a few bytes at a time resets that timer on every partial read and can stall far
+    past `timeout` without ever raising -- measured live: mach's connection sat at zero net
+    progress for 60+ s inside a request whose own socket timeout was 30 s, and the pod was killed
+    by activeDeadlineSeconds with the same-run privacy purge never having run. These tests fake
+    exactly that: an `urlopen` replacement that does not return, let alone raise, until long after
+    `timeout` -- proving `_get` itself enforces the wall clock rather than trusting urllib to."""
+
+    def test_it_returns_at_the_deadline_even_though_urlopen_never_raises(self, monkeypatch):
+        def slow_urlopen(url, timeout=None):
+            class _Resp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def read(self):
+                    time.sleep((timeout or 0) + 5.0)  # trickles past the deadline, never raises
+                    return b"too late"
+            return _Resp()
+
+        monkeypatch.setattr(HD.urllib.request, "urlopen", slow_urlopen)
+        t0 = time.monotonic()
+        with pytest.raises(TimeoutError):
+            HD._get("http://10.0.0.1/sd?file=dets.csv", timeout=0.2)
+        # Returned near the hard bound, not after the full 5.2 s the fake urlopen actually sleeps.
+        assert time.monotonic() - t0 < 2.0
+
+    def test_a_normal_fast_response_is_unaffected(self, monkeypatch):
+        def fast_urlopen(url, timeout=None):
+            class _Resp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def read(self):
+                    return b"node,ts\n"
+            return _Resp()
+
+        monkeypatch.setattr(HD.urllib.request, "urlopen", fast_urlopen)
+        assert HD._get("http://10.0.0.1/sd?file=dets.csv", timeout=5.0) == b"node,ts\n"
+
+    def test_an_http_error_from_urlopen_is_re_raised_unchanged(self, monkeypatch):
+        import urllib.error
+
+        def erroring_urlopen(url, timeout=None):
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+        monkeypatch.setattr(HD.urllib.request, "urlopen", erroring_urlopen)
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            HD._get("http://10.0.0.1/sd?file=dets.csv", timeout=5.0)
+        assert exc_info.value.code == 404
 
 
 # ---------------------------------------------------------------- fixture scene.csv
