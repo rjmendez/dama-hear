@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-mqtt-bridge-code.yaml
-# apply-mode client: 187360 B serialised; 187625 B of annotations against a 262144 B cap.
+# apply-mode client: 187455 B serialised; 187720 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-mqtt-bridge
   annotations:
-    dama-hear/commit: 'da26508'
-    dama-hear/source-sha256: 'f51b3e097e76e158379c49a284d41f319a16aea1488b124692221592a7d59460'
+    dama-hear/commit: '31f722c'
+    dama-hear/source-sha256: '2d49a113707d7abec99a57bf3375edf32e7cea686c344123c4408f9d107ee6dc'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '187360'
+    dama-hear/serialised-bytes: '187455'
 data:
   hear__init__.py: |
     
@@ -1693,6 +1693,7 @@ data:
     import re
     import socket
     import sqlite3
+    import sys
     import threading
     import time
     from contextlib import contextmanager
@@ -1703,6 +1704,8 @@ data:
     from urllib.parse import urlparse
     
     import redis
+    
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from hear.ingest import observability as IO
     
     logger = logging.getLogger("hear-heartbeat")
