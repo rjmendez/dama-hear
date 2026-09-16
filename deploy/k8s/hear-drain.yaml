@@ -72,6 +72,21 @@ spec:
       # this fleet's hardware, and the first run per pod additionally pays a one-time onnxruntime
       # install and model fetch. If the purge step starts eating the margin, it is the thing to
       # profile before raising activeDeadlineSeconds.
+      #
+      # ⚠️2026-09-16 INCIDENT: `--clip-deadline-s` bounds ONE node's clip lane, and `main()` drains
+      # nodes STRICTLY SEQUENTIALLY (drain_clips.__doc__: one client at a time is a node property,
+      # not a style choice). There is no cross-node cap, so worst case is
+      # num_nodes * clip-deadline-s, not clip-deadline-s once. At 270 s/node * 6 nodes = 1620 s,
+      # that worst case was already 2x this deadline BEFORE the purge step -- invisible only
+      # because `--clip-max-per-node 0` made every node's clip lane a no-op for as long as privacy
+      # mode was on. The first live cycle after retention was restored hit it: nyquist and
+      # rankine were both slow to answer, the pod was killed by activeDeadlineSeconds mid-fetch,
+      # and the purge line at the end of this script never ran -- clips nyquist had already
+      # written that cycle sat unscored until the next run's purge caught them (it scans the
+      # whole pool, so nothing was lost, only delayed). Fixed by shrinking the per-node clip
+      # budget below so 6 * clip-deadline-s fits with room for dets/scene and the purge step;
+      # `TestTheClipLaneIsBounded` in tests/test_hear_drain_manifest.py now asserts this
+      # arithmetic instead of relying on it being re-derived by hand during the next incident.
       activeDeadlineSeconds: 840
       backoffLimit: 2
       template:
@@ -129,7 +144,7 @@ spec:
                     --node ageev=172.16.100.83 \
                     --clip-max-per-node 96 \
                     --clip-store-max-b 2147483648 \
-                    --clip-deadline-s 270
+                    --clip-deadline-s 60
                   # PRIVACY GATE: every clip the fetch above just wrote is scored and, if it holds
                   # confirmed speech, destroyed before this run exits -- see the comment on the
                   # CronJob's `spec` field above. `--receipt-clean` also writes a NO_SPEECH row for
