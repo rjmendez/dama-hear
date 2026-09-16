@@ -19,6 +19,16 @@ implements; `docs/clip-pipeline.md` describes the clip lane whose files are purg
 
 ## ⚠️WHAT THIS CONTRACT DOES NOT ESTABLISH
 
+**0. THIS DOCUMENT ALREADY SHIPPED ONE SILENT FALSE-NEGATIVE DEFECT, AND IT IS KEPT ON THE
+PAGE.** PR #254 stated the model input as 512 samples. It is **576** — a 64-sample context tail
+prefixed to the 512-sample hop — and the wrong version does not fail: it returns ~0.001 for
+unambiguous speech, so a lane built on it would have written confident `NO_SPEECH` receipts over
+every conversation it was handed. Measured 2026-09-15 against the real artifact; corrected in
+§2.3, with the measured evidence in §2.5 and a mandatory startup canary in §2.4. The falsified
+version is recorded rather than quietly removed, because the reasoning that produced it —
+"32 ms at 16 kHz is 512 samples, therefore that is the input" — is correct arithmetic about the
+hop and will be produced again by the next reader who does not check the graph.
+
 **1. A VAD score is not consent, and a purge is not a legal basis.** Purging speech after the
 fact does not make capture lawful. `docs/data-governance.md` §1 still requires a documented
 basis, notice method and accountable owner *before* recording where people may be heard. This
@@ -58,10 +68,12 @@ gate.
 | Artifact | `silero_vad.onnx`, single file, **~2 MB** weights |
 | Runtime | ONNX Runtime, CPU execution provider, single-threaded |
 | Input rates | 16 000 Hz and 8 000 Hz **only** |
-| Frame size | **512 samples @ 16 kHz (32 ms)**; **256 samples @ 8 kHz (32 ms)** |
+| Hop (advance) | **512 samples @ 16 kHz (32 ms)**; 256 @ 8 kHz |
+| **Model input window** | **576 samples @ 16 kHz** = 64-sample context + 512-sample hop (§2.3, measured); 288 @ 8 kHz, unverified |
+| Graph IO (measured) | in: `input` `[B, N]` f32, `state` `[2, B, 128]` f32, `sr` int64 scalar · out: `output` `[B, 1]`, `stateN` |
 | Output | One `float32` speech probability in `[0, 1]` per frame, plus updated recurrent state |
 | Latency | **~0.5–1.0 ms per frame** on one CPU core (upstream claim; **UNMEASURED here**) |
-| Streaming | Stateful — recurrent state carried frame to frame within one stream |
+| Streaming | Stateful — recurrent `state` **and** a 64-sample context tail carried hop to hop (§3.2) |
 | Training data | Not redistributed; multi-language corpus described upstream |
 
 **Why this model and not the tagger already in the tree.** `tools/hear_tag.py` maps AudioSet
@@ -109,20 +121,47 @@ that separates speech from wind and insect noise. Use 8 kHz only where an upstre
 natively 8 kHz. Never downsample 16 kHz to 8 kHz to save time: the cost saved is ~0.5 ms/frame
 and the cost paid is sensitivity in the band that matters, on a detector whose misses are silent.
 
-### 2.3 Frame slicing
+### 2.3 Frame slicing — hop 512, **window 576**
+
+⚠️⚠️**THE MODEL INPUT IS 576 SAMPLES AT 16 kHz, NOT 512, AND FEEDING IT 512 FAILS SILENTLY
+TOWARDS RETENTION.** This document said 512 when it was first merged (PR #254). That was wrong,
+and it was wrong in the most dangerous available direction. Measured against the real artifact on
+**2026-09-15, onnxruntime 1.27.0** (see §2.5): a bare 512-sample call returns **~0.001 for
+everything, including unambiguous speech** — mean 0.001 / max 0.002 on a synthetic speech signal
+that scores mean 0.747 / max 0.998 when called correctly. No exception, no warning, no shape
+error. A lane built on the 512 reading would have written `NO_SPEECH` receipts over every
+conversation it was handed and reported a healthy run while doing it.
+
+The 512 figure is the **hop**. The model's input is that hop prefixed with a **64-sample context
+tail carried from the previous hop**:
 
 ```
-frames_per_clip = floor(n_samples / CHUNK)          # 16 kHz: CHUNK = 512
+window_t = concat(context_t, hop_t)            # 64 + 512 = 576 samples
+context_{t+1} = hop_t[-64:]                    # the last 64 samples of the hop just fed
+context_0 = zeros(64, float32)                 # start of every clip
+```
+
+| Constant | 16 kHz (the deployment path) | 8 kHz |
+|---|---|---|
+| `CHUNK_SAMPLES` (hop) | **512** (32 ms) | 256 (32 ms) |
+| `CONTEXT_SAMPLES` | **64** (4 ms) | 32 (4 ms) — **UNVERIFIED against the artifact** |
+| `WINDOW_SAMPLES` (model input) | **576** | 288 — **UNVERIFIED** |
+| advance per call | `CHUNK_SAMPLES` | `CHUNK_SAMPLES` |
+| dtype | `float32` in `[-1, 1]`, from int16 by `/ 32768.0` | same |
+| tail handling | **discard** a partial final hop; never zero-pad | same |
+
+```
+frames_per_clip = floor(n_samples / CHUNK_SAMPLES)
 5.0 s clip @ 16 kHz = 80,000 samples -> 156 frames, 64 samples discarded
 ```
 
-| Constant | 16 kHz | 8 kHz |
-|---|---|---|
-| `CHUNK` | 512 samples | 256 samples |
-| frame duration | 32 ms | 32 ms |
-| hop | `CHUNK` (no overlap) | `CHUNK` (no overlap) |
-| dtype | `float32`, scaled to `[-1, 1]` from int16 by `/ 32768.0` | same |
-| tail handling | **discard** a partial final frame; never zero-pad | same |
+Frame count and `tail_samples_dropped` are unchanged by the correction: the advance is still the
+hop. Only the tensor handed to the model changed, and the context tail is now part of the stream
+state (§3).
+
+⚠️**The 8 kHz row is arithmetic, not measurement.** 32 and 288 follow the 16 kHz ratio and have
+not been run against the artifact here. 8 kHz is not the deployment path (§2.2); anyone enabling
+it measures those two numbers first and replaces this note with the result.
 
 ⚠️**The partial tail is discarded, not zero-padded.** A zero-padded frame is a frame the model
 scores as near-silence by construction, and at the end of a clip that is exactly where a
@@ -130,10 +169,70 @@ truncated word sits. Discarding ≤ 31 ms is honest; padding invents a low score
 discarded samples is recorded on the receipt (`tail_samples_dropped`) so it is a number rather
 than a silence.
 
-⚠️**`CHUNK` is not a tunable.** The v5 export is traced at these sizes. Feeding 400 or 1024
-samples produces either a runtime shape error or — worse, on permissive builds — a silently wrong
-probability. The loader asserts the input shape against the model's declared signature at startup
-and refuses to run on a mismatch.
+⚠️**Neither the hop nor the window is a tunable**, and the loader may not trust either to a
+constant in this document. At startup it reads the model's **declared input dimension** and
+asserts every call's length against it; a length mismatch is `vad_window_contract_violated`
+(§9), which fails closed to purge. A constant that silently disagrees with the graph is exactly
+the defect this section was written to correct.
+
+### 2.4 The window canary — a startup check, not a comment
+
+Because the failure is silent, the contract requires a **positive** check that the window is
+being fed correctly, run once per process before any clip is judged:
+
+1. Score a deterministic, in-process synthetic speech-like signal (formant trajectories with a
+   ~4 Hz syllable envelope) through the normal streaming path.
+2. Assert `max(probs) >= 0.5`.
+3. Score the same signal through a deliberate bare-hop call (no context).
+4. Assert that path's `max(probs) < 0.1` — i.e. the degenerate mode is reproducible and the
+   normal path is demonstrably not in it.
+
+Failing either assertion is `vad_window_contract_violated`: the lane stops, and any clip in
+flight is purged. The canary signal is generated in code, contains no recording, and is not a
+model-accuracy test — it is a wiring test, and it is the only thing standing between a silent
+graph-shape regression and a receipt file full of false `NO_SPEECH`.
+
+### 2.5 Measured reference probabilities
+
+Measured by the `silero-vad-tests` lane on **2026-09-15**, real Silero VAD v5 ONNX, onnxruntime
+**1.27.0**, 2 s synthetic signals at 16 kHz, 512-sample hops with the 64-sample context, stateful
+streaming, 62 chunks. Graph IO as measured: inputs `input` `[B, N]` float32, `state`
+`[2, B, 128]` float32, `sr` int64 scalar; outputs `output` `[B, 1]`, `stateN`.
+
+| Signal | mean | max | `frac > 0.5` |
+|---|---|---|---|
+| synthetic speech (formants + fricatives + plosives + ~4 Hz envelope) | 0.75 | **0.998** | 0.82 |
+| the same speech, state **and context** reset before every chunk | 0.25 | — | 0.21 |
+| the same speech, bare 512-sample call (no context) | **0.001** | 0.002 | 0.00 |
+| speech upsampled to 48 kHz then decimated back to 16 kHz | 0.766 | — | — |
+| speech clipped to ±1 / with +0.3 DC / with pink noise added | ≥ 0.71 | — | — |
+| silence | — | 0.009 | 0.00 |
+| white noise, quiet and loud | — | 0.041 | 0.00 |
+| pink noise | — | 0.028 | 0.00 |
+| bird chirp up-sweeps, 3.5 → 7 kHz | — | 0.012 | 0.00 |
+| 1 kHz pure tone | — | 0.006 | 0.00 |
+| **static (non-time-varying) formant drone** | — | **0.863** | — |
+
+Four things this table settles, and one it does not:
+
+- **The 48 k → 16 k decimation is transparent to the detector.** 0.766 against 0.75 native. The
+  rate path of §2.1 costs nothing measurable here.
+- **A dropped or per-chunk-reset state costs most of the detector**, 0.75 → 0.25 mean and 0.82 →
+  0.21 above threshold. §3's reset discipline is a correctness requirement, not hygiene.
+- **The non-speech signals this fleet actually records sit far below any usable threshold** —
+  bird sweeps at 0.012, pink noise at 0.028, tone at 0.006, against a 0.50 gate. The purge is not
+  going to fire on a dawn chorus.
+- **Robustness to clipping, DC offset and additive pink noise is real** (≥ 0.71).
+- ⚠️**A static formant drone reaches 0.863 and would be purged.** Do not claim this model
+  rejects non-speech harmonic structure; it does not, and a resonant machine, a tonal alarm or a
+  wind-excited cavity can plausibly cross the gate. That is a **false positive, which destroys a
+  clip of a machine** — the tolerable direction — but it must be stated rather than discovered,
+  and it is why §10 gate 2 requires a dry run with a measured base rate before arming.
+
+⚠️**These are synthetic signals, not this fleet's audio.** They establish that the wiring is
+correct and that the obvious negatives score low. They do **not** establish a miss rate on
+distant, wind-masked, reverberant speech at the levels these nodes record (preamble item 3), and
+they do not replace §10 gate 3.
 
 ---
 
@@ -155,28 +254,39 @@ path; if they are `{input, sr, h, c}`, run the v4 path; anything else is refused
 (`vad_model_unverified`). `sr` is an `int64` scalar, 16000 or 8000, and must match the actual
 sample rate of the frames being fed — the model does not check it for you.
 
-### 3.2 Lifecycle rules
+### 3.2 Stream state is **two** objects, not one
 
-1. **Zero-initialise at the start of every clip.** `state = zeros((2, 1, 128), float32)`.
-2. **Carry the output state into the next frame of the same clip, in order.** Frame order is
-   sample order; frames are never scored out of order or in parallel within one clip.
+⚠️**The 64-sample context tail of §2.3 is stream state and is governed by every rule below.** It
+is not a buffering detail. Resetting the recurrent `state` while carrying a stale context, or the
+reverse, is a partial reset — and a partial reset is measured to cost most of the detector:
+resetting state *and* context before every chunk drops synthetic speech from mean **0.75** to
+**0.25**, and from 82 % of frames above threshold to 21 % (§2.5). `reset()` clears **both**:
+`state = zeros((2, 1, 128), float32)` and `context = zeros(64, float32)`.
+
+1. **Zero-initialise both at the start of every clip.** State `(2, 1, 128)`, context `64`.
+2. **Carry both forward, in order.** The output `stateN` becomes the next call's `state`; the
+   last 64 samples of the hop just fed become the next call's context. Frame order is sample
+   order; frames are never scored out of order or in parallel within one clip.
 3. **Reset between clips, unconditionally.** Two clips are not one stream: they may be from
    different nodes, different boots, hours apart (`docs/clip-pipeline.md` §3 — `sample` restarts
-   at 0 on every boot). Carrying state across a clip boundary leaks the tail of one clip's
-   context into the head of another's decision.
-4. **Reset on any exception**, and mark the clip fail-closed (§9). Never resume a stream from a
-   state produced by a failed call.
-5. **One state per stream. Batch size is 1.** If a future implementation batches, each row owns
-   its own state slice and rows are never reordered inside a batch.
-6. **State is never persisted, logged, or exported.** It is a function of the audio and therefore
-   inherits the audio's classification (`raw_audio`, `docs/data-governance.md` §1). It lives in
-   process memory, is overwritten at the next clip, and is dropped when the process exits.
+   at 0 on every boot). Carrying either object across a clip boundary leaks the tail of one
+   clip's audio into the head of another's decision — and the context tail leaks it as literal
+   samples of the previous clip.
+4. **Reset both on any exception**, and mark the clip fail-closed (§9). Never resume a stream
+   from a state produced by a failed call.
+5. **One state and one context per stream. Batch size is 1.** If a future implementation batches,
+   each row owns its own state slice and its own context, and rows are never reordered inside a
+   batch.
+6. **Neither is persisted, logged, or exported.** Both are functions of the audio and inherit its
+   classification (`raw_audio`, `docs/data-governance.md` §1) — the context tail is *literally 4
+   ms of PCM* and must never reach a receipt, a log line or a crash dump. They live in process
+   memory, are overwritten at the next clip, and are dropped when the process exits.
 
 ⚠️**A stale state is the failure mode with no symptom.** A forgotten reset changes probabilities
 by a little, not by a lot; nothing throws, nothing logs, and the per-clip verdict drifts. The
-implementation therefore asserts `state.sum() == 0` at frame index 0 of every clip and records
-`state_reset_confirmed: true` on the receipt. An assertion that runs on every clip is cheaper
-than a distribution shift nobody can date.
+implementation therefore asserts, at frame index 0 of every clip, that **both** `state.sum() == 0`
+and `context.sum() == 0`, and records `state_reset_confirmed: true` on the receipt. An assertion
+that runs on every clip is cheaper than a distribution shift nobody can date.
 
 ---
 
@@ -384,7 +494,8 @@ archive. Two obligations:
   `clips/vad_purge.jsonl` on the pool. Never pruned; it is the durable record, exactly as
   `index.jsonl` and `tags.jsonl` are (`docs/clip-pipeline.md` §3).
 - **It contains no audio and nothing reconstructable into audio.** No samples, no per-frame
-  probability array, no embedding, no spectrogram, no transcript, no speaker attribute. Scalars
+  probability array, **no context tail** (§3.2 — the 64-sample context is literally 4 ms of PCM),
+  no recurrent state, no embedding, no spectrogram, no transcript, no speaker attribute. Scalars
   and identifiers only.
 - **It contains no content description.** "What was said", "how many voices", "language",
   "adult/child" are all out of scope and out of the schema. The receipt proves a destruction; it
@@ -413,7 +524,8 @@ archive. Two obligations:
 | `fs_model_hz` | int | 16000 or 8000 — the rate the model actually read |
 | `fs_source_hz` | int | 48000 or 16000 — the rate the audio was captured at |
 | `frames_scored` | int | e.g. 156 |
-| `tail_samples_dropped` | int | partial final frame, §2.3 |
+| `tail_samples_dropped` | int | partial final hop, §2.3 |
+| `window_samples` | int | model input length actually fed — 576 at 16 kHz. Present so a silent window regression (§2.3) is dateable from the receipt file alone |
 | `verdict` | string | `SPEECH_DETECTED` / `NO_SPEECH` / `NOT_SCORED` |
 | `speech_confidence_max` | float | max frame probability over the clip |
 | `speech_confidence_mean_in_segments` | float\|null | mean probability inside accepted segments |
@@ -424,7 +536,8 @@ archive. Two obligations:
 | `provenance` | string | literal `"model"` |
 | `model` | object | `{name: "silero-vad", version: "v5", sha256, runtime: "onnxruntime", runtime_version}` |
 | `policy` | object | the six §4.1 parameters as used, plus `policy_version` |
-| `state_reset_confirmed` | bool | §3.2 rule 6 assertion result |
+| `state_reset_confirmed` | bool | §3.2 assertion result — **both** `state` and `context` zeroed at frame 0 |
+| `window_canary_passed` | bool | §2.4 startup canary result for the process that produced this verdict |
 | `purge_method` | string | `overwrite_unlink` / `crypto_erase` / `already_absent` |
 | `medium_guarantee` | string | `filesystem_only` / `key_destroyed` / `none` |
 | `crypto_key_id` | string\|null | identifier of the destroyed key; **never the key** |
@@ -468,7 +581,7 @@ export candidate, and never attached to an alert with media.
  "node":"nyquist","day":"2026-09-15","path_purged":"clips/2026-09-15/nyquist/…​.wav",
  "purged_sha256":"e3b0…","purged_bytes":480044,"purged_at":1789526400.0,
  "clip_duration_s":5.0,"fs_model_hz":16000,"fs_source_hz":48000,"frames_scored":156,
- "tail_samples_dropped":64,"verdict":"SPEECH_DETECTED","speech_confidence_max":0.94,
+ "tail_samples_dropped":64,"window_samples":576,"verdict":"SPEECH_DETECTED","speech_confidence_max":0.94,
  "speech_confidence_mean_in_segments":0.78,"speech_total_ms":1180,"speech_segment_count":2,
  "speech_segments_ms":[[640,1360],[2880,3340]],"truncated_segment":false,
  "provenance":"model",
@@ -476,7 +589,7 @@ export candidate, and never attached to an alert with media.
           "runtime_version":"1.18.0"},
  "policy":{"policy_version":"v1","speech_threshold":0.5,"neg_threshold":0.35,
            "min_speech_duration_ms":250,"min_silence_duration_ms":300,"speech_pad_ms":30},
- "state_reset_confirmed":true,"purge_method":"overwrite_unlink",
+ "state_reset_confirmed":true,"window_canary_passed":true,"purge_method":"overwrite_unlink",
  "medium_guarantee":"filesystem_only","crypto_key_id":null,"verified_absent":true,
  "already_absent":false,"derived_purged":["embedding"],
  "backup_generations_possibly_affected":[],"audio_retained":false,"fail_closed_reason":null}
@@ -499,7 +612,9 @@ is unbounded and unrecoverable.
 | Header rate not 48 kHz / 16 kHz, or `fs_hz` ≠ `wav_header_fs_hz` | `rate_refused` | `SPEECH_DETECTED` | purge; the clip cannot be honestly scored |
 | WAV truncated, not RIFF, or shorter than one frame | `clip_unreadable` | `SPEECH_DETECTED` | purge |
 | Per-clip deadline exceeded mid-scan | `vad_timeout` | `SPEECH_DETECTED` | purge the clip it was scanning |
-| `state_reset_confirmed` assertion failed | `state_contract_violated` | `SPEECH_DETECTED` | purge; **stop the lane**, the whole run's scores are suspect |
+| `state_reset_confirmed` assertion failed (state **or** context non-zero at frame 0) | `state_contract_violated` | `SPEECH_DETECTED` | purge; **stop the lane**, the whole run's scores are suspect |
+| Call length ≠ the model's declared input dimension (e.g. 512 fed to a 576 graph) | `vad_window_contract_violated` | `SPEECH_DETECTED` | purge; **stop the lane** — see §2.3, this mode returns ~0.001 for speech |
+| §2.4 startup window canary failed | `vad_window_contract_violated` | `SPEECH_DETECTED` | refuse to judge any clip; nothing scored in this process is trustworthy |
 | Purge itself failed (`OSError`) | `purge_failed` | `SPEECH_DETECTED` | retry once, then alarm and **stop the lane**; do not continue scanning while a known speech-bearing file is on disk |
 | Audio already gone | `null` | `NOT_SCORED` | receipt only |
 
@@ -541,6 +656,12 @@ Written here so they can be checked off in public, in the style of the tagger's 
    readable.
 8. ❌ **The health alarm exists and has been seen to fire**, so `vad_unavailable` is loud on the
    first clip rather than discovered in a receipt file a week later.
+9. ❌ **The §2.4 window canary ships, runs at startup, and has been seen to fail.** The 576-vs-512
+   defect (§2.3) produced no error and no log line; it produced quiet, confident `NO_SPEECH`. A
+   lane without a positive wiring check is one refactor away from that state again, and the only
+   evidence would be a receipt file that looks healthy.
+10. ❌ **The 8 kHz context and window lengths are measured**, or the 8 kHz path is refused at
+   startup rather than run on arithmetic (§2.3).
 
 ---
 
