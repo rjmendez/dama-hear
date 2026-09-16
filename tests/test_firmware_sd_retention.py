@@ -66,7 +66,8 @@ def test_target_free_space_scales_with_card_size(policy):
 def test_protected_files_are_not_cache_candidates(policy):
     protected = 0
     rolling = 1
-    unknown_rolling = 2
+    spool = 2
+    unknown_rolling = 3
     for path in (b"/gate.cfg", b"/gps.cfg", b"/provisioning.json", b"/wifi.state",
                  b"/secrets.h", b"/device.key"):
         assert policy.w_classify(path, 0) == protected
@@ -74,6 +75,9 @@ def test_protected_files_are_not_cache_candidates(policy):
                  b"/health-prev.csv", b"/clips/rankine-00002aabc123-0000000100.wav",
                  b"/node.log"):
         assert policy.w_classify(path, 0) == rolling
+    assert policy.w_classify(b"/spool", 1) == spool
+    for path in (b"/spool/seg-0001-0001.spl", b"/spool/ack-a.state", b"/spool/config.json"):
+        assert policy.w_classify(path, 0) == spool
     assert policy.w_classify(b"/kernel.img", 0) == unknown_rolling
     assert policy.w_classify(b"/System Volume Information", 1) == protected
 
