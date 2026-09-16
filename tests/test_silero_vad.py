@@ -688,3 +688,211 @@ def test_a_corrupt_model_file_is_a_clear_failure_not_a_silent_fallback(tmp_path)
         caught.value)
 
 
+
+
+# ===================================================================================
+# What the real graph actually answered, recorded once and asserted here.
+#
+# The tests above are hermetic by construction and therefore cannot say whether Silero
+# separates a voice from a bird. `testdata/silero_vad_golden.json` holds the per-frame
+# probabilities the real v5 graph produced for the fixtures in `tests/privacy_signals.py`,
+# measured under onnxruntime with the model sha256, the runtime version and every waveform's
+# digest recorded beside them. CI re-asserts the separation and the digests; where the weights
+# exist, the same engine is re-run and compared to the record frame by frame.
+#
+# Regenerate with:
+#     HEAR_VAD_MODEL=/path/to/silero_vad.onnx python3 tools/gen_silero_vad_golden.py \
+#         > testdata/silero_vad_golden.json
+# ===================================================================================
+
+import json     # noqa: E402
+import hashlib  # noqa: E402
+import os       # noqa: E402
+
+from tests import privacy_signals as SIG  # noqa: E402
+
+GOLDEN_PATH = ROOT / "testdata" / "silero_vad_golden.json"
+GOLDEN = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
+SHARED = tuple(SIG.catalogue())
+
+#: The model is real, so the bar is set where the measurement is, not where a docstring wishes
+#: it were. Speech peaked at 0.999 on 71% of frames; the loudest thing that is not speech
+#: peaked at 0.041.
+SPEECH_MIN_PEAK = 0.9
+SPEECH_MIN_FRACTION = 0.5
+AMBIENT_MAX_PEAK = 0.1
+
+
+def _probs(name):
+    return np.asarray(GOLDEN["fixtures"][name]["probs"], dtype=float)
+
+
+def _fraction_over(probs, threshold=V.DEFAULT_THRESHOLD):
+    return float(np.mean(probs >= threshold)) if len(probs) else 0.0
+
+
+def test_the_golden_names_the_model_the_runtime_and_the_geometry_it_was_measured_under():
+    """A recorded number without its provenance is a number somebody typed."""
+    assert GOLDEN["schema"] == "hear.vad.fixture_golden.v1"
+    assert len(GOLDEN["model"]["sha256"]) == 64
+    assert GOLDEN["model"]["version"] == "v5"
+    assert GOLDEN["runtime"]["name"] == "onnxruntime" and GOLDEN["runtime"]["version"]
+
+
+def test_the_geometry_the_golden_was_measured_under_is_the_geometry_the_module_uses():
+    """If the module's window moves, the recorded probabilities stop describing it."""
+    frame = GOLDEN["frame"]
+    rate = frame["rate_hz"]
+    assert rate == V.MODEL_RATE_HZ
+    assert frame["chunk_samples"] == V.CHUNK_SAMPLES[rate]
+    assert frame["context_samples"] == V.CONTEXT_SAMPLES[rate]
+    assert tuple(frame["state_shape"]) == tuple(V.STATE_SHAPE)
+    assert frame["chunk_samples"] + frame["context_samples"] == V.WINDOW_SAMPLES[rate]
+
+
+@pytest.mark.parametrize("name", [f[0] for f in SHARED])
+def test_the_waveform_scored_then_is_the_waveform_synthesised_now(name):
+    """The digest is what stops a fixture drifting under its own recorded answers."""
+    recorded = GOLDEN["fixtures"][name]
+    waveform = np.asarray(SIG.by_name(name), dtype=np.float32)
+    assert waveform.size == recorded["samples"]
+    assert hashlib.sha256(waveform.tobytes()).hexdigest() == recorded["sha256"], (
+        "%s changed; regenerate the golden with tools/gen_silero_vad_golden.py rather than "
+        "editing the numbers" % name)
+
+
+def test_the_real_model_called_the_voice_speech():
+    probs = _probs("speech_like")
+    assert probs.max() >= SPEECH_MIN_PEAK
+    assert _fraction_over(probs) >= SPEECH_MIN_FRACTION, (
+        "speech cleared the threshold on only %.0f%% of frames" % (100 * _fraction_over(probs)))
+
+
+@pytest.mark.parametrize("name", [f[0] for f in SHARED if not f[2]])
+def test_the_real_model_refused_everything_that_is_not_a_voice(name):
+    """Silence, gaussian and pink noise, bird chirp sweeps, a 1 kHz tone."""
+    probs = _probs(name)
+    assert probs.max() <= AMBIENT_MAX_PEAK, \
+        "%s peaked at %.3f, which is not a refusal" % (name, probs.max())
+    assert _fraction_over(probs) == 0.0
+
+
+def test_the_separation_is_a_gap_and_not_a_hair():
+    quietest_speech = _probs("speech_like").max()
+    loudest_ambient = max(_probs(n).max() for n, _x, speech in SHARED if not speech)
+    assert quietest_speech > 10 * loudest_ambient, \
+        "speech %.3f against ambient %.3f" % (quietest_speech, loudest_ambient)
+
+
+def test_a_static_formant_buzz_is_not_a_usable_stand_in_for_speech():
+    """Why the fixture is synthesised the hard way, recorded so nobody simplifies it back.
+
+    A held vowel with unmoving formants reaches 0.90 on a fifth of its frames. It is a control,
+    not a speech fixture: a suite built on it would pass while a detector that only fires on
+    drones shipped.
+    """
+    drone = _probs("formant_drone") if "formant_drone" in GOLDEN["fixtures"] else None
+    if drone is None:
+        pytest.skip("the drone was not recorded in this golden")
+    assert _fraction_over(drone) < _fraction_over(_probs("speech_like")) / 2
+
+
+def test_dropping_the_context_window_silently_stops_finding_speech():
+    """Contract §2.3, as a measurement: 512 samples where the graph declares 576.
+
+    No exception, no log line -- just a confident 0.001 on a clip of speech, which in this
+    pipeline means a voice clip that is never purged.
+    """
+    without = np.asarray(GOLDEN["ablations"]["speech_like_without_context"], dtype=float)
+    assert without.max() < AMBIENT_MAX_PEAK, \
+        "the ablation no longer demonstrates the failure it documents (max %.3f)" % without.max()
+    assert _probs("speech_like").max() > 50 * without.max()
+
+
+def test_resetting_the_state_every_frame_loses_most_of_the_speech():
+    """Contract §3.2: the state is not a buffering detail, it is the memory of the utterance."""
+    reset = np.asarray(GOLDEN["ablations"]["speech_like_state_reset_every_frame"], dtype=float)
+    assert _fraction_over(reset) < _fraction_over(_probs("speech_like")) / 2
+
+
+def test_decimating_48k_by_slicing_every_third_sample_is_not_decimation():
+    """Aliasing is not free: the naive path scores a different clip than the filtered one."""
+    naive = np.asarray(GOLDEN["ablations"]["speech_like_48k_decimated_naively"], dtype=float)
+    proper = _probs("speech_like")
+    assert naive.shape == proper.shape
+    assert np.max(np.abs(naive - proper)) > 0.05, \
+        "the aliased clip scores identically, so this ablation proves nothing"
+
+
+# ---------------------------------------------------------------- the fallback, measured
+
+@pytest.mark.parametrize("name,_x,holds_speech", SHARED, ids=[f[0] for f in SHARED])
+def test_the_fallback_engine_reaches_the_same_verdict_as_the_recorded_model(name, _x,
+                                                                           holds_speech):
+    """The synthetic engine is not Silero, but it may not disagree about what a voice is.
+
+    Probabilities are its own -- pink noise is its closest call at 0.42 against Silero's 0.028 --
+    so only the verdict is compared. A node running the fallback destroys the same clips.
+    """
+    engine = V.SileroVAD()
+    assert not engine.uses_real_model
+    verdict = engine.is_speech(np.asarray(SIG.by_name(name), dtype=np.float32))
+    recorded = bool(_probs(name).max() >= V.DEFAULT_THRESHOLD)
+    assert verdict is holds_speech, "%s: fallback says speech=%s" % (name, verdict)
+    assert verdict is recorded, \
+        "%s: fallback says %s, the recorded model says %s" % (name, verdict, recorded)
+
+
+# ---------------------------------------------------------------- against the weights
+
+MODEL = os.environ.get("HEAR_VAD_MODEL") or os.environ.get(V.MODEL_ENV) or ""
+needs_model = pytest.mark.skipif(
+    not (MODEL and os.path.exists(MODEL)),
+    reason="set HEAR_VAD_MODEL (or %s) to a silero_vad.onnx and install onnxruntime" % V.MODEL_ENV)
+
+
+@pytest.fixture(scope="module")
+def real_vad():
+    engine = V.SileroVAD(MODEL, require_model=True)
+    engine.assert_real_model()
+    return engine
+
+
+@needs_model
+def test_the_weights_on_disk_are_the_weights_the_golden_was_measured_from():
+    digest = hashlib.sha256(open(MODEL, "rb").read()).hexdigest()
+    if digest != GOLDEN["model"]["sha256"]:
+        pytest.skip("a different silero_vad.onnx (%s...); the golden is not about this file"
+                    % digest[:12])
+
+
+@needs_model
+@pytest.mark.parametrize("name", [f[0] for f in SHARED])
+def test_this_engine_reproduces_the_recorded_probabilities_frame_for_frame(real_vad, name):
+    """The end-to-end claim: the shipped code, the real graph, the recorded answers.
+
+    Everything else in this file tests a part. This tests that the parts, assembled, still
+    produce what was measured -- and it is what would catch a window, state or decimation
+    regression that every hermetic test agreed with.
+    """
+    if hashlib.sha256(open(MODEL, "rb").read()).hexdigest() != GOLDEN["model"]["sha256"]:
+        pytest.skip("different weights")
+    measured = np.asarray(real_vad.probabilities(np.asarray(SIG.by_name(name), dtype=np.float32)),
+                          dtype=float)
+    recorded = _probs(name)
+    assert measured.shape == recorded.shape
+    assert np.max(np.abs(measured - recorded)) < 1e-4, \
+        "%s drifted by %.5f" % (name, np.max(np.abs(measured - recorded)))
+
+
+@needs_model
+def test_the_real_model_finds_the_voice_and_refuses_the_ambient_battery(real_vad):
+    for name, waveform, holds_speech in SHARED:
+        assert real_vad.is_speech(np.asarray(waveform, dtype=np.float32)) is holds_speech, \
+            "%s: the real model disagrees with the fixture's own label" % name
+
+
+@needs_model
+def test_a_48k_clip_of_the_same_voice_is_still_speech_through_the_real_model(real_vad):
+    assert real_vad.is_speech(np.asarray(SIG.speech_like_48k(), dtype=np.float32),
+                              sample_rate=V.ACQ_RATE_HZ)

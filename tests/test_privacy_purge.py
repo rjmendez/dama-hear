@@ -633,3 +633,251 @@ def test_cli_receipt_clean_records_coverage(tmp_path):
 def test_cli_requires_a_target():
     proc = run_tool("--dry-run")
     assert proc.returncode != 0
+
+
+# ===================================================================================
+# The fixture battery: the same synthetic signals the VAD suite scores, run through the
+# purge end to end.
+#
+# The tests above prove the pipeline against sounds defined in this file. These prove it
+# against `tests/privacy_signals.py` -- the library `tests/test_silero_vad.py` uses and
+# `testdata/silero_vad_golden.json` records the real Silero v5 answers for. Sharing the
+# stimuli is the point: when a claim here disagrees with a claim there, the disagreement is
+# between two detectors on one waveform rather than between two idiolects of "noise".
+# ===================================================================================
+
+from tests import privacy_signals as SIG  # noqa: E402
+
+#: What the two detectors answer for the shared fixtures. Silero's column is not a guess: it
+#: is `testdata/silero_vad_golden.json`, measured on the real v5 graph (docs §2.3's 576-sample
+#: window, which the golden also records the 512-sample failure of).
+#:
+#: ⚠️THE FALLBACK DESTROYS PINK NOISE AND SILERO DOES NOT. `BandEnergyVAD` reads 1/f noise as
+#: voiced-band energy with enough spectral spread to clear the bar; the real model answers
+#: 0.028. This is over-destruction, not a leak -- the direction that costs clips of wind rather
+#: than clips of conversation -- and it is exactly the unmeasured-recall gap docs §12.3 refuses
+#: to wave through. It is asserted rather than described so that tuning the fallback shows up
+#: here as a decision instead of as a silent change in what a rainy night deletes.
+SHARED_FIXTURES = (
+    # name,                 holds speech, band_energy purges, silero peak (golden)
+    ("speech_like",         True,         True,               0.999),
+    ("silence",             False,        False,              0.009),
+    ("gaussian_noise",      False,        False,              0.030),
+    ("gaussian_noise_loud", False,        False,              0.041),
+    ("pink_noise",          False,        True,               0.028),
+    ("pink_noise_loud",     False,        True,               0.028),
+    ("bird_chirps",         False,        False,              0.018),
+    ("tone_1k",             False,        False,              0.006),
+)
+
+
+def band_energy():
+    return P.load_vad("band_energy")
+
+
+def clip_at(tmp_path, name, samples, rate=16000):
+    return write_wav(tmp_path / name, np.asarray(samples, dtype=np.float32), rate=rate)
+
+
+@pytest.mark.parametrize("name,holds_speech,purges,_silero", SHARED_FIXTURES,
+                         ids=[f[0] for f in SHARED_FIXTURES])
+def test_the_fallback_detector_answers_the_shared_fixtures_as_recorded(name, holds_speech,
+                                                                       purges, _silero):
+    decision = P.inspect_samples(np.asarray(SIG.by_name(name), dtype=np.float32), 16000,
+                                 band_energy())
+    assert decision.speech is purges, (
+        "%s: band_energy now says speech=%s (peak %.3f); the fixture holds speech=%s and Silero "
+        "answers %.3f. Update SHARED_FIXTURES deliberately or fix the detector."
+        % (name, decision.speech, decision.peak_prob, holds_speech, _silero))
+
+
+def test_the_voice_fixture_is_destroyed_and_the_ambient_ones_are_not_all_destroyed(tmp_path):
+    """The privacy-critical direction, on the shared battery: the voice must not survive."""
+    vad = band_energy()
+    for name, _holds, _purges, _p in SHARED_FIXTURES:
+        clip_at(tmp_path, name + ".wav", SIG.by_name(name))
+    report = P.scan_pool(str(tmp_path), vad=vad)
+    assert not os.path.exists(str(tmp_path / "speech_like.wav")), \
+        "the voice fixture survived the scan"
+    assert os.path.exists(str(tmp_path / "silence.wav")), \
+        "silence was destroyed: the detector is not discriminating at all"
+    assert report.purged + report.kept == report.scanned
+
+
+def test_the_48k_acquisition_rate_is_scored_at_its_own_rate(tmp_path):
+    """Clips arrive at 48 kHz (docs §2.1). The voice must not survive that path either."""
+    path = clip_at(tmp_path, "speech48.wav", SIG.speech_like_48k(), rate=48000)
+    outcome = P.purge_clip(path, band_energy())
+    assert outcome.status == "purged"
+    assert not os.path.exists(path)
+    assert abs(outcome.receipt.duration_s - 2.0) < 0.05, \
+        "duration was computed at the wrong rate: %.3f s" % outcome.receipt.duration_s
+
+
+# ---------------------------------------------------------------- re-running a drained pool
+
+def test_a_second_scan_of_a_drained_pool_purges_nothing_and_errors_on_nothing(tmp_path):
+    log = str(tmp_path / P.RECEIPT_NAME)
+    clip_at(tmp_path, "voice.wav", SIG.speech_like())
+    clip_at(tmp_path, "wind.wav", SIG.gaussian_noise())
+    first = P.scan_pool(str(tmp_path), engine="band_energy", audit_log=log)
+    assert first.purged == 1
+
+    second = P.scan_pool(str(tmp_path), engine="band_energy", audit_log=log)
+    assert second.purged == 0, "a drained pool purged something on the second pass"
+    assert second.errors == 0, "the second pass errored: %s" % [o.detail for o in second.outcomes]
+    assert second.scanned == 1, "the destroyed clip is still being scanned"
+    assert len(P.read_receipts(log)) == 1, "the re-run wrote a second receipt for one destruction"
+
+
+def test_a_third_and_fourth_pass_say_exactly_what_the_second_said(tmp_path):
+    clip_at(tmp_path, "voice.wav", SIG.speech_like())
+    P.scan_pool(str(tmp_path), engine="band_energy")
+    seen = {tuple(sorted(P.scan_pool(str(tmp_path), engine="band_energy").as_record().items()))
+            for _ in range(3)}
+    assert len(seen) == 1, "repeated scans of a settled pool disagree: %s" % (seen,)
+
+
+def test_an_armed_run_after_a_dry_run_still_destroys_the_clip(tmp_path):
+    path = clip_at(tmp_path, "voice.wav", SIG.speech_like())
+    before = open(path, "rb").read()
+    assert P.purge_clip(path, band_energy(), dry_run=True).status == "would_purge"
+    assert open(path, "rb").read() == before, "the dry run modified the clip"
+    assert P.purge_clip(path, band_energy()).status == "purged"
+    assert not os.path.exists(path)
+
+
+# ---------------------------------------------------------------- malformed clips
+
+@pytest.mark.parametrize("name,payload", [
+    ("empty", lambda: b""),
+    ("not_a_wav", lambda: SIG.not_a_wav()),
+    ("truncated", lambda: SIG.truncated_wav(SIG.speech_like())),
+])
+def test_an_unreadable_clip_is_an_error_and_is_never_reported_as_silent(tmp_path, name, payload):
+    """The one answer that is never acceptable is a quiet `kept`.
+
+    Shipped behaviour is `error` + the file survives; docs §9 asks for a purge. The divergence
+    is recorded in docs §12 and is the engine owner's call -- what this test pins is that
+    neither resolution may arrive as "no speech here", which is the answer that turns an
+    undecidable clip into a retained one without anybody noticing.
+    """
+    path = str(tmp_path / (name + ".wav"))
+    open(path, "wb").write(payload())
+    outcome = P.purge_clip(path, band_energy())
+    assert outcome.status != "kept", "%s was silently kept" % name
+    assert outcome.receipt is None or outcome.receipt.peak_speech_prob == outcome.receipt.peak_speech_prob
+
+
+def test_a_header_that_lies_about_its_length_is_decided_on_the_bytes_that_exist(tmp_path):
+    path = str(tmp_path / "lying.wav")
+    open(path, "wb").write(SIG.lying_wav(SIG.speech_like()))
+    outcome = P.purge_clip(path, band_energy())
+    assert outcome.status == "purged", \
+        "a truncated-but-readable voice clip was not destroyed: %s" % outcome.detail
+    assert not os.path.exists(path)
+
+
+def test_a_single_sample_clip_is_not_speech_and_does_not_raise(tmp_path):
+    path = str(tmp_path / "one.wav")
+    open(path, "wb").write(SIG.wav_bytes(np.asarray(SIG.speech_like()[:1], dtype=np.float32)))
+    outcome = P.purge_clip(path, band_energy())
+    assert outcome.status in ("kept", "error")
+    assert os.path.exists(path)
+
+
+def test_a_fully_clipped_clip_is_still_judged(tmp_path):
+    """Preamp saturation must not become an exception path that leaves audio on disk."""
+    path = clip_at(tmp_path, "clipped.wav", np.clip(np.asarray(SIG.speech_like()) * 50, -1, 1))
+    outcome = P.purge_clip(path, band_energy())
+    assert outcome.status in ("purged", "kept")
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_a_non_finite_sample_never_produces_a_confident_silence(bad):
+    """⚠️OPEN DEFECT, xfailing until the engine owner closes it (docs §9, `vad_inference_error`).
+
+    A NaN propagates through the fallback's band ratio, `peak_prob` comes back NaN, every
+    comparison against the threshold is False, and the clip is reported as `speech=False` --
+    a confident silence produced by arithmetic rather than by the audio. Docs §9 requires the
+    opposite: a detector that answered NaN has not answered, and the clip is purged.
+    """
+    samples = np.asarray(SIG.speech_like(), dtype=np.float32).copy()
+    samples[100] = bad
+    with np.errstate(all="ignore"):
+        decision = P.inspect_samples(samples, 16000, band_energy())
+    if decision.peak_prob != decision.peak_prob:
+        pytest.xfail("peak_prob is NaN; docs §9 asks for a fail-closed purge, not a score")
+    assert decision.speech, "a clip with a voice and a corrupt sample was called silent"
+
+
+def test_the_audit_log_stays_strict_json(tmp_path):
+    """NaN is not JSON, and an audit log a strict reader rejects -- jq, Go, a COPY -- is not one.
+
+    A 16-bit WAV cannot carry a non-finite sample, so the NaN hole the test above xfails on is
+    reachable only through the in-memory door (`inspect_samples`, `purge_wav_bytes`); this
+    guards the disk path against the day a probability arrives there unclamped.
+    """
+    path = clip_at(tmp_path, "voice.wav", SIG.speech_like())
+    log = str(tmp_path / P.RECEIPT_NAME)
+    assert P.purge_clip(path, band_energy(), audit_log=log).status == "purged"
+    lines = open(log, "r", encoding="utf-8").read().splitlines()
+    assert lines
+    for line in lines:
+        json.loads(line, parse_constant=_refuse_constant)
+
+
+def _refuse_constant(token):
+    raise AssertionError("the audit log holds %r, which no strict JSON reader will accept"
+                         % (token,))
+
+
+# ---------------------------------------------------------------- what the receipt cannot hold
+
+def _values(obj):
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _values(v)
+    elif isinstance(obj, (list, tuple)):
+        yield obj
+        for v in obj:
+            yield from _values(v)
+    else:
+        yield obj
+
+
+def test_no_receipt_value_is_long_enough_to_be_audio(tmp_path):
+    """2.0 s at 16 kHz is 32000 numbers. Every sequence on the receipt is a handful of seconds."""
+    path = clip_at(tmp_path, "voice.wav", SIG.speech_like())
+    record = P.purge_clip(path, band_energy()).receipt.as_record()
+    for value in _values(record):
+        if isinstance(value, (list, tuple)):
+            assert len(value) <= 64, "a %d-element sequence on the receipt" % len(value)
+
+
+def test_the_whole_receipt_is_smaller_than_the_clip_by_orders_of_magnitude(tmp_path):
+    path = clip_at(tmp_path, "voice.wav", SIG.speech_like())
+    clip_bytes = os.path.getsize(path)
+    line = json.dumps(P.purge_clip(path, band_energy()).receipt.as_record())
+    assert len(line) < min(4096, clip_bytes / 10), (
+        "the receipt is %d B against a %d B clip; a death certificate does not grow with the "
+        "body" % (len(line), clip_bytes))
+
+
+def test_the_spans_stay_inside_the_clip_they_describe(tmp_path):
+    path = clip_at(tmp_path, "voice.wav", SIG.speech_like())
+    receipt = P.purge_clip(path, band_energy()).receipt
+    record = receipt.as_record()
+    assert record["speech_s"] <= record["duration_s"] + 1e-6
+    for start, end in record["speech_spans_s"]:
+        assert 0.0 <= start < end <= record["duration_s"] + 1e-6, \
+            "span (%s, %s) is outside a %s s clip" % (start, end, record["duration_s"])
+
+
+def test_the_digest_is_of_the_bytes_that_were_destroyed(tmp_path):
+    import hashlib
+    path = clip_at(tmp_path, "voice.wav", SIG.speech_like())
+    expected = hashlib.sha256(open(path, "rb").read()).hexdigest()
+    receipt = P.purge_clip(path, band_energy()).receipt
+    assert receipt.purged_sha256 == expected
+    assert not os.path.exists(path), "the digest matched but the clip is still here"

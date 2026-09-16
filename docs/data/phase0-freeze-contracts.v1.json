@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "3896a4080e841be29ced1a45849abde47847f9573a760743a7d87adb2908a3c2",
+  "baseline_hash": "48db107f16dea7520440f7008272558620d7f99a141a828d095530a18d0251ef",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -46,6 +46,23 @@
         "summary": {
           "length": 450,
           "type": "array"
+        }
+      },
+      {
+        "path": "testdata/silero_vad_golden.json",
+        "sha256": "29a3cb2bca1df63669361e6f06c21277e51b7f297a5fb8a5bcfe608c32c0648b",
+        "size_bytes": 12281,
+        "summary": {
+          "schema": "hear.vad.fixture_golden.v1",
+          "top_level_keys": [
+            "ablations",
+            "fixtures",
+            "frame",
+            "model",
+            "runtime",
+            "schema"
+          ],
+          "type": "object"
         }
       },
       {
@@ -199,7 +216,7 @@
     ],
     "metadata_only": true,
     "privacy_note": "Representative fixture inventory only: repo paths, top-level schema ids, counts, sizes, and sha256 digests. No live corpus pulls and no payload bodies are copied.",
-    "section_hash": "466b3b2d681cbeee4ed0d49edf24fff01ad829e5c00c60bf20e2b64c51b1b4cb"
+    "section_hash": "52ddc9da76e76e5b920512c82bb9529b9075fea44faa6ce526d9347b35550af0"
   },
   "firmware_build_metadata": {
     "board_profiles": [
@@ -3746,6 +3763,13 @@
         ]
       },
       {
+        "schema": "hear.vad.fixture_golden.v1",
+        "source_paths": [
+          "testdata/silero_vad_golden.json",
+          "tools/gen_silero_vad_golden.py"
+        ]
+      },
+      {
         "schema": "hear.vad.purge.receipt.v1",
         "source_paths": [
           "hear/privacy/purge.py"
@@ -3759,7 +3783,7 @@
         ]
       }
     ],
-    "section_hash": "7d6f4dc9e19d1934853ad91793f573fc1f5ad2937758082939c040ab7a48f673",
+    "section_hash": "f5bc017574d40a523a7fb7b25ff685f08150651a78ae67a4f2f0e5e22cc31356",
     "telemetry_routes": [
       {
         "http_path": "/api/hear/heartbeat",
