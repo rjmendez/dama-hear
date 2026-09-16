@@ -1,12 +1,18 @@
-// Root CA for HEAR_PUSH_HOST's TLS certificate (Alert 3 remediation).
+// Root CA bundle for HEAR_PUSH_HOST's TLS certificate chain (Alert 3 remediation).
+//
+// ADR 0011 keeps the live push path and the future `/v1/ingest/batches` client on ONE device
+// trust input: `setCACert(HEAR_PUSH_CA_CERT)`. The steady-state bundle is as small as possible
+// (today: one root, Amazon Root CA 1), and a migration overlap may temporarily carry exactly two
+// roots. The tracked source bundle lives under firmware/hear_node/trust_store/ and
+// release_ca_bundle.py verifies that this default macro still matches it byte-for-byte before a
+// release can publish the CA-bundle artifact.
 //
 // HEAR_PUSH_HOST defaults to an AWS API Gateway custom domain, whose ACM certificate chains to
 // one of Amazon Trust Services' own roots. This is "Amazon Root CA 1", published by Amazon at
 // https://www.amazontrust.com/repository/AmazonRootCA1.pem specifically for embedding in device
-// firmware that cannot fetch a CA bundle at runtime -- the same reason AWS's own IoT Device SDKs
-// ship it verbatim. It is a public root certificate, not a secret: pinning it here lets
-// WiFiClientSecure verify the push endpoint's certificate chain instead of calling
-// client.setInsecure() and accepting anything that answers on the port.
+// firmware that cannot fetch a CA bundle at runtime. It is a public root certificate, not a
+// secret: pinning it here lets WiFiClientSecure verify the push endpoint's certificate chain
+// instead of calling client.setInsecure() and accepting anything that answers on the port.
 //
 // A build pointed at a different HEAR_PUSH_HOST (a different CA, or a private one) overrides this
 // by defining HEAR_PUSH_CA_CERT in secrets.h BEFORE this header is reached -- see the #ifndef

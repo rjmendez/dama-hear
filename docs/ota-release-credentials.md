@@ -22,7 +22,7 @@ release.
 | `hear_node` | Backend push host (`HEAR_PUSH_HOST`) | compiled public default or NVS `phost` override | Runtime config, not secret | Pushes go to the default ingest host |
 | `hear_node` | Backend push token (`HEAR_PUSH_TOKEN`) | `~/.hear_push` -> `secrets.h`, now copied/provisioned into NVS `ptoken` | Runtime secret | Pushes are sent without credentials and the backend returns `401` |
 | `hear_node` | Admin token (`HEAR_ADMIN_TOKEN`) | `~/.hear_push` -> `secrets.h`, now copied/provisioned into NVS `atoken` | Runtime secret | Non-OTA privileged endpoints fail closed; `/update` stays open only when no admin token exists so a bad generic image is recoverable |
-| `hear_node` | Push TLS CA / insecure override (`HEAR_PUSH_CA_CERT`, `HEAR_PUSH_TLS_INSECURE`) | tracked Amazon Root CA default, optional `secrets.h` override | Build-time policy/config | Default remains verified TLS; insecure must be explicit |
+| `hear_node` | Push TLS CA / insecure override (`HEAR_PUSH_CA_CERT`, `HEAR_PUSH_TLS_INSECURE`) | tracked bounded PEM bundle (steady state: Amazon Root CA 1) plus optional `secrets.h` override | Build-time policy/config | Default remains verified TLS; insecure must be explicit |
 | `puc_node` | Wi-Fi SSIDs/PSKs (`WIFI_*`) | `secrets.h`; CI can compile with `-DHEAR_ALLOW_NO_WIFI` | Runtime | AP-only/unreachable on LAN |
 | `puc_node` | Node identity (`NODE_ID`) | `secrets.h`, else MAC-derived | Runtime | Unique but not enrolled fleet identity |
 | `puc_node` | Admin token (`HEAR_ADMIN_TOKEN`) | `secrets.h`, default empty | Runtime secret | Privileged endpoints, including `/update` and `/reboot`, reject every request; a generic PUC artifact is not OTA-recoverable until PUC gets NVS credential provisioning |
@@ -78,6 +78,10 @@ if an installer can tell. Both are now declared and enforced at build time:
   the release checkout, and `firmware.yml` fails on any `secrets.h` anywhere in the tree it
   compiles. CI has never had one; the failure mode is a published fleet token and a fleet-wide
   rotation, so it is asserted rather than assumed.
+* `release_ca_bundle.py` builds and verifies `hear-push-ca-bundle.pem` plus
+  `hear-push-ca-bundle.json` from the tracked certificate files under
+  `firmware/hear_node/trust_store/`, and refuses a release if the bundle drifts from the default
+  `HEAR_PUSH_CA_CERT` macro or if any cert is missing/malformed.
 * `dist/build-info.json` and `release-manifest.json` carry the claim as fields:
 
   ```json
