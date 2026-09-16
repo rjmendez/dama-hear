@@ -11,6 +11,7 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "firmware" / "hear_node"))
 import board_profiles  # noqa: E402
+import release_ca_bundle  # noqa: E402
 import release_manifest  # noqa: E402
 
 
@@ -231,3 +232,17 @@ def test_dirty_source_is_refused_by_default_and_marked_when_allowed(monkeypatch,
     assert manifest["source"]["dirty"] is True
     assert manifest["source"]["verifiable"] is False
     assert manifest["source"]["refusals"]
+
+
+def test_release_manifest_hashes_the_ca_bundle_artifacts_when_present(monkeypatch, tmp_path):
+    dist, build_info = _write_dist(tmp_path)
+    release_ca_bundle.write_release_artifacts(ROOT, dist)
+    monkeypatch.setattr(release_manifest, "git_source_state", lambda *args, **kwargs: _source_state())
+    manifest = release_manifest.write_manifest(ROOT, dist, build_info)
+    artifacts = {item["name"]: item for item in manifest["release_artifacts"]}
+    for name, kind in ((release_ca_bundle.BUNDLE_NAME, "ca-bundle"),
+                       (release_ca_bundle.METADATA_NAME, "ca-bundle-metadata")):
+        assert artifacts[name]["kind"] == kind
+    summary = release_manifest.verify_release_directory(
+        dist / release_manifest.MANIFEST_NAME, dist, expected_tag=TAG)
+    assert summary["artifacts_checked"] >= len(manifest["release_artifacts"])

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "bundle_type": "dama-hear-device-push-ca-bundle-spec",
+  "adr": "docs/decisions/0011-device-push-trust-store-cutover-policy.md",
+  "target_macro": "HEAR_PUSH_CA_CERT",
+  "state": "steady-state",
+  "steady_state_max_certificates": 1,
+  "overlap_max_certificates": 2,
+  "applies_to": [
+    "current HTTPS push path through HEAR_PUSH_HOST",
+    "future /v1/ingest/batches device batch client"
+  ],
+  "certificates": [
+    {
+      "name": "amazon-root-ca-1",
+      "role": "current-root",
+      "path": "firmware/hear_node/trust_store/amazon-root-ca-1.pem",
+      "sha256": "8ecde6884f3d87b1125ba31ac3fcb13d7016de7f57cc904fe1cb97c6ae98196e"
+    }
+  ]
+}

@@ -35,6 +35,10 @@ def test_release_workflow_publishes_per_board_psram_assets():
         assert f'dist/{stem}-$TAG.elf' in yml
     assert "release-manifest.json" in yml
     assert "release-manifest.schema.json" in yml
+    assert "hear-push-ca-bundle.pem" in yml
+    assert "hear-push-ca-bundle.json" in yml
+    assert "release_ca_bundle.py generate" in yml
+    assert "release_ca_bundle.py verify" in yml
     assert "release_manifest.py generate" in yml
     assert "release_manifest.py verify" in yml
 
