@@ -2,9 +2,10 @@
 """Detect human speech in a clip, destroy the clip, and keep only the proof that it happened.
 
     from hear.privacy import purge
-    report = purge.scan_pool("~/hear-clips", audit_log="~/hear-clips/purged_receipts.jsonl")
-    report.purged            # how many WAVs no longer exist
-    report.receipts[0].as_record()["zero_audio_retained"]   # True, always
+    report = purge.scan_pool("~/hear-clips")                 # -> <pool>/vad_purge.jsonl
+    report.purged                                            # how many WAVs no longer exist
+    receipt = purge.purge_wav("one-clip.wav", vad=purge.load_vad())   # one clip, one dict
+    receipt["verdict"]       # SPEECH_DETECTED | NO_SPEECH | NOT_SCORED
 
 WHAT THIS MODULE IS FOR. Clips are captured for acoustics -- a gunshot's arrival time, a clap's
 envelope -- and a microphone that hears a gunshot also hears whoever was talking beside it. A
@@ -15,9 +16,10 @@ anything about its contents.
 ⚠️THE RECEIPT IS THE ONLY SURVIVOR, AND IT IS DELIBERATELY NEARLY EMPTY. A purge that leaves no
 record is indistinguishable from a lost file, from a crashed drain, and from a cover-up; an audit
 that cannot count destructions cannot prove the policy runs. So one JSONL line is written per
-purge and it carries `{timestamp, node, duration_s, peak_speech_prob, purged_sha256,
-purge_reason, zero_audio_retained}` -- when, where, how long, how sure, and the digest of bytes
-that no longer exist anywhere. The digest is a *tombstone*, not an index: nothing can be
+purge -- `hear.vad.purge.receipt.v1`, the schema of docs/silero-vad-privacy-contract.md §8 --
+carrying when, on which node, how long the clip was, how sure the detector was, how the bytes
+were destroyed, that their absence was CHECKED afterwards, and the digest of bytes that no
+longer exist anywhere. The digest is a *tombstone*, not an index: nothing can be
 recovered from it, and it is what lets a later question ("was THIS file purged?") be answered by
 whoever still holds the file, without this repository holding it.
 
@@ -43,6 +45,13 @@ filesystem, on flash with wear levelling, and in any snapshot or backup taken be
 the original blocks may still exist physically. That is a storage-layer property this module
 cannot fix and must not pretend to: the claim made in the receipt is `zero_audio_retained`, i.e.
 this pipeline retained nothing, not `unrecoverable`.
+
+⚠️A VERDICT IS NOT THE SAME AS A DESTRUCTION, AND RE-RUNNING IS NOT AN ERROR. `NO_SPEECH` says
+a clip was scored and found clean (`--receipt-clean` records those too, so the audit log can
+answer "what did you cover?" and not only "what did you destroy?"); `NOT_SCORED` with
+`already_absent: true` says the bytes were gone before this run reached them, which is what a
+second pass over a purged pool, or a race with the drain's own pruning, must produce instead of
+an exception. `audio_retained` is false on exactly the receipts where something was destroyed.
 
 ⚠️DRY RUN TOUCHES NOTHING, AND THAT INCLUDES THE AUDIT LOG. `--dry-run` answers "what would go"
 and must be safe to run on a pool someone else is draining. It hashes and detects, marks the
@@ -80,24 +89,73 @@ RECEIPT_SCHEMA_VERSION = 1
 #: had onnxruntime installed, and the count is the thing an auditor reads.
 PURGE_REASON = "silero_vad_speech_detected"
 
-#: Default audit sink, relative to the pool root being scanned.
-RECEIPT_NAME = "purged_receipts.jsonl"
+#: The receipt's own name, as docs/silero-vad-privacy-contract.md §8.1 fixes it.
+RECEIPT_SCHEMA = "hear.vad.purge.receipt.v1"
+
+#: Default audit sink, relative to the pool root being scanned. The contract's §8.1 name; the
+#: pipeline's first landed version wrote `purged_receipts.jsonl`, which `read_receipts()` still
+#: reads, because an audit log that a rename orphans was never durable in the first place.
+RECEIPT_NAME = "vad_purge.jsonl"
+LEGACY_RECEIPT_NAME = "purged_receipts.jsonl"
+
+#: Every verdict a scored clip can carry (contract §6). `NOT_SCORED` is not a failure: it is the
+#: honest answer for a clip whose audio was already gone when the scan reached it.
+VERDICT_SPEECH = "SPEECH_DETECTED"
+VERDICT_CLEAN = "NO_SPEECH"
+VERDICT_NOT_SCORED = "NOT_SCORED"
+VERDICTS = (VERDICT_SPEECH, VERDICT_CLEAN, VERDICT_NOT_SCORED)
+
+#: How the bytes went (contract §8.2). `already_absent` is the idempotent re-run: a second scan
+#: of a purged pool must record that the file was gone, not raise and not claim a destruction.
+METHOD_OVERWRITE = "overwrite_unlink"
+METHOD_ABSENT = "already_absent"
+METHOD_NONE = "none"
 
 #: EVERY key a receipt may carry. `assert_privacy_safe()` refuses anything else -- see the
 #: module docstring on why the failure mode here is additive.
+#:
+#: ⚠️THE CONTRACT'S `policy` AND `model` OBJECTS ARE FLATTENED INTO SCALARS HERE. §8.2 draws them
+#: as nested objects; this guard refuses every nested structure, because "a dict is allowed under
+#: this key" is exactly the hole a feature vector arrives through. The fields themselves are all
+#: present, one scalar each, which satisfies what §8.1 actually demands -- "scalars and
+#: identifiers only" -- and keeps the refusal rule one line long.
 RECEIPT_KEYS = (
+    "schema",
     "schema_version",
     "timestamp",
+    "purged_at",
     "node",
     "clip",
+    "clip_key",
     "duration_s",
+    "verdict",
     "peak_speech_prob",
+    "speech_confidence_max",
+    "speech_confidence_mean_in_segments",
     "speech_s",
+    "speech_total_ms",
+    "speech_segment_count",
     "speech_spans_s",
+    "speech_segments_ms",
+    "frames_scored",
     "purged_sha256",
+    "purged_bytes",
     "purge_reason",
+    "purge_method",
+    "medium_guarantee",
+    "verified_absent",
+    "already_absent",
+    "provenance",
     "vad_engine",
+    "policy_version",
+    "speech_threshold",
+    "neg_threshold",
+    "min_speech_duration_ms",
+    "min_silence_duration_ms",
+    "speech_pad_ms",
     "zero_audio_retained",
+    "audio_retained",
+    "fail_closed_reason",
     "dry_run",
 )
 
@@ -113,7 +171,11 @@ FORBIDDEN_SUBSTRINGS = (
 #: Allow-listed keys that legitimately spell a forbidden word. `zero_audio_retained` is the
 #: pipeline's central CLAIM about audio, not audio; the speech fields are measurements in
 #: seconds and a scalar probability.
-NAME_EXEMPT = ("zero_audio_retained", "speech_s", "speech_spans_s", "peak_speech_prob")
+NAME_EXEMPT = ("zero_audio_retained", "audio_retained", "speech_s", "speech_spans_s",
+               "speech_segments_ms", "speech_total_ms", "speech_segment_count",
+               "peak_speech_prob", "speech_threshold", "speech_confidence_max",
+               "speech_confidence_mean_in_segments", "speech_pad_ms",
+               "min_speech_duration_ms", "min_silence_duration_ms")
 
 #: A voice, in Hz: the band a telephone was built around, which is where speech energy is.
 VOICE_BAND_HZ = (300.0, 3400.0)
@@ -122,15 +184,25 @@ PITCH_HZ = (70.0, 350.0)
 #: Analysis geometry. 32 ms frames at 10 ms hops: long enough for a pitch period at 70 Hz to
 #: appear twice, short enough that a 250 ms utterance is 25 frames rather than 8.
 FRAME_MS, HOP_MS = 32.0, 10.0
-#: Two speech-labelled frames closer than this are one utterance with a pause between. 200 ms,
-#: not 120: at 120 the voiced peaks of one modulated utterance in noise stay separate 140 ms
+#: Silence shorter than this does NOT close a segment; it is bridged (contract §4.1). 300 ms,
+#: because at 120 the voiced peaks of one modulated utterance in noise stay separate 140 ms
 #: fragments, every fragment falls under `min_speech_ms`, and a clip of someone talking through
-#: traffic is KEPT. Merging first and length-testing after is what makes the length test mean
+#: traffic is KEPT. Bridging first and length-testing after is what makes the length test mean
 #: "how long were they speaking" rather than "how long was the loudest syllable".
-JOIN_GAP_MS = 200.0
+DEFAULT_MIN_SILENCE_MS = 300.0
 
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_MIN_SPEECH_MS = 250.0
+
+#: ⚠️HYSTERESIS: OPEN AT `threshold`, CLOSE ONLY BELOW `neg_threshold` (contract §4.2). A single
+#: threshold chatters -- `0.52, 0.48, 0.53` becomes three segments and two silences -- and a
+#: chattering segmenter turns one utterance into fragments that each fail the length test. The
+#: gap between the two numbers IS the noise immunity; closing it reintroduces the chatter.
+DEFAULT_NEG_THRESHOLD = 0.35
+#: Margin added to each end of an accepted segment (contract §4.1).
+DEFAULT_SPEECH_PAD_MS = 30.0
+#: Bumped when the MEANING of a verdict changes, so a past verdict stays reproducible.
+POLICY_VERSION = "v1"
 
 #: A clip larger than this is refused rather than read into memory. 5.0 s of 48 kHz mono PCM16
 #: is 480 044 B; 64 MiB is ~11 minutes, far past anything the firmware writes.
@@ -217,6 +289,10 @@ class SpeechSpan:
     def as_pair(self) -> List[float]:
         return [round(self.start_s, 3), round(self.end_s, 3)]
 
+    def as_ms_pair(self) -> List[int]:
+        """Contract §8.2 `speech_segments_ms`: integer ms offsets, relative to clip start."""
+        return [int(round(self.start_s * 1000.0)), int(round(self.end_s * 1000.0))]
+
 
 @dataclass(frozen=True)
 class VadDecision:
@@ -232,6 +308,12 @@ class VadDecision:
     speech_s: float
     spans: Tuple[SpeechSpan, ...]
     engine: str
+    #: Mean probability INSIDE the accepted segments, not over the clip. A clip-wide mean is
+    #: dominated by however much silence happened to surround the utterance, so it drops as the
+    #: clip gets longer for the same speech -- useless for tuning, which is what it is for.
+    mean_prob_in_segments: Optional[float] = None
+    frames_scored: int = 0
+    truncated_segment: bool = False
 
 
 class BandEnergyVAD:
@@ -262,9 +344,15 @@ class BandEnergyVAD:
     name = "band_energy_fallback_v1"
 
     def __init__(self, threshold: float = DEFAULT_THRESHOLD,
-                 min_speech_ms: float = DEFAULT_MIN_SPEECH_MS) -> None:
+                 min_speech_ms: float = DEFAULT_MIN_SPEECH_MS, *,
+                 neg_threshold: float = DEFAULT_NEG_THRESHOLD,
+                 min_silence_ms: float = DEFAULT_MIN_SILENCE_MS,
+                 speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS) -> None:
         self.threshold = float(threshold)
         self.min_speech_ms = float(min_speech_ms)
+        self.neg_threshold = min(float(neg_threshold), float(threshold))
+        self.min_silence_ms = float(min_silence_ms)
+        self.speech_pad_ms = float(speech_pad_ms)
 
     # -- framing ---------------------------------------------------------------------------
 
@@ -348,7 +436,11 @@ class BandEnergyVAD:
             return VadDecision(False, 0.0, 0.0, (), self.name)
         probs, hop = self._frame_probs(samples, rate)
         return decision_from_probs(probs, hop / float(rate), FRAME_MS / 1000.0,
-                                   self.threshold, self.min_speech_ms, self.name)
+                                   self.threshold, self.min_speech_ms, self.name,
+                                   neg_threshold=self.neg_threshold,
+                                   min_silence_ms=self.min_silence_ms,
+                                   speech_pad_ms=self.speech_pad_ms,
+                                   clip_s=samples.size / float(rate))
 
 
 def _ramp(x: np.ndarray, lo: float, hi: float) -> np.ndarray:
@@ -357,48 +449,78 @@ def _ramp(x: np.ndarray, lo: float, hi: float) -> np.ndarray:
 
 
 def decision_from_probs(probs: Sequence[float], hop_s: float, frame_s: float,
-                        threshold: float, min_speech_ms: float, engine: str) -> VadDecision:
-    """Per-frame probabilities -> spans, a peak and a verdict.
+                        threshold: float, min_speech_ms: float, engine: str, *,
+                        neg_threshold: Optional[float] = None,
+                        min_silence_ms: float = DEFAULT_MIN_SILENCE_MS,
+                        speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS,
+                        clip_s: Optional[float] = None) -> VadDecision:
+    """Per-frame probabilities -> segments, a peak and a verdict. Contract §4.3's state machine.
 
-    Shared by every engine so that "what counts as speech" is one rule: frames at or above
-    `threshold`, merged across gaps shorter than `JOIN_GAP_MS` (a stop consonant is a gap), and
-    any merged span shorter than `min_speech_ms` discarded (a door latch is not a word).
+    Shared by every engine so that "what counts as speech" is one rule and not one rule per
+    detector:
+
+      1. a segment OPENS at a frame >= `threshold` and CLOSES only below `neg_threshold`, so
+         ordinary probability wobble inside an utterance does not end it (§4.2);
+      2. a silence shorter than `min_silence_ms` is BRIDGED, because the gap between two
+         syllables is not the end of the speech;
+      3. each surviving segment is PADDED by `speech_pad_ms` at both ends, clamped to the clip;
+      4. only then is a segment shorter than `min_speech_ms` discarded as a blip.
+
+    ⚠️THE ORDER OF 2, 3 AND 4 IS THE WHOLE BEHAVIOUR. Length-testing before bridging asks "how
+    long was the loudest syllable", which is the question that keeps a clip of someone talking
+    through traffic. Length-testing after bridging asks "how long were they speaking".
     """
     arr = np.asarray(probs, dtype=np.float64)
     if arr.size == 0:
-        return VadDecision(False, 0.0, 0.0, (), engine)
+        return VadDecision(False, 0.0, 0.0, (), engine, None, 0, False)
+    neg = float(threshold if neg_threshold is None else neg_threshold)
+    if neg > float(threshold):
+        raise PurgeError("neg_threshold %.3f is above threshold %.3f: a segment that cannot "
+                         "close is not hysteresis" % (neg, threshold))
     peak = float(arr.max())
-    hot = arr >= float(threshold)
+    frames = int(arr.size)
+    total_s = (frames - 1) * hop_s + frame_s if clip_s is None else float(clip_s)
 
+    # 1. hysteresis
     raw: List[Tuple[int, int]] = []
     start: Optional[int] = None
-    for i, on in enumerate(hot):
-        if on and start is None:
-            start = i
-        elif not on and start is not None:
+    for i, p in enumerate(arr):
+        if start is None:
+            if p >= threshold:
+                start = i
+        elif p < neg:
             raw.append((start, i - 1))
             start = None
+    truncated = start is not None
     if start is not None:
-        raw.append((start, int(hot.size) - 1))
+        raw.append((start, frames - 1))
 
+    # 2. bridge short silences
     merged: List[Tuple[int, int]] = []
-    gap_frames = max(1, int(round((JOIN_GAP_MS / 1000.0) / max(hop_s, 1e-9))))
+    gap_frames = max(1, int(round((float(min_silence_ms) / 1000.0) / max(hop_s, 1e-9))))
     for span in raw:
         if merged and span[0] - merged[-1][1] <= gap_frames:
             merged[-1] = (merged[-1][0], span[1])
         else:
             merged.append(span)
 
+    pad_s = max(0.0, float(speech_pad_ms) / 1000.0)
     spans: List[SpeechSpan] = []
+    probs_in_segments: List[np.ndarray] = []
     for lo, hi in merged:
-        start_s = lo * hop_s
-        end_s = hi * hop_s + frame_s
+        # 3. pad, clamped to the clip
+        start_s = max(0.0, lo * hop_s - pad_s)
+        end_s = min(total_s, hi * hop_s + frame_s + pad_s)
+        # 4. and only now, the length test
         if (end_s - start_s) * 1000.0 < float(min_speech_ms):
             continue
         spans.append(SpeechSpan(start_s, end_s, float(arr[lo:hi + 1].max())))
+        probs_in_segments.append(arr[lo:hi + 1])
 
     speech_s = float(sum(s.duration_s for s in spans))
-    return VadDecision(bool(spans), peak, speech_s, tuple(spans), engine)
+    mean_in = (float(np.concatenate(probs_in_segments).mean()) if probs_in_segments else None)
+    return VadDecision(bool(spans), peak, speech_s, tuple(spans), engine, mean_in, frames,
+                       bool(truncated and spans))
 
 
 def load_vad(engine: str = "auto", threshold: float = DEFAULT_THRESHOLD,
@@ -429,12 +551,19 @@ def load_vad(engine: str = "auto", threshold: float = DEFAULT_THRESHOLD,
 
 @dataclass(frozen=True)
 class PurgeReceipt:
-    """What is allowed to outlive a voice clip.
+    """What is allowed to outlive a voice clip. `hear.vad.purge.receipt.v1` (contract §8).
 
     Read it as a death certificate: it says a file existed, on which node, for how long, that a
-    detector was this sure it held speech, and that its bytes hashed to this. It says nothing
-    that could be turned back into sound, and `assert_privacy_safe()` enforces that on the way
-    out rather than trusting this class to stay honest as it is edited.
+    detector was this sure it held speech, how it was destroyed, that it is confirmed gone, and
+    that its bytes hashed to this. It says nothing that could be turned back into sound, and
+    `assert_privacy_safe()` enforces that on the way out rather than trusting this class to stay
+    honest as it is edited.
+
+    ⚠️A `NO_SPEECH` RECEIPT IS ALSO A RECEIPT. Contract §6 writes one for every clip that was
+    scored, not only for the ones that were destroyed, because "this clip was examined and found
+    clean" and "this clip was never examined" are different facts and an audit that cannot tell
+    them apart cannot say what coverage it had. `audio_retained` is what distinguishes them, and
+    it is `true` on exactly the receipts where nothing was destroyed.
     """
     timestamp: str
     node: str
@@ -443,25 +572,79 @@ class PurgeReceipt:
     peak_speech_prob: float
     speech_s: float
     spans: Tuple[SpeechSpan, ...]
-    purged_sha256: str
+    purged_sha256: Optional[str]
     vad_engine: str
     dry_run: bool = False
     purge_reason: str = PURGE_REASON
+    verdict: str = VERDICT_SPEECH
+    mean_prob_in_segments: Optional[float] = None
+    frames_scored: int = 0
+    purged_bytes: Optional[int] = None
+    purge_method: str = METHOD_OVERWRITE
+    verified_absent: bool = True
+    already_absent: bool = False
+    fail_closed_reason: Optional[str] = None
+    clip_key: Optional[str] = None
+    threshold: float = DEFAULT_THRESHOLD
+    neg_threshold: float = DEFAULT_NEG_THRESHOLD
+    min_speech_ms: float = DEFAULT_MIN_SPEECH_MS
+    min_silence_ms: float = DEFAULT_MIN_SILENCE_MS
+    speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS
+
+    @property
+    def destroyed(self) -> bool:
+        """Did THIS receipt destroy something? False for a dry run, a clean clip, a missing one."""
+        return (self.verdict == VERDICT_SPEECH and not self.dry_run and not self.already_absent)
 
     def as_record(self) -> Dict[str, Any]:
+        mean_in = (None if self.mean_prob_in_segments is None
+                   else round(float(self.mean_prob_in_segments), 4))
+        peak = round(float(self.peak_speech_prob), 4)
         rec: Dict[str, Any] = {
+            "schema": RECEIPT_SCHEMA,
             "schema_version": RECEIPT_SCHEMA_VERSION,
             "timestamp": self.timestamp,
+            "purged_at": self.timestamp,
             "node": self.node,
             "clip": self.clip,
+            "clip_key": self.clip_key,
             "duration_s": round(float(self.duration_s), 3),
-            "peak_speech_prob": round(float(self.peak_speech_prob), 4),
+            "verdict": self.verdict,
+            "peak_speech_prob": peak,
+            "speech_confidence_max": peak,
+            "speech_confidence_mean_in_segments": mean_in,
             "speech_s": round(float(self.speech_s), 3),
+            "speech_total_ms": int(round(float(self.speech_s) * 1000.0)),
+            "speech_segment_count": len(self.spans),
             "speech_spans_s": [s.as_pair() for s in self.spans],
+            "speech_segments_ms": [s.as_ms_pair() for s in self.spans],
+            "frames_scored": int(self.frames_scored),
             "purged_sha256": self.purged_sha256,
+            "purged_bytes": self.purged_bytes,
             "purge_reason": self.purge_reason,
+            "purge_method": self.purge_method,
+            # Overwrite-then-unlink defeats a filesystem reader and nothing below it: see the
+            # module docstring. The receipt says which, rather than implying erasure.
+            "medium_guarantee": "filesystem_only" if self.destroyed else "none",
+            "verified_absent": bool(self.verified_absent),
+            "already_absent": bool(self.already_absent),
+            "provenance": "model",
             "vad_engine": self.vad_engine,
-            "zero_audio_retained": True,
+            "policy_version": POLICY_VERSION,
+            "speech_threshold": float(self.threshold),
+            "neg_threshold": float(self.neg_threshold),
+            "min_speech_duration_ms": float(self.min_speech_ms),
+            "min_silence_duration_ms": float(self.min_silence_ms),
+            "speech_pad_ms": float(self.speech_pad_ms),
+            # ⚠️THE TWO AUDIO FIELDS ARE ONE FACT SPELLED TWICE, AND THEY ARE ALWAYS
+            # OPPOSITE. `zero_audio_retained` is the task-level claim ("nothing of this clip's
+            # sound is held anywhere after this receipt"); `audio_retained` is contract §8.2's
+            # field, which must be false on every SPEECH_DETECTED receipt or the gate fails. A
+            # dry run and a clean clip both leave the WAV on disk, so both say so rather than
+            # asserting a destruction that did not happen.
+            "zero_audio_retained": self.destroyed,
+            "audio_retained": not self.destroyed,
+            "fail_closed_reason": self.fail_closed_reason,
             "dry_run": bool(self.dry_run),
         }
         assert_privacy_safe(rec)
@@ -487,13 +670,12 @@ def assert_privacy_safe(record: Dict[str, Any]) -> Dict[str, Any]:
             if bad in low and key not in NAME_EXEMPT:
                 raise PrivacyLeak("receipt field %r names %r, which this pipeline never "
                                   "retains" % (key, bad))
-        if key == "speech_spans_s":
+        if key in ("speech_spans_s", "speech_segments_ms"):
             if not isinstance(value, list):
-                raise PrivacyLeak("speech_spans_s must be a list of [start, end] pairs")
+                raise PrivacyLeak("%s must be a list of [start, end] pairs" % key)
             for pair in value:
                 if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-                    raise PrivacyLeak("speech_spans_s carries %r, not a [start, end] pair"
-                                      % (pair,))
+                    raise PrivacyLeak("%s carries %r, not a [start, end] pair" % (key, pair))
                 for edge in pair:
                     if not isinstance(edge, (int, float)) or isinstance(edge, bool):
                         raise PrivacyLeak("speech span edge %r is not a number" % (edge,))
@@ -541,6 +723,20 @@ def read_receipts(path: str) -> List[Dict[str, Any]]:
                 out.append(json.loads(line))
             except ValueError:
                 continue
+    return out
+
+
+def read_pool_receipts(root: str) -> List[Dict[str, Any]]:
+    """Every receipt a pool holds, under the current name AND the first landed one.
+
+    The audit sink was renamed to contract §8.1's `vad_purge.jsonl` after the pipeline shipped
+    as `purged_receipts.jsonl`. A rename that orphans destroyed-clip evidence is worse than the
+    inconsistent name was, so both are read and the union is returned.
+    """
+    root = os.path.abspath(os.path.expanduser(root))
+    out: List[Dict[str, Any]] = []
+    for name in (RECEIPT_NAME, LEGACY_RECEIPT_NAME):
+        out.extend(read_receipts(os.path.join(root, name)))
     return out
 
 
@@ -619,6 +815,22 @@ def node_of(path: str, default: str = "unknown") -> str:
         return default
 
 
+def _clip_key(path: str) -> Optional[str]:
+    """`hear.clips.clip_key` for a name this pipeline recognises, else None.
+
+    The key is the clip's IDENTITY -- node + boot + sample -- so a receipt can be joined to the
+    `clips/index.jsonl` row that recorded the arrival of the bytes it destroyed. It is derived
+    from the NAME, never from the content, which is the same rule `hear/clips.py` states: a
+    content hash would collide two clips of the same silence.
+    """
+    try:
+        from .. import clips as C
+        parts = C.parse_clip_name(C.CLIP_DIR + "/" + os.path.basename(path))
+        return str(C.clip_key(parts["node"], parts["boot"], parts["sample"]))
+    except Exception:
+        return None
+
+
 def _now_iso(now: Optional[dt.datetime] = None) -> str:
     stamp = now or dt.datetime.now(dt.timezone.utc)
     if stamp.tzinfo is None:
@@ -629,9 +841,9 @@ def _now_iso(now: Optional[dt.datetime] = None) -> str:
 
 @dataclass
 class ClipOutcome:
-    """One clip's fate: kept, purged, would-be-purged, or undecidable."""
+    """One clip's fate: kept, purged, would-be-purged, already gone, or undecidable."""
     path: str
-    status: str                       # "kept" | "purged" | "would_purge" | "error"
+    status: str    # "kept" | "purged" | "would_purge" | "already_absent" | "error"
     receipt: Optional[PurgeReceipt] = None
     detail: str = ""
 
@@ -643,6 +855,7 @@ class PurgeReport:
     purged: int = 0
     would_purge: int = 0
     kept: int = 0
+    already_absent: int = 0
     errors: int = 0
     dry_run: bool = False
     vad_engine: str = ""
@@ -652,7 +865,8 @@ class PurgeReport:
 
     def as_record(self) -> Dict[str, Any]:
         return {"scanned": self.scanned, "purged": self.purged, "would_purge": self.would_purge,
-                "kept": self.kept, "errors": self.errors, "dry_run": self.dry_run,
+                "kept": self.kept, "already_absent": self.already_absent,
+                "errors": self.errors, "dry_run": self.dry_run,
                 "vad_engine": self.vad_engine, "audit_log": self.audit_log}
 
 
@@ -702,16 +916,26 @@ def purge_wav_bytes(data: bytes, node: str = "stream", clip: str = "<stream>", v
     receipt = PurgeReceipt(timestamp=_now_iso(now), node=node, clip=clip,
                            duration_s=duration_s, peak_speech_prob=decision.peak_prob,
                            speech_s=decision.speech_s, spans=decision.spans,
-                           purged_sha256=digest, vad_engine=decision.engine, dry_run=False)
+                           purged_sha256=digest, purged_bytes=len(data),
+                           vad_engine=decision.engine, dry_run=False,
+                           verdict=VERDICT_SPEECH, purge_method=METHOD_OVERWRITE,
+                           verified_absent=True,
+                           mean_prob_in_segments=decision.mean_prob_in_segments,
+                           frames_scored=decision.frames_scored,
+                           threshold=threshold, min_speech_ms=min_speech_ms)
     if audit_log:
         append_receipt(audit_log, receipt)
     return receipt
 
 
 def purge_clip(path: str, vad=None, *, threshold: float = DEFAULT_THRESHOLD,
-               min_speech_ms: float = DEFAULT_MIN_SPEECH_MS, dry_run: bool = False,
+               min_speech_ms: float = DEFAULT_MIN_SPEECH_MS,
+               neg_threshold: float = DEFAULT_NEG_THRESHOLD,
+               min_silence_ms: float = DEFAULT_MIN_SILENCE_MS,
+               speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS, dry_run: bool = False,
                audit_log: Optional[str] = None, node: Optional[str] = None,
-               now: Optional[dt.datetime] = None) -> ClipOutcome:
+               now: Optional[dt.datetime] = None,
+               receipt_clean: bool = False) -> ClipOutcome:
     """Decide about one WAV on disk, and destroy it if it holds speech.
 
     Order is deliberate and is the audit's whole basis: **digest, detect, destroy, record.** The
@@ -721,7 +945,28 @@ def purge_clip(path: str, vad=None, *, threshold: float = DEFAULT_THRESHOLD,
     """
     path = os.path.abspath(os.path.expanduser(path))
     vad = vad or load_vad("auto", threshold, min_speech_ms)
+    policy = dict(threshold=threshold, neg_threshold=min(neg_threshold, threshold),
+                  min_speech_ms=min_speech_ms, min_silence_ms=min_silence_ms,
+                  speech_pad_ms=speech_pad_ms)
+
+    if not os.path.exists(path):
+        # ⚠️IDEMPOTENT RE-RUN, NOT AN ERROR. Scanning a pool twice, or racing a drain that
+        # already pruned the clip, must record "the bytes were gone when I got here" -- a
+        # NOT_SCORED receipt with `already_absent` -- and must not raise, must not claim a
+        # destruction it did not perform, and must not count as a failure to decide.
+        receipt = PurgeReceipt(timestamp=_now_iso(now), node=node or node_of(path),
+                               clip=os.path.basename(path), duration_s=0.0,
+                               peak_speech_prob=0.0, speech_s=0.0, spans=(),
+                               purged_sha256=None, vad_engine=getattr(vad, "name", "none"),
+                               dry_run=dry_run, verdict=VERDICT_NOT_SCORED,
+                               purge_method=METHOD_ABSENT, verified_absent=True,
+                               already_absent=True, clip_key=_clip_key(path), **policy)
+        if audit_log and not dry_run:
+            append_receipt(audit_log, receipt)
+        return ClipOutcome(path, "already_absent", receipt, "the file was gone before this run")
+
     try:
+        purged_bytes = os.path.getsize(path)
         digest = sha256_file(path)
         samples, rate = read_wav_mono(path)
     except PurgeError as exc:
@@ -736,24 +981,68 @@ def purge_clip(path: str, vad=None, *, threshold: float = DEFAULT_THRESHOLD,
     _zero(samples)
     del samples
 
+    common = dict(timestamp=_now_iso(now), node=node or node_of(path),
+                  clip=os.path.basename(path), clip_key=_clip_key(path),
+                  duration_s=duration_s, peak_speech_prob=decision.peak_prob,
+                  speech_s=decision.speech_s, spans=decision.spans,
+                  purged_sha256=digest, purged_bytes=purged_bytes,
+                  vad_engine=decision.engine,
+                  mean_prob_in_segments=decision.mean_prob_in_segments,
+                  frames_scored=decision.frames_scored, **policy)
+
     if not decision.speech:
-        return ClipOutcome(path, "kept", None,
+        receipt = PurgeReceipt(dry_run=dry_run, verdict=VERDICT_CLEAN,
+                               purge_method=METHOD_NONE, verified_absent=False, **common)
+        if audit_log and not dry_run and receipt_clean:
+            append_receipt(audit_log, receipt)
+        return ClipOutcome(path, "kept", receipt if receipt_clean else None,
                            "no speech (peak %.3f < %.3f)" % (decision.peak_prob, threshold))
 
-    receipt = PurgeReceipt(timestamp=_now_iso(now), node=node or node_of(path),
-                           clip=os.path.basename(path), duration_s=duration_s,
-                           peak_speech_prob=decision.peak_prob, speech_s=decision.speech_s,
-                           spans=decision.spans, purged_sha256=digest,
-                           vad_engine=decision.engine, dry_run=dry_run)
+    receipt = PurgeReceipt(dry_run=dry_run, verdict=VERDICT_SPEECH,
+                           purge_method=METHOD_OVERWRITE, verified_absent=False, **common)
     if dry_run:
         return ClipOutcome(path, "would_purge", receipt, "dry run: file untouched")
     try:
         shred_file(path)
     except PurgeError as exc:
         return ClipOutcome(path, "error", None, str(exc))
+    # ⚠️THE RECEIPT ASSERTS ABSENCE, SO ABSENCE IS CHECKED. A receipt that says a file is gone
+    # because the unlink returned without raising is a claim about an API call, not about the
+    # filesystem; contract §7.2 wants the post-unlink existence check on the record.
+    receipt = PurgeReceipt(dry_run=False, verdict=VERDICT_SPEECH,
+                           purge_method=METHOD_OVERWRITE,
+                           verified_absent=not os.path.exists(path), **common)
     if audit_log:
         append_receipt(audit_log, receipt)
     return ClipOutcome(path, "purged", receipt, "shredded and unlinked")
+
+
+def purge_wav(path: str, *, vad=None, dry_run: bool = False,
+              threshold: float = DEFAULT_THRESHOLD,
+              min_speech_ms: float = DEFAULT_MIN_SPEECH_MS,
+              neg_threshold: float = DEFAULT_NEG_THRESHOLD,
+              min_silence_ms: float = DEFAULT_MIN_SILENCE_MS,
+              speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS,
+              audit_log: Optional[str] = None, node: Optional[str] = None,
+              now: Optional[dt.datetime] = None) -> Dict[str, Any]:
+    """One clip in, one receipt dict out -- for every outcome, including the ones that keep it.
+
+    `purge_clip()` returns a `ClipOutcome` because a pool scan needs to count statuses;
+    this returns the receipt record itself, which is what a caller holding a single path
+    wants. The verdict is on the record (`SPEECH_DETECTED` / `NO_SPEECH` / `NOT_SCORED`), so a
+    kept clip and a destroyed one are told apart by a field rather than by a None.
+
+    Raises only for a clip that could not be DECIDED about -- an unreadable header, a detector
+    fault. A clip that is simply gone is `NOT_SCORED` with `already_absent: true`, which is what
+    makes a re-run over an already-purged pool a no-op instead of an exception.
+    """
+    outcome = purge_clip(path, vad, threshold=threshold, min_speech_ms=min_speech_ms,
+                         neg_threshold=neg_threshold, min_silence_ms=min_silence_ms,
+                         speech_pad_ms=speech_pad_ms, dry_run=dry_run, audit_log=audit_log,
+                         node=node, now=now, receipt_clean=True)
+    if outcome.receipt is None:
+        raise UnreadableClip(outcome.detail or "%s: undecidable" % path)
+    return outcome.receipt.as_record()
 
 
 def iter_clips(root: str) -> Iterator[str]:
@@ -770,13 +1059,16 @@ def iter_clips(root: str) -> Iterator[str]:
 
 
 def scan_pool(root: str, *, engine: str = "auto", threshold: float = DEFAULT_THRESHOLD,
-              min_speech_ms: float = DEFAULT_MIN_SPEECH_MS, dry_run: bool = False,
+              min_speech_ms: float = DEFAULT_MIN_SPEECH_MS,
+              neg_threshold: float = DEFAULT_NEG_THRESHOLD,
+              min_silence_ms: float = DEFAULT_MIN_SILENCE_MS,
+              speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS, dry_run: bool = False,
               audit_log: Optional[str] = None, vad=None,
-              now: Optional[dt.datetime] = None,
+              now: Optional[dt.datetime] = None, receipt_clean: bool = False,
               on_outcome=None) -> PurgeReport:
     """Walk a clip pool, purging every WAV that holds speech.
 
-    `audit_log` defaults to `<root>/purged_receipts.jsonl` for a live run and is never written
+    `audit_log` defaults to `<root>/vad_purge.jsonl` for a live run and is never written
     in a dry run. The audit log itself is never a scan target -- it is JSONL, not a WAV -- so a
     run cannot purge its own evidence.
     """
@@ -788,7 +1080,10 @@ def scan_pool(root: str, *, engine: str = "auto", threshold: float = DEFAULT_THR
                          audit_log=None if dry_run else audit_log)
     for path in iter_clips(root):
         outcome = purge_clip(path, vad, threshold=threshold, min_speech_ms=min_speech_ms,
-                             dry_run=dry_run, audit_log=None if dry_run else audit_log, now=now)
+                             neg_threshold=neg_threshold, min_silence_ms=min_silence_ms,
+                             speech_pad_ms=speech_pad_ms, dry_run=dry_run,
+                             audit_log=None if dry_run else audit_log, now=now,
+                             receipt_clean=receipt_clean)
         report.scanned += 1
         report.outcomes.append(outcome)
         if outcome.receipt is not None:
@@ -799,6 +1094,8 @@ def scan_pool(root: str, *, engine: str = "auto", threshold: float = DEFAULT_THR
             report.would_purge += 1
         elif outcome.status == "kept":
             report.kept += 1
+        elif outcome.status == "already_absent":
+            report.already_absent += 1
         else:
             report.errors += 1
         if on_outcome is not None:

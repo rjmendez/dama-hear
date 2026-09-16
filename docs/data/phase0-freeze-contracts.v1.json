@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "f69501a1b1d80f61d8006f61c6fb9d99cb773bfb1e4fbf085c9fa4d0171f3a9c",
+  "baseline_hash": "3896a4080e841be29ced1a45849abde47847f9573a760743a7d87adb2908a3c2",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -3746,6 +3746,12 @@
         ]
       },
       {
+        "schema": "hear.vad.purge.receipt.v1",
+        "source_paths": [
+          "hear/privacy/purge.py"
+        ]
+      },
+      {
         "schema": "hear.window.golden.v2",
         "source_paths": [
           "testdata/window_golden.json",
@@ -3753,7 +3759,7 @@
         ]
       }
     ],
-    "section_hash": "248d557d9051b2f32b5e89018296b180cf2772b602b7ed3ad3761989cc412519",
+    "section_hash": "7d6f4dc9e19d1934853ad91793f573fc1f5ad2937758082939c040ab7a48f673",
     "telemetry_routes": [
       {
         "http_path": "/api/hear/heartbeat",

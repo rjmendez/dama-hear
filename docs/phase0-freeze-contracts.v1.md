@@ -14,10 +14,10 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | f69501a1b1d80f61d8006f61c6fb9d99cb773bfb1e4fbf085c9fa4d0171f3a9c |
+| baseline | 3896a4080e841be29ced1a45849abde47847f9573a760743a7d87adb2908a3c2 |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
 | firmware_build_metadata | 354438a194e485711ece94ccefe668543ac63a20eb2e288bc5d4a6455e6e5f6f |
-| schemas | 248d557d9051b2f32b5e89018296b180cf2772b602b7ed3ad3761989cc412519 |
+| schemas | 7d6f4dc9e19d1934853ad91793f573fc1f5ad2937758082939c040ab7a48f673 |
 | published_contracts | a87c434d400f4f31ec4cc252761fff18ee14355a8170cf80133ef72315c082f3 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |
 | redis_keys | d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03 |
@@ -115,6 +115,7 @@ Source hashes:
 | hear.tdoa_arrival.v1 | tools/hear_tdoa.py |
 | hear.tdoa_attempt.v1 | tools/hear_tdoa.py |
 | hear.tdoa_model_card.v1 | tools/hear_tdoa.py |
+| hear.vad.purge.receipt.v1 | hear/privacy/purge.py |
 | hear.window.golden.v2 | testdata/window_golden.json<br>tools/gen_golden.py |
 
 ## Published contract artifacts
