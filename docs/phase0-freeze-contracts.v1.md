@@ -14,15 +14,15 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | f69501a1b1d80f61d8006f61c6fb9d99cb773bfb1e4fbf085c9fa4d0171f3a9c |
+| baseline | 48db107f16dea7520440f7008272558620d7f99a141a828d095530a18d0251ef |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
 | firmware_build_metadata | 354438a194e485711ece94ccefe668543ac63a20eb2e288bc5d4a6455e6e5f6f |
-| schemas | 248d557d9051b2f32b5e89018296b180cf2772b602b7ed3ad3761989cc412519 |
+| schemas | f5bc017574d40a523a7fb7b25ff685f08150651a78ae67a4f2f0e5e22cc31356 |
 | published_contracts | a87c434d400f4f31ec4cc252761fff18ee14355a8170cf80133ef72315c082f3 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |
 | redis_keys | d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03 |
 | kubernetes_and_pvc_layout | 0069b973796b11b1ce7d5e143bb2e2e8ef458e14d257f76f517c09ad4f974ee5 |
-| corpus_fixture_metadata | 466b3b2d681cbeee4ed0d49edf24fff01ad829e5c00c60bf20e2b64c51b1b4cb |
+| corpus_fixture_metadata | 52ddc9da76e76e5b920512c82bb9529b9075fea44faa6ce526d9347b35550af0 |
 
 ## Compatibility
 
@@ -115,6 +115,8 @@ Source hashes:
 | hear.tdoa_arrival.v1 | tools/hear_tdoa.py |
 | hear.tdoa_attempt.v1 | tools/hear_tdoa.py |
 | hear.tdoa_model_card.v1 | tools/hear_tdoa.py |
+| hear.vad.fixture_golden.v1 | testdata/silero_vad_golden.json<br>tools/gen_silero_vad_golden.py |
+| hear.vad.purge.receipt.v1 | hear/privacy/purge.py |
 | hear.window.golden.v2 | testdata/window_golden.json<br>tools/gen_golden.py |
 
 ## Published contract artifacts
@@ -284,6 +286,7 @@ Representative fixture inventory only: repo paths, top-level schema ids, counts,
 | docs/data/clap-calibration-2026-09-14/clean_clap_arrivals.json | (none) | {"top_level_keys": ["observations"], "type": "object"} | 3469 | 4fe8c28df91c876b3020c131b135a7885b6c9f5876bb76da84cacef799ebad0e |
 | docs/data/clap-calibration-2026-09-14/colocated_survey.json | (none) | {"nodes_count": 6, "top_level_keys": ["nodes"], "type": "object"} | 369 | e5d047bb0cc3a76de4ab7353b195512b2b928e44c635b3c07fe56a1c9ce4e99d |
 | testdata/hugbot_latency_trials.json | (none) | {"length": 450, "type": "array"} | 143346 | 72f50300ca13d7d4bbf01ff0959dc4512d1d4f96b1a81eb3872e84992ff2b254 |
+| testdata/silero_vad_golden.json | hear.vad.fixture_golden.v1 | {"schema": "hear.vad.fixture_golden.v1", "top_level_keys": ["ablations", "fixtures", "frame", "model", "runtime", "schema"], "type": "object"} | 12281 | 29a3cb2bca1df63669361e6f06c21277e51b7f297a5fb8a5bcfe608c32c0648b |
 | testdata/sketch_golden.json | hear.sketch.golden.v4 | {"cases_count": 9, "schema": "hear.sketch.golden.v4", "top_level_keys": ["cases", "f_hi", "f_lo", "frames", "fs_codes", "fs_mask", "fs_shift", "hop_s", "layout_bit", "layout_equivalent_above_hz", "mel_bands", "nfft", "note", "schema", "wire_size"], "type": "object"} | 109646 | 6c3cfbce52d54f01f9b6e21523d5f2dc426fa0b0562fbe193251a771d67516bd |
 | testdata/window_golden.json | hear.window.golden.v2 | {"cases_count": 4, "schema": "hear.window.golden.v2", "top_level_keys": ["cases", "env_ms", "guard_s", "note", "onset_frac", "retrigger_s", "schema"], "type": "object"} | 52751 | cadf188a841010ea11c969a053b1f57970832f9cb0a8164d3da9e65d32ea4d41 |
 | tests/fixtures/heartbeat-smoke.json | (none) | {"top_level_keys": ["class", "counters", "device_id", "fw_version", "gps", "telemetry_path", "telemetry_schema_version", "time", "ts", "uptime_s", "wifi"], "type": "object"} | 407 | f4bb34386f81e9ba8edf14b8d3b38adcd485bd376ee966d864590996962a29f8 |
