@@ -240,6 +240,12 @@ UNFETCHED_RING = 64
 BOOT_AUDIT_MAX_DAYS = 3
 
 DEFAULT_TIMEOUT_S = 30.0
+# ⚠️CLIP BODY FETCHES NEED THEIR OWN, MUCH SHORTER BOUND. A clip is fixed at 5.0 s of 48 kHz
+# mono WAV (480,044 B; see hear/clips.py), and docs/clip-pipeline.md records a measured 168 KB/s
+# clip path on the live fleet: a healthy transfer is ~2.9 s. 6 s leaves roughly 2x margin for a
+# normal clip while still failing fast enough that two stalls cost 12 s of a 60 s node budget,
+# not the whole budget as 2 x 30 s already did live on nyquist.
+CLIP_FETCH_TIMEOUT_S = 6.0
 # Slower Wi-Fi transfer rate floor to size adaptive timeouts for large whole-file fetches
 # (40-135 KB/s measured from ESP32 nodes).
 MIN_TRANSFER_RATE_BPS = 40_000.0
@@ -693,6 +699,11 @@ def _ls_sizes(ip: str, timeout: float = DEFAULT_TIMEOUT_S,
 LS_RETRIES = 3
 LS_RETRY_BACKOFF_S = 1.5
 
+# `/sd` hits the same one-client ESP32 HTTP loop as `/ls`, so the same "one dropped transport
+# under contention is worth retrying, an HTTP status is not" rule applies to dets/scene fetches.
+SD_RETRIES = 3
+SD_RETRY_BACKOFF_S = 1.5
+
 
 def ls_sizes_retrying(ip: str, timeout: float = DEFAULT_TIMEOUT_S, retries: int = LS_RETRIES,
                       backoff: float = LS_RETRY_BACKOFF_S,
@@ -730,6 +741,38 @@ def ls_sizes_retrying(ip: str, timeout: float = DEFAULT_TIMEOUT_S, retries: int 
             # `except Exception` here swallowed a signature mismatch as a dropped connection,
             # retried it three times with real backoff, and then reported the node unreachable --
             # so a bug in this process read exactly like a node refusing to answer. Raise it.
+            raise
+        except Exception as e:
+            last = repr(e)
+            if attempt < retries:
+                sleep(backoff * attempt)
+    return None, last, max(1, retries)
+
+
+def fetch_sd_retrying(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S,
+                      retries: int = SD_RETRIES,
+                      backoff: float = SD_RETRY_BACKOFF_S,
+                      sleep=None, tail: Optional[int] = None
+                      ) -> Tuple[Optional[bytes], Optional[str], int]:
+    """(body, error repr, attempts). None body with None error means "the node answered absent".
+
+    This ADAPTS `ls_sizes_retrying` to `/sd`: retry only transport-level failures, never an HTTP
+    status and never a programming error. The helper wraps `fetch_sd` itself, not `_get`, so the
+    existing absent-file contract (`404 -> None`, CSV/WAV sniffing, test stubs that patch
+    `fetch_sd`) stays intact.
+
+    ⚠️THIS IS FOR DETS/SCENE/CONTEXT, NOT FOR CLIP BODIES. A clip lane may have 100+ candidates
+    behind one deadline, so a stalled clip must fail fast and move on rather than being retried.
+    """
+    if sleep is None:
+        sleep = time.sleep
+    last = None
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            return fetch_sd(ip, name, timeout, tail=tail), None, attempt
+        except urllib.error.HTTPError as e:
+            return None, repr(e), attempt
+        except (TypeError, AttributeError, NameError):
             raise
         except Exception as e:
             last = repr(e)
@@ -1115,10 +1158,9 @@ def drain_context_file(pl: "P.Pool", node: str, ip: str, name: str, sizes: Optio
         tail, file_timeout = CONTEXT_BLIND_TAIL_BYTES, timeout
     else:
         tail, file_timeout = int(size_now) - int(prev) + CONTEXT_OVERLAP_BYTES, timeout
-    try:
-        body = fetch_sd(ip, name, file_timeout, tail=tail)
-    except Exception as e:
-        out["errors"].append("%s: %r" % (name, e))
+    body, err, _attempts = fetch_sd_retrying(ip, name, file_timeout, tail=tail)
+    if err:
+        out["errors"].append("%s: %s" % (name, err))
         return False
     if not body:
         return False
@@ -1149,7 +1191,7 @@ def drain_context_file(pl: "P.Pool", node: str, ip: str, name: str, sizes: Optio
 # ---------------------------------------------------------------- the clip lane
 
 
-def fetch_clip(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT_S
+def fetch_clip(ip: str, name: str, timeout: float = CLIP_FETCH_TIMEOUT_S
                ) -> Tuple[Optional[bytes], Optional[str]]:
     """One clip WAV off the card: `(body, None)` on a real clip, `(None, reason)` otherwise.
 
@@ -1368,6 +1410,7 @@ def _store_clip(root: str, node: str, cand: Dict[str, Any], body: bytes) -> str:
 
 def drain_clips(pl: "P.Pool", node: str, ip: str, candidates: List[Dict[str, Any]],
                 timeout: float = DEFAULT_TIMEOUT_S,
+                clip_timeout: float = CLIP_FETCH_TIMEOUT_S,
                 max_per_node: int = CLIP_MAX_PER_NODE_DEFAULT,
                 deadline_s: float = CLIP_DEADLINE_S_DEFAULT,
                 store_max_bytes: int = CLIP_STORE_MAX_BYTES_DEFAULT,
@@ -1459,7 +1502,7 @@ def drain_clips(pl: "P.Pool", node: str, ip: str, candidates: List[Dict[str, Any
                      outcome="deferred_by_cap", reason=out["clips_cap_reason"])
             continue
 
-        body, reason = fetch_clip(ip, cand["clip"], timeout)
+        body, reason = fetch_clip(ip, cand["clip"], clip_timeout)
         if reason == "http_404":
             # ⚠️ONE 404 IS NOT PROOF OF AN EVICTION. hear_node.ino:2436 answers 404 for ANY
             # failed SD.open -- the no-card case is a 503 at :2435, but descriptor exhaustion,
@@ -1924,6 +1967,7 @@ def _drain_live_ring(pl: "P.Pool", node: str, ip: str, st: Dict[str, Any], out: 
 
 def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOUT_S,
                stamp: Optional[int] = None,
+               clip_timeout: float = CLIP_FETCH_TIMEOUT_S,
                clip_max_per_node: int = CLIP_MAX_PER_NODE_DEFAULT,
                clip_deadline_s: float = CLIP_DEADLINE_S_DEFAULT,
                clip_store_max_bytes: int = CLIP_STORE_MAX_BYTES_DEFAULT) -> Dict[str, Any]:
@@ -2049,10 +2093,9 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
             file_timeout = rolled_file_timeout(size_now, timeout)
         else:
             file_timeout = timeout
-        try:
-            body = fetch_sd(ip, name, file_timeout, tail=tail)
-        except Exception as e:
-            out["errors"].append("%s: %r" % (name, e))
+        body, err, _attempts = fetch_sd_retrying(ip, name, file_timeout, tail=tail)
+        if err:
+            out["errors"].append("%s: %s" % (name, err))
             if tail:
                 out["unfetched_reason"] = "%s could not be fetched, so it was not measured" % name
             continue
@@ -2130,10 +2173,9 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
     dets_bodies: List[Tuple[str, bytes]] = []
     dets_failed: List[str] = []
     for name in DETS_FILES:
-        try:
-            body = fetch_sd(ip, name, timeout)
-        except Exception as e:
-            out["errors"].append("%s: %r" % (name, e))
+        body, err, _attempts = fetch_sd_retrying(ip, name, timeout)
+        if err:
+            out["errors"].append("%s: %s" % (name, err))
             dets_failed.append(name)
             continue
         if body is None:
@@ -2181,7 +2223,7 @@ def drain_node(pl: "P.Pool", node: str, ip: str, timeout: float = DEFAULT_TIMEOU
         try:
             cand = merge_candidates(clip_candidates(dets_bodies, node),
                                     ls_candidates(sizes, node))
-            out.update(drain_clips(pl, node, ip, cand, timeout,
+            out.update(drain_clips(pl, node, ip, cand, timeout, clip_timeout=clip_timeout,
                                    max_per_node=clip_max_per_node, deadline_s=clip_deadline_s,
                                    store_max_bytes=clip_store_max_bytes, now=stamp))
         except Exception as e:

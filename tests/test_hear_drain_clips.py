@@ -206,6 +206,29 @@ class TestAClipIsNotACsv:
         monkeypatch.setattr(HD, "_get", boom)
         assert HD.fetch_clip("10.0.0.1", CLIP_A) == (None, "transport")
 
+    def test_the_clip_fetch_timeout_is_shorter_than_the_csv_and_status_default(self, monkeypatch):
+        seen = []
+
+        def fake_get(url, timeout=None):
+            seen.append((url, timeout))
+            if "/status" in url:
+                return b'{"node":"nyquist"}'
+            if "/clips/" in url:
+                return _wav()
+            return _dets_csv([_dets_row(_name(1), sample=1)])
+
+        monkeypatch.setattr(HD, "_get", fake_get)
+        body, reason = HD.fetch_clip("10.0.0.1", CLIP_A)
+        assert reason is None and body is not None
+        assert HD.fetch_sd("10.0.0.1", "dets.csv") is not None
+        assert HD.fetch_status("10.0.0.1")["node"] == "nyquist"
+        clip_timeout = [t for url, t in seen if "/clips/" in url][0]
+        csv_timeout = [t for url, t in seen if "dets.csv" in url][0]
+        status_timeout = [t for url, t in seen if "/status" in url][0]
+        assert clip_timeout == HD.CLIP_FETCH_TIMEOUT_S
+        assert csv_timeout == status_timeout == HD.DEFAULT_TIMEOUT_S
+        assert clip_timeout < csv_timeout
+
 
 # ---------------------------------------------------------------- S2: names out of dets.csv
 
@@ -263,6 +286,28 @@ class TestTheNamesComeFromTheDetsColumn:
         r = HD.drain_node(_pool(tmp_path), "nyquist", "10.0.0.1")
         assert r["clips_seen"] == 1 and r["clips_fetched"] == 1
         assert _clip_paths(n) == [_name(500)], "the same clip was fetched twice from two files"
+
+    def test_a_transient_dets_transport_failure_is_retried_and_then_the_name_is_used(self, tmp_path,
+                                                                                     wired,
+                                                                                     monkeypatch):
+        row = _dets_row(_name(501), sample=501, seed=5)
+        pl = _pool(tmp_path)
+        n = wired(dets_rows=[row], clips={_name(501): _wav()})
+        real = HD.fetch_sd
+        dets_calls = []
+
+        def flaky(ip, name, timeout=None, tail=None):
+            if name == "dets.csv":
+                dets_calls.append((name, tail, timeout))
+                if len(dets_calls) == 1:
+                    raise TimeoutError("first dets fetch stalled")
+            return real(ip, name, timeout, tail=tail)
+
+        monkeypatch.setattr(HD, "fetch_sd", flaky)
+        r = HD.drain_node(pl, "nyquist", "10.0.0.1")
+        assert dets_calls == [("dets.csv", None, HD.DEFAULT_TIMEOUT_S)] * 2
+        assert _clip_paths(n) == [_name(501)]
+        assert r["clips_seen"] == 1 and r["clips_fetched"] == 1
 
 
 # ---------------------------------------------------------------- S4: the index is the memory
@@ -476,6 +521,37 @@ class TestOneClientAtATime:
         assert n.max_in_flight == 1, (
             "%d concurrent requests reached one node; it refuses the second rather than queueing "
             "it, so this loses clips and reports success" % n.max_in_flight)
+
+    def test_two_stalled_clips_fail_fast_enough_to_leave_room_for_a_later_one(self, tmp_path,
+                                                                               wired,
+                                                                               monkeypatch):
+        rows = [_dets_row(_name(s), sample=s, seed=i) for i, s in enumerate((1, 2, 3), start=1)]
+        wired(dets_rows=rows, clips={})
+        clock = {"t": 1000.0}
+        asked = []
+
+        def fake_time():
+            return clock["t"]
+
+        def fake_get(url, timeout=None):
+            path = url.split("file=", 1)[1]
+            asked.append((path, timeout))
+            if path in (_name(1), _name(2)):
+                clock["t"] += timeout
+                raise TimeoutError("clip body stalled")
+            clock["t"] += 0.2
+            return _wav()
+
+        monkeypatch.setattr(HD.time, "time", fake_time)
+        monkeypatch.setattr(HD, "_get", fake_get)
+        r = HD.drain_node(_pool(tmp_path), "nyquist", "10.0.0.1", clip_deadline_s=60.0)
+        assert asked == [(_name(1), HD.CLIP_FETCH_TIMEOUT_S),
+                         (_name(2), HD.CLIP_FETCH_TIMEOUT_S),
+                         (_name(3), HD.CLIP_FETCH_TIMEOUT_S)]
+        assert r["clips_refused"] == {"transport": 2}
+        assert r["clips_fetched"] == 1
+        assert r["clips_cap_hit"] is False
+        assert r["clips_elapsed_s"] < 60.0
 
 
 # ---------------------------------------------------------------- unmeasured is not clean
