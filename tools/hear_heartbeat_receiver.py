@@ -15,6 +15,7 @@ import os
 import re
 import socket
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -25,6 +26,8 @@ from typing import Any, Callable, Dict, Mapping, Optional
 from urllib.parse import urlparse
 
 import redis
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hear.ingest import observability as IO
 
 logger = logging.getLogger("hear-heartbeat")
