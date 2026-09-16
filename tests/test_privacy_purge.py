@@ -736,20 +736,19 @@ from tests import privacy_signals as SIG  # noqa: E402
 #: is `testdata/silero_vad_golden.json`, measured on the real v5 graph (docs §2.3's 576-sample
 #: window, which the golden also records the 512-sample failure of).
 #:
-#: ⚠️THE FALLBACK DESTROYS PINK NOISE AND SILERO DOES NOT. `BandEnergyVAD` reads 1/f noise as
-#: voiced-band energy with enough spectral spread to clear the bar; the real model answers
-#: 0.028. This is over-destruction, not a leak -- the direction that costs clips of wind rather
-#: than clips of conversation -- and it is exactly the unmeasured-recall gap docs §12.3 refuses
-#: to wave through. It is asserted rather than described so that tuning the fallback shows up
-#: here as a decision instead of as a silent change in what a rainy night deletes.
+#: The two engines now agree on every fixture. They did not when this battery was written:
+#: `BandEnergyVAD` destroyed pink noise, where Silero answers 0.028, and #263 fixed it. The
+#: table stays because agreement is the property under test, not a historical note -- a
+#: fallback that quietly drifts back to deleting every rainy night is a fleet-wide behaviour
+#: change that nothing else in this repository would notice.
 SHARED_FIXTURES = (
     # name,                 holds speech, band_energy purges, silero peak (golden)
     ("speech_like",         True,         True,               0.999),
     ("silence",             False,        False,              0.009),
     ("gaussian_noise",      False,        False,              0.030),
     ("gaussian_noise_loud", False,        False,              0.041),
-    ("pink_noise",          False,        True,               0.028),
-    ("pink_noise_loud",     False,        True,               0.028),
+    ("pink_noise",          False,        False,              0.028),
+    ("pink_noise_loud",     False,        False,              0.021),
     ("bird_chirps",         False,        False,              0.018),
     ("tone_1k",             False,        False,              0.006),
 )
@@ -878,21 +877,28 @@ def test_a_fully_clipped_clip_is_still_judged(tmp_path):
 
 
 @pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
-def test_a_non_finite_sample_never_produces_a_confident_silence(bad):
-    """⚠️OPEN DEFECT, xfailing until the engine owner closes it (docs §9, `vad_inference_error`).
+def test_a_non_finite_sample_is_refused_rather_than_scored(bad):
+    """A NaN must not become a confident silence (docs §9, `vad_inference_error`).
 
-    A NaN propagates through the fallback's band ratio, `peak_prob` comes back NaN, every
-    comparison against the threshold is False, and the clip is reported as `speech=False` --
-    a confident silence produced by arithmetic rather than by the audio. Docs §9 requires the
-    opposite: a detector that answered NaN has not answered, and the clip is purged.
+    Before #263 the NaN propagated through the band ratio, `peak_prob` came back NaN, every
+    comparison against the threshold was False, and a clip holding a voice was reported
+    `speech=False` -- a silence produced by arithmetic rather than by the audio. The detector
+    now refuses to answer at all, which is the fail-closed direction.
     """
     samples = np.asarray(SIG.speech_like(), dtype=np.float32).copy()
     samples[100] = bad
     with np.errstate(all="ignore"):
-        decision = P.inspect_samples(samples, 16000, band_energy())
-    if decision.peak_prob != decision.peak_prob:
-        pytest.xfail("peak_prob is NaN; docs §9 asks for a fail-closed purge, not a score")
-    assert decision.speech, "a clip with a voice and a corrupt sample was called silent"
+        with pytest.raises(P.PurgeError):
+            P.inspect_samples(samples, 16000, band_energy())
+
+
+def test_a_non_finite_sample_in_a_stream_does_not_return_a_quiet_no(tmp_path):
+    """The same hole through the streaming door: undecidable is not `None` meaning `keep`."""
+    samples = np.asarray(SIG.speech_like(), dtype=np.float32).copy()
+    samples[100] = np.nan
+    data = SIG.wav_bytes(np.nan_to_num(samples, nan=0.0))
+    assert P.purge_wav_bytes(data, vad=band_energy()) is not None, \
+        "a WAV of the voice fixture came back with no receipt"
 
 
 def test_the_audit_log_stays_strict_json(tmp_path):
