@@ -275,6 +275,12 @@ def rolled_file_timeout(size_bytes: Optional[int],
 # staleness is measured on the FETCH, not on new rows. 2 h is comfortably longer than any timer
 # interval and short enough to catch a node that fell off the wifi before its buffer rolls over.
 DEFAULT_MAX_STALE_S = 7200.0
+# A node's own push heartbeat (`auth.push.last_ok_s` from live `/status`) is authoritative for
+# liveness once it is this fresh (todo: cutover-cronjobs-to-push-model). It does not replace the
+# drain fetch, which stays authoritative for bulk scene/dets/clip data; it only stops a poll-side
+# stall (single-client /sd contention, a slow scene tail) from reading as "node down" when the
+# node is provably alive and pushing.
+DEFAULT_MAX_PUSH_STALE_S = 300.0
 # Ring wall span above this means the node heard more wall time than the ring should cover.
 # Section 0.2 of docs/acoustic-stack.md uses 1.02 as the line between the healthy rankine
 # control (~1.002) and the lossy nyquist/mach nodes (~1.09-1.12).
@@ -1010,7 +1016,28 @@ def poll_ring_wall_span(node: str, ip: str, timeout: float = DEFAULT_TIMEOUT_S) 
     except Exception as e:
         return {"node": node, "ip": ip, "ok": False, "reason": "audio: %r" % (e,)}
     return {"node": node, "ip": ip, "ok": True,
-            "measurement": ring_wall_span_measurement(status, audio)}
+            "measurement": ring_wall_span_measurement(status, audio),
+            "push": (status.get("auth") or {}).get("push") or {}}
+
+
+def _push_liveness_note(poll: Optional[Dict[str, Any]],
+                         max_push_stale_s: float) -> Tuple[str, bool]:
+    """(text, alive-via-push) -- whether this node's OWN push heartbeat proves it is up right
+    now, independent of whether the drain fetch just succeeded. Never makes a check fail; it can
+    only downgrade an otherwise-STALE drain reading, because a push-live node that the drain
+    could not reach is a poll-side problem (single-client /sd contention, a slow tail), not
+    evidence the node is down."""
+    if not poll or not poll.get("ok"):
+        return "", False
+    push = poll.get("push") or {}
+    last_ok_s = push.get("last_ok_s")
+    if last_ok_s is None:
+        return "", False
+    fresh = float(last_ok_s) <= max_push_stale_s
+    if not fresh:
+        return "", False
+    return ("  push-live (last_ok %.0fs ago, code %s)"
+            % (float(last_ok_s), push.get("last_code"))), True
 
 
 def _ring_wall_span_note(poll: Optional[Dict[str, Any]], max_ratio: float) -> Tuple[str, bool]:
@@ -2624,7 +2651,8 @@ def check(root: str, max_stale_s: float = DEFAULT_MAX_STALE_S,
           max_clips_lost: int = DEFAULT_MAX_CLIPS_LOST,
           nodes: Optional[Sequence[Tuple[str, str]]] = None,
           timeout: float = DEFAULT_TIMEOUT_S,
-          max_ring_wall_span: float = DEFAULT_MAX_RING_WALL_SPAN) -> Tuple[int, List[str]]:
+          max_ring_wall_span: float = DEFAULT_MAX_RING_WALL_SPAN,
+          max_push_stale_s: float = DEFAULT_MAX_PUSH_STALE_S) -> Tuple[int, List[str]]:
     """(exit code, lines). Non-zero on a stale sensor OR on a sensor that skipped scene bytes.
 
     ⚠️STALENESS WAS ONLY HALF OF IT. A drain whose HTTP succeeded, whose ingest succeeded and
@@ -2639,7 +2667,13 @@ def check(root: str, max_stale_s: float = DEFAULT_MAX_STALE_S,
     saw them. `_unfetched_note` sums the heartbeat's ring over `unfetched_window_s` instead.
 
     When `nodes` are supplied, the same `--check` pass also polls each live node's `/status` and
-    bare `/audio` to measure the ring wall span signal from docs/acoustic-stack.md section 0.2.
+    bare `/audio` to measure the ring wall span signal from docs/acoustic-stack.md section 0.2,
+    and reads that same live `/status` for the node's own push heartbeat freshness. A drain-stale
+    node whose push is fresh (`_push_liveness_note`) is reported `ok (push-live)` instead of
+    `STALE` and does not count against the exit code -- the push heartbeat is authoritative for
+    liveness, the drain fetch stays authoritative for bulk scene/dets/clip data (see todo
+    cutover-cronjobs-to-push-model). A node with no push signal at all falls back to the old
+    drain-only staleness gate unchanged.
     """
     now = time.time() if now is None else now
     ring_polls = {name: poll_ring_wall_span(name, ip, timeout) for name, ip in (nodes or [])}
@@ -2662,6 +2696,7 @@ def check(root: str, max_stale_s: float = DEFAULT_MAX_STALE_S,
         bad += ring_bad
         live_note, live_bad = _live_ring_note(s, now, unfetched_window_s)
         bad += live_bad
+        push_note, push_alive = _push_liveness_note(ring_polls.get(name), max_push_stale_s)
         if s.get("ls_truncated_at"):
             # Not fatal: the fetch and the ingest are unaffected. But scene_names() and the clip
             # work list are both built from a listing the node says it cut short, so a run on a
@@ -2670,16 +2705,24 @@ def check(root: str, max_stale_s: float = DEFAULT_MAX_STALE_S,
                           % int(s["ls_truncated_at"]))
         last = s.get("last_success_s")
         if last is None:
-            lines.append("%-10s NEVER succeeded (last error: %s)%s%s%s%s"
-                         % (name, s.get("last_error"), gap_note, clip_note, live_note, ring_note))
-            bad += 1
+            if push_alive:
+                lines.append("%-10s %-5s NEVER drained, but %s%s%s%s%s"
+                             % (name, "ok", push_note.strip(), gap_note, clip_note, live_note,
+                                ring_note))
+            else:
+                lines.append("%-10s NEVER succeeded (last error: %s)%s%s%s%s"
+                             % (name, s.get("last_error"), gap_note, clip_note, live_note, ring_note))
+                bad += 1
             continue
         age = now - float(last)
-        state = "STALE" if age > max_stale_s else "ok"
+        stale = age > max_stale_s
+        state = "ok" if (not stale or push_alive) else "STALE"
         bad += state == "STALE"
-        lines.append("%-10s %-5s last success %.0f s ago%s%s%s%s%s"
-                     % (name, state, age, gap_note, clip_note, live_note, ring_note, "" if not s.get("last_error")
-                        else "  (last error: %s)" % s["last_error"]))
+        if stale and push_alive:
+            state = "ok (push-live)"
+        lines.append("%-10s %-5s last success %.0f s ago%s%s%s%s%s%s"
+                     % (name, state, age, push_note, gap_note, clip_note, live_note, ring_note,
+                        "" if not s.get("last_error") else "  (last error: %s)" % s["last_error"]))
     return (1 if bad else 0), lines
 
 
@@ -2695,6 +2738,10 @@ def main(argv=None) -> int:
     ap.add_argument("--phone-days", type=int, default=3)
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     ap.add_argument("--max-stale-s", type=float, default=DEFAULT_MAX_STALE_S)
+    ap.add_argument("--max-push-stale-s", type=float, default=DEFAULT_MAX_PUSH_STALE_S,
+                    help="--check treats a node as authoritatively alive if its OWN live "
+                         "/status shows a push heartbeat no older than this, even when the "
+                         "drain fetch itself is stale. Requires --node so /status is polled")
     ap.add_argument("--max-unfetched-bytes", type=int, default=DEFAULT_MAX_UNFETCHED_BYTES,
                     help="--check fails above this many scene bytes no fetch has asked for. "
                          "Sub-row gaps are already clamped to 0, so the default of 0 means "
@@ -2755,7 +2802,8 @@ def main(argv=None) -> int:
                             unfetched_window_s=a.unfetched_window_s,
                             max_clips_deferred=a.max_clips_deferred,
                             max_clips_lost=a.max_clips_lost, nodes=nodes, timeout=a.timeout,
-                            max_ring_wall_span=a.max_ring_wall_span)
+                            max_ring_wall_span=a.max_ring_wall_span,
+                            max_push_stale_s=a.max_push_stale_s)
         print("\n".join(lines))
         return code
 
