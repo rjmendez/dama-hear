@@ -102,7 +102,6 @@ def test_every_bundle_provenance_matches_embedded_content(bundle):
         "%s has an unusable provenance stamp %r; regenerate from a clean commit" %
         (path.name, stamp))
 
-    embedded = _embedded(path)
     _app, code, data = _gen()["BUNDLES"][bundle]
     want = _gen()["source_digest"](code, data)
     assert annotations.get("dama-hear/source-sha256") == want
