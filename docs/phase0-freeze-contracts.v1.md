@@ -14,10 +14,10 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | 48db107f16dea7520440f7008272558620d7f99a141a828d095530a18d0251ef |
+| baseline | 0a43fd69aa28d4ac3145da4eec732f05456273db46de82cdb61297f9cf39aa90 |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
 | firmware_build_metadata | 354438a194e485711ece94ccefe668543ac63a20eb2e288bc5d4a6455e6e5f6f |
-| schemas | f5bc017574d40a523a7fb7b25ff685f08150651a78ae67a4f2f0e5e22cc31356 |
+| schemas | 94b4918a473b1622dc555228ba2b6b6359873dd5b12e4f498fb12f3b81087221 |
 | published_contracts | a87c434d400f4f31ec4cc252761fff18ee14355a8170cf80133ef72315c082f3 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |
 | redis_keys | d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03 |
@@ -112,6 +112,7 @@ Source hashes:
 | hear.node_positions.v1 | tools/hear_drain.py |
 | hear.sketch.golden.v4 | testdata/sketch_golden.json<br>tools/gen_golden.py |
 | hear.sketch_score.v1 | tools/hear_score.py |
+| hear.tdoa.transient.v1 | hear/privacy/transient_tdoa.py |
 | hear.tdoa_arrival.v1 | tools/hear_tdoa.py |
 | hear.tdoa_attempt.v1 | tools/hear_tdoa.py |
 | hear.tdoa_model_card.v1 | tools/hear_tdoa.py |

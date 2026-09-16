@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "48db107f16dea7520440f7008272558620d7f99a141a828d095530a18d0251ef",
+  "baseline_hash": "0a43fd69aa28d4ac3145da4eec732f05456273db46de82cdb61297f9cf39aa90",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -3745,6 +3745,12 @@
         ]
       },
       {
+        "schema": "hear.tdoa.transient.v1",
+        "source_paths": [
+          "hear/privacy/transient_tdoa.py"
+        ]
+      },
+      {
         "schema": "hear.tdoa_arrival.v1",
         "source_paths": [
           "tools/hear_tdoa.py"
@@ -3783,7 +3789,7 @@
         ]
       }
     ],
-    "section_hash": "f5bc017574d40a523a7fb7b25ff685f08150651a78ae67a4f2f0e5e22cc31356",
+    "section_hash": "94b4918a473b1622dc555228ba2b6b6359873dd5b12e4f498fb12f3b81087221",
     "telemetry_routes": [
       {
         "http_path": "/api/hear/heartbeat",
