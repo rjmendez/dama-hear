@@ -7,6 +7,7 @@ is satisfied, so this is a proof about the rules and not a licence to run them o
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 
@@ -76,8 +77,13 @@ def _tasks(pool):
 #: same ciphertext and dedupe still means something. Nothing here is a real key; see
 #: `hear/objectstore/crypto.py`, and `test_the_default_importer_cannot_publish_a_restricted_class`
 #: for what an importer without this does.
+#: Pinned so two importer instances in one test converge on the same ciphertext; `crypto.py`
+#: refuses to default a seed, because a default seed is a shipped key.
+SEED = b"phase3-objectstore-import-test-seed"
+
+
 def _crypto(tenant_id="dama"):
-    return C.synthetic_crypto(tenant_id)
+    return C.synthetic_crypto(tenant_id, SEED)
 
 
 _UNSET = object()
@@ -302,6 +308,101 @@ def test_a_backend_that_never_recovers_quarantines_the_object_and_not_the_run(po
     report = _importer(store, tmp_path).run(tasks)
     assert [q["error_class"] for q in report.quarantined] == ["backend_transient"]
     assert report.counters["published"] == 3
+
+
+def _flaky_step(store, monkeypatch, attr, match, failures):
+    """Fail the first `failures` calls of one backend step with a transient, then behave."""
+    real = getattr(store, attr)
+    seen = {"n": 0}
+
+    def flaky(key, *a, **kw):
+        if match(key):
+            seen["n"] += 1
+            if seen["n"] <= failures:
+                raise B.BackendTransient("503 slow down")
+        return real(key, *a, **kw)
+
+    monkeypatch.setattr(store, attr, flaky)
+    return seen
+
+
+def test_a_transient_on_the_blob_put_is_retried_rather_than_ending_the_run(pool, store, tmp_path,
+                                                                          monkeypatch):
+    """⚠️THE UNCONTAINED-TRANSIENT REGRESSION: only the staging put was ever retried.
+
+    A throttle on the blob put, the metadata put or the pointer commit escaped the per-object
+    handler entirely -- no retry, no quarantine record, no ledger close, no report: the whole
+    import died on one 503 in the step most likely to meet one. Every step that writes is
+    idempotent by construction, so every step that writes is now retried.
+    """
+    task = _tasks(pool)[0]
+    _flaky_step(store, monkeypatch, "put_immutable_stream", lambda k: "/blob/" in k, 2)
+    report = _importer(store, tmp_path).run([task])
+    assert report.counters["published"] == 1
+    assert report.counters["retries"] == 2
+    assert report.counters["quarantined"] == 0
+    assert len(store.keys_under("hear/v1/obj/")) == 1
+
+
+def test_a_transient_on_the_metadata_put_and_on_the_commit_is_retried_too(pool, store, tmp_path,
+                                                                         monkeypatch):
+    tasks = _tasks(pool)[:1]
+    _flaky_step(store, monkeypatch, "put_immutable", lambda k: "/meta/" in k, 2)
+    _flaky_step(store, monkeypatch, "commit_pointer", lambda k: "/obj/" in k, 1)
+    report = _importer(store, tmp_path).run(tasks)
+    assert report.counters["published"] == 1
+    assert report.counters["retries"] == 3
+    assert report.exit_code == 0
+
+
+def test_a_commit_that_never_stops_throttling_quarantines_one_object_and_closes_the_run(
+        pool, store, tmp_path, monkeypatch):
+    """Containment, not heroics: the object is refused, the run still reports, the exit is 1."""
+    tasks = _tasks(pool)
+    _flaky_step(store, monkeypatch, "commit_pointer",
+                lambda k: k.endswith(tasks[0].logical_id), 10 ** 6)
+    report = _importer(store, tmp_path).run(tasks)
+
+    assert [q["error_class"] for q in report.quarantined] == ["backend_transient"]
+    assert report.counters["published"] == 3
+    assert report.counters["retries"] == ST.MAX_TRANSIENT_RETRIES
+    assert report.outcome == "partial" and report.exit_code == 1
+    rows = [json.loads(l) for l in open(_ledger_path(tmp_path))]
+    assert rows[-1]["type"] == "run_close"              # the run closed rather than dying
+    assert {r["step"] for r in rows if r.get("step")} == {"pointer_commit"}
+    assert store.keys_under("hear/v1/staging/") == []   # and left no staged copy behind
+
+
+def test_a_full_volume_is_a_backend_fault_and_not_corrupt_source_data(pool, store, tmp_path):
+    """⚠️THE MISCLASSIFIED-ENOSPC REGRESSION: a full disk was quarantined as unreadable source.
+
+    `ENOSPC`/`EIO` raised by a *store* write used to reach the importer as a bare `OSError`, which
+    the per-object table reads as `source_unreadable` -- so an operator whose volume filled up was
+    told their evidence was corrupt and sent to re-fetch bytes that were never wrong. Store faults
+    are classified where they are raised; a source that really cannot be read still says so.
+    """
+    task = _tasks(pool)[0]
+    store.fail_next_write = [OSError(errno.ENOSPC, "No space left on device")
+                             for _ in range(ST.MAX_TRANSIENT_RETRIES)]
+    report = _importer(store, tmp_path).run([task])
+    assert [q["error_class"] for q in report.quarantined] == ["backend_transient"]
+    assert report.counters["retries"] == ST.MAX_TRANSIENT_RETRIES
+    assert store.keys_under("hear/v1/obj/") == []
+
+    # The other side of the classification, on the same importer: a source that is really gone.
+    missing = _raw_task(str(tmp_path / "not-a-file"), pool["raw_digest"], pool["raw_bytes"],
+                        logical="missing")
+    report2 = _importer(store, tmp_path, run=RUN + "-src").run([missing])
+    assert [q["error_class"] for q in report2.quarantined] == ["source_unreadable"]
+
+
+def test_an_unreadable_backend_read_is_a_backend_fault(pool, store, tmp_path):
+    """A device error reading the staged copy back is the store failing, not the source."""
+    task = _tasks(pool)[0]
+    store.fail_next_read = [OSError(errno.EIO, "input/output error")]
+    report = _importer(store, tmp_path).run([task])
+    assert [q["error_class"] for q in report.quarantined] == ["backend_transient"]
+    assert store.keys_under("hear/v1/obj/") == []
 
 
 def test_a_zombie_importer_with_a_stale_lease_is_fenced_at_the_commit(pool, tmp_path):

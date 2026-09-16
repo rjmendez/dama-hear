@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import json
 import os
 
@@ -27,6 +28,17 @@ from hear.objectstore import streaming as S
 from tests import objectstore_mini_pool as MINI
 
 RUN = "2026-09-16T0000Z-crypto"
+
+#: ⚠️A TEST SEED, PINNED IN A TEST FILE ON PURPOSE. `InMemoryTestKeyProvider` no longer carries a
+#: default seed and `synthetic_crypto` makes a random one per process, so a test that needs two
+#: runs to converge on one ciphertext has to say which synthetic key material it means. That is
+#: the whole point of the change: the only way to get a reproducible key here is to name it in a
+#: test, and nothing importable can reach one by accident.
+SEED = b"phase3-objectstore-crypto-test-seed"
+
+
+def _crypto(tenant_id="dama", seed=SEED):
+    return C.synthetic_crypto(tenant_id, seed)
 
 
 @pytest.fixture()
@@ -79,15 +91,64 @@ def test_a_refused_restricted_class_does_not_stop_an_unrestricted_one(pool, stor
 
 def test_no_production_cipher_ships_in_this_repository():
     with pytest.raises(C.KeyUnavailable):
-        C.ObjectCrypto(C.InMemoryTestKeyProvider(), cipher=C.HmacCtrCipher())
+        C.ObjectCrypto(C.InMemoryTestKeyProvider(SEED), cipher=C.HmacCtrCipher(),
+                       allow_test_provider=True)
     assert C.HmacCtrCipher.production_ready is False
     assert C.InMemoryTestKeyProvider.is_test_only is True
+
+
+# --------------------------------------- the test provider is a test provider
+
+
+def test_a_test_only_key_provider_is_refused_unless_a_test_asks_for_it_by_name():
+    """⚠️THE UNREAD-FLAG REGRESSION. `is_test_only` was documented as checked, and was not.
+
+    The class docstring said `ObjectCrypto` checked the flag; nothing did, so the provider whose
+    keys are recomputable by anyone holding this repository could be handed to a production wiring
+    and would seal real evidence. Both halves of the boundary are now admitted by name or refused.
+    """
+    provider = C.InMemoryTestKeyProvider(SEED)
+    with pytest.raises(C.KeyUnavailable) as refused:
+        C.ObjectCrypto(provider, cipher=C.HmacCtrCipher(), allow_test_cipher=True)
+    assert "test-only key provider" in str(refused.value)
+
+    # The refusal comes before anything can be sealed, not after a first object goes out.
+    with pytest.raises(C.KeyUnavailable):
+        C.ObjectCrypto(provider)  # even paired with the refusing cipher
+    assert C.ObjectCrypto(provider, cipher=C.HmacCtrCipher(), allow_test_cipher=True,
+                          allow_test_provider=True).can_seal is True
+
+
+def test_no_synthetic_seed_is_reachable_without_a_caller_choosing_one():
+    """⚠️THE DEFAULT-SEED REGRESSION: a key everyone already has is not a key.
+
+    `InMemoryTestKeyProvider()` used to default to a literal in `crypto.py`, so the module shipped
+    a complete, working, identical-everywhere key hierarchy that any call site could reach with no
+    argument. A seed is now required, is bounded below, and `synthetic_crypto` generates a random
+    per-process one rather than reintroducing the constant one level up.
+    """
+    with pytest.raises(TypeError):
+        C.InMemoryTestKeyProvider()
+    with pytest.raises(C.KeyUnavailable):
+        C.InMemoryTestKeyProvider(b"short")
+    with pytest.raises(C.KeyUnavailable):
+        C.InMemoryTestKeyProvider("a string is not key material" * 2)
+
+    # No default in either signature: the provider has none at all, and the wiring helper's
+    # `None` is "make a random one now", not "use the one in the file".
+    seed_param = inspect.signature(C.InMemoryTestKeyProvider).parameters["seed"]
+    assert seed_param.default is inspect.Parameter.empty
+    assert inspect.signature(C.synthetic_crypto).parameters["seed"].default is None
+    # Two unseeded wirings must not agree about anything, which is what a shipped seed destroys.
+    a, b = C.synthetic_crypto(), C.synthetic_crypto()
+    assert a.provider.tenant_index_key("dama") != b.provider.tenant_index_key("dama")
+    assert a.blob_id("clip", "a" * 64)[0] != b.blob_id("clip", "a" * 64)[0]
 
 
 def test_the_key_provider_writes_no_key_material_anywhere(tmp_path):
     """A provider that persisted a key would leave it in the tree the test owns. None appears."""
     cwd_before = ST.census(str(tmp_path))
-    crypto = C.synthetic_crypto()
+    crypto = _crypto()
     key = crypto.provider.data_key("dama", "clip", "a" * 64)
     assert ST.census(str(tmp_path)) == cwd_before
     assert not any(hasattr(crypto.provider, attr) for attr in ("save", "path", "keyfile"))
@@ -99,7 +160,7 @@ def test_the_key_provider_writes_no_key_material_anywhere(tmp_path):
 
 def test_a_restricted_blob_is_addressed_by_its_hmac_id_and_never_by_its_plaintext_digest(
         pool, store, tmp_path):
-    crypto = C.synthetic_crypto()
+    crypto = _crypto()
     report = _importer(store, tmp_path, crypto=crypto).run([_clip_task(pool)])
     assert report.counters["published"] == 1
     assert report.counters["encrypted"] == 1
@@ -117,7 +178,7 @@ def test_a_restricted_blob_is_addressed_by_its_hmac_id_and_never_by_its_plaintex
 
 def test_the_plaintext_digest_reaches_no_ledger_row_and_no_quarantine_record(
         pool, store, tmp_path, monkeypatch):
-    crypto = C.synthetic_crypto()
+    crypto = _crypto()
     ledger_path = str(tmp_path / "work" / RUN / "ledger.jsonl")
     _importer(store, tmp_path, crypto=crypto).run([_clip_task(pool)])
     assert pool["clip_digest"] not in open(ledger_path).read()
@@ -135,7 +196,7 @@ def test_the_plaintext_digest_reaches_no_ledger_row_and_no_quarantine_record(
 
 def test_the_clear_metadata_carries_the_label_and_the_sealed_document_carries_the_secret(
         pool, store, tmp_path):
-    crypto = C.synthetic_crypto()
+    crypto = _crypto()
     _importer(store, tmp_path, crypto=crypto).run([_clip_task(pool)])
     mkey = [k for k in store.keys_under("hear/v1/meta/")][0]
     meta = json.loads(store.get_range(mkey))
@@ -161,7 +222,7 @@ def test_an_unrestricted_class_keeps_its_plaintext_content_address(pool, store, 
     """Encryption is per class, not global: a record segment is still addressed by sha256."""
     seg = ST.ImportTask(object_class="record-seg", logical_id="0", partition=("2026-09-12", "mach"),
                         source_path=pool["records_path"], digest_source="computed-at-import")
-    report = _importer(store, tmp_path, crypto=C.synthetic_crypto()).run([seg])
+    report = _importer(store, tmp_path, crypto=_crypto()).run([seg])
     assert report.counters["encrypted"] == 0
     digest = S.digest_source(S.file_chunks(pool["records_path"])).digest
     assert store.keys_under("hear/v1/blob/") == [K.blob_key(digest)]
@@ -171,7 +232,7 @@ def test_an_unrestricted_class_keeps_its_plaintext_content_address(pool, store, 
 
 
 def test_the_stored_blob_is_not_the_plaintext_and_opens_back_to_it(pool, store, tmp_path):
-    crypto = C.synthetic_crypto()
+    crypto = _crypto()
     _importer(store, tmp_path, crypto=crypto).run([_clip_task(pool)])
     blob_key = [k for k in store.keys_under("hear/v1/blob/")][0]
     ciphertext = store.get_range(blob_key)
@@ -194,7 +255,7 @@ def test_the_stored_blob_is_not_the_plaintext_and_opens_back_to_it(pool, store, 
 
 
 def test_a_tampered_ciphertext_does_not_open(pool, store, tmp_path):
-    crypto = C.synthetic_crypto()
+    crypto = _crypto()
     _importer(store, tmp_path, crypto=crypto).run([_clip_task(pool)])
     blob_key = [k for k in store.keys_under("hear/v1/blob/")][0]
     body = bytearray(store.get_range(blob_key))
@@ -225,7 +286,7 @@ def test_a_source_that_changes_between_the_digest_pass_and_the_seal_pass_is_refu
     task = ST.ImportTask(object_class="clip", logical_id="9f2c" + "0" * 28,
                          partition=("2026-09-12", "mach"), chunks=shifting,
                          digest_source="computed-at-import")
-    report = _importer(store, tmp_path, crypto=C.synthetic_crypto()).run([task])
+    report = _importer(store, tmp_path, crypto=_crypto()).run([task])
     assert [q["error_class"] for q in report.quarantined] == ["source_changed_during_import"]
     assert store.keys_under("hear/v1/obj/") == []
 
@@ -235,7 +296,7 @@ def test_a_source_that_changes_between_the_digest_pass_and_the_seal_pass_is_refu
 
 def test_two_identical_restricted_objects_converge_on_one_blob_inside_a_tenant(
         pool, store, tmp_path):
-    crypto = C.synthetic_crypto()
+    crypto = _crypto()
     a, b = pool["clip_paths"]
     report = _importer(store, tmp_path, crypto=crypto).run([
         _clip_task(pool, a, "9f2c" + "0" * 28, "2026-09-12"),
@@ -249,14 +310,14 @@ def test_two_identical_restricted_objects_converge_on_one_blob_inside_a_tenant(
 
 def test_a_rerun_of_a_restricted_object_reseals_to_the_same_bytes(pool, store, tmp_path):
     """Non-convergent sealing would make every re-run look like a corrupt blob."""
-    crypto = C.synthetic_crypto()
+    crypto = _crypto()
     _importer(store, tmp_path, crypto=crypto).run([_clip_task(pool)])
     blob_key = store.keys_under("hear/v1/blob/")[0]
     first = store.get_range(blob_key)
 
     # A different run id and a fresh crypto object: nothing is carried over but the key seed.
     report = _importer(store, tmp_path, run=RUN + "-again",
-                       crypto=C.synthetic_crypto()).run([_clip_task(pool)])
+                       crypto=_crypto()).run([_clip_task(pool)])
     assert report.counters["replayed"] == 1
     assert report.counters["quarantined"] == 0
     assert store.get_range(blob_key) == first
@@ -264,8 +325,8 @@ def test_a_rerun_of_a_restricted_object_reseals_to_the_same_bytes(pool, store, t
 
 def test_two_tenants_do_not_share_a_blob_id_for_identical_bytes(pool, store, tmp_path):
     """Cross-tenant dedupe is a leak, not an optimisation (`docs/data-governance.md` :77-81)."""
-    one = C.synthetic_crypto("dama")
-    two = C.synthetic_crypto("other")
+    one = _crypto("dama")
+    two = _crypto("other")
     _importer(store, tmp_path, crypto=one, tenant_id="dama").run([_clip_task(pool)])
     _importer(store, tmp_path, run=RUN + "-t2", crypto=two,
               tenant_id="other").run([_clip_task(pool)])
@@ -313,7 +374,7 @@ def test_xoring_the_body_against_the_sealed_metadata_recovers_nothing(pool, stor
     plaintext is a JSON shape an attacker can write out from the schema, so subtracting it yields
     the body in the clear. This test performs that attack and requires it to fail.
     """
-    crypto = C.synthetic_crypto()
+    crypto = _crypto()
     _importer(store, tmp_path, crypto=crypto).run([_clip_task(pool)])
     body_ct = store.get_range(store.keys_under("hear/v1/blob/")[0])[:-C.TAG_BYTES]
     meta = json.loads(store.get_range(store.keys_under("hear/v1/meta/")[0]))
@@ -340,7 +401,7 @@ def test_no_published_field_confirms_a_guessed_plaintext(pool, store, tmp_path):
     key at all. Here the attacker *has* the plaintext (the strongest guess there is) and every
     published byte, and must still not be able to reproduce a single published field.
     """
-    crypto = C.synthetic_crypto()
+    crypto = _crypto()
     _importer(store, tmp_path, crypto=crypto).run([_clip_task(pool)])
     keys = store.keys_under("hear/")
     published = "\n".join(keys) + "\n" + _all_stored_bytes(store).decode("latin-1")
@@ -384,14 +445,134 @@ def test_no_published_field_confirms_a_guessed_plaintext(pool, store, tmp_path):
 
 def test_the_wrapped_key_cannot_be_reproduced_without_the_kek(pool):
     """It is convergent on the digest, so it must not be *computable* from the digest."""
-    provider = C.InMemoryTestKeyProvider()
+    provider = C.InMemoryTestKeyProvider(SEED)
     digest = pool["clip_digest"]
     wrapped = provider.data_key("dama", "clip", digest).wrapped
     assert wrapped != bytes.fromhex(digest[:64])
     assert wrapped != hashlib.sha256(digest.encode()).digest()
     # A provider with a different seed -- an attacker guessing the KEK -- gets different material.
-    assert C.InMemoryTestKeyProvider(b"another-seed").data_key("dama", "clip",
+    assert C.InMemoryTestKeyProvider(b"another-seed-entirely").data_key("dama", "clip",
                                                               digest).wrapped != wrapped
+
+
+# ---------------------------------------------- one DEK unwraps one object
+
+
+def test_one_disclosed_dek_does_not_unwrap_the_rest_of_its_class():
+    """⚠️THE CLASS-WIDE WRAPPING MASK REGRESSION, run as the attack it was.
+
+    The wrapping used to be `dek XOR mask(tenant, class)` with one mask for the whole class, so an
+    attacker who learned a single DEK -- one unwrapped object, one debug dump, one reader bug --
+    recovered `mask = dek XOR wrapped` and unwrapped **every other object of that class** from the
+    published metadata alone. The wrapping is now salted per object, so the leaked-DEK attack
+    recovers exactly one object: the one that leaked.
+    """
+    provider = C.InMemoryTestKeyProvider(SEED)
+    victim = provider.data_key("dama", "clip", "a" * 64)
+    others = [provider.data_key("dama", "clip", ch * 64) for ch in "bcdef"]
+
+    body = lambda w: w[C.WRAP_SALT_BYTES:C.WRAP_SALT_BYTES + C.KEY_BYTES]
+    leaked_mask = bytes(x ^ y for x, y in zip(victim.key, body(victim.wrapped)))
+    for other in others:
+        forged = bytes(x ^ y for x, y in zip(leaked_mask, body(other.wrapped)))
+        assert forged != other.key, "a leaked DEK still unwraps another object of its class"
+    # And the salts really are per object rather than one constant with a new name.
+    salts = {w.wrapped[:C.WRAP_SALT_BYTES] for w in others + [victim]}
+    assert len(salts) == len(others) + 1
+
+
+def test_a_wrapped_key_round_trips_and_is_refused_under_the_wrong_kek():
+    """Unwrapping is authenticated: a wrapping this KEK did not produce is refused, not decoded.
+
+    An unauthenticated XOR unwrap returns 32 bytes of plausible key for *any* input, so a key
+    substituted by an attacker or a corrupted metadata document turns into a stream key and fails
+    far away -- or does not fail at all, in a reader that treats the result as data.
+    """
+    provider = C.InMemoryTestKeyProvider(SEED)
+    sealed = provider.data_key("dama", "clip", "a" * 64)
+    assert provider.open_key(sealed.ref, sealed.wrapped) == sealed.key
+    assert len(sealed.wrapped) == C.WRAP_SALT_BYTES + C.KEY_BYTES + C.TAG_BYTES
+
+    flipped = bytearray(sealed.wrapped)
+    flipped[C.WRAP_SALT_BYTES] ^= 0x01
+    with pytest.raises(C.TamperDetected):
+        provider.open_key(sealed.ref, bytes(flipped))
+    with pytest.raises(C.TamperDetected):
+        provider.open_key(sealed.ref, sealed.wrapped[:-1])
+    # Another class under the same tenant is another KEK, so its wrapping does not open here.
+    other_class = provider.data_key("dama", "raw", "a" * 64)
+    with pytest.raises(C.TamperDetected):
+        provider.open_key(sealed.ref, other_class.wrapped)
+    with pytest.raises(C.TamperDetected):
+        C.InMemoryTestKeyProvider(b"another-seed-entirely").open_key(sealed.ref, sealed.wrapped)
+
+
+def test_wrapping_is_still_deterministic_so_a_re_seal_is_byte_identical():
+    """Per-object must not mean per-run: metadata is digest-addressed and a replay must be a no-op."""
+    one = C.InMemoryTestKeyProvider(SEED).data_key("dama", "clip", "a" * 64)
+    two = C.InMemoryTestKeyProvider(SEED).data_key("dama", "clip", "a" * 64)
+    assert one.wrapped == two.wrapped and one.key == two.key
+
+
+# --------------------------------------- precise location is restricted data
+
+
+TDOA_ROW = (b'{"arrival_us":1758000000123456,"lat":40.2925221,"lon":-79.1221604,"node":"mach"}\n')
+
+
+def _tdoa_task(tmp_path, object_class="tdoa-arrival-seg", name="tdoa.jsonl"):
+    path = tmp_path / name
+    path.write_bytes(TDOA_ROW)
+    return ST.ImportTask(object_class=object_class, logical_id="0",
+                         partition=("2026-09-12", "mach"), source_path=str(path),
+                         digest_source="computed-at-import")
+
+
+@pytest.mark.parametrize("object_class", ["tdoa-arrival-seg", "tdoa-run"])
+def test_a_tdoa_class_cannot_be_published_without_a_key_provider(store, tmp_path, object_class):
+    """The label is `precise_location`, so the refusal is the same one `clip` and `raw` get."""
+    task = _tdoa_task(tmp_path, object_class, name="%s.jsonl" % object_class)
+    report = _importer(store, tmp_path).run([task])
+    assert [q["error_class"] for q in report.quarantined] == ["key_provider_unavailable"]
+    assert store.keys_under("hear/v1/obj/") == []
+    assert store.keys_under("hear/v1/blob/") == []
+
+
+def test_a_tdoa_arrival_publishes_no_plaintext_digest_and_no_plaintext_coordinate(store, tmp_path):
+    """⚠️THE RAW-DIGEST LEAK, end to end: an arrival row is guessable, so its digest is an oracle."""
+    crypto = _crypto()
+    task = _tdoa_task(tmp_path)
+    report = _importer(store, tmp_path, crypto=crypto).run([task])
+    assert report.counters["published"] == 1
+    assert report.counters["encrypted"] == 1
+
+    plaintext_digest = K.sha256_hex(TDOA_ROW)
+    keys = store.keys_under("hear/")
+    stored = _all_stored_bytes(store)
+    assert not any(plaintext_digest in k for k in keys)
+    assert plaintext_digest.encode() not in stored
+    assert b"40.2925221" not in stored                      # the coordinate itself never lands
+    assert plaintext_digest not in open(
+        str(tmp_path / "work" / RUN / "ledger.jsonl")).read()
+
+    bid, algo = crypto.blob_id("tdoa-arrival-seg", plaintext_digest)
+    assert algo == "hmac-sha256"
+    assert K.blob_key(bid, algo=algo, tenant="dama") in keys
+    meta = json.loads(store.get_range([k for k in keys if "/meta/" in k][0]))
+    assert meta["governance"]["sensitivity"] == ["precise_location"]
+    assert meta["blob"]["plaintext_digest_location"] == "sealed"
+    assert "digest" not in meta["blob"]
+
+
+def test_two_tenants_do_not_share_a_tdoa_blob_for_identical_arrivals(store, tmp_path):
+    """Cross-tenant dedupe on a coordinate is a cross-tenant disclosure that it is the same place."""
+    task = _tdoa_task(tmp_path)
+    _importer(store, tmp_path, crypto=_crypto("dama"), tenant_id="dama").run([task])
+    _importer(store, tmp_path, run=RUN + "-t2", crypto=_crypto("other"),
+              tenant_id="other").run([task])
+    blobs = store.keys_under("hear/v1/blob/")
+    assert len(blobs) == 2
+    assert len({b.rsplit("/", 1)[-1] for b in blobs}) == 2
 
 
 # ------------------------------------------- the default cipher seals nothing
@@ -417,7 +598,8 @@ def test_a_key_provider_alone_does_not_make_an_importer_able_to_encrypt(pool, st
     who wires up a KMS and forgets to choose a cipher publishes nothing rather than test-grade
     ciphertext.
     """
-    crypto = C.ObjectCrypto(C.InMemoryTestKeyProvider(), tenant_id="dama")
+    crypto = C.ObjectCrypto(C.InMemoryTestKeyProvider(SEED), tenant_id="dama",
+                            allow_test_provider=True)
     assert crypto.can_seal is False
     report = _importer(store, tmp_path, crypto=crypto).run([_clip_task(pool)])
     assert [q["error_class"] for q in report.quarantined] == ["key_provider_unavailable"]
@@ -434,6 +616,6 @@ def test_the_importers_own_default_is_the_refusing_pair(store, tmp_path):
 
 def test_the_test_cipher_still_has_to_be_asked_for_by_name():
     with pytest.raises(C.KeyUnavailable):
-        C.ObjectCrypto(C.InMemoryTestKeyProvider(), cipher=C.HmacCtrCipher())
-    assert C.synthetic_crypto().can_seal is True
-    assert C.synthetic_crypto().cipher.production_ready is False
+        C.ObjectCrypto(C.InMemoryTestKeyProvider(SEED), cipher=C.HmacCtrCipher())
+    assert _crypto().can_seal is True
+    assert _crypto().cipher.production_ready is False

@@ -75,10 +75,70 @@ def test_a_live_lease_held_by_someone_else_is_not_handed_out(tmp_path):
     store = B.LocalDirBackend(str(tmp_path / "store"), now=lambda: clock["t"])
     held = store.acquire_lease("import/run", ttl_s=60, holder="a")
     assert store.acquire_lease("import/run", ttl_s=60, holder="b") is None
-    assert store.acquire_lease("import/run", ttl_s=60, holder="a").epoch == held.epoch
     store.release_lease(held)
     taken = store.acquire_lease("import/run", ttl_s=60, holder="b")
     assert taken is not None and taken.epoch == held.epoch + 1
+
+
+def test_a_same_holder_reacquisition_is_a_new_fence_and_not_a_shared_one(tmp_path):
+    """⚠️THE SHARED-EPOCH REGRESSION: two writers under one holder name held one fence.
+
+    A same-holder acquirer used to be handed the epoch that was already out there -- a renewal
+    wearing the word "acquire" -- so a second process started with the same holder id (a restarted
+    pod, a cron overlap, a stuck run whose supervisor launched another) got a lease object equal to
+    the first one's. Two writers holding one fencing epoch fence neither of them: both pass the
+    liveness check, both commit, and the pointer takes whichever landed last. Every acquisition is
+    now its own epoch and its own token, so the older writer is fenced the instant the newer one
+    acquires.
+    """
+    clock = {"t": 1000.0}
+    store = B.LocalDirBackend(str(tmp_path / "store"), now=lambda: clock["t"])
+    first = store.acquire_lease("import/run", ttl_s=60, holder="a")
+    second = store.acquire_lease("import/run", ttl_s=60, holder="a")
+
+    assert second is not None
+    assert second.epoch == first.epoch + 1
+    assert second.token != first.token
+    assert store._lease_is_live(second) is True
+    assert store._lease_is_live(first) is False
+
+    # And the fence is real at the commit, not just in the bookkeeping.
+    stale = _importer(store, tmp_path, run=RUN + "-stale", lease=first).run([_tail_task(b"{}\n")])
+    assert stale.outcome == "aborted"
+    assert store.keys_under("hear/v1/obj/") == []
+    ok = _importer(store, tmp_path, run=RUN + "-live", lease=second).run([_tail_task(b"{}\n")])
+    assert ok.counters["published"] == 1
+    assert _pointer(store, OKEY)["lease_epoch"] == second.epoch
+    assert _pointer(store, OKEY)["lease_token"] == second.token
+
+
+def test_a_renewal_keeps_the_fence_it_is_renewing(tmp_path):
+    """A renewal is not an acquisition: minting a fence per heartbeat invalidates its own writes."""
+    clock = {"t": 1000.0}
+    store = B.LocalDirBackend(str(tmp_path / "store"), now=lambda: clock["t"])
+    lease = store.acquire_lease("import/run", ttl_s=60, holder="a")
+    clock["t"] += 30
+    renewed = store.renew_lease(lease, ttl_s=60)
+    assert renewed.epoch == lease.epoch and renewed.token == lease.token
+    assert renewed.expires_utc_s > lease.expires_utc_s
+    assert store._lease_is_live(lease) is True  # the token it already wrote into a pointer
+    clock["t"] += 59
+    assert store._lease_is_live(renewed) is True
+
+
+def test_a_crashed_holder_that_comes_back_fences_the_copy_of_itself_that_did_not_die(tmp_path):
+    """The zombie case the holder name cannot distinguish: same name, two processes, one winner."""
+    clock = {"t": 1000.0}
+    store = B.LocalDirBackend(str(tmp_path / "store"), now=lambda: clock["t"])
+    zombie = store.acquire_lease("import/run", ttl_s=600, holder="importer-1")
+    # The supervisor believes it died and starts it again, inside the TTL, under the same name.
+    restarted = store.acquire_lease("import/run", ttl_s=600, holder="importer-1")
+
+    assert restarted.token != zombie.token and restarted.epoch > zombie.epoch
+    report = _importer(store, tmp_path, run=RUN + "-z", lease=zombie).run([_tail_task(b"{}\n")])
+    assert report.outcome == "aborted"
+    assert store.renew_lease(zombie, ttl_s=600) is None  # and it cannot renew its way back in
+    assert store.acquire_lease("import/run", ttl_s=600, holder="other") is None
 
 
 def test_a_released_lease_cannot_be_used_to_commit(tmp_path):
@@ -115,6 +175,68 @@ def test_a_store_without_a_conditional_put_really_does_lose_an_update(tmp_path):
     store.put_immutable(key, b"second writer")
     assert store.get_range(key) == b"second writer"  # the first writer's object is simply gone
     assert store.capabilities().commit_primitive == "lease-fencing"
+
+
+def test_a_store_without_a_conditional_put_has_no_atomic_cas_either(tmp_path):
+    """⚠️THE PRETENDED-ATOMICITY REGRESSION: the weak store used to keep one CAS in its pocket.
+
+    `_claim_generation` and the lease acquisition both used `O_CREAT|O_EXCL` in *both* modes, so
+    the store defined by not having a conditional put quietly had an atomic compare-and-swap for
+    the two operations the fallback primitive depends on. Every generation and fencing test then
+    passed for the wrong reason: they were exercising the strong store twice. The weak mode now
+    reports `atomic_cas=False` and its claim really is check, gap, write, confirm -- the gap is
+    real, a test can stand in it, and what saves the commit is the lease, not the claim.
+    """
+    weak = B.LocalDirBackend(str(tmp_path / "weak"), conditional_put=False)
+    strong = B.LocalDirBackend(str(tmp_path / "strong"))
+    assert weak.capabilities().atomic_cas is False
+    assert strong.capabilities().atomic_cas is True
+
+    seen = []
+
+    def competitor(path):
+        weak.race_hook = None
+        seen.append(path)
+        # Another writer lands inside the gap the missing CAS leaves open.
+        weak._replace_write(path, S.bytes_chunks(json.dumps(
+            _doc(1, "blob-theirs"), sort_keys=True, separators=(",", ":")).encode()))
+
+    weak.race_hook = competitor
+    claim, found = weak._claim_generation(OKEY, _doc(1, "blob-mine"))
+    assert seen, "the weak store claimed a generation without ever opening the gap"
+    assert claim == "taken"                                    # the confirm read caught them
+    assert json.loads(found)["blob_key"] == "blob-theirs"      # and did not clobber their claim
+
+    # The strong store never opens that gap at all: the claim IS the write.
+    strong.race_hook = lambda path: seen.append(("strong", path))
+    assert strong._claim_generation(OKEY, _doc(1, "blob-mine"))[0] == "claimed"
+    assert not [x for x in seen if isinstance(x, tuple)]
+
+
+def test_a_weak_store_lease_race_still_produces_at_most_one_live_fence(tmp_path):
+    """No CAS means acquisition cannot be atomic, so the fence is whatever a re-read says it is."""
+    clock = {"t": 1000.0}
+    store = B.LocalDirBackend(str(tmp_path / "store"), conditional_put=False,
+                              now=lambda: clock["t"])
+    other = {"lease": None}
+
+    def competitor(path):
+        store.race_hook = None
+        other["lease"] = store.acquire_lease("import/run", ttl_s=60, holder="b")
+
+    store.race_hook = competitor
+    mine = store.acquire_lease("import/run", ttl_s=60, holder="a")
+
+    leases = [l for l in (mine, other["lease"]) if l is not None]
+    assert leases, "both acquirers were refused a lease nobody held"
+    assert len([l for l in leases if store._lease_is_live(l)]) == 1
+    loser = [l for l in leases if not store._lease_is_live(l)]
+    for stale in loser:
+        assert _importer(store, tmp_path, run=RUN + "-lost", lease=stale).run(
+            [_tail_task(b"{}\n")]).outcome == "aborted"
+    winner = [l for l in leases if store._lease_is_live(l)][0]
+    assert _importer(store, tmp_path, run=RUN + "-won", lease=winner).run(
+        [_tail_task(b"{}\n")]).counters["published"] == 1
 
 
 def test_a_commit_without_a_lease_is_refused_when_the_store_cannot_do_a_conditional_put(tmp_path):
@@ -394,17 +516,21 @@ def test_a_republished_generation_claimed_by_another_writer_still_loses_the_cas(
     assert _pointer(store, OKEY)["blob_key"] == "blob-1"
 
 
+class _ProcessDied(BaseException):
+    """A death the importer does not contain, because a killed process is not a retryable error."""
+
+
 def test_an_importer_rerun_finishes_a_republish_whose_process_died_after_the_claim(tmp_path):
     """End to end: the wedge was an object no future run could ever publish again."""
     store = B.LocalDirBackend(str(tmp_path / "store"))
     rows = [{"key": "%032x" % i} for i in range(4)]
     _run_tail(store, tmp_path, rows[:2], RUN + "-w1", republish=True)
 
-    store.fail_after_claim = [B.BackendTransient("the pod was evicted mid-commit")]
+    store.fail_after_claim = [_ProcessDied("the pod was killed mid-commit")]
     try:
         _run_tail(store, tmp_path, rows, RUN + "-w2", republish=True)
         raise AssertionError("the injected failure did not fire")
-    except B.BackendTransient:
+    except _ProcessDied:
         pass
     assert _pointer(store, OKEY)["generation"] == 1
 

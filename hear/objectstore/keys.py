@@ -33,10 +33,6 @@ CLASSES = frozenset({
     "ledger-seg", "sketch-corpus", "annotations",
 })
 
-#: Classes whose blob id is HMAC-derived rather than the plaintext digest, because a plaintext
-#: digest of guessable content is a confirmation oracle (key design §8).
-RESTRICTED_CLASSES = frozenset({"clip", "raw"})
-
 #: The governance labels that travel with an object in the CLEAR part of its metadata. The label
 #: is clear precisely so a reader can refuse an object without opening it; the thing the label
 #: describes -- a 7-decimal coordinate, an ambient recording -- is inside the sealed sub-document
@@ -47,6 +43,32 @@ SENSITIVITY = {
     "tdoa-arrival-seg": ("precise_location",),
     "tdoa-run": ("precise_location",),
 }
+
+#: The labels that make a class restricted. `docs/data-governance.md` §5-§6 treats a 7-decimal
+#: arrival coordinate exactly as it treats an ambient recording: it is not published in the clear,
+#: it does not dedupe across tenants, and nothing about it may be confirmed from a guess.
+RESTRICTED_SENSITIVITY = frozenset({"ambient_audio", "precise_location"})
+
+#: Classes whose blob id is HMAC-derived rather than the plaintext digest, because a plaintext
+#: digest of guessable content is a confirmation oracle (key design §8).
+#:
+#: ⚠️DERIVED FROM `SENSITIVITY`, NEVER LISTED BESIDE IT. It used to be the literal
+#: `{"clip", "raw"}` while `SENSITIVITY` already labelled `tdoa-arrival-seg` and `tdoa-run`
+#: `precise_location` -- so the two TDOA classes were labelled restricted and then addressed by
+#: their raw plaintext digest, imported with no key provider, deduped across tenants, and had that
+#: digest copied into ledger rows and quarantine records. A TDOA arrival row is a short, highly
+#: guessable document (a handful of node ids, a coordinate, a microsecond timestamp), which makes
+#: a published digest of it a confirmation oracle for exactly the coordinate the label says to
+#: protect. Deriving the set means a class can never again be labelled sensitive and left
+#: unprotected: adding a label is the whole act.
+RESTRICTED_CLASSES = frozenset(
+    cls for cls, labels in SENSITIVITY.items() if RESTRICTED_SENSITIVITY.intersection(labels))
+
+#: A label on a class that has no key is a label on nothing, so the two tables are checked against
+#: each other at import time rather than by a test that someone may not run.
+if not set(SENSITIVITY) <= set(CLASSES):  # pragma: no cover - a typo in the tables above
+    raise RuntimeError("a sensitivity label names a class that has no key: %s"
+                       % sorted(set(SENSITIVITY) - set(CLASSES)))
 
 
 def pointer_generation_prefix(object_key: str) -> str:

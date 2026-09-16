@@ -30,6 +30,23 @@ and pass `allow_test_cipher=True` on the caller's behalf" -- made the guard deco
 one wiring that was supposed to be a deliberate act was the one the constructor performed for you.
 Only test code may name `HmacCtrCipher`, and it must still say `allow_test_cipher=True` to use it.
 
+⚠️A TEST-ONLY KEY PROVIDER IS REFUSED THE SAME WAY. `InMemoryTestKeyProvider.is_test_only` was a
+flag nobody read: the class documented that `ObjectCrypto` checked it, and `ObjectCrypto` did not.
+It also carried a default seed -- a literal in this file, in the git history, identical on every
+machine -- so `InMemoryTestKeyProvider()` was a complete working key hierarchy reachable from any
+production wiring with no argument at all. The seed is now required and bounded below, the
+provider is rejected unless the caller says `allow_test_provider=True`, and `synthetic_crypto`
+generates a per-process random seed when a test does not pin one.
+
+⚠️A DEK IS WRAPPED PER OBJECT, NOT PER CLASS. The wrapping used to be `dek XOR mask(tenant,
+class)` with one constant mask per class, so a single disclosed DEK yielded
+`mask = dek XOR wrapped` and unwrapped *every other object of that class* out of published
+metadata -- no KEK, no further access, one leak to total class compromise. A wrapped key is now
+`salt || dek XOR mask(KEK, salt) || HMAC(mac(KEK, salt), salt || body)` with the salt derived from
+the KEK and the object's context: stable across a re-seal (so dedupe and idempotent replay
+survive), different for every object, and authenticated so a wrapping this KEK did not produce is
+refused instead of unwrapping into plausible noise.
+
 ⚠️ONE DEK, TWO INDEPENDENT (KEY, NONCE) PAIRS, DERIVED WITH HKDF. The body and the sealed metadata
 sub-document are separate streams under the same data key, so they must never share a keystream: a
 CTR-mode stream reused across two messages gives up `P1 XOR P2`, and the metadata plaintext is a
@@ -47,12 +64,34 @@ unwrapping it needs the KEK; it is convergent on the plaintext digest, which is 
 intra-tenant equality leak the HMAC blob id already carries, and it is not verifiable from a guess.
 
 NOT PRODUCTION: no backend is selected, no KMS exists, and no gate (G0-G6) is satisfied.
+
+⚠️TWO PRODUCTION HARD GATES ARE STILL OPEN, AND NOTHING HERE CLOSES THEM. They are specified in
+`docs/decisions/0010-phase3-object-encryption-and-capability-contract.md` (ADR 0010, merged as
+PR #245) and in `docs/phase3-object-encryption-contract.md`; the fixes in this module are
+scaffold-level and do not satisfy either:
+
+1. **AEAD AAD metadata binding.** Nothing authenticates the object this ciphertext belongs to.
+   The test double MACs the nonce and the ciphertext and nothing else, so a blob moved onto
+   another object's pointer, relabelled with another tenant's metadata, reclassified from `raw`
+   to `record`, or replayed under an older schema version still opens and still verifies. ADR 0010
+   §D2 requires a real AEAD whose AAD binds object key, blob id, tenant, sensitivity class, key
+   reference and schema version, and requires that binding to be the thing a reader checks.
+2. **Streaming authenticated decryption.** `HmacCtrCipher.open` yields plaintext chunks and only
+   raises `TamperDetected` at the *end* of the stream, so a consumer sees unauthenticated bytes
+   and is asked not to act on them. "Must not" is not a mechanism. ADR 0010 §D4 requires
+   per-frame authentication so no plaintext is ever exposed before it is authenticated, plus the
+   `partially_authenticated` refusal at the reader API boundary for `keys.RESTRICTED_CLASSES`.
+
+Until both are implemented and their gates are green, sealing stays refused by default, the only
+cipher here stays `production_ready = False`, and no path in this repository may point either at
+real evidence.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
 import hmac
+import os
 import struct
 from typing import Any, Dict, Iterable, Iterator, Optional, Protocol
 
@@ -63,6 +102,9 @@ from . import streaming as S
 TAG_BYTES = 32
 NONCE_BYTES = 16
 KEY_BYTES = 32
+#: The per-object wrapping salt carried in front of a wrapped DEK. Derived from the KEK and the
+#: object's context, so it is stable for a re-seal and unpredictable without the KEK.
+WRAP_SALT_BYTES = 16
 #: Everything derived under this label is bound to this package and this schema version.
 KDF_LABEL = b"hear/objectstore/v1"
 #: What the metadata records about the derivation, so a reader never has to guess it.
@@ -183,14 +225,28 @@ class InMemoryTestKeyProvider:
     ⚠️THE SEED IS A TEST INPUT, NOT A SECRET, and this class says so in its name so that a
     production wiring of it is a visible act rather than an accident. Keys live for the lifetime of
     the object and are never written anywhere: there is no `save`, no path, no env var. `is_test_only`
-    is checked by `ObjectCrypto` and by a test that asserts no real provider ships here.
+    is checked by `ObjectCrypto` -- which refuses this provider unless the caller also says
+    `allow_test_provider=True` -- and by a test that asserts no real provider ships here.
+
+    ⚠️THERE IS NO DEFAULT SEED. It used to default to a literal `b"phase3-synthetic-test-seed"`,
+    so `InMemoryTestKeyProvider()` was a complete, working, *shipped* key hierarchy that any
+    production wiring could reach with no argument at all -- a synthetic secret whose value is in
+    the repository, in the git history, and identical on every machine that imported this module.
+    The seed is now a required argument and has to be long enough to be a deliberate act.
     """
 
     name = "in-memory-test"
     is_test_only = True
 
-    def __init__(self, seed: bytes = b"phase3-synthetic-test-seed", *, kek_version: int = 1) -> None:
-        self._seed = seed
+    #: Short enough to be a placeholder is short enough to be an accident.
+    MIN_SEED_BYTES = 16
+
+    def __init__(self, seed: bytes, *, kek_version: int = 1) -> None:
+        if not isinstance(seed, (bytes, bytearray)):
+            raise KeyUnavailable("a test key seed is bytes, chosen by the caller, never defaulted")
+        if len(seed) < self.MIN_SEED_BYTES:
+            raise KeyUnavailable("a test key seed is at least %d bytes" % self.MIN_SEED_BYTES)
+        self._seed = bytes(seed)
         self._kek_version = kek_version
         self._issued = 0
 
@@ -201,9 +257,21 @@ class InMemoryTestKeyProvider:
     def tenant_index_key(self, tenant_id: str) -> bytes:
         return hashlib.sha256(b"index/" + tenant_id.encode() + b"/" + self._seed).digest()
 
-    def _wrap_mask(self, tenant_id: str, data_class: str) -> bytes:
-        return hkdf_expand(hkdf_extract(KDF_LABEL + b"/wrap", self._kek(tenant_id, data_class)),
-                           KDF_LABEL + b"/wrap/mask", KEY_BYTES)
+    def _wrap_salt(self, kek: bytes, context: str) -> bytes:
+        """A per-object wrapping salt: unpredictable without the KEK, identical for a re-seal."""
+        return hmac.new(kek, b"wrap/salt/" + context.encode(), hashlib.sha256).digest()[:WRAP_SALT_BYTES]
+
+    def _wrap_material(self, kek: bytes, salt: bytes) -> tuple:
+        """`(mask, mac_key)` for ONE object. ⚠️NO TWO OBJECTS SHARE EITHER HALF."""
+        prk = hkdf_extract(KDF_LABEL + b"/wrap", kek)
+        mask = hkdf_expand(prk, KDF_LABEL + b"/wrap/mask/" + salt, KEY_BYTES)
+        mac = hkdf_expand(prk, KDF_LABEL + b"/wrap/mac/" + salt, KEY_BYTES)
+        return mask, mac
+
+    def _wrap(self, kek: bytes, dek: bytes, salt: bytes) -> bytes:
+        mask, mac = self._wrap_material(kek, salt)
+        body = bytes(a ^ b for a, b in zip(dek, mask))
+        return salt + body + hmac.new(mac, salt + body, hashlib.sha256).digest()
 
     def data_key(self, tenant_id: str, data_class: str, context: str) -> SealedKey:
         # Convergent on the plaintext digest, so re-sealing the same bytes is byte-identical and
@@ -214,16 +282,37 @@ class InMemoryTestKeyProvider:
         # intra-tenant equality the HMAC blob id already leaks. It has to be deterministic --
         # metadata is digest-addressed and immutable, so a wrapping that changed per run would make
         # every replay write a new metadata object and turn an idempotent re-run into a conflict.
+        #
+        # ⚠️THE WRAPPING IS PER OBJECT, NOT PER CLASS. It used to be `dek XOR mask(tenant, class)`,
+        # with one constant mask for every object in a class: anyone who learned a single DEK --
+        # one unwrapped object, one debug dump, one reader bug -- could compute
+        # `mask = dek XOR wrapped` and unwrap *every other object in that class* straight out of
+        # the published metadata, with no KEK and no further access. The salt is derived from the
+        # KEK and the object's context, so it is stable for a re-seal but different for every
+        # object, and a leaked DEK now recovers exactly the one object it belongs to.
         self._issued += 1
-        dek = hashlib.sha256(b"dek/" + context.encode() + b"/"
-                             + self._kek(tenant_id, data_class)).digest()
-        wrapped = bytes(a ^ b for a, b in zip(dek, self._wrap_mask(tenant_id, data_class)))
+        kek = self._kek(tenant_id, data_class)
+        dek = hashlib.sha256(b"dek/" + context.encode() + b"/" + kek).digest()
+        wrapped = self._wrap(kek, dek, self._wrap_salt(kek, context))
         ref = KeyRef(provider=self.name, tenant_id=tenant_id, data_class=data_class,
                      key_id="kek-v%d" % self._kek_version)
         return SealedKey(key=dek, wrapped=wrapped, ref=ref)
 
     def open_key(self, ref: KeyRef, wrapped: bytes) -> bytes:
-        return bytes(a ^ b for a, b in zip(wrapped, self._wrap_mask(ref.tenant_id, ref.data_class)))
+        """Unwrap, and refuse a wrapping this KEK did not produce rather than return garbage.
+
+        A silently wrong unwrap is a key-substitution attack that ends in `TamperDetected` at the
+        far end of a stream, or -- worse -- in a reader that treats plaintext-shaped noise as data.
+        """
+        if len(wrapped) != WRAP_SALT_BYTES + KEY_BYTES + TAG_BYTES:
+            raise TamperDetected("the wrapped key is not a wrapped key")
+        salt = wrapped[:WRAP_SALT_BYTES]
+        body = wrapped[WRAP_SALT_BYTES:WRAP_SALT_BYTES + KEY_BYTES]
+        tag = wrapped[WRAP_SALT_BYTES + KEY_BYTES:]
+        mask, mac = self._wrap_material(self._kek(ref.tenant_id, ref.data_class), salt)
+        if not hmac.compare_digest(hmac.new(mac, salt + body, hashlib.sha256).digest(), tag):
+            raise TamperDetected("the wrapped key does not authenticate under this KEK")
+        return bytes(a ^ b for a, b in zip(body, mask))
 
 
 class Cipher(Protocol):
@@ -363,10 +452,20 @@ class ObjectCrypto:
     """
 
     def __init__(self, provider: Optional[KeyProvider] = None, *, cipher: Optional[Cipher] = None,
-                 tenant_id: str = "dama", allow_test_cipher: bool = False) -> None:
+                 tenant_id: str = "dama", allow_test_cipher: bool = False,
+                 allow_test_provider: bool = False) -> None:
         self.provider = provider or NoKeyProvider()
         self.cipher = cipher or RefusingCipher()
         self.tenant_id = tenant_id
+        # ⚠️A TEST-ONLY PROVIDER IS REFUSED THE SAME WAY A TEST-ONLY CIPHER IS. The flag existed
+        # and nothing read it, so `InMemoryTestKeyProvider` -- seeded from a literal in this
+        # repository -- could be handed to a production wiring and would seal real evidence under
+        # keys anyone with the source can recompute. Both halves of the boundary now have to be
+        # admitted by name, and the checks run before anything can be sealed.
+        if getattr(self.provider, "is_test_only", False) and not allow_test_provider:
+            raise KeyUnavailable(
+                "%r is a test-only key provider; pass allow_test_provider=True to use it in a test"
+                % (getattr(self.provider, "name", self.provider),))
         if getattr(self.cipher, "is_refusing", False):
             return
         if not getattr(self.cipher, "production_ready", False) and not allow_test_cipher:
@@ -497,8 +596,18 @@ class ObjectCrypto:
         return json.loads(raw.decode("utf-8"))
 
 
-def synthetic_crypto(tenant_id: str = "dama",
-                     seed: bytes = b"phase3-synthetic-test-seed") -> ObjectCrypto:
-    """The only wiring that produces a usable `ObjectCrypto` here, and its keys are synthetic."""
-    return ObjectCrypto(InMemoryTestKeyProvider(seed), cipher=HmacCtrCipher(),
-                        tenant_id=tenant_id, allow_test_cipher=True)
+def synthetic_crypto(tenant_id: str = "dama", seed: Optional[bytes] = None) -> ObjectCrypto:
+    """The only wiring that produces a usable `ObjectCrypto` here, and its keys are synthetic.
+
+    ⚠️THE SEED IS REQUIRED AND IS A TEST INPUT. It used to default to a literal in this file, so
+    one no-argument call anywhere -- including in a future production path -- produced a complete,
+    working, repository-known key hierarchy. Now a caller that wants synthetic keys has to say
+    which synthetic keys, and both test doubles are admitted by name.
+
+    `seed=None` means "make one up for this process": `os.urandom`, never a constant, so a
+    forgotten argument produces keys that do not survive the interpreter rather than keys everyone
+    already has. A test that needs two runs to converge on one ciphertext passes its own seed.
+    """
+    return ObjectCrypto(InMemoryTestKeyProvider(seed if seed is not None else os.urandom(32)),
+                        cipher=HmacCtrCipher(), tenant_id=tenant_id,
+                        allow_test_cipher=True, allow_test_provider=True)

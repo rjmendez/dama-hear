@@ -20,13 +20,23 @@ computed from the bytes just written proves only that the store echoed them back
 says exactly which of the two happened (`digest_source`). Conflating them would mean the strongest
 claim the import can make and the weakest look identical afterwards.
 
-⚠️A RESTRICTED CLASS IS ENCRYPTED OR IT IS NOT IMPORTED. `clip` and `raw` carry ambient audio and
-7-decimal coordinates (key design §8). Without an injected `crypto.ObjectCrypto` -- and the default
-key provider refuses everything -- such a task is quarantined `key_provider_unavailable` and the
-run continues. Nothing in this package invents a key. When a provider *is* injected, the blob id is
+⚠️A RESTRICTED CLASS IS ENCRYPTED OR IT IS NOT IMPORTED. `keys.RESTRICTED_CLASSES` is derived from
+the sensitivity labels, so it is `clip` and `raw` (ambient audio, 7-decimal coordinates) *and*
+`tdoa-arrival-seg` and `tdoa-run`, whose arrival rows are precise locations in a short, guessable
+document (key design §8). Without an injected `crypto.ObjectCrypto` -- and the default key provider
+refuses everything -- such a task is quarantined `key_provider_unavailable` and the run continues.
+Nothing in this package invents a key. When a provider *is* injected, the blob id is
 `HMAC-SHA256(K_tenant_index, plaintext_digest)`, the plaintext digest goes only into the sealed
 metadata sub-document, and every ledger row, counter and quarantine record for that object carries
 the ciphertext digest instead -- a plaintext digest in a key or a log is a confirmation oracle.
+
+⚠️A TRANSIENT STORE FAILURE IS CONTAINED AND RETRIED AT EVERY STEP THAT WRITES. Staging, the blob
+put, the readback, the metadata put and the pointer commit are each idempotent by construction, so
+each is retried `MAX_TRANSIENT_RETRIES` times and an exhausted one quarantines that object as
+`backend_transient` with the run still closing, reporting and exiting non-zero. A backend I/O fault
+(`ENOSPC`, `EIO`) is classified as that transient by the backend itself and is never re-read as
+`source_unreadable`: a full volume is not corrupt evidence, and telling an operator it is sends
+them to re-fetch bytes that were never wrong.
 
 ⚠️ONE OBJECT'S FAILURE ABORTS ONE OBJECT. A readback mismatch, a corrupt source, an unreadable
 file: quarantine that object, count it, keep going -- an import that stops on the first bad byte
@@ -207,6 +217,14 @@ class Importer:
         (C.KeyUnavailable, "key_provider_unavailable", "message"),
         (C.SourceChanged, "source_changed_during_import", "none"),
         (C.TamperDetected, "stored_blob_corrupt", "none"),
+        # ⚠️A STORE THAT KEEPS FAILING QUARANTINES ONE OBJECT, NOT THE RUN. Only the staging put
+        # was ever retried, so a transient on the blob put, the metadata put or the pointer commit
+        # escaped `_one`, escaped `run`, and took the import down with no ledger close, no report
+        # and no quarantine record -- the exact failure the table below exists to prevent, on the
+        # three steps most likely to meet a throttle. It is listed before `OSError` because a
+        # backend fault that arrived as an `ENOSPC` has already been classified as this by
+        # `backend.as_backend_fault`, and must never be re-read as unreadable source data.
+        (B.BackendTransient, "backend_transient", "message"),
         (OSError, "source_unreadable", "type"),
     )
 
@@ -229,11 +247,38 @@ class Importer:
             if named is None:
                 raise
             reason, detail = named
+            # Whatever this object staged is not going to be published, and a staged copy of a
+            # restricted class is ciphertext nobody is coming back for. Removing it is the same
+            # bounded-staging rule the publish path follows, and it is best-effort: a store that
+            # is failing is not a reason to lose the quarantine record.
+            try:
+                self.store.delete_staged(self.run_id, task.task_id)
+            except Exception:  # noqa: BLE001 - cleanup must never replace the real failure
+                pass
             if detail is None:
                 self._quarantine(task, report, reason)
             else:
                 self._quarantine(task, report, reason, detail=detail)
             return "quarantined"
+
+    def _with_transient_retry(self, task: ImportTask, report: RunReport, step: str, call):
+        """Run one backend step, retrying a `BackendTransient` and containing an exhausted one.
+
+        Every step this wraps is idempotent by construction -- an immutable create-if-absent, a
+        digest-addressed metadata write, a pointer commit that replays or rolls forward -- which is
+        what makes a retry safe rather than a second publish. When the budget is gone the exception
+        is re-raised and `_one_guarded` turns it into one `backend_transient` quarantine record.
+        """
+        last: Optional[B.BackendTransient] = None
+        for attempt in range(1, MAX_TRANSIENT_RETRIES + 1):
+            try:
+                return call()
+            except B.BackendTransient as exc:
+                last = exc
+                report.counters["retries"] += 1
+                self.ledger.append("failed", task_id=task.task_id, attempt=attempt, step=step,
+                                   error_class="backend_transient", retryable=True)
+        raise B.BackendTransient("%s failed %d times: %s" % (step, MAX_TRANSIENT_RETRIES, last))
 
     def _stage_guarded(self, task: ImportTask, report: RunReport,
                        restricted: bool) -> Tuple["StagedFacts", Optional[B.StagedRef]]:
@@ -327,13 +372,18 @@ class Importer:
         # -------------------------------------------------------------- blob
         blob_key = K.blob_key(sealed.blob_id, algo=sealed.blob_algo,
                               tenant=self.tenant_id if restricted else None)
-        put = self.store.put_immutable_stream(
-            blob_key, self.store.range_source(staged.key, chunk_bytes=self.chunk_bytes))
+        put = self._with_transient_retry(
+            task, report, "blob_put",
+            lambda: self.store.put_immutable_stream(
+                blob_key, self.store.range_source(staged.key, chunk_bytes=self.chunk_bytes)))
         deduped = not put.created
         if deduped:
             # Existing-blob trust is verified, not assumed: the only thing that catches silent
             # storage corruption is re-reading the blob before pointing a new object at it.
-            stored = S.digest_source(self.store.range_source(blob_key, chunk_bytes=self.chunk_bytes))
+            stored = self._with_transient_retry(
+                task, report, "blob_readback",
+                lambda: S.digest_source(self.store.range_source(blob_key,
+                                                                chunk_bytes=self.chunk_bytes)))
             if stored.digest != stored_digest or stored.bytes != sealed.stored_bytes:
                 self._quarantine(task, report, "stored_blob_corrupt",
                                  expected=self._public(task, expected, stored_digest))
@@ -345,7 +395,8 @@ class Importer:
         meta = self._metadata(task, sealed, blob_key)
         meta_body = K.canonical_json(meta)
         mkey = K.meta_key(task.object_class, task.logical_id, K.sha256_hex(meta_body))
-        mput = self.store.put_immutable(mkey, meta_body)
+        mput = self._with_transient_retry(
+            task, report, "metadata_put", lambda: self.store.put_immutable(mkey, meta_body))
         report.counters["bytes_written"] += mput.bytes_written
 
         # ------------------------------------------------------------ commit
@@ -363,19 +414,23 @@ class Importer:
 
         for attempt in range(1, attempts + 1):
             if task.republish:
-                head = self.store.head(okey)
+                head = self._with_transient_retry(task, report, "pointer_head",
+                                                  lambda: self.store.head(okey))
                 current = head.generation if head else 0
                 if expect_generation is None or attempt > 1:
                     expect_generation = current
                 generation = current + 1
             doc = {"object_key": okey, "blob_key": blob_key, "meta_key": mkey,
                    "generation": generation, "state": "published",
-                   "lease_epoch": self.lease.epoch if self.lease else None}
+                   "lease_epoch": self.lease.epoch if self.lease else None,
+                   "lease_token": self.lease.token if self.lease else None}
             if task.republish:
                 doc["supersedes"] = generation - 1 if generation > 1 else None
-            commit = self.store.commit_pointer(
-                okey, doc, lease=self.lease,
-                expect_generation=expect_generation if task.republish else None)
+            commit = self._with_transient_retry(
+                task, report, "pointer_commit",
+                lambda: self.store.commit_pointer(
+                    okey, doc, lease=self.lease,
+                    expect_generation=expect_generation if task.republish else None))
 
             if commit.outcome == "generation_conflict":
                 report.counters["generation_retries"] += 1
@@ -474,7 +529,8 @@ class Importer:
             except B.BackendTransient:
                 report.counters["retries"] += 1
                 self.ledger.append("failed", task_id=task.task_id, attempt=attempt,
-                                   error_class="backend_transient", retryable=True)
+                                   step="staging_put", error_class="backend_transient",
+                                   retryable=True)
         return None
 
     def _public(self, task: ImportTask, plaintext_digest: Optional[str],
