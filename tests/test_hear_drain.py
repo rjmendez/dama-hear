@@ -86,6 +86,43 @@ class TestGetEnforcesAHardWallClockBound:
         assert exc_info.value.code == 404
 
 
+class TestFetchSdRetrying:
+    def test_a_transport_failure_is_retried_and_then_succeeds(self, monkeypatch):
+        calls, slept = [], []
+
+        def flaky(ip, name, timeout=None, tail=None):
+            calls.append((name, tail, timeout))
+            if len(calls) < 3:
+                raise TimeoutError("sd stalled")
+            return b"node,ts\n"
+
+        monkeypatch.setattr(HD, "fetch_sd", flaky)
+        body, err, attempts = HD.fetch_sd_retrying("10.0.0.1", "dets.csv", timeout=7.0,
+                                                   sleep=lambda s: slept.append(s))
+        assert body == b"node,ts\n"
+        assert err is None
+        assert attempts == 3
+        assert calls == [("dets.csv", None, 7.0)] * 3
+        assert slept == [HD.SD_RETRY_BACKOFF_S, HD.SD_RETRY_BACKOFF_S * 2]
+
+    def test_an_http_404_is_not_retried(self, monkeypatch):
+        import urllib.error
+
+        calls = []
+
+        def gone(ip, name, timeout=None, tail=None):
+            calls.append((name, tail, timeout))
+            raise urllib.error.HTTPError("http://10.0.0.1/sd?file=%s" % name,
+                                         404, "Not Found", {}, None)
+
+        monkeypatch.setattr(HD, "fetch_sd", gone)
+        body, err, attempts = HD.fetch_sd_retrying("10.0.0.1", "scene.csv", timeout=5.0)
+        assert body is None
+        assert "HTTPError 404" in err
+        assert attempts == 1
+        assert calls == [("scene.csv", None, 5.0)]
+
+
 # ---------------------------------------------------------------- fixture scene.csv
 
 def _mel_hex(bands=20, slices=4, seed=1):
@@ -487,6 +524,28 @@ class TestThereIsNoCatchUp:
 
 
 class TestLsFailure:
+    def test_a_transient_scene_tail_failure_is_retried_and_then_ingested(self, tmp_path, wired,
+                                                                         monkeypatch):
+        pl = P.Pool(str(tmp_path / "pool"))
+        n = wired()
+        n.grow(200)
+        real = HD.fetch_sd
+        calls = []
+
+        def flaky(ip, name, timeout=None, tail=None):
+            if name == "scene.csv" and tail:
+                calls.append((name, tail))
+                if len(calls) == 1:
+                    raise TimeoutError("first tail stalled")
+            return real(ip, name, timeout, tail=tail)
+
+        monkeypatch.setattr(HD, "fetch_sd", flaky)
+        r = _drain(pl, n, 20_000)
+        assert calls == [("scene.csv", 20_000), ("scene.csv", 20_000)]
+        scene = [f for f in r["files"] if f["name"] == "scene.csv"][0]
+        assert scene["ingested"] is True
+        assert r["scene_added"] > 0 and r["ok"] is True
+
     def test_an_unreachable_ls_reads_as_unknown_and_never_as_clean(self, tmp_path, wired,
                                                                    monkeypatch):
         pl = P.Pool(str(tmp_path / "pool"))
