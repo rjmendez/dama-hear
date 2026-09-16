@@ -237,6 +237,42 @@ class TestTheClipLaneIsBounded:
             "activeDeadlineSeconds %s is not shorter than the 900 s schedule, so it cannot stop "
             "a run from eating the next tick" % m.group(1))
 
+    def test_the_clip_lane_cannot_exceed_the_pod_deadline_across_every_node(self, blocks):
+        # ⚠️2026-09-16 INCIDENT: `--clip-deadline-s` bounds ONE node's clip lane, but
+        # `drain_clips()` runs STRICTLY SEQUENTIALLY, one node at a time (the ESP32 refuses a
+        # second client rather than queueing). There is no cross-node cap, so the clip lane's
+        # worst case is `num_nodes * --clip-deadline-s`, not `--clip-deadline-s` once. That
+        # arithmetic was invisible for months because `--clip-max-per-node 0` made every node's
+        # clip lane a no-op during privacy mode; the first live cycle after retention was
+        # restored hit it, the pod was killed by activeDeadlineSeconds mid-fetch, and the purge
+        # step at the end of this script never ran that cycle. This test makes the arithmetic a
+        # standing invariant instead of something re-derived by hand during the next incident.
+        with open(MANIFEST) as fh:
+            text = fh.read()
+        m_deadline = re.search(r"activeDeadlineSeconds:\s*(\d+)", text)
+        assert m_deadline, "no activeDeadlineSeconds to check the clip lane against"
+        pod_deadline_s = int(m_deadline.group(1))
+
+        m_clip = re.search(r"--clip-deadline-s\s+(\d+)", blocks["drain"])
+        assert m_clip, "no --clip-deadline-s in the drain block"
+        clip_deadline_s = int(m_clip.group(1))
+
+        num_nodes = len(re.findall(r"--node\s+\S+=\S+", blocks["drain"]))
+        assert num_nodes > 0, "no --node flags found in the drain block"
+
+        worst_case_clip_s = num_nodes * clip_deadline_s
+        # Leave real room for dets/scene fetch (measured 218-307 s historically) and the purge
+        # step (measured ~a few seconds for tens of clips; unmeasured at fleet scale, so budgeted
+        # generously) on top of the worst-case clip lane -- not just barely under the deadline.
+        margin_s = pod_deadline_s - worst_case_clip_s
+        assert margin_s >= 200, (
+            "worst-case clip lane is %d nodes * %d s = %d s, leaving only %d s of the %d s pod "
+            "deadline for dets/scene fetch and the purge step. A slow-but-alive node (not a dead "
+            "one -- a dead node fails dets and skips its clip lane entirely) can make every node "
+            "spend its full clip-deadline-s, and the purge step never running is a same-cycle "
+            "privacy exposure, not just a missed tick."
+            % (num_nodes, clip_deadline_s, worst_case_clip_s, margin_s, pod_deadline_s))
+
     def test_the_clip_retention_policy_is_declared_rather_than_defaulted(self, blocks):
         # Live policy retains voice WAVs only long enough to score and purge them: retention is
         # explicit and non-zero, but it must never appear WITHOUT the same-run purge gate that
