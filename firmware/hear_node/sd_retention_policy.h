@@ -11,7 +11,8 @@
 enum {
   SD_CACHE_PROTECTED = 0,
   SD_CACHE_ROLLING = 1,
-  SD_CACHE_UNKNOWN_ROLLING = 2,
+  SD_CACHE_SPOOL = 2,
+  SD_CACHE_UNKNOWN_ROLLING = 3,
 };
 
 typedef struct { char path[80]; char key[96]; uint32_t size; } sd_cache_ent_t;
@@ -39,9 +40,11 @@ static inline uint64_t sd_cache_target_free_bytes(uint64_t total_bytes) {
 }
 
 static inline int sd_cache_classify_path(const char *path, int is_dir) {
-  const char *base = sd_cache_base(path);
   if (!path || !path[0] || strcmp(path, "/") == 0) return SD_CACHE_PROTECTED;
+  if (strcmp(path, "/spool") == 0 || sd_cache_has_prefix(path, "/spool/")) return SD_CACHE_SPOOL;
   if (is_dir) return strcmp(path, "/clips") == 0 ? SD_CACHE_ROLLING : SD_CACHE_PROTECTED;
+
+  const char *base = sd_cache_base(path);
 
   if (strcmp(path, "/gate.cfg") == 0 || strcmp(path, "/gps.cfg") == 0 ||
       sd_cache_has_suffix(base, ".cfg") || sd_cache_has_suffix(base, ".json") ||
