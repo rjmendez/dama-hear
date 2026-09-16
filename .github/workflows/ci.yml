@@ -152,10 +152,23 @@ jobs:
         run: python tools/hear_durable_pg_testdb.py --self-test
       - name: migration files are still additive and reversible
         run: python tools/hear_durable_pg.py --check
+      - name: cut-over rehearsal (synthetic corpus, scratch database, receipt)
+        run: >-
+          python tools/hear_durable_cutover_rehearsal.py
+          --workdir "${RUNNER_TEMP}/rehearsal"
+          --dsn "${HEAR_PG_TEST_DSN}"
+          --out "${RUNNER_TEMP}/cutover-rehearsal-receipt.json"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: cutover-rehearsal-receipt
+          path: ${{ runner.temp }}/cutover-rehearsal-receipt.json
+          if-no-files-found: warn
       - run: >-
           python -m pytest -q -rs --color=yes
           tests/test_hear_durable_pg_schema.py
           tests/test_hear_durable_pg_store_parity.py
+          tests/test_hear_durable_cutover_rehearsal.py
 
   firmware:
     uses: ./.github/workflows/firmware.yml
