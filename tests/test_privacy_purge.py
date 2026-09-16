@@ -923,6 +923,26 @@ def test_a_non_finite_sample_never_produces_a_confident_silence(bad):
     assert receipt.as_record()["fail_closed_reason"] == P.REASON_INFERENCE
 
 
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_a_non_finite_sample_is_purged_rather_than_kept(tmp_path, bad):
+    """The refusal above, seen from the only place it matters: what happened to the audio."""
+    path = clip_at(tmp_path, "corrupt.wav", SIG.speech_like())
+    samples = np.asarray(SIG.speech_like(), dtype=np.float32).copy()
+    samples[100] = bad
+
+    class Corrupting:
+        name = "corrupting_stub"
+
+        def detect(self, _samples, rate):
+            with np.errstate(all="ignore"):
+                return P.inspect_samples(samples, rate, band_energy())
+
+    outcome = P.purge_clip(path, Corrupting())
+    assert outcome.status == "purged"
+    assert not os.path.exists(path)
+    assert outcome.receipt.fail_closed_reason
+
+
 def test_the_audit_log_stays_strict_json(tmp_path):
     """NaN is not JSON, and an audit log a strict reader rejects -- jq, Go, a COPY -- is not one.
 

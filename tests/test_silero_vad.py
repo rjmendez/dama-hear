@@ -94,10 +94,18 @@ def vad() -> V.SileroVAD:
 
 # -- the fallback is announced, never silently substituted -------------------------------------
 
-def test_absent_weights_fall_back_to_the_synthetic_engine_and_say_so(tmp_path):
-    engine = V.SileroVAD(str(tmp_path / "not-here.onnx"))
+def test_absent_weights_fall_back_to_the_synthetic_engine_and_say_so(monkeypatch, tmp_path):
+    monkeypatch.delenv(V.MODEL_ENV, raising=False)
+    monkeypatch.chdir(tmp_path)
+    engine = V.SileroVAD()
     assert isinstance(engine.engine, V.SyntheticVADEngine)
     assert engine.uses_real_model is False
+
+
+def test_a_model_path_the_caller_named_must_load_rather_than_fall_back(tmp_path):
+    """Being pointed at a file and answering with something else's arithmetic is not a fallback."""
+    with pytest.raises(V.ModelUnavailable):
+        V.SileroVAD(str(tmp_path / "not-here.onnx"))
 
 
 def test_a_caller_that_destroys_data_can_refuse_the_fallback(tmp_path):
@@ -191,9 +199,11 @@ def test_a_threshold_outside_zero_to_one_is_refused(vad):
 # -- the window contract: 576 samples, not 512 ---------------------------------------------------
 
 def test_the_window_is_the_hop_prefixed_with_a_context_tail():
-    assert V.CHUNK_SAMPLES == {8000: 256, 16000: 512}
-    assert V.CONTEXT_SAMPLES == {8000: 32, 16000: 64}
-    assert V.WINDOW_SAMPLES == {8000: 288, 16000: 576}
+    assert (V.CHUNK_SAMPLES, V.CONTEXT_SAMPLES, V.WINDOW_SAMPLES) == (512, 64, 576)
+    assert V.MODEL_SAMPLE_RATE == V.MODEL_RATE_HZ == 16000
+    assert V.CHUNK_SAMPLES_BY_RATE == {8000: 256, 16000: 512}
+    assert V.CONTEXT_SAMPLES_BY_RATE == {8000: 32, 16000: 64}
+    assert V.WINDOW_SAMPLES_BY_RATE == {8000: 288, 16000: 576}
     engine = V.SileroVAD()
     assert (engine.hop, engine.context_samples, engine.window) == (512, 64, 576)
     assert math.isclose(engine.hop / float(FS), 0.032)
@@ -242,41 +252,48 @@ def test_the_canary_signal_is_generated_and_is_speech_shaped(vad):
 # -- stateless scoring is reproducible, streaming state is carried -------------------------------
 
 def test_a_fresh_state_is_zero_in_both_halves(vad):
-    state = vad.new_state()
+    state = vad._zero_state()
     assert state.rnn.shape == V.STATE_SHAPE
     assert state.context.size == vad.context_samples
     assert state.is_zero() is True
 
 
-def test_score_chunk_is_stateless_and_repeatable(vad):
+def test_score_chunk_isolated_is_repeatable_and_leaves_the_stream_alone(vad):
     chunk = voice(0.2)[:vad.hop]
-    first, state_a = vad.score_chunk(chunk)
-    second, state_b = vad.score_chunk(chunk)
+    first, state_a = vad.score_chunk_isolated(chunk)
+    second, state_b = vad.score_chunk_isolated(chunk)
     assert first == second
     assert np.array_equal(state_a.rnn, state_b.rnn)
     assert np.array_equal(state_a.context, state_b.context)
-    assert vad.state.is_zero() is True
+    assert vad._state.is_zero() is True
 
 
 def test_the_next_state_carries_the_hops_own_tail_as_context(vad):
     chunk = voice(0.2)[:vad.hop]
-    _, state = vad.score_chunk(chunk)
+    _, state = vad.score_chunk_isolated(chunk)
     assert state.context == pytest.approx(chunk[-vad.context_samples:], abs=1e-6)
 
 
-def test_push_advances_both_halves_and_reset_clears_both(vad):
-    vad.push(voice(0.2)[:vad.hop])
-    assert vad.state.rnn.any()
-    assert vad.state.context.any()
+def test_score_chunk_advances_both_halves_and_reset_clears_both(vad):
+    assert isinstance(vad.score_chunk(voice(0.2)[:vad.hop]), float)
+    assert vad._state.rnn.any()
+    assert vad._state.context.any()
     vad.reset()
-    assert vad.state.is_zero() is True
+    assert vad._state.is_zero() is True
+
+
+def test_the_stream_memory_is_not_a_public_attribute(vad):
+    """Contract §3.2 rule 6: the context tail is 4 ms of PCM, so nothing can reach it by name."""
+    list(vad.score_stream(voice(0.5)))
+    public = {name for name in dir(vad) if not name.startswith("_")}
+    assert not {name for name in public if "state" in name.lower()}
 
 
 def test_streaming_a_clip_hop_by_hop_matches_scoring_it_whole(vad):
     clip = voice(1.0)
     whole = vad.probabilities(clip)
     vad.reset()
-    piecewise = [vad.push(clip[i:i + vad.hop])
+    piecewise = [vad.score_chunk(clip[i:i + vad.hop])
                  for i in range(0, (clip.size // vad.hop) * vad.hop, vad.hop)]
     assert piecewise == pytest.approx(whole[:len(piecewise)])
 
@@ -288,56 +305,57 @@ def test_a_dropped_context_changes_the_answer_so_it_is_not_a_buffering_detail(va
     vad.reset()
     partial = []
     for i in range(0, (clip.size // vad.hop) * vad.hop, vad.hop):
-        state = vad.state
+        state = vad._state.copy()
         state.context[:] = 0.0
-        vad.state = state
-        partial.append(vad.push(clip[i:i + vad.hop]))
+        vad._restore_state(state)
+        partial.append(vad.score_chunk(clip[i:i + vad.hop]))
     assert partial != pytest.approx(carried[:len(partial)])
 
 
-def test_state_is_a_copy_so_a_caller_cannot_mutate_it_from_underneath(vad):
-    vad.push(voice(0.2)[:vad.hop])
-    snapshot = vad.state
+def test_a_restored_state_is_a_copy_so_a_caller_cannot_mutate_it_from_underneath(vad):
+    vad.score_chunk(voice(0.2)[:vad.hop])
+    snapshot = vad._state.copy()
+    vad._restore_state(snapshot)
     snapshot.rnn[:] = 0.0
     snapshot.context[:] = 0.0
-    assert vad.state.rnn.any()
-    assert vad.state.context.any()
+    assert vad._state.rnn.any()
+    assert vad._state.context.any()
 
 
 def test_half_a_state_is_refused_because_a_partial_reset_is_the_silent_failure(vad):
     with pytest.raises(V.SileroVADError):
-        vad.state = np.zeros(V.STATE_SHAPE, dtype=np.float32)
+        vad._restore_state(np.zeros(V.STATE_SHAPE, dtype=np.float32))
     with pytest.raises(V.SileroVADError):
-        vad.state = V.StreamState(rnn=np.zeros((1, 1, 8), dtype=np.float32),
-                                  context=np.zeros(64, dtype=np.float32))
+        vad._restore_state(V.StreamState(rnn=np.zeros((1, 1, 8), dtype=np.float32),
+                                         context=np.zeros(64, dtype=np.float32)))
     with pytest.raises(V.SileroVADError):
-        vad.state = V.StreamState(rnn=np.zeros(V.STATE_SHAPE, dtype=np.float32),
-                                  context=np.zeros(16, dtype=np.float32))
+        vad._restore_state(V.StreamState(rnn=np.zeros(V.STATE_SHAPE, dtype=np.float32),
+                                         context=np.zeros(16, dtype=np.float32)))
 
 
 def test_a_restored_state_reproduces_the_stream_that_produced_it(vad):
     clip = voice(1.0)
-    first = list(vad.stream(clip, reset=True))
-    checkpoint = vad.state
-    tail_a = list(vad.stream(clip, reset=False))
-    vad.state = checkpoint
-    tail_b = list(vad.stream(clip, reset=False))
+    first = list(vad.score_stream(clip, reset=True))
+    checkpoint = vad._state.copy()
+    tail_a = list(vad.score_stream(clip, reset=False))
+    vad._restore_state(checkpoint)
+    tail_b = list(vad.score_stream(clip, reset=False))
     assert tail_a == tail_b
     assert len(first) == len(tail_a)
 
 
 def test_a_clip_is_scored_from_a_state_proven_zero(vad):
-    vad.push(voice(0.2)[:vad.hop])
+    vad.score_chunk(voice(0.2)[:vad.hop])
     scored = vad.score_clip(voice(1.0))
     assert scored.state_reset_confirmed is True
     assert scored.frames == len(scored.probabilities)
 
 
 def test_a_failed_call_resets_the_stream_rather_than_resuming_from_it(vad):
-    vad.push(voice(0.2)[:vad.hop])
+    vad.score_chunk(voice(0.2)[:vad.hop])
     with pytest.raises(V.SileroVADError):
-        vad.push(np.zeros(vad.hop + 1, dtype=np.float32))
-    assert vad.state.is_zero() is True
+        vad.score_chunk(np.zeros(vad.hop + 1, dtype=np.float32))
+    assert vad._state.is_zero() is True
 
 
 # -- frame boundaries and malformed buffers ------------------------------------------------------
@@ -345,7 +363,7 @@ def test_a_failed_call_resets_the_stream_rather_than_resuming_from_it(vad):
 def test_a_chunk_that_is_not_a_whole_hop_is_refused_not_padded(vad):
     for size in (vad.hop + 1, vad.hop - 1, vad.window):
         with pytest.raises(V.SileroVADError):
-            vad.score_chunk(np.zeros(size, dtype=np.float32))
+            vad.score_chunk_isolated(np.zeros(size, dtype=np.float32))
 
 
 def test_a_partial_final_hop_is_dropped_and_counted(vad):
@@ -386,11 +404,15 @@ def test_int16_pcm_is_scaled_rather_than_scored_as_thousands(vad):
     assert vad.is_speech(as_int16) is True
 
 
-def test_stereo_is_mixed_to_mono_on_the_way_in(vad):
+def test_a_single_channel_2d_buffer_is_flattened_but_real_stereo_is_refused(vad):
+    """A mixdown can cancel the one channel that holds the voice, so it is the caller's call."""
     clip = voice(1.0)
-    stereo = np.stack([clip, clip])
-    assert V.as_mono_float32(stereo) == pytest.approx(clip, abs=1e-6)
-    assert vad.is_speech(stereo) is True
+    assert V.as_mono_float32(clip.reshape(1, -1)) == pytest.approx(clip, abs=1e-6)
+    assert V.as_mono_float32(clip.reshape(-1, 1)) == pytest.approx(clip, abs=1e-6)
+    with pytest.raises(V.SileroVADError):
+        V.as_mono_float32(np.stack([clip, clip]))
+    with pytest.raises(V.SileroVADError):
+        vad.is_speech(np.stack([clip, clip], axis=1))
 
 
 def test_a_python_list_is_as_good_as_an_array(vad):
@@ -525,17 +547,17 @@ def test_the_onnx_engine_feeds_the_graph_and_carries_its_state(tmp_path, split_s
     # are zero, so the mean it returns is the one predicted for that window and not for the hop.
     hop = np.full(engine.hop, 0.25, dtype=np.float32)
     expected = 0.25 * engine.hop / float(engine.window)
-    probability, state = engine.score_chunk(hop)
+    probability, state = engine.score_chunk_isolated(hop)
     assert probability == pytest.approx(expected, abs=1e-6)
     assert state.rnn.shape == engine.engine.state_shape
     assert float(state.rnn[0, 0, 0]) == pytest.approx(expected, abs=1e-6)
     assert state.context == pytest.approx(hop[-engine.context_samples:])
 
     # The second hop sees the first one's state and context, which is the whole point.
-    assert engine.push(hop) == pytest.approx(expected, abs=1e-6)
-    assert engine.push(hop) == pytest.approx(0.25, abs=1e-6)
+    assert engine.score_chunk(hop) == pytest.approx(expected, abs=1e-6)
+    assert engine.score_chunk(hop) == pytest.approx(0.25, abs=1e-6)
     engine.reset()
-    assert engine.state.is_zero() is True
+    assert engine._state.is_zero() is True
 
 
 def test_a_graph_that_declares_the_wrong_window_is_refused(tmp_path):
@@ -653,7 +675,8 @@ def test_an_injected_session_is_never_swapped_for_the_fallback():
     stub = StubSession(declared_window=512)
     with pytest.raises(V.WindowContractViolated):
         V.SileroVAD(session=stub)
-    assert isinstance(V.SileroVAD("no-such-model.onnx").engine, V.SyntheticVADEngine)
+    with pytest.raises(V.ModelUnavailable):
+        V.SileroVAD("no-such-model.onnx")
 
 
 def test_an_injected_v4_session_is_recognised_by_its_signature():
@@ -661,7 +684,7 @@ def test_an_injected_v4_session_is_recognised_by_its_signature():
     assert vad.engine.split_state is True
     assert vad.engine.state_shape == V.V4_STATE_SHAPE
     assert vad.engine.name == "silero_vad_v4_onnx_injected_session"
-    assert vad.new_state().rnn.shape == V.V4_STATE_SHAPE
+    assert vad._zero_state().rnn.shape == V.V4_STATE_SHAPE
 
 
 def test_load_vad_accepts_an_injected_session_and_the_canary_runs_against_it():
@@ -744,10 +767,11 @@ def test_the_geometry_the_golden_was_measured_under_is_the_geometry_the_module_u
     frame = GOLDEN["frame"]
     rate = frame["rate_hz"]
     assert rate == V.MODEL_RATE_HZ
-    assert frame["chunk_samples"] == V.CHUNK_SAMPLES[rate]
-    assert frame["context_samples"] == V.CONTEXT_SAMPLES[rate]
+    assert frame["chunk_samples"] == V.CHUNK_SAMPLES == V.CHUNK_SAMPLES_BY_RATE[rate]
+    assert frame["context_samples"] == V.CONTEXT_SAMPLES == V.CONTEXT_SAMPLES_BY_RATE[rate]
     assert tuple(frame["state_shape"]) == tuple(V.STATE_SHAPE)
-    assert frame["chunk_samples"] + frame["context_samples"] == V.WINDOW_SAMPLES[rate]
+    assert (frame["chunk_samples"] + frame["context_samples"]
+            == V.WINDOW_SAMPLES == V.WINDOW_SAMPLES_BY_RATE[rate])
 
 
 @pytest.mark.parametrize("name", [f[0] for f in SHARED])
