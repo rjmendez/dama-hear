@@ -1,4 +1,5 @@
 """The hear heartbeat receiver: schema guard, TTL write, and advisory event intake."""
+import hashlib
 import json
 import os
 import socket
@@ -14,7 +15,9 @@ from typing import Dict
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hear.ingest import batch as BA  # noqa: E402
 from tools import hear_heartbeat_receiver as HR  # noqa: E402
+from tools import gen_ingest_contracts as GEN  # noqa: E402
 
 
 def redis_cluster_key_slot(key: str) -> int:
@@ -301,6 +304,7 @@ class TestValidation:
 
 @contextmanager
 def running_server(auth_token=None, socket_timeout_s=0.2, durable_store=None, fake=None,
+                   batch_adapter=None,
                    durable_replay_interval_s=0.0, durable_replay_limit=HR.DURABLE_REPLAY_LIMIT,
                    durable_prune_interval_s=0.0, durable_retention_days=HR.DURABLE_RETENTION_DAYS):
     fake = fake if fake is not None else FakeRedis()
@@ -313,6 +317,7 @@ def running_server(auth_token=None, socket_timeout_s=0.2, durable_store=None, fa
     server = HR.create_server(
         "127.0.0.1", 0, store, max_body_bytes=2048,
         auth_token=auth_token, socket_timeout_s=socket_timeout_s,
+        batch_adapter=batch_adapter,
         durable_replay_interval_s=durable_replay_interval_s,
         durable_replay_limit=durable_replay_limit,
         durable_prune_interval_s=durable_prune_interval_s,
@@ -433,6 +438,209 @@ class TestHttpIntegration(TestValidation):
         assert _parse_port("8080") == 8080
         assert _parse_port("tcp://10.43.154.155:5051") == 5051
         assert _parse_port("invalid", 5051) == 5051
+
+
+def _batch_credentials(tmp_path):
+    path = tmp_path / "batch-credentials.json"
+    doc = {
+        "credentials": [
+            {
+                "principal_id": "node:nyquist",
+                "site_id": GEN.BASE["site_id"],
+                "scope": "device",
+                "device_id": GEN.DEVICE_ID,
+                "permissions": ["ingest:write"],
+                "key_id": "k-2026-09",
+                "token_sha256": hashlib.sha256(b"node-secret").hexdigest(),
+            },
+            {
+                "principal_id": "svc:hear-drain-shadow",
+                "site_id": GEN.BASE["site_id"],
+                "scope": "site",
+                "permissions": ["ingest:write"],
+                "key_id": "k-2026-09",
+                "token_sha256": hashlib.sha256(b"site-secret").hexdigest(),
+            },
+        ]
+    }
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
+def _batch_adapter(tmp_path, durable_store, before_receipt_store=None):
+    return HR.BatchIngestAdapter.from_config(
+        durable_store,
+        str(_batch_credentials(tmp_path)),
+        raw_root=str(tmp_path / "batch-raw"),
+        adapter_version="test",
+    ) if before_receipt_store is None else HR.BatchIngestAdapter(
+        durable_store,
+        HR.BatchCredentialStore.from_file(str(_batch_credentials(tmp_path))),
+        raw_root=str(tmp_path / "batch-raw"),
+        adapter_version="test",
+        before_receipt_store=before_receipt_store,
+    )
+
+
+class TestBatchIngestRoute:
+    @staticmethod
+    def _post(url, frame, *, token="node-secret", headers=None):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(frame).encode("utf-8"),
+            headers={
+                "Content-Type": BA.BATCH_CODEC_MEDIA_TYPES["json"],
+                "Authorization": f"Bearer {token}",
+                "Idempotency-Key": "idem-1",
+                "Accept": BA.RECEIPT_MEDIA_TYPE,
+                **(headers or {}),
+            },
+            method="POST",
+        )
+        return urllib.request.urlopen(req, timeout=2)
+
+    def test_batch_route_requires_bearer_auth(self, tmp_path):
+        durable = HR.make_durable_store("sqlite", str(tmp_path / "heartbeats.sqlite3"))
+        adapter = _batch_adapter(tmp_path, durable)
+        with running_server(durable_store=durable, batch_adapter=adapter) as (
+            base_url, _fake, _addr, _server,
+        ):
+            req = urllib.request.Request(
+                base_url + "/v1/ingest/batches",
+                data=json.dumps(GEN._batch_valid()).encode("utf-8"),
+                headers={
+                    "Content-Type": BA.BATCH_CODEC_MEDIA_TYPES["json"],
+                    "Idempotency-Key": "idem-1",
+                },
+                method="POST",
+            )
+            with pytest.raises(urllib.error.HTTPError) as ei:
+                urllib.request.urlopen(req, timeout=2)
+            assert ei.value.code == 401
+            body = json.loads(ei.value.read().decode("utf-8"))
+            assert body["code"] == "credential_missing"
+
+    def test_batch_route_enforces_limits_and_media_type(self, tmp_path):
+        durable = HR.make_durable_store("sqlite", str(tmp_path / "heartbeats.sqlite3"))
+        adapter = _batch_adapter(tmp_path, durable)
+        with running_server(durable_store=durable, batch_adapter=adapter) as (
+            base_url, _fake, _addr, _server,
+        ):
+            with pytest.raises(urllib.error.HTTPError) as ei:
+                self._post(base_url + "/v1/ingest/batches", GEN._batch_valid(),
+                           headers={"Content-Type": "application/cbor"})
+            assert ei.value.code == 415
+            too_many = GEN._batch_too_many_items()
+            with pytest.raises(urllib.error.HTTPError) as ei2:
+                self._post(base_url + "/v1/ingest/batches", too_many,
+                           headers={"Content-Type": "application/json"})
+            assert ei2.value.code == 422
+            body = json.loads(ei2.value.read().decode("utf-8"))
+            assert body["code"] == "batch_too_many_items"
+
+    def test_batch_route_replays_a_stored_receipt_for_the_same_key_and_body(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        adapter = _batch_adapter(tmp_path, durable)
+        with running_server(durable_store=durable, batch_adapter=adapter) as (
+            base_url, _fake, _addr, _server,
+        ):
+            with self._post(base_url + "/v1/ingest/batches", GEN._batch_valid()) as resp:
+                first = resp.read()
+            with self._post(base_url + "/v1/ingest/batches", GEN._batch_valid()) as resp:
+                second = resp.read()
+            assert first == second
+            receipt = json.loads(first.decode("utf-8"))
+            assert receipt["counts"]["accepted"] == 3
+            assert receipt["counts"]["duplicate"] == 0
+            changed = GEN._batch_valid()
+            changed["batch_id"] = "018f2c1a-batch-9999"
+            req = urllib.request.Request(
+                base_url + "/v1/ingest/batches",
+                data=json.dumps(changed).encode("utf-8"),
+                headers={
+                    "Content-Type": BA.BATCH_CODEC_MEDIA_TYPES["json"],
+                    "Authorization": "Bearer node-secret",
+                    "Idempotency-Key": "idem-1",
+                },
+                method="POST",
+            )
+            with pytest.raises(urllib.error.HTTPError) as ei:
+                urllib.request.urlopen(req, timeout=2)
+            assert ei.value.code == 409
+
+    def test_batch_route_updates_spool_metrics_for_future_producers(self, tmp_path):
+        durable = HR.make_durable_store("sqlite", str(tmp_path / "heartbeats.sqlite3"))
+        adapter = _batch_adapter(tmp_path, durable)
+        with running_server(durable_store=durable, batch_adapter=adapter) as (
+            base_url, _fake, _addr, _server,
+        ):
+            with self._post(base_url + "/v1/ingest/batches", GEN._batch_valid()) as resp:
+                assert resp.status == 200
+            gapped = GEN._batch_valid()
+            gapped["batch_id"] = "018f2c1a-batch-0010"
+            gapped["producer"]["batch_sequence"] = 10
+            with self._post(base_url + "/v1/ingest/batches", gapped,
+                            headers={"Idempotency-Key": "idem-2"}) as resp:
+                assert resp.status == 200
+            with urllib.request.urlopen(base_url + "/metrics", timeout=2) as resp:
+                body = resp.read().decode("utf-8")
+        assert 'ingest_producer_spool_backlog{site="site-quarry-north",device_id="nyquist",' \
+               'source="batch-http",adapter="ingest-batch"} 118' in body
+        assert 'ingest_ack_gap_items_sum{site="site-quarry-north",device_id="nyquist",' \
+               'source="batch-http",adapter="ingest-batch"} 0' in body
+        assert 'ingest_sequence_gaps_total{site="site-quarry-north",device_id="nyquist",' \
+               'source="batch-http",adapter="ingest-batch"} 2' in body
+
+    def test_batch_route_translates_legacy_items_before_receipting(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        adapter = _batch_adapter(tmp_path, durable)
+        with running_server(durable_store=durable, batch_adapter=adapter) as (
+            base_url, _fake, _addr, _server,
+        ):
+            with self._post(base_url + "/v1/ingest/batches", GEN._batch_legacy_messages()) as resp:
+                receipt = json.loads(resp.read().decode("utf-8"))
+        assert receipt["ack_through_index"] == 1
+        assert [row["classification"] for row in receipt["results"]] == [BA.TRANSLATED, BA.TRANSLATED]
+        assert receipt["counts"]["accepted"] == 2
+        with sqlite3.connect(db) as con:
+            kinds = [row[0] for row in con.execute("SELECT kind FROM batch_events ORDER BY item_index")]
+        assert kinds == ["heartbeat", "detection"]
+
+    def test_batch_route_survives_a_kill_after_durable_write_before_receipt(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        crash_once = {"armed": True}
+
+        def crash():
+            if crash_once["armed"]:
+                crash_once["armed"] = False
+                raise RuntimeError("simulated kill between durable write and receipt")
+
+        adapter = _batch_adapter(tmp_path, durable, before_receipt_store=crash)
+        frame = GEN._batch_valid()
+        raw = json.dumps(frame).encode("utf-8")
+        with pytest.raises(RuntimeError, match="simulated kill"):
+            adapter.ingest(path="/v1/ingest/batches", raw=raw,
+                           content_type=BA.BATCH_CODEC_MEDIA_TYPES["json"],
+                           idempotency_key="idem-1", authorization="Bearer node-secret",
+                           content_encoding=None, request_id="req_crash")
+
+        rows = sqlite3.connect(db).execute("SELECT COUNT(*) FROM batch_events").fetchone()[0]
+        assert rows == 3
+        recovered = _batch_adapter(tmp_path, HR.make_durable_store("sqlite", str(db)))
+        status, body, _headers = recovered.ingest(
+            path="/v1/ingest/batches", raw=raw,
+            content_type=BA.BATCH_CODEC_MEDIA_TYPES["json"],
+            idempotency_key="idem-1", authorization="Bearer node-secret",
+            content_encoding=None, request_id="req_retry",
+        )
+        receipt = json.loads(body)
+        assert status == 200
+        assert receipt["counts"]["accepted"] == 0
+        assert receipt["counts"]["duplicate"] == 3
+        assert receipt["ack_through_index"] == 2
 
 
 class TestDurableSqlite(TestValidation):
