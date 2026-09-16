@@ -9,4 +9,4 @@ retain speech" a thing the code does rather than a thing the README says.
 that proves the destruction and carries nothing of what was said. It is stdlib + numpy, opens
 no socket, and refuses to emit any field it does not recognise.
 """
-from . import purge  # noqa: F401
+from . import purge, transient_tdoa  # noqa: F401
