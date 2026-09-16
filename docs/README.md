@@ -60,6 +60,7 @@ what was chosen, the in-tree evidence it rests on, and what was deliberately lef
 |---|---|
 | [architecture.md](architecture.md) | Current system overview. |
 | [acoustic-stack.md](acoustic-stack.md) | The acoustic processing stack end to end. |
+| [acoustic-models-bleeding-edge.md](acoustic-models-bleeding-edge.md) | The 5-Tier Acoustic Architecture: node micro-DSP, ingest privacy purge, coarse triage, bioacoustic foundation, spatial and replay — with block diagrams, per-tier latency/memory budgets, the licence compatibility matrix and gates G0–G4. |
 | [clip-pipeline.md](clip-pipeline.md) | Clip capture, drain, indexing, and retention. |
 | [timing.md](timing.md) | Clocking, boot-relative time, and trusted UTC. |
 | [uplink.md](uplink.md) | Node uplink transports and envelopes. |
