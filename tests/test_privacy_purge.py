@@ -736,12 +736,12 @@ from tests import privacy_signals as SIG  # noqa: E402
 #: is `testdata/silero_vad_golden.json`, measured on the real v5 graph (docs §2.3's 576-sample
 #: window, which the golden also records the 512-sample failure of).
 #:
-#: ⚠️THE FALLBACK DESTROYS PINK NOISE AND SILERO DOES NOT. `BandEnergyVAD` reads 1/f noise as
-#: voiced-band energy with enough spectral spread to clear the bar; the real model answers
-#: 0.028. This is over-destruction, not a leak -- the direction that costs clips of wind rather
-#: than clips of conversation -- and it is exactly the unmeasured-recall gap docs §12.3 refuses
-#: to wave through. It is asserted rather than described so that tuning the fallback shows up
-#: here as a decision instead of as a silent change in what a rainy night deletes.
+#: ⚠️THE FALLBACK USED TO DESTROY PINK NOISE AND SILERO DOES NOT (0.028). It read 1/f noise as
+#: voiced-band energy with enough spectral spread to clear the bar, which cost a clip of every
+#: rainy night. A fifth gate now scores pitch-track continuity -- hiss has a little of every
+#: frequency but no pitch that survives from one frame to the next -- and the two columns agree.
+#: The rows are asserted rather than described so that tuning the fallback shows up here as a
+#: decision instead of as a silent change in what a rainy night deletes.
 SHARED_FIXTURES = (
     # name,                 holds speech, band_energy purges, silero peak (golden)
     ("speech_like",         True,         True,               0.999),
@@ -749,7 +749,7 @@ SHARED_FIXTURES = (
     ("gaussian_noise",      False,        False,              0.030),
     ("gaussian_noise_loud", False,        False,              0.041),
     ("pink_noise",          False,        False,              0.028),
-    ("pink_noise_loud",     False,        False,              0.028),
+    ("pink_noise_loud",     False,        False,              0.021),
     ("bird_chirps",         False,        False,              0.018),
     ("tone_1k",             False,        False,              0.006),
 )
@@ -761,6 +761,22 @@ def band_energy():
 
 def clip_at(tmp_path, name, samples, rate=16000):
     return write_wav(tmp_path / name, np.asarray(samples, dtype=np.float32), rate=rate)
+
+
+@pytest.mark.parametrize("name,_holds,_purges,silero_peak", SHARED_FIXTURES,
+                         ids=[f[0] for f in SHARED_FIXTURES])
+def test_the_silero_column_is_the_golden_and_not_a_memory_of_it(name, _holds, _purges,
+                                                                silero_peak):
+    """The column says it was measured, so it is compared to the measurement.
+
+    A number copied into a comment is a number that drifts the first time the fixtures are
+    regenerated, and this one is the only reason to believe the fallback agrees with anything.
+    """
+    with open(os.path.join(ROOT, "testdata", "silero_vad_golden.json"), encoding="utf-8") as fh:
+        golden = json.load(fh)
+    recorded = max(golden["fixtures"][name]["probs"])
+    assert abs(recorded - silero_peak) < 0.0015, \
+        "%s: the table says %.3f, the golden says %.3f" % (name, silero_peak, recorded)
 
 
 @pytest.mark.parametrize("name,holds_speech,purges,_silero", SHARED_FIXTURES,
@@ -877,21 +893,34 @@ def test_a_fully_clipped_clip_is_still_judged(tmp_path):
     assert outcome.status in ("purged", "kept")
 
 
+class _NonFiniteVad:
+    """A detector that answers with a number that is not one."""
+
+    name = "non-finite"
+
+    def detect(self, samples, rate):
+        return P.VadDecision(False, float("nan"), 0.0, (), self.name)
+
+
 @pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
 def test_a_non_finite_sample_never_produces_a_confident_silence(bad):
-    """CLOSED (docs §9, `vad_inference_error`): the refusal is louder than a fail-closed verdict.
+    """CLOSED (docs §9, `vad_inference_error`): a detector that answered NaN has not answered.
 
-    A NaN used to propagate through the fallback's band ratio, `peak_prob` came back NaN, every
-    comparison against the threshold was False, and the clip was reported `speech=False` -- a
-    confident silence produced by arithmetic rather than by the audio. The detector now refuses
-    the buffer outright, which `purge_clip` turns into a fail-closed purge with a stated reason
-    rather than a verdict that looks measured.
+    A NaN used to propagate through the fallback's band ratio until `peak_prob` came back NaN,
+    every comparison against the threshold was False, and the clip was reported `speech=False`
+    -- a confident silence produced by arithmetic rather than by the audio. `assert_finite`
+    now refuses the input, and the callers that own a file turn that refusal into a purge.
     """
     samples = np.asarray(SIG.speech_like(), dtype=np.float32).copy()
     samples[100] = bad
     with np.errstate(all="ignore"):
         with pytest.raises(P.NonFiniteAudio):
             P.inspect_samples(samples, 16000, band_energy())
+        receipt = P.purge_wav_bytes(SIG.wav_bytes(np.asarray(SIG.speech_like(),
+                                                             dtype=np.float32)),
+                                    node="n", vad=_NonFiniteVad())
+    assert receipt is not None, "a non-finite score must never mean 'safe to keep'"
+    assert receipt.as_record()["fail_closed_reason"] == P.REASON_INFERENCE
 
 
 @pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
@@ -917,7 +946,7 @@ def test_a_non_finite_sample_is_purged_rather_than_kept(tmp_path, bad):
 def test_the_audit_log_stays_strict_json(tmp_path):
     """NaN is not JSON, and an audit log a strict reader rejects -- jq, Go, a COPY -- is not one.
 
-    A 16-bit WAV cannot carry a non-finite sample, so the NaN hole the test above xfails on is
+    A 16-bit WAV cannot carry a non-finite sample, so the NaN hole the test above closes is
     reachable only through the in-memory door (`inspect_samples`, `purge_wav_bytes`); this
     guards the disk path against the day a probability arrives there unclamped.
     """
