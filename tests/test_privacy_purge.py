@@ -409,10 +409,142 @@ def test_no_receipt_field_holds_anything_audio_shaped(tmp_path):
     for word in ("transcript", "mfcc", "embedding", "waveform", "pcm"):
         assert word not in blob.lower()
     for key, value in rec.items():
-        if key == "speech_spans_s":
+        if key in ("speech_spans_s", "speech_segments_ms"):
             assert all(len(pair) == 2 for pair in value)
             continue
-        assert isinstance(value, (str, int, float, bool))
+        assert value is None or isinstance(value, (str, int, float, bool))
+
+
+def test_the_receipt_is_contract_shaped(tmp_path):
+    """docs/silero-vad-privacy-contract.md §8.2, as far as this pipeline can answer it."""
+    path = write_wav(tmp_path / "nyquist-0123456789ab-0000000007.wav", voice())
+    rec = P.purge_wav(path, vad=P.BandEnergyVAD())
+    assert rec["schema"] == P.RECEIPT_SCHEMA
+    assert rec["verdict"] == P.VERDICT_SPEECH
+    assert rec["provenance"] == "model"
+    assert rec["purge_method"] == P.METHOD_OVERWRITE
+    assert rec["medium_guarantee"] == "filesystem_only"
+    assert rec["verified_absent"] is True
+    assert rec["already_absent"] is False
+    assert rec["audio_retained"] is False and rec["zero_audio_retained"] is True
+    assert rec["policy_version"] == P.POLICY_VERSION
+    assert rec["speech_threshold"] == P.DEFAULT_THRESHOLD
+    assert rec["neg_threshold"] == P.DEFAULT_NEG_THRESHOLD
+    assert rec["min_speech_duration_ms"] == P.DEFAULT_MIN_SPEECH_MS
+    assert rec["min_silence_duration_ms"] == P.DEFAULT_MIN_SILENCE_MS
+    assert rec["speech_pad_ms"] == P.DEFAULT_SPEECH_PAD_MS
+    assert rec["frames_scored"] > 0
+    assert rec["purged_bytes"] > 0
+    assert rec["clip_key"] and len(rec["clip_key"]) == 32
+    assert rec["speech_segment_count"] == len(rec["speech_segments_ms"]) >= 1
+    assert rec["speech_total_ms"] > 0
+    assert 0.0 < rec["speech_confidence_mean_in_segments"] <= rec["speech_confidence_max"]
+
+
+def test_a_kept_clip_can_be_receipted_too(tmp_path):
+    """Coverage is a fact: 'scored and clean' and 'never scored' must not look the same."""
+    path = write_wav(tmp_path / "bang.wav", gunshot())
+    rec = P.purge_wav(path, vad=P.BandEnergyVAD())
+    assert rec["verdict"] == P.VERDICT_CLEAN
+    assert rec["audio_retained"] is True and rec["zero_audio_retained"] is False
+    assert rec["purge_method"] == P.METHOD_NONE
+    assert rec["medium_guarantee"] == "none"
+    assert os.path.exists(path), "a NO_SPEECH receipt must not imply a destruction"
+
+
+def test_rerunning_over_an_already_purged_clip_is_a_no_op(tmp_path):
+    """The idempotency claim: no exception, no second destruction, and it says why."""
+    path = write_wav(tmp_path / "voice.wav", voice())
+    audit = str(tmp_path / "audit.jsonl")
+    first = P.purge_wav(path, vad=P.BandEnergyVAD(), audit_log=audit)
+    assert first["verdict"] == P.VERDICT_SPEECH
+
+    again = P.purge_wav(path, vad=P.BandEnergyVAD(), audit_log=audit)
+    assert again["verdict"] == P.VERDICT_NOT_SCORED
+    assert again["already_absent"] is True
+    assert again["purge_method"] == P.METHOD_ABSENT
+    assert again["purged_sha256"] is None
+    assert again["zero_audio_retained"] is False    # this run destroyed nothing
+    receipts = P.read_receipts(audit)
+    assert [r["verdict"] for r in receipts] == [P.VERDICT_SPEECH, P.VERDICT_NOT_SCORED]
+
+
+def test_scan_pool_counts_an_absent_clip_without_calling_it_an_error(tmp_path):
+    path = write_wav(tmp_path / "voice.wav", voice())
+    P.scan_pool(str(tmp_path), vad=P.BandEnergyVAD())
+    assert not os.path.exists(path)
+    report = P.scan_pool(str(tmp_path), vad=P.BandEnergyVAD())
+    assert report.errors == 0 and report.scanned == 0
+
+
+def test_dry_run_receipt_does_not_claim_a_destruction(tmp_path):
+    path = write_wav(tmp_path / "voice.wav", voice())
+    rec = P.purge_wav(path, vad=P.BandEnergyVAD(), dry_run=True)
+    assert rec["verdict"] == P.VERDICT_SPEECH
+    assert rec["dry_run"] is True
+    assert rec["zero_audio_retained"] is False and rec["audio_retained"] is True
+    assert os.path.exists(path)
+
+
+def test_purge_wav_raises_only_when_the_clip_cannot_be_decided(tmp_path):
+    bad = tmp_path / "bad.wav"
+    bad.write_bytes(b"not a wav")
+    with pytest.raises(P.UnreadableClip):
+        P.purge_wav(str(bad), vad=P.BandEnergyVAD())
+    assert bad.exists()
+
+
+# ---------------------------------------------------------------- hysteresis (contract §4)
+
+def test_hysteresis_keeps_one_wobbling_utterance_whole():
+    """0.52, 0.48, 0.53 is one segment, not three: closing needs affirmative confidence."""
+    probs = ([0.9] * 5 + [0.42] * 3) * 6 + [0.0] * 40
+    d = P.decision_from_probs(probs, hop_s=0.01, frame_s=0.032, threshold=0.5,
+                              min_speech_ms=250.0, engine="t", neg_threshold=0.35,
+                              min_silence_ms=0.0, speech_pad_ms=0.0)
+    assert d.speech is True and len(d.spans) == 1
+
+
+def test_a_closing_threshold_above_the_opening_one_is_refused():
+    with pytest.raises(P.PurgeError):
+        P.decision_from_probs([0.9] * 50, hop_s=0.01, frame_s=0.032, threshold=0.5,
+                              min_speech_ms=100.0, engine="t", neg_threshold=0.8)
+
+
+def test_short_silences_are_bridged_and_padding_is_clamped_to_the_clip():
+    probs = [0.9] * 30 + [0.0] * 20 + [0.9] * 30
+    d = P.decision_from_probs(probs, hop_s=0.01, frame_s=0.032, threshold=0.5,
+                              min_speech_ms=250.0, engine="t", min_silence_ms=300.0,
+                              speech_pad_ms=30.0, clip_s=0.82)
+    assert len(d.spans) == 1
+    assert d.spans[0].start_s == 0.0                      # padding cannot go negative
+    assert d.spans[0].end_s <= 0.82                       # nor past the clip
+
+
+def test_mean_confidence_is_measured_inside_the_segments():
+    """A clip-wide mean falls as silence is added; the in-segment mean does not."""
+    probs = [0.8] * 40 + [0.0] * 200
+    d = P.decision_from_probs(probs, hop_s=0.01, frame_s=0.032, threshold=0.5,
+                              min_speech_ms=250.0, engine="t")
+    assert d.mean_prob_in_segments == pytest.approx(0.8)
+    assert d.frames_scored == 240
+
+
+def test_segments_are_reported_in_ms_as_well_as_seconds(tmp_path):
+    path = write_wav(tmp_path / "v.wav", voice())
+    rec = P.purge_wav(path, vad=P.BandEnergyVAD())
+    for (lo_s, hi_s), (lo_ms, hi_ms) in zip(rec["speech_spans_s"], rec["speech_segments_ms"]):
+        assert lo_ms == pytest.approx(lo_s * 1000.0, abs=1.0)
+        assert hi_ms == pytest.approx(hi_s * 1000.0, abs=1.0)
+
+
+def test_pool_receipts_are_read_under_both_the_old_and_new_names(tmp_path):
+    write_wav(tmp_path / "a.wav", voice())
+    P.scan_pool(str(tmp_path), vad=P.BandEnergyVAD())
+    legacy = os.path.join(str(tmp_path), P.LEGACY_RECEIPT_NAME)
+    with open(legacy, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"verdict": "SPEECH_DETECTED", "legacy": True}) + "\n")
+    assert len(P.read_pool_receipts(str(tmp_path))) == 2
 
 
 def test_the_engine_name_is_on_every_receipt(tmp_path):
@@ -483,6 +615,19 @@ def test_cli_refuses_a_missing_pool_and_a_silly_threshold(tmp_path):
     assert run_tool("--pool", str(tmp_path / "nope")).returncode == 2
     assert run_tool("--pool", str(tmp_path), "--threshold", "4").returncode == 2
     assert run_tool("--pool", str(tmp_path), "--min-speech-ms", "-1").returncode == 2
+    assert run_tool("--pool", str(tmp_path), "--threshold", "0.4",
+                    "--neg-threshold", "0.9").returncode == 2
+
+
+def test_cli_receipt_clean_records_coverage(tmp_path):
+    write_wav(tmp_path / "bang.wav", gunshot())
+    audit = str(tmp_path / "a.jsonl")
+    proc = run_tool("--pool", str(tmp_path), "--vad", "band_energy", "--receipt-clean",
+                    "--audit-log", audit)
+    assert proc.returncode == 0, proc.stderr
+    receipts = P.read_receipts(audit)
+    assert [r["verdict"] for r in receipts] == [P.VERDICT_CLEAN]
+    assert os.path.exists(os.path.join(str(tmp_path), "bang.wav"))
 
 
 def test_cli_requires_a_target():
