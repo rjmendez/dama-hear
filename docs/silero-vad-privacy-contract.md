@@ -677,3 +677,92 @@ Written here so they can be checked off in public, in the style of the tagger's 
 `docs/data-governance.md` §2 — zone definitions, excluded zones, directional placement, and
 treating uncertain redaction as unredacted. This document does not relax any of it, and nothing
 here may be cited as a reason to enable recording in a place where people can be heard.
+
+---
+
+## 12. What actually shipped, and where it disagrees with this contract
+
+⚠️**Part of this lane is no longer a design.** `hear/privacy/purge.py`, `tools/hear_privacy_purge.py`
+and `tests/test_privacy_purge.py` (44 tests) landed on main in PR #255, written against an
+earlier revision of this page and in places against a different one. **Where the shipped code and
+this document disagree, the code is what runs**, and the disagreements are listed here rather
+than silently resolved in either direction — a contract that quietly edits itself to match the
+code stops being able to say the code is wrong.
+
+`hear/privacy/silero_vad.py` does **not** exist yet. The engine is the open half.
+
+### 12.1 What shipped, and is better than what this page asked for
+
+- **The receipt is key-allow-listed, not merely documented.** `assert_privacy_safe()` refuses any
+  key not in `RECEIPT_KEYS`, *and* refuses any value that is a sequence of numbers, so a feature
+  vector cannot be smuggled into a permitted field. §8.1 described a policy; the code enforces a
+  mechanism, and the module docstring names the real failure mode — a privacy pipeline leaks by
+  accretion of one more harmless field, never by a decision to leak.
+- **`vad_engine` is on every receipt.** A fleet-wide claim about what was purged is only as
+  strong as the weakest detector that produced it, and that is now visible in the record rather
+  than inferred from a deployment date. This page did not ask for it. It should have.
+- **The overwrite path makes the same refusal this page makes** (§7.2): `zero_audio_retained`
+  means *this pipeline retained nothing*, explicitly not *unrecoverable*.
+- **`--dry-run` does not append to the audit log at all**, where §8 assumed a `dry_run` receipt
+  would be written. The shipped choice is the safer one: a dry run must be safe to point at a
+  pool someone else is draining, and writing to a shared JSONL is a side effect. **The code
+  wins; §10 gate 2 now means "receipts on stdout/`--json`", not "receipts in the audit log".**
+
+### 12.2 Field-name divergence — the code wins, and the gap is real
+
+Shipped receipt: `purged_receipts.jsonl`, `schema_version: 1`, keys `timestamp, node, clip,
+duration_s, peak_speech_prob, speech_s, speech_spans_s, purged_sha256, purge_reason, vad_engine,
+zero_audio_retained, dry_run`. §8.2's `hear.vad.purge.receipt.v1` name and field spelling are
+**not** what is on disk.
+
+The names are a wash — `peak_speech_prob` is `speech_confidence_max` in a different shirt. What
+is missing is not:
+
+| §8.2 field | Status in the shipped receipt | Why it still matters |
+|---|---|---|
+| `verified_absent`, `already_absent` | absent | §7.1's ordering claim is unprovable from the record, and an idempotent re-run cannot be distinguished from a first purge |
+| `purge_method`, `medium_guarantee` | absent | §7.3's crypto-erase path cannot be told apart from §7.2's overwrite path by an auditor reading receipts |
+| `clip_key` | `clip` (a path) | a path does not join to `clips/index.jsonl`; §8.3's index update and §6's never-re-fetch rule both need the key |
+| `fail_closed_reason` | absent | a purge that happened because the detector was broken reads identically to one that happened because someone spoke |
+| `window_samples`, `window_canary_passed` | absent | §2.3's silent-false-negative regression would leave no trace in the record |
+| `backup_generations_possibly_affected` | absent | §7.4's restore-replay obligation has nothing to key off |
+
+Adding any of these is a deliberate act with a reviewer attached, which is exactly the property
+`RECEIPT_KEYS` was built to have. **Nothing here is a defect in the shipped code** — it is the
+gap between a working purge and an auditable one, and it is recorded so the next reviewer sees a
+list rather than a feeling.
+
+### 12.3 The disagreement that is not cosmetic: `load_vad("auto")` falls back
+
+§9 says a missing model is `vad_unavailable` and **purges**, loudly. The shipped `load_vad("auto")`
+instead falls back to `BandEnergyVAD` — a stdlib+numpy voiced-band/harmonicity detector with no
+model file — so a node without onnxruntime still enforces *a* policy rather than destroying its
+whole backlog.
+
+That is a third option this page did not consider, and it is arguably the better one: purging
+everything on a missing file is correct but operationally violent, and retention was never on the
+table. It is accepted **on one condition, which is not yet met**:
+
+⚠️**A fallback detector with an unmeasured recall weakens the privacy control in exactly the way
+retention does — quietly.** `vad_engine` makes *which* detector ran visible, but no number
+anywhere says what `BandEnergyVAD` misses. Until its recall is measured against the same set that
+sets the thresholds (§10 gate 3), a receipt that says `vad_engine: band_energy` is a record of a
+destruction, not evidence that the clips left behind are speech-free. Two acceptable resolutions,
+and the operator picks one before the lane is armed:
+
+1. Measure `BandEnergyVAD`'s miss rate on the speech-labelled set and publish it, so a
+   `band_energy` run carries a known weaker claim; **or**
+2. Make `auto` fail closed per §9 in any deployment where the model is *expected* to be present,
+   and reserve the fallback for deployments that declare they will never have onnxruntime.
+
+Until one of those lands, **this page treats a `band_energy` receipt as an uncertain redaction**
+under `docs/data-governance.md` §2, with the stricter retention and access rules applying to
+whatever that run left behind.
+
+### 12.4 Gate status after PR #255
+
+Gate 4 (purge proven on a scratch tree) and most of gate 5 (fail-closed branches exercised) are
+**met by `tests/test_privacy_purge.py`**, 44 tests, green on py3.12 and py3.13. Gates 1, 2, 3, 6,
+7, 8, 9 and 10 remain open, and gate 5 keeps one hole: the branches this page names
+(`vad_window_contract_violated`, `state_contract_violated`) belong to an engine that does not
+exist yet.
