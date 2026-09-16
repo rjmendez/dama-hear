@@ -102,8 +102,10 @@ import glob
 import hashlib
 import json
 import os
+import queue
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -296,8 +298,39 @@ DEFAULT_MAX_CLIPS_LOST = -1
 
 
 def _get(url: str, timeout: float = DEFAULT_TIMEOUT_S) -> bytes:
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        return r.read()
+    """`GET url` -> body, with `timeout` enforced as a HARD WALL-CLOCK BOUND ON THE WHOLE CALL.
+
+    ⚠️`urlopen(url, timeout=timeout)` ALONE DOES NOT BOUND THE REQUEST. That timeout resets on
+    every individual socket read, so a node that keeps sending a FEW bytes -- not silence -- can
+    stall far past `timeout` while never once going quiet long enough to trip it. MEASURED LIVE
+    2026-09-16: mach's `/sd` connection sat at zero net progress for 60+ s inside a request whose
+    own socket timeout was 30 s, and the pod was later killed by `activeDeadlineSeconds` with the
+    same-run privacy purge never having run. Every caller here (`fetch_sd`, `fetch_clip`,
+    `_ls_sizes`, `fetch_status`) inherits the fix by going through this one function.
+
+    The real fetch runs on a DAEMON thread so a request that never returns cannot block this
+    process from exiting; this call still returns (or raises) at `timeout`, and the abandoned
+    thread is left to finish or die with the pod. A node degraded enough to trickle forever gets
+    one stuck thread nobody waits on, not a job that blows its deadline.
+    """
+    q: "queue.Queue[Tuple[str, Any]]" = queue.Queue(maxsize=1)
+
+    def _do() -> None:
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                q.put(("ok", r.read()))
+        except Exception as e:  # noqa: BLE001 -- re-raised in the calling thread, not swallowed
+            q.put(("err", e))
+
+    threading.Thread(target=_do, daemon=True, name="hear_drain_get").start()
+    try:
+        kind, payload = q.get(timeout=timeout)
+    except queue.Empty:
+        raise TimeoutError(
+            "GET %s exceeded its hard wall-clock bound of %.1f s" % (url, timeout))
+    if kind == "err":
+        raise payload
+    return payload
 
 
 def fetch_status(ip: str, timeout: float = DEFAULT_TIMEOUT_S) -> Dict[str, Any]:
