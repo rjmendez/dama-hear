@@ -417,11 +417,17 @@ def load_vad(engine: str = "auto", threshold: float = DEFAULT_THRESHOLD,
     if engine in ("auto", "silero"):
         try:
             from . import silero_vad  # type: ignore[attr-defined]
+
+            # ⚠️INSIDE the try, not after it. `silero_vad.load_vad()` raises `ModelUnavailable`
+            # -- an `ImportError` -- when onnxruntime or the weights are absent, which is the
+            # same condition as the module being missing and takes the same branch. It refuses
+            # to substitute its own fallback scorer, so this is the only place the substitution
+            # can happen and `BandEnergyVAD`'s name is what reaches the receipt.
+            return silero_vad.load_vad(threshold=threshold, min_speech_ms=min_speech_ms)
         except ImportError as exc:
             if engine == "silero":
                 raise PurgeError("the silero engine was demanded and is not installed: %s" % exc)
             return BandEnergyVAD(threshold, min_speech_ms)
-        return silero_vad.load_vad(threshold=threshold, min_speech_ms=min_speech_ms)
     raise PurgeError("unknown vad engine %r; known: auto, silero, band_energy" % (engine,))
 
 
