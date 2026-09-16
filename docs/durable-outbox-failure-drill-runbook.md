@@ -13,7 +13,10 @@ Target: live `dama/hear-mqtt-bridge` only (durable SQLite outbox, running since 
 on PVC `hear-mqtt-bridge-state`, 5Gi RWO `local-path`). `hear-heartbeat` is **out of scope**; it has
 a separate ledger and PVC and is drilled separately if ever.
 
-Related: `docs/resilience.md` (invariants), session `files/bridge-durable-plan/PLAN.md` (rollout +
+Related: `docs/resilience.md` (invariants), `docs/durable-outbox-failure-drill-evidence.md` (the
+offline evidence-bundle schema, the abort boundary as constants, and the blocking execution gate,
+all checkable by `tools/bridge_drill_evidence.py` without touching the cluster), session
+`files/bridge-durable-plan/PLAN.md` (rollout +
 rollback ladder), session `files/audit-phase2-postgres/PHASE2-POSTGRES-INTERFACE-AUDIT.md` (defects
 D1/D2/D3 this drill must exercise **after** they are fixed).
 
@@ -83,6 +86,22 @@ kubectl -n dama get cm hear-mqtt-bridge-code -o jsonpath='{.metadata.annotations
 ```
 
 If any diff is non-empty, **stop**: the drill would measure code that is not in the repo.
+
+Record the gate result in `$DRILL/bundle.json` (schema and field list:
+`docs/durable-outbox-failure-drill-evidence.md` §2) and let the offline checker decide, rather than
+deciding at the keyboard:
+
+```bash
+python3 tools/bridge_drill_evidence.py gate --bundle $DRILL/bundle.json --require-pass
+python3 tools/bridge_drill_evidence.py plan --bundle $DRILL/bundle.json --require-pass
+```
+
+Both read local files only — no kubectl, no redis-cli, no network. `gate` exits 2 while any
+blocking item is `fail` **or** `unknown`; missing evidence keeps the gate shut on purpose. `plan`
+screens the command sequence you intend to run against the §6.2 rejected alternatives (Redis
+scale-down, `FLUSHDB`, `CLIENT PAUSE`, host `iptables`, NetworkPolicy, PVC deletion, the mTLS
+manifest, replica changes, `hear-heartbeat`) and requires the FAULT IN patch to ship with its exact
+inverse.
 
 ---
 
@@ -158,6 +177,33 @@ kubectl -n infra exec audit-redis-0 -- redis-cli -a "$PW" --no-auth-warning info
 
 **Never** delete `pvc/hear-mqtt-bridge-state`, and never `FLUSHDB`/`FLUSHALL`: pending records live
 only on that PVC, and the Redis keyspace is shared with nine other workloads.
+
+### 4.1 Record-conservation baseline (the reference every later count is judged against)
+
+The backup copy is not only a rollback artifact; it is the **conservation reference**. Transcribe
+its counts into `$DRILL/bundle.json` under `backup.ledger` *before* the fault, from the read-only
+copy (never from the live writer):
+
+```bash
+python3 -c "
+import sqlite3, json
+c = sqlite3.connect('file:$DRILL/backup/mqtt-bridge.pre.sqlite3?mode=ro', uri=True)
+c.execute('PRAGMA query_only=ON')
+q = lambda s: c.execute(s).fetchone()
+print(json.dumps({
+ 'records': q('select count(*) from durable_records')[0],
+ 'max_id':  q('select max(id) from durable_records')[0],
+ 'pending': q(\"select count(*) from durable_records r where not exists(select 1 from \"
+              \"cache_attempts a where a.record_uid=r.record_uid and a.outcome='succeeded')\")[0],
+ 'failed':  q(\"select count(*) from cache_attempts where outcome='failed'\")[0]}))"
+```
+
+Post-drill, the same four numbers come from `40-final`. The rule the tool enforces is not "the
+counts look similar" but: `records` and `max(id)` never decrease at any checkpoint, `final ≥
+pre-fault backup`, and the fault-window growth closes against 36 rec/min ±10 % **less** up to 60
+records per budgeted restart gap (`clean_session=True` legitimately loses that window's MQTT).
+Record `backup.files` as a `name → sha256` map and `backup.method` as the copy-only method used;
+`bridge_drill_evidence.py gate` refuses a backup method containing a mutating step.
 
 ---
 
@@ -302,6 +348,31 @@ the ingest rate is a finding, not a rounding error.
 
 ## 8. Abort triggers and abort procedure
 
+The boundary is exact, and it is the same arithmetic the checker applies — transcribe each
+checkpoint into `$DRILL/bundle.json` and run it between legs rather than eyeballing the numbers:
+
+```bash
+python3 tools/bridge_drill_evidence.py analyze --bundle $DRILL/bundle.json   # offline, reads files
+```
+
+| id | Trips when | Boundary |
+| --- | --- | --- |
+| `T1_fault_over_hard_bound` | fault elapsed exceeds the hard bound (to now, if the fault is still active) | **900 s**; target 600 s, soft bound 720 s |
+| `T2_pending_stalled` | `pending` grows by less than half the ingest rate between two fault checkpoints ≥ 60 s apart | **< 50 % of 36 rec/min** |
+| `T3_sqlite_integrity` | `database is locked`, `disk I/O error`, `malformed database`, corruption | any occurrence |
+| `T4_ledger_regressed` | `records` or `max(id)` decreases | any decrease |
+| `T5_state_disk_floor` | `/state` free space or usage crosses the floor | **< 500 MiB free** or **> 90 % used** |
+| `T6_restart_budget` | restarts consumed beyond budget, or `CrashLoopBackOff` | **> 3 restarts** |
+| `T7_redis_collateral` | `audit-redis-0` restarts, a named consumer degrades, or `connected_clients` drops more than the bridge's own connection | ≥ 25 % client loss |
+| `T8_mqtt_ingest_stopped` | `records` flat for ≥ 60 s while only Redis is faulted | any flat interval |
+| `T9_node_pressure` | operator declares node/kubelet/disk pressure | declaration |
+| `T10_operator_lost_control` | operator loses the second shell, kubeconfig, or the window | declaration |
+
+`abort: true` (any trigger fired) means execute §8.1 now. Continuing requires the stronger
+`continue_allowed: true` — every trigger **provably** clear, including T9/T10, which the operator
+must declare. A trigger that cannot be judged because the evidence was not captured does not permit
+continuing; it means the drill has stopped producing the receipt it exists for.
+
 Abort **immediately** (execute §8.1) on any of:
 
 1. Fault elapsed **> 15 min** for any reason, including operator uncertainty.
@@ -403,6 +474,7 @@ Directory `$DRILL/` (copy to session `files/phase2-durable-drill/<UTC-date>/`, n
 
 ```
 backup/   deploy, cm, pvc, rollout-history, resourceVersion, mqtt-bridge.pre.sqlite3, SHA256SUMS
+bundle.json  the transcribed evidence bundle (docs/durable-outbox-failure-drill-evidence.md §2)
 evidence/ 00-precheck .. 40-final snapshots (§5), plus:
           logs-full-fault-window.txt   kubectl logs --since=<window>
           drain-curve.csv              utc,pending,failed,records  (15 s samples, L6..L7)
@@ -416,6 +488,20 @@ patches applied (both directions) with change-cause; records/pending/failed at e
 restart count consumed; measured MQTT loss during each restart gap; drain time to `pending = 0`;
 `xlen` delta vs distinct event count; the precheck-live node TTLs at T+15 m; every negative-case result; abort
 triggers hit (if any); and the sign-off line `phase2-durable-failure-drill: PASS|FAIL <operator>`.
+
+Validate it rather than proof-reading it (offline, reads two local files):
+
+```bash
+python3 tools/bridge_drill_evidence.py receipt  --bundle $DRILL/bundle.json --receipt $DRILL/RECEIPT.md
+python3 tools/bridge_drill_evidence.py analyze  --bundle $DRILL/bundle.json --receipt $DRILL/RECEIPT.md --require-pass
+```
+
+`receipt` fails on a missing required field, a missing sign-off line, a missing required checkpoint
+(`00-precheck`, `10-fault-start`, `12-fault-t5`, `13-midfault-restart`, `14-fault-t9`,
+`20-recovery-t0`, `22-recovery-t5m`, `40-final`), an abort trigger that fired but is not named in
+the text, or a coordinate-shaped decimal left in the prose. `analyze --require-pass` exits 2 unless
+conservation, refusal, cap, cache, claim and receipt all pass with no abort trigger — that exit code
+is the drill's PASS.
 
 ---
 
