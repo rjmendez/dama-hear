@@ -54,11 +54,30 @@ DEFAULT_TIMEOUT_S = 30.0
 DEFAULT_LOG_TAIL = 500
 DEFAULT_OUT_DIR = "~/bridge-soak"
 
-# The six nodes that publish `dama/<node>/telemetry`; every one of them must appear in the ledger.
-EXPECTED_NODES: Tuple[str, ...] = ("gold", "nyquist", "mach", "rankine", "ageev", "kasami")
+# The authoritative Phase 2 soak baseline: the corrected durable-outbox semantics rollout. Every
+# snapshot records it, so a day-1/day-7/day-14 review can tell "this series measures the corrected
+# semantics" from "someone reset the soak and kept the old milestone labels".
+SOAK_BASELINE_T0 = "2026-09-15T18:26:22Z"
 
-# Measured at T0 (2026-09-15): 2,810 records in 77.75 min across six nodes.
-DEFAULT_RECORDS_PER_DAY = 52000
+# The five nodes that publish `dama/<node>/telemetry` and must appear in the ledger.
+EXPECTED_NODES: Tuple[str, ...] = ("ageev", "gold", "kasami", "mach", "nyquist")
+# Nodes that are deliberately out of the soak. An excluded node is *documented* here with its
+# reason and carried into every snapshot, so five-node coverage can never be mistaken for six-node
+# coverage and an absent node can never be silently absent.
+EXCLUDED_NODES: Dict[str, str] = {
+    "rankine": "offline pending physical USB recovery; see docs/fleet-hardware-remediation-2026-09-15.md",
+}
+# Redis heartbeat cache keys are `dama:hear:<node>` with a TTL (HEAR_HEARTBEAT_TTL_S, 30s default)
+# that every accepted heartbeat re-arms. A key that is present but persistent (TTL -1) means the
+# TTL semantics were lost; a missing key (TTL -2) for a node that is still writing means the cache
+# path stopped.
+DEFAULT_CACHE_KEY_PREFIX = "dama:hear:"
+DEFAULT_HEARTBEAT_TTL_S = 30
+
+# Measured before the corrected-semantics rollout: 2,810 records in 77.75 min across six nodes
+# (~52k/day). The authoritative soak runs five nodes -- Rankine is excluded -- so the expected rate
+# is pro-rated to those five; `--records-per-day` overrides it when the fleet changes again.
+DEFAULT_RECORDS_PER_DAY = 43300
 DEFAULT_GROWTH_TOLERANCE = 0.2
 # ~1.49 KB/record including indexes, so ~78 MB/day; the caps leave room for a burst and still sit
 # far under the 5Gi PVC.
@@ -416,16 +435,29 @@ def normalize_outbox(raw: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def node_coverage(outbox: Mapping[str, Any], expected: Sequence[str]) -> Dict[str, Any]:
+def node_coverage(outbox: Mapping[str, Any], expected: Sequence[str],
+                  excluded: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
+    """Per-node ledger coverage, with every absence either a failure or a documented exclusion.
+
+    `excluded` maps a node id to the reason it is out of the soak. Those nodes are recorded in the
+    snapshot with their reason rather than left out of it, so a five-node sample can never be read
+    as six-node evidence and a node that quietly stopped publishing can never pass as "excluded".
+    """
+    excluded = dict(EXCLUDED_NODES if excluded is None else excluded)
     by_device = outbox.get("by_device") or {}
     present = sorted(k for k in by_device if by_device.get(k))
     missing = [n for n in expected if n not in by_device or not by_device.get(n)]
+    excluded_present = sorted(n for n in excluded if by_device.get(n))
+    overlap = sorted(set(expected) & set(excluded))
     return {
         "expected": list(expected),
         "present": present,
         "missing": missing,
-        "unexpected": sorted(set(present) - set(expected)),
-        "complete": not missing and bool(present),
+        "excluded": excluded,
+        "excluded_present": excluded_present,
+        "excluded_overlap": overlap,
+        "unexpected": sorted(set(present) - set(expected) - set(excluded)),
+        "complete": not missing and not overlap and bool(present),
         "counts": {k: by_device[k] for k in sorted(by_device)},
     }
 
@@ -631,6 +663,39 @@ def scan_logs(text: Optional[str]) -> Dict[str, Any]:
             "graded": {k: counts.get(k, 0) for k in GRADED_LOG_KINDS}}
 
 
+def summarize_refusals(health: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """The receiver's refusal quarantine, kept as its own surface.
+
+    A refusal is input that failed validation; it is bounded by hard caps and never enters the
+    accepted outbox. It therefore must not be mixed into the durable-store health block, and a
+    refusal flood must never be gradeable as a durability defect -- only as a capped, separate
+    signal. `within_caps` is the property the caps exist to guarantee.
+    """
+    if not isinstance(health, Mapping):
+        return {"available": False}
+    refusals = health.get("refusals")
+    if not isinstance(refusals, Mapping):
+        return {"available": False}
+    refused = _as_int(refusals.get("refused_messages"))
+    max_rows = _as_int(refusals.get("max_rows"))
+    within = None if refused is None or max_rows is None else (
+        True if max_rows <= 0 else refused <= max_rows)
+    return {
+        "available": True,
+        "backend": refusals.get("backend"),
+        "enabled": refusals.get("enabled"),
+        "refused_messages": refused,
+        "last_refusal_at": refusals.get("last_refusal_at"),
+        "max_rows": max_rows,
+        "max_bytes": _as_int(refusals.get("max_bytes")),
+        "evicted_refusals": _as_int(refusals.get("evicted_refusals")),
+        "suppressed_refusals": _as_int(refusals.get("suppressed_refusals")),
+        "within_caps": within,
+        # Named so no later reader can wire this into the durable verdict by accident.
+        "separate_from_durable_health": "durable_store" in health,
+    }
+
+
 def summarize_receiver(health: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     """The hear-heartbeat receiver's own durable_store block from /healthz."""
     if not isinstance(health, Mapping):
@@ -651,9 +716,17 @@ def summarize_receiver(health: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
 
 
 def summarize_cache(raw: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
-    """Redis-side evidence: reachable, key count, and stream lengths if they were asked for."""
+    """Redis-side evidence: reachable, key count, stream lengths, and per-node heartbeat TTLs.
+
+    `ttl_seconds` maps a node id to the raw `TTL` reply for its `dama:hear:<node>` key: a positive
+    value is a re-armed volatile key, `-1` is a key that lost its expiry, `-2` is no key at all.
+    `volatile` / `persistent` / `absent` split them so grading never has to re-learn the encoding.
+    """
     if not isinstance(raw, Mapping):
         return {"available": False}
+    ttls = {str(k): _as_int(v) for k, v in (raw.get("ttl_seconds") or {}).items()}
+    limit = _as_int(raw.get("ttl_limit_s"))
+    known = {k: v for k, v in ttls.items() if v is not None}
     return {
         "available": True,
         "reachable": bool(raw.get("reachable")),
@@ -661,6 +734,14 @@ def summarize_cache(raw: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
         "dbsize": _as_int(raw.get("dbsize")),
         "error": redact_text(raw.get("error")),
         "streams": {str(k): _as_int(v) for k, v in (raw.get("streams") or {}).items()},
+        "key_prefix": raw.get("key_prefix"),
+        "ttl_limit_s": limit,
+        "ttl_seconds": ttls,
+        "volatile": sorted(k for k, v in known.items() if v > 0),
+        "persistent": sorted(k for k, v in known.items() if v == -1),
+        "absent": sorted(k for k, v in known.items() if v == -2),
+        "over_limit": sorted(k for k, v in known.items()
+                             if limit is not None and v > limit),
     }
 
 
@@ -768,6 +849,26 @@ def evaluate(snapshot: Mapping[str, Any], baseline: Optional[Mapping[str, Any]] 
     add("all_nodes_covered", None if not coverage.get("counts") else bool(coverage.get("complete")),
         "missing=%s present=%s" % (coverage.get("missing"), len(coverage.get("present") or [])))
 
+    # An excluded node is evidence in its own right: the snapshot has to say which nodes are out of
+    # the soak and why, or a five-node sample reads as if the fleet were complete.
+    declared = coverage.get("excluded")
+    if declared is None:
+        add("excluded_nodes_documented", None,
+            "snapshot predates the exclusion record; re-collect to grade it")
+    else:
+        undocumented = sorted(k for k, v in (declared or {}).items() if not str(v or "").strip())
+        overlap = coverage.get("excluded_overlap") or []
+        writing = coverage.get("excluded_present") or []
+        ok = not undocumented and not overlap
+        detail = "excluded=%s" % (", ".join(sorted(declared)) or "none")
+        if undocumented:
+            detail += " without a reason: %s" % undocumented
+        if overlap:
+            detail += " also listed as expected: %s" % overlap
+        if writing:
+            detail += " (still writing to the ledger: %s)" % writing
+        add("excluded_nodes_documented", ok, detail)
+
     newest = _parse_ts(outbox.get("newest_record_at"))
     if newest is None:
         add("ledger_fresh", None, "newest=unknown")
@@ -792,6 +893,41 @@ def evaluate(snapshot: Mapping[str, Any], baseline: Optional[Mapping[str, Any]] 
             None if receiver_pending is None else receiver_pending == 0,
             "receiver backend=%s pending=%s failures=%s"
             % (receiver.get("backend"), receiver_pending, receiver.get("cache_failures")))
+
+    # Refusals are graded on their own line, never folded into the durable verdict: refused input
+    # never reached the outbox, so a refusal flood is a capped quarantine signal, not a durability
+    # defect. What must hold is that the caps hold.
+    refusals = snapshot.get("refusals") or {}
+    if not refusals.get("available"):
+        add("refusal_caps_hold", None, "refusal surface unavailable")
+    else:
+        within = refusals.get("within_caps")
+        add("refusal_caps_hold", within,
+            "refused=%s cap=%s evicted=%s suppressed=%s (separate from durable health)"
+            % (refusals.get("refused_messages"), refusals.get("max_rows"),
+               refusals.get("evicted_refusals"), refusals.get("suppressed_refusals")))
+
+    cache = snapshot.get("cache") or {}
+    ttls = cache.get("ttl_seconds") or {}
+    if not cache.get("available") or not ttls:
+        add("cache_ttl_armed", None, "Redis TTL evidence unavailable (cache needs no credential "
+                                     "to grade durability; the ledger is authoritative)")
+    else:
+        persistent = cache.get("persistent") or []
+        absent = [n for n in (cache.get("absent") or []) if n in (coverage.get("present") or [])]
+        over = cache.get("over_limit") or []
+        bad = {"persistent": persistent, "absent_while_writing": absent, "over_limit": over}
+        bad = {k: v for k, v in bad.items() if v}
+        add("cache_ttl_armed", not bad,
+            "all %d keys volatile within %ss" % (len(ttls), cache.get("ttl_limit_s"))
+            if not bad else "TTL defects %s" % bad)
+
+    declared_baseline = snapshot.get("soak_baseline")
+    if declared_baseline is None:
+        add("soak_baseline_declared", None, "snapshot records no soak baseline")
+    else:
+        add("soak_baseline_declared", declared_baseline == SOAK_BASELINE_T0,
+            "baseline %s (authoritative %s)" % (declared_baseline, SOAK_BASELINE_T0))
 
     budget_mb = STATE_BUDGET_MB.get(milestone)
     used = state.get("total_bytes") if state.get("available") else outbox.get("db_bytes")
@@ -893,13 +1029,16 @@ def collect(cluster: Cluster, args: argparse.Namespace,
 
     outbox = normalize_outbox(outbox_raw)
     logs = scan_logs(cluster.logs("deploy/%s" % args.deployment, args.log_tail))
-    receiver = summarize_receiver(read_receiver_health(cluster, args))
+    health = read_receiver_health(cluster, args)
+    receiver = summarize_receiver(health)
+    refusals = summarize_refusals(health)
     cache = summarize_cache(read_cache_evidence(cluster, args))
     finished = dt.datetime.now(dt.timezone.utc) if when is None else when
 
     snapshot: Dict[str, Any] = {
         "schema": "dama-hear/bridge-soak-evidence/v1",
         "milestone": args.milestone,
+        "soak_baseline": getattr(args, "soak_baseline", SOAK_BASELINE_T0),
         "captured_at": utc_now_iso(started),
         "window": {"started_at": utc_now_iso(started), "finished_at": utc_now_iso(finished)},
         "namespace": args.namespace,
@@ -908,10 +1047,12 @@ def collect(cluster: Cluster, args: argparse.Namespace,
         "pvc": pvc,
         "pod": pod,
         "outbox": outbox,
-        "coverage": node_coverage(outbox, args.expected_nodes),
+        "coverage": node_coverage(outbox, args.expected_nodes,
+                                  getattr(args, "excluded_nodes", EXCLUDED_NODES)),
         "state_dir": parse_state_listing(state_raw),
         "logs": logs,
         "receiver": receiver,
+        "refusals": refusals,
         "cache": cache,
         "warnings": list(cluster.warnings.items),
     }
@@ -949,7 +1090,11 @@ def redis_value(out: Optional[str]) -> Tuple[Optional[int], Optional[str]]:
 
 
 def read_cache_evidence(cluster: Cluster, args: argparse.Namespace) -> Optional[Dict[str, Any]]:
-    """DBSIZE plus any requested stream lengths. Never enumerates keys on a live cache."""
+    """DBSIZE, requested stream lengths and per-node heartbeat TTLs.
+
+    Never enumerates keys on a live cache: each node's key is addressed by name (`TTL <prefix><id>`),
+    which is O(1), instead of `KEYS`, which is O(N) and refused by the read-verb guard.
+    """
     if not args.redis_workload:
         return None
     redis = Cluster(namespace=args.redis_namespace, timeout=cluster.timeout,
@@ -959,14 +1104,25 @@ def read_cache_evidence(cluster: Cluster, args: argparse.Namespace) -> Optional[
     dbsize, error = redis_value(out)
     if out is None:
         return {"reachable": False, "error": error}
+    prefix = getattr(args, "cache_key_prefix", DEFAULT_CACHE_KEY_PREFIX)
+    ttl_limit = getattr(args, "heartbeat_ttl", DEFAULT_HEARTBEAT_TTL_S)
     evidence: Dict[str, Any] = {"reachable": True, "authenticated": error is None,
-                                "dbsize": dbsize, "error": error}
+                                "dbsize": dbsize, "error": error,
+                                "key_prefix": prefix, "ttl_limit_s": ttl_limit}
     streams: Dict[str, Any] = {}
     for key in args.cache_stream or []:
         value, key_error = redis_value(
             redis.exec_out(target, ["redis-cli", "XLEN", key], "redis XLEN %s" % key))
         streams[key] = value if key_error is None else None
     evidence["streams"] = streams
+    ttls: Dict[str, Any] = {}
+    if error is None and prefix:
+        for node in args.expected_nodes or []:
+            key = "%s%s" % (prefix, node)
+            value, key_error = redis_value(
+                redis.exec_out(target, ["redis-cli", "TTL", key], "redis TTL %s" % key))
+            ttls[node] = value if key_error is None else None
+    evidence["ttl_seconds"] = ttls
     return evidence
 
 
@@ -992,6 +1148,7 @@ def format_snapshot(snapshot: Mapping[str, Any],
         "",
         "captured_at %s (UTC), namespace %s, read-only"
         % (snapshot.get("captured_at"), snapshot.get("namespace")),
+        "soak baseline %s" % (snapshot.get("soak_baseline") or "undeclared"),
         "",
         "## deployment",
         "generation %s/%s  image %s  strategy %s  replicas %s ready %s"
@@ -1020,10 +1177,12 @@ def format_snapshot(snapshot: Mapping[str, Any],
         "## node coverage",
         "present %s" % (", ".join(coverage.get("present") or []) or "none"),
         "missing %s" % (", ".join(coverage.get("missing") or []) or "none"),
+        "excluded %s" % (json.dumps(coverage.get("excluded") or {}, sort_keys=True)),
         "counts %s" % json.dumps(coverage.get("counts") or {}, sort_keys=True),
         "",
         "## receiver and cache",
         "receiver %s" % json.dumps(snapshot.get("receiver") or {}, sort_keys=True),
+        "refusals %s" % json.dumps(snapshot.get("refusals") or {}, sort_keys=True),
         "cache %s" % json.dumps(snapshot.get("cache") or {}, sort_keys=True),
         "",
         "## log evidence",
@@ -1099,6 +1258,15 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--baseline", help="T0 snapshot.json (or its directory) to compare against")
     ap.add_argument("--expected-nodes", default=",".join(EXPECTED_NODES),
                     help="comma-separated device ids that must appear in the ledger")
+    ap.add_argument("--excluded-node", action="append", default=[], metavar="ID=REASON",
+                    help="a node deliberately out of the soak and why; repeatable. Defaults to "
+                         "the documented exclusions (%s)" % ", ".join(sorted(EXCLUDED_NODES)))
+    ap.add_argument("--soak-baseline", default=SOAK_BASELINE_T0,
+                    help="authoritative soak baseline recorded in the snapshot")
+    ap.add_argument("--cache-key-prefix", default=DEFAULT_CACHE_KEY_PREFIX,
+                    help="Redis heartbeat key prefix read with TTL ('' to skip TTL evidence)")
+    ap.add_argument("--heartbeat-ttl", type=int, default=DEFAULT_HEARTBEAT_TTL_S,
+                    help="expected upper bound for a heartbeat key's TTL, in seconds")
     ap.add_argument("--records-per-day", type=int, default=DEFAULT_RECORDS_PER_DAY)
     ap.add_argument("--growth-tolerance", type=float, default=DEFAULT_GROWTH_TOLERANCE)
     ap.add_argument("--log-tail", type=int, default=DEFAULT_LOG_TAIL)
@@ -1113,9 +1281,23 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def parse_excluded(items: Sequence[str]) -> Dict[str, str]:
+    """`ID=REASON` pairs into the documented-exclusion map; no pairs means the built-in defaults."""
+    if not items:
+        return dict(EXCLUDED_NODES)
+    out: Dict[str, str] = {}
+    for item in items:
+        node, _, reason = str(item).partition("=")
+        node = node.strip()
+        if node:
+            out[node] = reason.strip() or EXCLUDED_NODES.get(node, "")
+    return out
+
+
 def main(argv: Optional[Sequence[str]] = None, runner: KubectlRunner = run_kubectl) -> int:
     args = build_parser().parse_args(list(argv or []))
     args.expected_nodes = [n.strip() for n in str(args.expected_nodes).split(",") if n.strip()]
+    args.excluded_nodes = parse_excluded(args.excluded_node)
     if not args.receiver:
         args.receiver = ""
     warnings = WarningSink()

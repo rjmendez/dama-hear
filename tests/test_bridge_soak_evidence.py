@@ -104,8 +104,8 @@ def cm_doc(body="print('bridge')\n"):
 def outbox_sample(records=2810, pending=0, failed=0, newest="2026-09-15T14:30:44Z",
                   oldest="2026-09-15T13:12:59Z", devices=None):
     devices = devices if devices is not None else [
-        ["gold", 492], ["ageev", 489], ["kasami", 487],
-        ["rankine", 475], ["nyquist", 448], ["mach", 419]]
+        ["gold", 592], ["ageev", 589], ["kasami", 587],
+        ["nyquist", 548], ["mach", 494]]
     return {
         "path": "/state/mqtt-bridge.sqlite3",
         "tables": ["cache_attempts", "durable_records"],
@@ -129,7 +129,11 @@ def outbox_sample(records=2810, pending=0, failed=0, newest="2026-09-15T14:30:44
 HEALTHZ = {"status": "ok", "durable_store": {"backend": "sqlite", "enabled": True,
                                              "pending_records": 0, "cache_successes": 9,
                                              "cache_failures": 0,
-                                             "last_cache_failure_at": None}}
+                                             "last_cache_failure_at": None},
+           "refusals": {"backend": "sqlite", "enabled": True, "refused_messages": 3,
+                        "last_refusal_at": "2026-09-15T18:40:02Z", "max_rows": 5000,
+                        "max_bytes": 16 * 1024 * 1024, "evicted_refusals": 0,
+                        "suppressed_refusals": 0}}
 
 STATE_LS = ("total 5540\n"
             "-rw-r--r-- 1 root root 4186112 Sep 15 14:30 mqtt-bridge.sqlite3\n"
@@ -151,6 +155,7 @@ class FakeKubectl:
         self.logs = overrides.get("logs", "connected; subscribing\ndurable backend=sqlite\n")
         self.state_ls = overrides.get("state_ls", STATE_LS)
         self.redis = overrides.get("redis", "41\n")
+        self.redis_ttl = overrides.get("redis_ttl", "22\n")
 
     def __call__(self, args, timeout):
         self.calls.append(list(args))
@@ -159,7 +164,7 @@ class FakeKubectl:
         if "exec" in args:
             remote = args[args.index("--") + 1:]
             if remote[0] == "redis-cli":
-                out = self.redis
+                out = self.redis_ttl if "TTL" in remote else self.redis
             elif "sqlite3" in " ".join(remote):
                 out = json.dumps(self.outbox)
             elif remote[0] == "sh":
@@ -397,7 +402,7 @@ class TestSummaries:
         assert o["records"] == 2810 and o["pending"] == 0 and o["failed"] == 0
         assert o["oldest_record_at"] == "2026-09-15T13:12:59Z"
         assert o["db_bytes"] == 1022 * 4096
-        assert o["by_device"]["gold"] == 492
+        assert o["by_device"]["gold"] == 592
 
     def test_an_unavailable_outbox_is_marked_rather_than_guessed(self):
         assert B.normalize_outbox(None) == {"available": False}
@@ -405,8 +410,25 @@ class TestSummaries:
     def test_node_coverage_names_what_is_missing(self):
         o = B.normalize_outbox(outbox_sample(devices=[["gold", 10], ["mach", 4]]))
         cov = B.node_coverage(o, B.EXPECTED_NODES)
-        assert cov["missing"] == ["nyquist", "rankine", "ageev", "kasami"]
+        assert cov["missing"] == ["ageev", "kasami", "nyquist"]
         assert cov["complete"] is False
+
+    def test_an_excluded_node_is_documented_rather_than_missing(self):
+        # Rankine is out of the soak pending physical recovery. It must never show up as one of
+        # the expected five, and its absence must carry a reason.
+        cov = B.node_coverage(B.normalize_outbox(outbox_sample()), B.EXPECTED_NODES)
+        assert "rankine" not in cov["expected"]
+        assert "rankine" not in cov["missing"]
+        assert cov["excluded"]["rankine"]
+        assert cov["excluded_present"] == []
+        assert cov["complete"] is True
+
+    def test_an_excluded_node_that_is_still_writing_is_reported(self):
+        o = B.normalize_outbox(outbox_sample(
+            devices=[[n, 100] for n in B.EXPECTED_NODES] + [["rankine", 4]]))
+        cov = B.node_coverage(o, B.EXPECTED_NODES)
+        assert cov["excluded_present"] == ["rankine"]
+        assert cov["unexpected"] == [], "a documented exclusion is not an unknown device"
 
     def test_full_coverage_is_complete(self):
         cov = B.node_coverage(B.normalize_outbox(outbox_sample()), B.EXPECTED_NODES)
@@ -434,6 +456,33 @@ class TestSummaries:
     def test_the_receiver_health_block_is_flattened(self):
         r = B.summarize_receiver(HEALTHZ)
         assert r["backend"] == "sqlite" and r["pending_records"] == 0 and r["available"] is True
+
+    def test_the_refusal_surface_is_kept_separate_from_durable_health(self):
+        # refused input never reaches the outbox, so its counters must not be folded into the
+        # durable_store block the durability verdict reads.
+        r = B.summarize_refusals(HEALTHZ)
+        assert r["refused_messages"] == 3 and r["max_rows"] == 5000
+        assert r["within_caps"] is True
+        assert r["separate_from_durable_health"] is True
+        assert "pending_records" not in r
+
+    def test_refusals_beyond_the_row_cap_are_reported_as_a_cap_breach(self):
+        health = copy.deepcopy(HEALTHZ)
+        health["refusals"]["refused_messages"] = 500000
+        assert B.summarize_refusals(health)["within_caps"] is False
+
+    def test_a_receiver_without_a_refusal_surface_is_unavailable_not_empty(self):
+        assert B.summarize_refusals({"durable_store": {}})["available"] is False
+
+    def test_cache_ttls_are_split_into_volatile_persistent_and_absent(self):
+        cache = B.summarize_cache({"reachable": True, "authenticated": True, "dbsize": 41,
+                                   "key_prefix": "dama:hear:", "ttl_limit_s": 30,
+                                   "ttl_seconds": {"gold": 22, "mach": -1, "ageev": -2,
+                                                   "kasami": 900, "nyquist": 7}})
+        assert cache["volatile"] == ["gold", "kasami", "nyquist"]
+        assert cache["persistent"] == ["mach"], "a key that lost its expiry is an unbounded cache"
+        assert cache["absent"] == ["ageev"]
+        assert cache["over_limit"] == ["kasami"]
 
 
 # ---------------------------------------------------------------- 4. Phase-2 grading
@@ -473,6 +522,69 @@ class TestGrading:
                   "2026-09-15T14:30:45Z")
         assert verdicts(B.evaluate(snap, None, "T0"))["all_nodes_covered"] == "fail"
 
+    def test_the_excluded_node_is_graded_as_documented_not_missing(self):
+        snap = at(snapshot_from(), "2026-09-15T14:30:45Z")
+        grading = B.evaluate(snap, None, "T0")
+        assert verdicts(grading)["excluded_nodes_documented"] == "pass"
+        assert verdicts(grading)["all_nodes_covered"] == "pass"
+        assert snap["coverage"]["excluded"]["rankine"]
+
+    def test_an_exclusion_without_a_reason_fails(self):
+        snap = at(snapshot_from(), "2026-09-15T14:30:45Z")
+        snap["coverage"]["excluded"] = {"rankine": ""}
+        assert verdicts(B.evaluate(snap, None, "T0"))["excluded_nodes_documented"] == "fail"
+
+    def test_a_node_cannot_be_expected_and_excluded_at_once(self):
+        snap = at(snapshot_from(), "2026-09-15T14:30:45Z")
+        snap["coverage"] = B.node_coverage(B.normalize_outbox(outbox_sample()),
+                                           B.EXPECTED_NODES, {"gold": "on the bench"})
+        grading = B.evaluate(snap, None, "T0")
+        assert verdicts(grading)["excluded_nodes_documented"] == "fail"
+        assert verdicts(grading)["all_nodes_covered"] == "fail"
+
+    def test_the_snapshot_declares_the_authoritative_soak_baseline(self):
+        snap = at(snapshot_from(), "2026-09-15T18:30:00Z")
+        assert snap["soak_baseline"] == "2026-09-15T18:26:22Z"
+        assert verdicts(B.evaluate(snap, None, "T0"))["soak_baseline_declared"] == "pass"
+
+    def test_a_snapshot_from_another_baseline_fails(self):
+        snap = at(snapshot_from(), "2026-09-15T18:30:00Z")
+        snap["soak_baseline"] = "2026-09-15T13:12:44Z"
+        assert verdicts(B.evaluate(snap, None, "T0"))["soak_baseline_declared"] == "fail"
+
+    def test_refusals_are_graded_on_their_own_line(self):
+        snap = at(snapshot_from(), "2026-09-15T14:30:45Z")
+        grading = B.evaluate(snap, None, "T0")
+        assert verdicts(grading)["refusal_caps_hold"] == "pass"
+        snap["refusals"]["within_caps"] = False
+        broken = B.evaluate(snap, None, "T0")
+        assert verdicts(broken)["refusal_caps_hold"] == "fail"
+        assert verdicts(broken)["receiver_ledger_drained"] == "pass", \
+            "a refusal cap breach is not a durability defect"
+
+    def test_a_heartbeat_key_that_lost_its_expiry_fails(self):
+        snap = at(snapshot_from({"redis_ttl": "-1\n"}), "2026-09-15T14:30:45Z")
+        assert verdicts(B.evaluate(snap, None, "T0"))["cache_ttl_armed"] == "fail"
+
+    def test_a_missing_heartbeat_key_for_a_writing_node_fails(self):
+        snap = at(snapshot_from({"redis_ttl": "-2\n"}), "2026-09-15T14:30:45Z")
+        assert verdicts(B.evaluate(snap, None, "T0"))["cache_ttl_armed"] == "fail"
+
+    def test_unreadable_redis_leaves_ttl_unknown_rather_than_failing_the_soak(self):
+        snap = at(snapshot_from({"redis": "NOAUTH Authentication required.\n"}),
+                  "2026-09-15T14:30:45Z")
+        assert verdicts(B.evaluate(snap, None, "T0"))["cache_ttl_armed"] == "unknown"
+
+    def test_ttl_evidence_never_enumerates_keys(self):
+        fake = FakeKubectl()
+        args = B.build_parser().parse_args(["--no-write"])
+        args.expected_nodes = list(B.EXPECTED_NODES)
+        B.collect(B.Cluster(runner=fake), args)
+        redis_calls = [c for c in fake.calls if "redis-cli" in c]
+        assert redis_calls, "the collector must ask Redis for per-node TTLs"
+        assert all("KEYS" not in c and "SCAN" not in c for c in redis_calls)
+        assert any(["TTL", "dama:hear:gold"] == c[-2:] for c in redis_calls)
+
     def test_a_restarted_pod_fails(self):
         snap = at(snapshot_from({"pods": pods_doc(restarts=2)}), "2026-09-15T14:30:45Z")
         assert verdicts(B.evaluate(snap, None, "T0"))["pod_restarts_zero"] == "fail"
@@ -505,12 +617,12 @@ class TestGrading:
         base = at(snapshot_from(), "2026-09-15T14:30:45Z")
         later = at(snapshot_from({"outbox": outbox_sample(
             records=records, newest="2026-09-16T14:30:45Z",
-            devices=[[n, records // 6] for n in B.EXPECTED_NODES])}),
+            devices=[[n, records // 5] for n in B.EXPECTED_NODES])}),
             "2026-09-16T14:30:45Z" if hours == 24 else "2026-09-22T14:30:45Z")
         return base, later
 
     def test_t24h_passes_when_growth_matches_the_measured_rate(self):
-        base, later = self._pair(24, 2810 + 52000)
+        base, later = self._pair(24, 2810 + 43300)
         grading = B.evaluate(later, base, "T+24h")
         assert verdicts(grading)["record_growth"] == "pass"
         assert verdicts(grading)["window_matches_milestone"] == "pass"
@@ -530,13 +642,13 @@ class TestGrading:
         assert grading["verdict"] == "fail"
 
     def test_a_sample_taken_at_the_wrong_time_is_not_graded_as_that_milestone(self):
-        base, later = self._pair(24, 2810 + 52000)
+        base, later = self._pair(24, 2810 + 43300)
         assert verdicts(B.evaluate(later, base, "T+7d"))["window_matches_milestone"] == "fail"
 
     def test_coverage_regression_against_the_baseline_fails(self):
         base = at(snapshot_from(), "2026-09-15T14:30:45Z")
         later = at(snapshot_from({"outbox": outbox_sample(
-            records=2810 + 52000, newest="2026-09-16T14:30:45Z",
+            records=2810 + 43300, newest="2026-09-16T14:30:45Z",
             devices=[["gold", 9000], ["mach", 9000]])}), "2026-09-16T14:30:45Z")
         grading = B.evaluate(later, base, "T+24h")
         assert verdicts(grading)["coverage_not_regressed"] == "fail"
@@ -544,7 +656,7 @@ class TestGrading:
     def test_retention_is_graded_at_the_long_milestones(self):
         base = at(snapshot_from(), "2026-09-15T14:30:45Z")
         later = at(snapshot_from({"outbox": outbox_sample(
-            records=2810 + 52000 * 14, oldest="2026-07-01T00:00:00Z",
+            records=2810 + 43300 * 14, oldest="2026-07-01T00:00:00Z",
             newest="2026-09-29T14:30:45Z",
             devices=[[n, 100000] for n in B.EXPECTED_NODES])}), "2026-09-29T14:30:45Z")
         grading = B.evaluate(later, base, "T+14d")
@@ -556,14 +668,14 @@ class TestGrading:
         # which is what the outbox is for.
         base = at(snapshot_from({"outbox": outbox_sample(failed=12)}), "2026-09-15T14:30:45Z")
         later = at(snapshot_from({"outbox": outbox_sample(
-            records=2810 + 52000, failed=12, newest="2026-09-16T14:30:45Z",
+            records=2810 + 43300, failed=12, newest="2026-09-16T14:30:45Z",
             devices=[[n, 9000] for n in B.EXPECTED_NODES])}), "2026-09-16T14:30:45Z")
         assert verdicts(B.evaluate(later, base, "T+24h"))["no_cache_failures"] == "pass"
 
     def test_growing_cache_failures_fail(self):
         base = at(snapshot_from({"outbox": outbox_sample(failed=12)}), "2026-09-15T14:30:45Z")
         later = at(snapshot_from({"outbox": outbox_sample(
-            records=2810 + 52000, failed=900, newest="2026-09-16T14:30:45Z",
+            records=2810 + 43300, failed=900, newest="2026-09-16T14:30:45Z",
             devices=[[n, 9000] for n in B.EXPECTED_NODES])}), "2026-09-16T14:30:45Z")
         assert verdicts(B.evaluate(later, base, "T+24h"))["no_cache_failures"] == "fail"
 
@@ -665,3 +777,21 @@ class TestCli:
         payload = json.loads(capsys.readouterr().out)
         assert payload["snapshot"]["coverage"]["expected"] == ["gold", "mach"]
         assert payload["snapshot"]["coverage"]["complete"] is True
+
+    def test_exclusions_are_configurable_and_always_carry_a_reason(self, capsys):
+        rc, _ = run(["--no-write", "--format", "json", "--expected-nodes", "gold,mach",
+                     "--excluded-node", "kasami=on the bench for mic rework"])
+        payload = json.loads(capsys.readouterr().out)
+        coverage = payload["snapshot"]["coverage"]
+        assert coverage["excluded"] == {"kasami": "on the bench for mic rework"}
+        assert "rankine" in coverage["unexpected"] or "rankine" not in coverage["present"]
+        assert payload["grading"]["verdict"] in ("pass", "fail", "incomplete")
+
+    def test_ttl_evidence_can_be_skipped_without_failing_the_run(self, capsys):
+        rc, fake = run(["--no-write", "--format", "json", "--cache-key-prefix", ""])
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["snapshot"]["cache"]["ttl_seconds"] == {}
+        assert all("TTL" not in call for call in fake.calls)
+        names = {c["name"]: c["verdict"] for c in payload["grading"]["checks"]}
+        assert names["cache_ttl_armed"] == "unknown"
