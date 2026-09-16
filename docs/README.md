@@ -65,6 +65,7 @@ what was chosen, the in-tree evidence it rests on, and what was deliberately lef
 | [uplink.md](uplink.md) | Node uplink transports and envelopes. |
 | [esp32s3-lora-node.md](esp32s3-lora-node.md) | ESP32-S3 LoRa node design. |
 | [node-hardware.md](node-hardware.md) | Node hardware reference. |
+| [survey-edge-dsp-micro-acoustic-models.md](survey-edge-dsp-micro-acoustic-models.md) | Survey of micro-acoustic and edge DSP models for constrained nodes (ESP32-S3, iCE40, Zynq, Cortex-M4/M7): the measured per-second budget the tier-1 node already spends, micro-VAD/TinyML triggers and why an onset delay of 1–3 frames is disqualifying against a 183 µs timing budget, on-chip FFT/mel/I2S-DMA/PDM-decimation options and the DMA depth as the real compute bound, STA/LTA vs Teager-Kaiser vs spectral flux for impulsive and sustained targets, and FPGA phase alignment, delay-and-sum and bounded-lag correlation for 8–32 capsule arrays. Adopts nothing; every candidate figure is DERIVED or vendor-claimed and none has been run on a node. |
 | [faketec-pin-budget.md](faketec-pin-budget.md) | Board pin budget. |
 | [l86-reference.md](l86-reference.md) | L86 GNSS module reference. |
 | [hear-latency-calibration-runbook.md](hear-latency-calibration-runbook.md) | Latency calibration procedure. |
