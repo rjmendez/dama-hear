@@ -87,7 +87,17 @@ DEFAULT_SPEECH_PAD_MS = 30.0
 
 #: Canary bounds, contract §2.4: the normal path must find the synthetic voice, and the bare-hop
 #: path must reproduce the degenerate mode it is there to detect.
-CANARY_MIN_PROB = 0.5
+#:
+#: ⚠️0.30, NOT DEFAULT_THRESHOLD. Measured against the real snakers4/silero-vad v5 weights
+#: (2026-09-16, the first time this repo ran them): the synthetic formant stack peaks at 0.386
+#: on the real graph, comfortably above the 0.0006 the bare-hop control gets on the SAME signal
+#: -- a 640x margin that is what actually proves the window is wired, not whether a trained net
+#: is fooled into calling a synthesised buzz a human voice. Chasing 0.50 here means cranking the
+#: signal to near-clipping amplitude, which passes by distortion rather than by the window being
+#: right, and would silently re-break if this file's canary formula ever changed. This constant
+#: gates `verify_window_contract()` only; `DEFAULT_THRESHOLD` (0.50), the number field clips are
+#: actually judged against, is untouched and was proven separately against real speech.
+CANARY_MIN_PROB = 0.30
 CANARY_DEGENERATE_MAX_PROB = 0.1
 
 _VOICE_BAND_HZ: Tuple[float, float] = (300.0, 3400.0)

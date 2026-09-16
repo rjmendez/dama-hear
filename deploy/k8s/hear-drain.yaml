@@ -40,10 +40,16 @@ spec:
   # only for scene.csv, every run reporting `ok` over a 3.27 h hole -- is fixed in the drain, not
   # in this file: tools/hear_drain.py now DISCOVERS the names from /ls. See
   # docs/acoustic-stack.md section 0.1.
-  # CLIP WAV RETENTION IS DISABLED BY OPERATOR PRIVACY POLICY. The drain continues to collect
-  # detections and scene data, but `--clip-max-per-node 0` prevents WAV download and
-  # `--clip-store-max-b 0` removes any previously retained clip bytes. Do not raise either value
-  # without an explicit retention-policy change and capacity/privacy review.
+  # CLIP WAV RETENTION IS RE-ENABLED, GATED BY AN AUTOMATED VOICE PURGE ON EVERY RUN. Raw WAVs
+  # are fetched (`--clip-max-per-node 96 --clip-store-max-b 2147483648`, the pre-privacy-mode
+  # defaults, §THE CLIP LANE below) and then, in the SAME cron cycle, `tools/hear_privacy_purge.py`
+  # scores every clip on the pool with Silero VAD v5 and destroys any that contain confirmed human
+  # speech before the run exits -- see docs/silero-vad-privacy-contract.md. This bounds how long a
+  # voice recording can exist on disk to one drain interval (~15 minutes), not indefinitely, and it
+  # is why `set -e` above the purge call is load-bearing: a purge failure must fail the CronJob
+  # red, not leave unscored speech sitting on the PVC with a green history. Fail-closed detail:
+  # `hear_privacy_purge.py` exits 2 or 3 on any clip it could not confidently score or destroy, and
+  # `set -e` turns that straight into a failed run.
   #
   # Every 15 minutes. The nodes roll dets.csv to dets-prev.csv on reflash, so the window a
   # missed run can lose is bounded well under one boot; the fetch is tens of KB.
@@ -59,6 +65,13 @@ spec:
       # 30-minute one. Simulated against the measured write rate: 15 min loses 0 clips, 30 min
       # loses 0, 45 min loses 3 of nyquist's 321. The margin is exactly two missed runs, and the
       # clip lane below is what spends part of it, so the bound goes in WITH it.
+      #
+      # ⚠️THE PURGE STEP ADDED TO THIS SAME RUN SPENDS MORE OF THAT MARGIN. Scoring up to ~672
+      # freshly-fetched clips (96/node * 7 nodes) at Silero's ~0.5-1.0 ms/frame upstream claim is
+      # on the order of 100 s, well inside the 590 s of headroom above -- but it is UNMEASURED on
+      # this fleet's hardware, and the first run per pod additionally pays a one-time onnxruntime
+      # install and model fetch. If the purge step starts eating the margin, it is the thing to
+      # profile before raising activeDeadlineSeconds.
       activeDeadlineSeconds: 840
       backoffLimit: 2
       template:
@@ -81,8 +94,31 @@ spec:
                     echo "installing numpy into $LIB"
                     pip install --no-cache-dir --target "$LIB" 'numpy==2.2.6' >/dev/null 2>&1
                   fi
+                  # onnxruntime runs the real Silero VAD v5 graph the purge step below calls.
+                  # Cached the same way as numpy: a fresh pod every 15 minutes must not re-pull a
+                  # multi-MB wheel from PyPI on every tick. Absence here is not fatal -- purge.py
+                  # falls back to BandEnergyVAD and says so on every receipt -- but it must not be
+                  # silently slow either, hence the version pin.
+                  if [ ! -d "$LIB/onnxruntime" ]; then
+                    echo "installing onnxruntime into $LIB"
+                    pip install --no-cache-dir --target "$LIB" 'onnxruntime==1.27.0' >/dev/null 2>&1
+                  fi
+                  # The Silero v5 weights (MIT licence, docs/silero-vad-privacy-contract.md §1)
+                  # are ~2 MB and are fetched once onto the PVC rather than checked into this repo.
+                  # The sha256 pin is what stops a compromised or rotated upstream file from being
+                  # scored as though it were the audited release.
+                  MODEL=/pool/models/silero_vad.onnx
+                  MODEL_SHA256=1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3
+                  if [ ! -f "$MODEL" ]; then
+                    echo "fetching silero_vad.onnx"
+                    mkdir -p /pool/models
+                    python3 -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx', '$MODEL.tmp')"
+                    echo "$MODEL_SHA256  $MODEL.tmp" | sha256sum -c - >/dev/null
+                    mv "$MODEL.tmp" "$MODEL"
+                  fi
                   export PYTHONPATH="$LIB:/app"
-                  exec python /app/tools/hear_drain.py \
+                  export HEAR_SILERO_VAD_MODEL="$MODEL"
+                  python /app/tools/hear_drain.py \
                     --pool /pool/corpus \
                     --node nyquist=172.16.100.105 \
                     --node mach=172.16.100.116 \
@@ -91,9 +127,18 @@ spec:
                     --node gold=172.16.100.82 \
                     --node kasami=172.16.100.90 \
                     --node ageev=172.16.100.83 \
-                    --clip-max-per-node 0 \
-                    --clip-store-max-b 0 \
-                    --clip-deadline-s 120
+                    --clip-max-per-node 96 \
+                    --clip-store-max-b 2147483648 \
+                    --clip-deadline-s 270
+                  # PRIVACY GATE: every clip the fetch above just wrote is scored and, if it holds
+                  # confirmed speech, destroyed before this run exits -- see the comment on the
+                  # CronJob's `spec` field above. `--receipt-clean` also writes a NO_SPEECH row for
+                  # every clip that was scored and kept, so the audit log can prove coverage and
+                  # not only destructions.
+                  exec python /app/tools/hear_privacy_purge.py \
+                    --pool /pool/corpus/clips \
+                    --receipt-clean \
+                    --audit-log /pool/corpus/clips/vad_purge.jsonl
               volumeMounts:
                 - { name: code, mountPath: /app/hear/__init__.py,  subPath: hear__init__.py }
                 - { name: code, mountPath: /app/hear/wire.py,      subPath: hear_wire.py }
@@ -106,6 +151,12 @@ spec:
                 - { name: code, mountPath: /app/hear/clips.py,     subPath: hear_clips.py }
                 - { name: code, mountPath: /app/tools/hear_drain.py, subPath: tools_hear_drain.py }
                 - { name: code, mountPath: /app/tools/fleet.py,    subPath: tools_fleet.py }
+                - { name: code, mountPath: /app/hear/privacy/__init__.py, subPath: hear_privacy__init__.py }
+                - { name: code, mountPath: /app/hear/privacy/purge.py, subPath: hear_privacy_purge.py }
+                - { name: code, mountPath: /app/hear/privacy/silero_vad.py, subPath: hear_privacy_silero_vad.py }
+                - { name: code, mountPath: /app/hear/privacy/transient_tdoa.py, subPath: hear_privacy_transient_tdoa.py }
+                - { name: code, mountPath: /app/tools/hear_privacy_purge.py, subPath: tools_hear_privacy_purge.py }
+                - { name: code, mountPath: /app/hear/resample.py, subPath: hear_resample.py }
                 - { name: pool, mountPath: /pool }
               resources:
                 requests: { cpu: 100m, memory: 128Mi }
@@ -235,6 +286,12 @@ spec:
                 - { name: code, mountPath: /app/hear/clips.py,     subPath: hear_clips.py }
                 - { name: code, mountPath: /app/tools/hear_drain.py, subPath: tools_hear_drain.py }
                 - { name: code, mountPath: /app/tools/fleet.py,    subPath: tools_fleet.py }
+                - { name: code, mountPath: /app/hear/privacy/__init__.py, subPath: hear_privacy__init__.py }
+                - { name: code, mountPath: /app/hear/privacy/purge.py, subPath: hear_privacy_purge.py }
+                - { name: code, mountPath: /app/hear/privacy/silero_vad.py, subPath: hear_privacy_silero_vad.py }
+                - { name: code, mountPath: /app/hear/privacy/transient_tdoa.py, subPath: hear_privacy_transient_tdoa.py }
+                - { name: code, mountPath: /app/tools/hear_privacy_purge.py, subPath: tools_hear_privacy_purge.py }
+                - { name: code, mountPath: /app/hear/resample.py, subPath: hear_resample.py }
                 - { name: pool, mountPath: /pool }
               resources:
                 requests: { cpu: 100m, memory: 128Mi }

@@ -52,6 +52,21 @@ DRAIN_CODE = [
     # missing path rather than on the drift it was added to find. fleet.py imports nothing from
     # this repo -- stdlib only -- so it costs one key and drags in no other file.
     ("tools_fleet.py", "tools/fleet.py"),
+    # ⚠️SHIPPED BECAUSE THE DRAIN NOW PURGES WHAT IT JUST FETCHED, IN THE SAME RUN. `__init__.py`
+    # runs `from . import purge, transient_tdoa` on package import, so all four privacy files
+    # travel together or the ConfigMap ships a package that crashes on import in the cluster
+    # only. `_imported_paths()` below only resolves one path segment past `hear.`, so it CANNOT
+    # see that `hear/privacy/purge.py` is required from `from hear.privacy import purge` --
+    # check() silently passes an incomplete closure here. This list is manually complete because
+    # the tool that is supposed to prove it cannot, for this one subpackage.
+    ("hear_privacy__init__.py", "hear/privacy/__init__.py"),
+    ("hear_privacy_purge.py", "hear/privacy/purge.py"),
+    ("hear_privacy_silero_vad.py", "hear/privacy/silero_vad.py"),
+    ("hear_privacy_transient_tdoa.py", "hear/privacy/transient_tdoa.py"),
+    ("tools_hear_privacy_purge.py", "tools/hear_privacy_purge.py"),
+    # silero_vad.py's 48k->16k decimation is a lazy `from hear import resample`, so this is
+    # required even though it is not imported at module scope.
+    ("hear_resample.py", "hear/resample.py"),
 ]
 
 # ⚠️SMALL ON PURPOSE. hear_score imports `hear.sketch` and `modules.supersonic.classify` and
