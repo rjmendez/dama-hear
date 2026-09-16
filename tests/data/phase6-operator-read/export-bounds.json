@@ -1,0 +1,177 @@
+{
+  "case_set": "bounded-export-equivalence-and-refusal",
+  "source_of_truth": "hear/verify/list_read.py",
+  "docs": [
+    "docs/legacy-operator-read-boundaries.md",
+    "docs/phase6-list-read-comparison.md"
+  ],
+  "position": "`/api/export` serialises the whole annotations table in one unbounded response (L1). The comparator never issues it. Equivalence is proved over a bounded, recorded range, slice by slice, against a manifest digest -- and a range that cannot be bounded costs recorded coverage instead of being silently skipped.",
+  "equivalence_cases": [
+    {
+      "name": "bounded-range-matches-the-paged-read",
+      "kwargs": {
+        "paged_slice_digests": ["s:one", "s:two"],
+        "export_slice_digests": ["s:one", "s:two"],
+        "rows_paged": 2000,
+        "rows_exported": 2000,
+        "bounded": true,
+        "rows_declared": 2000
+      },
+      "expected": {"equivalent": true, "classification": "match", "rows_compared": 2000, "slices": 2},
+      "reason_contains": null,
+      "why": "The property the boundaries document owes an operator: page exhaustion over a recorded (since_id, max_id) pair is byte-equivalent to the export of that range."
+    },
+    {
+      "name": "an-empty-bounded-range-is-still-a-proof",
+      "kwargs": {
+        "paged_slice_digests": [],
+        "export_slice_digests": [],
+        "rows_paged": 0,
+        "rows_exported": 0,
+        "bounded": true,
+        "rows_declared": 0
+      },
+      "expected": {"equivalent": true, "classification": "match", "rows_compared": 0, "slices": 0},
+      "reason_contains": null,
+      "why": "Nothing in the range, agreed by both sides, is evidence of agreement rather than an absence of evidence."
+    },
+    {
+      "name": "an-unbounded-request-is-refused-not-audited",
+      "kwargs": {
+        "paged_slice_digests": [],
+        "export_slice_digests": [],
+        "rows_paged": 0,
+        "rows_exported": 0,
+        "bounded": false
+      },
+      "expected": {"equivalent": false, "classification": "export_bound_exceeded", "rows_compared": 0, "slices": 0},
+      "reason_contains": "unbounded export",
+      "why": "An auditor that needs the resources of the defect it is auditing is a second outage."
+    },
+    {
+      "name": "a-range-past-the-cap-is-split-never-widened",
+      "kwargs": {
+        "paged_slice_digests": ["s:one"],
+        "export_slice_digests": ["s:one"],
+        "rows_paged": 50001,
+        "rows_exported": 50001,
+        "bounded": true
+      },
+      "expected": {"equivalent": false, "classification": "export_bound_exceeded", "rows_compared": 0, "slices": 0},
+      "reason_contains": "split the range",
+      "why": "The cap is a bound on one proof, not a budget to be raised when a proof is inconvenient."
+    },
+    {
+      "name": "two-sides-returned-different-row-counts",
+      "kwargs": {
+        "paged_slice_digests": ["s:one"],
+        "export_slice_digests": ["s:one"],
+        "rows_paged": 1000,
+        "rows_exported": 999,
+        "bounded": true
+      },
+      "expected": {"equivalent": false, "classification": "export_divergence", "rows_compared": 1000, "slices": 1},
+      "reason_contains": "paged read returned",
+      "why": "A row the export drops between pages is exactly the loss this comparison exists to catch."
+    },
+    {
+      "name": "a-manifest-that-lies-about-its-row-count",
+      "kwargs": {
+        "paged_slice_digests": ["s:one"],
+        "export_slice_digests": ["s:one"],
+        "rows_paged": 1000,
+        "rows_exported": 1000,
+        "bounded": true,
+        "rows_declared": 1001
+      },
+      "expected": {"equivalent": false, "classification": "export_divergence", "rows_compared": 1000, "slices": 1},
+      "reason_contains": "manifest declares",
+      "why": "The manifest is part of the evidence; a manifest that disagrees with its own payload is a finding, not a rounding."
+    },
+    {
+      "name": "same-rows-different-order",
+      "kwargs": {
+        "paged_slice_digests": ["s:one", "s:two"],
+        "export_slice_digests": ["s:two", "s:one"],
+        "rows_paged": 2000,
+        "rows_exported": 2000,
+        "bounded": true
+      },
+      "expected": {"equivalent": false, "classification": "export_divergence", "rows_compared": 2000, "slices": 2},
+      "reason_contains": "different ordered content digest",
+      "why": "An export is an ordered range; the slice digest is order-dependent on purpose."
+    },
+    {
+      "name": "same-row-count-different-content",
+      "kwargs": {
+        "paged_slice_digests": ["s:one", "s:two"],
+        "export_slice_digests": ["s:one", "s:three"],
+        "rows_paged": 2000,
+        "rows_exported": 2000,
+        "bounded": true,
+        "rows_declared": 2000
+      },
+      "expected": {"equivalent": false, "classification": "export_divergence", "rows_compared": 2000, "slices": 2},
+      "reason_contains": "different ordered content digest",
+      "why": "Counting rows is not comparing them."
+    }
+  ],
+  "classify_cases": [
+    {
+      "name": "a-bounded-export-that-matches",
+      "export": {"classification": "match", "reason": null},
+      "expected_classification": "match",
+      "expected_gate_impact": "none",
+      "expected_severity": "info"
+    },
+    {
+      "name": "a-refused-unbounded-export-costs-coverage-and-blocks-nothing",
+      "export": {"classification": "export_bound_exceeded", "reason": "the range could not be bounded"},
+      "expected_classification": "export_bound_exceeded",
+      "expected_gate_impact": "none",
+      "expected_severity": "warn",
+      "why": "A read the comparator may not issue is not a defect in either store. It is coverage loss, and coverage loss is reported."
+    },
+    {
+      "name": "a-content-divergence-inside-a-bounded-range-blocks",
+      "export": {"classification": "export_divergence", "reason": "same row count, different ordered content digest"},
+      "expected_classification": "export_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_severity": "critical"
+    },
+    {
+      "name": "an-export-verdict-this-build-cannot-read",
+      "export": {"classification": "export_partially_equivalent", "reason": "from a newer comparator"},
+      "expected_classification": "unclassified",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_severity": "critical",
+      "why": "A verdict this build cannot interpret must never be stepped over by a gate."
+    }
+  ],
+  "coverage_cases": [
+    {
+      "name": "a-refused-export-is-named-in-the-coverage-block",
+      "counts": {
+        "legacy_rows_offered": 1000,
+        "compared": 700,
+        "excluded_unsettled": 100,
+        "excluded_retention_edge": 50,
+        "excluded_sampling": 50,
+        "excluded_unpinned": 50,
+        "excluded_unbounded": 50
+      },
+      "expected": {"accounted": true, "eligible": 750, "excluded_unbounded": 50, "excluded_unpinned": 50},
+      "why": "A refused range leaves the eligible denominator as well as the numerator, so refusing to read it cannot inflate the ratio. Sampling does not: a sampled-away page was eligible and the ratio should say so."
+    },
+    {
+      "name": "rows-that-vanish-from-the-accounting-fail-it",
+      "counts": {"legacy_rows_offered": 1000, "compared": 700},
+      "expected": {"accounted": false}
+    }
+  ],
+  "bounds": {
+    "max_export_rows_compared": 50000,
+    "export_slice_rows": 1000,
+    "why": "Slices are bounded so neither the comparator nor the legacy service ever materialises a whole dump on either side."
+  }
+}

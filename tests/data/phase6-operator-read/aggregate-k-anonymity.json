@@ -1,0 +1,187 @@
+{
+  "case_set": "aggregate-k-anonymity-suppression-and-redaction",
+  "source_of_truth": "hear/verify/list_read.py",
+  "docs": [
+    "docs/phase6-read-audit-retention.md",
+    "docs/phase6-list-read-comparison.md",
+    "docs/data-governance.md"
+  ],
+  "position": "An aggregate receipt carries counts, not people. Group keys come from a closed dimension list, an aggregate over a denied path is refused at construction rather than blinded, and a cell below the k-anonymity floor keeps its verdict while losing its key and its numbers.",
+  "k": 5,
+  "k_decision_ref": "D10",
+  "k_is_decided": false,
+  "dimension_cases": [
+    {"name": "declared-dimensions-are-sorted-and-deduplicated", "dimensions": ["device_id", "day", "device_id"], "accepted": ["day", "device_id"]},
+    {"name": "the-full-closed-set-is-accepted", "dimensions": ["site_id", "device_id", "day", "hour", "evidence_class", "kind", "state", "retention_class", "lane_mode"], "accepted": ["day", "device_id", "evidence_class", "hour", "kind", "lane_mode", "retention_class", "site_id", "state"]},
+    {"name": "a-reviewer-identity-is-not-a-dimension", "dimensions": ["user_id"], "accepted": null, "why": "A count grouped by reviewer identity is a per-reviewer productivity report nobody approved."},
+    {"name": "an-actor-pseudonym-is-not-a-dimension-here-either", "dimensions": ["actor_ref"], "accepted": null, "why": "The retention design keeps actor dimensions in the audit family, under suppression; a read-comparison receipt has no business carrying one at all."},
+    {"name": "free-text-is-not-a-dimension", "dimensions": ["notes"], "accepted": null},
+    {"name": "a-coordinate-is-not-a-dimension", "dimensions": ["lat"], "accepted": null},
+    {"name": "a-client-network-identity-is-not-a-dimension", "dimensions": ["client_ip"], "accepted": null}
+  ],
+  "aggregatable_path_cases": [
+    {"name": "a-permitted-cell-path", "path": "aggregate.value", "refused": false},
+    {"name": "a-small-cell-path", "path": "aggregate.value_small", "refused": false},
+    {"name": "min-max-over-a-coordinate-is-a-bounding-box", "path": "location.lat", "refused": true},
+    {"name": "a-longitude-by-another-name", "path": "node.position", "refused": true},
+    {"name": "distinct-over-a-token-is-a-credential-census", "path": "auth.token", "refused": true},
+    {"name": "an-aggregate-over-clip-bytes", "path": "clip.audio.samples", "refused": true},
+    {"name": "an-aggregate-over-a-response-body", "path": "response.body", "refused": true},
+    {"name": "an-aggregate-over-free-text-payload", "path": "annotation.notes.payload", "refused": true},
+    {"name": "an-empty-path", "path": "   ", "refused": true}
+  ],
+  "cell_key_cases": [
+    {
+      "name": "a-cell-at-the-floor-keeps-its-key",
+      "cell": {"device_id": "gold", "day": "2026-09-15"},
+      "count": 5,
+      "suppressed": false,
+      "expected_values": {"device_id": "gold", "day": "2026-09-15"}
+    },
+    {
+      "name": "a-cell-below-the-floor-loses-its-key-and-keeps-its-dimensions",
+      "cell": {"device_id": "gold", "day": "2026-09-15"},
+      "count": 4,
+      "suppressed": true,
+      "expected_values": null,
+      "why": "A per-device, per-day cell of size one is a record with extra steps, and a receipt store full of them is a movement log."
+    },
+    {
+      "name": "an-empty-cell-is-suppressed",
+      "cell": {"device_id": "gold"},
+      "count": 0,
+      "suppressed": true,
+      "expected_values": null
+    },
+    {
+      "name": "a-suppressed-cell-still-declares-why",
+      "cell": {"site_id": "site-alpha", "hour": "2026-09-15T02"},
+      "count": 1,
+      "suppressed": true,
+      "expected_values": null,
+      "reason_contains": "below k=5",
+      "why": "Suppressing the finding as well as the key would be the comparator hiding its own evidence."
+    }
+  ],
+  "comparison_cases": [
+    {
+      "name": "two-aggregates-that-agree",
+      "legacy": {"gold|2026-09-15": 412, "kasami|2026-09-15": 388},
+      "canonical": {"gold|2026-09-15": 412, "kasami|2026-09-15": 388},
+      "function": "count",
+      "tolerance": 0.0,
+      "cell_counts": null,
+      "expected_difference_count": 0,
+      "expected_paths_start_with": null,
+      "expected_quoted": null
+    },
+    {
+      "name": "a-large-cell-that-differs-is-quoted-so-it-is-actionable",
+      "legacy": {"gold|2026-09-15": 412},
+      "canonical": {"gold|2026-09-15": 371},
+      "function": "count",
+      "tolerance": 0.0,
+      "cell_counts": null,
+      "expected_difference_count": 1,
+      "expected_paths_start_with": "aggregate.value.c:",
+      "expected_quoted": true,
+      "expected_values": {"legacy": 412, "canonical": 371},
+      "why": "A finding with both sides hidden is a finding an operator cannot act on."
+    },
+    {
+      "name": "a-small-cell-that-differs-keeps-the-verdict-and-hides-the-numbers",
+      "legacy": {"gold|2026-09-15T02": 3},
+      "canonical": {"gold|2026-09-15T02": 1},
+      "function": "count",
+      "tolerance": 0.0,
+      "cell_counts": null,
+      "expected_difference_count": 1,
+      "expected_paths_start_with": "aggregate.value_small.c:",
+      "expected_quoted": false
+    },
+    {
+      "name": "a-cell-present-on-one-side-only",
+      "legacy": {"gold|2026-09-15": 412},
+      "canonical": {},
+      "function": "count",
+      "tolerance": 0.0,
+      "cell_counts": null,
+      "expected_difference_count": 1,
+      "expected_paths_start_with": "aggregate.value.c:",
+      "expected_quoted": true,
+      "expected_tolerance": "cell present on one side only"
+    },
+    {
+      "name": "a-count-is-compared-exactly-whatever-tolerance-the-caller-asks-for",
+      "legacy": {"gold|2026-09-15": 100},
+      "canonical": {"gold|2026-09-15": 101},
+      "function": "count",
+      "tolerance": 5.0,
+      "cell_counts": null,
+      "expected_difference_count": 1,
+      "expected_paths_start_with": "aggregate.value.c:",
+      "expected_quoted": true,
+      "why": "\"Close enough\" on a row count is how a missing day survives a review."
+    },
+    {
+      "name": "a-continuous-function-inside-tolerance-over-a-populated-cell",
+      "legacy": {"gold|2026-09-15": 102.0},
+      "canonical": {"gold|2026-09-15": 104.0},
+      "function": "p95",
+      "tolerance": 5.0,
+      "cell_counts": {"gold|2026-09-15": 50},
+      "expected_difference_count": 0,
+      "expected_paths_start_with": null,
+      "expected_quoted": null
+    },
+    {
+      "name": "a-percentile-over-a-cell-with-no-declared-population-is-treated-as-small",
+      "legacy": {"gold|2026-09-15": 102.0},
+      "canonical": {"gold|2026-09-15": 140.0},
+      "function": "p95",
+      "tolerance": 5.0,
+      "cell_counts": null,
+      "expected_difference_count": 1,
+      "expected_paths_start_with": "aggregate.value_small.c:",
+      "expected_quoted": false,
+      "why": "Defaulting to suppression is the only safe default; the alternative leaks exactly the cells that identify one person or one node."
+    }
+  ],
+  "cell_reference_cases": [
+    {
+      "name": "a-cell-key-never-appears-in-a-difference-path",
+      "cell_key": "gold|2026-09-15",
+      "must_not_appear_in_path": ["gold", "2026-09-15"]
+    },
+    {
+      "name": "a-cell-handle-is-stable-so-two-receipts-about-one-cell-join",
+      "cell_key": "gold|2026-09-15",
+      "stable": true
+    }
+  ],
+  "cap_cases": [
+    {"name": "an-aggregate-larger-than-the-cell-cap-is-a-list", "cells": 501, "refused": true},
+    {"name": "an-aggregate-at-the-cap-is-still-an-aggregate", "cells": 500, "refused": false}
+  ],
+  "classify_cases": [
+    {
+      "name": "one-cell-outside-tolerance-blocks-a-cutover",
+      "grain": "aggregate",
+      "surface": "health_snapshot",
+      "differences": [{"path": "aggregate.value.c:ab12cd34"}],
+      "expected_classification": "aggregate_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_severity": "critical"
+    },
+    {
+      "name": "a-suppressed-cell-still-produces-a-blocking-finding",
+      "grain": "aggregate",
+      "surface": "ledger_stat",
+      "differences": [{"path": "aggregate.value_small.c:ab12cd34"}],
+      "expected_classification": "aggregate_divergence",
+      "expected_gate_impact": "blocks_cutover",
+      "expected_severity": "critical",
+      "why": "k-anonymity hides who; it never hides that the two stores disagree."
+    }
+  ]
+}

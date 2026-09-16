@@ -1,0 +1,67 @@
+{
+  "set": "phase6-operator-read",
+  "status": "authored",
+  "generated": false,
+  "generator": null,
+  "why_not_generated": "tools/gen_list_read_contracts.py owns docs/phase6-list-read/fixtures and CI regenerates that tree. These are hand-written case tables for rules that had no worked examples, and they live under tests/ so the generator check and this set cannot collide.",
+  "read_authority": "legacy",
+  "enables": "nothing: no route, no reader, no auth, no audit table, no cluster access, no I/O of any kind",
+  "source_modules": [
+    "hear/verify/list_read.py",
+    "hear/verify/shadow_read.py",
+    "hear/ingest/reconcile.py"
+  ],
+  "source_docs": [
+    "docs/phase6-list-read-comparison.md",
+    "docs/phase6-operator-read-audit.md",
+    "docs/phase6-operator-api-contract.md",
+    "docs/phase6-read-audit-retention.md",
+    "docs/phase5-shadow-read-comparator.md",
+    "docs/legacy-operator-read-boundaries.md",
+    "docs/data-governance.md"
+  ],
+  "driven_by": "tests/test_operator_read_fixtures.py",
+  "files": [
+    {
+      "file": "cursor-pins.json",
+      "covers": "opaque cursor consistency and pin refusal semantics",
+      "case_keys": ["pin_cases", "cursor_opacity_cases", "cursor_comparability_cases", "classify_cases"]
+    },
+    {
+      "file": "export-bounds.json",
+      "covers": "bounded export equivalence, refusal of the unbounded dump, and the coverage that refusal costs",
+      "case_keys": ["equivalence_cases", "classify_cases", "coverage_cases"]
+    },
+    {
+      "file": "aggregate-k-anonymity.json",
+      "covers": "closed group-key dimensions, k-anonymity suppression, small-cell value redaction, aggregate refusal over denied paths",
+      "case_keys": ["dimension_cases", "aggregatable_path_cases", "cell_key_cases", "comparison_cases", "cell_reference_cases", "cap_cases", "classify_cases"]
+    },
+    {
+      "file": "never-retained-fields.json",
+      "covers": "the never-retain field list: clip bytes, coordinates and their digests, notes, labels, tokens, filter values, response bodies and unknown paths",
+      "case_keys": ["never_retained", "still_quotable", "filter_redaction_cases", "blind_rendering_cases"]
+    },
+    {
+      "file": "receipt-minimisation.json",
+      "covers": "the closed receipt field set, the key names a receipt may never carry, and the size and difference bounds",
+      "case_keys": ["readcompare", "shadowread", "forbidden_key_names", "bounds", "invariants"]
+    },
+    {
+      "file": "retention-windows.json",
+      "covers": "family/class/window classification, the retention-edge and retention-divergence verdicts, and the operator decisions still open",
+      "case_keys": ["families", "undecided_decisions", "rt1_finding", "row_state_cases", "retention_edge_cases", "no_enforcement_yet"]
+    },
+    {
+      "file": "read-authority.json",
+      "covers": "legacy as the sole read authority, and the absence of any live comparator, reader, route, credential or audit store",
+      "case_keys": ["authority", "design_modules", "forbidden_in_runtime_trees", "no_auth_enforcement", "no_live_read_path", "schema_constants", "manifest_claims", "every_emitted_receipt_declares"]
+    }
+  ],
+  "undecided": {
+    "owner": "operator",
+    "recorded_in": "docs/phase6-read-audit-retention.md §14",
+    "refs": ["D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9", "D10", "D11", "D12"],
+    "note": "These fixtures pin the *classification* of each window and the default the design would run on. They deliberately do not assert that any period is correct: RA7 makes recording the choice a gate, and a test that froze a default would quietly make the default the decision."
+  }
+}

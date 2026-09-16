@@ -1,0 +1,195 @@
+{
+  "case_set": "cursor-and-pin-refusal-semantics",
+  "source_of_truth": "hear/verify/list_read.py",
+  "docs": [
+    "docs/phase6-list-read-comparison.md",
+    "docs/phase6-operator-api-contract.md",
+    "docs/api-boundaries.md"
+  ],
+  "position": "A list answer is a function of a snapshot. A side that cannot state its pin is refused, and a cursor is an opaque, side-local handle the comparator never parses, never re-derives, never compares across sides and never writes down.",
+  "pin_cases": [
+    {
+      "name": "legacy-range-pin-with-both-bounds",
+      "side_overrides": {"pin_kind": "range_pin", "pin_bound": {"since_id_present": true, "max_id_present": true}},
+      "pin_ok": true,
+      "assert_pinned": "range_pin",
+      "why": "The legacy list surfaces have no cursor, so the comparator bounds its own request instead of adding one to the reader."
+    },
+    {
+      "name": "range-pin-missing-the-upper-bound",
+      "side_overrides": {"pin_kind": "range_pin", "pin_bound": {"since_id_present": true, "max_id_present": false}},
+      "pin_ok": false,
+      "assert_pinned": null,
+      "why": "An open-ended range is not a snapshot; the rows it covers change while it is read."
+    },
+    {
+      "name": "range-pin-missing-the-lower-bound",
+      "side_overrides": {"pin_kind": "range_pin", "pin_bound": {"since_id_present": false, "max_id_present": true}},
+      "pin_ok": false,
+      "assert_pinned": null,
+      "why": "Same reason, other end: a half-declared bound is a declared intention, not a pin."
+    },
+    {
+      "name": "range-pin-with-no-recorded-bound-at-all",
+      "side_overrides": {"pin_kind": "range_pin", "pin_bound": {}},
+      "pin_ok": false,
+      "assert_pinned": null,
+      "why": "A pin that was not recorded cannot be re-presented, so the read is not reproducible."
+    },
+    {
+      "name": "canonical-cursor-pin-inside-its-lifetime",
+      "side_overrides": {"pin_kind": "cursor_pin", "pin_id": "pin:canonical", "pin_age_s": 30.0},
+      "pin_ok": true,
+      "assert_pinned": "cursor_pin",
+      "why": "The canonical surface's own opaque cursor, held no longer than the 24 h lifetime the API boundary already states."
+    },
+    {
+      "name": "cursor-pin-older-than-its-ttl",
+      "side_overrides": {"pin_kind": "cursor_pin", "pin_id": "pin:canonical", "pin_age_s": 86401.0},
+      "pin_ok": false,
+      "assert_pinned": null,
+      "why": "An expired pin is the comparator's own fault; presenting it would date the evidence without saying so."
+    },
+    {
+      "name": "cursor-pin-with-no-handle",
+      "side_overrides": {"pin_kind": "cursor_pin", "pin_id": null, "pin_age_s": 10.0},
+      "pin_ok": false,
+      "assert_pinned": null,
+      "why": "A pin kind without a handle is a claim, not a pin."
+    },
+    {
+      "name": "store-level-snapshot-id",
+      "side_overrides": {"pin_kind": "snapshot_id", "pin_id": "pin:snapshot:2026-09-15T02", "pin_age_s": 5.0},
+      "pin_ok": true,
+      "assert_pinned": "snapshot_id",
+      "why": "A store-level snapshot is the strongest available pin and is accepted as one."
+    },
+    {
+      "name": "unpinned-side",
+      "side_overrides": {"pin_kind": "none"},
+      "pin_ok": false,
+      "assert_pinned": null,
+      "why": "Refusing is the honest answer; inventing a cursor for the legacy surface would make the comparator the author of the ordering it audits."
+    },
+    {
+      "name": "pin-kind-from-a-newer-build",
+      "side_overrides": {"pin_kind": "keyset_pin", "pin_id": "pin:x"},
+      "pin_ok": false,
+      "assert_pinned": null,
+      "why": "The pin vocabulary is closed: an unrecognised kind is unpinned, never assumed equivalent."
+    }
+  ],
+  "cursor_opacity_cases": [
+    {"name": "an-opaque-string-handle", "token": "eyJjIjoib3BhcXVlIn0", "opaque": true},
+    {"name": "a-parsed-cursor-is-not-a-cursor", "token": {"created_at": "2026-09-15T00:00:00Z", "id": 41}, "opaque": false},
+    {"name": "an-empty-token-is-no-token", "token": "", "opaque": false},
+    {"name": "a-numeric-offset-is-not-an-opaque-handle", "token": 41, "opaque": false},
+    {"name": "a-missing-token", "token": null, "opaque": false}
+  ],
+  "cursor_comparability_cases": [
+    {"name": "identical-strings-are-still-not-comparable", "left": "cursor-a", "right": "cursor-a"},
+    {"name": "different-strings-are-not-comparable", "left": "cursor-a", "right": "cursor-b"},
+    {"name": "empty-tokens-are-not-comparable", "left": "", "right": ""}
+  ],
+  "classify_cases": [
+    {
+      "name": "two-pinned-pages-agree",
+      "pair_overrides": {},
+      "legacy_overrides": {},
+      "canonical_overrides": {},
+      "expected_classification": "match",
+      "expected_severity": "info",
+      "expected_gate_impact": "none"
+    },
+    {
+      "name": "an-unpinned-legacy-page-is-a-fault-not-a-finding",
+      "pair_overrides": {},
+      "legacy_overrides": {"pin_kind": "none"},
+      "canonical_overrides": {},
+      "expected_classification": "comparator_fault",
+      "expected_severity": "critical",
+      "expected_gate_impact": "blocks_cutover"
+    },
+    {
+      "name": "an-expired-canonical-pin-is-a-fault",
+      "pair_overrides": {},
+      "legacy_overrides": {},
+      "canonical_overrides": {"pin_age_s": 86401.0},
+      "expected_classification": "comparator_fault",
+      "expected_severity": "critical",
+      "expected_gate_impact": "blocks_cutover"
+    },
+    {
+      "name": "an-incomplete-legacy-range-pin-is-a-fault",
+      "pair_overrides": {},
+      "legacy_overrides": {"pin_bound": {"since_id_present": true, "max_id_present": false}},
+      "canonical_overrides": {},
+      "expected_classification": "comparator_fault",
+      "expected_severity": "critical",
+      "expected_gate_impact": "blocks_cutover"
+    },
+    {
+      "name": "a-cursor-that-does-not-round-trip-is-judged-before-content",
+      "pair_overrides": {},
+      "legacy_overrides": {},
+      "canonical_overrides": {"cursor_stable": false, "row_count": 99},
+      "expected_classification": "cursor_divergence",
+      "expected_severity": "critical",
+      "expected_gate_impact": "blocks_cutover"
+    },
+    {
+      "name": "a-row-skipped-across-a-page-boundary",
+      "pair_overrides": {"cursor_gaps": 1},
+      "legacy_overrides": {},
+      "canonical_overrides": {},
+      "expected_classification": "cursor_divergence",
+      "expected_severity": "critical",
+      "expected_gate_impact": "blocks_cutover"
+    },
+    {
+      "name": "a-row-served-twice-across-a-page-boundary",
+      "pair_overrides": {"cursor_duplicates": 2},
+      "legacy_overrides": {},
+      "canonical_overrides": {},
+      "expected_classification": "cursor_divergence",
+      "expected_severity": "critical",
+      "expected_gate_impact": "blocks_cutover"
+    },
+    {
+      "name": "the-comparator-recorded-no-pin-for-the-read",
+      "pair_overrides": {"drift": {"kind": "pin_absent"}},
+      "legacy_overrides": {},
+      "canonical_overrides": {},
+      "expected_classification": "comparator_fault",
+      "expected_severity": "critical",
+      "expected_gate_impact": "blocks_cutover"
+    },
+    {
+      "name": "a-pinned-re-read-that-shifted-is-a-property-of-the-legacy-surface",
+      "pair_overrides": {"drift": {"kind": "snapshot_drift", "rows_inserted": 2}},
+      "legacy_overrides": {},
+      "canonical_overrides": {},
+      "expected_classification": "snapshot_drift",
+      "expected_severity": "warn",
+      "expected_gate_impact": "none"
+    },
+    {
+      "name": "equal-sort-keys-ordered-differently-void-the-paging",
+      "pair_overrides": {"tie_rows_reordered": 2},
+      "legacy_overrides": {},
+      "canonical_overrides": {},
+      "expected_classification": "tie_break_divergence",
+      "expected_severity": "critical",
+      "expected_gate_impact": "blocks_cutover"
+    },
+    {
+      "name": "a-reachable-but-unavailable-surface-is-not-an-answer-about-absence",
+      "pair_overrides": {},
+      "legacy_overrides": {"outcome": "unavailable"},
+      "canonical_overrides": {},
+      "expected_classification": "comparator_fault",
+      "expected_severity": "critical",
+      "expected_gate_impact": "blocks_cutover"
+    }
+  ]
+}

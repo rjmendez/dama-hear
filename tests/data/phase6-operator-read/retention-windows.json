@@ -1,0 +1,188 @@
+{
+  "case_set": "retention-window-classification-and-what-is-still-undecided",
+  "source_of_truth": [
+    "hear/verify/shadow_read.py",
+    "hear/verify/list_read.py",
+    "docs/phase6-read-audit-retention.md"
+  ],
+  "docs": [
+    "docs/phase6-read-audit-retention.md",
+    "docs/data-governance.md",
+    "docs/phase6-operator-api-contract.md"
+  ],
+  "position": "Retention is classified here and decided nowhere. Each family below has a governance class, a default the design would run on, a ceiling and a clock -- and a decision reference for the period an operator still owes. Nothing in this repository enforces any of them: there is no audit schema, no migration, no job and no reader. These cases pin the classification and pin the fact that it is not yet enforcement.",
+  "governance_classes": {
+    "R0-derived": "90 days",
+    "R3-evidence": "until release",
+    "R4-audit": "1 year"
+  },
+  "families": [
+    {
+      "family": "F1",
+      "name": "access audit -- hot tier, full fields",
+      "governance_class": "R4-audit",
+      "default_horizon": "90 d",
+      "doc_default_text": "| **90 d** |",
+      "ceiling": "1 y",
+      "clock": "the access instant (decided_at)",
+      "decided": false,
+      "decision_ref": "D1"
+    },
+    {
+      "family": "F1",
+      "name": "access audit -- cold tier, minimised",
+      "governance_class": "R4-audit",
+      "default_horizon": "1 y",
+      "doc_default_text": "1 y, the `R4-audit` ceiling",
+      "ceiling": "1 y",
+      "clock": "the access instant (decided_at)",
+      "decided": false,
+      "decision_ref": "D2"
+    },
+    {
+      "family": "F1",
+      "name": "access to a restricted class",
+      "governance_class": "R4-audit",
+      "default_horizon": "1 y",
+      "doc_default_text": "never tiered below actor-pseudonym + object id",
+      "ceiling": "1 y, extendable only by a hold",
+      "clock": "the access instant (decided_at)",
+      "decided": false,
+      "decision_ref": "D1"
+    },
+    {
+      "family": "F2",
+      "name": "read receipts (match/audit), sampled",
+      "governance_class": "R0-derived",
+      "default_horizon": "14 d or the close of the gate window that cites them",
+      "doc_default_text": "**14 d**, or the close of the gate window that cites them",
+      "ceiling": "90 d",
+      "clock": "receipt window.as_of",
+      "decided": false,
+      "decision_ref": "D3"
+    },
+    {
+      "family": "F3",
+      "name": "refusal quarantine",
+      "governance_class": "R0-derived",
+      "default_horizon": "30 d and 5,000 rows and 16 MiB, whichever binds first",
+      "doc_default_text": "whichever binds first",
+      "ceiling": "90 d",
+      "clock": "received_at",
+      "decided": false,
+      "decision_ref": "D4",
+      "open_finding": "RT-1"
+    },
+    {
+      "family": "F4",
+      "name": "mismatch receipts -- warn classes",
+      "governance_class": "R0-derived",
+      "default_horizon": "90 d",
+      "doc_default_text": "| **90 d** |",
+      "ceiling": "90 d",
+      "clock": "window.as_of",
+      "decided": false,
+      "decision_ref": "D3"
+    },
+    {
+      "family": "F4",
+      "name": "mismatch receipts -- the cutover-blocking classes",
+      "governance_class": "R0-derived",
+      "default_horizon": "until the gate decision they inform is recorded, + 90 d",
+      "doc_default_text": "until the gate decision they inform is recorded, + 90 d",
+      "ceiling": "hold-governed",
+      "clock": "window.as_of",
+      "decided": false,
+      "decision_ref": "D3"
+    },
+    {
+      "family": "F4",
+      "name": "mismatch receipts -- incident evidence",
+      "governance_class": "R3-evidence",
+      "default_horizon": "until the incident is closed and released by the custodian",
+      "doc_default_text": "until the incident is closed and released by the custodian",
+      "ceiling": "hold-governed",
+      "clock": "window.as_of",
+      "decided": false,
+      "decision_ref": "D3"
+    }
+  ],
+  "undecided_decisions": [
+    {"ref": "D1", "question": "F1 hot horizon (full fields)", "default": "90 d"},
+    {"ref": "D2", "question": "F1 cold horizon (minimised)", "default": "1 y, the R4-audit ceiling"},
+    {"ref": "D3", "question": "mismatch-receipt destruction schedule for the three critical classes", "default": "until incident close + custodian release"},
+    {"ref": "D4", "question": "refusal quarantine class: R0-derived as coded, or R4-audit as the API contract table says (finding RT-1)", "default": "R0-derived, 30 d, as the DDL enforces"},
+    {"ref": "D5", "question": "raw client IP: retain 7 d, or never retain", "default": "retain 7 d, hot tier only"},
+    {"ref": "D6", "question": "fail-open versus fail-closed on audit-store unavailability", "default": "closed for restricted classes, open + page for the rest"},
+    {"ref": "D7", "question": "pseudonym key rotation period", "default": "annual, aligned to D2"},
+    {"ref": "D8", "question": "backup erasure strategy", "default": "documented non-erasure, because the encryption crypto-shredding requires does not exist"},
+    {"ref": "D9", "question": "audit store blast-radius separation", "default": "separate schema"},
+    {"ref": "D10", "question": "aggregate suppression threshold k", "default": "5"},
+    {"ref": "D11", "question": "bulk-read threshold", "default": "not guessed; set from a week of stage-0 logs"},
+    {"ref": "D12", "question": "who may read the audit log", "default": "auditor + custodian only"}
+  ],
+  "rt1_finding": {
+    "ref": "RT-1",
+    "statement": "docs/phase6-operator-api-contract.md maps enforce_refusal_retention() to R4-audit (1 y); the function defaults to 30 days and raises above 90, citing the R0-derived ceiling. One of the two is wrong and the retention design says the code is right.",
+    "code_default_days": 30,
+    "code_ceiling_days": 90,
+    "sql_file": "deploy/postgres/migrations/0006_hear_durable_refusals.sql",
+    "still_open": true
+  },
+  "row_state_cases": [
+    {
+      "name": "a-pruned-row-at-the-shared-horizon-is-not-loss",
+      "age_s": 604800.0,
+      "legacy_horizon_s": 604800,
+      "canonical_horizon_s": 604800,
+      "expired_side": "canonical",
+      "expected_classification": "match",
+      "expected_gate_impact": "none",
+      "why": "A TTL that fired between the two reads is correct behaviour on both sides."
+    },
+    {
+      "name": "a-row-well-past-both-horizons-is-excluded-not-reported",
+      "age_s": 864000.0,
+      "legacy_horizon_s": 604800,
+      "canonical_horizon_s": 604800,
+      "expired_side": "canonical",
+      "expected_classification": "match",
+      "expected_gate_impact": "none"
+    },
+    {
+      "name": "a-prune-far-from-any-horizon-is-a-finding",
+      "age_s": 86400.0,
+      "legacy_horizon_s": 7776000,
+      "canonical_horizon_s": 7776000,
+      "expired_side": "canonical",
+      "expected_classification": "retention_divergence",
+      "expected_gate_impact": "none",
+      "expected_severity": "warn",
+      "expected_repair_action": "manual_review",
+      "why": "Reported and triaged, never gate-blocking: a horizon disagreement is a policy defect, not a data loss proof."
+    },
+    {
+      "name": "the-authoritative-side-pruning-first-is-also-a-finding",
+      "age_s": 86400.0,
+      "legacy_horizon_s": 7776000,
+      "canonical_horizon_s": 7776000,
+      "expired_side": "legacy",
+      "expected_classification": "retention_divergence",
+      "expected_gate_impact": "none",
+      "expected_severity": "warn"
+    }
+  ],
+  "retention_edge_cases": [
+    {"name": "inside-the-edge-window-below-the-horizon", "age_s": 7774200.0, "horizons_s": [7776000], "edge": true},
+    {"name": "an-hour-and-a-half-below-the-horizon-is-not-the-edge", "age_s": 7770600.0, "horizons_s": [7776000], "edge": false},
+    {"name": "past-the-horizon-is-always-the-edge", "age_s": 8000000.0, "horizons_s": [7776000], "edge": true},
+    {"name": "an-undeclared-horizon-is-not-an-edge", "age_s": 86400.0, "horizons_s": [null], "edge": false},
+    {"name": "the-nearer-of-two-horizons-decides", "age_s": 604800.0, "horizons_s": [7776000, 604800], "edge": true}
+  ],
+  "no_enforcement_yet": {
+    "forbidden_migration_files": ["0007_hear_audit_baseline.sql", "0008_hear_audit_retention.sql"],
+    "forbidden_identifiers": ["hear_audit", "hear_audit_writer", "hear_audit_reader", "hear_audit_custodian", "hear_audit_admin", "access_records_minimised", "access_records_restricted"],
+    "searched_trees": ["hear", "tools", "deploy", "modules"],
+    "why": "The retention design creates no table, no migration, no route, no credential and no bucket. A test that lets one appear quietly would make the design's own claim untestable."
+  }
+}

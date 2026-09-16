@@ -1,0 +1,91 @@
+{
+  "case_set": "receipt-minimisation-and-the-names-a-receipt-may-never-carry",
+  "source_of_truth": [
+    "hear/verify/list_read.py",
+    "hear/verify/shadow_read.py"
+  ],
+  "docs": [
+    "docs/phase6-read-audit-retention.md",
+    "docs/phase5-shadow-read-comparator.md"
+  ],
+  "position": "A receipt is an index into evidence, never the evidence. The field set below is the whole of it: adding a field is a contract change that has to edit this fixture, which is the point. Minimisation is checked as a closed field set rather than as a byte budget, because a field nobody classified is exactly how a result body arrives inside an audit record.",
+  "readcompare": {
+    "contract": "hear.readcompare.receipt.v1",
+    "top_level": [
+      "aggregate", "comparator", "coverage", "differences", "differences_dropped",
+      "disposition", "drift", "emitted_at", "evidence", "export", "grain", "page", "query",
+      "read_authority", "read_mode", "receipt_id", "run_id", "sampling", "schema",
+      "schema_version", "sides", "verdict", "window"
+    ],
+    "query": [
+      "bound_kind", "device_ids", "expected_difference_list", "filters", "fingerprint",
+      "page_size", "projection_version", "site_id", "sort", "surface",
+      "threshold_fingerprint", "time_from", "time_to"
+    ],
+    "side": [
+      "cursor_stable", "membership_digest", "order_digest", "outcome", "page_count",
+      "pin_age_s", "pin_id", "pin_kind", "projection_fields_digest", "projection_version",
+      "read_contract_major", "reader", "reader_version", "reasons", "result_hash",
+      "retention_class", "retention_horizon_s", "row_count", "row_state", "snapshot_at",
+      "truncated"
+    ],
+    "window": ["as_of", "end", "settle_s", "start"],
+    "disposition": ["gate_impact", "queue_ref", "queued", "repair_action", "repairable"],
+    "evidence": ["canonical_result_ref", "legacy_result_ref", "redaction_profile"],
+    "verdict": ["actionable", "classification", "gate_impact", "notes", "repair_action", "severity"]
+  },
+  "shadowread": {
+    "contract": "hear.shadowread.receipt.v1",
+    "top_level": [
+      "comparator", "coverage", "differences", "differences_dropped", "disposition",
+      "emitted_at", "evidence", "grain", "query", "read_authority", "read_mode",
+      "receipt_id", "row", "run_id", "sampling", "schema", "schema_version", "sides",
+      "verdict", "window"
+    ],
+    "side": [
+      "cursor_stable", "outcome", "page_count", "projection_version", "read_contract_major",
+      "reader", "reader_version", "reasons", "result_hash", "retention_class",
+      "retention_horizon_s", "row_count", "row_state", "snapshot_at", "state_hash",
+      "truncated"
+    ]
+  },
+  "forbidden_key_names": [
+    {"key": "cursor_token", "why": "A cursor is opaque, side-local and never durable; a receipt that stores one has turned a handle into a record."},
+    {"key": "cursor", "why": "Same reason, shorter spelling."},
+    {"key": "rows", "why": "A receipt carries counts and digests. A rows array is the result body with a different name."},
+    {"key": "row_payload", "why": "The record carries the count, never the result."},
+    {"key": "body", "why": "Result bodies are never retained."},
+    {"key": "payload", "why": "Result bodies are never retained."},
+    {"key": "raw", "why": "Result bodies are never retained."},
+    {"key": "notes_text", "why": "Free-text annotation notes are never logged, never in an audit record, never in an error body."},
+    {"key": "actor_name", "why": "The only field that can name a person; it does not exist on a comparison receipt at all."},
+    {"key": "actor", "why": "A comparison receipt has no actor: nobody's read produced it."},
+    {"key": "principal", "why": "Same."},
+    {"key": "client_ip", "why": "A network-behaviour log is not a comparison receipt."},
+    {"key": "token", "why": "No credential of any kind."},
+    {"key": "authorization", "why": "No credential of any kind."},
+    {"key": "secret", "why": "No credential of any kind."},
+    {"key": "lat", "why": "Coordinates have no durable representation, not even a hash."},
+    {"key": "lon", "why": "Coordinates have no durable representation, not even a hash."},
+    {"key": "position", "why": "Coordinates have no durable representation, not even a hash."},
+    {"key": "geohash", "why": "Coordinates have no durable representation, not even a hash."},
+    {"key": "audio", "why": "Clip bytes and their transforms never enter a receipt."},
+    {"key": "pcm", "why": "Clip bytes and their transforms never enter a receipt."},
+    {"key": "samples", "why": "Clip bytes and their transforms never enter a receipt."},
+    {"key": "dsn", "why": "The DSN carries a password."},
+    {"key": "filter_values", "why": "A query is user input; only declared facets are quotable and they live under `query.filters`."}
+  ],
+  "bounds": {
+    "max_receipt_bytes": 8192,
+    "max_differences": 32,
+    "oversize_is_refused_not_truncated": true,
+    "why": "Truncating a receipt to fit silently drops the evidence references that make it useful; refusing makes an oversized receipt someone's problem at the moment it is produced."
+  },
+  "invariants": [
+    {"name": "a-receipt-never-queues-a-repair", "path": "disposition.queued", "value": false},
+    {"name": "a-receipt-names-its-redaction-profile", "path": "evidence.redaction_profile", "value": "hear.readcompare.redact.v1"},
+    {"name": "a-receipt-names-the-read-authority-it-was-produced-under", "path": "read_authority", "value": "legacy"},
+    {"name": "a-receipt-points-at-evidence-rather-than-carrying-it", "path": "evidence.legacy_result_ref", "kind": "reference"},
+    {"name": "a-pending-comparison-produces-no-receipt-at-all", "kind": "refusal", "why": "`pending` is a scheduling state; writing it down fills the store with rows that mean \"ask again\"."}
+  ]
+}
