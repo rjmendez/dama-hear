@@ -310,36 +310,34 @@ class OnnxVADEngine:
     name = "silero_vad_v5_onnx"
     is_real = True
 
-    def __init__(self, model_path: str, sample_rate: int = MODEL_RATE_HZ,
-                 providers: Optional[Sequence[str]] = None) -> None:
-        try:
-            import onnxruntime
-        except ImportError as exc:  # pragma: no cover - exercised only without onnxruntime
-            raise ModelUnavailable(
-                "onnxruntime is not installed, so %s cannot be scored" % (model_path,)
-            ) from exc
-        if not os.path.isfile(model_path):
-            raise ModelUnavailable("no Silero weights at %s" % (model_path,))
-
-        options = onnxruntime.SessionOptions()
-        options.inter_op_num_threads = 1
-        options.intra_op_num_threads = 1
-        self.model_path = model_path
-        self.session = onnxruntime.InferenceSession(
-            model_path, sess_options=options,
-            providers=list(providers) if providers else ["CPUExecutionProvider"],
-        )
+    def __init__(self, model_path: Optional[str] = None, sample_rate: int = MODEL_RATE_HZ,
+                 providers: Optional[Sequence[str]] = None, session: Any = None) -> None:
+        if session is None:
+            session = self._open_session(model_path, providers)
+            self.injected = False
+        else:
+            # ⚠️AN INJECTED SESSION SKIPS THE WEIGHT-FILE CHECK, SO IT IS NOT PROOF OF SILERO.
+            # It exists so a test, or a service that already holds a warm session, can drive the
+            # ONNX path with no onnxruntime import and no 2 MB blob in the repository. The
+            # signature and window checks below still run against whatever was handed in, and
+            # `name` says an injected session produced the score so a receipt cannot imply the
+            # shipped weights did.
+            self.injected = True
+            self.name = "silero_vad_onnx_injected_session"
+        self.model_path = model_path or "<injected session>"
+        self.session = session
         inputs = {i.name: i for i in self.session.get_inputs()}
         if "h" in inputs and "c" in inputs:
             self.split_state, self.state_shape = True, V4_STATE_SHAPE
-            self.name = "silero_vad_v4_onnx"
+            self.name = ("silero_vad_v4_onnx_injected_session" if self.injected
+                         else "silero_vad_v4_onnx")
         elif "state" in inputs:
             self.split_state, self.state_shape = False, STATE_SHAPE
         else:
             raise WindowContractViolated(
                 "%s declares inputs %s, which is neither the v5 {input, sr, state} nor the v4 "
                 "{input, sr, h, c} signature; refused rather than guessed"
-                % (model_path, sorted(inputs)))
+                % (self.model_path, sorted(inputs)))
         self.wants_rate = "sr" in inputs
         self.input_name = "input" if "input" in inputs else self.session.get_inputs()[0].name
         self.declared_window = self._declared_window(inputs[self.input_name])
@@ -348,8 +346,26 @@ class OnnxVADEngine:
             raise WindowContractViolated(
                 "%s declares an input of %d samples and this module feeds %d (%d context + %d "
                 "hop); a constant that disagrees with the graph is the defect, not the graph"
-                % (model_path, self.declared_window, expected,
+                % (self.model_path, self.declared_window, expected,
                    CONTEXT_SAMPLES[sample_rate], CHUNK_SAMPLES[sample_rate]))
+
+    @staticmethod
+    def _open_session(model_path: Optional[str], providers: Optional[Sequence[str]]) -> Any:
+        """Load the weights, or say why they cannot be. Never a silent substitution."""
+        try:
+            import onnxruntime
+        except ImportError as exc:  # pragma: no cover - exercised only without onnxruntime
+            raise ModelUnavailable(
+                "onnxruntime is not installed, so %s cannot be scored" % (model_path,)
+            ) from exc
+        if not model_path or not os.path.isfile(model_path):
+            raise ModelUnavailable("no Silero weights at %s" % (model_path,))
+        options = onnxruntime.SessionOptions()
+        options.inter_op_num_threads = 1
+        options.intra_op_num_threads = 1
+        return onnxruntime.InferenceSession(
+            model_path, sess_options=options,
+            providers=list(providers) if providers else ["CPUExecutionProvider"])
 
     @staticmethod
     def _declared_window(spec: Any) -> Optional[int]:
@@ -390,11 +406,17 @@ class SileroVAD:
     falls back to `SyntheticVADEngine` when neither the weights nor onnxruntime are there. Pass
     `require_model=True` where a fallback answer would be a privacy failure rather than a
     convenience.
+
+    `session=` drives the ONNX path with an already-built session -- a warm one held by a
+    service, or a stub in a test -- without importing onnxruntime and without a weight file. An
+    injected session is checked against the same signature and window rules as a loaded one, is
+    never silently replaced by the fallback, and names itself on every receipt as injected.
     """
 
     def __init__(self, model_path: Optional[str] = None, *, sample_rate: int = MODEL_RATE_HZ,
                  require_model: bool = False,
-                 providers: Optional[Sequence[str]] = None) -> None:
+                 providers: Optional[Sequence[str]] = None,
+                 session: Any = None) -> None:
         rate = validate_rate(sample_rate)
         self.sample_rate = MODEL_RATE_HZ if rate == ACQ_RATE_HZ else rate
         self.hop = CHUNK_SAMPLES[self.sample_rate]
@@ -402,7 +424,7 @@ class SileroVAD:
         self.window = WINDOW_SAMPLES[self.sample_rate]
         self.model_path = self._resolve_path(model_path)
         self.engine = self._open_engine(self.model_path, self.sample_rate, require_model,
-                                        providers)
+                                        providers, session)
         self._state = self.new_state()
 
     @staticmethod
@@ -413,11 +435,18 @@ class SileroVAD:
 
     @staticmethod
     def _open_engine(model_path: str, sample_rate: int, require_model: bool,
-                     providers: Optional[Sequence[str]]) -> Any:
+                     providers: Optional[Sequence[str]], session: Any = None) -> Any:
+        """The graph if it loads, else the fallback -- unless a caller said it must be the graph.
+
+        An injected `session` is never swapped for the fallback: a caller that handed over a
+        session asked for that session, and quietly scoring with something else would make the
+        engine name on a receipt a guess.
+        """
         try:
-            return OnnxVADEngine(model_path, sample_rate=sample_rate, providers=providers)
+            return OnnxVADEngine(model_path, sample_rate=sample_rate, providers=providers,
+                                 session=session)
         except ModelUnavailable:
-            if require_model:
+            if require_model or session is not None:
                 raise
             return SyntheticVADEngine()
 
@@ -758,7 +787,8 @@ class SileroDetector:
 
 def load_vad(threshold: float = DEFAULT_THRESHOLD,
              min_speech_ms: float = DEFAULT_MIN_SPEECH_MS,
-             model_path: Optional[str] = None) -> SileroDetector:
+             model_path: Optional[str] = None,
+             session: Any = None) -> SileroDetector:
     """The real Silero engine, verified, or `ModelUnavailable` -- never the fallback in disguise.
 
     `purge.load_vad("auto")` falls back to its own `BandEnergyVAD` when this raises, and writes
@@ -766,7 +796,7 @@ def load_vad(threshold: float = DEFAULT_THRESHOLD,
     "silero" on a receipt that Silero never saw, which is the one lie this pipeline cannot
     tolerate. The window canary (§2.4) runs before the detector is handed over.
     """
-    vad = SileroVAD(model_path, require_model=True)
+    vad = SileroVAD(model_path, require_model=True, session=session)
     vad.verify_window_contract()
     return SileroDetector(vad, threshold, min_speech_ms)
 

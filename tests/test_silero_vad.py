@@ -589,6 +589,95 @@ def test_load_vad_runs_the_canary_and_returns_a_purge_detector(tmp_path, monkeyp
     assert 0.0 <= decision.peak_prob <= 1.0
 
 
+# -- an injected session: the ONNX path with no onnxruntime and no weight file -------------------
+
+class _Spec:
+    """The two attributes this module reads off an onnxruntime input spec."""
+
+    def __init__(self, name: str, shape: list) -> None:
+        self.name = name
+        self.shape = shape
+
+
+class StubSession:
+    """A scripted Silero v5 session, degenerate on a bare hop exactly as the real graph is.
+
+    Records what it was fed, so the 576-sample window and the context tail inside it can be
+    asserted without a 2 MB blob in the repository or onnxruntime on the runner.
+    """
+
+    def __init__(self, probabilities=(0.9,), declared_window="n", split_state=False,
+                 window: int = 576, degenerate: float = 0.001) -> None:
+        self.script = list(probabilities)
+        self.window = window
+        self.degenerate = degenerate
+        self.calls: list = []
+        shape = list(V.V4_STATE_SHAPE if split_state else V.STATE_SHAPE)
+        names = ["h", "c"] if split_state else ["state"]
+        self._inputs = [_Spec("input", [1, declared_window]), _Spec("sr", [])]
+        self._inputs += [_Spec(n, shape) for n in names]
+        self._state_names = names
+        self._shape = shape
+
+    def get_inputs(self):
+        return self._inputs
+
+    def run(self, _outputs, feed):
+        self.calls.append({k: np.array(v, copy=True) for k, v in feed.items()})
+        window = np.asarray(feed["input"]).shape[-1]
+        probability = (self.script[min(len(self.calls) - 1, len(self.script) - 1)]
+                       if window == self.window else self.degenerate)
+        carried = np.asarray(feed[self._state_names[0]], dtype=np.float32)
+        return [np.array([[probability]], dtype=np.float32),
+                (carried + np.float32(0.01)).reshape(self._shape)]
+
+
+def test_an_injected_session_drives_the_onnx_path_without_onnxruntime():
+    stub = StubSession(probabilities=[0.02, 0.97, 0.97, 0.02])
+    vad = V.SileroVAD(session=stub)
+    assert vad.uses_real_model is True
+    assert vad.engine.injected is True
+    assert vad.engine.name == "silero_vad_onnx_injected_session"
+
+    scores = vad.probabilities(voice(1.0))
+    assert scores[:4] == pytest.approx([0.02, 0.97, 0.97, 0.02], abs=1e-6)
+    fed = stub.calls[1]
+    assert fed["input"].shape == (1, 576)
+    assert fed["sr"].dtype == np.int64 and int(fed["sr"]) == 16000
+    assert fed["state"].shape == V.STATE_SHAPE
+    # Frame 1's window opens with the literal last 64 samples of frame 0's hop.
+    assert fed["input"][0, :64] == pytest.approx(voice(1.0)[448:512], abs=1e-6)
+
+
+def test_an_injected_session_is_never_swapped_for_the_fallback():
+    stub = StubSession(declared_window=512)
+    with pytest.raises(V.WindowContractViolated):
+        V.SileroVAD(session=stub)
+    assert isinstance(V.SileroVAD("no-such-model.onnx").engine, V.SyntheticVADEngine)
+
+
+def test_an_injected_v4_session_is_recognised_by_its_signature():
+    vad = V.SileroVAD(session=StubSession(split_state=True))
+    assert vad.engine.split_state is True
+    assert vad.engine.state_shape == V.V4_STATE_SHAPE
+    assert vad.engine.name == "silero_vad_v4_onnx_injected_session"
+    assert vad.new_state().rnn.shape == V.V4_STATE_SHAPE
+
+
+def test_load_vad_accepts_an_injected_session_and_the_canary_runs_against_it():
+    detector = V.load_vad(session=StubSession(probabilities=[0.95]))
+    assert detector.name == "silero_vad_onnx_injected_session"
+    decision = detector.detect(voice(1.0), FS)
+    assert decision.speech is True
+    assert decision.engine == "silero_vad_onnx_injected_session"
+
+
+def test_an_injected_session_that_never_fires_fails_the_canary():
+    """The bare-hop control is the point: a session degenerate everywhere is not wired proof."""
+    with pytest.raises(V.WindowContractViolated):
+        V.load_vad(session=StubSession(probabilities=[0.001]))
+
+
 def test_a_corrupt_model_file_is_a_clear_failure_not_a_silent_fallback(tmp_path):
     pytest.importorskip("onnxruntime")
     broken = tmp_path / "broken.onnx"
