@@ -272,7 +272,9 @@ sequence makes:
 It is excluded from every OTA step above, in every branch of D1. Any OTA attempt is a no-op that
 burns rollout attention.
 
-**Recovery is physical and is owned by `recover-rankine-usb`.** Sequence, dependency-ordered:
+**Recovery is physical and is owned by `recover-rankine-usb`.** The full procedure — data pull and
+receipt, custody handoff, the USB session, acceptance, validation, no-go conditions and the soak
+consequence — is [rankine-usb-recovery.md](rankine-usb-recovery.md). Sequence, dependency-ordered:
 
 1. **Back the node's data up first, before anything is written.** `rankine` is one of the three
    SD-card nodes and the drain log shows it still serving files; `sd 80` in the build table is its
