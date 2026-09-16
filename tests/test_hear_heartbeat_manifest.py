@@ -31,6 +31,11 @@ def test_the_receiver_runs_the_new_entrypoint_and_mounts_its_bundle_and_state():
     assert c["image"] == "python:3.13-slim"
     assert "hear_heartbeat_receiver.py --port 5051" in c["args"][0]
     mounts = {(m["name"], m.get("subPath", m["mountPath"])): m["mountPath"] for m in c["volumeMounts"]}
+    assert mounts[("code", "hear__init__.py")] == "/app/hear/__init__.py"
+    assert mounts[("code", "hear_ingest__init__.py")] == "/app/hear/ingest/__init__.py"
+    assert mounts[("code", "hear_ingest_envelope.py")] == "/app/hear/ingest/envelope.py"
+    assert mounts[("code", "hear_ingest_batch.py")] == "/app/hear/ingest/batch.py"
+    assert mounts[("code", "hear_ingest_observability.py")] == "/app/hear/ingest/observability.py"
     assert mounts[("code", "tools_hear_heartbeat_receiver.py")] == "/app/tools/hear_heartbeat_receiver.py"
     assert mounts[("state", "/state")] == "/state"
 
@@ -45,6 +50,13 @@ def test_it_exposes_the_http_port_on_the_host_and_health_probe():
         assert probe["httpGet"]["port"] == "http"
     ports = svc["spec"]["ports"]
     assert ports == [{"name": "http", "port": 5051, "targetPort": "http"}]
+
+
+def test_it_enables_prometheus_scraping_of_the_same_http_port():
+    annotations = _doc("Deployment")["spec"]["template"]["metadata"]["annotations"]
+    assert annotations["prometheus.io/scrape"] == "true"
+    assert annotations["prometheus.io/path"] == "/metrics"
+    assert annotations["prometheus.io/port"] == "5051"
 
 
 def test_it_declares_the_expected_environment_durable_outbox_and_required_token_secret():

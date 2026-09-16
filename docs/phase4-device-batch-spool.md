@@ -593,7 +593,9 @@ Server-side these need no new metric: `producer.spool_backlog` already feeds
 `ingest_producer_spool_backlog`, `ingest_ack_gap_items` already measures the acknowledgement
 gap, and `ingest_sequence_gaps_total` already detects `batch_sequence` gaps within a `boot_id`.
 That is not a coincidence — the frame was designed with a producer spool in mind, and this
-document is the producer it was waiting for.
+document is the producer it was waiting for. The checked-in server-side seam is
+`hear/ingest/observability.py`; staged dashboard and alert assets for these series live in
+`deploy/observability/`.
 
 Two alert rules that are not obvious:
 

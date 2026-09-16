@@ -266,7 +266,9 @@ payload, never a coordinate.
 These are computed from receipts and run manifests. They do not replace the ingest counters
 in `phase4-https-batch-ingest.md` §12; `ingest_dual_write_mismatch_total{class}` there is the
 same signal as `reconcile_classified_total` restricted to mismatch classes, and the two must
-agree.
+agree. The ingest-side spool backlog / ack-gap dashboard and alert assets stay separate and
+are staged in `deploy/observability/`, because they are request-path signals rather than
+receipt-derived ones.
 
 ### 8.2 SLOs
 
