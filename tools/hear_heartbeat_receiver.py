@@ -12,23 +12,27 @@ import hashlib
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import socket
 import sqlite3
 import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 from urllib.parse import urlparse
 
 import redis
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hear.ingest import observability as IO
+from hear.ingest import batch as IB
+from hear.ingest import envelope as EV
 
 logger = logging.getLogger("hear-heartbeat")
 
@@ -36,6 +40,12 @@ REDIS_HOST = os.environ.get("REDIS_HOST", "audit-redis.infra.svc.cluster.local")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 REDIS_PASS = os.environ.get("REDIS_PASS")
 AUTH_TOKEN = os.environ.get("HEAR_HEARTBEAT_TOKEN")
+BATCH_CREDENTIALS_FILE = os.environ.get("HEAR_BATCH_CREDENTIALS_FILE")
+BATCH_RAW_DIR = os.environ.get("HEAR_BATCH_RAW_DIR", "/state/ingest-batch/raw")
+BATCH_ROUTE = "/v1/ingest/batches"
+BATCH_ALIAS_ROUTE = "/ingest/batch"
+BATCH_ADAPTER_NAME = "ingest-batch"
+BATCH_ADAPTER_VERSION = os.environ.get("HEAR_BATCH_ADAPTER_VERSION", "0.1.0")
 
 
 DURABLE_BACKENDS = ("none", "sqlite", "postgres")
@@ -131,8 +141,47 @@ class RequestError(ValueError):
         self.status = status
 
 
+class ProblemDetailError(RequestError):
+    def __init__(self, *, status: int, code: str, detail: str,
+                 retryable: bool = False,
+                 field_errors: Optional[Sequence[Mapping[str, Any]]] = None,
+                 headers: Optional[Mapping[str, str]] = None):
+        super().__init__(detail, status=status)
+        self.code = code
+        self.detail = detail
+        self.retryable = bool(retryable)
+        self.field_errors = [dict(row) for row in (field_errors or ())]
+        self.headers = dict(headers or {})
+
+
 class DurableStoreError(RuntimeError):
     """The durable ledger could not record or replay a record."""
+
+
+@dataclass(frozen=True)
+class BatchCredential:
+    principal_id: str
+    site_id: str
+    scope: str
+    permissions: tuple[str, ...]
+    key_id: Optional[str]
+    device_id: Optional[str] = None
+
+    @property
+    def site_scoped(self) -> bool:
+        return self.scope == "site"
+
+    @property
+    def can_ingest(self) -> bool:
+        return "ingest:write" in self.permissions
+
+
+@dataclass(frozen=True)
+class StoredBatchReceipt:
+    request_fingerprint: str
+    response_status: int
+    response_body: str
+    request_id: str
 
 
 @dataclass(frozen=True)
@@ -420,6 +469,85 @@ class SqliteDurableRecordStore(DurableRecordStore):
             con.execute(
                 "CREATE INDEX IF NOT EXISTS refused_messages_source "
                 "ON refused_messages(source, device_id, id)"
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS batch_events (
+                    event_id TEXT PRIMARY KEY,
+                    site_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    observed_at TEXT,
+                    received_at TEXT NOT NULL,
+                    dispatchable INTEGER NOT NULL,
+                    raw_ref TEXT,
+                    envelope_json TEXT NOT NULL,
+                    batch_id TEXT NOT NULL,
+                    item_index INTEGER NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    credential_scope TEXT NOT NULL,
+                    key_id TEXT
+                )
+                """
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS batch_events_site_device "
+                "ON batch_events(site_id, device_id, received_at)"
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS batch_outbox (
+                    event_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(event_id) REFERENCES batch_events(event_id)
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS batch_receipts (
+                    idempotency_scope TEXT PRIMARY KEY,
+                    request_fingerprint TEXT NOT NULL,
+                    response_status INTEGER NOT NULL,
+                    response_body TEXT NOT NULL,
+                    site_id TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    batch_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS batch_refusals (
+                    refusal_uid TEXT PRIMARY KEY,
+                    level TEXT NOT NULL CHECK (level IN ('frame', 'item')),
+                    site_id TEXT,
+                    device_id TEXT,
+                    batch_id TEXT,
+                    item_index INTEGER,
+                    principal_id TEXT,
+                    credential_scope TEXT,
+                    key_id TEXT,
+                    source TEXT NOT NULL,
+                    adapter TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    raw_ref TEXT,
+                    raw_sha256 TEXT NOT NULL,
+                    raw_bytes INTEGER NOT NULL,
+                    reasons_json TEXT NOT NULL,
+                    classification TEXT,
+                    event_id TEXT,
+                    request_id TEXT NOT NULL
+                )
+                """
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS batch_refusals_lookup "
+                "ON batch_refusals(site_id, device_id, received_at)"
             )
         self._migrate_record_uids()
 
@@ -756,6 +884,128 @@ class SqliteDurableRecordStore(DurableRecordStore):
             # The publish attempt is over either way, so release the claim immediately instead of
             # waiting out the lease: a failed record becomes replayable on the very next sweep.
             con.execute("DELETE FROM cache_claims WHERE record_uid = ?", (record_uid,))
+
+    def batch_lookup_receipt(self, idempotency_scope: str) -> Optional[StoredBatchReceipt]:
+        with self._lock, self._reading() as con:
+            row = con.execute(
+                "SELECT request_fingerprint, response_status, response_body, request_id "
+                "FROM batch_receipts WHERE idempotency_scope = ?",
+                (idempotency_scope,),
+            ).fetchone()
+        if row is None:
+            return None
+        return StoredBatchReceipt(
+            request_fingerprint=str(row["request_fingerprint"]),
+            response_status=int(row["response_status"]),
+            response_body=str(row["response_body"]),
+            request_id=str(row["request_id"]),
+        )
+
+    def batch_store_receipt(self, *, idempotency_scope: str, request_fingerprint: str,
+                            response_status: int, response_body: str, site_id: str,
+                            principal_id: str, batch_id: str, request_id: str) -> None:
+        with self._lock, self._transaction() as con:
+            con.execute(
+                """
+                INSERT OR REPLACE INTO batch_receipts
+                (idempotency_scope, request_fingerprint, response_status, response_body, site_id,
+                 principal_id, batch_id, request_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (idempotency_scope, request_fingerprint, response_status, response_body,
+                 site_id, principal_id, batch_id, request_id, utc_now()),
+            )
+
+    def batch_persist_event(self, event_id: str, site_id: str, device_id: str, source: str,
+                            kind: str, observed_at: Optional[str], received_at: str,
+                            dispatchable: bool, raw_ref: Optional[str], envelope_json: str,
+                            batch_id: str, item_index: int, principal_id: str,
+                            credential_scope: str, key_id: Optional[str]) -> bool:
+        with self._lock, self._transaction() as con:
+            cur = con.execute(
+                """
+                INSERT OR IGNORE INTO batch_events
+                (event_id, site_id, device_id, source, kind, observed_at, received_at,
+                 dispatchable, raw_ref, envelope_json, batch_id, item_index, principal_id,
+                 credential_scope, key_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (event_id, site_id, device_id, source, kind, observed_at, received_at,
+                 1 if dispatchable else 0, raw_ref, envelope_json, batch_id, int(item_index),
+                 principal_id, credential_scope, key_id),
+            )
+            duplicate = cur.rowcount == 0
+            if not duplicate:
+                con.execute(
+                    "INSERT OR IGNORE INTO batch_outbox (event_id, state, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (event_id, "pending", received_at),
+                )
+        return duplicate
+
+    def batch_record_frame_refusal(self, *, raw: bytes, reasons: Sequence[str], source: str,
+                                   adapter: str, received_at: str, batch_id: Optional[str],
+                                   raw_ref: Optional[str], site_id: Optional[str],
+                                   device_id: Optional[str], principal_id: Optional[str],
+                                   credential_scope: Optional[str], key_id: Optional[str],
+                                   request_id: str) -> None:
+        self._batch_record_refusal(
+            level="frame", raw=raw, reasons=reasons, source=source, adapter=adapter,
+            received_at=received_at, batch_id=batch_id, item_index=None, raw_ref=raw_ref,
+            site_id=site_id, device_id=device_id, principal_id=principal_id,
+            credential_scope=credential_scope, key_id=key_id, classification=None,
+            event_id=None, request_id=request_id,
+        )
+
+    def batch_record_item_refusal(self, *, raw: bytes, reasons: Sequence[str], source: str,
+                                  adapter: str, received_at: str, batch_id: str,
+                                  item_index: int, raw_ref: Optional[str],
+                                  site_id: Optional[str], device_id: Optional[str],
+                                  principal_id: Optional[str],
+                                  credential_scope: Optional[str], key_id: Optional[str],
+                                  classification: Optional[str], event_id: Optional[str],
+                                  request_id: str) -> None:
+        self._batch_record_refusal(
+            level="item", raw=raw, reasons=reasons, source=source, adapter=adapter,
+            received_at=received_at, batch_id=batch_id, item_index=item_index, raw_ref=raw_ref,
+            site_id=site_id, device_id=device_id, principal_id=principal_id,
+            credential_scope=credential_scope, key_id=key_id, classification=classification,
+            event_id=event_id, request_id=request_id,
+        )
+
+    def _batch_record_refusal(self, *, level: str, raw: bytes, reasons: Sequence[str], source: str,
+                              adapter: str, received_at: str, batch_id: Optional[str],
+                              item_index: Optional[int], raw_ref: Optional[str],
+                              site_id: Optional[str], device_id: Optional[str],
+                              principal_id: Optional[str], credential_scope: Optional[str],
+                              key_id: Optional[str], classification: Optional[str],
+                              event_id: Optional[str], request_id: str) -> None:
+        refusal_uid = hashlib.sha256(
+            ("\x1f".join((
+                level,
+                site_id or "",
+                device_id or "",
+                batch_id or "",
+                "" if item_index is None else str(item_index),
+                ",".join(sorted(set(reasons))),
+                hashlib.sha256(raw).hexdigest(),
+            ))).encode("utf-8")
+        ).hexdigest()
+        with self._lock, self._transaction() as con:
+            con.execute(
+                """
+                INSERT OR IGNORE INTO batch_refusals
+                (refusal_uid, level, site_id, device_id, batch_id, item_index, principal_id,
+                 credential_scope, key_id, source, adapter, received_at, raw_ref, raw_sha256,
+                 raw_bytes, reasons_json, classification, event_id, request_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (refusal_uid, level, site_id, device_id, batch_id, item_index, principal_id,
+                 credential_scope, key_id, source, adapter, received_at, raw_ref,
+                 hashlib.sha256(raw).hexdigest(), len(raw), encode_json({
+                     "reasons": sorted(set(reasons)),
+                 }), classification, event_id, request_id),
+            )
 
     def pending_records(self, limit: int) -> list[DurableEntry]:
         if limit <= 0:
@@ -1106,6 +1356,407 @@ class HeartbeatReceiverStore:
         }
 
 
+class BatchCredentialStore:
+    """Bearer-token lookup by token hash. The file contains hashes, never cleartext tokens."""
+
+    def __init__(self, credentials: Sequence[tuple[str, BatchCredential]]):
+        self._by_hash = dict(credentials)
+
+    @classmethod
+    def from_file(cls, path: str) -> "BatchCredentialStore":
+        if not path or not path.strip():
+            raise ValueError("HEAR_BATCH_CREDENTIALS_FILE must be set for batch ingest")
+        body = Path(path).read_text(encoding="utf-8")
+        doc = json.loads(body)
+        rows = doc.get("credentials") if isinstance(doc, dict) else doc
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("batch credential store must be a non-empty credentials array")
+        out: list[tuple[str, BatchCredential]] = []
+        for idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise ValueError(f"credential {idx} must be an object")
+            token_sha256 = _hex_field(row, "token_sha256", idx)
+            scope = _choice_field(row, "scope", ("device", "site"), idx)
+            site_id = _require_non_empty_string(row, "site_id", idx)
+            principal_id = _require_non_empty_string(row, "principal_id", idx)
+            perms = row.get("permissions")
+            if not isinstance(perms, list) or not all(isinstance(v, str) and v for v in perms):
+                raise ValueError(f"credential {idx} permissions must be a non-empty string array")
+            device_id = row.get("device_id")
+            if scope == "device":
+                if not isinstance(device_id, str) or not device_id.strip():
+                    raise ValueError(f"credential {idx} device scope requires device_id")
+                device_id = device_id.strip()
+            else:
+                device_id = None
+            cred = BatchCredential(
+                principal_id=principal_id,
+                site_id=site_id,
+                scope=scope,
+                permissions=tuple(perms),
+                key_id=row.get("key_id") if isinstance(row.get("key_id"), str) else None,
+                device_id=device_id,
+            )
+            out.append((token_sha256, cred))
+        return cls(out)
+
+    def authenticate(self, authorization: Optional[str]) -> BatchCredential:
+        if not isinstance(authorization, str) or not authorization.strip():
+            raise ProblemDetailError(status=401, code="credential_missing",
+                                     detail="Authorization: Bearer is required")
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            raise ProblemDetailError(status=401, code="credential_missing",
+                                     detail="Authorization must be Bearer <token>")
+        token_sha256 = hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+        cred = self._by_hash.get(token_sha256)
+        if cred is None:
+            raise ProblemDetailError(status=401, code="credential_missing",
+                                     detail="credential is missing, invalid or expired")
+        if not cred.can_ingest:
+            raise ProblemDetailError(status=403, code="forbidden",
+                                     detail="credential lacks ingest:write")
+        return cred
+
+
+class BatchIngestAdapter:
+    def __init__(self, durable_store: DurableRecordStore,
+                 credential_store: Optional[BatchCredentialStore],
+                 *, raw_root: str = BATCH_RAW_DIR,
+                 adapter_name: str = BATCH_ADAPTER_NAME,
+                 adapter_version: str = BATCH_ADAPTER_VERSION,
+                 metrics: Optional[IO.IngestMetrics] = None,
+                 load_error: Optional[str] = None,
+                 before_receipt_store: Optional[Callable[[], None]] = None):
+        self.durable_store = durable_store
+        self.credential_store = credential_store
+        self.raw_root = os.path.abspath(raw_root)
+        self.adapter_name = adapter_name
+        self.adapter_version = adapter_version
+        self.metrics = metrics or IO.IngestMetrics()
+        self.load_error = load_error
+        self.before_receipt_store = before_receipt_store
+
+    @classmethod
+    def from_config(cls, durable_store: DurableRecordStore,
+                    credentials_file: Optional[str],
+                    *, raw_root: str = BATCH_RAW_DIR,
+                    adapter_name: str = BATCH_ADAPTER_NAME,
+                    adapter_version: str = BATCH_ADAPTER_VERSION,
+                    metrics: Optional[IO.IngestMetrics] = None) -> "BatchIngestAdapter":
+        load_error = None
+        creds = None
+        try:
+            if credentials_file:
+                creds = BatchCredentialStore.from_file(credentials_file)
+            else:
+                load_error = "HEAR_BATCH_CREDENTIALS_FILE is not configured"
+        except Exception as exc:
+            load_error = str(exc)
+        return cls(durable_store, creds, raw_root=raw_root, adapter_name=adapter_name,
+                   metrics=metrics,
+                   adapter_version=adapter_version, load_error=load_error)
+
+    def ingest(self, *, path: str, raw: bytes, content_type: str, idempotency_key: str,
+               authorization: Optional[str], content_encoding: Optional[str],
+               request_id: str) -> tuple[int, str, Dict[str, str]]:
+        store = self._require_store()
+        cred = self._authenticate(authorization)
+        scope = IB.idempotency_scope(site_id=cred.site_id, principal=cred.principal_id,
+                                     route="POST /v1/ingest/batches", key=idempotency_key)
+        fingerprint = IB.request_fingerprint(raw)
+        replay = store.batch_lookup_receipt(scope)
+        if replay is not None:
+            if replay.request_fingerprint != fingerprint:
+                self.metrics.observe_idempotency_conflict(
+                    site=cred.site_id,
+                    device_id=cred.device_id or cred.principal_id,
+                    source="batch-http",
+                    adapter=self.adapter_name,
+                )
+                raise ProblemDetailError(
+                    status=409,
+                    code="idempotency_conflict",
+                    detail="Idempotency-Key was reused with a different request body",
+                )
+            return replay.response_status, replay.response_body, {
+                "Content-Type": IB.RECEIPT_MEDIA_TYPE,
+                "X-Request-ID": request_id,
+            }
+
+        received_at = utc_now()
+        frame_raw_ref = _retain_batch_bytes(
+            self.raw_root, cred.site_id, cred.device_id or cred.principal_id,
+            "frame-" + request_id, raw, suffix="json")
+        if isinstance(content_encoding, str) and content_encoding.strip():
+            store.batch_record_frame_refusal(
+                raw=raw, reasons=["content_encoding_unsupported"], source="batch-http",
+                adapter=self.adapter_name, received_at=received_at,
+                batch_id=None, raw_ref=frame_raw_ref, site_id=cred.site_id,
+                device_id=cred.device_id, principal_id=cred.principal_id,
+                credential_scope=cred.scope, key_id=cred.key_id, request_id=request_id)
+            self.metrics.observe_frame_refusal(
+                ["content_encoding_unsupported"],
+                raw_body_bytes=len(raw),
+                received_at=received_at,
+                site=cred.site_id,
+                source="batch-http",
+                adapter=self.adapter_name,
+            )
+            raise ProblemDetailError(status=415, code="content_encoding_unsupported",
+                                     detail="Content-Encoding is reserved and not enabled")
+
+        try:
+            codec = IB.codec_for_media_type(content_type)
+        except IB.BatchError as exc:
+            store.batch_record_frame_refusal(
+                raw=raw, reasons=["unsupported_media_type"], source="batch-http",
+                adapter=self.adapter_name, received_at=received_at,
+                batch_id=None, raw_ref=frame_raw_ref, site_id=cred.site_id,
+                device_id=cred.device_id, principal_id=cred.principal_id,
+                credential_scope=cred.scope, key_id=cred.key_id, request_id=request_id)
+            self.metrics.observe_frame_refusal(
+                ["unsupported_media_type"],
+                raw_body_bytes=len(raw),
+                received_at=received_at,
+                site=cred.site_id,
+                source="batch-http",
+                adapter=self.adapter_name,
+            )
+            raise ProblemDetailError(status=415, code="unsupported_media_type", detail=str(exc))
+
+        try:
+            frame = IB.decode_batch(raw, codec)
+        except IB.BatchError as exc:
+            reason = "batch_too_large" if len(raw) > IB.MAX_BATCH_BYTES else "undecodable_body"
+            store.batch_record_frame_refusal(
+                raw=raw, reasons=[reason], source="batch-http",
+                adapter=self.adapter_name, received_at=received_at,
+                batch_id=None, raw_ref=frame_raw_ref, site_id=cred.site_id,
+                device_id=cred.device_id, principal_id=cred.principal_id,
+                credential_scope=cred.scope, key_id=cred.key_id, request_id=request_id)
+            self.metrics.observe_frame_refusal(
+                [reason],
+                raw_body_bytes=len(raw),
+                received_at=received_at,
+                site=cred.site_id,
+                source="batch-http",
+                adapter=self.adapter_name,
+            )
+            raise ProblemDetailError(
+                status=413 if reason == "batch_too_large" else 400,
+                code=reason,
+                detail=str(exc),
+            )
+
+        validated = IB.validate_batch(
+            frame,
+            credential_device_id=cred.device_id,
+            credential_site_id=cred.site_id,
+            site_scoped=cred.site_scoped,
+        )
+        if not validated.ok:
+            code = _frame_error_status(validated.reasons)
+            store.batch_record_frame_refusal(
+                raw=raw, reasons=validated.reasons, source="batch-http",
+                adapter=self.adapter_name, received_at=received_at,
+                batch_id=frame.get("batch_id") if isinstance(frame, dict) else None,
+                raw_ref=frame_raw_ref, site_id=cred.site_id, device_id=cred.device_id,
+                principal_id=cred.principal_id, credential_scope=cred.scope,
+                key_id=cred.key_id, request_id=request_id)
+            self.metrics.observe_frame_refusal(
+                validated.reasons,
+                frame=frame,
+                raw_body_bytes=len(raw),
+                received_at=received_at,
+                site=cred.site_id,
+                source="batch-http",
+                adapter=self.adapter_name,
+            )
+            raise ProblemDetailError(
+                status=code,
+                code=validated.reasons[0],
+                detail="batch frame was refused",
+                field_errors=[{"field": row.get("path"), "reason": row.get("reason")}
+                              for row in validated.errors if row.get("path")],
+            )
+
+        results = self._persist_items(
+            store=store,
+            frame=frame,
+            raw_messages=frame.get("messages") or [],
+            provisional=validated.items,
+            cred=cred,
+            received_at=received_at,
+            request_id=request_id,
+        )
+        frame_status = "refused" if all(result.status == "deferred" for result in results) else "accepted"
+        self.metrics.observe_batch_results(
+            frame,
+            results,
+            raw_body_bytes=len(raw),
+            received_at=received_at,
+            site=cred.site_id,
+            source="batch-http",
+            adapter=self.adapter_name,
+            frame_status=frame_status,
+        )
+        if all(result.status == "deferred" for result in results):
+            raise ProblemDetailError(status=503, code="durable_store_unavailable",
+                                     detail="durable store unavailable",
+                                     retryable=True, headers={"Retry-After": "5"})
+        receipt = IB.build_receipt(frame, results, received_at=received_at,
+                                   adapter=self.adapter_name,
+                                   adapter_version=self.adapter_version)
+        body = encode_json(receipt)
+        if self.before_receipt_store is not None:
+            self.before_receipt_store()
+        store.batch_store_receipt(
+            idempotency_scope=scope,
+            request_fingerprint=fingerprint,
+            response_status=200,
+            response_body=body,
+            site_id=cred.site_id,
+            principal_id=cred.principal_id,
+            batch_id=str(frame.get("batch_id")),
+            request_id=request_id,
+        )
+        return 200, body, {"Content-Type": IB.RECEIPT_MEDIA_TYPE, "X-Request-ID": request_id}
+
+    def _require_store(self) -> "SqliteDurableRecordStore":
+        if not isinstance(self.durable_store, SqliteDurableRecordStore):
+            raise ProblemDetailError(status=503, code="durable_store_unavailable",
+                                     detail="batch ingest requires sqlite durable storage",
+                                     retryable=True, headers={"Retry-After": "5"})
+        if self.credential_store is None:
+            raise ProblemDetailError(status=503, code="credential_store_unavailable",
+                                     detail=self.load_error or "batch credential store unavailable",
+                                     retryable=True, headers={"Retry-After": "5"})
+        return self.durable_store
+
+    def _authenticate(self, authorization: Optional[str]) -> BatchCredential:
+        assert self.credential_store is not None
+        return self.credential_store.authenticate(authorization)
+
+    def _persist_items(self, *, store: "SqliteDurableRecordStore", frame: Mapping[str, Any],
+                       raw_messages: Sequence[Any], provisional: Sequence[IB.ItemResult],
+                       cred: BatchCredential, received_at: str,
+                       request_id: str) -> list[IB.ItemResult]:
+        results: list[IB.ItemResult] = []
+        batch_id = str(frame.get("batch_id"))
+        for seed, item in zip(provisional, raw_messages):
+            item_raw = _json_bytes(item)
+            item_raw_ref = _retain_batch_bytes(
+                self.raw_root, cred.site_id, str(frame.get("device_id")), batch_id, item_raw,
+                suffix=f"item-{seed.index}.json")
+            if seed.classification == IB.TRANSLATION_REQUIRED:
+                results.append(self._persist_translated_item(
+                    store=store, frame=frame, item=item, seed=seed, cred=cred,
+                    received_at=received_at, raw_ref=item_raw_ref, request_id=request_id))
+                continue
+            if seed.status == "refused":
+                refused = IB.ItemResult(seed.index, "refused", event_id=None,
+                                        dispatchable=False, reasons=seed.reasons,
+                                        raw_ref=item_raw_ref, classification=seed.classification)
+                store.batch_record_item_refusal(
+                    raw=item_raw, reasons=refused.reasons, source="batch-http",
+                    adapter=self.adapter_name, received_at=received_at, batch_id=batch_id,
+                    item_index=seed.index, raw_ref=item_raw_ref, site_id=cred.site_id,
+                    device_id=str(frame.get("device_id")), principal_id=cred.principal_id,
+                    credential_scope=cred.scope, key_id=cred.key_id,
+                    classification=seed.classification, event_id=None, request_id=request_id)
+                results.append(refused)
+                continue
+            envelope = dict(item)
+            accepted = IB.ItemResult(seed.index, seed.status, event_id=seed.event_id,
+                                     dispatchable=seed.dispatchable, reasons=seed.reasons,
+                                     raw_ref=item_raw_ref, classification=seed.classification)
+            try:
+                duplicate = store.batch_persist_event(
+                    accepted.event_id or "", cred.site_id, str(envelope.get("device_id")),
+                    str(envelope.get("source")), str(envelope.get("kind")),
+                    envelope.get("observed_at"), received_at, accepted.dispatchable,
+                    item_raw_ref, encode_json(envelope), batch_id, seed.index,
+                    cred.principal_id, cred.scope, cred.key_id)
+            except sqlite3.Error:
+                results.append(IB.ItemResult(seed.index, "deferred",
+                                             reasons=["durable_store_unavailable"],
+                                             raw_ref=item_raw_ref,
+                                             classification=seed.classification))
+                break
+            if duplicate:
+                results.append(IB.ItemResult(seed.index, "duplicate", event_id=accepted.event_id,
+                                             dispatchable=accepted.dispatchable, reasons=[],
+                                             raw_ref=item_raw_ref,
+                                             classification=seed.classification))
+            else:
+                results.append(accepted)
+        if len(results) < len(provisional):
+            for seed, item in zip(provisional[len(results):], raw_messages[len(results):]):
+                deferred = IB.ItemResult(seed.index, "deferred",
+                                         reasons=["durable_store_unavailable"],
+                                         raw_ref=None,
+                                         classification=seed.classification)
+                if seed.classification != IB.TRANSLATION_REQUIRED and seed.status == "refused":
+                    deferred = IB.ItemResult(seed.index, "deferred",
+                                             reasons=["durable_store_unavailable"],
+                                             classification=seed.classification)
+                results.append(deferred)
+        return results
+
+    def _persist_translated_item(self, *, store: "SqliteDurableRecordStore",
+                                 frame: Mapping[str, Any], item: Any, seed: IB.ItemResult,
+                                 cred: BatchCredential, received_at: str, raw_ref: str,
+                                 request_id: str) -> IB.ItemResult:
+        try:
+            envelope = translate_legacy_batch_item(
+                item, frame=frame, credential=cred, received_at=received_at,
+                adapter_name=self.adapter_name, adapter_version=self.adapter_version,
+                raw_ref=raw_ref)
+        except RequestError as exc:
+            refused = IB.resolve_translation(
+                seed, status="refused", reasons=[_request_error_reason(exc)], raw_ref=raw_ref)
+            store.batch_record_item_refusal(
+                raw=_json_bytes(item), reasons=refused.reasons, source="batch-http",
+                adapter=self.adapter_name, received_at=received_at,
+                batch_id=str(frame.get("batch_id")), item_index=seed.index, raw_ref=raw_ref,
+                site_id=cred.site_id, device_id=str(frame.get("device_id")),
+                principal_id=cred.principal_id, credential_scope=cred.scope,
+                key_id=cred.key_id, classification=IB.TRANSLATED, event_id=None,
+                request_id=request_id)
+            return refused
+        verdict = EV.validate(envelope, require_event_id_match=True)
+        if not verdict.ok:
+            refused = IB.resolve_translation(seed, status="refused", reasons=verdict.reasons,
+                                             raw_ref=raw_ref)
+            store.batch_record_item_refusal(
+                raw=_json_bytes(item), reasons=refused.reasons, source="batch-http",
+                adapter=self.adapter_name, received_at=received_at,
+                batch_id=str(frame.get("batch_id")), item_index=seed.index, raw_ref=raw_ref,
+                site_id=cred.site_id, device_id=str(frame.get("device_id")),
+                principal_id=cred.principal_id, credential_scope=cred.scope,
+                key_id=cred.key_id, classification=IB.TRANSLATED,
+                event_id=envelope.get("event_id"), request_id=request_id)
+            return refused
+        result = IB.resolve_translation(seed, status="accepted", event_id=envelope["event_id"],
+                                        dispatchable=verdict.dispatchable, raw_ref=raw_ref)
+        try:
+            duplicate = store.batch_persist_event(
+                result.event_id or "", cred.site_id, str(envelope.get("device_id")),
+                str(envelope.get("source")), str(envelope.get("kind")),
+                envelope.get("observed_at"), received_at, result.dispatchable, raw_ref,
+                encode_json(envelope), str(frame.get("batch_id")), seed.index,
+                cred.principal_id, cred.scope, cred.key_id)
+        except sqlite3.Error:
+            return IB.resolve_translation(seed, status="deferred",
+                                          reasons=["durable_store_unavailable"],
+                                          raw_ref=raw_ref)
+        if duplicate:
+            return IB.resolve_translation(seed, status="duplicate", event_id=result.event_id,
+                                          dispatchable=result.dispatchable, raw_ref=raw_ref)
+        return result
+
+
 class DurableReplayWorker:
     """Small stoppable background thread that periodically retries pending durable records.
 
@@ -1304,6 +1955,82 @@ def make_durable_store(kind: str = DURABLE_STORE,
     raise ValueError(f"unknown durable store {kind!r}; expected one of {', '.join(DURABLE_BACKENDS)}")
 
 
+def _require_non_empty_string(row: Mapping[str, Any], key: str, idx: int) -> str:
+    value = row.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"credential {idx} {key} must be a non-empty string")
+    return value.strip()
+
+
+def _choice_field(row: Mapping[str, Any], key: str, choices: Sequence[str], idx: int) -> str:
+    value = _require_non_empty_string(row, key, idx)
+    if value not in choices:
+        raise ValueError(f"credential {idx} {key} must be one of {', '.join(choices)}")
+    return value
+
+
+def _hex_field(row: Mapping[str, Any], key: str, idx: int) -> str:
+    value = _require_non_empty_string(row, key, idx).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError(f"credential {idx} {key} must be a 64-char sha256 hex digest")
+    return value
+
+
+def _json_bytes(value: Any) -> bytes:
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=False).encode("utf-8")
+
+
+def _retain_batch_bytes(root: str, site_id: str, device_id: str, batch_id: str,
+                        raw: bytes, *, suffix: str) -> str:
+    digest = hashlib.sha256(raw).hexdigest()
+    rel = os.path.join("raw", site_id, device_id, batch_id, f"{digest}-{suffix}")
+    full = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    if os.path.exists(full):
+        return rel.replace(os.sep, "/")
+    tmp = full + ".tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(raw)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, full)
+    return rel.replace(os.sep, "/")
+
+
+def _frame_error_status(reasons: Sequence[str]) -> int:
+    set_reasons = set(reasons)
+    if "credential_missing" in set_reasons:
+        return 401
+    if {"batch_schema_version_unsupported", "batch_empty", "batch_too_many_items",
+        "batch_id_invalid", "device_identity_mismatch"} & set_reasons:
+        return 422
+    return 400
+
+
+def _problem_title(status: int) -> str:
+    return {
+        400: "Bad Request",
+        401: "Unauthorized",
+        403: "Forbidden",
+        409: "Conflict",
+        413: "Payload Too Large",
+        415: "Unsupported Media Type",
+        422: "Unprocessable Content",
+        429: "Too Many Requests",
+        503: "Service Unavailable",
+    }.get(status, "Error")
+
+
+def _request_error_reason(exc: RequestError) -> str:
+    mapping = {
+        "telemetry_schema_version must be 1": "schema_version_unsupported",
+        "ts is required when time.valid is true": "field_missing",
+        "ts must be null when time.valid is false": "clock_valid_without_observed_at",
+    }
+    return mapping.get(str(exc), "field_missing")
+
+
 def _require_object(payload: Any, label: str) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise RequestError(f"{label} must be an object")
@@ -1454,6 +2181,90 @@ def validate_event_payload(payload: Any) -> Dict[str, Any]:
     return body
 
 
+def translate_legacy_batch_item(item: Any, *, frame: Mapping[str, Any], credential: BatchCredential,
+                                received_at: str, adapter_name: str, adapter_version: str,
+                                raw_ref: str) -> Dict[str, Any]:
+    body = _require_object(item, "item")
+    telemetry_path = body.get("telemetry_path")
+    translated = dict(body)
+    if telemetry_path == "hear/heartbeat":
+        checked = validate_heartbeat_payload(translated)
+        kind = "heartbeat"
+        producer_sequence = None
+        source = "import" if credential.site_scoped or frame.get("adapter") else "node-http"
+        payload = {
+            "telemetry_schema_version": 1,
+            "uptime_s": checked["uptime_s"],
+            "gps_fix": checked["gps"]["fix"],
+            "wifi": checked.get("wifi"),
+            "counters": checked["counters"],
+            "legacy": checked,
+        }
+    elif telemetry_path == "hear/event":
+        if translated.get("event_type") == "dets":
+            translated["event_type"] = "detection_batch_ready"
+        checked = validate_event_payload(translated)
+        event_type = str(checked["event_type"])
+        kind = "clip" if event_type == "clip_written" else "detection"
+        producer_sequence = checked["event_seq"]
+        source = "import" if credential.site_scoped or frame.get("adapter") else "node-http"
+        payload = {
+            "telemetry_schema_version": 1,
+            "event_type": event_type,
+            "event_seq": checked["event_seq"],
+            "event": checked["event"],
+            "legacy": checked,
+        }
+    else:
+        raise RequestError("telemetry_path must be 'hear/heartbeat' or 'hear/event'")
+    time_block = checked.get("time") or {}
+    if time_block.get("valid") is True:
+        tier = "gps_pps"
+        sigma_ns = int(time_block.get("sync_sigma_ns") or 0)
+    else:
+        tier = "monotonic"
+        sigma_ns = 0
+    envelope = {
+        "event_id": "",
+        "source": source,
+        "site_id": credential.site_id,
+        "device_id": checked["device_id"],
+        "device_class": checked["class"],
+        "firmware_version": checked["fw_version"],
+        "observed_at": checked.get("ts"),
+        "received_at": received_at,
+        "clock": {
+            "valid": bool(time_block.get("valid")),
+            "tier": tier,
+            "sigma_ns": sigma_ns,
+        },
+        "kind": kind,
+        "schema_version": EV.SCHEMA_MAJOR,
+        "payload": payload,
+        "raw_ref": raw_ref,
+        "adapter": {"name": adapter_name, "version": adapter_version},
+        "producer": {},
+    }
+    for key, value in (
+        ("boot_id", time_block.get("boot_id")),
+        ("boot_epoch_us", time_block.get("boot_epoch_us")),
+        ("sequence", producer_sequence),
+    ):
+        if value is not None:
+            envelope["producer"][key] = value
+    if "boot_id" not in envelope["producer"] and frame.get("producer"):
+        producer = frame.get("producer") or {}
+        if isinstance(producer, Mapping):
+            if producer.get("boot_id") is not None:
+                envelope["producer"]["boot_id"] = producer.get("boot_id")
+            if producer.get("boot_epoch_us") is not None:
+                envelope["producer"]["boot_epoch_us"] = producer.get("boot_epoch_us")
+    if not envelope["producer"]:
+        envelope.pop("producer")
+    envelope["event_id"] = EV.derive_event_id(envelope)
+    return envelope
+
+
 def _refused_device_id(raw_body: Any) -> str:
     """Best-effort device id for a refused body; "unknown" when it cannot be read.
 
@@ -1479,7 +2290,8 @@ def make_handler(store: HeartbeatReceiverStore,
                  max_body_bytes: int = MAX_BODY_BYTES,
                  auth_token: Optional[str] = AUTH_TOKEN,
                  socket_timeout_s: float = SOCKET_TIMEOUT_S,
-                 ingest_metrics: Optional[IO.IngestMetrics] = None) -> type[BaseHTTPRequestHandler]:
+                 ingest_metrics: Optional[IO.IngestMetrics] = None,
+                 batch_adapter: Optional[BatchIngestAdapter] = None) -> type[BaseHTTPRequestHandler]:
     ingest_metrics = ingest_metrics or IO.IngestMetrics()
 
     class ReceiverHandler(BaseHTTPRequestHandler):
@@ -1508,6 +2320,51 @@ def make_handler(store: HeartbeatReceiverStore,
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
+            self.raw_body = None
+            request_id = self.request_id()
+            if path in (BATCH_ROUTE, BATCH_ALIAS_ROUTE):
+                try:
+                    if batch_adapter is None:
+                        raise ProblemDetailError(
+                            status=503,
+                            code="batch_ingest_unavailable",
+                            detail="batch ingest route is not configured",
+                            retryable=True,
+                            headers={"Retry-After": "5"},
+                        )
+                    status, body, headers = batch_adapter.ingest(
+                        path=path,
+                        raw=self.read_raw_body(IB.MAX_BATCH_BYTES),
+                        content_type=self.required_header("Content-Type"),
+                        idempotency_key=self.require_idempotency_key(),
+                        authorization=self.headers.get("Authorization"),
+                        content_encoding=self.headers.get("Content-Encoding"),
+                        request_id=request_id,
+                    )
+                except ProblemDetailError as exc:
+                    self.send_problem(exc, request_id)
+                    return
+                except RequestError as exc:
+                    self.send_problem(
+                        ProblemDetailError(status=exc.status,
+                                           code="payload_too_large" if exc.status == 413 else
+                                                "bad_request",
+                                           detail=str(exc),
+                                           retryable=exc.status in (408,)),
+                        request_id)
+                    return
+                except Exception as exc:  # pragma: no cover - crash window is tested below
+                    self.close_connection = True
+                    logger.exception("batch ingest request crashed: %s", exc)
+                    return
+                encoded = body.encode("utf-8")
+                self.send_response(status)
+                for key, value in headers.items():
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+                return
             routes: Dict[str, tuple[Callable[[Any], Dict[str, Any]], Callable[[Dict[str, Any]], Dict[str, Any]]]] = {
                 "/api/hear/heartbeat": (validate_heartbeat_payload, store.write_heartbeat),
                 "/api/hear/event": (validate_event_payload, store.write_event),
@@ -1518,7 +2375,6 @@ def make_handler(store: HeartbeatReceiverStore,
                 return
             validator, writer = route
             telemetry_path = path.replace("/api/", "", 1)
-            self.raw_body = None
             try:
                 self.require_auth(auth_token)
                 writer(validator(self.read_json_body(max_body_bytes)))
@@ -1547,8 +2403,17 @@ def make_handler(store: HeartbeatReceiverStore,
                 raise RequestError("unauthorized", status=401)
 
         def read_json_body(self, max_body_bytes: int) -> Any:
+            raw = self.read_raw_body(max_body_bytes)
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError as exc:
+                raise RequestError("request body must be UTF-8 JSON") from exc
+            except json.JSONDecodeError as exc:
+                raise RequestError("malformed JSON") from exc
+
+        def read_raw_body(self, max_body_bytes: int) -> bytes:
             raw_len = self.headers.get("Content-Length")
-            if raw_len is None:
+            if raw_len is None or self.headers.get("Transfer-Encoding"):
                 raise RequestError("missing Content-Length")
             try:
                 length = int(raw_len)
@@ -1556,9 +2421,6 @@ def make_handler(store: HeartbeatReceiverStore,
                 raise RequestError("invalid Content-Length") from exc
             if length < 0:
                 raise RequestError("invalid Content-Length")
-            if length > max_body_bytes:
-                raise RequestError(
-                    f"payload too large ({length} > {max_body_bytes} bytes)", status=413)
             try:
                 raw = self.rfile.read(length)
             except (TimeoutError, socket.timeout) as exc:
@@ -1568,12 +2430,56 @@ def make_handler(store: HeartbeatReceiverStore,
             self.raw_body = raw
             if len(raw) != length:
                 raise RequestError("truncated request body")
-            try:
-                return json.loads(raw.decode("utf-8"))
-            except UnicodeDecodeError as exc:
-                raise RequestError("request body must be UTF-8 JSON") from exc
-            except json.JSONDecodeError as exc:
-                raise RequestError("malformed JSON") from exc
+            if length > max_body_bytes:
+                raise RequestError(
+                    f"payload too large ({length} > {max_body_bytes} bytes)", status=413)
+            return raw
+
+        def require_idempotency_key(self) -> str:
+            raw = self.headers.get("Idempotency-Key")
+            if not isinstance(raw, str) or not raw.strip():
+                raise ProblemDetailError(status=400, code="idempotency_key_missing",
+                                         detail="Idempotency-Key is required")
+            value = raw.strip()
+            if len(value) > 128:
+                raise ProblemDetailError(status=400, code="idempotency_key_invalid",
+                                         detail="Idempotency-Key must be 128 characters or fewer")
+            return value
+
+        def required_header(self, name: str) -> str:
+            value = self.headers.get(name)
+            if not isinstance(value, str) or not value.strip():
+                raise ProblemDetailError(status=400, code=f"{name.lower()}_missing",
+                                         detail=f"{name} is required")
+            return value.strip()
+
+        def request_id(self) -> str:
+            got = self.headers.get("X-Request-ID")
+            if isinstance(got, str) and got.strip():
+                return got.strip()
+            return "req_" + uuid.uuid4().hex
+
+        def send_problem(self, exc: ProblemDetailError, request_id: str) -> None:
+            detail = {
+                "type": f"https://api.dama.example/problems/{exc.code}",
+                "title": _problem_title(exc.status),
+                "status": exc.status,
+                "code": exc.code,
+                "detail": exc.detail,
+                "instance": request_id,
+                "retryable": exc.retryable,
+            }
+            if exc.field_errors:
+                detail["field_errors"] = exc.field_errors
+            body = encode_json(detail).encode("utf-8")
+            self.send_response(exc.status)
+            self.send_header("Content-Type", "application/problem+json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Request-ID", request_id)
+            for key, value in exc.headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(body)
 
         def send_json(self, data: Mapping[str, Any], code: int = 200) -> None:
             body = json.dumps(data, separators=(",", ":")).encode("utf-8")
@@ -1614,15 +2520,20 @@ def create_server(bind: str, port: int, store: HeartbeatReceiverStore,
                   auth_token: Optional[str] = AUTH_TOKEN,
                   socket_timeout_s: float = SOCKET_TIMEOUT_S,
                   ingest_metrics: Optional[IO.IngestMetrics] = None,
+                  batch_adapter: Optional[BatchIngestAdapter] = None,
                   durable_replay_interval_s: float = 0.0,
                   durable_replay_limit: int = DURABLE_REPLAY_LIMIT,
                   durable_prune_interval_s: float = 0.0,
                   durable_retention_days: int = DURABLE_RETENTION_DAYS) -> ReceiverServer:
+    if ingest_metrics is None and batch_adapter is not None:
+        ingest_metrics = batch_adapter.metrics
+    elif ingest_metrics is not None and batch_adapter is not None:
+        batch_adapter.metrics = ingest_metrics
     return ReceiverServer(
         (bind, port),
         make_handler(store, max_body_bytes=max_body_bytes,
                      auth_token=auth_token, socket_timeout_s=socket_timeout_s,
-                     ingest_metrics=ingest_metrics),
+                     ingest_metrics=ingest_metrics, batch_adapter=batch_adapter),
         store,
         durable_replay_interval_s=durable_replay_interval_s,
         durable_replay_limit=durable_replay_limit,
@@ -1644,6 +2555,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--event-stream-maxlen", type=int, default=EVENT_STREAM_MAXLEN)
     ap.add_argument("--auth-token", default=AUTH_TOKEN)
     ap.add_argument("--socket-timeout-s", type=float, default=SOCKET_TIMEOUT_S)
+    ap.add_argument("--batch-credentials-file", default=BATCH_CREDENTIALS_FILE)
+    ap.add_argument("--batch-raw-dir", default=BATCH_RAW_DIR)
     add_durable_store_args(ap)
     return ap.parse_args(argv)
 
@@ -1661,8 +2574,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         durable_store=make_durable_store(args.durable_store, args.durable_db),
     )
     replay = store.replay_pending(limit=args.durable_replay_limit)
+    batch_adapter = BatchIngestAdapter.from_config(
+        store.durable_store, args.batch_credentials_file, raw_root=args.batch_raw_dir,
+        adapter_version=BATCH_ADAPTER_VERSION)
     print(f"[hear-heartbeat] Redis target configured -> {target}")
     print(f"[hear-heartbeat] durable backend={store.durable_store.backend} path={store.durable_store.path}")
+    if batch_adapter.credential_store is None:
+        print("[hear-heartbeat] batch ingest credentials unavailable; route will refuse: %s"
+              % (batch_adapter.load_error or "unknown error"))
     if replay["attempted"] or replay["failed"]:
         print("[hear-heartbeat] replay pending attempted=%d synced=%d failed=%d remaining=%d"
               % (replay["attempted"], replay["synced"], replay["failed"],
@@ -1671,6 +2590,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     server = create_server(
         args.bind, args.port, store, max_body_bytes=args.max_body_bytes,
         auth_token=auth_token, socket_timeout_s=args.socket_timeout_s,
+        batch_adapter=batch_adapter,
         durable_replay_interval_s=args.durable_replay_interval_s,
         durable_replay_limit=args.durable_replay_limit,
         durable_prune_interval_s=args.durable_prune_interval_s,

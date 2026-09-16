@@ -37,6 +37,9 @@ def test_the_receiver_runs_the_new_entrypoint_and_mounts_its_bundle_and_state():
     assert mounts[("code", "hear_ingest_batch.py")] == "/app/hear/ingest/batch.py"
     assert mounts[("code", "hear_ingest_observability.py")] == "/app/hear/ingest/observability.py"
     assert mounts[("code", "tools_hear_heartbeat_receiver.py")] == "/app/tools/hear_heartbeat_receiver.py"
+    assert mounts[("batch-credentials", "/var/run/dama-hear/batch-credentials")] == (
+        "/var/run/dama-hear/batch-credentials"
+    )
     assert mounts[("state", "/state")] == "/state"
 
 
@@ -70,6 +73,10 @@ def test_it_declares_the_expected_environment_durable_outbox_and_required_token_
     assert env["HEAR_DURABLE_STORE"]["value"] == "sqlite"
     assert env["HEAR_DURABLE_DB"]["value"] == "/state/heartbeat-receiver.sqlite3"
     assert env["HEAR_DURABLE_REPLAY_LIMIT"]["value"] == "256"
+    assert env["HEAR_BATCH_CREDENTIALS_FILE"]["value"] == (
+        "/var/run/dama-hear/batch-credentials/credentials.json"
+    )
+    assert env["HEAR_BATCH_RAW_DIR"]["value"] == "/state/ingest-batch"
     assert env["REDIS_PASS"]["valueFrom"]["secretKeyRef"] == {
         "name": "dama-redis-secret",
         "key": "REDIS_PASS",
@@ -80,6 +87,10 @@ def test_it_declares_the_expected_environment_durable_outbox_and_required_token_
         "key": "token",
     }
     volumes = {v["name"]: v for v in spec["volumes"]}
+    assert volumes["batch-credentials"]["secret"] == {
+        "secretName": "hear-batch-credentials",
+        "optional": True,
+    }
     assert volumes["state"]["persistentVolumeClaim"] == {"claimName": "hear-heartbeat-state"}
 
 

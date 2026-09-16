@@ -15,9 +15,9 @@
 #                     with, so there is no `pip install` left to run against the live index
 #   volumeMounts:     the `code` and `deps` mounts deleted
 #   volumes:          the `code` ConfigMap volume and the `deps` emptyDir deleted
-# and nothing else. hostNetwork, dnsPolicy, hostPort 5051, the Service, all nine env vars
-# including both secretKeyRefs, both probes, resources, replicas, `strategy: Recreate`, the
-# `state` mount, the PVC and the root uid are byte-identical;
+# and nothing else. hostNetwork, dnsPolicy, hostPort 5051, the Service, every env var including
+# both secretKeyRefs, both probes, resources, replicas, `strategy: Recreate`, the
+# `batch-credentials` and `state` mounts, the PVC and the root uid are byte-identical;
 # tests/test_service_images.py::test_the_proposed_manifest_changes_only_packaging proves it by
 # parsing both files rather than by trusting this comment.
 ---
@@ -86,6 +86,8 @@ spec:
             - { name: HEAR_DURABLE_STORE, value: "sqlite" }
             - { name: HEAR_DURABLE_DB, value: "/state/heartbeat-receiver.sqlite3" }
             - { name: HEAR_DURABLE_REPLAY_LIMIT, value: "256" }
+            - { name: HEAR_BATCH_CREDENTIALS_FILE, value: "/var/run/dama-hear/batch-credentials/credentials.json" }
+            - { name: HEAR_BATCH_RAW_DIR, value: "/state/ingest-batch" }
             - { name: REDIS_HOST, value: "audit-redis.infra.svc.cluster.local" }
             - { name: REDIS_PORT, value: "6379" }
             - name: REDIS_PASS
@@ -100,8 +102,10 @@ spec:
                   name: hear-heartbeat-token
                   key: token
           volumeMounts:
-            # `code` and `deps` are gone: both are in the image. `state` is untouched -- a
-            # packaging change may not create, move, reformat or re-own durable state.
+            # `code` and `deps` are gone: both are in the image. `batch-credentials` and `state`
+            # are untouched -- a packaging change may not create, move, reformat or re-own
+            # runtime inputs or durable state.
+            - { name: batch-credentials, mountPath: /var/run/dama-hear/batch-credentials, readOnly: true }
             - { name: state, mountPath: /state }
           readinessProbe:
             httpGet: { path: /healthz, port: http }
@@ -116,6 +120,10 @@ spec:
         # ⚠️ConfigMap hear-heartbeat-code STAYS APPLIED AND UNREFERENCED. It is the rollback
         # artifact, it keeps its BUNDLES entry and its sync test, and it is deleted in the
         # retirement step (9), never in a cutover.
+        - name: batch-credentials
+          secret:
+            secretName: hear-batch-credentials
+            optional: true
         - name: state
           persistentVolumeClaim:
             claimName: hear-heartbeat-state

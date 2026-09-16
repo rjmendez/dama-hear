@@ -42,7 +42,7 @@ spec:
         # Forces a new ReplicaSet (Recreate: a full pod restart) whenever
         # hear-heartbeat-code.yaml's content changes. The code file below is mounted
         # with subPath, which kubelet's ConfigMap sync does not live-update.
-        checksum/hear-heartbeat-code: '825ab427bb565eedf85b95cc00ca6fc351b1325b3f79f5c79d2ea8d2dc4b4b1e'
+        checksum/hear-heartbeat-code: 'bbbe0767f0567bf6ae8f1ae6266929e54c62223e6239bee55a8d6f67bfe4b514'
         prometheus.io/scrape: "true"
         prometheus.io/path: /metrics
         prometheus.io/port: "5051"
@@ -71,6 +71,8 @@ spec:
             - { name: HEAR_DURABLE_STORE, value: "sqlite" }
             - { name: HEAR_DURABLE_DB, value: "/state/heartbeat-receiver.sqlite3" }
             - { name: HEAR_DURABLE_REPLAY_LIMIT, value: "256" }
+            - { name: HEAR_BATCH_CREDENTIALS_FILE, value: "/var/run/dama-hear/batch-credentials/credentials.json" }
+            - { name: HEAR_BATCH_RAW_DIR, value: "/state/ingest-batch" }
             - { name: REDIS_HOST, value: "audit-redis.infra.svc.cluster.local" }
             - { name: REDIS_PORT, value: "6379" }
             - name: REDIS_PASS
@@ -92,6 +94,7 @@ spec:
             - { name: code, mountPath: /app/hear/ingest/observability.py, subPath: hear_ingest_observability.py }
             - { name: code, mountPath: /app/tools/hear_heartbeat_receiver.py, subPath: tools_hear_heartbeat_receiver.py }
             - { name: deps, mountPath: /deps }
+            - { name: batch-credentials, mountPath: /var/run/dama-hear/batch-credentials, readOnly: true }
             - { name: state, mountPath: /state }
           readinessProbe:
             httpGet: { path: /healthz, port: http }
@@ -108,6 +111,10 @@ spec:
             name: hear-heartbeat-code
         - name: deps
           emptyDir: {}
+        - name: batch-credentials
+          secret:
+            secretName: hear-batch-credentials
+            optional: true
         - name: state
           persistentVolumeClaim:
             claimName: hear-heartbeat-state
