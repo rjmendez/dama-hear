@@ -174,10 +174,21 @@ TDOA_DATA = [
 
 HEARTBEAT_CODE = [
     ("hear__init__.py", "hear/__init__.py"),
+    ("hear_sketch.py", "hear/sketch.py"),
+    ("hear_identity.py", "hear/identity.py"),
+    ("hear_clips.py", "hear/clips.py"),
     ("hear_ingest__init__.py", "hear/ingest/__init__.py"),
     ("hear_ingest_envelope.py", "hear/ingest/envelope.py"),
     ("hear_ingest_batch.py", "hear/ingest/batch.py"),
     ("hear_ingest_observability.py", "hear/ingest/observability.py"),
+    # The batch promotion lane imports privacy modules lazily so hear-mqtt-bridge does not pay
+    # their numpy/model closure, but hear-heartbeat *does* need the same package fragments the
+    # drain ships once a clip-bearing batch arrives.
+    ("hear_privacy__init__.py", "hear/privacy/__init__.py"),
+    ("hear_privacy_purge.py", "hear/privacy/purge.py"),
+    ("hear_privacy_silero_vad.py", "hear/privacy/silero_vad.py"),
+    ("hear_privacy_transient_tdoa.py", "hear/privacy/transient_tdoa.py"),
+    ("hear_resample.py", "hear/resample.py"),
     ("tools_hear_heartbeat_receiver.py", "tools/hear_heartbeat_receiver.py"),
 ]
 
@@ -186,6 +197,9 @@ MQTT_BRIDGE_CODE = [
     # the AWS and LAN ingest paths share one schema instead of two that can drift apart --
     # which means both files have to ship in the same ConfigMap for the import to resolve.
     ("hear__init__.py", "hear/__init__.py"),
+    ("hear_sketch.py", "hear/sketch.py"),
+    ("hear_identity.py", "hear/identity.py"),
+    ("hear_clips.py", "hear/clips.py"),
     ("hear_ingest__init__.py", "hear/ingest/__init__.py"),
     ("hear_ingest_envelope.py", "hear/ingest/envelope.py"),
     ("hear_ingest_batch.py", "hear/ingest/batch.py"),

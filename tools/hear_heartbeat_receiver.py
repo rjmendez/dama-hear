@@ -8,6 +8,8 @@ surface, and pending cache publishes can be replayed after a crash or cache outa
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -21,7 +23,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
@@ -42,6 +44,7 @@ REDIS_PASS = os.environ.get("REDIS_PASS")
 AUTH_TOKEN = os.environ.get("HEAR_HEARTBEAT_TOKEN")
 BATCH_CREDENTIALS_FILE = os.environ.get("HEAR_BATCH_CREDENTIALS_FILE")
 BATCH_RAW_DIR = os.environ.get("HEAR_BATCH_RAW_DIR", "/state/ingest-batch/raw")
+BATCH_POOL_ROOT = os.environ.get("HEAR_BATCH_POOL_ROOT", "/pool/corpus")
 BATCH_ROUTE = "/v1/ingest/batches"
 BATCH_ALIAS_ROUTE = "/ingest/batch"
 BATCH_ADAPTER_NAME = "ingest-batch"
@@ -158,6 +161,10 @@ class DurableStoreError(RuntimeError):
     """The durable ledger could not record or replay a record."""
 
 
+class BatchPromotionError(RuntimeError):
+    """The shared corpus promotion step could not safely complete."""
+
+
 @dataclass(frozen=True)
 class BatchCredential:
     principal_id: str
@@ -182,6 +189,25 @@ class StoredBatchReceipt:
     response_status: int
     response_body: str
     request_id: str
+
+
+@dataclass(frozen=True)
+class StoredBatchPromotion:
+    event_id: str
+    state: str
+    clip_key: Optional[str]
+    pool_path: Optional[str]
+    reason: Optional[str]
+
+
+@dataclass(frozen=True)
+class PendingBatchPromotion:
+    event_id: str
+    envelope_json: str
+    raw_ref: Optional[str]
+    batch_id: str
+    site_id: str
+    device_id: str
 
 
 @dataclass(frozen=True)
@@ -549,6 +575,24 @@ class SqliteDurableRecordStore(DurableRecordStore):
                 "CREATE INDEX IF NOT EXISTS batch_refusals_lookup "
                 "ON batch_refusals(site_id, device_id, received_at)"
             )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS batch_promotions (
+                    event_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL CHECK (state IN ('promoted', 'purged', 'skipped')),
+                    clip_key TEXT,
+                    pool_path TEXT,
+                    reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(event_id) REFERENCES batch_events(event_id)
+                )
+                """
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS batch_promotions_state_updated "
+                "ON batch_promotions(state, updated_at, event_id)"
+            )
         self._migrate_record_uids()
 
     def _migrate_record_uids(self) -> None:
@@ -915,6 +959,68 @@ class SqliteDurableRecordStore(DurableRecordStore):
                 (idempotency_scope, request_fingerprint, response_status, response_body,
                  site_id, principal_id, batch_id, request_id, utc_now()),
             )
+
+    def batch_lookup_promotion(self, event_id: str) -> Optional[StoredBatchPromotion]:
+        with self._lock, self._reading() as con:
+            row = con.execute(
+                "SELECT event_id, state, clip_key, pool_path, reason "
+                "FROM batch_promotions WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return StoredBatchPromotion(str(row["event_id"]), str(row["state"]),
+                                    None if row["clip_key"] is None else str(row["clip_key"]),
+                                    None if row["pool_path"] is None else str(row["pool_path"]),
+                                    None if row["reason"] is None else str(row["reason"]))
+
+    def batch_store_promotion(self, *, event_id: str, state: str,
+                              clip_key: Optional[str] = None,
+                              pool_path: Optional[str] = None,
+                              reason: Optional[str] = None) -> StoredBatchPromotion:
+        now = utc_now()
+        with self._lock, self._transaction() as con:
+            con.execute(
+                """
+                INSERT INTO batch_promotions
+                (event_id, state, clip_key, pool_path, reason, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id) DO UPDATE SET
+                    state = excluded.state,
+                    clip_key = excluded.clip_key,
+                    pool_path = excluded.pool_path,
+                    reason = excluded.reason,
+                    updated_at = excluded.updated_at
+                """,
+                (event_id, state, clip_key, pool_path, reason, now, now),
+            )
+        return StoredBatchPromotion(event_id, state, clip_key, pool_path, reason)
+
+    def batch_unpromoted_events(self, limit: int = 64) -> list[PendingBatchPromotion]:
+        if limit <= 0:
+            return []
+        with self._lock, self._reading() as con:
+            rows = con.execute(
+                """
+                SELECT e.event_id, e.envelope_json, e.raw_ref, e.batch_id, e.site_id, e.device_id
+                FROM batch_events e
+                LEFT JOIN batch_promotions p ON p.event_id = e.event_id
+                WHERE p.event_id IS NULL
+                ORDER BY e.received_at, e.item_index, e.event_id
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [PendingBatchPromotion(str(row["event_id"]), str(row["envelope_json"]),
+                                      None if row["raw_ref"] is None else str(row["raw_ref"]),
+                                      str(row["batch_id"]), str(row["site_id"]),
+                                      str(row["device_id"]))
+                for row in rows]
+
+    def batch_update_envelope(self, event_id: str, envelope_json: str) -> None:
+        with self._lock, self._transaction() as con:
+            con.execute("UPDATE batch_events SET envelope_json = ? WHERE event_id = ?",
+                        (envelope_json, event_id))
 
     def batch_persist_event(self, event_id: str, site_id: str, device_id: str, source: str,
                             kind: str, observed_at: Optional[str], received_at: str,
@@ -1419,18 +1525,268 @@ class BatchCredentialStore:
         return cred
 
 
+class BatchClipPromoter:
+    _AUDIO_KEYS = ("wav_b64", "audio_wav_b64", "clip_wav_b64", "audio_b64")
+    _CLIP_KEYS = ("clip", "clip_path", "clip_name")
+
+    def __init__(self, *, pool_root: str = BATCH_POOL_ROOT,
+                 audit_log: Optional[str] = None, vad: Any = None):
+        self.pool_root = os.path.abspath(pool_root)
+        self.audit_log = audit_log or os.path.join(self.pool_root, "clips", "vad_purge.jsonl")
+        self._vad = vad
+
+    def _modules(self):
+        from hear import clips as clip_store
+        from hear import identity as node_identity
+        from hear.privacy import purge as privacy_purge
+        return clip_store, node_identity, privacy_purge
+
+    def _load_vad(self) -> Any:
+        if self._vad is not None:
+            return self._vad
+        _clip_store, _node_identity, privacy_purge = self._modules()
+        self._vad = privacy_purge.load_vad("auto")
+        return self._vad
+
+    @staticmethod
+    def _mapping(value: Any) -> Optional[Mapping[str, Any]]:
+        return value if isinstance(value, Mapping) else None
+
+    @staticmethod
+    def _string(value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        return value or None
+
+    def _clip_name(self, payload: Mapping[str, Any]) -> Optional[str]:
+        clip_store, _node_identity, _privacy_purge = self._modules()
+        for key in self._CLIP_KEYS:
+            got = self._string(payload.get(key))
+            if got:
+                return got
+        got = self._string(payload.get("clip_basename"))
+        if got:
+            return clip_store.CLIP_DIR + "/" + got
+        for nested_key in ("event", "legacy", "clip"):
+            nested = self._mapping(payload.get(nested_key))
+            if nested is None:
+                continue
+            got = self._clip_name(nested)
+            if got:
+                return got
+        return None
+
+    def _audio_b64(self, payload: Mapping[str, Any]) -> Optional[str]:
+        for key in self._AUDIO_KEYS:
+            got = self._string(payload.get(key))
+            if got:
+                return got
+        for nested_key in ("event", "legacy", "clip"):
+            nested = self._mapping(payload.get(nested_key))
+            if nested is None:
+                continue
+            got = self._audio_b64(nested)
+            if got:
+                return got
+        return None
+
+    def carries_clip_audio(self, envelope: Mapping[str, Any]) -> bool:
+        if envelope.get("kind") != "clip":
+            return False
+        payload = self._mapping(envelope.get("payload"))
+        if payload is None:
+            return False
+        return self._clip_name(payload) is not None and self._audio_b64(payload) is not None
+
+    def redact_audio_fields(self, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {str(key): self.redact_audio_fields(child)
+                    for key, child in value.items()
+                    if str(key) not in self._AUDIO_KEYS}
+        if isinstance(value, list):
+            return [self.redact_audio_fields(child) for child in value]
+        return value
+
+    def _audio_bytes(self, payload: Mapping[str, Any], clip_name: str) -> bytes:
+        raw = self._audio_b64(payload)
+        if raw is None:
+            raise BatchPromotionError(f"{clip_name}: clip payload carried no audio bytes")
+        if raw.startswith("data:"):
+            prefix = "base64,"
+            if prefix not in raw:
+                raise BatchPromotionError(f"{clip_name}: unsupported audio data URL")
+            raw = raw.split(prefix, 1)[1]
+        try:
+            return base64.b64decode(raw, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise BatchPromotionError(f"{clip_name}: audio payload is not valid base64") from exc
+
+    def _parse_observed_at(self, observed_at: Any) -> Optional[datetime]:
+        value = self._string(observed_at)
+        if value is None:
+            return None
+        try:
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
+            return datetime.fromisoformat(value).astimezone(timezone.utc)
+        except ValueError as exc:
+            raise BatchPromotionError(f"observed_at is not RFC3339 UTC: {observed_at!r}") from exc
+
+    def _clip_candidate(self, envelope: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        clip_store, node_identity, _privacy_purge = self._modules()
+        if envelope.get("kind") != "clip":
+            return None
+        payload = self._mapping(envelope.get("payload"))
+        if payload is None:
+            return None
+        clip_name = self._clip_name(payload)
+        if clip_name is None or self._audio_b64(payload) is None:
+            return None
+        try:
+            parts = clip_store.parse_clip_name(clip_name)
+        except ValueError as exc:
+            raise BatchPromotionError(str(exc)) from exc
+        node = self._string(envelope.get("device_id")) or str(parts["node"])
+        if parts["node"] != node and node_identity.alias_of(parts["node"]) != node:
+            raise BatchPromotionError(
+                "clip name says node %r, envelope says %r" % (parts["node"], node))
+        observed = self._parse_observed_at(envelope.get("observed_at"))
+        clock = self._mapping(envelope.get("clock")) or {}
+        anchored = bool(clock.get("valid") is True and observed is not None)
+        ts_utc_s = observed.timestamp() if anchored and observed is not None else None
+        utc_us = int(round(ts_utc_s * 1_000_000.0)) if ts_utc_s is not None else 0
+        return {
+            "clip": clip_name,
+            "parts": parts,
+            "node": node,
+            "body": self._audio_bytes(payload, clip_name),
+            "clip_key": clip_store.clip_key(parts["node"], parts["boot"], parts["sample"]),
+            "dets": {
+                "utc_us": utc_us,
+                "ts_utc_s": ts_utc_s,
+                "anchored": anchored,
+                "uptime_s": payload.get("uptime_s"),
+                "fs_hz": payload.get("fs_hz"),
+                "trigger": payload.get("trigger"),
+                "clip_why": payload.get("clip_why"),
+                "dets_origin": "batch-http",
+                "record_key": payload.get("record_key"),
+            },
+        }
+
+    def _receipt_exists(self, clip_key: str) -> bool:
+        if not os.path.exists(self.audit_log):
+            return False
+        with open(self.audit_log, "r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if record.get("clip_key") == clip_key:
+                    return True
+        return False
+
+    def _store_clean_clip(self, clip: Dict[str, Any]) -> str:
+        clip_store, _node_identity, _privacy_purge = self._modules()
+        clip_store.sweep_tmp(self.pool_root, time.time())
+        day = clip_store._day(clip["dets"]["ts_utc_s"] if clip["dets"]["anchored"] else None)
+        full = clip_store.store_path(self.pool_root, day, clip["node"], clip["parts"]["basename"])
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        tmp = "%s.%d.tmp" % (full, os.getpid())
+        with open(tmp, "wb") as fh:
+            fh.write(clip["body"])
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, full)
+        return os.path.relpath(full, self.pool_root)
+
+    def ensure(self, store: "SqliteDurableRecordStore", event_id: str,
+               envelope: Mapping[str, Any]) -> StoredBatchPromotion:
+        prior = store.batch_lookup_promotion(event_id)
+        if prior is not None:
+            return prior
+        clip_store, _node_identity, privacy_purge = self._modules()
+        clip = self._clip_candidate(envelope)
+        if clip is None:
+            return store.batch_store_promotion(event_id=event_id, state="skipped",
+                                               reason="non_clip_or_no_audio_payload")
+        current = clip_store.read_index(self.pool_root).get(clip["clip_key"])
+        if current is not None and current.get("outcome") == "stored":
+            return store.batch_store_promotion(
+                event_id=event_id,
+                state="promoted",
+                clip_key=clip["clip_key"],
+                pool_path=None if current.get("path") is None else str(current.get("path")),
+                reason="already_promoted",
+            )
+        if self._receipt_exists(clip["clip_key"]):
+            return store.batch_store_promotion(
+                event_id=event_id,
+                state="purged",
+                clip_key=clip["clip_key"],
+                reason="already_purged",
+            )
+        receipt = privacy_purge.purge_wav_bytes(
+            clip["body"],
+            node=clip["node"],
+            clip=clip["parts"]["basename"],
+            vad=self._load_vad(),
+        )
+        if receipt is not None:
+            privacy_purge.append_receipt(
+                self.audit_log,
+                replace(receipt, clip_key=clip["clip_key"], clip=clip["parts"]["basename"],
+                        node=clip["node"]),
+            )
+            return store.batch_store_promotion(
+                event_id=event_id,
+                state="purged",
+                clip_key=clip["clip_key"],
+                reason=receipt.fail_closed_reason or receipt.verdict,
+            )
+        rel = self._store_clean_clip(clip)
+        current = clip_store.read_index(self.pool_root).get(clip["clip_key"])
+        if current is None or current.get("outcome") != "stored":
+            clip_store.append_index(
+                self.pool_root,
+                (
+                    clip_store.index_row(
+                        clip=clip["clip"],
+                        parts=clip["parts"],
+                        node=clip["node"],
+                        body=clip["body"],
+                        probe=clip_store.wav_probe(clip["body"]),
+                        dets=clip["dets"],
+                        path=rel,
+                        outcome="stored",
+                        fetched_at=time.time(),
+                    ),
+                ),
+            )
+        return store.batch_store_promotion(event_id=event_id, state="promoted",
+                                           clip_key=clip["clip_key"], pool_path=rel)
+
+
 class BatchIngestAdapter:
     def __init__(self, durable_store: DurableRecordStore,
                  credential_store: Optional[BatchCredentialStore],
                  *, raw_root: str = BATCH_RAW_DIR,
+                 pool_root: str = BATCH_POOL_ROOT,
                  adapter_name: str = BATCH_ADAPTER_NAME,
                  adapter_version: str = BATCH_ADAPTER_VERSION,
                  metrics: Optional[IO.IngestMetrics] = None,
                  load_error: Optional[str] = None,
-                 before_receipt_store: Optional[Callable[[], None]] = None):
+                 before_receipt_store: Optional[Callable[[], None]] = None,
+                 vad: Any = None):
         self.durable_store = durable_store
         self.credential_store = credential_store
         self.raw_root = os.path.abspath(raw_root)
+        self.promoter = BatchClipPromoter(pool_root=pool_root, vad=vad)
         self.adapter_name = adapter_name
         self.adapter_version = adapter_version
         self.metrics = metrics or IO.IngestMetrics()
@@ -1441,6 +1797,7 @@ class BatchIngestAdapter:
     def from_config(cls, durable_store: DurableRecordStore,
                     credentials_file: Optional[str],
                     *, raw_root: str = BATCH_RAW_DIR,
+                    pool_root: str = BATCH_POOL_ROOT,
                     adapter_name: str = BATCH_ADAPTER_NAME,
                     adapter_version: str = BATCH_ADAPTER_VERSION,
                     metrics: Optional[IO.IngestMetrics] = None) -> "BatchIngestAdapter":
@@ -1453,7 +1810,8 @@ class BatchIngestAdapter:
                 load_error = "HEAR_BATCH_CREDENTIALS_FILE is not configured"
         except Exception as exc:
             load_error = str(exc)
-        return cls(durable_store, creds, raw_root=raw_root, adapter_name=adapter_name,
+        return cls(durable_store, creds, raw_root=raw_root, pool_root=pool_root,
+                   adapter_name=adapter_name,
                    metrics=metrics,
                    adapter_version=adapter_version, load_error=load_error)
 
@@ -1590,6 +1948,19 @@ class BatchIngestAdapter:
             received_at=received_at,
             request_id=request_id,
         )
+        try:
+            self._promote_results(
+                store=store,
+                frame=frame,
+                raw_messages=frame.get("messages") or [],
+                results=results,
+                cred=cred,
+                received_at=received_at,
+            )
+        except Exception as exc:
+            raise ProblemDetailError(status=503, code="batch_promotion_unavailable",
+                                     detail=str(exc), retryable=True,
+                                     headers={"Retry-After": "5"}) from exc
         frame_status = "refused" if all(result.status == "deferred" for result in results) else "accepted"
         self.metrics.observe_batch_results(
             frame,
@@ -1637,6 +2008,36 @@ class BatchIngestAdapter:
     def _authenticate(self, authorization: Optional[str]) -> BatchCredential:
         assert self.credential_store is not None
         return self.credential_store.authenticate(authorization)
+
+    def promote_pending(self, limit: int = 64) -> Dict[str, int]:
+        out = {"attempted": 0, "promoted": 0, "failed": 0}
+        store = self._require_store()
+        for row in store.batch_unpromoted_events(limit):
+            out["attempted"] += 1
+            try:
+                envelope = json.loads(row.envelope_json)
+                if not isinstance(envelope, Mapping):
+                    raise BatchPromotionError(
+                        f"{row.event_id}: stored envelope is not a JSON object")
+                self.promoter.ensure(store, row.event_id, envelope)
+                if self.promoter.carries_clip_audio(envelope):
+                    self._scrub_promoted_item(
+                        store=store,
+                        event_id=row.event_id,
+                        envelope=envelope,
+                        raw_ref=row.raw_ref,
+                    )
+                    self._delete_batch_frame_refs(
+                        site_id=row.site_id,
+                        device_id=row.device_id,
+                        batch_id=row.batch_id,
+                    )
+            except Exception:
+                out["failed"] += 1
+                logger.exception("batch promotion replay failed for %s", row.event_id)
+                continue
+            out["promoted"] += 1
+        return out
 
     def _persist_items(self, *, store: "SqliteDurableRecordStore", frame: Mapping[str, Any],
                        raw_messages: Sequence[Any], provisional: Sequence[IB.ItemResult],
@@ -1703,6 +2104,123 @@ class BatchIngestAdapter:
                                              classification=seed.classification)
                 results.append(deferred)
         return results
+
+    def _promotion_envelope(self, *, item: Any, result: IB.ItemResult, frame: Mapping[str, Any],
+                            cred: BatchCredential, received_at: str) -> Mapping[str, Any]:
+        if result.classification == IB.TRANSLATED:
+            return translate_legacy_batch_item(
+                item, frame=frame, credential=cred, received_at=received_at,
+                adapter_name=self.adapter_name, adapter_version=self.adapter_version,
+                raw_ref=result.raw_ref or "",
+            )
+        if not isinstance(item, Mapping):
+            raise BatchPromotionError(
+                f"batch item {result.index} is not an object and cannot be promoted")
+        return item
+
+    def _raw_ref_path(self, raw_ref: Optional[str]) -> Optional[str]:
+        if not raw_ref:
+            return None
+        return os.path.join(self.raw_root, raw_ref)
+
+    def _batch_raw_dir(self, *, site_id: Optional[str], device_id: Optional[str],
+                       batch_id: Optional[str]) -> Optional[str]:
+        if not site_id or not device_id or not batch_id:
+            return None
+        return os.path.join(self.raw_root, "raw", site_id, device_id, batch_id)
+
+    @staticmethod
+    def _write_json(path: str, payload: Any) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, sort_keys=True, separators=(",", ":"))
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+
+    def _scrub_promoted_item(self, *, store: "SqliteDurableRecordStore", event_id: str,
+                             envelope: Mapping[str, Any], raw_ref: Optional[str]) -> None:
+        redacted = self.promoter.redact_audio_fields(envelope)
+        store.batch_update_envelope(event_id, encode_json(redacted))
+        raw_path = self._raw_ref_path(raw_ref)
+        if raw_path:
+            self._write_json(raw_path, redacted)
+
+    def _scrub_batch_frame(self, *, frame: Mapping[str, Any], site_id: str,
+                           device_id: str) -> None:
+        frame_paths = self._frame_raw_refs(
+            site_id=site_id,
+            device_id=device_id,
+            batch_id=str(frame.get("batch_id") or ""),
+        )
+        redacted = self.promoter.redact_audio_fields(frame)
+        for path in frame_paths:
+            self._write_json(path, redacted)
+
+    def _delete_batch_frame_refs(self, *, site_id: Optional[str], device_id: Optional[str],
+                                 batch_id: Optional[str]) -> None:
+        for path in self._frame_raw_refs(site_id=site_id, device_id=device_id, batch_id=batch_id):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                continue
+
+    def _frame_raw_refs(self, *, site_id: Optional[str], device_id: Optional[str],
+                        batch_id: Optional[str]) -> list[str]:
+        if not site_id or not device_id or not batch_id:
+            return []
+        root = os.path.join(self.raw_root, "raw", site_id, device_id)
+        if not os.path.isdir(root):
+            return []
+        matches: list[str] = []
+        for dirname in os.listdir(root):
+            if not dirname.startswith("frame-"):
+                continue
+            candidate = os.path.join(root, dirname)
+            if not os.path.isdir(candidate):
+                continue
+            for name in os.listdir(candidate):
+                path = os.path.join(candidate, name)
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        doc = json.load(fh)
+                except (OSError, ValueError):
+                    continue
+                if isinstance(doc, Mapping) and str(doc.get("batch_id") or "") == str(batch_id):
+                    matches.append(path)
+        return matches
+
+    def _promote_results(self, *, store: "SqliteDurableRecordStore", frame: Mapping[str, Any],
+                         raw_messages: Sequence[Any], results: Sequence[IB.ItemResult],
+                         cred: BatchCredential, received_at: str) -> None:
+        scrubbed_frame = False
+        for result in results:
+            if result.status not in ("accepted", "duplicate") or not result.event_id:
+                continue
+            envelope = self._promotion_envelope(
+                item=raw_messages[result.index],
+                result=result,
+                frame=frame,
+                cred=cred,
+                received_at=received_at,
+            )
+            self.promoter.ensure(store, result.event_id, envelope)
+            if self.promoter.carries_clip_audio(envelope):
+                self._scrub_promoted_item(
+                    store=store,
+                    event_id=result.event_id,
+                    envelope=envelope,
+                    raw_ref=result.raw_ref,
+                )
+                scrubbed_frame = True
+        if scrubbed_frame:
+            self._scrub_batch_frame(
+                frame=frame,
+                site_id=cred.site_id,
+                device_id=str(frame.get("device_id")),
+            )
 
     def _persist_translated_item(self, *, store: "SqliteDurableRecordStore",
                                  frame: Mapping[str, Any], item: Any, seed: IB.ItemResult,
@@ -2586,6 +3104,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     batch_adapter = BatchIngestAdapter.from_config(
         store.durable_store, args.batch_credentials_file, raw_root=args.batch_raw_dir,
         adapter_version=BATCH_ADAPTER_VERSION)
+    try:
+        promoted = batch_adapter.promote_pending(limit=256)
+        if promoted["attempted"]:
+            print("[hear-heartbeat] batch promotion bootstrap attempted=%d promoted=%d failed=%d"
+                  % (promoted["attempted"], promoted["promoted"], promoted["failed"]))
+    except Exception:
+        logger.exception("batch promotion bootstrap failed")
     print(f"[hear-heartbeat] Redis target configured -> {target}")
     print(f"[hear-heartbeat] durable backend={store.durable_store.backend} path={store.durable_store.path}")
     if batch_adapter.credential_store is None:

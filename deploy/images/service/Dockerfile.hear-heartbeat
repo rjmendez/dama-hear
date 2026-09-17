@@ -1,8 +1,9 @@
 # hear-heartbeat -- the Phase 1.5 pilot service image.
 #
 # The receiver that deploy/k8s/hear-heartbeat.yaml runs today from a ConfigMap `subPath` mount,
-# with `redis` pip-installed into an emptyDir at every pod start. Here both are layers: the code
-# is copied from the checkout at build time and the dependency is replayed from a hash lock.
+# with its Python closure pip-installed into an emptyDir at every pod start. Here both are
+# layers: the code is copied from the checkout at build time and the dependencies are replayed
+# from a hash lock.
 #
 # ⚠️THIS BUILDS ON hear-runtime, NOT ON AN UPSTREAM TAG. The parent arrives as a digest from
 # .github/workflows/images.yml, which builds the chain in one job and hands each child the exact
@@ -13,12 +14,9 @@
 #         --build-arg RUNTIME_IMAGE=hear-runtime:dev \
 #         --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" -t hear-heartbeat:dev .
 #
-# ⚠️A SMALL IMPORT CLOSURE AND ONE DEPENDENCY IS THE POINT. This is still the pilot because its
-# only third-party closure is `redis`, so what is being proven is the mechanism -- build,
-# provenance, cutover, rollback -- and not somebody's ability to containerise numpy. The repo
-# modules below are copied one by one so tests/test_service_images.py can prove the image and the
-# rollback ConfigMap ship the exact same code at the exact same paths. See docs/worker-packaging.md,
-# gate 1.
+# ⚠️THE ROLLBACK-ARTIFACT PARITY IS THE POINT. The repo modules below are copied one by one so
+# tests/test_service_images.py can prove the image and the rollback ConfigMap ship the exact same
+# code at the exact same paths. See docs/worker-packaging.md, gate 1.
 ARG RUNTIME_IMAGE
 FROM ${RUNTIME_IMAGE}
 
@@ -58,10 +56,18 @@ RUN pip install --require-hashes --no-deps -r /tmp/lock.txt && rm -f /tmp/lock.t
 # `hear-heartbeat-code` bundle so the image and its own rollback artifact cannot come to contain
 # different code.
 COPY hear/__init__.py /app/hear/__init__.py
+COPY hear/clips.py /app/hear/clips.py
+COPY hear/identity.py /app/hear/identity.py
 COPY hear/ingest/__init__.py /app/hear/ingest/__init__.py
 COPY hear/ingest/envelope.py /app/hear/ingest/envelope.py
 COPY hear/ingest/batch.py /app/hear/ingest/batch.py
 COPY hear/ingest/observability.py /app/hear/ingest/observability.py
+COPY hear/privacy/__init__.py /app/hear/privacy/__init__.py
+COPY hear/privacy/purge.py /app/hear/privacy/purge.py
+COPY hear/privacy/silero_vad.py /app/hear/privacy/silero_vad.py
+COPY hear/privacy/transient_tdoa.py /app/hear/privacy/transient_tdoa.py
+COPY hear/resample.py /app/hear/resample.py
+COPY hear/sketch.py /app/hear/sketch.py
 COPY tools/hear_heartbeat_receiver.py /app/tools/hear_heartbeat_receiver.py
 
 # The port the fleet POSTs to, and the one deploy/k8s/hear-heartbeat.yaml binds on the host.

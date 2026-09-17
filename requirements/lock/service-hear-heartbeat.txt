@@ -2,7 +2,7 @@
 #
 # variant:  service:hear-heartbeat
 # base:     python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285
-# input:    requirements/image-service-hear-heartbeat.txt sha256:1b96664db5150d6ab2fe20c4b14db2d68bf77090882ad491ddbf660edc034f27
+# input:    requirements/image-service-hear-heartbeat.txt sha256:3126a7ab72c1a13d40419f59175e0dbc021de41fa68c59dab31f4e8bb7aae8ba
 # platform: linux/amd64
 # pip:      26.2.1
 #
@@ -10,5 +10,15 @@
 # only replays it. Regenerate with
 #
 #     python3 deploy/images/gen_pip_lock.py service:hear-heartbeat > requirements/lock/service-hear-heartbeat.txt
+flatbuffers==25.12.19 \
+    --hash=sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4
+numpy==2.2.6 \
+    --hash=sha256:1bc23a79bfabc5d056d106f9befb8d50c31ced2fbc70eedb8155aec74a45798f
+onnxruntime==1.27.0 \
+    --hash=sha256:6872443f236a554921cda6f318c900e2d0c226792cf3534d00e5057c6926e5d2
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+protobuf==7.36.1 \
+    --hash=sha256:97198b77e369a0abd8e262b8f6c7266c55ddb796a3a12c76d7b8881188ed83aa
 redis==7.4.0 \
     --hash=sha256:a9c74a5c893a5ef8455a5adb793a31bb70feb821c86eccb62eebef5a19c429ec

@@ -20,16 +20,18 @@ ordering, gates, rollback). This directory is where the two meet, one workload a
 
 ## The pilot: `hear-heartbeat`
 
-One source file (`tools/hear_heartbeat_receiver.py`), one third-party import (`redis==7.4.0`),
-its own PVC, an HTTP health probe and a single consumer manifest. It is the pilot because it is
+One entrypoint (`tools/hear_heartbeat_receiver.py`), a small repo-file closure for clip
+promotion/privacy purge, three third-party imports (`numpy`, `onnxruntime`, `redis`), its own
+PVCs, an HTTP health probe and a single consumer manifest. It is still the pilot because it is
 the smallest instrument that can prove the whole mechanism, and because it is *not* the Phase 2
 soak artifact — `hear-mqtt-bridge` is, and a change of artifact resets that 14-day window.
 
 ```
 python:3.13-slim@sha256:9d2e555…        upstream, pinned in ../base-images.txt
   └── hear-runtime                       interpreter, nonroot uid 65532, no packages, no code
-        └── hear-heartbeat               redis==7.4.0 from the lock, the receiver at /app/tools,
-                                         USER root, ENTRYPOINT the receiver on port 5051
+        └── hear-heartbeat               numpy/onnxruntime/redis from the lock, the receiver and
+                                         promotion helpers at /app, USER root, ENTRYPOINT the
+                                         receiver on port 5051
 ```
 
 ### What the image deliberately does **not** change
@@ -43,7 +45,7 @@ python:3.13-slim@sha256:9d2e555…        upstream, pinned in ../base-images.txt
   adopting 65532 in the same change would produce a write failure at runtime, on a PVC, after
   cutover. Re-owning `/state` is a separate, per-volume change with its own proof of write.
 * **Anything else in the manifest.** `hostNetwork`, `dnsPolicy`, `hostPort` 5051, the Service,
-  all nine env vars including both `secretKeyRef`s, both probes, resources, replicas and
+  all env vars including both `secretKeyRef`s, both probes, resources, replicas and
   `strategy: Recreate` are byte-identical between `hear-heartbeat.yaml` and
   `hear-heartbeat.proposed.yaml`. That is asserted by parsing both, not by reading the diff.
 * **The ConfigMap.** `hear-heartbeat-code` stays applied, stays in `gen_configmap.BUNDLES`, and
