@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "27fc2ec078d388a4ea4697c0f85f0594c911f58c4a14a756b6fe16b05a911eba",
+  "baseline_hash": "dac2038e8ffb491ac2848dbe8ffe11908e3ff05917ce436be1606c41c84c43fc",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -289,7 +289,7 @@
     ],
     "default_board_class": "xiao-s3-pps",
     "fqbn": "esp32:esp32:XIAO_ESP32S3:PSRAM=opi",
-    "section_hash": "fe871b339088ca7888a2cdec7babdce0cee9e29b31fe3c8d4c2afc4ce2a02716",
+    "section_hash": "67078665e30681570b5d8e9f781fe410dccea4ac7469751a1ad6e8e6e746e581",
     "source_files": [
       {
         "path": ".github/workflows/firmware.yml",
@@ -323,8 +323,8 @@
       },
       {
         "path": "firmware/hear_node/hear_node.ino",
-        "sha256": "6a55d04ab19317bff274b45f04741fa7c23da68c4416d94e077625e3a9ce045e",
-        "size_bytes": 359661
+        "sha256": "37b620896f9494d53d2eb213feb31f4dd3cd6cefb4a9b5f1e39b9d1dfe2c2588",
+        "size_bytes": 375864
       },
       {
         "path": "firmware/hear_node/hear_push_payload.h",
@@ -490,13 +490,13 @@
       },
       {
         "path": "deploy/k8s/hear-heartbeat.yaml",
-        "sha256": "f9acc490f689694908a72e8c3b0d77633df24e98c3c080edb6d69be918134d8b",
-        "size_bytes": 7183
+        "sha256": "51650db38098ac506ec248fe3492385b4dd2813f5474cab8579d25d00c385e69",
+        "size_bytes": 7291
       },
       {
         "path": "deploy/k8s/hear-mqtt-bridge.yaml",
-        "sha256": "9de120f8a789d748670702960b2a0fec6b8997e87d8733e2d148ecfe6a0b518f",
-        "size_bytes": 6328
+        "sha256": "4f2f2fe19ce2abb38bcf018d073491048ab75c0cd538986718ff3e26cc0e1d3e",
+        "size_bytes": 6436
       },
       {
         "path": "deploy/k8s/hear-pool-backup.yaml",
@@ -1324,6 +1324,12 @@
               },
               {
                 "claim_name": null,
+                "mount_path": "/app/hear/ingest/clipupload.py",
+                "sub_path": "hear_ingest_clipupload.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
                 "mount_path": "/app/hear/privacy/__init__.py",
                 "sub_path": "hear_privacy__init__.py",
                 "volume_name": "code"
@@ -1542,6 +1548,12 @@
                 "claim_name": null,
                 "mount_path": "/app/hear/ingest/observability.py",
                 "sub_path": "hear_ingest_observability.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/ingest/clipupload.py",
+                "sub_path": "hear_ingest_clipupload.py",
                 "volume_name": "code"
               },
               {
@@ -2657,7 +2669,7 @@
         "storage_request": "20Gi"
       }
     ],
-    "section_hash": "83c73b7e49986cf78ce253d49d63f131df4e09809381a95f4d28c57ceae9bd45"
+    "section_hash": "2a40118d0087921c2ead0cc604b381cc0feecd744fe8a68def1674ab88e03626"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",
@@ -3981,6 +3993,12 @@
         ]
       },
       {
+        "schema": "hear.ingest.clip.v1",
+        "source_paths": [
+          "hear/ingest/clipupload.py"
+        ]
+      },
+      {
         "schema": "hear.ingest.v1",
         "source_paths": [
           "hear/ingest/envelope.py"
@@ -4050,7 +4068,7 @@
         ]
       }
     ],
-    "section_hash": "94b4918a473b1622dc555228ba2b6b6359873dd5b12e4f498fb12f3b81087221",
+    "section_hash": "093cdafddb09365291f71e7fc02ca1a9018253a9e5e9a3af0a8781ff7ada3eb9",
     "telemetry_routes": [
       {
         "http_path": "/api/hear/heartbeat",
