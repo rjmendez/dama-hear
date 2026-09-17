@@ -1,5 +1,5 @@
-# kubectl apply -f deploy/k8s/hear-mqtt-bridge-code.yaml
-# apply-mode client: 234606 B serialised; 234871 B of annotations against a 262144 B cap.
+# kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-mqtt-bridge-code.yaml
+# apply-mode server: 301371 B serialised; 301642 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,13 +8,897 @@ metadata:
   labels:
     app: hear-mqtt-bridge
   annotations:
-    dama-hear/commit: '7954906'
-    dama-hear/source-sha256: '4ea2bc6afe4c4bb2dee88968c6878ba3722aed252b874ccb981a073645930a2a'
+    dama-hear/commit: '52d8118-dirty'
+    dama-hear/source-sha256: 'faa72d60f45c40141b4795461f990335c9d7d6c2b7f51d4013a02727357b33d9'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
-    dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '234606'
+    dama-hear/apply-mode: server
+    dama-hear/serialised-bytes: '301371'
 data:
   hear__init__.py: |
+    
+  hear_sketch.py: |
+    #!/usr/bin/env python3
+    """Log-mel sketch: what a node ships instead of audio, sized to one Meshtastic packet.
+    
+    A Meshtastic payload is 237 bytes, ~200 usable after protobuf framing. The sketch is
+    MEL_BANDS x FRAMES int8 values -- 160 B at the default 20x8 -- leaving room for a header.
+    
+    WHY A SKETCH AND NOT A LEARNED EMBEDDING. A learned embedding is only as general as the classes
+    it was trained on, and it goes stale the day you add a new sound. A log-mel sketch is just a
+    coarse spectrogram: the node commits to no interpretation, and the central side can train new
+    classifiers on the same bytes forever -- gunshots today, cicadas next, whatever after. That is
+    the whole point of putting the hard maths elsewhere.
+    
+    ⚠️QUANTISATION IS PER-EVENT AND THE SCALE MUST TRAVEL. Levels span the noise floor to a clipped
+    rifle report; a fixed int8 scale would either saturate or waste its range. The reference level is
+    sent in the header so the central side can undo it. Without that the sketch carries shape but not
+    amplitude, and amplitude is the single strongest feature this project has measured.
+    """
+    from __future__ import annotations
+    
+    import math
+    import struct
+    from typing import Dict, Optional, Tuple
+    
+    import numpy as np
+    
+    MEL_BANDS = 20
+    FRAMES = 8
+    F_LO, F_HI = 300.0, 20000.0
+    HOP_S = 0.004
+    NFFT = 256
+    MESHTASTIC_PAYLOAD = 237
+    
+    # ⚠️THE BAND EDGES DEPEND ON fs AND THE FRAME COULD NOT SAY SO.
+    # `mel_filterbank` clamps its top edge to Nyquist, so 20 bands span 300 Hz-20 kHz on a 48 kHz
+    # phone and 300 Hz-7.84 kHz on a 16 kHz node. Band 12 is 4.6 kHz on one and 1.9 kHz on the other.
+    # The header carried `bands` and `frames` but never `fs`, so two frames that mean entirely
+    # different things were byte-indistinguishable -- and the whole point of the phones emitting this
+    # format is that one corpus is built from both. Four bits of the flags word now carry a sample
+    # rate code. 0 stays "unstated", which is what every frame written before this said implicitly.
+    FS_CODES = {8000.0: 1, 16000.0: 2, 22050.0: 3, 24000.0: 4, 32000.0: 5,
+                44100.0: 6, 48000.0: 7, 96000.0: 8, 192000.0: 9}
+    FS_BY_CODE = {v: k for k, v in FS_CODES.items()}
+    FS_SHIFT = 8                      # flags bits 8-11; bits 0-7 stay event flags (bit0 = retrigger)
+    FS_MASK = 0x0F
+    
+    # The event bits, named. ⚠️These are v1 positions and must be read off `event_flags` (flags &
+    # 0xFF), never off the raw word: in v2 bit 1 is a profile-id bit, so masking the raw flags tags a
+    # good v2 frame as context-starved.
+    FLAG_RETRIGGER = 0x0001
+    FLAG_NO_CONTEXT = 0x0002
+    
+    LAYOUT_NYQUIST = "nyquist"      # legacy: edges rescaled to each node's Nyquist
+    LAYOUT_FIXED = "fixed"          # edges always over [F_LO, F_HI]; bands above Nyquist go empty
+    LAYOUT_BIT = 1 << 12            # flags bit 12 set => LAYOUT_FIXED
+    
+    #: Above this rate the two layouts are IDENTICAL, because min(F_HI, fs/2*0.98) == F_HI.
+    #: Every 48 kHz sensor in this fleet is above it, so the flag changes not one byte a phone sends.
+    LAYOUT_EQUIVALENT_ABOVE_HZ = F_HI / 0.49    # 40816.3 Hz at F_HI = 20 kHz
+    
+    
+    
+    
+    def fs_code(fs: Optional[float]) -> int:
+        """Code for `fs`, or 0 when it is not one this format can name.
+    
+        0 rather than an error: an odd rate is still worth sketching, and "unstated" is an honest
+        thing for the frame to say. It is NOT the same as a stated rate, and `unpack` keeps them apart.
+        """
+        return 0 if fs is None else FS_CODES.get(float(fs), 0)
+    
+    
+    def band_edges_hz(fs: float, bands: int = MEL_BANDS,
+                      f_lo: float = F_LO, f_hi: float = F_HI,
+                      layout: str = LAYOUT_NYQUIST) -> np.ndarray:
+        """The bands+2 triangle edges this fs and layout produce. What a consumer needs to know
+        whether two frames are comparable at all."""
+        hi = f_hi if layout == LAYOUT_FIXED else min(f_hi, fs / 2.0 * 0.98)
+        return _mel_to_hz(np.linspace(_hz_to_mel(f_lo), _hz_to_mel(hi), bands + 2))
+    
+    
+    def valid_bands(fs: float, bands: int = MEL_BANDS, f_lo: float = F_LO, f_hi: float = F_HI,
+                    layout: str = LAYOUT_FIXED, strict: bool = False) -> int:
+        """How many of `bands` carry any FFT bin at this rate. Under `fixed` a slow node's top bands
+        are empty and must be MASKED, not fed to a model as if they were measurements of silence:
+        unmasked they cost 1.7 points of cross-rate AUC (0.9306 against 0.9473).
+    
+        ⚠️`strict=False` (the default, and what the 0.9473 was measured with) counts every band with
+        a bin below Nyquist, so the TOP one is partially covered and reads systematically low. That
+        band is still worth more than nothing on this corpus; `strict=True` drops it if you would
+        rather have fewer, cleaner bands."""
+        if layout == LAYOUT_NYQUIST:
+            return int(bands)
+        e = band_edges_hz(fs, bands, f_lo, f_hi, LAYOUT_FIXED)
+        nyq = fs / 2.0
+        if strict:
+            # every triangle wholly below Nyquist. Excludes the one straddling band, whose energy is
+            # systematically low because part of its passband does not exist on this node.
+            return int(sum(1 for b in range(bands) if e[b + 2] <= nyq))
+        return int(sum(1 for b in range(bands) if e[b] < nyq))
+    
+    
+    def common_bands(rates: "Sequence[float]", bands: int = MEL_BANDS, **kw) -> int:
+        """Bands usable by EVERY rate in `rates` -- the width of a matrix they can share."""
+        return min(valid_bands(float(r), bands, layout=LAYOUT_FIXED, **kw) for r in rates)
+    
+    
+    def _hz_to_mel(f):
+        return 2595.0 * np.log10(1.0 + np.asarray(f, float) / 700.0)
+    
+    
+    def _mel_to_hz(m):
+        return 700.0 * (10 ** (np.asarray(m, float) / 2595.0) - 1.0)
+    
+    
+    def mel_filterbank(fs: float, nfft: int = NFFT, bands: int = MEL_BANDS,
+                       f_lo: float = F_LO, f_hi: float = F_HI,
+                       layout: str = LAYOUT_NYQUIST) -> np.ndarray:
+        """Triangular mel bank, area-normalised.
+    
+        ⚠️`layout` DECIDES WHETHER TWO SENSORS ARE COMPARABLE AT ALL.
+    
+        `nyquist` (the shipped default) rescales the whole bank to each node's Nyquist, so band 12 is
+        5826 Hz at 48 kHz and 3072 Hz at 16 kHz. Measured on the 228 labelled events: a model trained
+        on 48 kHz sketches and applied to the same audio at 16 kHz drops from AUC 0.9634 to **0.9141**,
+        purely from the axis moving.
+    
+        `fixed` puts the edges over [f_lo, f_hi] whatever the rate. Bands whose support is wholly
+        above a node's Nyquist get no FFT bins, so their power is zero and they quantise to the floor;
+        the rest mean the same frequency everywhere. With those empty bands masked off
+        (`valid_bands`), the same cross-rate transfer is **0.9473 / 0.9485** in both directions.
+    
+        The cost, stated rather than hidden: at 16 kHz only 15 of 20 bands are usable, so a slow node
+        resolves its own spectrum more coarsely than the rescaled bank would. That is the trade -- one
+        model across the fleet, against per-node resolution.
+        """
+        if layout not in (LAYOUT_NYQUIST, LAYOUT_FIXED):
+            raise ValueError("layout must be %r or %r" % (LAYOUT_NYQUIST, LAYOUT_FIXED))
+        hi = f_hi if layout == LAYOUT_FIXED else min(f_hi, fs / 2.0 * 0.98)
+        edges = _mel_to_hz(np.linspace(_hz_to_mel(f_lo), _hz_to_mel(hi), bands + 2))
+        freqs = np.fft.rfftfreq(nfft, 1.0 / fs)
+        fb = np.zeros((bands, len(freqs)))
+        for b in range(bands):
+            lo, mid, up = edges[b], edges[b + 1], edges[b + 2]
+            if up <= lo:
+                continue
+            rise = (freqs - lo) / max(mid - lo, 1e-9)
+            fall = (up - freqs) / max(up - mid, 1e-9)
+            fb[b] = np.clip(np.minimum(rise, fall), 0.0, None)
+            s = fb[b].sum()
+            if s > 0:
+                fb[b] /= s
+        return fb
+    
+    
+    def sketch(x: np.ndarray, fs: float, bands: int = MEL_BANDS, frames: int = FRAMES,
+               hop_s: float = HOP_S, nfft: int = NFFT, f_lo: float = F_LO,
+               f_hi: float = F_HI, layout: str = LAYOUT_NYQUIST) -> Tuple[np.ndarray, float]:
+        """(int8 [bands x frames], ref_db). Frames start at the sample the caller passes as index 0.
+    
+        `layout` decides what band k MEANS -- see [mel_filterbank]. At any rate above
+        LAYOUT_EQUIVALENT_ABOVE_HZ the two are the same bytes."""
+        x = np.asarray(x, float)
+        fb = mel_filterbank(fs, nfft, bands, f_lo=f_lo, f_hi=f_hi, layout=layout)
+        hop = max(1, int(hop_s * fs))
+        win = np.hanning(nfft)
+        out = np.zeros((bands, frames))
+        for t in range(frames):
+            s = t * hop
+            seg = x[s:s + nfft]
+            if len(seg) < nfft:
+                seg = np.pad(seg, (0, nfft - len(seg)))
+            P = np.abs(np.fft.rfft(seg * win, nfft)) ** 2
+            out[:, t] = fb @ P
+        db = 10.0 * np.log10(out + 1e-12)
+        ref = float(db.max())
+        # 0.5 dB per step over a 64 dB window: enough to hold a spectrum's shape, and 64 dB is
+        # wider than the useful dynamic range between this site's noise floor and a clipped report.
+        q = np.clip(np.round((db - ref) * 2.0), -128, 127).astype(np.int8)
+        return q, ref
+    
+    
+    def pack(node_us: int, ref_db: float, peak: int, q: np.ndarray, flags: int = 0,
+             fs: Optional[float] = None, layout: str = LAYOUT_NYQUIST) -> bytes:
+        """Wire format. Header is 12 B; the sketch is bands*frames int8.
+    
+        `node_us` is microseconds within the PPS second -- the whole second comes from the mesh's own
+        clock, so the timestamp costs 4 bytes rather than 8 and still resolves to 1 us.
+    
+        `fs` is folded into flags bits 8-11 (see FS_CODES). Pass it: a frame that cannot say what its
+        bands mean is only comparable to frames from an identical node.
+        """
+        body = q.astype(np.int8).tobytes()
+        f = (int(flags) & 0xFFFF) | ((fs_code(fs) & FS_MASK) << FS_SHIFT)
+        if layout == LAYOUT_FIXED:
+            f |= LAYOUT_BIT
+        elif layout != LAYOUT_NYQUIST:
+            raise ValueError("layout must be %r or %r" % (LAYOUT_NYQUIST, LAYOUT_FIXED))
+        hdr = struct.pack("<IhHBBH", int(node_us) & 0xFFFFFFFF, int(round(ref_db * 4)),
+                          min(int(peak), 0xFFFF), q.shape[0], q.shape[1], f)
+        return hdr + body
+    
+    
+    def unpack(b: bytes) -> Dict:
+        """Decode a wire frame. Raises ValueError on anything that is not one.
+    
+        ⚠️A radio DELIVERS TRUNCATED FRAMES. This used to slice the body and reshape it, so a short
+        packet surfaced as numpy's "cannot reshape array of size 157 into shape (20,8)" from three
+        frames down the stack -- and a body that was short by a whole row of the sketch, with the
+        slice landing on a multiple of `frames`, would have reshaped CLEANLY into the wrong geometry.
+        """
+        if len(b) < 12:
+            raise ValueError("frame is %d B, shorter than the 12 B header" % len(b))
+        node_us, ref4, peak, bands, frames, flags = struct.unpack("<IhHBBH", b[:12])
+        if bands <= 0 or frames <= 0:
+            raise ValueError("header declares a %dx%d sketch" % (bands, frames))
+        want = 12 + bands * frames
+        if len(b) != want:
+            raise ValueError("frame is %d B; header declares %dx%d, so it must be %d"
+                             % (len(b), bands, frames, want))
+        q = np.frombuffer(b[12:want], dtype=np.int8).reshape(bands, frames)
+        code = (flags >> FS_SHIFT) & FS_MASK
+        fs = FS_BY_CODE.get(code)
+        layout = LAYOUT_FIXED if (flags & LAYOUT_BIT) else LAYOUT_NYQUIST
+        return {"node_us": node_us, "ref_db": ref4 / 4.0, "peak": peak,
+                "flags": flags, "event_flags": flags & 0xFF, "retrigger": bool(flags & 1),
+                "fs_code": code, "fs_hz": fs, "layout": layout,
+                # how many of this frame's bands carry a measurement. None when the rate is unstated:
+                # without it there is no way to know which bands a slow node left empty.
+                "valid_bands": None if fs is None else valid_bands(fs, bands, layout=layout),
+                # None, not a guess: two frames whose band edges are unknown must not be silently
+                # stacked into one feature matrix. See hear/corpus.py.
+                "band_edges_hz": None if fs is None else band_edges_hz(fs, bands, layout=layout),
+                "q": q, "db": q.astype(float) / 2.0 + ref4 / 4.0}
+    
+    
+    def wire_size(bands: int = MEL_BANDS, frames: int = FRAMES) -> int:
+        return 12 + bands * frames
+    
+    
+    def fits_meshtastic(bands: int = MEL_BANDS, frames: int = FRAMES, overhead: int = 37) -> bool:
+        """237 B payload minus protobuf/portnum overhead. Default 20x8 leaves headroom."""
+        return wire_size(bands, frames) <= MESHTASTIC_PAYLOAD - overhead
+    
+  hear_identity.py: |
+    #!/usr/bin/env python3
+    """What a row's `node` cell is allowed to be renamed to, and on what evidence.
+    
+        from hear import identity
+        identity.resolve("hear-5c4c94", "file")   -> ("rankine", "alias", "hear-5c4c94")
+        identity.resolve("nyquist", "file")       -> ("nyquist", "file", None)
+    
+    ⚠️THIS IS NOT A LOOSENING OF `pool._node_mismatch`. That guard exists because a row filed under
+    the wrong node is worse than a dropped one -- it puts one microphone's arrivals on another
+    microphone's position, and TDoA then solves for a source that was never there. The guard stays
+    exactly as strict. What this module adds is the ONE case the guard cannot tell apart from a
+    mis-flash and which is not one: a node that wrote rows before it had a name.
+    
+    ⚠️AN UNPROVISIONED ID IS NOT ANOTHER NODE'S NAME. firmware/hear_node/hear_node.ino:84-88 is
+    the whole mechanism:
+    
+        #ifdef NODE_ID
+          snprintf(node_id, sizeof node_id, "%s", NODE_ID);
+        #else
+          snprintf(node_id, sizeof node_id, "hear-%02x%02x%02x", m[3], m[4], m[5]);
+    
+    `NODE_ID` is a compile-time #define written by firmware/hear_node/gen_secrets.py:58, so a build
+    made before someone ran gen_secrets.py falls back to the last three bytes of that ESP32's OWN
+    MAC. `hear-5c4c94` is therefore a name no operator ever chose and no second board can answer to:
+    it is a hardware address, and the board that emitted it is by construction the board whose MAC
+    it is. Relabelling it to the name that board was later given adds no claim that its own bytes did
+    not already make. Relabelling `nyquist` to `mach` would be an entirely different act, and the
+    shape of the table below is what makes it impossible rather than merely discouraged.
+    
+    ⚠️PROVENANCE IS KEPT, NOT OVERWRITTEN. `pool._node_mismatch`'s docstring refuses to relabel
+    because "the label is evidence that a node was flashed with the wrong identity; rewriting it to
+    the fetch's name would file the rows correctly and destroy the only trace of the flashing error."
+    That objection is answered rather than waived: an aliased record carries `node_from: "alias"` and
+    `node_alias_of: "<the raw id>"`, and the ledger entry carries an `aliased` tally beside
+    `node_mismatch`. The raw id survives in the record, in the ledger and on the card. Nothing is
+    erased; the row is merely reachable.
+    
+    ⚠️THE ALIAS IS A PROPERTY OF THE IDENTITY, NOT OF THE FETCH. It is applied whether or not the
+    caller passed a `default_node`, because the alternative makes ONE detection content-address two
+    ways -- `key()` hashes the node name, so the same frame ingested by the drain (which passes a
+    node) and by `backfill` (which may not) would land twice under two names. Resolving first and
+    comparing second keeps one detection one key, and leaves the mismatch guard fully armed: an
+    aliased row still has to agree with the fetch, so `hear-5c4c94` rows appearing on MACH's card
+    would resolve to `rankine`, disagree with `mach`, and be refused exactly as before.
+    """
+    from __future__ import annotations
+    
+    import re
+    from typing import Dict, Optional, Tuple
+    
+    #: The only id shape this module will ever rename FROM: `hear-` + three MAC bytes, lower-case
+    #: hex, exactly as hear_node.ino:88 formats them. A name outside this shape is a name a human
+    #: chose, and no evidence can make one human-chosen name mean another.
+    UNPROVISIONED = re.compile(r"^hear-[0-9a-f]{6}$")
+    
+    #: raw unprovisioned id -> (the node it is, why we say so). The evidence must be checkable from
+    #: the pool and the cards; a line here is a claim about hardware, not a convenience.
+    ALIASES: Dict[str, Tuple[str, str]] = {
+        "hear-5c4c94": ("rankine", (
+            "MEASURED 2026-09-10. (a) The id matches hear_node.ino:88's unprovisioned fallback, so "
+            "it is one board's MAC tail and not a name. (b) EXCLUSIVITY: of the archived cards in "
+            "the pool's raw/ tree it appears on rankine's and only rankine's -- 23 of 23 rankine "
+            "dets archives and 13 scene archives, 0 of mach's and 0 of nyquist's; and rankine's dets "
+            "archives carry exactly two ids, `rankine` and this one. (c) INTERLEAVING: rankine's live "
+            "/dets.csv alternates the two ids across reboots within one file -- row 567 uptime 12 s "
+            "as hear-5c4c94, row 596 uptime 18 s as rankine, row 640 uptime 48 s as hear-5c4c94, row "
+            "853 uptime 15 s as rankine -- i.e. one card written by one board being reflashed on "
+            "2026-09-10, not two boards. (d) 172.16.100.50/status answers node=rankine, "
+            "class=xiao-s3-pps. The 242 rows (233 anchored, 12:58:03Z-15:57:32Z) were refused at "
+            "ingest by _node_mismatch on every one of 23 drains.")),
+    }
+    
+    
+    def _check_table() -> None:
+        """A malformed line must fail at import, not at the drain that trusts it.
+    
+        ⚠️THE SECOND ASSERT IS THE LOAD-BEARING ONE. A table that could map a provisioned name to
+        another provisioned name would be the mis-filing this whole guard exists to prevent, wearing
+        the word `alias`. Neither side of an entry may be a name a human chose: the left side must
+        match `UNPROVISIONED`, and the right side must NOT -- and no target may itself be a key, so
+        the mapping cannot chain.
+        """
+        for raw, (name, why) in ALIASES.items():
+            assert UNPROVISIONED.match(raw), (
+                "alias source %r is not an unprovisioned id -- only hear_node.ino:88's "
+                "hear-<mac tail> form may be renamed" % raw)
+            assert not UNPROVISIONED.match(name), (
+                "alias target %r is itself an unprovisioned id" % name)
+            assert name not in ALIASES, "alias target %r is itself aliased -- no chaining" % name
+            assert why and len(why) > 40, "alias %r -> %r states no evidence" % (raw, name)
+    
+    
+    _check_table()
+    
+    
+    def is_unprovisioned(node: Optional[str]) -> bool:
+        """True for an id the firmware generated for itself because no NODE_ID was compiled in."""
+        return bool(node) and bool(UNPROVISIONED.match(str(node)))
+    
+    
+    def alias_of(node: Optional[str]) -> Optional[str]:
+        """The provisioned name this raw id is known to be, or None. Never guesses from the shape.
+    
+        ⚠️Shape is necessary and NOT sufficient. An unprovisioned id with no table entry stays
+        exactly as it is and takes the mismatch guard's refusal, because `hear-` + a MAC tail says
+        which board wrote a row and says nothing whatever about which position that board stood at.
+        """
+        if not is_unprovisioned(node):
+            return None
+        hit = ALIASES.get(str(node))
+        return hit[0] if hit else None
+    
+    
+    def reason(node: Optional[str]) -> Optional[str]:
+        """The evidence recorded for this alias, for a report that has to justify a rename."""
+        hit = ALIASES.get(str(node))
+        return hit[1] if hit else None
+    
+    
+    def resolve(node: Optional[str], node_from: Optional[str]
+                ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """`(node, node_from, node_alias_of)` after any declared rename. Pure; mutates nothing.
+    
+        Returns the input unchanged when there is no alias, so a caller may apply it to every row.
+        `node_alias_of` is None unless a rename happened, and is the RAW id when one did -- the field
+        that keeps the flashing history readable after the row has been filed correctly.
+        """
+        to = alias_of(node)
+        if to is None:
+            return node, node_from, None
+        return to, "alias", str(node)
+    
+  hear_clips.py: |
+    #!/usr/bin/env python3
+    """The clip store: names off a node, WAV bytes into the pool, and one append-only index of both.
+    
+    Every node writes 5.0 s 48 kHz WAVs into /clips, a rolling window of 13 files (6,291,456 B of
+    480,044 B each) that evicts its oldest to make room. The drain fetches a clip before it rolls off,
+    and the pool holds it for identification under its own byte cap.
+    
+    WHAT THIS MODULE IS FOR, and what it deliberately is not:
+    
+      * it turns a node-supplied string into a local path, in ONE place, refusing everything else
+      * it probes the 44-byte WAV header without decoding audio, and names every way that can fail
+      * it keeps `clips/index.jsonl`, which is the record of what arrived AND of what was destroyed
+    
+    ⚠️THE INDEX IS THE DURABLE RECORD; THE AUDIO IS A CACHE. `prune()` deletes WAVs and never index
+    lines. A clip the node has already evicted cannot be re-fetched from anywhere, so the row that
+    says it existed, when, on which node and why it did not arrive is the only thing left of it.
+    
+    ⚠️IDENTITY IS THE NAME, NOT THE CONTENT. `clip_key` hashes node + boot + sample, which is unique
+    by construction and is known BEFORE the bytes are -- and skipping a fetch is the entire cost this
+    module exists to avoid. A content hash would collide two clips of the same silence and drop a
+    real timestamped event. hear/pool.py:71 solved the same problem the same way.
+    """
+    from __future__ import annotations
+    
+    from . import sketch as SK
+    
+    import hashlib
+    import json
+    import os
+    import re
+    import shutil
+    from typing import Any, Dict, Iterable, List, Optional, Tuple
+    
+    #: 3 drops `header_rate_suspect`: one clip geometry, and old clips roll off.
+    CLIP_SCHEMA_VERSION = 3
+    #: What a clip may be, as a duration: the header proves the body, not a byte count.
+    CLIP_MIN_S, CLIP_MAX_S = 0.5, 30.0
+    CLIP_PRE_S = 1.0
+    CLIP_POST_S = 4.0
+    #: The firmware writes exactly this many seconds per clip.
+    CLIP_TOTAL_S = CLIP_PRE_S + CLIP_POST_S
+    #: Slack on a header-derived duration: the header's integer rate against the node's clock.
+    CLIP_DUR_TOL = 0.02
+    CLIP_DIR = "/clips"
+    INDEX_NAME = "index.jsonl"
+    
+    #: Every terminal and non-terminal state one clip can be in. `index_row` refuses anything else --
+    #: an outcome that is not on this list cannot be counted, and an uncounted refusal is the failure
+    #: this whole lane exists to prevent.
+    OUTCOMES = ("stored", "already_held", "evicted_before_fetch", "refused_bad_body",
+                "refused_short", "refused_http", "deferred_by_cap", "refused_name",
+                "refused_node", "probed_404", "refused_store")
+    
+    #: Once an index row reaches one of these, the name is never probed again. Without it the drain
+    #: re-probes 321 already-dead nyquist names every 15 minutes forever (measured 2026-09-09).
+    #: ⚠️`probed_404` IS DELIBERATELY NOT HERE. hear_node.ino:2436 answers 404 for ANY failed
+    #: SD.open, not only for a missing file: max_files is 8 and the long-lived set reaches 6
+    #: (dets.csv + scene.csv + the open clip + /ls's directory and entry + health.csv) with
+    #: the pre-FIFO firmware's clip_evict_worse_than() taking 2 more during an eviction. One
+    #: descriptor-exhausted moment must not retire a clip that is still on the card.
+    TERMINAL_OUTCOMES = ("stored", "evicted_before_fetch")
+    
+    #: Consecutive 404s before a name is called destroyed. 2, not 1: a 404 costs ~0.1 s, so
+    #: confirming the 321 already-dead nyquist names costs one extra ~32 s pass, once.
+    CONFIRM_404 = 2
+    
+    #: ⚠️EVERY SHIPPED SHAPE. The oldest firmware wrote `<node>-<8 hex boot>-<sample>.wav`, the
+    #: priority-eviction firmware prepended `%02u-`, and the FIFO firmware writes a 12 hex boot
+    #: (6 hex boot sequence + 6 random). Older names stay on a card until they are evicted.
+    #: A node id may contain dashes: gen_secrets.py allows them and a build without NODE_ID names
+    #: itself `hear-<mac tail>` (rankine's 30 `hear-5c4c94` clips were refused as bad_name).
+    _NODE = r"[A-Za-z0-9_][A-Za-z0-9_-]*"
+    _FIFO_RE = re.compile(r"^(%s)-([0-9a-f]{12})-(\d{10})\.wav$" % _NODE)
+    _NAME_RE = re.compile(r"^(?:(\d{2})-)?(%s)-([0-9a-fA-F]+)-(\d+)\.wav$" % _NODE)
+    _MAX_BASENAME = 64
+    
+    
+    def parse_clip_name(name: str) -> Dict[str, Any]:
+        """A node-side clip path -> its parts. Raises ValueError on anything else.
+    
+        ⚠️THIS IS THE ONLY PLACE A NODE-SUPPLIED STRING BECOMES A LOCAL PATH. The dets.csv `clip`
+        column is written by firmware and read by a process with the PVC mounted; `..`, a nested
+        separator and a non-.wav suffix are all refused HERE so no caller has to remember to. Callers
+        build local paths from `basename`, never from `raw`.
+        """
+        if not isinstance(name, str):
+            raise ValueError("clip name is %r, not a string" % (name,))
+        raw = name.strip()
+        if not raw:
+            raise ValueError("empty clip name")
+        if ".." in raw:
+            raise ValueError("clip name %r contains '..'" % raw)
+        if not raw.startswith(CLIP_DIR + "/"):
+            raise ValueError("clip name %r is not under %s/" % (raw, CLIP_DIR))
+        basename = raw[len(CLIP_DIR) + 1:]
+        if "/" in basename:
+            raise ValueError("clip name %r nests below %s/" % (raw, CLIP_DIR))
+        if len(basename) > _MAX_BASENAME:
+            raise ValueError("clip basename is %d chars, over the %d cap" % (len(basename),
+                                                                            _MAX_BASENAME))
+        m = _FIFO_RE.match(basename)
+        if m:
+            prio, (node, boot, sample) = None, m.groups()
+        else:
+            m = _NAME_RE.match(basename)
+            if not m:
+                raise ValueError("clip basename %r is not <prio->?<node>-<boot>-<sample>.wav" % basename)
+            prio, node, boot, sample = m.groups()
+        return {"raw": raw, "basename": basename, "node": node, "boot": boot,
+                "sample": int(sample), "prio": None if prio is None else int(prio)}
+    
+    
+    _FIFO_TAIL_RE = re.compile(r"-([0-9a-fA-F]{12})-(\d{10})\.wav$")
+    
+    
+    def eviction_key(basename: str) -> Tuple[Any, ...]:
+        """Sort key that orders clips the way the node evicts them, oldest first.
+    
+        Mirrors firmware/hear_node/clip_order.h (tests/test_clip_eviction.py runs both on the same
+        names): any name not of the FIFO shape first, by name; then by (boot sequence, sample).
+        """
+        m = _FIFO_TAIL_RE.search(basename)
+        if m is None or m.start() == 0 or int(m.group(2)) > 0xFFFFFFFF:
+            return (0, basename)
+        return (1, int(m.group(1)[:6], 16), int(m.group(2)), basename)
+    
+    
+    def clip_key(node: str, boot: str, sample: int) -> str:
+        """The identity of one clip. Same shape as hear.pool.key(): sha256 truncated to 32 hex."""
+        h = hashlib.sha256()
+        for part in ("clip", node, boot, str(sample)):
+            h.update(part.encode())
+            h.update(b"\x1f")
+        return h.hexdigest()[:32]
+    
+    
+    def bad_name_key(node: str, raw: str) -> str:
+        """Identity for a dets cell that would not parse, so it can be counted and de-duplicated.
+    
+        It gets a key of its own rather than being dropped: a name the firmware wrote and this parser
+        refuses is a firmware/parser disagreement, and one that vanished from the census would be
+        indistinguishable from a clip that was never written.
+        """
+        h = hashlib.sha256()
+        for part in ("clip-badname", node, raw):
+            h.update(part.encode())
+            h.update(b"\x1f")
+        return h.hexdigest()[:32]
+    
+    
+    def _day(ts_utc_s: Optional[float]) -> str:
+        """UTC day partition, hear.pool._day() semantics: `unanchored` rather than a guessed day."""
+        if not ts_utc_s:
+            return "unanchored"
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(ts_utc_s, _dt.timezone.utc).strftime("%Y-%m-%d")
+    
+    
+    def clips_dir(root: str) -> str:
+        return os.path.join(root, "clips")
+    
+    
+    def store_path(root: str, day: str, node: str, basename: str) -> str:
+        return os.path.join(clips_dir(root), day, node, basename)
+    
+    
+    def index_path(root: str) -> str:
+        return os.path.join(clips_dir(root), INDEX_NAME)
+    
+    
+    def wav_probe(body: bytes) -> Dict[str, Any]:
+        """Parse the 44-byte canonical header. No audio is decoded.
+    
+        The rate is REPORTED, not required; whether it is usable is the tagger's decision, not the
+        store's.
+        """
+        out: Dict[str, Any] = {"ok": False, "reason": None, "fs_hz": None, "channels": None,
+                               "bits": None, "data_bytes": None, "total_bytes": len(body), "dur_s": None, "fs_nameable": None}
+        if len(body) < 44:
+            out["reason"] = "header_short_%d" % len(body)
+            return out
+        if body[0:4] != b"RIFF":
+            out["reason"] = "not_riff"
+            return out
+        if body[8:12] != b"WAVE":
+            out["reason"] = "not_wave"
+            return out
+        if body[12:16] != b"fmt ":
+            out["reason"] = "no_fmt_chunk"
+            return out
+        fmt = int.from_bytes(body[20:22], "little")
+        out["channels"] = int.from_bytes(body[22:24], "little")
+        out["fs_hz"] = int.from_bytes(body[24:28], "little")
+        out["bits"] = int.from_bytes(body[34:36], "little")
+        if body[36:40] != b"data":
+            out["reason"] = "no_data_chunk"
+            return out
+        out["data_bytes"] = int.from_bytes(body[40:44], "little")
+        if fmt != 1:
+            out["reason"] = "audio_format_%d" % fmt
+            return out
+        if out["channels"] != 1:
+            out["reason"] = "channels_%d" % out["channels"]
+            return out
+        if out["bits"] != 16:
+            out["reason"] = "bits_%d" % out["bits"]
+            return out
+        if 44 + out["data_bytes"] != len(body):
+            out["reason"] = "data_len_%d_body_%d" % (out["data_bytes"], len(body))
+            return out
+        # ⚠️THE HEADER ALREADY PROVED THE BODY. `44 + data_bytes == len(body)` above catches a
+        # truncated or padded fetch, so what is left to check is whether this is a PLAUSIBLE CLIP --
+        # a question about duration and rate, not about one firmware's byte count.
+        # A rate this format cannot name is reported, not refused: `fs_nameable` travels with the row
+        # and the tagger decides, the same rule the index follows by carrying both the header rate and
+        # the dets rate.
+        if not out["fs_hz"]:
+            out["reason"] = "fs_zero"
+            return out
+        out["fs_nameable"] = SK.fs_code(float(out["fs_hz"])) != 0
+        out["dur_s"] = out["data_bytes"] / float(out["fs_hz"] * 2)
+        if not (CLIP_MIN_S <= out["dur_s"] <= CLIP_MAX_S):
+            out["reason"] = "duration_%.3f_s_outside_%.1f_%.1f" % (out["dur_s"], CLIP_MIN_S, CLIP_MAX_S)
+            return out
+        out["ok"] = True
+        return out
+    
+    
+    def index_row(*, clip: str, parts: Optional[Dict[str, Any]], node: str, body: Optional[bytes],
+                  probe: Optional[Dict[str, Any]], dets: Dict[str, Any], path: Optional[str],
+                  outcome: str, fetched_at: float, reason: Optional[str] = None,
+                  probe_404s: int = 0) -> Dict[str, Any]:
+        """One index line.
+    
+        ⚠️IT NEVER INVENTS A TIME. Every time field is copied from the parent dets row or left None,
+        and `t_start/t_end` are null for an unanchored clip rather than derived from `fetched_at`.
+        They exist at all so no consumer re-derives CLIP_PRE_SAMPLES for itself.
+    
+        `fs_hz` and `wav_header_fs_hz` travel side by side, so a disagreement between them is visible.
+        """
+        if outcome not in OUTCOMES:
+            raise ValueError("unknown clip outcome %r; known: %s" % (outcome, ", ".join(OUTCOMES)))
+        ts = dets.get("ts_utc_s")
+        anchored = bool(dets.get("anchored"))
+        row: Dict[str, Any] = {
+            "schema_version": CLIP_SCHEMA_VERSION,
+            "clip_key": (clip_key(parts["node"], parts["boot"], parts["sample"]) if parts
+                         else bad_name_key(node, clip)),
+            "clip": clip,
+            "basename": parts["basename"] if parts else None,
+            "node": node,
+            "boot": parts["boot"] if parts else None,
+            "sample": parts["sample"] if parts else None,
+            "prio": parts["prio"] if parts else None,
+            "outcome": outcome,
+            "reason": reason,
+            "path": path,
+            "bytes": len(body) if body is not None else None,
+            "sha256": hashlib.sha256(body).hexdigest() if body is not None else None,
+            "utc_us": dets.get("utc_us"),
+            "ts_utc_s": ts,
+            "anchored": anchored,
+            "t_start_utc_s": (ts - CLIP_PRE_S) if (anchored and ts) else None,
+            "t_end_utc_s": (ts + CLIP_POST_S) if (anchored and ts) else None,
+            "uptime_s": dets.get("uptime_s"),
+            "fs_hz": dets.get("fs_hz"),
+            "wav_header_fs_hz": (probe or {}).get("fs_hz"),
+            "dur_s": (probe or {}).get("dur_s"),
+            "trigger": dets.get("trigger"),
+            "clip_why": dets.get("clip_why"),
+            "dets_origin": dets.get("dets_origin"),
+            "record_key": dets.get("record_key"),
+            "fetched_at": fetched_at,
+            "probe_404s": probe_404s,
+        }
+        return row
+    
+    
+    def read_index(root: str) -> Dict[str, Dict[str, Any]]:
+        """clip_key -> the LAST line for that key. One pass, the way Pool.keys() does it.
+    
+        An unreadable line is skipped rather than fatal: the index is append-only and a torn tail
+        from a killed pod must not make the whole negative cache unreadable, which would re-probe
+        every dead name on the card.
+        """
+        p = index_path(root)
+        out: Dict[str, Dict[str, Any]] = {}
+        if not os.path.exists(p):
+            return out
+        with open(p, "r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                k = row.get("clip_key")
+                if isinstance(k, str):
+                    out[k] = row
+        return out
+    
+    
+    def read_outcomes(root: str) -> Dict[str, Dict[str, Any]]:
+        """clip_key -> just the two fields the negative cache needs. The SAME last-line-wins pass as
+        `read_index`, at a measured 191 B resident per key against that function's 3,096 B.
+    
+        ⚠️THE DRAIN MUST NOT MATERIALISE THE WHOLE INDEX. The index is append-only and never
+        compacted; at the spec's 1,109 clips/day the full-row dict reaches the drain container's
+        512Mi limit in ~152 days and the drain then OOMKills, which returns the fleet to destroying
+        every clip. The same walk at 191 B/key is ~7 years, and nothing here reads a field the
+        dispatch loop does not use.
+        """
+        p = index_path(root)
+        out: Dict[str, Dict[str, Any]] = {}
+        if not os.path.exists(p):
+            return out
+        with open(p, "r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                k = row.get("clip_key")
+                if isinstance(k, str):
+                    out[k] = {"outcome": row.get("outcome"), "probe_404s": row.get("probe_404s") or 0}
+        return out
+    
+    
+    def rows_for_basenames(root: str, names) -> Dict[str, Dict[str, Any]]:
+        """basename -> its LAST index row, for the given basenames only.
+    
+        Same reason as `read_outcomes`: `prune` needs whole rows, but only for the handful of files it
+        actually deleted, so it streams the index rather than holding all of it.
+        """
+        want = set(names)
+        out: Dict[str, Dict[str, Any]] = {}
+        p = index_path(root)
+        if not want or not os.path.exists(p):
+            return out
+        with open(p, "r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                b = row.get("basename")
+                if b in want:
+                    out[b] = row
+        return out
+    
+    
+    def append_index(root: str, rows: Iterable[Dict[str, Any]]) -> int:
+        p = index_path(root)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        n = 0
+        with open(p, "a") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, sort_keys=True) + "\n")
+                n += 1
+        return n
+    
+    
+    def _audio_files(root: str) -> List[Dict[str, Any]]:
+        """Every stored WAV under clips/<day>/<node>/, with its day, node and size."""
+        base = clips_dir(root)
+        out: List[Dict[str, Any]] = []
+        if not os.path.isdir(base):
+            return out
+        for day in sorted(os.listdir(base)):
+            d = os.path.join(base, day)
+            if not os.path.isdir(d):
+                continue
+            for node in sorted(os.listdir(d)):
+                nd = os.path.join(d, node)
+                if not os.path.isdir(nd):
+                    continue
+                for fn in sorted(os.listdir(nd)):
+                    if not fn.endswith(".wav"):
+                        continue
+                    p = os.path.join(nd, fn)
+                    try:
+                        st = os.stat(p)
+                    except OSError:
+                        continue
+                    out.append({"day": day, "node": node, "basename": fn, "path": p,
+                                "bytes": st.st_size, "mtime": st.st_mtime})
+        return out
+    
+    
+    def sweep_tmp(root: str, now: float, older_than_s: float = 900.0) -> Dict[str, Any]:
+        """Delete abandoned `*.tmp` part-files under clips/<day>/<node>/.
+    
+        ⚠️`_audio_files` FILTERS ON `.wav`, SO A `.wav.<pid>.tmp` IS INVISIBLE TO THE CAP. A pod
+        killed by `activeDeadlineSeconds: 780` mid-write leaks up to 480044 B per node per run onto a
+        5Gi PVC that nothing else would ever reclaim. `older_than_s` is one drain interval, and the
+        pid in the name means a live writer's file is never the one being swept.
+        """
+        base = clips_dir(root)
+        out: Dict[str, Any] = {"tmp_deleted": 0, "tmp_bytes": 0}
+        if not os.path.isdir(base):
+            return out
+        for day in sorted(os.listdir(base)):
+            d = os.path.join(base, day)
+            if not os.path.isdir(d):
+                continue
+            for node in sorted(os.listdir(d)):
+                nd = os.path.join(d, node)
+                if not os.path.isdir(nd):
+                    continue
+                for fn in sorted(os.listdir(nd)):
+                    if not fn.endswith(".tmp"):
+                        continue
+                    p = os.path.join(nd, fn)
+                    try:
+                        st = os.stat(p)
+                        if now - st.st_mtime < older_than_s:
+                            continue
+                        os.remove(p)
+                    except OSError:
+                        continue
+                    out["tmp_deleted"] += 1
+                    out["tmp_bytes"] += st.st_size
+        return out
+    
+    
+    def audio_bytes(root: str) -> int:
+        return sum(f["bytes"] for f in _audio_files(root))
+    
+    
+    def _day_order(day: str) -> tuple:
+        """Oldest UTC day first. `unanchored` sorts LAST because it has no day to compare and any
+        ordering imposed on it would be a guess presented as a measurement."""
+        return (1, "") if day == "unanchored" else (0, day)
+    
+    
+    def _prune_order(f: Dict[str, Any]) -> tuple:
+        """Deletion order: `unanchored` FIRST, by file mtime, then the dated days oldest first.
+    
+        ⚠️THE OPPOSITE OF `_day_order`, AND DELIBERATELY. An anchored clip carries utc_us,
+        t_start/t_end and a record_key that joins it to its sketch and its scene rows; an unanchored
+        one carries none of that and joins to nothing. Sorting unanchored last paid the whole cap out
+        of the joinable clips and protected the ones with the least recoverable context. Within
+        `unanchored` the order is mtime -- a measured arrival time, not a day guessed from nothing.
+        """
+        if f["day"] == "unanchored":
+            return (0, f["mtime"], f["node"], f["basename"])
+        return (1, f["day"], f["node"], f["basename"])
+    
+    
+    def prune(root: str, max_bytes: int, now: float) -> Dict[str, Any]:
+        """Delete whole WAV files, `unanchored` first and then oldest UTC day, until the audio tree
+        is at or under max_bytes. Abandoned `*.tmp` part-files are swept on every call, cap or no cap.
+    
+        ⚠️AUDIO IS THE ONLY PRUNABLE THING. The index row survives and gains `audio_pruned_at`, which
+        is appended as a new line (the index is append-only and `read_index` keeps the last line per
+        key) rather than rewritten in place. The row's outcome stays `stored`, so a pruned clip is
+        still never re-probed: the node destroyed it long ago and the 404 would cost a request to
+        learn nothing.
+        """
+        files = _audio_files(root)
+        before = sum(f["bytes"] for f in files)
+        out: Dict[str, Any] = {"bytes_before": before, "bytes_after": before,
+                               "files_deleted": 0, "days_touched": []}
+        out.update(sweep_tmp(root, now))
+        if max_bytes is None or before <= max_bytes:
+            return out
+        files.sort(key=_prune_order)
+        running, deleted, days, gone = before, 0, [], []
+        for f in files:
+            if running <= max_bytes:
+                break
+            try:
+                os.remove(f["path"])
+            except OSError:
+                continue
+            running -= f["bytes"]
+            deleted += 1
+            if f["day"] not in days:
+                days.append(f["day"])
+            gone.append(f["basename"])
+        rows = []
+        for row in rows_for_basenames(root, gone).values():
+            r = dict(row)
+            r["audio_pruned_at"] = now
+            rows.append(r)
+        if rows:
+            append_index(root, rows)
+        out["bytes_after"] = running
+        out["files_deleted"] = deleted
+        out["days_touched"] = days
+        return out
+    
+    
+    def free_bytes(root: str) -> int:
+        """Free bytes on the filesystem holding the pool. The clip lane refuses to fill a PVC."""
+        os.makedirs(root, exist_ok=True)
+        return shutil.disk_usage(root).free
     
   hear_ingest__init__.py: |
     from . import envelope  # noqa: F401
@@ -1686,6 +2570,8 @@ data:
     from __future__ import annotations
     
     import argparse
+    import base64
+    import binascii
     import hashlib
     import json
     import logging
@@ -1699,7 +2585,7 @@ data:
     import time
     import uuid
     from contextlib import contextmanager
-    from dataclasses import dataclass
+    from dataclasses import dataclass, replace
     from datetime import datetime, timedelta, timezone
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from typing import Any, Callable, Dict, Mapping, Optional, Sequence
@@ -1720,6 +2606,7 @@ data:
     AUTH_TOKEN = os.environ.get("HEAR_HEARTBEAT_TOKEN")
     BATCH_CREDENTIALS_FILE = os.environ.get("HEAR_BATCH_CREDENTIALS_FILE")
     BATCH_RAW_DIR = os.environ.get("HEAR_BATCH_RAW_DIR", "/state/ingest-batch/raw")
+    BATCH_POOL_ROOT = os.environ.get("HEAR_BATCH_POOL_ROOT", "/pool/corpus")
     BATCH_ROUTE = "/v1/ingest/batches"
     BATCH_ALIAS_ROUTE = "/ingest/batch"
     BATCH_ADAPTER_NAME = "ingest-batch"
@@ -1836,6 +2723,10 @@ data:
         """The durable ledger could not record or replay a record."""
     
     
+    class BatchPromotionError(RuntimeError):
+        """The shared corpus promotion step could not safely complete."""
+    
+    
     @dataclass(frozen=True)
     class BatchCredential:
         principal_id: str
@@ -1860,6 +2751,25 @@ data:
         response_status: int
         response_body: str
         request_id: str
+    
+    
+    @dataclass(frozen=True)
+    class StoredBatchPromotion:
+        event_id: str
+        state: str
+        clip_key: Optional[str]
+        pool_path: Optional[str]
+        reason: Optional[str]
+    
+    
+    @dataclass(frozen=True)
+    class PendingBatchPromotion:
+        event_id: str
+        envelope_json: str
+        raw_ref: Optional[str]
+        batch_id: str
+        site_id: str
+        device_id: str
     
     
     @dataclass(frozen=True)
@@ -2227,6 +3137,24 @@ data:
                     "CREATE INDEX IF NOT EXISTS batch_refusals_lookup "
                     "ON batch_refusals(site_id, device_id, received_at)"
                 )
+                con.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS batch_promotions (
+                        event_id TEXT PRIMARY KEY,
+                        state TEXT NOT NULL CHECK (state IN ('promoted', 'purged', 'skipped')),
+                        clip_key TEXT,
+                        pool_path TEXT,
+                        reason TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY(event_id) REFERENCES batch_events(event_id)
+                    )
+                    """
+                )
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS batch_promotions_state_updated "
+                    "ON batch_promotions(state, updated_at, event_id)"
+                )
             self._migrate_record_uids()
     
         def _migrate_record_uids(self) -> None:
@@ -2593,6 +3521,68 @@ data:
                     (idempotency_scope, request_fingerprint, response_status, response_body,
                      site_id, principal_id, batch_id, request_id, utc_now()),
                 )
+    
+        def batch_lookup_promotion(self, event_id: str) -> Optional[StoredBatchPromotion]:
+            with self._lock, self._reading() as con:
+                row = con.execute(
+                    "SELECT event_id, state, clip_key, pool_path, reason "
+                    "FROM batch_promotions WHERE event_id = ?",
+                    (event_id,),
+                ).fetchone()
+            if row is None:
+                return None
+            return StoredBatchPromotion(str(row["event_id"]), str(row["state"]),
+                                        None if row["clip_key"] is None else str(row["clip_key"]),
+                                        None if row["pool_path"] is None else str(row["pool_path"]),
+                                        None if row["reason"] is None else str(row["reason"]))
+    
+        def batch_store_promotion(self, *, event_id: str, state: str,
+                                  clip_key: Optional[str] = None,
+                                  pool_path: Optional[str] = None,
+                                  reason: Optional[str] = None) -> StoredBatchPromotion:
+            now = utc_now()
+            with self._lock, self._transaction() as con:
+                con.execute(
+                    """
+                    INSERT INTO batch_promotions
+                    (event_id, state, clip_key, pool_path, reason, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(event_id) DO UPDATE SET
+                        state = excluded.state,
+                        clip_key = excluded.clip_key,
+                        pool_path = excluded.pool_path,
+                        reason = excluded.reason,
+                        updated_at = excluded.updated_at
+                    """,
+                    (event_id, state, clip_key, pool_path, reason, now, now),
+                )
+            return StoredBatchPromotion(event_id, state, clip_key, pool_path, reason)
+    
+        def batch_unpromoted_events(self, limit: int = 64) -> list[PendingBatchPromotion]:
+            if limit <= 0:
+                return []
+            with self._lock, self._reading() as con:
+                rows = con.execute(
+                    """
+                    SELECT e.event_id, e.envelope_json, e.raw_ref, e.batch_id, e.site_id, e.device_id
+                    FROM batch_events e
+                    LEFT JOIN batch_promotions p ON p.event_id = e.event_id
+                    WHERE p.event_id IS NULL
+                    ORDER BY e.received_at, e.item_index, e.event_id
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                ).fetchall()
+            return [PendingBatchPromotion(str(row["event_id"]), str(row["envelope_json"]),
+                                          None if row["raw_ref"] is None else str(row["raw_ref"]),
+                                          str(row["batch_id"]), str(row["site_id"]),
+                                          str(row["device_id"]))
+                    for row in rows]
+    
+        def batch_update_envelope(self, event_id: str, envelope_json: str) -> None:
+            with self._lock, self._transaction() as con:
+                con.execute("UPDATE batch_events SET envelope_json = ? WHERE event_id = ?",
+                            (envelope_json, event_id))
     
         def batch_persist_event(self, event_id: str, site_id: str, device_id: str, source: str,
                                 kind: str, observed_at: Optional[str], received_at: str,
@@ -3097,18 +4087,268 @@ data:
             return cred
     
     
+    class BatchClipPromoter:
+        _AUDIO_KEYS = ("wav_b64", "audio_wav_b64", "clip_wav_b64", "audio_b64")
+        _CLIP_KEYS = ("clip", "clip_path", "clip_name")
+    
+        def __init__(self, *, pool_root: str = BATCH_POOL_ROOT,
+                     audit_log: Optional[str] = None, vad: Any = None):
+            self.pool_root = os.path.abspath(pool_root)
+            self.audit_log = audit_log or os.path.join(self.pool_root, "clips", "vad_purge.jsonl")
+            self._vad = vad
+    
+        def _modules(self):
+            from hear import clips as clip_store
+            from hear import identity as node_identity
+            from hear.privacy import purge as privacy_purge
+            return clip_store, node_identity, privacy_purge
+    
+        def _load_vad(self) -> Any:
+            if self._vad is not None:
+                return self._vad
+            _clip_store, _node_identity, privacy_purge = self._modules()
+            self._vad = privacy_purge.load_vad("auto")
+            return self._vad
+    
+        @staticmethod
+        def _mapping(value: Any) -> Optional[Mapping[str, Any]]:
+            return value if isinstance(value, Mapping) else None
+    
+        @staticmethod
+        def _string(value: Any) -> Optional[str]:
+            if not isinstance(value, str):
+                return None
+            value = value.strip()
+            return value or None
+    
+        def _clip_name(self, payload: Mapping[str, Any]) -> Optional[str]:
+            clip_store, _node_identity, _privacy_purge = self._modules()
+            for key in self._CLIP_KEYS:
+                got = self._string(payload.get(key))
+                if got:
+                    return got
+            got = self._string(payload.get("clip_basename"))
+            if got:
+                return clip_store.CLIP_DIR + "/" + got
+            for nested_key in ("event", "legacy", "clip"):
+                nested = self._mapping(payload.get(nested_key))
+                if nested is None:
+                    continue
+                got = self._clip_name(nested)
+                if got:
+                    return got
+            return None
+    
+        def _audio_b64(self, payload: Mapping[str, Any]) -> Optional[str]:
+            for key in self._AUDIO_KEYS:
+                got = self._string(payload.get(key))
+                if got:
+                    return got
+            for nested_key in ("event", "legacy", "clip"):
+                nested = self._mapping(payload.get(nested_key))
+                if nested is None:
+                    continue
+                got = self._audio_b64(nested)
+                if got:
+                    return got
+            return None
+    
+        def carries_clip_audio(self, envelope: Mapping[str, Any]) -> bool:
+            if envelope.get("kind") != "clip":
+                return False
+            payload = self._mapping(envelope.get("payload"))
+            if payload is None:
+                return False
+            return self._clip_name(payload) is not None and self._audio_b64(payload) is not None
+    
+        def redact_audio_fields(self, value: Any) -> Any:
+            if isinstance(value, Mapping):
+                return {str(key): self.redact_audio_fields(child)
+                        for key, child in value.items()
+                        if str(key) not in self._AUDIO_KEYS}
+            if isinstance(value, list):
+                return [self.redact_audio_fields(child) for child in value]
+            return value
+    
+        def _audio_bytes(self, payload: Mapping[str, Any], clip_name: str) -> bytes:
+            raw = self._audio_b64(payload)
+            if raw is None:
+                raise BatchPromotionError(f"{clip_name}: clip payload carried no audio bytes")
+            if raw.startswith("data:"):
+                prefix = "base64,"
+                if prefix not in raw:
+                    raise BatchPromotionError(f"{clip_name}: unsupported audio data URL")
+                raw = raw.split(prefix, 1)[1]
+            try:
+                return base64.b64decode(raw, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise BatchPromotionError(f"{clip_name}: audio payload is not valid base64") from exc
+    
+        def _parse_observed_at(self, observed_at: Any) -> Optional[datetime]:
+            value = self._string(observed_at)
+            if value is None:
+                return None
+            try:
+                if value.endswith("Z"):
+                    value = value[:-1] + "+00:00"
+                return datetime.fromisoformat(value).astimezone(timezone.utc)
+            except ValueError as exc:
+                raise BatchPromotionError(f"observed_at is not RFC3339 UTC: {observed_at!r}") from exc
+    
+        def _clip_candidate(self, envelope: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+            clip_store, node_identity, _privacy_purge = self._modules()
+            if envelope.get("kind") != "clip":
+                return None
+            payload = self._mapping(envelope.get("payload"))
+            if payload is None:
+                return None
+            clip_name = self._clip_name(payload)
+            if clip_name is None or self._audio_b64(payload) is None:
+                return None
+            try:
+                parts = clip_store.parse_clip_name(clip_name)
+            except ValueError as exc:
+                raise BatchPromotionError(str(exc)) from exc
+            node = self._string(envelope.get("device_id")) or str(parts["node"])
+            if parts["node"] != node and node_identity.alias_of(parts["node"]) != node:
+                raise BatchPromotionError(
+                    "clip name says node %r, envelope says %r" % (parts["node"], node))
+            observed = self._parse_observed_at(envelope.get("observed_at"))
+            clock = self._mapping(envelope.get("clock")) or {}
+            anchored = bool(clock.get("valid") is True and observed is not None)
+            ts_utc_s = observed.timestamp() if anchored and observed is not None else None
+            utc_us = int(round(ts_utc_s * 1_000_000.0)) if ts_utc_s is not None else 0
+            return {
+                "clip": clip_name,
+                "parts": parts,
+                "node": node,
+                "body": self._audio_bytes(payload, clip_name),
+                "clip_key": clip_store.clip_key(parts["node"], parts["boot"], parts["sample"]),
+                "dets": {
+                    "utc_us": utc_us,
+                    "ts_utc_s": ts_utc_s,
+                    "anchored": anchored,
+                    "uptime_s": payload.get("uptime_s"),
+                    "fs_hz": payload.get("fs_hz"),
+                    "trigger": payload.get("trigger"),
+                    "clip_why": payload.get("clip_why"),
+                    "dets_origin": "batch-http",
+                    "record_key": payload.get("record_key"),
+                },
+            }
+    
+        def _receipt_exists(self, clip_key: str) -> bool:
+            if not os.path.exists(self.audit_log):
+                return False
+            with open(self.audit_log, "r", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue
+                    if record.get("clip_key") == clip_key:
+                        return True
+            return False
+    
+        def _store_clean_clip(self, clip: Dict[str, Any]) -> str:
+            clip_store, _node_identity, _privacy_purge = self._modules()
+            clip_store.sweep_tmp(self.pool_root, time.time())
+            day = clip_store._day(clip["dets"]["ts_utc_s"] if clip["dets"]["anchored"] else None)
+            full = clip_store.store_path(self.pool_root, day, clip["node"], clip["parts"]["basename"])
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            tmp = "%s.%d.tmp" % (full, os.getpid())
+            with open(tmp, "wb") as fh:
+                fh.write(clip["body"])
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, full)
+            return os.path.relpath(full, self.pool_root)
+    
+        def ensure(self, store: "SqliteDurableRecordStore", event_id: str,
+                   envelope: Mapping[str, Any]) -> StoredBatchPromotion:
+            prior = store.batch_lookup_promotion(event_id)
+            if prior is not None:
+                return prior
+            clip_store, _node_identity, privacy_purge = self._modules()
+            clip = self._clip_candidate(envelope)
+            if clip is None:
+                return store.batch_store_promotion(event_id=event_id, state="skipped",
+                                                   reason="non_clip_or_no_audio_payload")
+            current = clip_store.read_index(self.pool_root).get(clip["clip_key"])
+            if current is not None and current.get("outcome") == "stored":
+                return store.batch_store_promotion(
+                    event_id=event_id,
+                    state="promoted",
+                    clip_key=clip["clip_key"],
+                    pool_path=None if current.get("path") is None else str(current.get("path")),
+                    reason="already_promoted",
+                )
+            if self._receipt_exists(clip["clip_key"]):
+                return store.batch_store_promotion(
+                    event_id=event_id,
+                    state="purged",
+                    clip_key=clip["clip_key"],
+                    reason="already_purged",
+                )
+            receipt = privacy_purge.purge_wav_bytes(
+                clip["body"],
+                node=clip["node"],
+                clip=clip["parts"]["basename"],
+                vad=self._load_vad(),
+            )
+            if receipt is not None:
+                privacy_purge.append_receipt(
+                    self.audit_log,
+                    replace(receipt, clip_key=clip["clip_key"], clip=clip["parts"]["basename"],
+                            node=clip["node"]),
+                )
+                return store.batch_store_promotion(
+                    event_id=event_id,
+                    state="purged",
+                    clip_key=clip["clip_key"],
+                    reason=receipt.fail_closed_reason or receipt.verdict,
+                )
+            rel = self._store_clean_clip(clip)
+            current = clip_store.read_index(self.pool_root).get(clip["clip_key"])
+            if current is None or current.get("outcome") != "stored":
+                clip_store.append_index(
+                    self.pool_root,
+                    (
+                        clip_store.index_row(
+                            clip=clip["clip"],
+                            parts=clip["parts"],
+                            node=clip["node"],
+                            body=clip["body"],
+                            probe=clip_store.wav_probe(clip["body"]),
+                            dets=clip["dets"],
+                            path=rel,
+                            outcome="stored",
+                            fetched_at=time.time(),
+                        ),
+                    ),
+                )
+            return store.batch_store_promotion(event_id=event_id, state="promoted",
+                                               clip_key=clip["clip_key"], pool_path=rel)
+    
+    
     class BatchIngestAdapter:
         def __init__(self, durable_store: DurableRecordStore,
                      credential_store: Optional[BatchCredentialStore],
                      *, raw_root: str = BATCH_RAW_DIR,
+                     pool_root: str = BATCH_POOL_ROOT,
                      adapter_name: str = BATCH_ADAPTER_NAME,
                      adapter_version: str = BATCH_ADAPTER_VERSION,
                      metrics: Optional[IO.IngestMetrics] = None,
                      load_error: Optional[str] = None,
-                     before_receipt_store: Optional[Callable[[], None]] = None):
+                     before_receipt_store: Optional[Callable[[], None]] = None,
+                     vad: Any = None):
             self.durable_store = durable_store
             self.credential_store = credential_store
             self.raw_root = os.path.abspath(raw_root)
+            self.promoter = BatchClipPromoter(pool_root=pool_root, vad=vad)
             self.adapter_name = adapter_name
             self.adapter_version = adapter_version
             self.metrics = metrics or IO.IngestMetrics()
@@ -3119,6 +4359,7 @@ data:
         def from_config(cls, durable_store: DurableRecordStore,
                         credentials_file: Optional[str],
                         *, raw_root: str = BATCH_RAW_DIR,
+                        pool_root: str = BATCH_POOL_ROOT,
                         adapter_name: str = BATCH_ADAPTER_NAME,
                         adapter_version: str = BATCH_ADAPTER_VERSION,
                         metrics: Optional[IO.IngestMetrics] = None) -> "BatchIngestAdapter":
@@ -3131,7 +4372,8 @@ data:
                     load_error = "HEAR_BATCH_CREDENTIALS_FILE is not configured"
             except Exception as exc:
                 load_error = str(exc)
-            return cls(durable_store, creds, raw_root=raw_root, adapter_name=adapter_name,
+            return cls(durable_store, creds, raw_root=raw_root, pool_root=pool_root,
+                       adapter_name=adapter_name,
                        metrics=metrics,
                        adapter_version=adapter_version, load_error=load_error)
     
@@ -3268,6 +4510,19 @@ data:
                 received_at=received_at,
                 request_id=request_id,
             )
+            try:
+                self._promote_results(
+                    store=store,
+                    frame=frame,
+                    raw_messages=frame.get("messages") or [],
+                    results=results,
+                    cred=cred,
+                    received_at=received_at,
+                )
+            except Exception as exc:
+                raise ProblemDetailError(status=503, code="batch_promotion_unavailable",
+                                         detail=str(exc), retryable=True,
+                                         headers={"Retry-After": "5"}) from exc
             frame_status = "refused" if all(result.status == "deferred" for result in results) else "accepted"
             self.metrics.observe_batch_results(
                 frame,
@@ -3315,6 +4570,36 @@ data:
         def _authenticate(self, authorization: Optional[str]) -> BatchCredential:
             assert self.credential_store is not None
             return self.credential_store.authenticate(authorization)
+    
+        def promote_pending(self, limit: int = 64) -> Dict[str, int]:
+            out = {"attempted": 0, "promoted": 0, "failed": 0}
+            store = self._require_store()
+            for row in store.batch_unpromoted_events(limit):
+                out["attempted"] += 1
+                try:
+                    envelope = json.loads(row.envelope_json)
+                    if not isinstance(envelope, Mapping):
+                        raise BatchPromotionError(
+                            f"{row.event_id}: stored envelope is not a JSON object")
+                    self.promoter.ensure(store, row.event_id, envelope)
+                    if self.promoter.carries_clip_audio(envelope):
+                        self._scrub_promoted_item(
+                            store=store,
+                            event_id=row.event_id,
+                            envelope=envelope,
+                            raw_ref=row.raw_ref,
+                        )
+                        self._delete_batch_frame_refs(
+                            site_id=row.site_id,
+                            device_id=row.device_id,
+                            batch_id=row.batch_id,
+                        )
+                except Exception:
+                    out["failed"] += 1
+                    logger.exception("batch promotion replay failed for %s", row.event_id)
+                    continue
+                out["promoted"] += 1
+            return out
     
         def _persist_items(self, *, store: "SqliteDurableRecordStore", frame: Mapping[str, Any],
                            raw_messages: Sequence[Any], provisional: Sequence[IB.ItemResult],
@@ -3381,6 +4666,123 @@ data:
                                                  classification=seed.classification)
                     results.append(deferred)
             return results
+    
+        def _promotion_envelope(self, *, item: Any, result: IB.ItemResult, frame: Mapping[str, Any],
+                                cred: BatchCredential, received_at: str) -> Mapping[str, Any]:
+            if result.classification == IB.TRANSLATED:
+                return translate_legacy_batch_item(
+                    item, frame=frame, credential=cred, received_at=received_at,
+                    adapter_name=self.adapter_name, adapter_version=self.adapter_version,
+                    raw_ref=result.raw_ref or "",
+                )
+            if not isinstance(item, Mapping):
+                raise BatchPromotionError(
+                    f"batch item {result.index} is not an object and cannot be promoted")
+            return item
+    
+        def _raw_ref_path(self, raw_ref: Optional[str]) -> Optional[str]:
+            if not raw_ref:
+                return None
+            return os.path.join(self.raw_root, raw_ref)
+    
+        def _batch_raw_dir(self, *, site_id: Optional[str], device_id: Optional[str],
+                           batch_id: Optional[str]) -> Optional[str]:
+            if not site_id or not device_id or not batch_id:
+                return None
+            return os.path.join(self.raw_root, "raw", site_id, device_id, batch_id)
+    
+        @staticmethod
+        def _write_json(path: str, payload: Any) -> None:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, sort_keys=True, separators=(",", ":"))
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+    
+        def _scrub_promoted_item(self, *, store: "SqliteDurableRecordStore", event_id: str,
+                                 envelope: Mapping[str, Any], raw_ref: Optional[str]) -> None:
+            redacted = self.promoter.redact_audio_fields(envelope)
+            store.batch_update_envelope(event_id, encode_json(redacted))
+            raw_path = self._raw_ref_path(raw_ref)
+            if raw_path:
+                self._write_json(raw_path, redacted)
+    
+        def _scrub_batch_frame(self, *, frame: Mapping[str, Any], site_id: str,
+                               device_id: str) -> None:
+            frame_paths = self._frame_raw_refs(
+                site_id=site_id,
+                device_id=device_id,
+                batch_id=str(frame.get("batch_id") or ""),
+            )
+            redacted = self.promoter.redact_audio_fields(frame)
+            for path in frame_paths:
+                self._write_json(path, redacted)
+    
+        def _delete_batch_frame_refs(self, *, site_id: Optional[str], device_id: Optional[str],
+                                     batch_id: Optional[str]) -> None:
+            for path in self._frame_raw_refs(site_id=site_id, device_id=device_id, batch_id=batch_id):
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    continue
+    
+        def _frame_raw_refs(self, *, site_id: Optional[str], device_id: Optional[str],
+                            batch_id: Optional[str]) -> list[str]:
+            if not site_id or not device_id or not batch_id:
+                return []
+            root = os.path.join(self.raw_root, "raw", site_id, device_id)
+            if not os.path.isdir(root):
+                return []
+            matches: list[str] = []
+            for dirname in os.listdir(root):
+                if not dirname.startswith("frame-"):
+                    continue
+                candidate = os.path.join(root, dirname)
+                if not os.path.isdir(candidate):
+                    continue
+                for name in os.listdir(candidate):
+                    path = os.path.join(candidate, name)
+                    try:
+                        with open(path, "r", encoding="utf-8") as fh:
+                            doc = json.load(fh)
+                    except (OSError, ValueError):
+                        continue
+                    if isinstance(doc, Mapping) and str(doc.get("batch_id") or "") == str(batch_id):
+                        matches.append(path)
+            return matches
+    
+        def _promote_results(self, *, store: "SqliteDurableRecordStore", frame: Mapping[str, Any],
+                             raw_messages: Sequence[Any], results: Sequence[IB.ItemResult],
+                             cred: BatchCredential, received_at: str) -> None:
+            scrubbed_frame = False
+            for result in results:
+                if result.status not in ("accepted", "duplicate") or not result.event_id:
+                    continue
+                envelope = self._promotion_envelope(
+                    item=raw_messages[result.index],
+                    result=result,
+                    frame=frame,
+                    cred=cred,
+                    received_at=received_at,
+                )
+                self.promoter.ensure(store, result.event_id, envelope)
+                if self.promoter.carries_clip_audio(envelope):
+                    self._scrub_promoted_item(
+                        store=store,
+                        event_id=result.event_id,
+                        envelope=envelope,
+                        raw_ref=result.raw_ref,
+                    )
+                    scrubbed_frame = True
+            if scrubbed_frame:
+                self._scrub_batch_frame(
+                    frame=frame,
+                    site_id=cred.site_id,
+                    device_id=str(frame.get("device_id")),
+                )
     
         def _persist_translated_item(self, *, store: "SqliteDurableRecordStore",
                                      frame: Mapping[str, Any], item: Any, seed: IB.ItemResult,
@@ -4264,6 +5666,13 @@ data:
         batch_adapter = BatchIngestAdapter.from_config(
             store.durable_store, args.batch_credentials_file, raw_root=args.batch_raw_dir,
             adapter_version=BATCH_ADAPTER_VERSION)
+        try:
+            promoted = batch_adapter.promote_pending(limit=256)
+            if promoted["attempted"]:
+                print("[hear-heartbeat] batch promotion bootstrap attempted=%d promoted=%d failed=%d"
+                      % (promoted["attempted"], promoted["promoted"], promoted["failed"]))
+        except Exception:
+            logger.exception("batch promotion bootstrap failed")
         print(f"[hear-heartbeat] Redis target configured -> {target}")
         print(f"[hear-heartbeat] durable backend={store.durable_store.backend} path={store.durable_store.path}")
         if batch_adapter.credential_store is None:

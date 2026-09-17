@@ -42,7 +42,7 @@ spec:
         # Forces a new ReplicaSet (Recreate: a full pod restart) whenever
         # hear-heartbeat-code.yaml's content changes. The code file below is mounted
         # with subPath, which kubelet's ConfigMap sync does not live-update.
-        checksum/hear-heartbeat-code: '6018403d563a3b5f6fded553825141ad597d0e10c34777711a07c570a17f2760'
+        checksum/hear-heartbeat-code: '7bfd938e7f91c3dc51671375cadaad70d4a57c0d348a62953eb213c21c4a8dab'
         prometheus.io/scrape: "true"
         prometheus.io/path: /metrics
         prometheus.io/port: "5051"
@@ -62,6 +62,24 @@ spec:
                 echo "installing redis==7.4.0 into $LIB"
                 pip install --no-cache-dir --upgrade --target "$LIB" 'redis==7.4.0' >/dev/null 2>&1
               fi
+              if [ ! -d "$LIB/numpy" ]; then
+                echo "installing numpy into $LIB"
+                pip install --no-cache-dir --upgrade --target "$LIB" 'numpy==2.2.6' >/dev/null 2>&1
+              fi
+              if [ ! -d "$LIB/onnxruntime" ]; then
+                echo "installing onnxruntime into $LIB"
+                pip install --no-cache-dir --upgrade --target "$LIB" 'onnxruntime==1.27.0' >/dev/null 2>&1
+              fi
+              MODEL=/pool/models/silero_vad.onnx
+              MODEL_SHA256=1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3
+              if [ ! -f "$MODEL" ]; then
+                echo "fetching silero_vad.onnx"
+                mkdir -p /pool/models
+                python3 -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx', '$MODEL.tmp')"
+                echo "$MODEL_SHA256  $MODEL.tmp" | sha256sum -c - >/dev/null
+                mv "$MODEL.tmp" "$MODEL"
+              fi
+              export HEAR_SILERO_VAD_MODEL="$MODEL"
               exec python /app/tools/hear_heartbeat_receiver.py --port 5051
           ports:
             - { name: http, containerPort: 5051, hostPort: 5051 }
@@ -88,13 +106,22 @@ spec:
                   key: token
           volumeMounts:
             - { name: code, mountPath: /app/hear/__init__.py, subPath: hear__init__.py }
+            - { name: code, mountPath: /app/hear/sketch.py, subPath: hear_sketch.py }
+            - { name: code, mountPath: /app/hear/identity.py, subPath: hear_identity.py }
+            - { name: code, mountPath: /app/hear/clips.py, subPath: hear_clips.py }
             - { name: code, mountPath: /app/hear/ingest/__init__.py, subPath: hear_ingest__init__.py }
             - { name: code, mountPath: /app/hear/ingest/envelope.py, subPath: hear_ingest_envelope.py }
             - { name: code, mountPath: /app/hear/ingest/batch.py, subPath: hear_ingest_batch.py }
             - { name: code, mountPath: /app/hear/ingest/observability.py, subPath: hear_ingest_observability.py }
+            - { name: code, mountPath: /app/hear/privacy/__init__.py, subPath: hear_privacy__init__.py }
+            - { name: code, mountPath: /app/hear/privacy/purge.py, subPath: hear_privacy_purge.py }
+            - { name: code, mountPath: /app/hear/privacy/silero_vad.py, subPath: hear_privacy_silero_vad.py }
+            - { name: code, mountPath: /app/hear/privacy/transient_tdoa.py, subPath: hear_privacy_transient_tdoa.py }
+            - { name: code, mountPath: /app/hear/resample.py, subPath: hear_resample.py }
             - { name: code, mountPath: /app/tools/hear_heartbeat_receiver.py, subPath: tools_hear_heartbeat_receiver.py }
             - { name: deps, mountPath: /deps }
             - { name: batch-credentials, mountPath: /var/run/dama-hear/batch-credentials, readOnly: true }
+            - { name: pool, mountPath: /pool }
             - { name: state, mountPath: /state }
           readinessProbe:
             httpGet: { path: /healthz, port: http }
@@ -115,6 +142,9 @@ spec:
           secret:
             secretName: hear-batch-credentials
             optional: true
+        - name: pool
+          persistentVolumeClaim:
+            claimName: hear-pool
         - name: state
           persistentVolumeClaim:
             claimName: hear-heartbeat-state

@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "94802e431aee0f5e46904def821b06129c663616cececb6506cb6963b325a983",
+  "baseline_hash": "894e22bd537c591bf52acfde974d6bbfd1ff6294d8f60f7fd9cecb4ce5d16ba4",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -490,13 +490,13 @@
       },
       {
         "path": "deploy/k8s/hear-heartbeat.yaml",
-        "sha256": "f51ff767ab84d718fa5200d3ee4a31c83dccce813d45050bdce16500477d8258",
-        "size_bytes": 5062
+        "sha256": "6bc92db4af6e555860fbc2a9668e28e97de568b1d9afd5c016d3b0737e502e4c",
+        "size_bytes": 7070
       },
       {
         "path": "deploy/k8s/hear-mqtt-bridge.yaml",
-        "sha256": "99ec50b48933871c151a04fbcbe603cdb0fca6d492e2b7eadc38f95291ce353b",
-        "size_bytes": 6068
+        "sha256": "9de120f8a789d748670702960b2a0fec6b8997e87d8733e2d148ecfe6a0b518f",
+        "size_bytes": 6328
       },
       {
         "path": "deploy/k8s/hear-pool-backup.yaml",
@@ -1206,7 +1206,11 @@
         "manifest": "deploy/k8s/hear-heartbeat.yaml",
         "name": "hear-heartbeat-state",
         "namespace": "dama",
-        "path_references": [],
+        "path_references": [
+          "/pool",
+          "/pool/models",
+          "/pool/models/silero_vad.onnx"
+        ],
         "storage_request": "5Gi"
       },
       {
@@ -1274,6 +1278,24 @@
               },
               {
                 "claim_name": null,
+                "mount_path": "/app/hear/sketch.py",
+                "sub_path": "hear_sketch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/identity.py",
+                "sub_path": "hear_identity.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/clips.py",
+                "sub_path": "hear_clips.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
                 "mount_path": "/app/hear/ingest/__init__.py",
                 "sub_path": "hear_ingest__init__.py",
                 "volume_name": "code"
@@ -1298,6 +1320,36 @@
               },
               {
                 "claim_name": null,
+                "mount_path": "/app/hear/privacy/__init__.py",
+                "sub_path": "hear_privacy__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/privacy/purge.py",
+                "sub_path": "hear_privacy_purge.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/privacy/silero_vad.py",
+                "sub_path": "hear_privacy_silero_vad.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/privacy/transient_tdoa.py",
+                "sub_path": "hear_privacy_transient_tdoa.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/resample.py",
+                "sub_path": "hear_resample.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
                 "mount_path": "/app/tools/hear_heartbeat_receiver.py",
                 "sub_path": "tools_hear_heartbeat_receiver.py",
                 "volume_name": "code"
@@ -1315,6 +1367,12 @@
                 "volume_name": "batch-credentials"
               },
               {
+                "claim_name": "hear-pool",
+                "mount_path": "/pool",
+                "sub_path": null,
+                "volume_name": "pool"
+              },
+              {
                 "claim_name": "hear-heartbeat-state",
                 "mount_path": "/state",
                 "sub_path": null,
@@ -1329,14 +1387,22 @@
         "manifest": "deploy/k8s/hear-heartbeat.yaml",
         "name": "hear-heartbeat",
         "namespace": "dama",
-        "path_references": []
+        "path_references": [
+          "/pool",
+          "/pool/models",
+          "/pool/models/silero_vad.onnx"
+        ]
       },
       {
         "kind": "Service",
         "manifest": "deploy/k8s/hear-heartbeat.yaml",
         "name": "hear-heartbeat",
         "namespace": "dama",
-        "path_references": [],
+        "path_references": [
+          "/pool",
+          "/pool/models",
+          "/pool/models/silero_vad.onnx"
+        ],
         "ports": [
           {
             "name": "http",
@@ -1430,6 +1496,24 @@
                 "claim_name": null,
                 "mount_path": "/app/hear/__init__.py",
                 "sub_path": "hear__init__.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/sketch.py",
+                "sub_path": "hear_sketch.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/identity.py",
+                "sub_path": "hear_identity.py",
+                "volume_name": "code"
+              },
+              {
+                "claim_name": null,
+                "mount_path": "/app/hear/clips.py",
+                "sub_path": "hear_clips.py",
                 "volume_name": "code"
               },
               {
@@ -2412,7 +2496,11 @@
           }
         ],
         "declared_in": "deploy/k8s/hear-heartbeat.yaml",
-        "path_references": [],
+        "path_references": [
+          "/pool",
+          "/pool/models",
+          "/pool/models/silero_vad.onnx"
+        ],
         "storage_request": "5Gi"
       },
       {
@@ -2466,6 +2554,13 @@
             "manifest": "deploy/k8s/hear-embed.yaml",
             "mount_path": "/pool",
             "object_name": "hear-embed-check"
+          },
+          {
+            "container": "receiver",
+            "kind": "Deployment",
+            "manifest": "deploy/k8s/hear-heartbeat.yaml",
+            "mount_path": "/pool",
+            "object_name": "hear-heartbeat"
           },
           {
             "container": "backup",
@@ -2558,7 +2653,7 @@
         "storage_request": "20Gi"
       }
     ],
-    "section_hash": "9e63ff9416e4677a19edd1a4c2708d815bf4092e77b7280f354199b4d9810e00"
+    "section_hash": "a16f7c192f63f187cef37d0c5a3a2ab55077246dbab462a282d2e8f75ca756e1"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",

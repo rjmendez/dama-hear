@@ -1,4 +1,5 @@
 """The hear heartbeat receiver: schema guard, TTL write, and advisory event intake."""
+import base64
 import hashlib
 import json
 import os
@@ -15,7 +16,11 @@ from typing import Dict
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hear import clips as CL  # noqa: E402
 from hear.ingest import batch as BA  # noqa: E402
+from hear.ingest import envelope as EV  # noqa: E402
+from hear.privacy import purge as PP  # noqa: E402
+from tests import privacy_signals as SIG  # noqa: E402
 from tools import hear_heartbeat_receiver as HR  # noqa: E402
 from tools import gen_ingest_contracts as GEN  # noqa: E402
 
@@ -467,19 +472,45 @@ def _batch_credentials(tmp_path):
     return path
 
 
-def _batch_adapter(tmp_path, durable_store, before_receipt_store=None):
+def _batch_adapter(tmp_path, durable_store, before_receipt_store=None, *, pool_root=None,
+                   vad=None):
     return HR.BatchIngestAdapter.from_config(
         durable_store,
         str(_batch_credentials(tmp_path)),
         raw_root=str(tmp_path / "batch-raw"),
+        pool_root=str(pool_root or (tmp_path / "pool" / "corpus")),
         adapter_version="test",
-    ) if before_receipt_store is None else HR.BatchIngestAdapter(
+    ) if before_receipt_store is None and vad is None else HR.BatchIngestAdapter(
         durable_store,
         HR.BatchCredentialStore.from_file(str(_batch_credentials(tmp_path))),
         raw_root=str(tmp_path / "batch-raw"),
+        pool_root=str(pool_root or (tmp_path / "pool" / "corpus")),
         adapter_version="test",
         before_receipt_store=before_receipt_store,
+        vad=vad,
     )
+
+
+def _clip_message(*, sequence: int, basename: str, wav_bytes: bytes,
+                  observed_at: str = "2026-09-14T18:03:11.250000Z",
+                  payload_overrides=None):
+    env = json.loads(json.dumps(GEN.BASE))
+    env["kind"] = "clip"
+    env["observed_at"] = observed_at
+    env["raw_ref"] = None
+    env["producer"] = dict(env["producer"], sequence=sequence, cursor="clips:%d" % sequence)
+    env["payload"] = {
+        "clip": "/clips/%s" % basename,
+        "wav_b64": base64.b64encode(wav_bytes).decode("ascii"),
+        "fs_hz": 48000.0,
+        "trigger": "lf",
+        "clip_why": "ok",
+        "record_key": "rk-%d" % sequence,
+    }
+    if payload_overrides:
+        env["payload"].update(payload_overrides)
+    env["event_id"] = EV.derive_event_id(env)
+    return env
 
 
 class TestBatchIngestRoute:
@@ -607,6 +638,230 @@ class TestBatchIngestRoute:
         with sqlite3.connect(db) as con:
             kinds = [row[0] for row in con.execute("SELECT kind FROM batch_events ORDER BY item_index")]
         assert kinds == ["heartbeat", "detection"]
+
+    def test_batch_route_promotes_a_clean_clip_into_the_shared_pool(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        pool_root = tmp_path / "pool" / "corpus"
+        adapter = _batch_adapter(tmp_path, durable, pool_root=pool_root, vad=PP.BandEnergyVAD())
+        basename = "nyquist-00002a9f13c0-0240479148.wav"
+        wav_bytes = SIG.wav_bytes(SIG.gaussian_noise(seconds=1.0, fs=SIG.MODEL_RATE),
+                                  fs=SIG.MODEL_RATE)
+        frame = GEN._frame([
+            _clip_message(sequence=240479148, basename=basename, wav_bytes=wav_bytes,
+                          payload_overrides={"fs_hz": 16000.0}),
+        ], batch_id="clip-clean-1")
+        with running_server(durable_store=durable, batch_adapter=adapter) as (
+            base_url, _fake, _addr, _server,
+        ):
+            with self._post(base_url + "/v1/ingest/batches", frame) as resp:
+                receipt = json.loads(resp.read().decode("utf-8"))
+        assert receipt["counts"] == {"submitted": 1, "accepted": 1, "duplicate": 0,
+                                      "refused": 0, "deferred": 0}
+        idx = CL.read_index(str(pool_root))
+        assert list(idx) == [CL.clip_key("nyquist", "00002a9f13c0", 240479148)]
+        row = list(idx.values())[0]
+        assert row["outcome"] == "stored"
+        assert row["clip"] == "/clips/%s" % basename
+        assert row["path"] == "clips/2026-09-14/nyquist/%s" % basename
+        assert row["record_key"] == "rk-240479148"
+        assert row["bytes"] == len(wav_bytes)
+        assert os.path.exists(pool_root / row["path"])
+        raw_ref = receipt["results"][0]["raw_ref"]
+        raw_doc = json.loads((tmp_path / "batch-raw" / raw_ref).read_text(encoding="utf-8"))
+        assert "wav_b64" not in raw_doc["payload"]
+        with sqlite3.connect(db) as con:
+            stored = json.loads(
+                con.execute("SELECT envelope_json FROM batch_events").fetchone()[0]
+            )
+        assert "wav_b64" not in stored["payload"]
+        frame_root = tmp_path / "batch-raw" / "raw" / GEN.BASE["site_id"] / GEN.DEVICE_ID
+        frame_files = list(frame_root.glob("frame-*/*"))
+        assert len(frame_files) == 1
+        frame_doc = json.loads(frame_files[0].read_text(encoding="utf-8"))
+        assert "wav_b64" not in frame_doc["messages"][0]["payload"]
+
+    def test_batch_route_purges_speech_clip_and_audit_logs_it_without_pool_write(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        pool_root = tmp_path / "pool" / "corpus"
+        adapter = _batch_adapter(tmp_path, durable, pool_root=pool_root, vad=PP.BandEnergyVAD())
+        basename = "nyquist-00002a9f13c0-0240479149.wav"
+        wav_bytes = SIG.wav_bytes(SIG.speech_like(seconds=1.0, fs=SIG.MODEL_RATE),
+                                  fs=SIG.MODEL_RATE)
+        frame = GEN._frame([
+            _clip_message(sequence=240479149, basename=basename, wav_bytes=wav_bytes,
+                          payload_overrides={"fs_hz": 16000.0}),
+        ], batch_id="clip-speech-1")
+        with running_server(durable_store=durable, batch_adapter=adapter) as (
+            base_url, _fake, _addr, _server,
+        ):
+            with self._post(base_url + "/v1/ingest/batches", frame) as resp:
+                receipt = json.loads(resp.read().decode("utf-8"))
+        assert receipt["counts"] == {"submitted": 1, "accepted": 1, "duplicate": 0,
+                                      "refused": 0, "deferred": 0}
+        assert CL.read_index(str(pool_root)) == {}
+        audit = pool_root / "clips" / PP.RECEIPT_NAME
+        receipts = PP.read_receipts(str(audit))
+        assert len(receipts) == 1
+        assert receipts[0]["clip"] == basename
+        assert receipts[0]["clip_key"] == CL.clip_key("nyquist", "00002a9f13c0", 240479149)
+        assert receipts[0]["verdict"] == PP.VERDICT_SPEECH
+        assert receipts[0]["audio_retained"] is False
+        assert not os.path.exists(pool_root / "clips" / "2026-09-14" / "nyquist" / basename)
+        raw_ref = receipt["results"][0]["raw_ref"]
+        raw_doc = json.loads((tmp_path / "batch-raw" / raw_ref).read_text(encoding="utf-8"))
+        assert "wav_b64" not in raw_doc["payload"]
+        with sqlite3.connect(db) as con:
+            stored = json.loads(
+                con.execute("SELECT envelope_json FROM batch_events").fetchone()[0]
+            )
+        assert "wav_b64" not in stored["payload"]
+        frame_root = tmp_path / "batch-raw" / "raw" / GEN.BASE["site_id"] / GEN.DEVICE_ID
+        frame_files = list(frame_root.glob("frame-*/*"))
+        assert len(frame_files) == 1
+        frame_doc = json.loads(frame_files[0].read_text(encoding="utf-8"))
+        assert "wav_b64" not in frame_doc["messages"][0]["payload"]
+
+    def test_non_clip_batch_items_do_not_enter_the_audio_purge_path(self, tmp_path, monkeypatch):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        pool_root = tmp_path / "pool" / "corpus"
+        adapter = _batch_adapter(tmp_path, durable, pool_root=pool_root)
+        monkeypatch.setattr(PP, "purge_wav_bytes",
+                            lambda *args, **kwargs: (_ for _ in ()).throw(
+                                AssertionError("non-clip batch item hit purge_wav_bytes")))
+        with running_server(durable_store=durable, batch_adapter=adapter) as (
+            base_url, _fake, _addr, _server,
+        ):
+            with self._post(base_url + "/v1/ingest/batches", GEN._batch_valid()) as resp:
+                receipt = json.loads(resp.read().decode("utf-8"))
+        assert receipt["counts"]["accepted"] == 3
+        assert CL.read_index(str(pool_root)) == {}
+        assert not os.path.exists(pool_root / "clips" / PP.RECEIPT_NAME)
+
+    def test_bootstrap_promotion_backfills_an_already_accepted_clip_event(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        store = HR.make_durable_store("sqlite", str(db))
+        assert isinstance(store, HR.SqliteDurableRecordStore)
+        pool_root = tmp_path / "pool" / "corpus"
+        raw_root = tmp_path / "batch-raw"
+        wav_bytes = SIG.wav_bytes(SIG.gaussian_noise(seconds=1.0, fs=SIG.MODEL_RATE),
+                                  fs=SIG.MODEL_RATE)
+        envelope = _clip_message(sequence=240479152,
+                                 basename="nyquist-00002a9f13c0-0240479152.wav",
+                                 wav_bytes=wav_bytes,
+                                 payload_overrides={"fs_hz": 16000.0})
+        raw_ref = "raw/%s/%s/bootstrap-clip-1/seed-item.json" % (GEN.BASE["site_id"], GEN.DEVICE_ID)
+        raw_path = raw_root / raw_ref
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_path.write_text(json.dumps(envelope), encoding="utf-8")
+        frame_path = raw_root / "raw" / GEN.BASE["site_id"] / GEN.DEVICE_ID / "frame-seed-request" / "seed-frame.json"
+        frame_path.parent.mkdir(parents=True, exist_ok=True)
+        frame_path.write_text(json.dumps({"batch_id": "bootstrap-clip-1", "messages": [envelope]}),
+                              encoding="utf-8")
+        duplicate = store.batch_persist_event(
+            envelope["event_id"], envelope["site_id"], envelope["device_id"],
+            envelope["source"], envelope["kind"], envelope["observed_at"],
+            envelope["received_at"], True, raw_ref, HR.encode_json(envelope),
+            "bootstrap-clip-1", 0, "node:nyquist", "device", "k-2026-09",
+        )
+        assert duplicate is False
+        adapter = _batch_adapter(tmp_path, store, pool_root=pool_root, vad=PP.BandEnergyVAD())
+        assert adapter.promote_pending(limit=10) == {"attempted": 1, "promoted": 1, "failed": 0}
+        idx = CL.read_index(str(pool_root))
+        assert list(idx) == [CL.clip_key("nyquist", "00002a9f13c0", 240479152)]
+        assert "wav_b64" not in json.loads(raw_path.read_text(encoding="utf-8"))["payload"]
+        assert not frame_path.exists()
+
+    def test_retry_after_receipt_crash_does_not_duplicate_a_clean_clip_index_row(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        pool_root = tmp_path / "pool" / "corpus"
+        crash_once = {"armed": True}
+
+        def crash():
+            if crash_once["armed"]:
+                crash_once["armed"] = False
+                raise RuntimeError("simulated crash after promotion before receipt")
+
+        adapter = _batch_adapter(tmp_path, durable, before_receipt_store=crash,
+                                 pool_root=pool_root, vad=PP.BandEnergyVAD())
+        basename = "nyquist-00002a9f13c0-0240479150.wav"
+        wav_bytes = SIG.wav_bytes(SIG.gaussian_noise(seconds=1.0, fs=SIG.MODEL_RATE),
+                                  fs=SIG.MODEL_RATE)
+        frame = GEN._frame([
+            _clip_message(sequence=240479150, basename=basename, wav_bytes=wav_bytes,
+                          payload_overrides={"fs_hz": 16000.0}),
+        ], batch_id="clip-clean-crash")
+        raw = json.dumps(frame).encode("utf-8")
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            adapter.ingest(path="/v1/ingest/batches", raw=raw,
+                           content_type=BA.BATCH_CODEC_MEDIA_TYPES["json"],
+                           idempotency_key="idem-clean-crash",
+                           authorization="Bearer node-secret",
+                           content_encoding=None, request_id="req-clean-crash")
+
+        recovered = _batch_adapter(tmp_path, HR.make_durable_store("sqlite", str(db)),
+                                   pool_root=pool_root, vad=PP.BandEnergyVAD())
+        status, body, _headers = recovered.ingest(
+            path="/v1/ingest/batches", raw=raw,
+            content_type=BA.BATCH_CODEC_MEDIA_TYPES["json"],
+            idempotency_key="idem-clean-crash", authorization="Bearer node-secret",
+            content_encoding=None, request_id="req-clean-retry",
+        )
+        receipt = json.loads(body)
+        assert status == 200
+        assert receipt["counts"]["accepted"] == 0
+        assert receipt["counts"]["duplicate"] == 1
+        idx = CL.read_index(str(pool_root))
+        assert len(idx) == 1
+        assert list(idx.values())[0]["path"] == "clips/2026-09-14/nyquist/%s" % basename
+
+    def test_retry_after_receipt_crash_does_not_double_count_the_purge_audit_log(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        pool_root = tmp_path / "pool" / "corpus"
+        crash_once = {"armed": True}
+
+        def crash():
+            if crash_once["armed"]:
+                crash_once["armed"] = False
+                raise RuntimeError("simulated crash after purge before receipt")
+
+        adapter = _batch_adapter(tmp_path, durable, before_receipt_store=crash,
+                                 pool_root=pool_root, vad=PP.BandEnergyVAD())
+        wav_bytes = SIG.wav_bytes(SIG.speech_like(seconds=1.0, fs=SIG.MODEL_RATE),
+                                  fs=SIG.MODEL_RATE)
+        frame = GEN._frame([
+            _clip_message(sequence=240479151,
+                          basename="nyquist-00002a9f13c0-0240479151.wav",
+                          wav_bytes=wav_bytes,
+                          payload_overrides={"fs_hz": 16000.0}),
+        ], batch_id="clip-speech-crash")
+        raw = json.dumps(frame).encode("utf-8")
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            adapter.ingest(path="/v1/ingest/batches", raw=raw,
+                           content_type=BA.BATCH_CODEC_MEDIA_TYPES["json"],
+                           idempotency_key="idem-speech-crash",
+                           authorization="Bearer node-secret",
+                           content_encoding=None, request_id="req-speech-crash")
+
+        recovered = _batch_adapter(tmp_path, HR.make_durable_store("sqlite", str(db)),
+                                   pool_root=pool_root, vad=PP.BandEnergyVAD())
+        status, body, _headers = recovered.ingest(
+            path="/v1/ingest/batches", raw=raw,
+            content_type=BA.BATCH_CODEC_MEDIA_TYPES["json"],
+            idempotency_key="idem-speech-crash", authorization="Bearer node-secret",
+            content_encoding=None, request_id="req-speech-retry",
+        )
+        receipt = json.loads(body)
+        assert status == 200
+        assert receipt["counts"]["accepted"] == 0
+        assert receipt["counts"]["duplicate"] == 1
+        receipts = PP.read_receipts(str(pool_root / "clips" / PP.RECEIPT_NAME))
+        assert len(receipts) == 1
+        assert receipts[0]["clip_key"] == CL.clip_key("nyquist", "00002a9f13c0", 240479151)
 
     def test_batch_route_survives_a_kill_after_durable_write_before_receipt(self, tmp_path):
         db = tmp_path / "heartbeats.sqlite3"
