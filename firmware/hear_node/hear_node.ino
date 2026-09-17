@@ -2740,6 +2740,13 @@ static uint32_t spool_failures = 0;
 static int spool_last_code = 0;
 static uint32_t spool_last_attempt_s = 0;
 static uint32_t spool_last_ok_s = 0;
+// init_ok/fail_reason exist because spool_init() previously had no observable outcome at all: an
+// SD miss, a failed PSRAM segment-buffer alloc, and a torn segment scan all returned silently and
+// left the node indistinguishable from "healthy, nothing to send yet" from the HTTP API alone.
+static bool spool_init_ok = false;
+static const char *spool_init_fail_reason = "";
+static uint32_t spool_last_fail_log_ms = 0;
+static uint32_t spool_sends_ok = 0;
 static uint16_t spool_gen = 1;
 static uint16_t spool_next_segment_idx = 1;
 static size_t spool_segment_count = 0;
@@ -3177,14 +3184,24 @@ static void spool_init() {
   spool_last_code = 0;
   spool_last_attempt_s = 0;
   spool_last_ok_s = 0;
-  if (!sd_ok) return;
+  spool_init_ok = false;
+  spool_init_fail_reason = "";
+  if (!sd_ok) { spool_init_fail_reason = "sd"; logf("spool init failed: no sd\n"); return; }
   if (!SD.exists(HEAR_SPOOL_DIR)) SD.mkdir(HEAR_SPOOL_DIR);
   if (!spool_scan_buf) spool_scan_buf = (uint8_t *)heap_caps_malloc(
       HEAR_SPOOL_SEGMENT_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!spool_scan_buf) return;
+  if (!spool_scan_buf) {
+    spool_init_fail_reason = "alloc";
+    logf("spool init failed: %u B psram alloc (free %u)\n",
+         (unsigned)HEAR_SPOOL_SEGMENT_MAX_BYTES, (unsigned)ESP.getFreePsram());
+    return;
+  }
   spool_load_watermark();
-  if (!spool_scan_segments(true)) return;
+  if (!spool_scan_segments(true)) { spool_init_fail_reason = "scan"; logf("spool init failed: segment scan\n"); return; }
   spool_enabled = true;
+  spool_init_ok = true;
+  logf("spool init ok: backlog=%lu segments=%u\n",
+       (unsigned long)spool_backlog_records, (unsigned)spool_segment_count);
   if (spool_backlog_records) spool_schedule_send(HEAR_SPOOL_FLUSH_MS);
 }
 
@@ -3196,23 +3213,37 @@ static void spool_pump() {
     return;
   hear_spool_batch_plan_t plan = {};
   size_t body_len = 0, receipt_len = 0;
-  if (!spool_collect_batch(&plan, &body_len)) return;
+  if (!spool_collect_batch(&plan, &body_len)) {
+    logf("spool collect_batch failed with backlog=%lu (torn/oversize record?)\n",
+         (unsigned long)spool_backlog_records);
+    return;
+  }
   int code = 0;
   spool_last_attempt_s = push_uptime_s();
   if (!spool_post_batch(spool_batch_body, body_len, plan.idempotency_key, &code, &receipt_len)) {
     spool_failures++;
     spool_last_code = code;
+    uint32_t now = millis();
+    if (!spool_last_fail_log_ms || (uint32_t)(now - spool_last_fail_log_ms) >= HEAR_PUSH_FAIL_LOG_MS) {
+      logf("spool send failed (%d) backlog=%lu failures=%lu\n", code,
+           (unsigned long)spool_backlog_records, (unsigned long)spool_failures);
+      spool_last_fail_log_ms = now;
+    }
     spool_schedule_send(spool_backoff_ms());
     return;
   }
   spool_last_code = code;
   if (!spool_apply_watermark(&plan, spool_receipt_buf, receipt_len)) {
+    logf("spool watermark apply failed after accepted send (%d)\n", code);
     spool_schedule_send(HEAR_SPOOL_FLUSH_MS);
     return;
   }
   spool_last_ok_s = spool_last_attempt_s;
   spool_failures = 0;
+  spool_sends_ok++;
   spool_prune_acked_segments();
+  logf("spool send ok (%d) records=%lu bytes=%lu backlog_left=%lu\n", code,
+       (unsigned long)plan.item_count, (unsigned long)body_len, (unsigned long)spool_backlog_records);
   if (spool_backlog_records) spool_schedule_send(1);
   else spool_next_send_ms = 0;
 }
@@ -3983,6 +4014,11 @@ static String status_json() {
     "\"skip_dedupe\":%lu,\"skip_ring\":%lu,"
     "\"nocard\":%lu,\"fail\":%lu,\"bytes_each\":%lu,\"budget_b\":%lu,\"budget_left_b\":%lu,"
     "\"budget_left_clips\":%lu,\"held\":%d,\"pre_s\":%.1f,\"post_s\":%.1f,\"dir\":\"%s\",\"boot\":\"%06lx%s\"},"
+    // spool has no other way to be seen from the HTTP API: init_ok/fail_reason distinguish "never
+    // got past sd/alloc/scan" from "enabled but backlogged", and last_code/failures/last_ok_s
+    // distinguish a healthy quiet queue from a queue that has been failing every attempt.
+    "\"spool\":{\"init_ok\":%s,\"fail_reason\":\"%s\",\"enabled\":%s,\"backlog\":%lu,"
+    "\"failures\":%lu,\"last_code\":%d,\"last_attempt_s\":%lu,\"last_ok_s\":%lu,\"sends_ok\":%lu},"
     "\"env\":{\"temp_c\":%s,\"press_hpa\":%s,\"c_mps\":%s,\"rh_pct\":%s,\"reads\":%lu,\"fail\":%lu},"
     "\"sd\":%s,\"sd_free_mb\":%lu,\"sd_total_mb\":%lu,"
     "\"cache\":{\"target_free_mb\":%lu,\"target_pct\":%u,\"evicted_files\":%lu,"
@@ -4077,6 +4113,11 @@ static String status_json() {
     (unsigned long)(clip_budget_left() / CLIP_BYTES), clip_q_n,
     (double)CLIP_PRE_SAMPLES / FS_ACQ, (double)CLIP_POST_SAMPLES / FS_ACQ,
     CLIP_DIR, (unsigned long)clip_seq, clip_rand,
+    spool_init_ok ? "true" : "false", spool_init_fail_reason,
+    spool_enabled ? "true" : "false", (unsigned long)spool_backlog_records,
+    (unsigned long)spool_failures, spool_last_code,
+    (unsigned long)spool_last_attempt_s, (unsigned long)spool_last_ok_s,
+    (unsigned long)spool_sends_ok,
     envs_t, envs_p, envs_c, envs_h, (unsigned long)bmp_reads, (unsigned long)bmp_fail,
     sd_ok ? "true" : "false",
     (unsigned long)(sd_ok ? (SD.totalBytes() - SD.usedBytes()) / 1048576UL : 0UL),
