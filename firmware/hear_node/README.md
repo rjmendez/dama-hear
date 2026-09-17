@@ -161,6 +161,7 @@ it. Everything below is fetchable over the same link with `/sd?file=/dets.csv&ta
 | `health.csv` | every 30 s | GPS and PPS quality, the acquisition audit, gate state and `gate_floor`, detection counters, the clip counters, card space |
 | `scene.csv` | every 1.024 s, ungated | the scene descriptor — 20 bands × 4 quarter-second slices of log-mel, hex, the microseconds its FFTs cost, and the band edges that produced it |
 | `clips/*.wav` | one per detection, budgeted | 4 s of raw PCM around the trigger |
+| `spool/seg-*.spl`, `spool/ack-*.state` | on `clip_written` / `detection_batch_ready`, drained every ≤30 s or 8 records | the device-side HTTPS uplink spool: framed event records, plus the dual-slot acknowledgement watermark for `POST /v1/ingest/batches` |
 | `gate.cfg` | when `POST /gate?...&persist=1` is used | one line: the gate floor to restore at boot |
 
 ⚠️**Three headers changed in this build**, so the first boot after flashing rolls `dets.csv`,
