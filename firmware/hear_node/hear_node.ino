@@ -52,6 +52,7 @@
 #endif
 #include "hear_push_ca.h"   // HEAR_PUSH_CA_CERT / HEAR_PUSH_TLS_INSECURE (Alert 3); after
                             // secrets.h so a build can override either there.
+#include "spool_push.h"
 
 // ---- shared platform -------------------------------------------------------------------------
 // firmware/lib/hear_platform. Built with: arduino-cli compile --libraries firmware/lib
@@ -2638,6 +2639,9 @@ static char clip_rand[CLIP_RAND_HEX + 1] = "000000";
 // at that receiver (HEAR_PUSH_AUTH_BEARER=0 in secrets.h) keeps working unchanged.
 #define HEAR_PUSH_AUTH_BEARER       1
 #endif
+#ifndef HEAR_SPOOL
+#define HEAR_SPOOL                  1
+#endif
 #ifndef HEAR_PUSH_WRAP_BATCH
 // The ingest Lambda expects one {"device_id":...,"messages":[...]} envelope per POST, not
 // hear_node's bare heartbeat/event object -- wrap it here so hear_push_payload.h's encoders
@@ -2689,6 +2693,24 @@ static char clip_rand[CLIP_RAND_HEX + 1] = "000000";
 #define HEAR_PUSH_EVENT_CLIP        1u
 #define HEAR_PUSH_EVENT_DETS        2u
 
+#if HEAR_SPOOL
+#define HEAR_SPOOL_FLUSH_MS         30000UL
+#define HEAR_SPOOL_MAX_SEGMENTS     48u
+#define HEAR_SPOOL_SEG_PATH_MAX     48u
+#define HEAR_SPOOL_RECORD_STAGE_MAX (HEAR_SPOOL_RECORD_HEADER_BYTES + HEAR_PUSH_BODY_MAX)
+#define HEAR_SPOOL_BATCH_RECORDS_MAX (HEAR_SPOOL_BATCH_MAX_ITEMS * HEAR_SPOOL_RECORD_STAGE_MAX)
+
+struct HearSpoolSegmentInfo {
+  char path[HEAR_SPOOL_SEG_PATH_MAX];
+  uint16_t gen;
+  uint16_t idx;
+  uint32_t first_seq;
+  uint32_t last_seq;
+  uint16_t records;
+  uint32_t size;
+};
+#endif
+
 struct HearPushEvent {
   bool pending;
   uint8_t type;
@@ -2705,6 +2727,31 @@ static uint32_t push_last_fail_log_ms = 0;
 static int push_last_code = 0;
 static uint32_t push_last_attempt_s = 0;
 static uint32_t push_last_ok_s = 0;
+
+#if HEAR_SPOOL
+static bool spool_enabled = false;
+static uint32_t spool_next_seq = 1;
+static uint32_t spool_batch_sequence = 1;
+static uint32_t spool_acked_seq = 0;
+static uint32_t spool_oldest_seq = 1;
+static uint32_t spool_backlog_records = 0;
+static uint32_t spool_next_send_ms = 0;
+static uint32_t spool_failures = 0;
+static int spool_last_code = 0;
+static uint32_t spool_last_attempt_s = 0;
+static uint32_t spool_last_ok_s = 0;
+static uint16_t spool_gen = 1;
+static uint16_t spool_next_segment_idx = 1;
+static size_t spool_segment_count = 0;
+static struct HearSpoolSegmentInfo spool_segments[HEAR_SPOOL_MAX_SEGMENTS];
+static uint8_t *spool_scan_buf = nullptr;
+static uint8_t spool_record_buf[HEAR_SPOOL_RECORD_STAGE_MAX];
+static char spool_event_json[HEAR_SPOOL_EVENT_JSON_MAX];
+static uint8_t spool_batch_records[HEAR_SPOOL_BATCH_RECORDS_MAX];
+static uint32_t spool_batch_seqs[HEAR_SPOOL_BATCH_MAX_ITEMS];
+static char spool_batch_body[HEAR_SPOOL_BATCH_BODY_MAX];
+static uint8_t spool_receipt_buf[HEAR_SPOOL_RECEIPT_MAX_BYTES + 1u];
+#endif
 
 static uint32_t push_backoff_ms() {
   uint32_t cap = HEAR_PUSH_RETRY_BASE_MS;
@@ -2736,6 +2783,440 @@ static void push_note_failure(const char *what, int code) {
 static bool push_now_utc(int64_t *utc_us) {
   return local_to_utc((uint64_t)esp_timer_get_time(), utc_us);
 }
+
+#if HEAR_SPOOL
+static uint32_t spool_backoff_ms() {
+  uint32_t cap = HEAR_PUSH_RETRY_BASE_MS;
+  for (uint32_t k = 1; k < spool_failures && cap < HEAR_PUSH_HEARTBEAT_MAX_MS; k++) {
+    cap = cap > HEAR_PUSH_HEARTBEAT_MAX_MS / 2 ? HEAR_PUSH_HEARTBEAT_MAX_MS : cap * 2;
+  }
+  uint32_t delay_ms = (uint32_t)random((long)cap + 1L);
+  return delay_ms ? delay_ms : 1;
+}
+
+static void spool_schedule_send(uint32_t delay_ms) {
+  spool_next_send_ms = millis() + delay_ms;
+}
+
+static bool spool_read_small_file(const char *path, uint8_t *out, size_t cap, size_t *len_out) {
+  if (len_out) *len_out = 0;
+  if (!path || !out || !cap || !SD.exists(path)) return false;
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+  size_t want = (size_t)f.size();
+  if (want > cap) { f.close(); return false; }
+  size_t got = f.read(out, want);
+  f.close();
+  if (got != want) return false;
+  if (len_out) *len_out = got;
+  return true;
+}
+
+static bool spool_write_small_file(const char *path, const uint8_t *buf, size_t len) {
+  if (!path || !buf || !len) return false;
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) return false;
+  bool ok = f.write(buf, len) == len;
+  f.flush();
+  f.close();
+  return ok;
+}
+
+static bool spool_parse_segment_name(const char *name, uint16_t *gen, uint16_t *idx) {
+  unsigned g = 0, i = 0;
+  const char *base = name;
+  const char *slash = strrchr(name, '/');
+  if (slash && slash[1]) base = slash + 1;
+  if (sscanf(base, "seg-%u-%u.spl", &g, &i) != 2) return false;
+  if (!g || !i || g > 0xffffu || i > 0xffffu) return false;
+  if (gen) *gen = (uint16_t)g;
+  if (idx) *idx = (uint16_t)i;
+  return true;
+}
+
+static void spool_sort_segments() {
+  for (size_t i = 1; i < spool_segment_count; ++i) {
+    struct HearSpoolSegmentInfo cur = spool_segments[i];
+    size_t j = i;
+    while (j > 0) {
+      const struct HearSpoolSegmentInfo &prev = spool_segments[j - 1u];
+      if (prev.gen < cur.gen || (prev.gen == cur.gen && prev.idx <= cur.idx)) break;
+      spool_segments[j] = spool_segments[j - 1u];
+      --j;
+    }
+    spool_segments[j] = cur;
+  }
+}
+
+static bool spool_rewrite_segment_prefix(const char *path, const uint8_t *buf, size_t len) {
+  char tmp[HEAR_SPOOL_SEG_PATH_MAX + 8];
+  snprintf(tmp, sizeof tmp, "%s.fix", path);
+  SD.remove(tmp);
+  File f = SD.open(tmp, FILE_WRITE);
+  if (!f) return false;
+  bool ok = f.write(buf, len) == len;
+  f.flush();
+  f.close();
+  if (!ok) { SD.remove(tmp); return false; }
+  SD.remove(path);
+  if (!SD.rename(tmp, path)) { SD.remove(tmp); return false; }
+  return true;
+}
+
+static bool spool_scan_segments(bool repair_tail) {
+  if (!sd_ok || !spool_scan_buf) return false;
+  spool_segment_count = 0;
+  spool_backlog_records = 0;
+  spool_next_seq = 1;
+  spool_oldest_seq = 0;
+  File dir = SD.open(HEAR_SPOOL_DIR);
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    SD.mkdir(HEAR_SPOOL_DIR);
+    return true;
+  }
+  for (;;) {
+    File ent = dir.openNextFile();
+    if (!ent) break;
+    if (!ent.isDirectory() && spool_segment_count < HEAR_SPOOL_MAX_SEGMENTS) {
+      uint16_t gen = 0, idx = 0;
+      if (spool_parse_segment_name(ent.name(), &gen, &idx)) {
+        struct HearSpoolSegmentInfo &seg = spool_segments[spool_segment_count++];
+        memset(&seg, 0, sizeof seg);
+        snprintf(seg.path, sizeof seg.path, "%s", ent.name());
+        seg.gen = gen;
+        seg.idx = idx;
+        seg.size = (uint32_t)ent.size();
+      }
+    }
+    ent.close();
+  }
+  dir.close();
+  if (!spool_segment_count) {
+    spool_gen = 1;
+    spool_next_segment_idx = 1;
+    spool_oldest_seq = spool_acked_seq + 1u;
+    return true;
+  }
+  spool_sort_segments();
+  spool_gen = spool_segments[spool_segment_count - 1u].gen;
+  spool_next_segment_idx = spool_segments[spool_segment_count - 1u].idx + 1u;
+  for (size_t i = 0; i < spool_segment_count; ++i) {
+    struct HearSpoolSegmentInfo &seg = spool_segments[i];
+    File f = SD.open(seg.path, FILE_READ);
+    if (!f) return false;
+    size_t len = (size_t)f.size();
+    if (len > HEAR_SPOOL_SEGMENT_MAX_BYTES) { f.close(); return false; }
+    size_t got = f.read(spool_scan_buf, len);
+    f.close();
+    if (got != len) return false;
+    hear_spool_scan_result_t scan = {};
+    if (!hear_spool_scan_segment(spool_scan_buf, len, &scan)) return false;
+    if (scan.status == HEAR_SPOOL_SCAN_UNSUPPORTED_FMT) return false;
+    if (repair_tail && i + 1u == spool_segment_count && scan.status == HEAR_SPOOL_SCAN_TORN_TAIL &&
+        scan.truncate_offset < len) {
+      if (!spool_rewrite_segment_prefix(seg.path, spool_scan_buf, scan.truncate_offset)) return false;
+      len = scan.truncate_offset;
+    } else if (scan.status == HEAR_SPOOL_SCAN_TORN_TAIL) {
+      len = scan.last_good_end;
+    }
+    size_t off = 0;
+    while (off < len) {
+      hear_spool_record_view_t rec;
+      int rc = hear_spool_record_parse(spool_scan_buf + off, len - off, &rec);
+      if (rc == HEAR_SPOOL_RECORD_OK) {
+        size_t rec_bytes = HEAR_SPOOL_RECORD_HEADER_BYTES + (size_t)rec.len;
+        if (!seg.records) seg.first_seq = rec.seq;
+        seg.last_seq = rec.seq;
+        seg.records++;
+        seg.size = (uint32_t)len;
+        if (rec.seq >= spool_next_seq) spool_next_seq = rec.seq + 1u;
+        if (rec.seq > spool_acked_seq) {
+          spool_backlog_records++;
+          if (!spool_oldest_seq || rec.seq < spool_oldest_seq) spool_oldest_seq = rec.seq;
+        }
+        off += rec_bytes;
+        continue;
+      }
+      size_t next = hear_spool_find_next_valid_record(spool_scan_buf, len, off + 1u);
+      if (next >= len) break;
+      off = next;
+    }
+  }
+  if (!spool_backlog_records) spool_oldest_seq = spool_acked_seq + 1u;
+  return true;
+}
+
+static void spool_load_watermark() {
+  uint8_t a[HEAR_SPOOL_WATERMARK_BYTES] = {0};
+  uint8_t b[HEAR_SPOOL_WATERMARK_BYTES] = {0};
+  size_t la = 0, lb = 0;
+  hear_spool_watermark_t wm = {};
+  spool_acked_seq = 0;
+  spool_oldest_seq = 1;
+  spool_read_small_file(HEAR_SPOOL_ACK_A_PATH, a, sizeof a, &la);
+  spool_read_small_file(HEAR_SPOOL_ACK_B_PATH, b, sizeof b, &lb);
+  if (hear_spool_watermark_choose(a, la, b, lb, &wm, 0)) {
+    spool_acked_seq = wm.acked_seq;
+    spool_oldest_seq = wm.oldest_seq ? wm.oldest_seq : (wm.acked_seq + 1u);
+  }
+}
+
+static bool spool_apply_watermark(const hear_spool_batch_plan_t *batch, const uint8_t *receipt_body,
+                                  size_t receipt_len) {
+  uint8_t slot_a[HEAR_SPOOL_WATERMARK_BYTES] = {0};
+  uint8_t slot_b[HEAR_SPOOL_WATERMARK_BYTES] = {0};
+  uint8_t planned[HEAR_SPOOL_WATERMARK_BYTES] = {0};
+  size_t la = 0, lb = 0;
+  int target = -1;
+  hear_spool_batch_plan_t receipt_plan = {};
+  spool_read_small_file(HEAR_SPOOL_ACK_A_PATH, slot_a, sizeof slot_a, &la);
+  spool_read_small_file(HEAR_SPOOL_ACK_B_PATH, slot_b, sizeof slot_b, &lb);
+  if (!hear_spool_plan_watermark_advance(slot_a, la, slot_b, lb, boot_id, batch->batch_id,
+                                         receipt_body, receipt_len, spool_batch_seqs,
+                                         batch->item_count,
+                                         planned, sizeof planned, &target, &receipt_plan))
+    return false;
+  const char *path = target == 0 ? HEAR_SPOOL_ACK_A_PATH : HEAR_SPOOL_ACK_B_PATH;
+  if (!spool_write_small_file(path, planned, sizeof planned)) return false;
+  spool_acked_seq = receipt_plan.acked_seq;
+  spool_oldest_seq = receipt_plan.oldest_seq;
+  return true;
+}
+
+static void spool_prune_acked_segments() {
+  for (size_t i = 0; i < spool_segment_count; ++i) {
+    if (spool_segments[i].records && spool_segments[i].last_seq <= spool_acked_seq) {
+      SD.remove(spool_segments[i].path);
+    }
+  }
+  spool_scan_segments(false);
+}
+
+static bool spool_append_event(const struct HearPushEvent *src) {
+  if (!spool_enabled || !sd_ok || !src) return false;
+  hear_push_event_t ev = {};
+  push_fill_event(src, &ev);
+  int wrote = hear_spool_event_record_encode(&ev, spool_next_seq, spool_event_json,
+                                             sizeof spool_event_json, spool_record_buf,
+                                             sizeof spool_record_buf);
+  if (wrote <= 0) return false;
+  size_t need = (size_t)wrote;
+  if (!sd_cache_prune(need, NULL) && !sd_cache_above_target(need)) return false;
+  char path[HEAR_SPOOL_SEG_PATH_MAX];
+  if (!spool_segment_count ||
+      spool_segments[spool_segment_count - 1u].size + need > HEAR_SPOOL_SEGMENT_MAX_BYTES) {
+    snprintf(path, sizeof path, HEAR_SPOOL_DIR "/seg-%04u-%04u.spl", (unsigned)spool_gen,
+             (unsigned)spool_next_segment_idx++);
+  } else {
+    snprintf(path, sizeof path, "%s", spool_segments[spool_segment_count - 1u].path);
+  }
+  File f = SD.open(path, FILE_APPEND);
+  if (!f) return false;
+  bool ok = f.write(spool_record_buf, need) == need;
+  f.flush();
+  f.close();
+  if (!ok) return false;
+  if (!spool_segment_count || strcmp(spool_segments[spool_segment_count - 1u].path, path) != 0) {
+    if (spool_segment_count >= HEAR_SPOOL_MAX_SEGMENTS) return spool_scan_segments(false);
+    struct HearSpoolSegmentInfo &seg = spool_segments[spool_segment_count++];
+    memset(&seg, 0, sizeof seg);
+    snprintf(seg.path, sizeof seg.path, "%s", path);
+    seg.gen = spool_gen;
+    seg.idx = spool_next_segment_idx - 1u;
+    seg.first_seq = spool_next_seq;
+  }
+  struct HearSpoolSegmentInfo &seg = spool_segments[spool_segment_count - 1u];
+  if (!seg.records) seg.first_seq = spool_next_seq;
+  seg.last_seq = spool_next_seq;
+  seg.records++;
+  seg.size += (uint32_t)need;
+  if (!spool_backlog_records) spool_oldest_seq = spool_next_seq;
+  spool_backlog_records++;
+  spool_next_seq++;
+  if (spool_backlog_records >= HEAR_SPOOL_BATCH_MAX_ITEMS) spool_schedule_send(1);
+  else if (!spool_next_send_ms) spool_schedule_send(HEAR_SPOOL_FLUSH_MS);
+  return true;
+}
+
+static bool spool_collect_batch(hear_spool_batch_plan_t *plan, size_t *body_len_out) {
+  size_t agg_len = 0;
+  uint32_t gathered = 0;
+  char sent_at[40];
+  int64_t utc_us = 0;
+  bool have_utc = push_now_utc(&utc_us);
+  if (!plan || !body_len_out || !spool_segment_count || !spool_scan_buf) return false;
+  if (!hear_push_ts_field(have_utc ? 1 : 0, have_utc ? utc_us : 0, sent_at, sizeof sent_at))
+    return false;
+  for (size_t i = 0; i < spool_segment_count; ++i) {
+    const struct HearSpoolSegmentInfo &seg = spool_segments[i];
+    File f = SD.open(seg.path, FILE_READ);
+    if (!f) return false;
+    size_t len = (size_t)f.size();
+    if (len > HEAR_SPOOL_SEGMENT_MAX_BYTES) { f.close(); return false; }
+    size_t got = f.read(spool_scan_buf, len);
+    f.close();
+    if (got != len) return false;
+    hear_spool_scan_result_t scan = {};
+    if (!hear_spool_scan_segment(spool_scan_buf, len, &scan) ||
+        scan.status == HEAR_SPOOL_SCAN_UNSUPPORTED_FMT)
+      return false;
+    if (scan.status == HEAR_SPOOL_SCAN_TORN_TAIL) len = scan.last_good_end;
+    size_t off = 0;
+    while (off < len) {
+      hear_spool_record_view_t rec;
+      int rc = hear_spool_record_parse(spool_scan_buf + off, len - off, &rec);
+      if (rc == HEAR_SPOOL_RECORD_OK) {
+        size_t rec_bytes = HEAR_SPOOL_RECORD_HEADER_BYTES + (size_t)rec.len;
+        if (rec.seq > spool_acked_seq) {
+          if (gathered < HEAR_SPOOL_BATCH_MAX_ITEMS) {
+            if (rec_bytes > HEAR_SPOOL_RECORD_STAGE_MAX ||
+                agg_len + rec_bytes > sizeof spool_batch_records)
+              return false;
+            memcpy(spool_batch_records + agg_len, spool_scan_buf + off, rec_bytes);
+            agg_len += rec_bytes;
+            gathered++;
+          }
+        }
+        off += rec_bytes;
+        continue;
+      }
+      size_t next = hear_spool_find_next_valid_record(spool_scan_buf, len, off + 1u);
+      if (next >= len) break;
+      off = next;
+    }
+    if (gathered >= HEAR_SPOOL_BATCH_MAX_ITEMS) break;
+  }
+  if (!gathered) return false;
+  int n = hear_spool_build_batch_from_records(spool_batch_records, agg_len, node_id, boot_id,
+                                              have_utc ? clock_boot_epoch_us() : 0, sent_at,
+                                              spool_batch_sequence++, spool_backlog_records,
+                                              spool_batch_body, sizeof spool_batch_body,
+                                              spool_batch_seqs, HEAR_SPOOL_BATCH_MAX_ITEMS, plan);
+  if (n <= 0) return false;
+  *body_len_out = (size_t)n;
+  return true;
+}
+
+static bool spool_post_batch(const char *body, size_t body_len, const char *idempotency_key,
+                             int *code_out, size_t *receipt_len_out) {
+  boot_wdt_service();
+  if (code_out) *code_out = -2;
+  if (receipt_len_out) *receipt_len_out = 0;
+  if (!sta_ok || WiFi.status() != WL_CONNECTED || !body || !body_len || !idempotency_key)
+    return false;
+  const char *push_host = push_host_runtime();
+  const char *push_token = push_token_runtime();
+  if (!push_host[0] || !push_token[0]) return false;
+#if HEAR_PUSH_TLS
+  WiFiClientSecure client;
+#if HEAR_PUSH_TLS_INSECURE
+  client.setInsecure();
+#else
+  client.setCACert(HEAR_PUSH_CA_CERT);
+#endif
+#else
+  WiFiClient client;
+#endif
+  client.setNoDelay(true);
+  if (!client.connect(push_host, HEAR_PUSH_PORT, HEAR_PUSH_CONNECT_TIMEOUT_MS)) {
+    if (code_out) *code_out = -4;
+    return false;
+  }
+  static char req[HEAR_SPOOL_BATCH_BODY_MAX + HEAR_PUSH_REQ_HEADER_MAX + 256u];
+  int n = snprintf(req, sizeof req,
+                   "POST %s HTTP/1.1\r\n"
+                   "Host: %s:%u\r\n"
+                   "Content-Type: %s\r\n"
+                   "Accept: %s\r\n"
+                   "Connection: close\r\n"
+                   "Authorization: Bearer %s\r\n"
+                   "Idempotency-Key: %s\r\n"
+                   "Content-Length: %u\r\n\r\n%.*s",
+                   HEAR_SPOOL_BATCH_PATH, push_host, (unsigned)HEAR_PUSH_PORT,
+                   HEAR_SPOOL_BATCH_MEDIA_TYPE, HEAR_SPOOL_RECEIPT_MEDIA_TYPE, push_token,
+                   idempotency_key, (unsigned)body_len, (int)body_len, body);
+  if (n <= 0 || n >= (int)sizeof req) {
+    client.stop();
+    if (code_out) *code_out = -3;
+    return false;
+  }
+  size_t wrote = client.write((const uint8_t *)req, (size_t)n);
+  if (wrote != (size_t)n) {
+    client.stop();
+    if (code_out) *code_out = -5;
+    return false;
+  }
+  client.setTimeout(HEAR_PUSH_READ_TIMEOUT_MS);
+  String status_line = client.readStringUntil('\n');
+  int code = -6;
+  if (status_line.length() >= 12 && status_line.startsWith("HTTP/1.")) {
+    code = status_line.substring(9, 12).toInt();
+    if (code < 100 || code > 599) code = -7;
+  }
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r" || line.length() == 0) break;
+  }
+  size_t receipt_len = client.readBytes((char *)spool_receipt_buf, HEAR_SPOOL_RECEIPT_MAX_BYTES);
+  spool_receipt_buf[receipt_len] = 0;
+  client.stop();
+  if (code_out) *code_out = code;
+  if (receipt_len_out) *receipt_len_out = receipt_len;
+  return code >= 200 && code < 300;
+}
+
+static void spool_init() {
+  spool_enabled = false;
+  spool_segment_count = 0;
+  spool_next_seq = 1;
+  spool_batch_sequence = 1;
+  spool_backlog_records = 0;
+  spool_next_send_ms = 0;
+  spool_failures = 0;
+  spool_last_code = 0;
+  spool_last_attempt_s = 0;
+  spool_last_ok_s = 0;
+  if (!sd_ok) return;
+  if (!SD.exists(HEAR_SPOOL_DIR)) SD.mkdir(HEAR_SPOOL_DIR);
+  if (!spool_scan_buf) spool_scan_buf = (uint8_t *)heap_caps_malloc(
+      HEAR_SPOOL_SEGMENT_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!spool_scan_buf) return;
+  spool_load_watermark();
+  if (!spool_scan_segments(true)) return;
+  spool_enabled = true;
+  if (spool_backlog_records) spool_schedule_send(HEAR_SPOOL_FLUSH_MS);
+}
+
+static void spool_pump() {
+  if (!spool_enabled || !sta_ok || WiFi.status() != WL_CONNECTED || !spool_backlog_records) return;
+  if (!push_token_runtime()[0]) return;
+  if (!spool_next_send_ms) spool_schedule_send(HEAR_SPOOL_FLUSH_MS);
+  if ((int32_t)(millis() - spool_next_send_ms) < 0 && spool_backlog_records < HEAR_SPOOL_BATCH_MAX_ITEMS)
+    return;
+  hear_spool_batch_plan_t plan = {};
+  size_t body_len = 0, receipt_len = 0;
+  if (!spool_collect_batch(&plan, &body_len)) return;
+  int code = 0;
+  spool_last_attempt_s = push_uptime_s();
+  if (!spool_post_batch(spool_batch_body, body_len, plan.idempotency_key, &code, &receipt_len)) {
+    spool_failures++;
+    spool_last_code = code;
+    spool_schedule_send(spool_backoff_ms());
+    return;
+  }
+  spool_last_code = code;
+  if (!spool_apply_watermark(&plan, spool_receipt_buf, receipt_len)) {
+    spool_schedule_send(HEAR_SPOOL_FLUSH_MS);
+    return;
+  }
+  spool_last_ok_s = spool_last_attempt_s;
+  spool_failures = 0;
+  spool_prune_acked_segments();
+  if (spool_backlog_records) spool_schedule_send(1);
+  else spool_next_send_ms = 0;
+}
+#endif
 
 static void push_fill_heartbeat(hear_push_heartbeat_t *hb) {
   uint64_t nowl = (uint64_t)esp_timer_get_time();
@@ -2912,6 +3393,9 @@ static void push_mark_clip_written(const char *path) {
   push_clip_event.seq = clip_written;
   push_clip_event.batch_rows = 0;
   snprintf(push_clip_event.clip_basename, sizeof push_clip_event.clip_basename, "%s", base);
+#if HEAR_SPOOL
+  spool_append_event(&push_clip_event);
+#endif
 }
 
 static void push_mark_dets_ready(uint32_t batch_rows) {
@@ -2921,6 +3405,9 @@ static void push_mark_dets_ready(uint32_t batch_rows) {
   push_dets_event.seq = det_flushed;
   push_dets_event.batch_rows = batch_rows;
   push_dets_event.clip_basename[0] = 0;
+#if HEAR_SPOOL
+  spool_append_event(&push_dets_event);
+#endif
 }
 
 static bool push_send_heartbeat() {
@@ -5184,6 +5671,9 @@ void setup() {
   // reset instead of a silent dead node that never reaches healthy or marks the partition bad.
   loop_wdt_arm(5000);
   push_init();
+#if HEAR_SPOOL
+  spool_init();
+#endif
 }
 
 // ---------------------------------------------------------------- detections -> card
@@ -5870,6 +6360,9 @@ void loop() {
 
   if (prov.n > 0) hear_boot_tick(sta_ok);          // reachability is the sketch's to answer, not the library's
   push_pump();
+#if HEAR_SPOOL
+  spool_pump();
+#endif
 
   static uint32_t last = 0;
   if (millis() - last > 30000) {
