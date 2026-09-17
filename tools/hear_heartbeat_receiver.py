@@ -3309,7 +3309,12 @@ def make_handler(store: HeartbeatReceiverStore,
                         retryable=True,
                         headers={"Retry-After": "5"},
                     )
-                self.require_idempotency_key()
+                # No Idempotency-Key here on purpose: docs/phase4-push-clip-upload.md gives chunk
+                # PUT its own dedup key -- X-Hear-Chunk-SHA256 plus the byte range implied by
+                # chunk_index -- and clipupload.py has no chunk_idempotency_key to match, unlike
+                # init/complete. Requiring one here rejected every spec-conformant firmware chunk
+                # with 400 idempotency_key_missing (real hardware hit this; the test suite's
+                # shared request helper always sent one, so it never caught it here).
                 self.send_adapter_response(batch_adapter.clip_chunk(
                     upload_id=chunk.group(1),
                     chunk_index=int(chunk.group(2)),
