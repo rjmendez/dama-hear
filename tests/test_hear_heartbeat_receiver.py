@@ -18,6 +18,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hear import clips as CL  # noqa: E402
 from hear.ingest import batch as BA  # noqa: E402
+from hear.ingest import clipupload as CU  # noqa: E402
 from hear.ingest import envelope as EV  # noqa: E402
 from hear.privacy import purge as PP  # noqa: E402
 from tests import privacy_signals as SIG  # noqa: E402
@@ -454,7 +455,7 @@ def _batch_credentials(tmp_path):
                 "site_id": GEN.BASE["site_id"],
                 "scope": "device",
                 "device_id": GEN.DEVICE_ID,
-                "permissions": ["ingest:write"],
+                "permissions": ["ingest:write", "clip:write"],
                 "key_id": "k-2026-09",
                 "token_sha256": hashlib.sha256(b"node-secret").hexdigest(),
             },
@@ -462,7 +463,7 @@ def _batch_credentials(tmp_path):
                 "principal_id": "svc:hear-drain-shadow",
                 "site_id": GEN.BASE["site_id"],
                 "scope": "site",
-                "permissions": ["ingest:write"],
+                "permissions": ["ingest:write", "clip:write"],
                 "key_id": "k-2026-09",
                 "token_sha256": hashlib.sha256(b"site-secret").hexdigest(),
             },
@@ -739,6 +740,219 @@ class TestBatchIngestRoute:
         assert receipt["counts"]["accepted"] == 3
         assert CL.read_index(str(pool_root)) == {}
         assert not os.path.exists(pool_root / "clips" / PP.RECEIPT_NAME)
+
+
+class TestClipUploadRoute:
+    @staticmethod
+    def _init_body(*, basename: str, wav_bytes: bytes, source: str = "psram_ring"):
+        parts = CL.parse_clip_name("/clips/%s" % basename)
+        return {
+            "upload_schema_version": 1,
+            "device_id": parts["node"],
+            "node": parts["node"],
+            "boot": parts["boot"],
+            "sample": parts["sample"],
+            "clip_basename": parts["basename"],
+            "clip_bytes": len(wav_bytes),
+            "chunk_bytes": CU.CHUNK_BYTES,
+            "upload_source": source,
+            "upload_id": CU.upload_id(parts["node"], parts["boot"], parts["sample"]),
+        }
+
+    @staticmethod
+    def _request(url, *, method, data=b"", token="node-secret", headers=None):
+        return urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Idempotency-Key": "idem-clip",
+                **(headers or {}),
+            },
+            method=method,
+        )
+
+    def _upload_chunks(self, base_url, upload_id, wav_bytes):
+        for idx in range(CU.chunk_count(len(wav_bytes))):
+            start, end = CU.chunk_span(idx, len(wav_bytes))
+            chunk = wav_bytes[start:end]
+            req = self._request(
+                f"{base_url}/v1/ingest/clips/{upload_id}/chunks/{idx}",
+                method="PUT",
+                data=chunk,
+                headers={
+                    "Content-Type": CU.CHUNK_MEDIA_TYPE,
+                    CU.CHUNK_DIGEST_HEADER: hashlib.sha256(chunk).hexdigest(),
+                },
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                assert resp.status == 200
+
+    def test_clip_upload_promotes_clean_audio_only_after_complete(self, tmp_path):
+        db = tmp_path / "heartbeats.sqlite3"
+        durable = HR.make_durable_store("sqlite", str(db))
+        pool_root = tmp_path / "pool" / "corpus"
+        adapter = _batch_adapter(tmp_path, durable, pool_root=pool_root, vad=PP.BandEnergyVAD())
+        wav_bytes = SIG.wav_bytes(SIG.gaussian_noise(seconds=1.0, fs=SIG.MODEL_RATE),
+                                  fs=SIG.MODEL_RATE)
+        init = self._init_body(
+            basename="nyquist-00002a9f13c0-0240479160.wav",
+            wav_bytes=wav_bytes,
+        )
+        with running_server(durable_store=durable, batch_adapter=adapter) as (
+            base_url, _fake, _addr, _server,
+        ):
+            req = self._request(
+                base_url + CU.INIT_ROUTE,
+                method="POST",
+                data=json.dumps(init).encode("utf-8"),
+                headers={"Content-Type": CU.INIT_MEDIA_TYPE},
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                assert resp.status == 201
+                receipt = json.loads(resp.read().decode("utf-8"))
+            assert receipt["state"] == CU.STATE_OPEN
+            assert CL.read_index(str(pool_root)) == {}
+            self._upload_chunks(base_url, init["upload_id"], wav_bytes)
+            assert CL.read_index(str(pool_root)) == {}
+            done = {
+                "upload_schema_version": 1,
+                "clip_bytes": len(wav_bytes),
+                "sha256": hashlib.sha256(wav_bytes).hexdigest(),
+            }
+            req = self._request(
+                f"{base_url}/v1/ingest/clips/{init['upload_id']}/complete",
+                method="POST",
+                data=json.dumps(done).encode("utf-8"),
+                headers={"Content-Type": CU.COMPLETE_MEDIA_TYPE,
+                         "Idempotency-Key": "idem-clip-complete"},
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                assert resp.status == 200
+                receipt = json.loads(resp.read().decode("utf-8"))
+        assert receipt["state"] == CU.STATE_PROMOTED
+        idx = CL.read_index(str(pool_root))
+        assert list(idx) == [init["upload_id"]]
+        assert idx[init["upload_id"]]["path"].endswith(init["clip_basename"])
+        staging = tmp_path / "batch-raw" / "clip_uploads"
+        assert not staging.exists() or not [p for p in staging.rglob("*") if p.is_file()]
+        with sqlite3.connect(db) as con:
+            stored = json.loads(
+                con.execute("SELECT envelope_json FROM batch_events").fetchone()[0]
+            )
+        assert "wav_b64" not in stored["payload"]
+
+    def test_clip_upload_purges_speech_without_corpus_write(self, tmp_path):
+        durable = HR.make_durable_store("sqlite", str(tmp_path / "heartbeats.sqlite3"))
+        pool_root = tmp_path / "pool" / "corpus"
+        adapter = _batch_adapter(tmp_path, durable, pool_root=pool_root, vad=PP.BandEnergyVAD())
+        wav_bytes = SIG.wav_bytes(SIG.speech_like(seconds=1.0, fs=SIG.MODEL_RATE),
+                                  fs=SIG.MODEL_RATE)
+        init = self._init_body(
+            basename="nyquist-00002a9f13c0-0240479161.wav",
+            wav_bytes=wav_bytes,
+        )
+        with running_server(durable_store=durable, batch_adapter=adapter) as (
+            base_url, _fake, _addr, _server,
+        ):
+            with urllib.request.urlopen(self._request(
+                base_url + CU.INIT_ROUTE,
+                method="POST",
+                data=json.dumps(init).encode("utf-8"),
+                headers={"Content-Type": CU.INIT_MEDIA_TYPE},
+            ), timeout=2):
+                pass
+            self._upload_chunks(base_url, init["upload_id"], wav_bytes)
+            done = {
+                "upload_schema_version": 1,
+                "clip_bytes": len(wav_bytes),
+                "sha256": hashlib.sha256(wav_bytes).hexdigest(),
+            }
+            with urllib.request.urlopen(self._request(
+                f"{base_url}/v1/ingest/clips/{init['upload_id']}/complete",
+                method="POST",
+                data=json.dumps(done).encode("utf-8"),
+                headers={"Content-Type": CU.COMPLETE_MEDIA_TYPE,
+                         "Idempotency-Key": "idem-clip-complete"},
+            ), timeout=2) as resp:
+                receipt = json.loads(resp.read().decode("utf-8"))
+        assert receipt["state"] == CU.STATE_PURGED
+        assert CL.read_index(str(pool_root)) == {}
+        receipts = PP.read_receipts(str(pool_root / "clips" / PP.RECEIPT_NAME))
+        assert len(receipts) == 1
+        assert receipts[0]["clip_key"] == init["upload_id"]
+        assert receipts[0]["audio_retained"] is False
+        assert not (pool_root / "clips" / init["clip_basename"]).exists()
+        staging = tmp_path / "batch-raw" / "clip_uploads"
+        assert not staging.exists() or not [p for p in staging.rglob("*") if p.is_file()]
+
+    def test_clip_upload_refuses_incomplete_complete_and_conflicting_chunk(self, tmp_path):
+        durable = HR.make_durable_store("sqlite", str(tmp_path / "heartbeats.sqlite3"))
+        adapter = _batch_adapter(tmp_path, durable, vad=PP.BandEnergyVAD())
+        wav_bytes = SIG.wav_bytes(SIG.gaussian_noise(seconds=1.0, fs=SIG.MODEL_RATE),
+                                  fs=SIG.MODEL_RATE)
+        init = self._init_body(
+            basename="nyquist-00002a9f13c0-0240479162.wav",
+            wav_bytes=wav_bytes,
+        )
+        with running_server(durable_store=durable, batch_adapter=adapter) as (
+            base_url, _fake, _addr, _server,
+        ):
+            with urllib.request.urlopen(self._request(
+                base_url + CU.INIT_ROUTE,
+                method="POST",
+                data=json.dumps(init).encode("utf-8"),
+                headers={"Content-Type": CU.INIT_MEDIA_TYPE},
+            ), timeout=2):
+                pass
+            complete = self._request(
+                f"{base_url}/v1/ingest/clips/{init['upload_id']}/complete",
+                method="POST",
+                data=json.dumps({
+                    "upload_schema_version": 1,
+                    "clip_bytes": len(wav_bytes),
+                    "sha256": hashlib.sha256(wav_bytes).hexdigest(),
+                }).encode("utf-8"),
+                headers={"Content-Type": CU.COMPLETE_MEDIA_TYPE,
+                         "Idempotency-Key": "idem-clip-complete"},
+            )
+            with pytest.raises(urllib.error.HTTPError) as ei:
+                urllib.request.urlopen(complete, timeout=2)
+            assert ei.value.code == 422
+            body = json.loads(ei.value.read().decode("utf-8"))
+            assert body["code"] == "clip_bytes_incomplete"
+
+            start, end = CU.chunk_span(0, len(wav_bytes))
+            chunk = wav_bytes[start:end]
+            url = f"{base_url}/v1/ingest/clips/{init['upload_id']}/chunks/0"
+            with urllib.request.urlopen(self._request(
+                url,
+                method="PUT",
+                data=chunk,
+                headers={"Content-Type": CU.CHUNK_MEDIA_TYPE,
+                         CU.CHUNK_DIGEST_HEADER: hashlib.sha256(chunk).hexdigest()},
+            ), timeout=2):
+                pass
+            with urllib.request.urlopen(self._request(
+                url,
+                method="PUT",
+                data=chunk,
+                headers={"Content-Type": CU.CHUNK_MEDIA_TYPE,
+                         CU.CHUNK_DIGEST_HEADER: hashlib.sha256(chunk).hexdigest()},
+            ), timeout=2) as resp:
+                assert resp.status == 200
+            changed = bytes([chunk[0] ^ 0x01]) + chunk[1:]
+            with pytest.raises(urllib.error.HTTPError) as conflict:
+                urllib.request.urlopen(self._request(
+                    url,
+                    method="PUT",
+                    data=changed,
+                    headers={"Content-Type": CU.CHUNK_MEDIA_TYPE,
+                             CU.CHUNK_DIGEST_HEADER: hashlib.sha256(changed).hexdigest()},
+                ), timeout=2)
+            assert conflict.value.code == 409
+            body = json.loads(conflict.value.read().decode("utf-8"))
+            assert body["code"] == "chunk_conflict"
 
     def test_bootstrap_promotion_backfills_an_already_accepted_clip_event(self, tmp_path):
         db = tmp_path / "heartbeats.sqlite3"

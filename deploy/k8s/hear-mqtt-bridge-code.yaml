@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-mqtt-bridge-code.yaml
-# apply-mode server: 301365 B serialised; 301630 B of annotations against a 262144 B cap.
+# apply-mode server: 339537 B serialised; 339808 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-mqtt-bridge
   annotations:
-    dama-hear/commit: '15224e1'
-    dama-hear/source-sha256: 'faa72d60f45c40141b4795461f990335c9d7d6c2b7f51d4013a02727357b33d9'
+    dama-hear/commit: '804a371-dirty'
+    dama-hear/source-sha256: '9352d52ce1062b9935fc4972ff80c5b53f0cbef7b37ea413ec8ff923a46f88b1'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '301365'
+    dama-hear/serialised-bytes: '339537'
 data:
   hear__init__.py: |
     
@@ -2559,6 +2559,316 @@ data:
                 lines.extend(self._metrics[definition.name].render())
             return ("\n".join(lines) + "\n").encode("utf-8")
     
+  hear_ingest_clipupload.py: |
+    """Canonical `hear.ingest.clip.v1` chunked WAV upload contract: push-only clip ingestion.
+    
+    This is the *wire contract* for moving one 5.0 s clip (480,044 B nominal) from a node to the
+    pool over HTTPS, in bounded chunks, without `tools/hear_drain.py` ever pulling it. It is a
+    contract, not an adapter: nothing here opens a socket, names a host, touches the filesystem,
+    Redis, SQLite or PostgreSQL, scores audio, or deletes anything. The operational specification
+    is `docs/phase4-push-clip-upload.md` and the decision record is
+    `docs/decisions/0012-push-only-chunked-clip-upload.md`.
+    
+    Five rules carry the weight, and each has a test in `tests/test_clip_upload_contract.py`:
+    
+    1. **Identity is the name, not the bytes.** `upload_id == hear.clips.clip_key(node, boot,
+       sample)`, so a retry after reboot, a re-init from a different session, or a duplicate
+       submission converge on one upload instead of minting a second copy of the same audio.
+       The body `sha256` is an integrity field, checked at `complete`, never identity.
+    2. **A chunk is addressed, not appended.** `(upload_id, chunk_index)` names the byte range
+       exactly, so a `PUT` is idempotent, resumable and order-free. Re-`PUT`ting the same index
+       with different bytes is a conflict, never an overwrite.
+    3. **No SD card is required.** The source of record is declared (`psram_ring` or `sd`) and
+       the server treats both identically; a no-SD node streams the window straight out of its
+       PSRAM raw ring. Durability of the node-side copy is the node's business and is
+       best-effort by construction (`UPLOAD_SOURCES`).
+    4. **Nothing is promoted before it is scored.** `complete` assembles into a quarantine root
+       that is not the corpus and is not tagger-visible, then scores for human speech. Promotion
+       into the corpus and purge-with-receipt are the *only* two exits, and `NOT_SCORED`
+       fails closed to purge (`terminal_state_for_verdict`).
+    5. **A purged clip is terminal for its `clip_key`.** Re-initialising a purged upload is
+       refused with `clip_key_purged`, so the push lane cannot become a loop that re-transports
+       destroyed speech — the same rule `docs/silero-vad-privacy-contract.md` §6 puts on
+       `hear-drain`.
+    """
+    from __future__ import annotations
+    
+    import hashlib
+    import re
+    from typing import Dict, Mapping, Optional, Tuple
+    
+    CLIP_UPLOAD_SCHEMA_ID = "hear.ingest.clip.v1"
+    CLIP_UPLOAD_SCHEMA_MAJOR = 1
+    """The only `upload_schema_version` this contract defines. A larger major is refused whole."""
+    
+    # --------------------------------------------------------------------------- routes
+    
+    INIT_ROUTE = "/v1/ingest/clips"
+    UPLOAD_ROUTE_TEMPLATE = "/v1/ingest/clips/{upload_id}"
+    CHUNK_ROUTE_TEMPLATE = "/v1/ingest/clips/{upload_id}/chunks/{chunk_index}"
+    COMPLETE_ROUTE_TEMPLATE = "/v1/ingest/clips/{upload_id}/complete"
+    ABORT_ROUTE_TEMPLATE = "/v1/ingest/clips/{upload_id}"
+    
+    #: method -> route template, the closed set of this contract's request lines.
+    ROUTES: Tuple[Tuple[str, str], ...] = (
+        ("POST", INIT_ROUTE),
+        ("PUT", CHUNK_ROUTE_TEMPLATE),
+        ("POST", COMPLETE_ROUTE_TEMPLATE),
+        ("GET", UPLOAD_ROUTE_TEMPLATE),
+        ("DELETE", ABORT_ROUTE_TEMPLATE),
+    )
+    
+    INIT_MEDIA_TYPE = "application/vnd.dama.hear.ingest.clip-init.v1+json"
+    COMPLETE_MEDIA_TYPE = "application/vnd.dama.hear.ingest.clip-complete.v1+json"
+    STATUS_MEDIA_TYPE = "application/vnd.dama.hear.ingest.clip-status.v1+json"
+    CHUNK_MEDIA_TYPE = "application/octet-stream"
+    
+    #: Per-chunk integrity, hex lowercase sha256 of the chunk body. Required on every chunk PUT:
+    #: a truncated TLS write that still reports its own length is the failure this catches.
+    CHUNK_DIGEST_HEADER = "X-Hear-Chunk-SHA256"
+    #: Echoed request correlation id, per docs/api-boundaries.md.
+    REQUEST_ID_HEADER = "X-Request-ID"
+    IDEMPOTENCY_HEADER = "Idempotency-Key"
+    
+    # --------------------------------------------------------------------------- limits
+    
+    #: One chunk on the wire. 32 KiB is four times the device spool batch body (8192 B) and still
+    #: fits an ESP32 TLS write loop without heap pressure; 480,044 B is then 15 chunks.
+    MAX_CHUNK_BYTES = 32_768
+    #: Every chunk but the last is exactly this size, so an index is an offset and nothing has to
+    #: be reconstructed from arrival order.
+    CHUNK_BYTES = 32_768
+    #: Hard bound on one assembled clip. Above the 480,044 B nominal with room for a longer
+    #: window; a declared `clip_bytes` above it is refused at init, before a byte is accepted.
+    MAX_CLIP_BYTES = 524_288
+    #: ceil(MAX_CLIP_BYTES / CHUNK_BYTES). An index outside [0, MAX_CHUNKS) is refused.
+    MAX_CHUNKS = 16
+    #: A clip the firmware actually writes today: 5.0 s, 48 kHz, 16-bit mono, 44-byte header.
+    NOMINAL_CLIP_BYTES = 480_044
+    #: An upload that stops mid-flight is swept, staging and all, after this long.
+    UPLOAD_TTL_S = 3_600
+    #: Concurrent unfinished uploads one device may hold. Above it, init is 429.
+    MAX_OPEN_UPLOADS_PER_DEVICE = 4
+    
+    LIMITS: Dict[str, int] = {
+        "chunk_bytes": CHUNK_BYTES,
+        "max_chunk_bytes": MAX_CHUNK_BYTES,
+        "max_clip_bytes": MAX_CLIP_BYTES,
+        "max_chunks": MAX_CHUNKS,
+        "nominal_clip_bytes": NOMINAL_CLIP_BYTES,
+        "upload_ttl_s": UPLOAD_TTL_S,
+        "max_open_uploads_per_device": MAX_OPEN_UPLOADS_PER_DEVICE,
+    }
+    
+    #: Where the node read the window from. Declared, never inferred: a no-SD node
+    #: (`gold`, `ageev`, `kasami`) has only `psram_ring`, and the server must not read an absent
+    #: card as an absent clip.
+    UPLOAD_SOURCES: Tuple[str, ...] = ("psram_ring", "sd")
+    
+    #: Credential scopes. `ingest:write` alone does not authorize audio upload.
+    REQUIRED_SCOPES: Tuple[str, ...] = ("ingest:write", "clip:write")
+    
+    # --------------------------------------------------------------------------- state machine
+    
+    #: Non-terminal.
+    STATE_OPEN = "open"
+    STATE_RECEIVING = "receiving"
+    STATE_ASSEMBLING = "assembling"
+    STATE_SCORING = "scoring"
+    #: Terminal.
+    STATE_PROMOTED = "promoted"
+    STATE_PURGED = "purged"
+    STATE_REFUSED = "refused"
+    STATE_EXPIRED = "expired"
+    STATE_ABORTED = "aborted"
+    
+    STATES: Tuple[str, ...] = (
+        STATE_OPEN, STATE_RECEIVING, STATE_ASSEMBLING, STATE_SCORING,
+        STATE_PROMOTED, STATE_PURGED, STATE_REFUSED, STATE_EXPIRED, STATE_ABORTED,
+    )
+    TERMINAL_STATES: Tuple[str, ...] = (
+        STATE_PROMOTED, STATE_PURGED, STATE_REFUSED, STATE_EXPIRED, STATE_ABORTED,
+    )
+    #: A terminal state the node may treat as "stop holding this window, and never re-init it".
+    #: `refused` and `expired` are terminal for the *upload*; `purged` is terminal for the
+    #: `clip_key` itself (silero-vad-privacy-contract.md §6).
+    CLIP_KEY_TERMINAL_STATES: Tuple[str, ...] = (STATE_PROMOTED, STATE_PURGED)
+    
+    TRANSITIONS: Dict[str, Tuple[str, ...]] = {
+        STATE_OPEN: (STATE_RECEIVING, STATE_ASSEMBLING, STATE_EXPIRED, STATE_ABORTED, STATE_REFUSED),
+        STATE_RECEIVING: (STATE_RECEIVING, STATE_ASSEMBLING, STATE_EXPIRED, STATE_ABORTED,
+                          STATE_REFUSED),
+        STATE_ASSEMBLING: (STATE_SCORING, STATE_REFUSED, STATE_EXPIRED, STATE_ABORTED),
+        # No edge from `scoring` to `promoted` that does not pass a verdict, and no edge back to
+        # `receiving`: audio already in quarantine is never re-opened for more bytes.
+        STATE_SCORING: (STATE_PROMOTED, STATE_PURGED),
+        STATE_PROMOTED: (),
+        STATE_PURGED: (),
+        STATE_REFUSED: (),
+        STATE_EXPIRED: (),
+        STATE_ABORTED: (),
+    }
+    
+    #: VAD verdict (`docs/silero-vad-privacy-contract.md` §5) -> the only state it may produce.
+    #: `NOT_SCORED` fails closed: an unscored clip is purged, never promoted, never held.
+    VERDICT_TERMINAL_STATE: Dict[str, str] = {
+        "NO_SPEECH": STATE_PROMOTED,
+        "SPEECH_DETECTED": STATE_PURGED,
+        "NOT_SCORED": STATE_PURGED,
+    }
+    
+    #: Closed refusal vocabulary. A refusal is a durable, attributable result, not a log line.
+    REFUSAL_REASONS: Tuple[str, ...] = (
+        "upload_schema_version_unsupported",
+        "clip_bytes_invalid",
+        "chunk_bytes_invalid",
+        "chunk_index_out_of_range",
+        "chunk_length_mismatch",
+        "chunk_digest_mismatch",
+        "chunk_conflict",
+        "clip_name_invalid",
+        "clip_key_mismatch",
+        "device_identity_mismatch",
+        "upload_source_unknown",
+        "clip_bytes_incomplete",
+        "clip_sha256_mismatch",
+        "clip_not_riff",
+        "clip_header_rate_unsupported",
+        "clip_key_purged",
+        "clip_key_already_stored",
+        "upload_expired",
+        "credential_missing",
+        "scope_missing",
+        "quota_exceeded",
+        "store_unavailable",
+    )
+    
+    # --------------------------------------------------------------------------- identity
+    
+    _HEX32_RE = re.compile(r"[0-9a-f]{32}\Z")
+    _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+    
+    
+    def upload_id(node: str, boot: str, sample: int) -> str:
+        """The upload's identity, byte-identical to `hear.clips.clip_key(node, boot, sample)`.
+    
+        Kept here rather than imported so this contract module stays dependency-free; the two are
+        asserted equal by test, which is the only place the duplication is allowed to live.
+        """
+        h = hashlib.sha256()
+        for part in ("clip", node, boot, str(sample)):
+            h.update(part.encode())
+            h.update(b"\x1f")
+        return h.hexdigest()[:32]
+    
+    
+    def init_idempotency_key(device_id: str, upload: str) -> str:
+        """`Idempotency-Key` for init. Derived from identity, so a retry is the same key."""
+        return f"{device_id}.clipinit.{upload}"
+    
+    
+    def complete_idempotency_key(device_id: str, upload: str, sha256_hex: str) -> str:
+        """`Idempotency-Key` for complete. Carries the body hash: a completion claiming different
+        bytes for the same upload is a `409`, not a silent second assembly."""
+        return f"{device_id}.clipdone.{upload}.{sha256_hex[:16]}"
+    
+    
+    def chunk_count(clip_bytes: int, chunk_bytes: int = CHUNK_BYTES) -> int:
+        """How many chunks a clip of `clip_bytes` is cut into. Raises on an unusable declaration."""
+        if chunk_bytes <= 0 or chunk_bytes > MAX_CHUNK_BYTES:
+            raise ValueError("chunk_bytes_invalid")
+        if clip_bytes <= 0 or clip_bytes > MAX_CLIP_BYTES:
+            raise ValueError("clip_bytes_invalid")
+        return (clip_bytes + chunk_bytes - 1) // chunk_bytes
+    
+    
+    def chunk_span(chunk_index: int, clip_bytes: int, chunk_bytes: int = CHUNK_BYTES) -> Tuple[int, int]:
+        """Byte range `[start, end)` of one chunk. An index is an offset, never an arrival order."""
+        total = chunk_count(clip_bytes, chunk_bytes)
+        if chunk_index < 0 or chunk_index >= total:
+            raise ValueError("chunk_index_out_of_range")
+        start = chunk_index * chunk_bytes
+        return start, min(start + chunk_bytes, clip_bytes)
+    
+    
+    def expected_chunk_bytes(chunk_index: int, clip_bytes: int,
+                             chunk_bytes: int = CHUNK_BYTES) -> int:
+        """Exact `Content-Length` this chunk must carry. Every chunk but the last is full."""
+        start, end = chunk_span(chunk_index, clip_bytes, chunk_bytes)
+        return end - start
+    
+    
+    def is_terminal(state: str) -> bool:
+        return state in TERMINAL_STATES
+    
+    
+    def transition_allowed(current: str, nxt: str) -> bool:
+        """Whether the state machine has this edge. An unknown state is not an edge to anywhere."""
+        return nxt in TRANSITIONS.get(current, ())
+    
+    
+    def terminal_state_for_verdict(verdict: str) -> str:
+        """The one state a VAD verdict may produce. An unknown verdict fails closed to `purged`."""
+        return VERDICT_TERMINAL_STATE.get(verdict, STATE_PURGED)
+    
+    
+    def validate_init(body: Mapping[str, object], *,
+                      credential_device_id: Optional[str]) -> Optional[str]:
+        """Refusal reason for an init frame, or `None` when the frame is admissible.
+    
+        Field-shape only: it does not touch storage, does not decide whether the `clip_key` is
+        already terminal (that needs the index), and never repairs a field.
+        """
+        if credential_device_id is None:
+            return "credential_missing"
+        if body.get("upload_schema_version") != CLIP_UPLOAD_SCHEMA_MAJOR:
+            return "upload_schema_version_unsupported"
+        device_id = body.get("device_id")
+        if not isinstance(device_id, str) or device_id != credential_device_id:
+            return "device_identity_mismatch"
+        if body.get("upload_source") not in UPLOAD_SOURCES:
+            return "upload_source_unknown"
+        clip_bytes = body.get("clip_bytes")
+        if not isinstance(clip_bytes, int) or isinstance(clip_bytes, bool):
+            return "clip_bytes_invalid"
+        chunk = body.get("chunk_bytes", CHUNK_BYTES)
+        if not isinstance(chunk, int) or isinstance(chunk, bool):
+            return "chunk_bytes_invalid"
+        try:
+            chunk_count(clip_bytes, chunk)
+        except ValueError as exc:
+            return str(exc)
+        for field in ("node", "boot", "clip_basename"):
+            value = body.get(field)
+            if not isinstance(value, str) or not value:
+                return "clip_name_invalid"
+        sample = body.get("sample")
+        if not isinstance(sample, int) or isinstance(sample, bool) or sample < 0:
+            return "clip_name_invalid"
+        declared = body.get("upload_id")
+        if not isinstance(declared, str) or not _HEX32_RE.match(declared):
+            return "clip_key_mismatch"
+        if declared != upload_id(str(body["node"]), str(body["boot"]), sample):
+            return "clip_key_mismatch"
+        return None
+    
+    
+    def validate_complete(body: Mapping[str, object], *, bytes_received: int,
+                          chunks_received: int, expected_chunks: int,
+                          clip_bytes: int) -> Optional[str]:
+        """Refusal reason for a complete frame, or `None` when assembly may begin."""
+        if body.get("upload_schema_version") != CLIP_UPLOAD_SCHEMA_MAJOR:
+            return "upload_schema_version_unsupported"
+        sha = body.get("sha256")
+        if not isinstance(sha, str) or not _SHA256_RE.match(sha):
+            return "clip_sha256_mismatch"
+        declared = body.get("clip_bytes")
+        if declared != clip_bytes:
+            return "clip_bytes_invalid"
+        if chunks_received != expected_chunks or bytes_received != clip_bytes:
+            return "clip_bytes_incomplete"
+        return None
+    
   tools_hear_heartbeat_receiver.py: |
     #!/usr/bin/env python3
     """Tiny hear_node heartbeat/event receiver that writes Redis state.
@@ -2578,6 +2888,7 @@ data:
     import os
     from pathlib import Path
     import re
+    import shutil
     import socket
     import sqlite3
     import sys
@@ -2596,6 +2907,7 @@ data:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from hear.ingest import observability as IO
     from hear.ingest import batch as IB
+    from hear.ingest import clipupload as CU
     from hear.ingest import envelope as EV
     
     logger = logging.getLogger("hear-heartbeat")
@@ -2611,6 +2923,7 @@ data:
     BATCH_ALIAS_ROUTE = "/ingest/batch"
     BATCH_ADAPTER_NAME = "ingest-batch"
     BATCH_ADAPTER_VERSION = os.environ.get("HEAR_BATCH_ADAPTER_VERSION", "0.1.0")
+    CLIP_UPLOAD_ADAPTER_NAME = "clip-upload"
     
     
     DURABLE_BACKENDS = ("none", "sqlite", "postgres")
@@ -2743,6 +3056,10 @@ data:
         @property
         def can_ingest(self) -> bool:
             return "ingest:write" in self.permissions
+    
+        @property
+        def can_upload_clip(self) -> bool:
+            return self.can_ingest and "clip:write" in self.permissions
     
     
     @dataclass(frozen=True)
@@ -4571,6 +4888,314 @@ data:
             assert self.credential_store is not None
             return self.credential_store.authenticate(authorization)
     
+        def _authenticate_clip(self, authorization: Optional[str]) -> BatchCredential:
+            cred = self._authenticate(authorization)
+            if not cred.can_upload_clip:
+                raise ProblemDetailError(status=403, code="scope_missing",
+                                         detail="credential lacks ingest:write and clip:write")
+            return cred
+    
+        def _clip_root(self, cred: BatchCredential, upload_id: str) -> str:
+            if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+                raise ProblemDetailError(status=404, code="upload_not_found",
+                                         detail="clip upload was not found")
+            return os.path.join(self.raw_root, "clip_uploads", cred.site_id,
+                                cred.device_id or cred.principal_id, upload_id)
+    
+        @staticmethod
+        def _clip_meta_path(root: str) -> str:
+            return os.path.join(root, "meta.json")
+    
+        def _load_clip_meta(self, root: str) -> Dict[str, Any]:
+            try:
+                with open(self._clip_meta_path(root), "r", encoding="utf-8") as fh:
+                    meta = json.load(fh)
+            except FileNotFoundError as exc:
+                raise ProblemDetailError(status=404, code="upload_not_found",
+                                         detail="clip upload was not found") from exc
+            except ValueError as exc:
+                raise ProblemDetailError(status=503, code="store_unavailable",
+                                         detail="clip upload metadata is unreadable",
+                                         retryable=True,
+                                         headers={"Retry-After": "5"}) from exc
+            if not isinstance(meta, dict):
+                raise ProblemDetailError(status=503, code="store_unavailable",
+                                         detail="clip upload metadata is invalid",
+                                         retryable=True,
+                                         headers={"Retry-After": "5"})
+            return meta
+    
+        def _write_clip_meta(self, root: str, meta: Mapping[str, Any]) -> None:
+            os.makedirs(root, exist_ok=True)
+            self._write_json(self._clip_meta_path(root), meta)
+    
+        @staticmethod
+        def _clip_response(meta: Mapping[str, Any], *, request_id: str,
+                           status: int = 200) -> tuple[int, str, Dict[str, str]]:
+            body = {
+                "upload_schema_version": CU.CLIP_UPLOAD_SCHEMA_MAJOR,
+                "upload_id": meta.get("upload_id"),
+                "state": meta.get("state"),
+                "chunk_bytes": meta.get("chunk_bytes"),
+                "expected_chunks": meta.get("expected_chunks"),
+                "received_chunks": len(meta.get("chunks") or {}),
+                "received_bytes": meta.get("bytes_received", 0),
+            }
+            if meta.get("clip_key"):
+                body["clip_key"] = meta.get("clip_key")
+            if meta.get("pool_path"):
+                body["pool_path"] = meta.get("pool_path")
+            if meta.get("reason"):
+                body["reason"] = meta.get("reason")
+            return status, encode_json(body), {
+                "Content-Type": CU.STATUS_MEDIA_TYPE,
+                "X-Request-ID": request_id,
+            }
+    
+        def clip_init(self, *, raw: bytes, content_type: str, authorization: Optional[str],
+                      request_id: str) -> tuple[int, str, Dict[str, str]]:
+            store = self._require_store()
+            cred = self._authenticate_clip(authorization)
+            if content_type.split(";", 1)[0].strip().lower() not in (
+                CU.INIT_MEDIA_TYPE, "application/json",
+            ):
+                raise ProblemDetailError(status=415, code="unsupported_media_type",
+                                         detail="unsupported clip init media type")
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise ProblemDetailError(status=400, code="undecodable_body",
+                                         detail="clip init body is not UTF-8 JSON") from exc
+            if not isinstance(body, Mapping):
+                raise ProblemDetailError(status=400, code="not_an_object",
+                                         detail="clip init body must be a JSON object")
+            credential_device_id = str(body.get("device_id")) if cred.site_scoped else cred.device_id
+            reason = CU.validate_init(body, credential_device_id=credential_device_id)
+            if reason is not None:
+                raise ProblemDetailError(status=422, code=reason, detail="clip init was refused")
+            upload_id = str(body["upload_id"])
+            if self.promoter._receipt_exists(upload_id):
+                raise ProblemDetailError(status=409, code="clip_key_purged",
+                                         detail="clip key was already purged")
+            from hear import clips as clip_store
+            current = clip_store.read_index(self.promoter.pool_root).get(upload_id)
+            if current is not None and current.get("outcome") == "stored":
+                raise ProblemDetailError(status=409, code="clip_key_already_stored",
+                                         detail="clip key was already promoted")
+            root = self._clip_root(cred, upload_id)
+            chunk_bytes = int(body.get("chunk_bytes", CU.CHUNK_BYTES))
+            expected_chunks = CU.chunk_count(int(body["clip_bytes"]), chunk_bytes)
+            existing = None
+            try:
+                existing = self._load_clip_meta(root)
+            except ProblemDetailError as exc:
+                if exc.status != 404:
+                    raise
+            if existing is not None:
+                same = all(existing.get(key) == body.get(key) for key in (
+                    "device_id", "node", "boot", "sample", "clip_basename",
+                    "clip_bytes", "chunk_bytes", "upload_source", "upload_id",
+                ))
+                if not same:
+                    raise ProblemDetailError(status=409, code="idempotency_conflict",
+                                             detail="upload_id was reused with different metadata")
+                return self._clip_response(existing, request_id=request_id)
+            now = utc_now()
+            meta: Dict[str, Any] = {
+                "upload_schema_version": CU.CLIP_UPLOAD_SCHEMA_MAJOR,
+                "site_id": cred.site_id,
+                "principal_id": cred.principal_id,
+                "credential_scope": cred.scope,
+                "key_id": cred.key_id,
+                "device_id": str(body["device_id"]),
+                "node": str(body["node"]),
+                "boot": str(body["boot"]),
+                "sample": int(body["sample"]),
+                "clip_basename": str(body["clip_basename"]),
+                "clip_bytes": int(body["clip_bytes"]),
+                "chunk_bytes": chunk_bytes,
+                "expected_chunks": expected_chunks,
+                "upload_source": str(body["upload_source"]),
+                "upload_id": upload_id,
+                "state": CU.STATE_OPEN,
+                "chunks": {},
+                "bytes_received": 0,
+                "created_at": now,
+                "updated_at": now,
+            }
+            self._write_clip_meta(root, meta)
+            return self._clip_response(meta, request_id=request_id, status=201)
+    
+        def clip_status(self, *, upload_id: str, authorization: Optional[str],
+                        request_id: str) -> tuple[int, str, Dict[str, str]]:
+            cred = self._authenticate_clip(authorization)
+            meta = self._load_clip_meta(self._clip_root(cred, upload_id))
+            return self._clip_response(meta, request_id=request_id)
+    
+        def clip_chunk(self, *, upload_id: str, chunk_index: int, raw: bytes,
+                       content_type: str, chunk_sha256: Optional[str],
+                       authorization: Optional[str],
+                       request_id: str) -> tuple[int, str, Dict[str, str]]:
+            cred = self._authenticate_clip(authorization)
+            if content_type.split(";", 1)[0].strip().lower() != CU.CHUNK_MEDIA_TYPE:
+                raise ProblemDetailError(status=415, code="unsupported_media_type",
+                                         detail="unsupported clip chunk media type")
+            root = self._clip_root(cred, upload_id)
+            meta = self._load_clip_meta(root)
+            if CU.is_terminal(str(meta.get("state"))):
+                return self._clip_response(meta, request_id=request_id)
+            expected_len = CU.expected_chunk_bytes(
+                chunk_index, int(meta["clip_bytes"]), int(meta["chunk_bytes"]))
+            if len(raw) != expected_len:
+                raise ProblemDetailError(status=422, code="chunk_length_mismatch",
+                                         detail="clip chunk length did not match its byte range")
+            digest = hashlib.sha256(raw).hexdigest()
+            if chunk_sha256 != digest:
+                raise ProblemDetailError(status=422, code="chunk_digest_mismatch",
+                                         detail="clip chunk digest did not match")
+            chunks = dict(meta.get("chunks") or {})
+            existing = chunks.get(str(chunk_index))
+            if isinstance(existing, Mapping):
+                if existing.get("sha256") == digest and existing.get("bytes") == len(raw):
+                    return self._clip_response(meta, request_id=request_id)
+                raise ProblemDetailError(status=409, code="chunk_conflict",
+                                         detail="chunk index already has different bytes")
+            chunk_path = os.path.join(root, f"{chunk_index:04d}.chunk")
+            tmp = f"{chunk_path}.{os.getpid()}.tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(raw)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, chunk_path)
+            chunks[str(chunk_index)] = {"sha256": digest, "bytes": len(raw)}
+            meta["chunks"] = chunks
+            meta["bytes_received"] = int(meta.get("bytes_received") or 0) + len(raw)
+            meta["state"] = CU.STATE_RECEIVING
+            meta["updated_at"] = utc_now()
+            self._write_clip_meta(root, meta)
+            return self._clip_response(meta, request_id=request_id)
+    
+        def clip_complete(self, *, upload_id: str, raw: bytes, content_type: str,
+                          authorization: Optional[str],
+                          request_id: str) -> tuple[int, str, Dict[str, str]]:
+            store = self._require_store()
+            cred = self._authenticate_clip(authorization)
+            if content_type.split(";", 1)[0].strip().lower() not in (
+                CU.COMPLETE_MEDIA_TYPE, "application/json",
+            ):
+                raise ProblemDetailError(status=415, code="unsupported_media_type",
+                                         detail="unsupported clip complete media type")
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise ProblemDetailError(status=400, code="undecodable_body",
+                                         detail="clip complete body is not UTF-8 JSON") from exc
+            if not isinstance(body, Mapping):
+                raise ProblemDetailError(status=400, code="not_an_object",
+                                         detail="clip complete body must be a JSON object")
+            root = self._clip_root(cred, upload_id)
+            meta = self._load_clip_meta(root)
+            reason = CU.validate_complete(
+                body,
+                bytes_received=int(meta.get("bytes_received") or 0),
+                chunks_received=len(meta.get("chunks") or {}),
+                expected_chunks=int(meta["expected_chunks"]),
+                clip_bytes=int(meta["clip_bytes"]),
+            )
+            if reason is not None:
+                raise ProblemDetailError(status=422, code=reason, detail="clip complete was refused")
+            assembled = os.path.join(root, "assembled.wav")
+            tmp = f"{assembled}.{os.getpid()}.tmp"
+            h = hashlib.sha256()
+            with open(tmp, "wb") as out:
+                for idx in range(int(meta["expected_chunks"])):
+                    with open(os.path.join(root, f"{idx:04d}.chunk"), "rb") as inp:
+                        while True:
+                            chunk = inp.read(64 * 1024)
+                            if not chunk:
+                                break
+                            h.update(chunk)
+                            out.write(chunk)
+                out.flush()
+                os.fsync(out.fileno())
+            if h.hexdigest() != body.get("sha256"):
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
+                raise ProblemDetailError(status=422, code="clip_sha256_mismatch",
+                                         detail="assembled clip digest did not match")
+            os.replace(tmp, assembled)
+            wav_bytes = Path(assembled).read_bytes()
+            envelope = self._clip_envelope(meta=meta, cred=cred, received_at=utc_now(),
+                                           wav_bytes=wav_bytes)
+            verdict = EV.validate(envelope, require_event_id_match=True)
+            if not verdict.ok:
+                raise ProblemDetailError(status=422, code=verdict.reasons[0],
+                                         detail="assembled clip envelope was refused")
+            redacted = self.promoter.redact_audio_fields(envelope)
+            duplicate = store.batch_persist_event(
+                str(envelope["event_id"]), cred.site_id, str(envelope["device_id"]),
+                str(envelope["source"]), str(envelope["kind"]), envelope.get("observed_at"),
+                str(envelope["received_at"]), verdict.dispatchable, None, encode_json(redacted),
+                "clip-upload:" + upload_id, 0, cred.principal_id, cred.scope, cred.key_id)
+            promotion = self.promoter.ensure(store, str(envelope["event_id"]), envelope)
+            meta["state"] = promotion.state if promotion.state in (CU.STATE_PROMOTED, CU.STATE_PURGED) \
+                else CU.STATE_REFUSED
+            meta["clip_key"] = promotion.clip_key
+            meta["pool_path"] = promotion.pool_path
+            meta["reason"] = promotion.reason or ("duplicate" if duplicate else None)
+            meta["updated_at"] = utc_now()
+            if meta["state"] in (CU.STATE_PROMOTED, CU.STATE_PURGED):
+                shutil.rmtree(root, ignore_errors=True)
+            else:
+                self._write_clip_meta(root, meta)
+            return self._clip_response(meta, request_id=request_id)
+    
+        def clip_abort(self, *, upload_id: str, authorization: Optional[str],
+                       request_id: str) -> tuple[int, str, Dict[str, str]]:
+            cred = self._authenticate_clip(authorization)
+            root = self._clip_root(cred, upload_id)
+            meta = self._load_clip_meta(root)
+            meta["state"] = CU.STATE_ABORTED
+            meta["updated_at"] = utc_now()
+            self._write_clip_meta(root, meta)
+            shutil.rmtree(root, ignore_errors=True)
+            return self._clip_response(meta, request_id=request_id)
+    
+        def _clip_envelope(self, *, meta: Mapping[str, Any], cred: BatchCredential,
+                           received_at: str, wav_bytes: bytes) -> Dict[str, Any]:
+            envelope: Dict[str, Any] = {
+                "event_id": "",
+                "source": "node-http",
+                "site_id": cred.site_id,
+                "device_id": str(meta["device_id"]),
+                "device_class": "esp32s3-i2s-gps",
+                "firmware_version": "unknown",
+                "observed_at": None,
+                "received_at": received_at,
+                "clock": {"valid": False, "tier": "monotonic", "sigma_ns": 0},
+                "kind": "clip",
+                "schema_version": 1,
+                "payload": {
+                    "clip": "/clips/%s" % str(meta["clip_basename"]),
+                    "wav_b64": base64.b64encode(wav_bytes).decode("ascii"),
+                    "fs_hz": 48000.0,
+                    "upload_source": str(meta["upload_source"]),
+                    "clip_why": "push-upload",
+                    "record_key": "clip-upload:%s" % str(meta["upload_id"]),
+                },
+                "raw_ref": None,
+                "adapter": {"name": CLIP_UPLOAD_ADAPTER_NAME, "version": self.adapter_version},
+                "producer": {
+                    "boot_id": str(meta["boot"]),
+                    "sequence": int(meta["sample"]),
+                    "cursor": "clip-upload:%s" % str(meta["upload_id"]),
+                },
+            }
+            envelope["event_id"] = EV.derive_event_id(envelope)
+            return envelope
+    
         def promote_pending(self, limit: int = 64) -> Dict[str, int]:
             out = {"attempted": 0, "promoted": 0, "failed": 0}
             store = self._require_store()
@@ -5386,6 +6011,26 @@ data:
     
             def do_GET(self) -> None:
                 path = urlparse(self.path).path
+                request_id = self.request_id()
+                clip_status = re.fullmatch(r"/v1/ingest/clips/([0-9a-f]{32})", path)
+                if clip_status:
+                    try:
+                        if batch_adapter is None:
+                            raise ProblemDetailError(
+                                status=503,
+                                code="clip_upload_unavailable",
+                                detail="clip upload route is not configured",
+                                retryable=True,
+                                headers={"Retry-After": "5"},
+                            )
+                        self.send_adapter_response(batch_adapter.clip_status(
+                            upload_id=clip_status.group(1),
+                            authorization=self.headers.get("Authorization"),
+                            request_id=request_id,
+                        ))
+                    except ProblemDetailError as exc:
+                        self.send_problem(exc, request_id)
+                    return
                 if path == "/metrics":
                     self.send_prometheus(ingest_metrics.render_prometheus())
                     return
@@ -5405,6 +6050,45 @@ data:
                 path = urlparse(self.path).path
                 self.raw_body = None
                 request_id = self.request_id()
+                clip_complete = re.fullmatch(r"/v1/ingest/clips/([0-9a-f]{32})/complete", path)
+                if path == CU.INIT_ROUTE or clip_complete:
+                    try:
+                        if batch_adapter is None:
+                            raise ProblemDetailError(
+                                status=503,
+                                code="clip_upload_unavailable",
+                                detail="clip upload route is not configured",
+                                retryable=True,
+                                headers={"Retry-After": "5"},
+                            )
+                        self.require_idempotency_key()
+                        if clip_complete:
+                            result = batch_adapter.clip_complete(
+                                upload_id=clip_complete.group(1),
+                                raw=self.read_raw_body(CU.MAX_CLIP_BYTES),
+                                content_type=self.required_header("Content-Type"),
+                                authorization=self.headers.get("Authorization"),
+                                request_id=request_id,
+                            )
+                        else:
+                            result = batch_adapter.clip_init(
+                                raw=self.read_raw_body(8192),
+                                content_type=self.required_header("Content-Type"),
+                                authorization=self.headers.get("Authorization"),
+                                request_id=request_id,
+                            )
+                        self.send_adapter_response(result)
+                    except ProblemDetailError as exc:
+                        self.send_problem(exc, request_id)
+                    except RequestError as exc:
+                        self.send_problem(
+                            ProblemDetailError(status=exc.status,
+                                               code="payload_too_large" if exc.status == 413 else
+                                                    "bad_request",
+                                               detail=str(exc),
+                                               retryable=exc.status in (408,)),
+                            request_id)
+                    return
                 if path in (BATCH_ROUTE, BATCH_ALIAS_ROUTE):
                     try:
                         if batch_adapter is None:
@@ -5479,6 +6163,72 @@ data:
                 self.send_response(204)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+    
+            def do_PUT(self) -> None:
+                path = urlparse(self.path).path
+                self.raw_body = None
+                request_id = self.request_id()
+                chunk = re.fullmatch(r"/v1/ingest/clips/([0-9a-f]{32})/chunks/(\d+)", path)
+                if not chunk:
+                    self.send_error(404)
+                    return
+                try:
+                    if batch_adapter is None:
+                        raise ProblemDetailError(
+                            status=503,
+                            code="clip_upload_unavailable",
+                            detail="clip upload route is not configured",
+                            retryable=True,
+                            headers={"Retry-After": "5"},
+                        )
+                    self.require_idempotency_key()
+                    self.send_adapter_response(batch_adapter.clip_chunk(
+                        upload_id=chunk.group(1),
+                        chunk_index=int(chunk.group(2)),
+                        raw=self.read_raw_body(CU.MAX_CHUNK_BYTES),
+                        content_type=self.required_header("Content-Type"),
+                        chunk_sha256=self.headers.get(CU.CHUNK_DIGEST_HEADER),
+                        authorization=self.headers.get("Authorization"),
+                        request_id=request_id,
+                    ))
+                except ProblemDetailError as exc:
+                    self.send_problem(exc, request_id)
+                except ValueError as exc:
+                    self.send_problem(ProblemDetailError(status=422, code=str(exc),
+                                                         detail="clip chunk was refused"),
+                                      request_id)
+                except RequestError as exc:
+                    self.send_problem(
+                        ProblemDetailError(status=exc.status,
+                                           code="payload_too_large" if exc.status == 413 else
+                                                "bad_request",
+                                           detail=str(exc), retryable=exc.status in (408,)),
+                        request_id)
+    
+            def do_DELETE(self) -> None:
+                path = urlparse(self.path).path
+                request_id = self.request_id()
+                clip = re.fullmatch(r"/v1/ingest/clips/([0-9a-f]{32})", path)
+                if not clip:
+                    self.send_error(404)
+                    return
+                try:
+                    if batch_adapter is None:
+                        raise ProblemDetailError(
+                            status=503,
+                            code="clip_upload_unavailable",
+                            detail="clip upload route is not configured",
+                            retryable=True,
+                            headers={"Retry-After": "5"},
+                        )
+                    self.require_idempotency_key()
+                    self.send_adapter_response(batch_adapter.clip_abort(
+                        upload_id=clip.group(1),
+                        authorization=self.headers.get("Authorization"),
+                        request_id=request_id,
+                    ))
+                except ProblemDetailError as exc:
+                    self.send_problem(exc, request_id)
     
             def require_auth(self, token: Optional[str]) -> None:
                 if not token:
@@ -5573,6 +6323,16 @@ data:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+    
+            def send_adapter_response(self, result: tuple[int, str, Dict[str, str]]) -> None:
+                status, body, headers = result
+                encoded = body.encode("utf-8")
+                self.send_response(status)
+                for key, value in headers.items():
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
     
             def send_prometheus(self, body: bytes, code: int = 200) -> None:
                 self.send_response(code)
