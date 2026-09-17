@@ -49,7 +49,7 @@ spec:
         # whatever code it started with, indefinitely. Kept in sync by
         # deploy/k8s/gen_configmap.py (DEPLOYMENT_CHECKSUM_TARGETS) whenever the bundle
         # is regenerated; see tests/test_configmap_sync.py for the guard.
-        checksum/hear-mqtt-bridge-code: 'a2d25143f194a2f9801e45235910cccf195b207a76887489d7d101a8b152e04f'
+        checksum/hear-mqtt-bridge-code: '4ea2bc6afe4c4bb2dee88968c6878ba3722aed252b874ccb981a073645930a2a'
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet

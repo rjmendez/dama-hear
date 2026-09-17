@@ -1,5 +1,5 @@
 # kubectl apply -f deploy/k8s/hear-heartbeat-code.yaml
-# apply-mode client: 215267 B serialised; 215532 B of annotations against a 262144 B cap.
+# apply-mode client: 215768 B serialised; 216033 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-heartbeat
   annotations:
-    dama-hear/commit: 'bb7eeef'
-    dama-hear/source-sha256: 'bbbe0767f0567bf6ae8f1ae6266929e54c62223e6239bee55a8d6f67bfe4b514'
+    dama-hear/commit: '7954906'
+    dama-hear/source-sha256: '6018403d563a3b5f6fded553825141ad597d0e10c34777711a07c570a17f2760'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: client
-    dama-hear/serialised-bytes: '215267'
+    dama-hear/serialised-bytes: '215768'
 data:
   hear__init__.py: |
     
@@ -3969,7 +3969,10 @@ data:
                      auth_token: Optional[str] = AUTH_TOKEN,
                      socket_timeout_s: float = SOCKET_TIMEOUT_S,
                      ingest_metrics: Optional[IO.IngestMetrics] = None,
-                     batch_adapter: Optional[BatchIngestAdapter] = None) -> type[BaseHTTPRequestHandler]:
+                     batch_adapter: Optional[BatchIngestAdapter] = None,
+                     before_batch_response: Optional[
+                         Callable[[int, str, Dict[str, str], str], None]
+                     ] = None) -> type[BaseHTTPRequestHandler]:
         ingest_metrics = ingest_metrics or IO.IngestMetrics()
     
         class ReceiverHandler(BaseHTTPRequestHandler):
@@ -4036,6 +4039,8 @@ data:
                         logger.exception("batch ingest request crashed: %s", exc)
                         return
                     encoded = body.encode("utf-8")
+                    if before_batch_response is not None:
+                        before_batch_response(status, body, headers, request_id)
                     self.send_response(status)
                     for key, value in headers.items():
                         self.send_header(key, value)
@@ -4199,6 +4204,9 @@ data:
                       socket_timeout_s: float = SOCKET_TIMEOUT_S,
                       ingest_metrics: Optional[IO.IngestMetrics] = None,
                       batch_adapter: Optional[BatchIngestAdapter] = None,
+                      before_batch_response: Optional[
+                          Callable[[int, str, Dict[str, str], str], None]
+                      ] = None,
                       durable_replay_interval_s: float = 0.0,
                       durable_replay_limit: int = DURABLE_REPLAY_LIMIT,
                       durable_prune_interval_s: float = 0.0,
@@ -4211,7 +4219,8 @@ data:
             (bind, port),
             make_handler(store, max_body_bytes=max_body_bytes,
                          auth_token=auth_token, socket_timeout_s=socket_timeout_s,
-                         ingest_metrics=ingest_metrics, batch_adapter=batch_adapter),
+                         ingest_metrics=ingest_metrics, batch_adapter=batch_adapter,
+                         before_batch_response=before_batch_response),
             store,
             durable_replay_interval_s=durable_replay_interval_s,
             durable_replay_limit=durable_replay_limit,

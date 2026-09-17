@@ -42,7 +42,7 @@ spec:
         # Forces a new ReplicaSet (Recreate: a full pod restart) whenever
         # hear-heartbeat-code.yaml's content changes. The code file below is mounted
         # with subPath, which kubelet's ConfigMap sync does not live-update.
-        checksum/hear-heartbeat-code: 'bbbe0767f0567bf6ae8f1ae6266929e54c62223e6239bee55a8d6f67bfe4b514'
+        checksum/hear-heartbeat-code: '6018403d563a3b5f6fded553825141ad597d0e10c34777711a07c570a17f2760'
         prometheus.io/scrape: "true"
         prometheus.io/path: /metrics
         prometheus.io/port: "5051"
