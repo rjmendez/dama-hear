@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-mqtt-bridge-code.yaml
-# apply-mode server: 339537 B serialised; 339808 B of annotations against a 262144 B cap.
+# apply-mode server: 339531 B serialised; 339796 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-mqtt-bridge
   annotations:
-    dama-hear/commit: '804a371-dirty'
+    dama-hear/commit: '716606a'
     dama-hear/source-sha256: '9352d52ce1062b9935fc4972ff80c5b53f0cbef7b37ea413ec8ff923a46f88b1'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '339537'
+    dama-hear/serialised-bytes: '339531'
 data:
   hear__init__.py: |
     
