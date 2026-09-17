@@ -761,12 +761,16 @@ class TestClipUploadRoute:
 
     @staticmethod
     def _request(url, *, method, data=b"", token="node-secret", headers=None):
+        # No default Idempotency-Key: real chunk PUTs never send one (see
+        # docs/phase4-push-clip-upload.md -- chunk dedup is X-Hear-Chunk-SHA256 plus
+        # chunk_index, not an idempotency key), so a default here would mask a server route
+        # wrongly requiring it on PUT the way it did before that bug was found and fixed.
+        # Call sites that need one (init, complete) pass it explicitly.
         return urllib.request.Request(
             url,
             data=data,
             headers={
                 "Authorization": f"Bearer {token}",
-                "Idempotency-Key": "idem-clip",
                 **(headers or {}),
             },
             method=method,
@@ -806,7 +810,7 @@ class TestClipUploadRoute:
                 base_url + CU.INIT_ROUTE,
                 method="POST",
                 data=json.dumps(init).encode("utf-8"),
-                headers={"Content-Type": CU.INIT_MEDIA_TYPE},
+                headers={"Content-Type": CU.INIT_MEDIA_TYPE, "Idempotency-Key": "idem-clip-init"},
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
                 assert resp.status == 201
@@ -859,7 +863,7 @@ class TestClipUploadRoute:
                 base_url + CU.INIT_ROUTE,
                 method="POST",
                 data=json.dumps(init).encode("utf-8"),
-                headers={"Content-Type": CU.INIT_MEDIA_TYPE},
+                headers={"Content-Type": CU.INIT_MEDIA_TYPE, "Idempotency-Key": "idem-clip-init"},
             ), timeout=2):
                 pass
             self._upload_chunks(base_url, init["upload_id"], wav_bytes)
@@ -902,7 +906,7 @@ class TestClipUploadRoute:
                 base_url + CU.INIT_ROUTE,
                 method="POST",
                 data=json.dumps(init).encode("utf-8"),
-                headers={"Content-Type": CU.INIT_MEDIA_TYPE},
+                headers={"Content-Type": CU.INIT_MEDIA_TYPE, "Idempotency-Key": "idem-clip-init"},
             ), timeout=2):
                 pass
             complete = self._request(

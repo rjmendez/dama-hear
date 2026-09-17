@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-heartbeat-code.yaml
-# apply-mode server: 454401 B serialised; 454666 B of annotations against a 262144 B cap.
+# apply-mode server: 454925 B serialised; 455190 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-heartbeat
   annotations:
-    dama-hear/commit: '716606a'
-    dama-hear/source-sha256: 'e63e91c26fd76e158618276f484552e03b8ce2c10e21516bfa2ffcbafdb643d2'
+    dama-hear/commit: 'b94edcc'
+    dama-hear/source-sha256: 'fbea38fcd1815389c67d1d49284c94cc7dfec341a9115dfc56f9fb5b965a5b3c'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '454401'
+    dama-hear/serialised-bytes: '454925'
 data:
   hear__init__.py: |
     
@@ -8790,7 +8790,12 @@ data:
                             retryable=True,
                             headers={"Retry-After": "5"},
                         )
-                    self.require_idempotency_key()
+                    # No Idempotency-Key here on purpose: docs/phase4-push-clip-upload.md gives chunk
+                    # PUT its own dedup key -- X-Hear-Chunk-SHA256 plus the byte range implied by
+                    # chunk_index -- and clipupload.py has no chunk_idempotency_key to match, unlike
+                    # init/complete. Requiring one here rejected every spec-conformant firmware chunk
+                    # with 400 idempotency_key_missing (real hardware hit this; the test suite's
+                    # shared request helper always sent one, so it never caught it here).
                     self.send_adapter_response(batch_adapter.clip_chunk(
                         upload_id=chunk.group(1),
                         chunk_index=int(chunk.group(2)),
