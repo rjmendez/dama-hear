@@ -2644,6 +2644,10 @@ static uint8_t  clip_push_phase = CLIP_PUSH_INIT;
 static uint32_t clip_push_k = 0, clip_push_at_sample = 0, clip_push_at_seq = 0;
 static uint64_t clip_push_start_acq = 0;    // acquisition-domain first PCM sample, set at begin
 static uint32_t clip_push_chunk_index = 0, clip_push_total_chunks = 0;
+// A retried CHUNK attempt must not re-fold the same bytes into clip_push_whole_ctx a second time
+// -- that would corrupt the whole-clip digest checked at complete. UINT32_MAX (never a real chunk
+// index) means "nothing hashed yet for the chunk in progress".
+static uint32_t clip_push_hashed_chunk_index = UINT32_MAX;
 static hear_sha256_ctx_t clip_push_whole_ctx;   // accumulates every byte sent, header included
 static char     clip_push_upload_id[HEAR_CLIP_UPLOAD_ID_MAX] = "";
 static char     clip_push_boot[CLIP_BOOT_HEX + 1] = "";
@@ -2659,6 +2663,14 @@ static int      clip_push_last_code = 0;    // last HTTP status (or the negative
                                             // push_post_json already uses) from any of the three
                                             // request kinds, whichever ran last
 static uint32_t clip_push_attempts = 0;
+// init/chunk retry-on-transient-failure state. Bounded and short: a Cloudflare/tunnel edge blip
+// (connect failure, or a 5xx -- Cloudflare's synthetic 520-530 range included) is retried in place
+// a few times before the clip is abandoned; a 4xx (e.g. clip_key_mismatch) is a permanent contract
+// rejection that retrying cannot fix and fails on the first try, same as before. complete is
+// deliberately excluded -- see its "one-shot, not retried" comment in clip_push_step.
+static uint32_t clip_push_phase_tries = 0;
+static uint32_t clip_push_retry_at_ms = 0;
+static uint32_t clip_push_retries = 0;      // visible in /status: transient attempts absorbed
 
 
 #ifndef HEAR_PUSH_PORT
@@ -2729,6 +2741,11 @@ static uint32_t clip_push_attempts = 0;
                                      HEAR_PROV_TOKEN_MAX + HEAR_CLIP_IDEMPOTENCY_KEY_MAX)
 #define HEAR_PUSH_CONNECT_TIMEOUT_MS 3000u
 #define HEAR_PUSH_READ_TIMEOUT_MS   2000u
+// init/chunk get up to this many tries (first attempt + retries) before the clip is abandoned,
+// gated HEAR_CLIP_PUSH_RETRY_MS apart so a blip is retried, not hammered, inside the same
+// one-round-trip-per-loop()-pass budget clip_push_step already keeps.
+#define HEAR_CLIP_PUSH_MAX_TRIES    3u
+#define HEAR_CLIP_PUSH_RETRY_MS     400UL
 #define HEAR_PUSH_FAIL_LOG_MS       60000UL
 #define HEAR_PUSH_HEARTBEAT_MS      10000UL
 #define HEAR_PUSH_RETRY_BASE_MS     1000UL
@@ -3903,16 +3920,28 @@ static bool clip_push_begin(uint32_t k, uint32_t sample, uint32_t seq, uint64_t 
   clip_push_start_acq = start_acq;
   clip_push_chunk_index = 0;
   clip_push_phase = CLIP_PUSH_INIT;
+  clip_push_phase_tries = 0;
+  clip_push_retry_at_ms = 0;
+  clip_push_hashed_chunk_index = UINT32_MAX;
   hear_sha256_init(&clip_push_whole_ctx);
   clip_push_busy = true;
   clip_push_attempts++;
   return true;
 }
 
+// True for a failure class a retry can plausibly fix: a connect/write/parse failure (the negative
+// codes clip_push_http returns) or a 5xx, which is where Cloudflare's synthetic edge errors
+// (520-530) land. A 4xx is the receiver rejecting the contract itself -- retrying sends the same
+// rejected request again, so it fails on the first try exactly as before.
+static bool clip_push_transient(int code) { return code < 0 || code >= 500; }
+
 // One HTTP request per call -- init, then one PUT per chunk, then complete -- so a clip's upload
 // paces the same way its card write does: clip_pump() is called once per loop() pass, and this
 // never does more than one round trip per pass.
 static void clip_push_step() {
+  // Retry gate: after a transient failure this phase is revisited on a later loop() pass, not
+  // the very next one -- clip_push_retry_at_ms is 0 (i.e. already due) the rest of the time.
+  if (clip_push_retry_at_ms && (int32_t)(millis() - clip_push_retry_at_ms) < 0) return;
   Det &d = dets[clip_push_k % det_cap];
   // The slot could have been recycled under us, same guard the SD path uses.
   bool mine = (d.sample == clip_push_at_sample);
@@ -3932,7 +3961,18 @@ static void clip_push_step() {
       ok = clip_push_http("POST", HEAR_CLIP_INIT_PATH, HEAR_CLIP_INIT_MEDIA_TYPE, idem_key, NULL,
                           (const uint8_t *)body, (size_t)bn, &code);
       clip_push_last_code = code;
-      if (!ok) { clip_push_init_fail++; clip_push_abort(st_out, CLIP_FAIL); return; }
+      if (!ok) {
+        clip_push_init_fail++;
+        if (clip_push_transient(code) && ++clip_push_phase_tries < HEAR_CLIP_PUSH_MAX_TRIES) {
+          clip_push_retries++;
+          clip_push_retry_at_ms = millis() + HEAR_CLIP_PUSH_RETRY_MS;
+          return;   // same phase, retried on a later pass -- idem_key is recomputed identically
+        }
+        clip_push_abort(st_out, CLIP_FAIL);
+        return;
+      }
+      clip_push_phase_tries = 0;
+      clip_push_retry_at_ms = 0;
       clip_push_phase = CLIP_PUSH_CHUNK;
       return;
     }
@@ -3941,14 +3981,30 @@ static void clip_push_step() {
       if (!clip_push_fill_chunk(&len)) {
         clip_push_ring_lost++; clip_push_abort(st_out, CLIP_RING); return;
       }
-      hear_sha256_update(&clip_push_whole_ctx, clip_push_stage, len);
+      // Fold into the whole-clip digest exactly once per chunk index, no matter how many HTTP
+      // attempts that index takes -- see clip_push_hashed_chunk_index's comment.
+      if (clip_push_hashed_chunk_index != clip_push_chunk_index) {
+        hear_sha256_update(&clip_push_whole_ctx, clip_push_stage, len);
+        clip_push_hashed_chunk_index = clip_push_chunk_index;
+      }
       char digest[65]; hear_sha256_hex_of(clip_push_stage, len, digest);
       char path[96];
       hear_clip_chunk_path(clip_push_upload_id, clip_push_chunk_index, path, sizeof path);
       ok = clip_push_http("PUT", path, HEAR_CLIP_CHUNK_MEDIA_TYPE, NULL, digest,
                           clip_push_stage, len, &code);
       clip_push_last_code = code;
-      if (!ok) { clip_push_chunk_fail++; clip_push_abort(st_out, CLIP_FAIL); return; }
+      if (!ok) {
+        clip_push_chunk_fail++;
+        if (clip_push_transient(code) && ++clip_push_phase_tries < HEAR_CLIP_PUSH_MAX_TRIES) {
+          clip_push_retries++;
+          clip_push_retry_at_ms = millis() + HEAR_CLIP_PUSH_RETRY_MS;
+          return;   // same chunk index, retried on a later pass
+        }
+        clip_push_abort(st_out, CLIP_FAIL);
+        return;
+      }
+      clip_push_phase_tries = 0;
+      clip_push_retry_at_ms = 0;
       clip_push_chunk_index++;
       if (clip_push_chunk_index >= clip_push_total_chunks) clip_push_phase = CLIP_PUSH_COMPLETE;
       return;
@@ -4304,7 +4360,7 @@ static String status_json() {
     // a stuck upload can be told apart from a stuck network, and stage_alloc_failed says whether
     // the one PSRAM allocation this path needs ever actually succeeded.
     "\"clip_push\":{\"busy\":%s,\"ok\":%lu,\"fail\":%lu,\"init_fail\":%lu,\"chunk_fail\":%lu,"
-    "\"complete_fail\":%lu,\"ring_lost\":%lu,\"attempts\":%lu,\"last_code\":%d,"
+    "\"complete_fail\":%lu,\"ring_lost\":%lu,\"attempts\":%lu,\"retries\":%lu,\"last_code\":%d,"
     "\"stage_alloc_failed\":%s},"
     // spool has no other way to be seen from the HTTP API: init_ok/fail_reason distinguish "never
     // got past sd/alloc/scan" from "enabled but backlogged", and last_code/failures/last_ok_s
@@ -4408,7 +4464,7 @@ static String status_json() {
     clip_push_busy ? "true" : "false", (unsigned long)clip_push_ok, (unsigned long)clip_push_fail,
     (unsigned long)clip_push_init_fail, (unsigned long)clip_push_chunk_fail,
     (unsigned long)clip_push_complete_fail, (unsigned long)clip_push_ring_lost,
-    (unsigned long)clip_push_attempts, clip_push_last_code,
+    (unsigned long)clip_push_attempts, (unsigned long)clip_push_retries, clip_push_last_code,
     clip_push_alloc_failed ? "true" : "false",
     spool_init_ok ? "true" : "false", spool_init_fail_reason,
     spool_enabled ? "true" : "false", (unsigned long)spool_backlog_records,
