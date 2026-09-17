@@ -1,5 +1,5 @@
 {
-  "baseline_hash": "894e22bd537c591bf52acfde974d6bbfd1ff6294d8f60f7fd9cecb4ce5d16ba4",
+  "baseline_hash": "6817c5dab1c0bbec8f92547c3c62eedb437a17b7d1449d6e4f8ed9fbd71ca86b",
   "baseline_version": 1,
   "compatibility": {
     "forward_path": [
@@ -490,8 +490,8 @@
       },
       {
         "path": "deploy/k8s/hear-heartbeat.yaml",
-        "sha256": "6bc92db4af6e555860fbc2a9668e28e97de568b1d9afd5c016d3b0737e502e4c",
-        "size_bytes": 7070
+        "sha256": "f9acc490f689694908a72e8c3b0d77633df24e98c3c080edb6d69be918134d8b",
+        "size_bytes": 7183
       },
       {
         "path": "deploy/k8s/hear-mqtt-bridge.yaml",
@@ -1244,6 +1244,10 @@
               {
                 "binding": "literal",
                 "name": "HEAR_BATCH_RAW_DIR"
+              },
+              {
+                "binding": "literal",
+                "name": "HEAR_SILERO_VAD_MODEL"
               },
               {
                 "binding": "literal",
@@ -2653,7 +2657,7 @@
         "storage_request": "20Gi"
       }
     ],
-    "section_hash": "a16f7c192f63f187cef37d0c5a3a2ab55077246dbab462a282d2e8f75ca756e1"
+    "section_hash": "83c73b7e49986cf78ce253d49d63f131df4e09809381a95f4d28c57ceae9bd45"
   },
   "mqtt_topics": {
     "section_hash": "800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8",

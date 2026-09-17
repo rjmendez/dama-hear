@@ -70,7 +70,7 @@ spec:
                 echo "installing onnxruntime into $LIB"
                 pip install --no-cache-dir --upgrade --target "$LIB" 'onnxruntime==1.27.0' >/dev/null 2>&1
               fi
-              MODEL=/pool/models/silero_vad.onnx
+              MODEL="${HEAR_SILERO_VAD_MODEL:-/pool/models/silero_vad.onnx}"
               MODEL_SHA256=1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3
               if [ ! -f "$MODEL" ]; then
                 echo "fetching silero_vad.onnx"
@@ -91,6 +91,7 @@ spec:
             - { name: HEAR_DURABLE_REPLAY_LIMIT, value: "256" }
             - { name: HEAR_BATCH_CREDENTIALS_FILE, value: "/var/run/dama-hear/batch-credentials/credentials.json" }
             - { name: HEAR_BATCH_RAW_DIR, value: "/state/ingest-batch" }
+            - { name: HEAR_SILERO_VAD_MODEL, value: "/pool/models/silero_vad.onnx" }
             - { name: REDIS_HOST, value: "audit-redis.infra.svc.cluster.local" }
             - { name: REDIS_PORT, value: "6379" }
             - name: REDIS_PASS

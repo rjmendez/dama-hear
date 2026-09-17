@@ -1,5 +1,5 @@
 # kubectl apply --server-side --force-conflicts -f deploy/k8s/hear-heartbeat-code.yaml
-# apply-mode server: 416241 B serialised; 416512 B of annotations against a 262144 B cap.
+# apply-mode server: 416235 B serialised; 416500 B of annotations against a 262144 B cap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +8,11 @@ metadata:
   labels:
     app: hear-heartbeat
   annotations:
-    dama-hear/commit: '52d8118-dirty'
+    dama-hear/commit: '15224e1'
     dama-hear/source-sha256: '7bfd938e7f91c3dc51671375cadaad70d4a57c0d348a62953eb213c21c4a8dab'
     dama-hear/generated-by: deploy/k8s/gen_configmap.py
     dama-hear/apply-mode: server
-    dama-hear/serialised-bytes: '416241'
+    dama-hear/serialised-bytes: '416235'
 data:
   hear__init__.py: |
     
