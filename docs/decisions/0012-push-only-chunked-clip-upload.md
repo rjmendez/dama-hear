@@ -1,8 +1,7 @@
 # ADR 0012: push-only chunked clip upload
 
-## Status
-
-Accepted for Phase 4 migration.
+- Status: accepted for Phase 4 migration
+- Date: 2026-09-17
 
 ## Context
 

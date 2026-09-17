@@ -62,6 +62,7 @@ COPY hear/ingest/__init__.py /app/hear/ingest/__init__.py
 COPY hear/ingest/envelope.py /app/hear/ingest/envelope.py
 COPY hear/ingest/batch.py /app/hear/ingest/batch.py
 COPY hear/ingest/observability.py /app/hear/ingest/observability.py
+COPY hear/ingest/clipupload.py /app/hear/ingest/clipupload.py
 COPY hear/privacy/__init__.py /app/hear/privacy/__init__.py
 COPY hear/privacy/purge.py /app/hear/privacy/purge.py
 COPY hear/privacy/silero_vad.py /app/hear/privacy/silero_vad.py
