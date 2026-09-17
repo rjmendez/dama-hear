@@ -148,8 +148,10 @@ def test_praw_is_written_and_read_in_one_64_bit_domain():
     assert re.search(r"^static uint64_t acq_of\(uint32_t d_samp\)", CODE, flags=re.M)
     assert re.search(r"^static uint64_t clip_s = 0;", CODE, flags=re.M)
     assert "uint64_t s = acq_of((uint32_t)got0);" in _handler("/audio")
+    # clip_push_fill_chunk (the no-SD push path) reads the ring the same way /audio does, one
+    # more "s % praw_cap" site with the same acquisition-domain uint64_t s -- not a new pattern.
     assert sorted(re.findall(r"\(([^()]*(?:\([^()]*\))?[^()]*) % praw_cap\)", CODE)) == \
-        ["(g_samples64 * DECIM)", "clip_s", "s"]
+        ["(g_samples64 * DECIM)", "clip_s", "s", "s"]
 
 
 def test_the_uint32_cursor_was_off_by_2_32_mod_the_ring_and_the_64_bit_one_is_not():

@@ -42,7 +42,7 @@ spec:
         # Forces a new ReplicaSet (Recreate: a full pod restart) whenever
         # hear-heartbeat-code.yaml's content changes. The code file below is mounted
         # with subPath, which kubelet's ConfigMap sync does not live-update.
-        checksum/hear-heartbeat-code: '7bfd938e7f91c3dc51671375cadaad70d4a57c0d348a62953eb213c21c4a8dab'
+        checksum/hear-heartbeat-code: 'e63e91c26fd76e158618276f484552e03b8ce2c10e21516bfa2ffcbafdb643d2'
         prometheus.io/scrape: "true"
         prometheus.io/path: /metrics
         prometheus.io/port: "5051"
@@ -114,6 +114,7 @@ spec:
             - { name: code, mountPath: /app/hear/ingest/envelope.py, subPath: hear_ingest_envelope.py }
             - { name: code, mountPath: /app/hear/ingest/batch.py, subPath: hear_ingest_batch.py }
             - { name: code, mountPath: /app/hear/ingest/observability.py, subPath: hear_ingest_observability.py }
+            - { name: code, mountPath: /app/hear/ingest/clipupload.py, subPath: hear_ingest_clipupload.py }
             - { name: code, mountPath: /app/hear/privacy/__init__.py, subPath: hear_privacy__init__.py }
             - { name: code, mountPath: /app/hear/privacy/purge.py, subPath: hear_privacy_purge.py }
             - { name: code, mountPath: /app/hear/privacy/silero_vad.py, subPath: hear_privacy_silero_vad.py }

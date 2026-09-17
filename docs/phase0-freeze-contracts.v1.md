@@ -14,14 +14,14 @@ python3 tools/freeze_contracts.py --check
 
 | section | sha256 |
 | --- | --- |
-| baseline | 27fc2ec078d388a4ea4697c0f85f0594c911f58c4a14a756b6fe16b05a911eba |
+| baseline | dac2038e8ffb491ac2848dbe8ffe11908e3ff05917ce436be1606c41c84c43fc |
 | wire_profiles | 4ea3d122ddf5d4f736624acd394fec2a82a8cec8550fc63c36f1af1e6502bbba |
-| firmware_build_metadata | fe871b339088ca7888a2cdec7babdce0cee9e29b31fe3c8d4c2afc4ce2a02716 |
-| schemas | 94b4918a473b1622dc555228ba2b6b6359873dd5b12e4f498fb12f3b81087221 |
+| firmware_build_metadata | 67078665e30681570b5d8e9f781fe410dccea4ac7469751a1ad6e8e6e746e581 |
+| schemas | 093cdafddb09365291f71e7fc02ca1a9018253a9e5e9a3af0a8781ff7ada3eb9 |
 | published_contracts | a87c434d400f4f31ec4cc252761fff18ee14355a8170cf80133ef72315c082f3 |
 | mqtt_topics | 800a4d7031d24e55b408d0c7b03a916924c6449dde75ae027126feac63494be8 |
 | redis_keys | d7ca4d6fb110a1d3587adf6357413412444957728ae13cefe047279c85729a03 |
-| kubernetes_and_pvc_layout | 83c73b7e49986cf78ce253d49d63f131df4e09809381a95f4d28c57ceae9bd45 |
+| kubernetes_and_pvc_layout | 2a40118d0087921c2ead0cc604b381cc0feecd744fe8a68def1674ab88e03626 |
 | corpus_fixture_metadata | 52ddc9da76e76e5b920512c82bb9529b9075fea44faa6ce526d9347b35550af0 |
 
 ## Compatibility
@@ -108,6 +108,7 @@ Source hashes:
 | hear.experimental_clap_geometry_selfcal.v1 | tools/estimate_geometry_from_claps.py |
 | hear.ingest.batch.receipt.v1 | hear/ingest/batch.py |
 | hear.ingest.batch.v1 | hear/ingest/batch.py |
+| hear.ingest.clip.v1 | hear/ingest/clipupload.py |
 | hear.ingest.v1 | hear/ingest/envelope.py |
 | hear.node_positions.v1 | tools/hear_drain.py |
 | hear.sketch.golden.v4 | testdata/sketch_golden.json<br>tools/gen_golden.py |
@@ -228,8 +229,8 @@ Manifest hashes:
 | deploy/k8s/hear-birdnet.yaml | 7474 | 9a4265e78c5c03e10a563b1a178582492e3f0aeef0c47f630f56fe23c06c6aa5 |
 | deploy/k8s/hear-drain.yaml | 19588 | af67cf80b27831423574f9f0c1b8d3a06bb14f1ed6e987b295d0289451ed8b12 |
 | deploy/k8s/hear-embed.yaml | 9190 | 1f3e86e8d5d1f57f4bc5d8d4ca6adb958671f5a65c7db7b21e47225916d465ad |
-| deploy/k8s/hear-heartbeat.yaml | 7183 | f9acc490f689694908a72e8c3b0d77633df24e98c3c080edb6d69be918134d8b |
-| deploy/k8s/hear-mqtt-bridge.yaml | 6328 | 9de120f8a789d748670702960b2a0fec6b8997e87d8733e2d148ecfe6a0b518f |
+| deploy/k8s/hear-heartbeat.yaml | 7291 | 51650db38098ac506ec248fe3492385b4dd2813f5474cab8579d25d00c385e69 |
+| deploy/k8s/hear-mqtt-bridge.yaml | 6436 | 4f2f2fe19ce2abb38bcf018d073491048ab75c0cd538986718ff3e26cc0e1d3e |
 | deploy/k8s/hear-pool-backup.yaml | 15918 | 269a57100ca6078c5b5321cf2d13780fb70d46b440c2b2ecd3db940cb45efb26 |
 | deploy/k8s/hear-score.yaml | 11126 | 03c0713d22b23d3f06177c79ca6d612925768c98d566f012fc01d209de5dcf0d |
 | deploy/k8s/hear-tag.yaml | 15625 | 367ed67528bb15a5dd652bf924db0af409a8f65c1b00128c0a3b14e990be1890 |

@@ -181,6 +181,11 @@ HEARTBEAT_CODE = [
     ("hear_ingest_envelope.py", "hear/ingest/envelope.py"),
     ("hear_ingest_batch.py", "hear/ingest/batch.py"),
     ("hear_ingest_observability.py", "hear/ingest/observability.py"),
+    # hear.ingest.clipupload is the wire-contract source of truth for the push-only chunked
+    # clip upload adapter (init/chunk/complete/status/abort) -- tools/hear_heartbeat_receiver.py
+    # imports it unconditionally at module load, so omitting it here is an import-time crash
+    # in the cluster only, exactly the failure mode this script exists to make impossible.
+    ("hear_ingest_clipupload.py", "hear/ingest/clipupload.py"),
     # The batch promotion lane imports privacy modules lazily so hear-mqtt-bridge does not pay
     # their numpy/model closure, but hear-heartbeat *does* need the same package fragments the
     # drain ships once a clip-bearing batch arrives.
@@ -204,6 +209,9 @@ MQTT_BRIDGE_CODE = [
     ("hear_ingest_envelope.py", "hear/ingest/envelope.py"),
     ("hear_ingest_batch.py", "hear/ingest/batch.py"),
     ("hear_ingest_observability.py", "hear/ingest/observability.py"),
+    # See HEARTBEAT_CODE above: tools/hear_heartbeat_receiver.py imports this unconditionally,
+    # and this bundle ships that same receiver module.
+    ("hear_ingest_clipupload.py", "hear/ingest/clipupload.py"),
     ("tools_hear_heartbeat_receiver.py", "tools/hear_heartbeat_receiver.py"),
     ("tools_hear_mqtt_bridge.py", "tools/hear_mqtt_bridge.py"),
 ]
