@@ -2890,7 +2890,9 @@ static bool spool_scan_segments(bool repair_tail) {
       if (spool_parse_segment_name(ent.name(), &gen, &idx)) {
         struct HearSpoolSegmentInfo &seg = spool_segments[spool_segment_count++];
         memset(&seg, 0, sizeof seg);
-        snprintf(seg.path, sizeof seg.path, "%s", ent.name());
+        const char *name = ent.name();
+        if (name[0] == '/') snprintf(seg.path, sizeof seg.path, "%s", name);
+        else snprintf(seg.path, sizeof seg.path, HEAR_SPOOL_DIR "/%s", name);
         seg.gen = gen;
         seg.idx = idx;
         seg.size = (uint32_t)ent.size();

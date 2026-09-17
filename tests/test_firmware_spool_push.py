@@ -11,6 +11,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 HDR = ROOT / "firmware" / "hear_node" / "spool_push.h"
+INO = ROOT / "firmware" / "hear_node" / "hear_node.ino"
 BUILD = ROOT / ".otabuild" / "host_tests" / "spool_push"
 
 
@@ -123,6 +124,12 @@ def _detection_record(spool_push, seq: int, event_seq: int, batch_rows: int):
                                           payload, len(payload))
     assert wrote > 16
     return bytes(record[:wrote]), payload.value.decode("utf-8")
+
+
+def test_spool_scan_reopens_directory_entries_under_the_spool_dir():
+    src = INO.read_text(encoding="utf-8")
+    assert 'snprintf(seg.path, sizeof seg.path, HEAR_SPOOL_DIR "/%s", name);' in src
+    assert 'snprintf(seg.path, sizeof seg.path, "%s", ent.name());' not in src
 
 
 def _watermark(spool_push, gen: int, acked: int, oldest: int):
