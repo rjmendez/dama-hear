@@ -120,12 +120,15 @@ jobs:
               "credentials": "none compiled in; read from the node's NVS (enroll.py)",
           }, open("dist/build-info.json", "w"), indent=2)
           PY
+          python3 firmware/hear_node/release_ca_bundle.py generate \
+            --dist dist
           python3 firmware/hear_node/release_sbom.py generate \
             --dist dist \
             --build-info dist/build-info.json
           python3 firmware/hear_node/release_manifest.py generate \
             --dist dist \
             --build-info dist/build-info.json
+          python3 firmware/hear_node/release_ca_bundle.py verify --dist dist
           python3 firmware/hear_node/release_manifest.py verify \
             --dist dist \
             --tag "$TAG" \
@@ -154,6 +157,8 @@ jobs:
           | \`hear_node-esp32s3-i2s-gps-$TAG.*\` | ESP32-S3 + I2S mic + PMTK GPS octal-PSRAM release set |
           | \`hear_node-esp32s3-i2s-gps-qspi-$TAG.*\` | ESP32-S3 + I2S mic + PMTK GPS quad-PSRAM (QSPI) release set |
           | \`build-info.json\` | toolchain and flags |
+          | \`hear-push-ca-bundle.pem\` | bounded device TLS trust bundle carried by \`HEAR_PUSH_CA_CERT\` |
+          | \`hear-push-ca-bundle.json\` | CA bundle scope metadata (ADR 0011, cert list, digests, routes) |
           | \`release-manifest.json\` | immutable offline-verifiable release manifest |
           | \`release-manifest.schema.json\` | manifest JSON schema |
           | \`release-sbom.cdx.json\` | CycloneDX 1.6 SBOM: binaries, source closure, vendored libraries, toolchain pins |
@@ -168,6 +173,8 @@ jobs:
                 --bundle release-provenance.intoto.jsonl
 
           **SBOM.** \`release-sbom.cdx.json\` (CycloneDX 1.6) lists the published binaries, the source files they were built from, the vendored \`firmware/lib\` libraries and the pinned toolchain (arduino-cli, esp32 core), all by SHA-256. It is derived from the same tree the manifest is, and its own hash is recorded in the manifest. It does **not** enumerate the contents of the esp32 board package: that is pinned by version, not built here.
+
+          **Device TLS trust bundle.** \`hear-push-ca-bundle.pem\` is the bounded PEM bundle ADR 0011 puts behind \`HEAR_PUSH_CA_CERT\`: one root in steady state, two only during a planned overlap cutover. \`hear-push-ca-bundle.json\` states which routes it covers and which tracked cert files generated it. \`release_ca_bundle.py verify --dist dist\` refuses missing, malformed or drifted certificates before publication.
 
           Verify a downloaded release offline (hashes, manifest, SBOM, and that the attestation covers every asset):
 

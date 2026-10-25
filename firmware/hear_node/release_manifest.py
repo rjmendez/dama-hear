@@ -19,6 +19,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import board_profiles  # noqa: E402
+import release_ca_bundle  # noqa: E402
 
 MANIFEST_NAME = "release-manifest.json"
 # What a published image IS, as a field rather than as prose in the release notes. "unprovisioned"
@@ -60,9 +61,14 @@ COMMON_INPUTS = (
     ("firmware/hear_node/deploy_gate.py", "rollout-readiness-gate"),
     ("firmware/hear_node/enroll.py", "usb-release-installer"),
     ("firmware/hear_node/flash.py", "ota-release-installer"),
+    ("firmware/hear_node/hear_push_ca.h", "device-push-trust-bundle"),
     ("firmware/hear_node/hear_node.ino", "firmware-sketch"),
+    ("firmware/hear_node/release_ca_bundle.py", "device-push-ca-bundle-generator"),
     ("firmware/lib/hear_platform/src/hear_prov.h", "nvs-provenance-storage"),
     ("firmware/lib/hear_platform/src/hear_prov_line.h", "provisioning-wire-format"),
+    ("firmware/hear_node/trust_store/amazon-root-ca-1.pem", "device-push-trust-root"),
+    ("firmware/hear_node/trust_store/hear_push_ca_bundle_spec.json",
+     "device-push-trust-bundle-spec"),
 )
 GENERATED_INPUTS = (
     ("firmware/hear_node/decim.h", "firmware/gen_decim.py", "generated-decimator"),
@@ -358,6 +364,13 @@ def build_manifest(repo_root: pathlib.Path, dist_dir: pathlib.Path, build_info_p
         _record_bytes("build-info.json", build_info_bytes, kind="build-info"),
         _record_bytes(SCHEMA_NAME, schema_text.encode("utf-8"), kind="manifest-schema"),
     ]
+    for name, kind in (
+        (release_ca_bundle.BUNDLE_NAME, "ca-bundle"),
+        (release_ca_bundle.METADATA_NAME, "ca-bundle-metadata"),
+    ):
+        path = dist_dir / name
+        if path.exists():
+            release_artifacts.append(_record_bytes(name, path.read_bytes(), kind=kind))
     # The SBOM is written BEFORE the manifest (release.yml runs release_sbom.py first) precisely
     # so the manifest can hash it: an SBOM nobody's checksum covers is a document an attacker can
     # rewrite. A release cut without one still produces a manifest, and an installer that meets a
