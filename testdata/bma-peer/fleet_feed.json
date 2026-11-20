@@ -1,0 +1,625 @@
+{
+ "v": 1,
+ "k": "fleet",
+ "updated_s": 1794000000.5,
+ "hub": {
+  "version": "fleet-hub 1.2.0",
+  "sound_speed_mps": 343.21,
+  "assoc_window_ms": 20.0,
+  "hold_ms": 974.0,
+  "config_sha": "0123abcd"
+ },
+ "origin_id": "example-origin",
+ "units": [
+  {
+   "unit_id": "bma1",
+   "mac": "00:00:5e:00:53:01",
+   "label": "BMA1",
+   "pose_state": "surveyed",
+   "pose": {
+    "origin_id": "example-origin",
+    "position": {
+     "e_m": 0.0,
+     "n_m": 0.0,
+     "u_m": 1.5,
+     "sigma_m": 0.05
+    },
+    "orientation": {
+     "heading_deg": 12.5,
+     "pitch_deg": 0.0,
+     "roll_deg": 0.0,
+     "port_normal": "+z",
+     "sigma_heading_deg": 1.0
+    },
+    "source": "FICTITIOUS EXAMPLE",
+    "surveyed_utc": "2026-11-14T00:00:00Z"
+   },
+   "clock": {
+    "domain": "PTP_LOCKED",
+    "offset_samples": 0,
+    "offset_source": "FICTITIOUS EXAMPLE",
+    "reference_unit": "bma1"
+   },
+   "fused": true,
+   "not_fused_reason": null,
+   "ambiguous": false,
+   "det_rate_hz": 9.5,
+   "last_det_age_s": 0.12,
+   "counts": {
+    "dets": 1200,
+    "gap_before": 1,
+    "dropped": 1,
+    "clip": 0,
+    "wind": 0
+   },
+   "clock_effective": {
+    "domain": "PTP_LOCKED",
+    "offset_samples": 0,
+    "offset_source": "FICTITIOUS EXAMPLE",
+    "reference_unit": "bma1",
+    "offset_sigma_samples": null,
+    "drift_ppm": null
+   },
+   "pose_state_rel": "relative_origin"
+  },
+  {
+   "unit_id": "bma2",
+   "mac": "00:00:5e:00:53:02",
+   "label": "BMA2",
+   "pose_state": "surveyed",
+   "pose": {
+    "origin_id": "example-origin",
+    "position": {
+     "e_m": 100.0,
+     "n_m": 0.0,
+     "u_m": 1.5,
+     "sigma_m": 0.05
+    },
+    "orientation": {
+     "heading_deg": 270.0,
+     "pitch_deg": 0.0,
+     "roll_deg": 0.0,
+     "port_normal": "+z",
+     "sigma_heading_deg": 1.0
+    },
+    "source": "FICTITIOUS EXAMPLE",
+    "surveyed_utc": "2026-11-14T00:00:00Z"
+   },
+   "clock": {
+    "domain": "PTP_LOCKED",
+    "offset_samples": 602,
+    "offset_source": "FICTITIOUS EXAMPLE",
+    "reference_unit": "bma1"
+   },
+   "fused": true,
+   "not_fused_reason": null,
+   "ambiguous": false,
+   "det_rate_hz": 9.5,
+   "last_det_age_s": 0.12,
+   "counts": {
+    "dets": 1200,
+    "gap_before": 1,
+    "dropped": 1,
+    "clip": 0,
+    "wind": 0
+   },
+   "clock_effective": {
+    "domain": "PTP_LOCKED",
+    "offset_samples": 602,
+    "offset_source": "FICTITIOUS EXAMPLE",
+    "reference_unit": "bma1",
+    "offset_sigma_samples": null,
+    "drift_ppm": null
+   },
+   "pose_state_rel": "relative_clap"
+  },
+  {
+   "unit_id": "bma3",
+   "mac": "00:00:5e:00:53:03",
+   "label": "BMA3",
+   "pose_state": "unsurveyed",
+   "pose": null,
+   "clock": {
+    "domain": "LOCAL",
+    "offset_samples": 0,
+    "offset_source": "unset",
+    "reference_unit": null
+   },
+   "fused": false,
+   "not_fused_reason": "clock_local",
+   "ambiguous": true,
+   "det_rate_hz": 4.0,
+   "last_det_age_s": 0.4,
+   "counts": {
+    "dets": 300,
+    "gap_before": 0,
+    "dropped": 0,
+    "clip": 2,
+    "wind": 1
+   },
+   "clock_effective": {
+    "domain": "LOCAL",
+    "offset_samples": 0,
+    "offset_source": "unset",
+    "reference_unit": null,
+    "offset_sigma_samples": null,
+    "drift_ppm": null
+   },
+   "pose_state_rel": null
+  }
+ ],
+ "rays": [
+  {
+   "unit_id": "bma1",
+   "det_id": "bma1:305419896:7",
+   "t_wall_s": 1794000000.25,
+   "kind": "azel",
+   "az_deg_local": 340.4946,
+   "el_deg_local": 11.0949,
+   "sigma_deg": 2.0,
+   "bearing_deg_world": 32.0054,
+   "mirror_bearings_deg_world": null,
+   "local_track_id": 1,
+   "existence": 0.93
+  },
+  {
+   "unit_id": "bma2",
+   "det_id": "bma2:305419896:8",
+   "t_wall_s": 1794000000.25,
+   "kind": "azel",
+   "az_deg_local": 302.0054,
+   "el_deg_local": 11.0949,
+   "sigma_deg": 2.0,
+   "bearing_deg_world": 327.9946,
+   "mirror_bearings_deg_world": null,
+   "local_track_id": 1,
+   "existence": 0.93
+  },
+  {
+   "unit_id": "bma3",
+   "det_id": "bma3:77:3",
+   "t_wall_s": 1794000000.1,
+   "kind": "cone",
+   "az_deg_local": 300.0,
+   "el_deg_local": null,
+   "sigma_deg": 3.0,
+   "bearing_deg_world": null,
+   "mirror_bearings_deg_world": null,
+   "local_track_id": 2,
+   "existence": 0.5
+  }
+ ],
+ "bearing_tracks": [
+  {
+   "unit_id": "bma1",
+   "local_track_id": 1,
+   "az_deg_local": 340.4946,
+   "sigma_deg": 2.0,
+   "bearing_deg_world": 32.0054,
+   "existence": 0.93,
+   "class": "bird"
+  },
+  {
+   "unit_id": "bma2",
+   "local_track_id": 1,
+   "az_deg_local": 302.0054,
+   "sigma_deg": 2.0,
+   "bearing_deg_world": 327.9946,
+   "existence": 0.93,
+   "class": "bird"
+  },
+  {
+   "unit_id": "bma3",
+   "local_track_id": 2,
+   "az_deg_local": 300.0,
+   "sigma_deg": 3.0,
+   "bearing_deg_world": null,
+   "existence": 0.5,
+   "class": "unknown"
+  }
+ ],
+ "tracks": [
+  {
+   "track_id": "F1",
+   "state": "confirmed",
+   "existence": 0.97,
+   "pos_enu_m": [
+    50.0,
+    80.0,
+    20.0
+   ],
+   "vel_enu_mps": [
+    1.0,
+    -0.5,
+    0.0
+   ],
+   "cov_pos_m2": [
+    [
+     16.0,
+     2.0,
+     0.0
+    ],
+    [
+     2.0,
+     9.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     25.0
+    ]
+   ],
+   "born_s": 1793999990.0,
+   "updated_s": 1794000000.25,
+   "contributors": [
+    "bma1",
+    "bma2"
+   ],
+   "n_bearings": 182,
+   "history": [
+    [
+     1793999999.25,
+     49.0,
+     80.5,
+     20.0
+    ],
+    [
+     1794000000.25,
+     50.0,
+     80.0,
+     20.0
+    ]
+   ],
+   "class": {
+    "label": "Northern Cardinal",
+    "score": 0.82,
+    "source": "birds",
+    "unit_id": "bma1",
+    "t": 1793999999.0
+   },
+   "det_ids": [
+    "bma1:305419896:7",
+    "bma2:305419896:8"
+   ]
+  }
+ ],
+ "timing": {
+  "pairs": [
+   {
+    "a": "bma1",
+    "b": "bma2",
+    "offset_samples_a": 0,
+    "offset_samples_b": 602,
+    "cross_ok": true,
+    "assoc_count": 175
+   }
+  ]
+ },
+ "relative": {
+  "reference_unit": "bma1",
+  "frame": "array:bma1",
+  "frame_label": "relative frame (the reference unit's array axes, origin at its MIC121), not geographic",
+  "state": "running",
+  "refused_reason": null,
+  "updated_s": 1794000000.0,
+  "age_s": 0.5,
+  "sound_speed_mps": 343.2146,
+  "units": [
+   {
+    "unit_id": "bma2",
+    "refused": null,
+    "clock": {
+     "state": "anchored",
+     "segment": 0,
+     "segment_reason": "start",
+     "segments": 1,
+     "anchor_kind": "two_clap_registry",
+     "ref_index": 10612000,
+     "offset_samples": 1240.893,
+     "offset_sigma_samples": 6.223,
+     "offset_interval_samples": [
+      1106.081,
+      1768.605
+     ],
+     "interval_ref_index": 10096000,
+     "drift_ppm": 18.611,
+     "drift_sigma_ppm": 10.5426,
+     "drift_source": "prior",
+     "drift_assumption": "the source layout is stationary over the fit span (g has no trend)",
+     "events": 12,
+     "events_total": 12,
+     "outliers": 0,
+     "jumps": 0,
+     "g_bound_samples": 706.124,
+     "domain": "ACOUSTIC_REL",
+     "offset_source": "acoustic_two_clap"
+    },
+    "pose": {
+     "state": "relative_clap",
+     "reason": null,
+     "n_claps": 6,
+     "gauge": "rotation about the reference arm axis fixed by convention: the unit's origin in the reference array plane (z = 0), y >= 0",
+     "unobservable_always": [
+      "the unit's roll about its own arm axis (its cone measures the angle to the axis only)",
+      "the front/back mirror about the reference array plane: fixes are folded to z >= 0 and the unit's arm elevation theta to >= 0"
+     ],
+     "t_m": [
+      3.9526,
+      2.9845,
+      0.0
+     ],
+     "t_cov_m2": [
+      [
+       0.003284,
+       -0.003913,
+       0.0
+      ],
+      [
+       -0.003913,
+       0.005104,
+       0.0
+      ],
+      [
+       0.0,
+       0.0,
+       0.0
+      ]
+     ],
+     "axis": [
+      0.52714,
+      0.84978,
+      0.00075
+     ],
+     "params": {
+      "t_x_m": 3.9526,
+      "t_y_m": 2.9845,
+      "phi_deg": 58.1876,
+      "theta_deg": 0.0432,
+      "off0_samples": 1241.5348,
+      "drift_ppm": 19.6471
+     },
+     "sigma_post": {
+      "t_x_m": 0.0573,
+      "t_y_m": 0.0714,
+      "phi_deg": 2.4339,
+      "theta_deg": 4.9568,
+      "off0_samples": 2.9763,
+      "drift_ppm": 9.1551
+     },
+     "sigma_data": {
+      "t_x_m": 0.1477,
+      "t_y_m": 0.1836,
+      "phi_deg": null,
+      "theta_deg": 9.9568,
+      "off0_samples": 10.622,
+      "drift_ppm": null
+     },
+     "observable": {
+      "t_x_m": true,
+      "t_y_m": true,
+      "phi_deg": false,
+      "theta_deg": true,
+      "off0_samples": true,
+      "drift_ppm": false
+     },
+     "unobservable": [
+      {
+       "off0_samples": 0.114,
+       "drift_ppm": 0.993
+      },
+      {
+       "theta_deg": 1.0
+      }
+     ],
+     "prior_dependent": [
+      "phi_deg"
+     ],
+     "assumptions": [
+      "owner_arm_angle_60",
+      "operator_coplanar"
+     ],
+     "baseline_m": 4.9938,
+     "mirror": {
+      "modes": 2,
+      "resolved_by": "owner_prior_abs_phi",
+      "phi_deg_alternatives": [
+       58.19,
+       23.28
+      ]
+     },
+     "cost": 4.284,
+     "n_events": 16,
+     "refined_with_events": 10,
+     "prior_check": {
+      "owner_abs_phi_deg": 60.0,
+      "estimate_abs_phi_deg": 58.19,
+      "agrees": true
+     }
+    }
+   }
+  ],
+  "targets": [
+   {
+    "units": [
+     "bma1",
+     "bma2"
+    ],
+    "t_wall_s": 1800000010.752,
+    "ref_index": 10516000,
+    "delay_samples": 1803.918,
+    "psr": 8.293,
+    "tdoa": {
+     "dt_s": 0.0117669,
+     "dt_sigma_s": 0.0001118,
+     "dt_interval_s": null,
+     "path_diff_m": 4.0386,
+     "path_diff_sigma_m": 0.0384,
+     "path_diff_interval_m": null
+    },
+    "cones": [
+     {
+      "which": "ref",
+      "psi_deg": 133.222,
+      "sigma_deg": 1.573,
+      "unit_id": "bma1"
+     },
+     {
+      "which": "unit",
+      "psi_deg": 141.348,
+      "sigma_deg": 1.835,
+      "unit_id": "bma2"
+     }
+    ],
+    "fix": {
+     "pos_m": [
+      -5.3929,
+      -2.1849,
+      5.4853
+     ],
+     "cov_m2": [
+      [
+       65.24618,
+       42.036068,
+       -58.347035
+      ],
+      [
+       42.036068,
+       27.17794,
+       -37.656131
+      ],
+      [
+       -58.347035,
+       -37.656131,
+       52.230814
+      ]
+     ],
+     "chi2": 0.0,
+     "mirror_z": true,
+     "n_candidates": 1,
+     "ambiguous": false
+    }
+   },
+   {
+    "units": [
+     "bma1",
+     "bma2"
+    ],
+    "t_wall_s": 1800000011.752,
+    "ref_index": 10564000,
+    "delay_samples": 1258.272,
+    "psr": 8.939,
+    "tdoa": {
+     "dt_s": 0.0003807,
+     "dt_sigma_s": 0.0001207,
+     "dt_interval_s": null,
+     "path_diff_m": 0.1307,
+     "path_diff_sigma_m": 0.0414,
+     "path_diff_interval_m": null
+    },
+    "cones": [
+     {
+      "which": "ref",
+      "psi_deg": 71.863,
+      "sigma_deg": 1.206,
+      "unit_id": "bma1"
+     },
+     {
+      "which": "unit",
+      "psi_deg": 117.579,
+      "sigma_deg": 1.293,
+      "unit_id": "bma2"
+     }
+    ],
+    "fix": {
+     "pos_m": [
+      1.5706,
+      2.1418,
+      3.7469
+     ],
+     "cov_m2": [
+      [
+       0.14951,
+       -0.188259,
+       0.583422
+      ],
+      [
+       -0.188259,
+       0.238515,
+       -0.736394
+      ],
+      [
+       0.583422,
+       -0.736394,
+       2.386621
+      ]
+     ],
+     "chi2": 0.0,
+     "mirror_z": true,
+     "n_candidates": 1,
+     "ambiguous": false
+    }
+   },
+   {
+    "units": [
+     "bma1",
+     "bma2"
+    ],
+    "t_wall_s": 1800000012.752,
+    "ref_index": 10612000,
+    "delay_samples": 1579.897,
+    "psr": 8.484,
+    "tdoa": {
+     "dt_s": 0.0070626,
+     "dt_sigma_s": 0.0001298,
+     "dt_interval_s": null,
+     "path_diff_m": 2.424,
+     "path_diff_sigma_m": 0.0445,
+     "path_diff_interval_m": null
+    },
+    "cones": [
+     {
+      "which": "ref",
+      "psi_deg": 125.289,
+      "sigma_deg": 1.404,
+      "unit_id": "bma1"
+     },
+     {
+      "which": "unit",
+      "psi_deg": 119.646,
+      "sigma_deg": 1.319,
+      "unit_id": "bma2"
+     }
+    ],
+    "fix": {
+     "pos_m": [
+      -3.6546,
+      2.6303,
+      4.6977
+     ],
+     "cov_m2": [
+      [
+       4.129896,
+       0.457947,
+       -6.98993
+      ],
+      [
+       0.457947,
+       0.102968,
+       -0.859164
+      ],
+      [
+       -6.98993,
+       -0.859164,
+       12.010734
+      ]
+     ],
+     "chi2": 0.0,
+     "mirror_z": true,
+     "n_candidates": 1,
+     "ambiguous": false
+    }
+   }
+  ]
+ }
+}

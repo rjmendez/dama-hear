@@ -1,0 +1,238 @@
+{
+  "label": "SYNTHETIC",
+  "provenance": {
+    "repository": "rjmendez/dama-gotchi-fresh",
+    "commit": "e55d4c5873cd8b382baba20f2582cfd5dbad8c10",
+    "branch_at_capture": "origin/main",
+    "capture_method": "The sender batch is the proposed envelope around the output of this repository's convert_fleet for the synthetic input. Subsequent stage outputs were produced by executing the named pure function definitions and their pure helpers from git-show source at the pinned commit. AWS clients and MQTT were not imported or called. UUID4 was fixed to the value shown for a reproducible capture.",
+    "functions": [
+      "aws/lambda/batch_ingest/handler.py::_normalize_messages",
+      "aws/lambda/forwarder/handler.py::_validate_payload",
+      "aws/oxalis/dama-sqs-consumer.py::_topic_for"
+    ],
+    "scope": "Synthetic proposed BMA schema compatibility only; this is not an AWS-published message, a real sensor record, or evidence that AWS supports BMA."
+  },
+  "batch_idempotency_key": "synthetic-batch-key-01",
+  "input": {
+    "origin": {
+      "origin_id": "synthetic-yard",
+      "lat": 0.0,
+      "lon": 0.0,
+      "alt_m": 0.0,
+      "datum": "WGS84",
+      "north": "true"
+    },
+    "fleet": {
+      "v": 1,
+      "k": "fleet",
+      "updated_s": 1794000000.5,
+      "origin_id": "synthetic-yard",
+      "units": [
+        {
+          "unit_id": "bma_west",
+          "pose_state": "surveyed",
+          "pose": {
+            "origin_id": "synthetic-yard",
+            "position": {
+              "e_m": 10.0,
+              "n_m": 20.0,
+              "u_m": 1.5,
+              "sigma_m": 0.1
+            },
+            "orientation": {
+              "heading_deg": 0.0,
+              "pitch_deg": 0.0,
+              "roll_deg": 0.0,
+              "port_normal": "+z",
+              "sigma_heading_deg": 1.0
+            },
+            "source": "SYNTHETIC fixture",
+            "surveyed_utc": "2026-11-19T00:00:00Z"
+          },
+          "fused": false,
+          "not_fused_reason": null,
+          "ambiguous": false
+        }
+      ],
+      "rays": [
+        {
+          "unit_id": "bma_west",
+          "det_id": "bma_west:305419896:7",
+          "t_wall_s": 1794000000.25,
+          "kind": "azel",
+          "az_deg_local": 270.0,
+          "el_deg_local": 0.0,
+          "sigma_deg": 2.0,
+          "bearing_deg_world": 90.0,
+          "mirror_bearings_deg_world": null,
+          "ambiguous": false
+        }
+      ]
+    }
+  },
+  "expected": {
+    "sender_batch": {
+      "device_id": "bma-bma_west",
+      "messages": [
+        {
+          "device_id": "bma-bma_west",
+          "ts_ms": 1794000000250,
+          "telemetry_path": "bma/bearing",
+          "schema": "bma.bearing.v1",
+          "observation": {
+            "unit_id": "bma_west",
+            "det_id": "bma_west:305419896:7",
+            "source_time_wall_s": 1794000000.25,
+            "origin_id": "synthetic-yard",
+            "pose": {
+              "origin_id": "synthetic-yard",
+              "position": {
+                "e_m": 10.0,
+                "n_m": 20.0,
+                "u_m": 1.5,
+                "sigma_m": 0.1
+              },
+              "orientation": {
+                "heading_deg": 0.0,
+                "pitch_deg": 0.0,
+                "roll_deg": 0.0,
+                "port_normal": "+z",
+                "sigma_heading_deg": 1.0
+              },
+              "source": "SYNTHETIC fixture",
+              "surveyed_utc": "2026-11-19T00:00:00Z"
+            },
+            "bearing_deg_true": 90.0,
+            "sigma_deg": 2.0,
+            "clock_precise": false,
+            "evidence": "unvalidated"
+          }
+        }
+      ]
+    },
+    "batch_ingest": {
+      "valid_messages": [
+        {
+          "device_id": "bma-bma_west",
+          "ts_ms": 1794000000250,
+          "telemetry_path": "bma/bearing",
+          "schema": "bma.bearing.v1",
+          "observation": {
+            "unit_id": "bma_west",
+            "det_id": "bma_west:305419896:7",
+            "source_time_wall_s": 1794000000.25,
+            "origin_id": "synthetic-yard",
+            "pose": {
+              "origin_id": "synthetic-yard",
+              "position": {
+                "e_m": 10.0,
+                "n_m": 20.0,
+                "u_m": 1.5,
+                "sigma_m": 0.1
+              },
+              "orientation": {
+                "heading_deg": 0.0,
+                "pitch_deg": 0.0,
+                "roll_deg": 0.0,
+                "port_normal": "+z",
+                "sigma_heading_deg": 1.0
+              },
+              "source": "SYNTHETIC fixture",
+              "surveyed_utc": "2026-11-19T00:00:00Z"
+            },
+            "bearing_deg_true": 90.0,
+            "sigma_deg": 2.0,
+            "clock_precise": false,
+            "evidence": "unvalidated"
+          },
+          "idempotency_key": "c6648da7306cf2e4202ad30a15211a06fe1d19529b430ba771c7cb8e6a944de3",
+          "batch_idempotency_key": "synthetic-batch-key-01",
+          "ingest_trace_id": "12345678-1234-5678-1234-567812345678"
+        }
+      ],
+      "invalid_messages": []
+    },
+    "forwarder": {
+      "quarantine_reason": null,
+      "payload": {
+        "device_id": "bma-bma_west",
+        "ts_ms": 1794000000250,
+        "telemetry_path": "bma/bearing",
+        "schema": "bma.bearing.v1",
+        "observation": {
+          "unit_id": "bma_west",
+          "det_id": "bma_west:305419896:7",
+          "source_time_wall_s": 1794000000.25,
+          "origin_id": "synthetic-yard",
+          "pose": {
+            "origin_id": "synthetic-yard",
+            "position": {
+              "e_m": 10.0,
+              "n_m": 20.0,
+              "u_m": 1.5,
+              "sigma_m": 0.1
+            },
+            "orientation": {
+              "heading_deg": 0.0,
+              "pitch_deg": 0.0,
+              "roll_deg": 0.0,
+              "port_normal": "+z",
+              "sigma_heading_deg": 1.0
+            },
+            "source": "SYNTHETIC fixture",
+            "surveyed_utc": "2026-11-19T00:00:00Z"
+          },
+          "bearing_deg_true": 90.0,
+          "sigma_deg": 2.0,
+          "clock_precise": false,
+          "evidence": "unvalidated"
+        },
+        "idempotency_key": "c6648da7306cf2e4202ad30a15211a06fe1d19529b430ba771c7cb8e6a944de3",
+        "batch_idempotency_key": "synthetic-batch-key-01",
+        "ingest_trace_id": "12345678-1234-5678-1234-567812345678",
+        "ts": 1794000000250
+      }
+    },
+    "oxalis": {
+      "topic": "dama/bma-bma-west/telemetry",
+      "payload": {
+        "device_id": "bma-bma_west",
+        "ts_ms": 1794000000250,
+        "telemetry_path": "bma/bearing",
+        "schema": "bma.bearing.v1",
+        "observation": {
+          "unit_id": "bma_west",
+          "det_id": "bma_west:305419896:7",
+          "source_time_wall_s": 1794000000.25,
+          "origin_id": "synthetic-yard",
+          "pose": {
+            "origin_id": "synthetic-yard",
+            "position": {
+              "e_m": 10.0,
+              "n_m": 20.0,
+              "u_m": 1.5,
+              "sigma_m": 0.1
+            },
+            "orientation": {
+              "heading_deg": 0.0,
+              "pitch_deg": 0.0,
+              "roll_deg": 0.0,
+              "port_normal": "+z",
+              "sigma_heading_deg": 1.0
+            },
+            "source": "SYNTHETIC fixture",
+            "surveyed_utc": "2026-11-19T00:00:00Z"
+          },
+          "bearing_deg_true": 90.0,
+          "sigma_deg": 2.0,
+          "clock_precise": false,
+          "evidence": "unvalidated"
+        },
+        "idempotency_key": "c6648da7306cf2e4202ad30a15211a06fe1d19529b430ba771c7cb8e6a944de3",
+        "batch_idempotency_key": "synthetic-batch-key-01",
+        "ingest_trace_id": "12345678-1234-5678-1234-567812345678",
+        "ts": 1794000000250
+      }
+    }
+  }
+}
